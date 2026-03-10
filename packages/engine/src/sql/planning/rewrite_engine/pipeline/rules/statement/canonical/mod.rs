@@ -12,14 +12,93 @@ use crate::functions::LixFunctionProvider;
 use crate::errors;
 use crate::{LixBackend, LixError, Value};
 
-use super::context::StatementContext;
-use super::helpers::merge_rewrite_output;
-use super::outcome::StatementRuleOutcome;
-
 const MAX_REWRITE_PASSES: usize = 32;
 const LIX_CHANGE_VIEW_NAME: &str = "lix_change";
 const LIX_STATE_HISTORY_VIEW_NAME: &str = "lix_state_history";
 const LIX_STATE_HISTORY_BY_VERSION_VIEW_NAME: &str = "lix_state_history_by_version";
+
+struct StatementContext<'a> {
+    params: &'a [Value],
+    writer_key: Option<&'a str>,
+    backend: Option<&'a dyn LixBackend>,
+    side_effects: Vec<Statement>,
+    registrations: Vec<crate::engine::sql::planning::rewrite_engine::SchemaRegistration>,
+    generated_params: Vec<Value>,
+    mutations: Vec<crate::engine::sql::planning::rewrite_engine::MutationRow>,
+    update_validations: Vec<crate::engine::sql::planning::rewrite_engine::UpdateValidationPlan>,
+    postprocess: Option<crate::engine::sql::planning::rewrite_engine::PostprocessPlan>,
+}
+
+impl<'a> StatementContext<'a> {
+    fn new_sync(params: &'a [Value], writer_key: Option<&'a str>) -> Self {
+        Self {
+            params,
+            writer_key,
+            backend: None,
+            side_effects: Vec::new(),
+            registrations: Vec::new(),
+            generated_params: Vec::new(),
+            mutations: Vec::new(),
+            update_validations: Vec::new(),
+            postprocess: None,
+        }
+    }
+
+    fn new_backend(
+        backend: &'a dyn LixBackend,
+        params: &'a [Value],
+        writer_key: Option<&'a str>,
+    ) -> Self {
+        Self {
+            params,
+            writer_key,
+            backend: Some(backend),
+            side_effects: Vec::new(),
+            registrations: Vec::new(),
+            generated_params: Vec::new(),
+            mutations: Vec::new(),
+            update_validations: Vec::new(),
+            postprocess: None,
+        }
+    }
+
+    fn take_output(&mut self, statements: Vec<Statement>) -> RewriteOutput {
+        RewriteOutput {
+            statements,
+            effect_only: false,
+            params: std::mem::take(&mut self.generated_params),
+            registrations: std::mem::take(&mut self.registrations),
+            postprocess: self.postprocess.take(),
+            mutations: std::mem::take(&mut self.mutations),
+            update_validations: std::mem::take(&mut self.update_validations),
+        }
+    }
+}
+
+enum StatementRuleOutcome {
+    Continue(Statement),
+    Emit(RewriteOutput),
+    NoMatch,
+}
+
+fn merge_rewrite_output(base: &mut RewriteOutput, mut next: RewriteOutput) -> Result<(), LixError> {
+    if base.postprocess.is_some() && next.postprocess.is_some() {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "only one postprocess rewrite is supported per query".to_string(),
+        });
+    }
+    if base.postprocess.is_none() {
+        base.postprocess = next.postprocess.take();
+    }
+    base.statements.extend(next.statements);
+    base.effect_only = base.effect_only || next.effect_only;
+    base.params.extend(next.params);
+    base.registrations.extend(next.registrations);
+    base.mutations.extend(next.mutations);
+    base.update_validations.extend(next.update_validations);
+    Ok(())
+}
 
 fn reject_read_only_public_write(statement: &Statement) -> Result<(), LixError> {
     match statement {

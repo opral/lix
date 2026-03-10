@@ -1,6 +1,6 @@
-#[path = "pipeline/rules/mod.rs"]
-mod rules;
 mod steps;
+#[path = "pipeline/rules/statement/canonical/mod.rs"]
+mod canonical;
 #[path = "pipeline/validator.rs"]
 mod validator;
 
@@ -94,11 +94,11 @@ pub(crate) fn rewrite_statement<P: LixFunctionProvider>(
     provider: &mut P,
 ) -> Result<RewriteOutput, LixError> {
     let output = if let Some(output) =
-        rules::statement::canonical::rewrite_sync_statement(statement.clone(), params, writer_key, provider)?
+        canonical::rewrite_sync_statement(statement.clone(), params, writer_key, provider)?
     {
         output
     } else {
-        rules::statement::passthrough::apply(statement)
+        passthrough_output(statement)
     };
     validator::validate_statement_output(&output)?;
     Ok(output)
@@ -115,7 +115,7 @@ where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
     let output = if let Some(output) =
-        rules::statement::canonical::rewrite_backend_statement(
+        canonical::rewrite_backend_statement(
             backend,
             statement.clone(),
             params,
@@ -126,8 +126,20 @@ where
     {
         output
     } else {
-        rules::statement::passthrough::apply(statement)
+        passthrough_output(statement)
     };
     validator::validate_statement_output(&output)?;
     Ok(output)
+}
+
+fn passthrough_output(statement: Statement) -> RewriteOutput {
+    RewriteOutput {
+        statements: vec![statement],
+        effect_only: false,
+        params: Vec::new(),
+        registrations: Vec::new(),
+        postprocess: None,
+        mutations: Vec::new(),
+        update_validations: Vec::new(),
+    }
 }
