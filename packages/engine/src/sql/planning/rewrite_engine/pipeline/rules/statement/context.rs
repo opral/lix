@@ -3,7 +3,6 @@ use sqlparser::ast::Statement;
 use crate::engine::sql::planning::rewrite_engine::types::{
     MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration, UpdateValidationPlan,
 };
-use crate::engine::sql::planning::rewrite_engine::DetectedFileDomainChange;
 use crate::{LixBackend, Value};
 
 pub(crate) struct StatementContext<'a> {
@@ -11,7 +10,6 @@ pub(crate) struct StatementContext<'a> {
     pub(crate) writer_key: Option<&'a str>,
     pub(crate) active_version_id_hint: Option<&'a str>,
     pub(crate) backend: Option<&'a dyn LixBackend>,
-    pub(crate) detected_file_domain_changes: &'a [DetectedFileDomainChange],
     pub(crate) side_effects: Vec<Statement>,
     pub(crate) registrations: Vec<SchemaRegistration>,
     pub(crate) generated_params: Vec<Value>,
@@ -27,7 +25,6 @@ impl<'a> StatementContext<'a> {
             writer_key,
             active_version_id_hint: None,
             backend: None,
-            detected_file_domain_changes: &[],
             side_effects: Vec::new(),
             registrations: Vec::new(),
             generated_params: Vec::new(),
@@ -42,14 +39,12 @@ impl<'a> StatementContext<'a> {
         params: &'a [Value],
         writer_key: Option<&'a str>,
         active_version_id_hint: Option<&'a str>,
-        detected_file_domain_changes: &'a [DetectedFileDomainChange],
     ) -> Self {
         Self {
             params,
             writer_key,
             active_version_id_hint,
             backend: Some(backend),
-            detected_file_domain_changes,
             side_effects: Vec::new(),
             registrations: Vec::new(),
             generated_params: Vec::new(),

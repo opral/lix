@@ -2,7 +2,6 @@ use sqlparser::ast::Insert;
 
 use crate::engine::sql::planning::rewrite_engine::steps::vtable_write;
 use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
-use crate::engine::sql::planning::rewrite_engine::DetectedFileDomainChange;
 use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
@@ -70,7 +69,6 @@ pub(crate) async fn rewrite_vtable_inserts_with_backend<P: LixFunctionProvider>(
     inserts: Vec<Insert>,
     params: &[Value],
     functions: &mut P,
-    detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
 ) -> Result<RewriteOutput, LixError> {
     let mut statements = Vec::new();
@@ -85,7 +83,6 @@ pub(crate) async fn rewrite_vtable_inserts_with_backend<P: LixFunctionProvider>(
             insert,
             params,
             generated_param_offset,
-            detected_file_domain_changes,
             writer_key,
             functions,
         )

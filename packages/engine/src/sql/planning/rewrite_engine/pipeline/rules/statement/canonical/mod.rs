@@ -6,7 +6,6 @@ use crate::engine::sql::planning::rewrite_engine::pipeline::query_engine::rewrit
 use crate::engine::sql::planning::rewrite_engine::steps::lix_change_view_write;
 use crate::engine::sql::planning::rewrite_engine::steps::lix_state_history_view_write;
 use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
-use crate::engine::sql::planning::rewrite_engine::DetectedFileDomainChange;
 use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
@@ -54,7 +53,6 @@ pub(crate) async fn rewrite_backend_statement<P>(
     writer_key: Option<&str>,
     active_version_id_hint: Option<&str>,
     functions: &mut P,
-    detected_file_domain_changes: &[DetectedFileDomainChange],
 ) -> Result<Option<RewriteOutput>, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
@@ -86,7 +84,6 @@ where
                     params,
                     writer_key,
                     active_version_id_hint,
-                    detected_file_domain_changes,
                 );
                 let outcome = rewrite_backend_loop(statement, &mut context, functions).await?;
                 let side_effects = std::mem::take(&mut context.side_effects);
@@ -355,8 +352,6 @@ where
                 lix_change_view_write::reject_insert(&insert)?;
                 lix_state_history_view_write::reject_insert(&insert)?;
 
-                let insert_detected_file_domain_changes = context.detected_file_domain_changes;
-
                 if let Some(version_rewrite) = lix_version_write::rewrite_insert_with_backend(
                     backend,
                     insert.clone(),
@@ -369,7 +364,6 @@ where
                         version_rewrite.vtable_inserts,
                         context.params,
                         functions,
-                        &insert_detected_file_domain_changes,
                         context.writer_key,
                     )
                     .await?;
@@ -387,7 +381,6 @@ where
                         active_account_inserts,
                         context.params,
                         functions,
-                        &insert_detected_file_domain_changes,
                         context.writer_key,
                     )
                     .await?;
@@ -444,7 +437,6 @@ where
                     current_insert.clone(),
                     context.params,
                     context.generated_params.len(),
-                    &insert_detected_file_domain_changes,
                     context.writer_key,
                     functions,
                 )
@@ -508,7 +500,6 @@ where
                         active_version_inserts,
                         context.params,
                         functions,
-                        context.detected_file_domain_changes,
                         context.writer_key,
                     )
                     .await?;
@@ -544,7 +535,6 @@ where
                         version_rewrite.vtable_inserts,
                         context.params,
                         functions,
-                        context.detected_file_domain_changes,
                         context.writer_key,
                     )
                     .await?;
@@ -610,7 +600,6 @@ where
                         version_rewrite.vtable_inserts,
                         context.params,
                         functions,
-                        context.detected_file_domain_changes,
                         context.writer_key,
                     )
                     .await?;

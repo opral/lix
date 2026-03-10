@@ -28,7 +28,6 @@ pub(crate) use pipeline::statement_pipeline::StatementPipeline;
 pub(crate) use row_resolution::{
     resolve_expr_cell_with_state, resolve_insert_rows, ResolvedCell, RowSourceResolver,
 };
-pub(crate) use steps::vtable_write::DetectedFileDomainChange;
 pub(crate) use types::{
     MutationOperation, MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration,
 };

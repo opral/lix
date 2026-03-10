@@ -106,9 +106,6 @@ pub struct VtableDeleteRewrite {
     pub plan: VtableDeletePlan,
 }
 
-pub type DetectedFileDomainChange =
-    crate::engine::sql::contracts::effects::DetectedFileDomainChange;
-
 #[cfg(test)]
 pub fn rewrite_insert(
     insert: sqlparser::ast::Insert,
@@ -194,7 +191,6 @@ pub async fn rewrite_insert_with_backend(
     mut insert: sqlparser::ast::Insert,
     params: &[EngineValue],
     generated_param_offset: usize,
-    detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Option<VtableWriteRewrite>, LixError> {
@@ -239,7 +235,6 @@ pub async fn rewrite_insert_with_backend(
             tracked_rows,
             &mut registrations,
             &mut mutations,
-            detected_file_domain_changes,
             params.len() + generated_param_offset,
             writer_key,
             functions,
@@ -1083,7 +1078,6 @@ async fn rewrite_tracked_rows_with_backend(
     rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
     registrations: &mut Vec<SchemaRegistration>,
     mutations: &mut Vec<MutationRow>,
-    detected_file_domain_changes: &[DetectedFileDomainChange],
     placeholder_offset: usize,
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
@@ -1175,28 +1169,6 @@ async fn rewrite_tracked_rows_with_backend(
             plugin_key,
             snapshot_content: snapshot_json,
             untracked: false,
-        });
-    }
-
-    for change in detected_file_domain_changes {
-        affected_versions.insert(change.version_id.clone());
-        ensure_registration(registrations, &change.schema_key);
-        let domain_writer_key = change
-            .writer_key
-            .clone()
-            .or_else(|| writer_key.map(ToString::to_string));
-        domain_changes.push(DomainChangeInput {
-            id: functions.uuid_v7(),
-            entity_id: change.entity_id.clone(),
-            schema_key: change.schema_key.clone(),
-            schema_version: change.schema_version.clone(),
-            file_id: change.file_id.clone(),
-            version_id: change.version_id.clone(),
-            plugin_key: change.plugin_key.clone(),
-            snapshot_content: change.snapshot_content.clone(),
-            metadata: change.metadata.clone(),
-            created_at: timestamp.clone(),
-            writer_key: domain_writer_key,
         });
     }
 
