@@ -435,7 +435,7 @@ fn should_run_binary_cas_gc(
             .any(|change| change.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
 }
 
-fn collect_postprocess_file_cache_targets(
+pub(crate) fn collect_postprocess_file_cache_targets(
     rows: &[Vec<Value>],
     schema_key: &str,
 ) -> Result<BTreeSet<(String, String)>, LixError> {

@@ -5,7 +5,12 @@ use sqlparser::parser::Parser;
 
 use crate::commit::{generate_commit, DomainChangeInput, GenerateCommitArgs};
 use crate::deterministic_mode::RuntimeFunctionProvider;
+use crate::engine::collect_postprocess_file_cache_targets;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::state_commit_stream::{
+    state_commit_stream_changes_from_postprocess_rows, StateCommitStreamChange,
+    StateCommitStreamOperation,
+};
 use crate::version::{
     version_descriptor_file_id, version_descriptor_schema_key,
     version_descriptor_storage_version_id, GLOBAL_VERSION_ID,
@@ -14,7 +19,8 @@ use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value as EngineVa
 
 use crate::engine::sql::ast::lowering::lower_statement;
 use crate::engine::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
-use crate::internal_state::{VtableDeletePlan, VtableUpdatePlan};
+use crate::engine::sql::execution::execute_prepared::execute_prepared_with_transaction;
+use crate::internal_state::{PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
 use crate::engine::sql::contracts::prepared_statement::PreparedStatement;
 use crate::engine::sql::history::commit_runtime::{
     bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
@@ -36,6 +42,91 @@ const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "writer_key",
     "updated_at",
 ];
+
+pub(crate) struct PostprocessExecutionOutcome {
+    pub(crate) internal_result: QueryResult,
+    pub(crate) postprocess_file_cache_targets: BTreeSet<(String, String)>,
+    pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
+}
+
+pub(crate) async fn execute_postprocess_with_transaction(
+    transaction: &mut dyn LixTransaction,
+    prepared_statements: &[PreparedStatement],
+    postprocess_plan: &PostprocessPlan,
+    should_refresh_file_cache: bool,
+    functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
+    writer_key: Option<&str>,
+) -> Result<PostprocessExecutionOutcome, LixError> {
+    let internal_result = execute_prepared_with_transaction(transaction, prepared_statements).await?;
+
+    let mut postprocess_file_cache_targets = BTreeSet::new();
+    if should_refresh_file_cache {
+        let schema_key = match postprocess_plan {
+            PostprocessPlan::VtableUpdate(update_plan) => &update_plan.schema_key,
+            PostprocessPlan::VtableDelete(delete_plan) => &delete_plan.schema_key,
+        };
+        postprocess_file_cache_targets =
+            collect_postprocess_file_cache_targets(&internal_result.rows, schema_key)?;
+    }
+
+    let mut state_commit_stream_changes = Vec::new();
+    match postprocess_plan {
+        PostprocessPlan::VtableUpdate(update_plan) => {
+            let changes = state_commit_stream_changes_from_postprocess_rows(
+                &internal_result.rows,
+                &update_plan.schema_key,
+                StateCommitStreamOperation::Update,
+                writer_key,
+            )?;
+            state_commit_stream_changes.extend(changes);
+        }
+        PostprocessPlan::VtableDelete(delete_plan) => {
+            let changes = state_commit_stream_changes_from_postprocess_rows(
+                &internal_result.rows,
+                &delete_plan.schema_key,
+                StateCommitStreamOperation::Delete,
+                writer_key,
+            )?;
+            state_commit_stream_changes.extend(changes);
+        }
+    }
+
+    let mut followup_functions = functions.clone();
+    let followup_params = prepared_statements
+        .first()
+        .map(|statement| statement.params.as_slice())
+        .unwrap_or(&[]);
+    let followup_statements = match postprocess_plan {
+        PostprocessPlan::VtableUpdate(update_plan) => {
+            build_update_followup_statements(
+                transaction,
+                update_plan,
+                &internal_result.rows,
+                writer_key,
+                &mut followup_functions,
+            )
+            .await?
+        }
+        PostprocessPlan::VtableDelete(delete_plan) => {
+            build_delete_followup_statements(
+                transaction,
+                delete_plan,
+                &internal_result.rows,
+                followup_params,
+                writer_key,
+                &mut followup_functions,
+            )
+            .await?
+        }
+    };
+    execute_prepared_with_transaction(transaction, &followup_statements).await?;
+
+    Ok(PostprocessExecutionOutcome {
+        internal_result,
+        postprocess_file_cache_targets,
+        state_commit_stream_changes,
+    })
+}
 
 #[async_trait::async_trait(?Send)]
 trait SqlExecutor {
