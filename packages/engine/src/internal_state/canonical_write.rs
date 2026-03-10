@@ -631,5 +631,3 @@ fn is_allowed_internal_write_target(target: &str) -> bool {
     normalized.starts_with("lix_internal_")
 }
 
-#[cfg(test)]
-mod tests {}
