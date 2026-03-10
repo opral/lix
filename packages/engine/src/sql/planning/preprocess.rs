@@ -108,7 +108,7 @@ where
         // futures in recursive rewrite call paths.
         let output = Box::pin(
             StatementPipeline::new(params, writer_key, active_version_id_hint)
-                .rewrite_statement_with_backend(backend, statement, provider, &[]),
+                .rewrite_statement_with_backend(backend, statement, provider),
         )
         .await
         .map_err(|error| LixError {
@@ -172,12 +172,7 @@ where
     P: LixFunctionProvider + Send + 'static,
 {
     preprocess_sql_with_provider_and_detected_file_domain_changes(
-        backend,
-        evaluator,
-        sql_text,
-        params,
-        functions,
-        None,
+        backend, evaluator, sql_text, params, functions, None,
     )
     .await
 }

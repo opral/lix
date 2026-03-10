@@ -1,7 +1,6 @@
 use sqlparser::ast::Statement;
 
 use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
-use crate::engine::sql::planning::rewrite_engine::DetectedFileDomainChange;
 use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
@@ -45,19 +44,13 @@ impl<'a> StatementPipeline<'a> {
         backend: &dyn LixBackend,
         statement: Statement,
         provider: &mut P,
-        detected_file_domain_changes: &[DetectedFileDomainChange],
     ) -> Result<RewriteOutput, LixError>
     where
         P: LixFunctionProvider + Clone + Send + 'static,
     {
         let output =
             StatementRuleEngine::new(self.params, self.writer_key, self.active_version_id_hint)
-                .rewrite_statement_with_backend(
-                    backend,
-                    statement,
-                    provider,
-                    detected_file_domain_changes,
-                )
+                .rewrite_statement_with_backend(backend, statement, provider)
                 .await?;
         validate_statement_output(&output)?;
         Ok(output)
@@ -111,7 +104,6 @@ impl<'a> StatementRuleEngine<'a> {
         backend: &dyn LixBackend,
         statement: Statement,
         provider: &mut P,
-        detected_file_domain_changes: &[DetectedFileDomainChange],
     ) -> Result<RewriteOutput, LixError>
     where
         P: LixFunctionProvider + Clone + Send + 'static,
@@ -125,7 +117,6 @@ impl<'a> StatementRuleEngine<'a> {
                 self.writer_key,
                 self.active_version_id_hint,
                 provider,
-                detected_file_domain_changes,
             )
             .await?
             {

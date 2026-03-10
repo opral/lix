@@ -2,7 +2,6 @@ use sqlparser::ast::{Delete, Insert, Statement, Update};
 
 use crate::engine::sql::planning::rewrite_engine::steps::vtable_write;
 use crate::engine::sql::planning::rewrite_engine::types::{PostprocessPlan, RewriteOutput};
-use crate::engine::sql::planning::rewrite_engine::DetectedFileDomainChange;
 use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
@@ -20,7 +19,6 @@ pub(crate) async fn rewrite_insert_with_backend<P: LixFunctionProvider>(
     insert: Insert,
     params: &[Value],
     generated_param_offset: usize,
-    detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
     functions: &mut P,
 ) -> Result<Option<vtable_write::VtableWriteRewrite>, LixError> {
@@ -29,7 +27,6 @@ pub(crate) async fn rewrite_insert_with_backend<P: LixFunctionProvider>(
         insert,
         params,
         generated_param_offset,
-        detected_file_domain_changes,
         writer_key,
         functions,
     )

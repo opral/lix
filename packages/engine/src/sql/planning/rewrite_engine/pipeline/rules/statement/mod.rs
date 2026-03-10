@@ -1,7 +1,6 @@
 use sqlparser::ast::Statement;
 
 use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
-use crate::engine::sql::planning::rewrite_engine::DetectedFileDomainChange;
 use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
@@ -45,7 +44,6 @@ pub(crate) async fn apply_backend_rule<P>(
     writer_key: Option<&str>,
     active_version_id_hint: Option<&str>,
     provider: &mut P,
-    detected_file_domain_changes: &[DetectedFileDomainChange],
 ) -> Result<Option<RewriteOutput>, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
@@ -61,7 +59,6 @@ where
                 writer_key,
                 active_version_id_hint,
                 provider,
-                detected_file_domain_changes,
             )
             .await
         }

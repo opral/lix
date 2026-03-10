@@ -1662,11 +1662,7 @@ mod tests {
         );
         assert!(canonicalized.write_command.selector.exact_only);
         assert_eq!(
-            canonicalized
-                .write_command
-                .selector
-                .exact_filters
-                .get("id"),
+            canonicalized.write_command.selector.exact_filters.get("id"),
             Some(&Value::Text("file-1".to_string()))
         );
     }

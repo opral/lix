@@ -3023,7 +3023,7 @@ mod tests {
         let mut provider = SystemFunctionProvider;
 
         let output = pipeline
-            .rewrite_statement_with_backend(&backend, statement, &mut provider, &[])
+            .rewrite_statement_with_backend(&backend, statement, &mut provider)
             .await
             .expect("pipeline rewrite should succeed");
 
