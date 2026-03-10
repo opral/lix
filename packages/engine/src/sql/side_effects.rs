@@ -202,6 +202,7 @@ impl Engine {
         params: &[Value],
         active_version_id: &str,
         writer_key: Option<&str>,
+        skip_legacy_filesystem_update_side_effect_detection: bool,
     ) -> Result<CollectedExecutionSideEffects, LixError> {
         let pending_file_write_collection =
             crate::filesystem::pending_file_writes::collect_pending_file_writes_from_statements(
@@ -242,17 +243,24 @@ impl Engine {
             vec![Vec::new(); pending_file_writes_by_statement.len()];
 
         let filesystem_update_domain_changes =
-            collect_filesystem_update_detected_file_domain_changes_from_statements(
-                backend, statements, params,
-            )
-            .await
-            .map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "filesystem update side-effect detection failed: {}",
-                    error.description
-                ),
-            })?;
+            if skip_legacy_filesystem_update_side_effect_detection {
+                FilesystemUpdateDomainChangeCollection {
+                    untracked_changes: Vec::new(),
+                    tracked_changes_by_statement: vec![Vec::new(); statements.len()],
+                }
+            } else {
+                collect_filesystem_update_detected_file_domain_changes_from_statements(
+                    backend, statements, params,
+                )
+                .await
+                .map_err(|error| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
+                        "filesystem update side-effect detection failed: {}",
+                        error.description
+                    ),
+                })?
+            };
         let filesystem_update_tracked_changes_by_statement = filesystem_update_domain_changes
             .tracked_changes_by_statement
             .iter()

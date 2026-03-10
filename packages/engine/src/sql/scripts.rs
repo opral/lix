@@ -97,6 +97,7 @@ impl Engine {
                     params,
                     active_version_id,
                     options.writer_key.as_deref(),
+                    false,
                 )
                 .await?
             };
