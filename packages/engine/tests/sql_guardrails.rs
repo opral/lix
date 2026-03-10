@@ -391,7 +391,7 @@ fn guardrail_sql_side_effects_stays_off_legacy_filesystem_update_detector() {
 #[test]
 fn guardrail_live_transaction_script_filesystem_coalescer_stays_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let script_source = fs::read_to_string(root.join("src/sql/planning/script.rs"))
+    let script_source = fs::read_to_string(root.join("src/internal_state/script.rs"))
         .expect("script.rs should be readable");
     let scripts_source =
         fs::read_to_string(root.join("src/sql/scripts.rs")).expect("scripts.rs readable");

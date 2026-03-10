@@ -9,4 +9,3 @@ pub(crate) mod param_context;
 pub(crate) mod parse;
 pub(crate) mod plan;
 pub(crate) mod preprocess;
-pub(crate) mod script;

@@ -553,7 +553,7 @@ mod tests {
     use crate::engine::sql::ast::walk::contains_transaction_control_statement;
     use crate::engine::sql::contracts::planned_statement::UpdateValidationPlan;
     use crate::engine::sql::history::plugin_inputs::file_history_read_materialization_required_for_statements;
-    use crate::engine::sql::planning::script::extract_explicit_transaction_script_from_statements;
+    use crate::internal_state::script::extract_explicit_transaction_script_from_statements;
     use crate::engine::sql::semantics::state_resolution::canonical::is_query_only_statements;
     use crate::engine::sql::semantics::state_resolution::effects::active_version_from_update_validations;
     use crate::engine::sql::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;

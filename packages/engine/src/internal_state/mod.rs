@@ -2,6 +2,7 @@ pub(crate) mod stored_schema;
 pub(crate) mod vtable_read;
 pub(crate) mod vtable_write;
 pub(crate) mod materialize;
+pub(crate) mod script;
 #[path = "canonical_write.rs"]
 mod canonical;
 pub(crate) mod followup;
