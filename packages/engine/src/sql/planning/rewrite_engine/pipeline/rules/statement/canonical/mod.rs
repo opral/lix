@@ -213,7 +213,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
     context: &mut StatementContext<'_>,
     functions: &mut P,
 ) -> Result<StatementRuleOutcome, LixError> {
-    let mut current = statement;
+    let current = statement;
 
     if !matches!(
         current,
@@ -323,7 +323,7 @@ where
         });
     };
 
-    let mut current = statement;
+    let current = statement;
 
     if !matches!(
         current,

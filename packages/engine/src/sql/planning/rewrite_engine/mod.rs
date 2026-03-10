@@ -1,5 +1,4 @@
 mod ast_utils;
-mod params;
 mod pipeline;
 mod row_resolution;
 mod steps;
@@ -11,8 +10,8 @@ use sqlparser::ast::Statement;
 
 pub(crate) use ast_utils::{object_name_matches, parse_single_query, quote_ident};
 #[cfg(test)]
-pub(crate) use params::bind_sql_with_state_and_appended_params;
-pub(crate) use params::PlaceholderState;
+pub(crate) use crate::engine::sql::ast::utils::bind_sql_with_state_and_appended_params;
+pub(crate) use crate::engine::sql::ast::utils::PlaceholderState;
 #[cfg(test)]
 pub use pipeline::parse_sql_statements;
 #[cfg(test)]

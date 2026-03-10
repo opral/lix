@@ -3,9 +3,7 @@ use sqlparser::ast::{
     SetExpr, Value as SqlValue,
 };
 
-use crate::engine::sql::planning::rewrite_engine::params::{
-    resolve_placeholder_index, PlaceholderState,
-};
+use crate::engine::sql::ast::utils::{resolve_placeholder_index, PlaceholderState};
 use crate::{LixError, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,15 +86,6 @@ pub fn resolve_values_rows(
     }
 
     Ok(resolved_rows)
-}
-
-pub fn resolve_insert_rows(
-    insert: &Insert,
-    params: &[Value],
-) -> Result<Option<Vec<Vec<ResolvedCell>>>, LixError> {
-    Ok(RowSourceResolver::new(params)
-        .resolve_insert(insert)?
-        .map(|source| source.resolved_rows))
 }
 
 pub fn resolve_expr_cell_with_state(
