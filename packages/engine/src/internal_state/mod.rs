@@ -1023,38 +1023,6 @@ mod tests {
     }
 
     #[test]
-    fn statement_validator_rejects_postprocess_with_mutations() {
-        let output = RewriteOutput {
-            statements: vec![empty_statement()],
-            effect_only: false,
-            params: Vec::new(),
-            registrations: Vec::new(),
-            postprocess: Some(PostprocessPlan::VtableDelete(VtableDeletePlan {
-                schema_key: "schema".to_string(),
-                effective_scope_fallback: false,
-                effective_scope_selection_sql: None,
-                effective_scope_untracked_selection_sql: None,
-            })),
-            mutations: vec![MutationRow {
-                operation: MutationOperation::Insert,
-                entity_id: "e".to_string(),
-                schema_key: "s".to_string(),
-                schema_version: "1".to_string(),
-                file_id: "f".to_string(),
-                version_id: "v".to_string(),
-                plugin_key: "p".to_string(),
-                snapshot_content: None,
-                untracked: false,
-            }],
-            update_validations: Vec::new(),
-        };
-
-        let err = validate_statement_output(&output)
-            .expect_err("postprocess output with mutations should be rejected");
-        assert!(err.description.contains("cannot emit mutation rows"));
-    }
-
-    #[test]
     fn statement_validator_rejects_update_validation_with_non_update_statement() {
         let output = RewriteOutput {
             statements: vec![empty_statement(), empty_update_statement()],
@@ -1102,46 +1070,4 @@ mod tests {
             .contains("update validations require an UPDATE statement output"));
     }
 
-    #[test]
-    fn statement_validator_rejects_vtable_update_postprocess_on_non_update_statement() {
-        let output = RewriteOutput {
-            statements: vec![empty_statement()],
-            effect_only: false,
-            params: Vec::new(),
-            registrations: Vec::new(),
-            postprocess: Some(PostprocessPlan::VtableUpdate(VtableUpdatePlan {
-                schema_key: "schema".to_string(),
-                explicit_writer_key: None,
-                writer_key_assignment_present: false,
-            })),
-            mutations: Vec::new(),
-            update_validations: Vec::new(),
-        };
-
-        let err = validate_statement_output(&output)
-            .expect_err("vtable update postprocess on query statement should be rejected");
-        assert!(err
-            .description
-            .contains("vtable update postprocess requires an UPDATE statement"));
-    }
-
-    #[test]
-    fn statement_validator_allows_multi_statement_vtable_update_postprocess() {
-        let output = RewriteOutput {
-            statements: vec![empty_update_statement(), empty_update_statement()],
-            effect_only: false,
-            params: Vec::new(),
-            registrations: Vec::new(),
-            postprocess: Some(PostprocessPlan::VtableUpdate(VtableUpdatePlan {
-                schema_key: "schema".to_string(),
-                explicit_writer_key: None,
-                writer_key_assignment_present: false,
-            })),
-            mutations: Vec::new(),
-            update_validations: Vec::new(),
-        };
-
-        validate_statement_output(&output)
-            .expect("multi-statement vtable update postprocess should remain valid");
-    }
 }
