@@ -20,7 +20,6 @@ pub(crate) async fn build_execution_plan<P>(
     evaluator: &CelEvaluator,
     parsed_statements: Vec<Statement>,
     params: &[Value],
-    active_version_id_hint: Option<&str>,
     dependency_spec_override: Option<DependencySpec>,
     functions: SharedFunctionProvider<P>,
     pending_file_delete_targets: &BTreeSet<(String, String)>,
@@ -36,7 +35,6 @@ where
         evaluator,
         parsed_statements.clone(),
         params,
-        active_version_id_hint,
         functions,
         writer_key,
     )

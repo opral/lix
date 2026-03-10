@@ -198,7 +198,6 @@ pub(crate) async fn prepare_execution_with_backend(
             &engine.cel_evaluator,
             plan_statements,
             params,
-            Some(active_version_id),
             sql2_read
                 .as_ref()
                 .and_then(|prepared| prepared.dependency_spec.clone()),

@@ -52,7 +52,7 @@ fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider>(
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
 
     for statement in statements {
-        let output = StatementPipeline::new(params, writer_key, None)
+        let output = StatementPipeline::new(params, writer_key)
             .rewrite_statement(statement, provider)?;
         accumulate_rewrite_output(
             from_rewrite_output(output),
@@ -90,7 +90,6 @@ async fn preprocess_statements_with_provider_and_backend<P>(
     backend: &dyn LixBackend,
     statements: Vec<Statement>,
     params: &[Value],
-    active_version_id_hint: Option<&str>,
     provider: &mut P,
     writer_key: Option<&str>,
 ) -> Result<PlannedStatementSet, LixError>
@@ -107,7 +106,7 @@ where
         // Keep this async rewrite future boxed to avoid infinitely sized
         // futures in recursive rewrite call paths.
         let output = Box::pin(
-            StatementPipeline::new(params, writer_key, active_version_id_hint)
+            StatementPipeline::new(params, writer_key)
                 .rewrite_statement_with_backend(backend, statement, provider),
         )
         .await
@@ -193,7 +192,6 @@ where
         evaluator,
         parse_sql_statements(sql_text)?,
         params,
-        None,
         functions,
         writer_key,
     )
@@ -205,7 +203,6 @@ pub(crate) async fn preprocess_with_surfaces_to_plan<P: LixFunctionProvider>(
     evaluator: &CelEvaluator,
     statements: Vec<Statement>,
     params: &[Value],
-    active_version_id_hint: Option<&str>,
     functions: SharedFunctionProvider<P>,
     writer_key: Option<&str>,
 ) -> Result<PlannedStatementSet, LixError>
@@ -247,7 +244,6 @@ where
         backend,
         statements,
         &params,
-        active_version_id_hint,
         &mut provider,
         writer_key,
     )

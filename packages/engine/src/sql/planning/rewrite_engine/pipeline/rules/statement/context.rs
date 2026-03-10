@@ -36,7 +36,6 @@ impl<'a> StatementContext<'a> {
         backend: &'a dyn LixBackend,
         params: &'a [Value],
         writer_key: Option<&'a str>,
-        _active_version_id_hint: Option<&'a str>,
     ) -> Self {
         Self {
             params,
