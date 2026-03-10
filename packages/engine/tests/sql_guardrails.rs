@@ -272,16 +272,6 @@ fn guardrail_legacy_filesystem_step_wrapper_is_removed() {
             .exists(),
         "legacy filesystem step wrapper must stay removed"
     );
-
-    let canonical_source = fs::read_to_string(root.join(
-        "src/sql/planning/rewrite_engine/pipeline/rules/statement/canonical/filesystem_write.rs",
-    ))
-    .expect("filesystem_write.rs should be readable");
-
-    assert!(
-        !canonical_source.contains("filesystem_step::"),
-        "filesystem canonical write rule must call neutral filesystem runtime directly"
-    );
 }
 
 #[test]
@@ -319,7 +309,9 @@ fn guardrail_legacy_filesystem_select_rewrite_is_removed() {
 fn guardrail_dead_rewrite_engine_filesystem_coalescer_stays_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !root.join("src/sql/planning/rewrite_engine/rewrite.rs").exists(),
+        !root
+            .join("src/sql/planning/rewrite_engine/rewrite.rs")
+            .exists(),
         "dead rewrite_engine filesystem coalescer must stay removed"
     );
 }
@@ -328,7 +320,9 @@ fn guardrail_dead_rewrite_engine_filesystem_coalescer_stays_removed() {
 fn guardrail_dead_rewrite_engine_filesystem_analysis_stays_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !root.join("src/sql/planning/rewrite_engine/analysis.rs").exists(),
+        !root
+            .join("src/sql/planning/rewrite_engine/analysis.rs")
+            .exists(),
         "dead rewrite_engine filesystem analysis helper must stay removed"
     );
 }
@@ -340,6 +334,77 @@ fn guardrail_dead_canonical_filesystem_write_wrapper_stays_removed() {
         !root.join("src/sql/planning/rewrite_engine/pipeline/rules/statement/canonical/filesystem_write.rs").exists(),
         "dead canonical filesystem write wrapper must stay removed"
     );
+}
+
+#[test]
+fn guardrail_legacy_canonical_statement_rewrite_is_filesystem_blind() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let canonical_mod_source = fs::read_to_string(
+        root.join("src/sql/planning/rewrite_engine/pipeline/rules/statement/canonical/mod.rs"),
+    )
+    .expect("canonical/mod.rs should be readable");
+
+    for forbidden in [
+        "mutation_rewrite::rewrite_insert(",
+        "mutation_rewrite::rewrite_update(",
+        "mutation_rewrite::rewrite_delete(",
+        "mutation_rewrite::insert_side_effect_statements_with_backend(",
+        "filesystem backend insert side-effect discovery failed",
+        "filesystem backend insert rewrite failed",
+        "filesystem/backend insert vtable lowering failed",
+        "FilesystemUpdateRewrite",
+    ] {
+        assert!(
+            !canonical_mod_source.contains(forbidden),
+            "legacy canonical statement rewrite must not carry filesystem write branches: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn guardrail_legacy_filesystem_mutation_rewrite_is_removed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !root.join("src/filesystem/mutation_rewrite.rs").exists(),
+        "legacy filesystem mutation rewrite must stay removed once sql2 owns filesystem writes"
+    );
+
+    let filesystem_mod_source =
+        fs::read_to_string(root.join("src/filesystem/mod.rs")).expect("filesystem mod readable");
+    assert!(
+        !filesystem_mod_source.contains("mutation_rewrite"),
+        "filesystem module tree must not re-export the removed legacy mutation rewrite"
+    );
+}
+
+#[test]
+fn guardrail_sql_side_effects_stays_off_legacy_filesystem_update_detector() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let side_effects_source =
+        fs::read_to_string(root.join("src/sql/side_effects.rs")).expect("side_effects readable");
+    let intent_source =
+        fs::read_to_string(root.join("src/sql/execution/intent.rs")).expect("intent readable");
+    let shared_path_source = fs::read_to_string(root.join("src/sql/execution/shared_path.rs"))
+        .expect("shared_path readable");
+
+    for forbidden in [
+        "mutation_rewrite::update_side_effects_with_backend(",
+        "skip_legacy_filesystem_update_side_effect_detection",
+        "collect_filesystem_update_detected_file_domain_changes_from_statements",
+    ] {
+        assert!(
+            !side_effects_source.contains(forbidden),
+            "sql side-effects must not keep legacy filesystem update detector plumbing: {forbidden}"
+        );
+        assert!(
+            !intent_source.contains(forbidden),
+            "execution intent must not keep legacy filesystem update detector plumbing: {forbidden}"
+        );
+        assert!(
+            !shared_path_source.contains(forbidden),
+            "shared_path must not keep legacy filesystem update detector plumbing: {forbidden}"
+        );
+    }
 }
 
 #[test]
@@ -369,14 +434,12 @@ fn guardrail_live_transaction_script_filesystem_coalescer_stays_removed() {
 #[test]
 fn guardrail_legacy_query_pipeline_context_and_validator_are_filesystem_blind() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let context_source = fs::read_to_string(
-        root.join("src/sql/planning/rewrite_engine/pipeline/context.rs"),
-    )
-    .expect("context.rs should be readable");
-    let validator_source = fs::read_to_string(
-        root.join("src/sql/planning/rewrite_engine/pipeline/validator.rs"),
-    )
-    .expect("validator.rs should be readable");
+    let context_source =
+        fs::read_to_string(root.join("src/sql/planning/rewrite_engine/pipeline/context.rs"))
+            .expect("context.rs should be readable");
+    let validator_source =
+        fs::read_to_string(root.join("src/sql/planning/rewrite_engine/pipeline/validator.rs"))
+            .expect("validator.rs should be readable");
 
     for forbidden in [
         "lix_file",
@@ -474,31 +537,24 @@ fn guardrail_live_filesystem_effects_do_not_carry_cache_invalidation_targets() {
 }
 
 #[test]
-fn guardrail_filesystem_data_only_updates_use_explicit_effect_only_rewrite() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let canonical_source = fs::read_to_string(
-        root.join("src/sql/planning/rewrite_engine/pipeline/rules/statement/canonical/mod.rs"),
-    )
-    .expect("canonical statement rule source should be readable");
-    let mutation_source = fs::read_to_string(root.join("src/filesystem/mutation_rewrite.rs"))
-        .expect("mutation_rewrite.rs should be readable");
+fn guardrail_filesystem_noop_sql_synthesis_stays_removed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rust_sources(&root, &mut files);
 
-    assert!(
-        canonical_source.contains("FilesystemUpdateRewrite::EffectOnly"),
-        "canonical filesystem rewrite must branch on explicit effect-only updates"
-    );
-    assert!(
-        mutation_source.contains("FilesystemUpdateRewrite::EffectOnly"),
-        "filesystem mutation rewrite must emit explicit effect-only updates"
-    );
-    assert!(
-        !canonical_source.contains("filesystem_noop_statement"),
-        "canonical filesystem rewrite must not pattern-match fake no-op SQL"
-    );
-    assert!(
-        !mutation_source.contains("failed to build filesystem no-op statement"),
-        "filesystem mutation rewrite must not synthesize fake no-op SQL statements"
-    );
+    for file in files {
+        let source = fs::read_to_string(&file).expect("source file should be readable");
+        for forbidden in [
+            "filesystem_noop_statement",
+            "failed to build filesystem no-op statement",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "filesystem runtime must not synthesize fake no-op SQL statements: {}",
+                file.display()
+            );
+        }
+    }
 }
 
 #[test]

@@ -3,6 +3,7 @@ use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     version_descriptor_schema_key, GLOBAL_VERSION_ID,
 };
+use crate::{LixBackend, LixError, Value};
 
 pub(crate) const LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN: &str = "__lix_blob_hash";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -21,6 +22,28 @@ pub(crate) fn build_live_file_projection_sql() -> String {
 
 pub(crate) fn build_live_file_prefetch_projection_sql() -> String {
     build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, true)
+}
+
+pub(crate) async fn resolve_file_id_by_path_in_version(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    path: &str,
+) -> Result<Option<String>, LixError> {
+    let sql = format!(
+        "SELECT id \
+         FROM ({live_projection_sql}) AS live_files \
+         WHERE lixcol_version_id = '{version_id}' \
+           AND path = '{path}' \
+         LIMIT 1",
+        live_projection_sql = build_live_file_prefetch_projection_sql(),
+        version_id = escape_sql_string(version_id),
+        path = escape_sql_string(path),
+    );
+    let result = backend.execute(&sql, &[]).await?;
+    Ok(result.rows.first().and_then(|row| match row.first() {
+        Some(Value::Text(id)) => Some(id.clone()),
+        _ => None,
+    }))
 }
 
 pub(crate) fn build_filesystem_file_projection_sql(

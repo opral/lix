@@ -2,14 +2,11 @@ use std::collections::VecDeque;
 
 use sqlparser::ast::Statement;
 
-use crate::engine::sql::contracts::effects::DetectedFileDomainChange as Sql2DetectedFileDomainChange;
 use crate::engine::sql::planning::rewrite_engine::pipeline::query_engine::rewrite_read_query_with_backend_and_params;
 use crate::engine::sql::planning::rewrite_engine::steps::lix_change_view_write;
 use crate::engine::sql::planning::rewrite_engine::steps::lix_state_history_view_write;
 use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
 use crate::engine::sql::planning::rewrite_engine::DetectedFileDomainChange;
-use crate::filesystem::mutation_rewrite;
-use crate::filesystem::mutation_rewrite::FilesystemUpdateRewrite;
 use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
@@ -140,10 +137,6 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 lix_change_view_write::reject_insert(&insert)?;
                 lix_state_history_view_write::reject_insert(&insert)?;
 
-                if let Some(rewritten) = mutation_rewrite::rewrite_insert(insert.clone())? {
-                    current = Statement::Insert(rewritten);
-                    continue;
-                }
                 if let Some(version_inserts) =
                     lix_version_write::rewrite_insert(insert.clone(), context.params)?
                 {
@@ -227,19 +220,6 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 lix_change_view_write::reject_update(&update)?;
                 lix_state_history_view_write::reject_update(&update)?;
 
-                if let Some(rewritten) = mutation_rewrite::rewrite_update(update.clone())? {
-                    match rewritten {
-                        FilesystemUpdateRewrite::EffectOnly => {
-                            return Ok(StatementRuleOutcome::Emit(
-                                context.take_effect_only_output(),
-                            ));
-                        }
-                        FilesystemUpdateRewrite::Statement(rewritten) => {
-                            current = rewritten;
-                        }
-                    }
-                    continue;
-                }
                 if let Some(rewritten) =
                     entity_view_write::rewrite_update(update.clone(), context.params)?
                 {
@@ -262,10 +242,6 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 lix_change_view_write::reject_delete(&delete)?;
                 lix_state_history_view_write::reject_delete(&delete)?;
 
-                if let Some(rewritten) = mutation_rewrite::rewrite_delete(delete.clone())? {
-                    current = Statement::Delete(rewritten);
-                    continue;
-                }
                 if let Some(rewritten) = entity_view_write::rewrite_delete(delete.clone())? {
                     current = Statement::Delete(rewritten);
                     continue;
@@ -379,51 +355,7 @@ where
                 lix_change_view_write::reject_insert(&insert)?;
                 lix_state_history_view_write::reject_insert(&insert)?;
 
-                let filesystem_insert_side_effects =
-                    mutation_rewrite::insert_side_effect_statements_with_backend(
-                        backend,
-                        &insert,
-                        context.params,
-                        context.active_version_id_hint,
-                    )
-                    .await
-                    .map_err(|error| LixError {
-                        code: error.code,
-                        description: format!(
-                            "filesystem backend insert side-effect discovery failed: {}",
-                            error.description
-                        ),
-                    })?;
-                context.side_effects = filesystem_insert_side_effects.statements.clone();
-
-                let mut insert_detected_file_domain_changes =
-                    context.detected_file_domain_changes.to_vec();
-                insert_detected_file_domain_changes.extend(
-                    filesystem_insert_side_effects
-                        .tracked_directory_changes
-                        .iter()
-                        .map(sql_change_to_detected_file_domain_change),
-                );
-
-                let insert = if let Some(rewritten) = mutation_rewrite::rewrite_insert_with_backend(
-                    backend,
-                    insert.clone(),
-                    context.params,
-                    Some(&filesystem_insert_side_effects.resolved_directory_ids),
-                    filesystem_insert_side_effects.active_version_id.as_deref(),
-                )
-                .await
-                .map_err(|error| LixError {
-                    code: error.code,
-                    description: format!(
-                        "filesystem backend insert rewrite failed: {}",
-                        error.description
-                    ),
-                })? {
-                    rewritten
-                } else {
-                    insert
-                };
+                let insert_detected_file_domain_changes = context.detected_file_domain_changes;
 
                 if let Some(version_rewrite) = lix_version_write::rewrite_insert_with_backend(
                     backend,
@@ -520,7 +452,7 @@ where
                 .map_err(|error| LixError {
                     code: error.code,
                     description: format!(
-                        "filesystem/backend insert vtable lowering failed: {}",
+                        "backend insert vtable lowering failed: {}",
                         error.description
                     ),
                 })? {
@@ -549,27 +481,6 @@ where
             Statement::Update(update) => {
                 lix_change_view_write::reject_update(&update)?;
                 lix_state_history_view_write::reject_update(&update)?;
-
-                if let Some(rewritten) = mutation_rewrite::rewrite_update_with_backend(
-                    backend,
-                    update.clone(),
-                    context.params,
-                    context.active_version_id_hint,
-                )
-                .await?
-                {
-                    match rewritten {
-                        FilesystemUpdateRewrite::EffectOnly => {
-                            return Ok(StatementRuleOutcome::Emit(
-                                context.take_effect_only_output(),
-                            ));
-                        }
-                        FilesystemUpdateRewrite::Statement(rewritten) => {
-                            current = rewritten;
-                        }
-                    }
-                    continue;
-                }
 
                 let update = if let Some(rewritten) =
                     entity_view_write::rewrite_update_with_backend(
@@ -651,19 +562,6 @@ where
                 lix_state_history_view_write::reject_delete(&delete)?;
 
                 let mut effective_scope_fallback = false;
-                let delete = if let Some(rewritten) = mutation_rewrite::rewrite_delete_with_backend(
-                    backend,
-                    delete.clone(),
-                    context.params,
-                    context.active_version_id_hint,
-                )
-                .await?
-                {
-                    rewritten
-                } else {
-                    delete
-                };
-
                 let delete = if let Some(rewritten) =
                     entity_view_write::rewrite_delete_with_backend(backend, delete.clone()).await?
                 {
@@ -805,75 +703,5 @@ fn is_allowed_internal_write_target(target: &str) -> bool {
     normalized.starts_with("lix_internal_")
 }
 
-fn sql_change_to_detected_file_domain_change(
-    change: &Sql2DetectedFileDomainChange,
-) -> DetectedFileDomainChange {
-    DetectedFileDomainChange {
-        entity_id: change.entity_id.clone(),
-        schema_key: change.schema_key.clone(),
-        schema_version: change.schema_version.clone(),
-        file_id: change.file_id.clone(),
-        version_id: change.version_id.clone(),
-        plugin_key: change.plugin_key.clone(),
-        snapshot_content: change.snapshot_content.clone(),
-        metadata: change.metadata.clone(),
-        writer_key: change.writer_key.clone(),
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::rewrite_backend_statement;
-    use crate::functions::SystemFunctionProvider;
-    use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
-    use sqlparser::ast::Statement;
-    use sqlparser::dialect::GenericDialect;
-    use sqlparser::parser::Parser;
-
-    struct NoopBackend;
-
-    #[async_trait::async_trait(?Send)]
-    impl LixBackend for NoopBackend {
-        fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
-        }
-
-        async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            })
-        }
-
-        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
-            Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "transactions are not supported in this test backend".to_string(),
-            })
-        }
-    }
-
-    fn parse_statement(sql: &str) -> Statement {
-        let mut statements =
-            Parser::parse_sql(&GenericDialect {}, sql).expect("test SQL should parse");
-        assert_eq!(statements.len(), 1, "test SQL should produce one statement");
-        statements.remove(0)
-    }
-
-    #[tokio::test]
-    async fn data_only_filesystem_update_rewrites_to_effect_only_output() {
-        let backend = NoopBackend;
-        let statement = parse_statement("UPDATE lix_file SET data = X'01' WHERE id = 'f1'");
-        let mut functions = SystemFunctionProvider;
-
-        let output =
-            rewrite_backend_statement(&backend, statement, &[], None, None, &mut functions, &[])
-                .await
-                .expect("rewrite should succeed")
-                .expect("filesystem update should match rewrite rule");
-
-        assert!(output.statements.is_empty());
-        assert!(output.effect_only);
-        assert!(output.postprocess.is_none());
-    }
-}
+mod tests {}

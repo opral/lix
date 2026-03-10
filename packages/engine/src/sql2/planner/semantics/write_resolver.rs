@@ -937,6 +937,14 @@ async fn resolve_file_insert_target(
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<ResolvedFileInsertTarget, WriteResolveError> {
+    if !payload
+        .keys()
+        .any(|key| !matches!(key.as_str(), "data" | "version_id" | "untracked"))
+    {
+        return Err(WriteResolveError {
+            message: "file insert requires at least one non-data column".to_string(),
+        });
+    }
     let explicit_path = payload_text_required(payload, "path", "sql2 filesystem file insert")?;
     let parsed = parse_file_path(&explicit_path).map_err(write_resolve_backend_error)?;
     let explicit_id = payload.get("id").and_then(text_from_value);
@@ -1198,9 +1206,13 @@ fn payload_binary_value(
     match payload.get(key) {
         None => Ok(None),
         Some(Value::Blob(bytes)) => Ok(Some(bytes.clone())),
-        Some(Value::Text(text)) => Ok(Some(text.as_bytes().to_vec())),
+        Some(Value::Text(_)) => Err(WriteResolveError {
+            message:
+                "data expects bytes; use lix_text_encode('...') for text, X'HEX', or a blob parameter"
+                    .to_string(),
+        }),
         Some(other) => Err(WriteResolveError {
-            message: format!("sql2 filesystem resolver expected blob/text {key}, got {other:?}"),
+            message: format!("sql2 filesystem resolver expected blob {key}, got {other:?}"),
         }),
     }
 }

@@ -35,6 +35,7 @@ use super::super::contracts::requirements::PlanRequirements;
 use super::super::contracts::result_contract::ResultContract;
 use super::super::planning::derive_requirements::derive_plan_requirements;
 use super::super::planning::plan::build_execution_plan;
+use super::super::semantics::state_resolution::canonical::statement_targets_table_name;
 use super::intent::{
     authoritative_pending_file_write_targets, collect_execution_intent_with_backend,
     ExecutionIntent, IntentCollectionPolicy,
@@ -67,7 +68,6 @@ pub(crate) struct CacheTargets {
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
-const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 
 struct Sql2AppendInvariantChecker<'a> {
     planned_write: &'a crate::sql2::planner::ir::PlannedWrite,
@@ -147,6 +147,16 @@ pub(crate) async fn prepare_execution_with_backend(
                     error.description
                 ),
             })?;
+    if let Some(target_name) = filesystem_public_write_target_name(&statements) {
+        if sql2_write.is_none() {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "filesystem public write target '{target_name}' must route through sql2"
+                ),
+            });
+        }
+    }
     let plan_statements = sql2_read
         .as_ref()
         .and_then(|prepared| prepared.lowered_read.as_ref())
@@ -163,19 +173,6 @@ pub(crate) async fn prepare_execution_with_backend(
         &requirements,
         IntentCollectionPolicy {
             skip_side_effect_collection: policy.skip_side_effect_collection,
-            skip_legacy_filesystem_update_side_effect_detection:
-                should_skip_legacy_filesystem_update_side_effect_detection(
-                    derive_result_contract_for_statements(&statements),
-                    sql2_write.as_ref().map(|prepared| {
-                        prepared
-                            .planned_write
-                            .command
-                            .target
-                            .descriptor
-                            .public_name
-                            .as_str()
-                    }),
-                ),
         },
     )
     .await
@@ -293,20 +290,6 @@ fn passthrough_execution_plan_for_sql2_write(
     }
 }
 
-fn should_skip_legacy_filesystem_update_side_effect_detection(
-    result_contract: ResultContract,
-    sql2_write_target_name: Option<&str>,
-) -> bool {
-    matches!(result_contract, ResultContract::DmlNoReturning)
-        && matches!(
-            sql2_write_target_name,
-            Some("lix_file")
-                | Some("lix_file_by_version")
-                | Some("lix_directory")
-                | Some("lix_directory_by_version")
-        )
-}
-
 fn sql2_schema_registrations(sql2_write: &Sql2PreparedWrite) -> Vec<SchemaRegistration> {
     let mut schema_keys = BTreeSet::new();
     if let Some(resolved) = sql2_write.planned_write.resolved_write_plan.as_ref() {
@@ -366,50 +349,60 @@ fn derive_result_contract_for_statements(statements: &[Statement]) -> ResultCont
     }
 }
 
+fn filesystem_public_write_target_name(statements: &[Statement]) -> Option<&'static str> {
+    [
+        "lix_file",
+        "lix_file_by_version",
+        "lix_file_history",
+        "lix_file_history_by_version",
+        "lix_directory",
+        "lix_directory_by_version",
+        "lix_directory_history",
+    ]
+    .into_iter()
+    .find(|target_name| {
+        statements
+            .iter()
+            .any(|statement| statement_targets_table_name(statement, target_name))
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{should_skip_legacy_filesystem_update_side_effect_detection, ResultContract};
+    use super::filesystem_public_write_target_name;
+    use crate::engine::sql::ast::utils::parse_sql_statements;
 
     #[test]
-    fn skips_legacy_filesystem_update_detection_for_sql2_filesystem_writes_without_returning() {
-        for target in [
-            "lix_file",
-            "lix_file_by_version",
-            "lix_directory",
-            "lix_directory_by_version",
-        ] {
-            assert!(
-                should_skip_legacy_filesystem_update_side_effect_detection(
-                    ResultContract::DmlNoReturning,
-                    Some(target),
-                ),
-                "expected sql2 filesystem target {target} to bypass legacy update detection"
-            );
-        }
-    }
+    fn detects_top_level_filesystem_public_write_targets() {
+        let statements = parse_sql_statements(
+            "UPDATE lix_file SET data = X'01' WHERE id = 'f1'; \
+             DELETE FROM some_other_table WHERE id = 'x'",
+        )
+        .expect("parse");
+        assert_eq!(
+            filesystem_public_write_target_name(&statements),
+            Some("lix_file")
+        );
 
-    #[test]
-    fn keeps_legacy_filesystem_update_detection_for_other_shapes() {
-        assert!(!should_skip_legacy_filesystem_update_side_effect_detection(
-            ResultContract::DmlReturning,
-            Some("lix_file"),
-        ));
-        assert!(!should_skip_legacy_filesystem_update_side_effect_detection(
-            ResultContract::DmlNoReturning,
-            Some("lix_file_history"),
-        ));
-        assert!(!should_skip_legacy_filesystem_update_side_effect_detection(
-            ResultContract::DmlNoReturning,
-            Some("lix_state"),
-        ));
-        assert!(!should_skip_legacy_filesystem_update_side_effect_detection(
-            ResultContract::Select,
-            Some("lix_directory"),
-        ));
-        assert!(!should_skip_legacy_filesystem_update_side_effect_detection(
-            ResultContract::DmlNoReturning,
-            None,
-        ));
+        let statements = parse_sql_statements(
+            "INSERT INTO lix_directory_by_version (id, path, lixcol_version_id) VALUES ('d1', '/docs', 'v1')",
+        )
+        .expect("parse");
+        assert_eq!(
+            filesystem_public_write_target_name(&statements),
+            Some("lix_directory_by_version")
+        );
+
+        let statements =
+            parse_sql_statements("DELETE FROM lix_file_history WHERE id = 'f1'").expect("parse");
+        assert_eq!(
+            filesystem_public_write_target_name(&statements),
+            Some("lix_file_history")
+        );
+
+        let statements =
+            parse_sql_statements("SELECT * FROM lix_file WHERE id = 'f1'").expect("parse");
+        assert_eq!(filesystem_public_write_target_name(&statements), None);
     }
 }
 
@@ -682,43 +675,6 @@ fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     let Some(sql2_write) = prepared.sql2_write.as_ref() else {
         return false;
     };
-    let target_name = sql2_write
-        .planned_write
-        .command
-        .target
-        .descriptor
-        .public_name
-        .as_str();
-    let filesystem_schema_set_supported =
-        prepared
-            .intent
-            .detected_file_domain_changes
-            .iter()
-            .all(|change| {
-                matches!(
-                    change.schema_key.as_str(),
-                    DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-                        | FILE_DESCRIPTOR_SCHEMA_KEY
-                        | BINARY_BLOB_REF_SCHEMA_KEY
-                )
-            });
-    let filesystem_directory_side_effects_only =
-        matches!(target_name, "lix_directory" | "lix_directory_by_version")
-            && filesystem_schema_set_supported;
-    let filesystem_file_side_effects_only =
-        matches!(target_name, "lix_file" | "lix_file_by_version")
-            && filesystem_schema_set_supported;
-    let filesystem_surface = matches!(
-        target_name,
-        "lix_file" | "lix_file_by_version" | "lix_directory" | "lix_directory_by_version"
-    );
-    let no_legacy_detected_filesystem_duplicates =
-        filesystem_surface || prepared.intent.detected_file_domain_changes.is_empty();
-    let no_legacy_untracked_filesystem_duplicates = filesystem_surface
-        || prepared
-            .intent
-            .untracked_filesystem_update_domain_changes
-            .is_empty();
     matches!(
         prepared.plan.result_contract,
         ResultContract::DmlNoReturning
@@ -728,10 +684,6 @@ fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     ) && sql2_write.domain_change_batch.is_some()
         && sql2_write.planned_write.commit_preconditions.is_some()
         && live_sql2_operation_supported(sql2_write)
-        && (no_legacy_detected_filesystem_duplicates
-            || filesystem_directory_side_effects_only
-            || filesystem_file_side_effects_only)
-        && no_legacy_untracked_filesystem_duplicates
 }
 
 fn sql2_untracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
@@ -745,12 +697,6 @@ fn sql2_untracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
         .descriptor
         .public_name
         .as_str();
-    let filesystem_surface = matches!(
-        target_name,
-        "lix_file" | "lix_file_by_version" | "lix_directory" | "lix_directory_by_version"
-    );
-    let no_legacy_filesystem_duplicates =
-        filesystem_surface || prepared.intent.detected_file_domain_changes.is_empty();
     matches!(
         prepared.plan.result_contract,
         ResultContract::DmlNoReturning
@@ -765,7 +711,7 @@ fn sql2_untracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
             | "lix_file_by_version"
             | "lix_directory"
             | "lix_directory_by_version"
-    ) && no_legacy_filesystem_duplicates
+    )
 }
 
 fn live_sql2_operation_supported(sql2_write: &Sql2PreparedWrite) -> bool {

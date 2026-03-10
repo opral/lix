@@ -1,4 +1,6 @@
 use crate::commit::load_committed_version_tip_commit_id;
+use crate::engine::sql::semantics::state_resolution::canonical::statement_targets_table_name;
+use crate::errors::file_data_expects_bytes_error;
 use crate::history_timeline::ensure_history_timeline_materialized_for_root;
 use crate::sql2::backend::PushdownDecision;
 use crate::sql2::catalog::{SurfaceFamily, SurfaceRegistry, SurfaceVariant};
@@ -450,13 +452,29 @@ pub(crate) async fn try_prepare_sql2_write(
             requested_version_id: Some(active_version_id.to_string()),
         },
     );
+    let filesystem_target_name =
+        top_level_filesystem_write_target_name(&bound_statement.statement).map(str::to_string);
     let canonicalized = match canonicalize_write(bound_statement.clone(), &registry) {
         Ok(canonicalized) => canonicalized,
-        Err(_) => return Ok(None),
+        Err(error) => match filesystem_target_name.as_deref() {
+            Some(target_name) => {
+                return Err(sql2_filesystem_write_error(target_name, &error.message));
+            }
+            None => return Ok(None),
+        },
     };
     let mut planned_write = match prove_write(&canonicalized) {
         Ok(planned_write) => planned_write,
-        Err(_) => return Ok(None),
+        Err(error) => {
+            if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::Filesystem
+            {
+                return Err(sql2_filesystem_write_error(
+                    &canonicalized.surface_binding.descriptor.public_name,
+                    &error.message,
+                ));
+            }
+            return Ok(None);
+        }
     };
     let resolved_write_plan = match resolve_write_plan(backend, &planned_write).await {
         Ok(resolved_write_plan) => resolved_write_plan,
@@ -468,11 +486,29 @@ pub(crate) async fn try_prepare_sql2_write(
     planned_write.resolved_write_plan = Some(resolved_write_plan.clone());
     let domain_change_batch = match build_domain_change_batch(&planned_write) {
         Ok(domain_change_batch) => domain_change_batch,
-        Err(_) => return Ok(None),
+        Err(error) => {
+            if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::Filesystem
+            {
+                return Err(sql2_filesystem_write_error(
+                    &canonicalized.surface_binding.descriptor.public_name,
+                    &error.message,
+                ));
+            }
+            return Ok(None);
+        }
     };
     let commit_preconditions = match derive_commit_preconditions(backend, &planned_write).await {
         Ok(commit_preconditions) => commit_preconditions,
-        Err(_) => return Ok(None),
+        Err(error) => {
+            if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::Filesystem
+            {
+                return Err(sql2_filesystem_write_error(
+                    &canonicalized.surface_binding.descriptor.public_name,
+                    &error.message,
+                ));
+            }
+            return Ok(None);
+        }
     };
     planned_write.commit_preconditions = commit_preconditions.clone();
     let invariant_trace = Some(build_sql2_invariant_trace(&planned_write));
@@ -526,16 +562,45 @@ fn sql2_authoritative_write_error(
     message: String,
 ) -> Option<LixError> {
     match canonicalized.surface_binding.descriptor.surface_family {
-        SurfaceFamily::Filesystem
-            if message.contains("untracked winner")
-                || message.contains("untracked visible row")
-                || message.contains("untracked visible rows")
-                || message.contains("untracked winners in the cascade") =>
-        {
-            Some(LixError::new("LIX_ERROR_INVALID_INPUT", message))
-        }
+        SurfaceFamily::Filesystem => Some(sql2_filesystem_write_error(
+            &canonicalized.surface_binding.descriptor.public_name,
+            &message,
+        )),
         _ => None,
     }
+}
+
+fn top_level_filesystem_write_target_name(statement: &Statement) -> Option<&'static str> {
+    [
+        "lix_file",
+        "lix_file_by_version",
+        "lix_directory",
+        "lix_directory_by_version",
+        "lix_file_history",
+        "lix_file_history_by_version",
+        "lix_directory_history",
+    ]
+    .into_iter()
+    .find(|target_name| statement_targets_table_name(statement, target_name))
+}
+
+fn sql2_filesystem_write_error(target_name: &str, message: &str) -> LixError {
+    if message.contains("data expects bytes") {
+        return file_data_expects_bytes_error();
+    }
+
+    if message.contains("untracked winner")
+        || message.contains("untracked visible row")
+        || message.contains("untracked visible rows")
+        || message.contains("untracked winners in the cascade")
+    {
+        return LixError::new("LIX_ERROR_INVALID_INPUT", message);
+    }
+
+    LixError::new(
+        "LIX_ERROR_UNKNOWN",
+        &message.replace("surface ''", &format!("surface '{target_name}'")),
+    )
 }
 
 fn sql2_write_phase_trace() -> Vec<String> {
