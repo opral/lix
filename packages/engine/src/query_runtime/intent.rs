@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-use crate::query_runtime::contracts::requirements::PlanRequirements;
 use crate::engine::{CollectedExecutionSideEffects, Engine};
+use crate::query_runtime::contracts::requirements::PlanRequirements;
 use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::Statement;
 

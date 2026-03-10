@@ -1,6 +1,5 @@
-use crate::{LixBackend, LixError, LixTransaction, QueryResult};
-
 use crate::query_runtime::contracts::prepared_statement::PreparedStatement;
+use crate::{LixBackend, LixError, LixTransaction, QueryResult};
 
 pub(crate) async fn execute_prepared_with_backend(
     backend: &dyn LixBackend,

@@ -36,7 +36,7 @@ use crate::query_runtime::contracts::requirements::PlanRequirements;
 use crate::query_runtime::contracts::result_contract::ResultContract;
 use crate::query_runtime::derive_requirements::derive_plan_requirements;
 use crate::query_runtime::plan::build_execution_plan;
-use super::intent::{
+use crate::query_runtime::intent::{
     authoritative_pending_file_write_targets, collect_execution_intent_with_backend,
     ExecutionIntent, IntentCollectionPolicy,
 };

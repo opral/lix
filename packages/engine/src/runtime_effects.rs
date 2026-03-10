@@ -3,8 +3,8 @@ use super::{
     should_run_binary_cas_gc, CollectedExecutionSideEffects, DeferredTransactionSideEffects,
     Engine, TransactionBackendAdapter,
 };
-use crate::engine::sql::execution::execute_prepared::execute_prepared_with_transaction;
 use crate::engine::sql::history::plugin_inputs as history_plugin_inputs;
+use crate::query_runtime::execute_prepared::execute_prepared_with_transaction;
 use crate::query_runtime::preprocess::preprocess_sql_to_plan;
 use crate::engine::sql::storage::queries::{
     filesystem as filesystem_queries, history as history_queries, state as state_queries,
