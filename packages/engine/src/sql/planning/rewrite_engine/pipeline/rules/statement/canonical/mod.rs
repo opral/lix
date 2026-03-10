@@ -1,21 +1,21 @@
 use std::collections::VecDeque;
 
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Delete, Statement, Update};
 
+use crate::cel::CelEvaluator;
+use crate::engine::sql::planning::rewrite_engine::entity_views::write as entity_view_write;
+use crate::engine::sql::planning::rewrite_engine::steps::lix_active_account_view_write;
+use crate::engine::sql::planning::rewrite_engine::steps::lix_active_version_view_write;
 use crate::engine::sql::planning::rewrite_engine::steps::lix_change_view_write;
+use crate::engine::sql::planning::rewrite_engine::steps::lix_state_by_version_view_write;
 use crate::engine::sql::planning::rewrite_engine::steps::lix_state_history_view_write;
-use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
-use crate::functions::LixFunctionProvider;
+use crate::engine::sql::planning::rewrite_engine::steps::lix_state_view_write;
+use crate::engine::sql::planning::rewrite_engine::steps::lix_version_view_write;
+use crate::engine::sql::planning::rewrite_engine::steps::stored_schema;
+use crate::engine::sql::planning::rewrite_engine::steps::vtable_write;
+use crate::engine::sql::planning::rewrite_engine::types::{PostprocessPlan, RewriteOutput};
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::{LixBackend, LixError, Value};
-
-pub(crate) mod entity_view_write;
-pub(crate) mod lix_active_account_write;
-pub(crate) mod lix_active_version_write;
-pub(crate) mod lix_state_by_version_write;
-pub(crate) mod lix_state_write;
-pub(crate) mod lix_version_write;
-pub(crate) mod stored_schema_write;
-pub(crate) mod vtable_write;
 
 use super::context::StatementContext;
 use super::helpers::{
@@ -24,6 +24,113 @@ use super::helpers::{
 use super::outcome::StatementRuleOutcome;
 
 const MAX_REWRITE_PASSES: usize = 32;
+
+fn rewrite_vtable_update_output(
+    update: Update,
+    rewritten: Option<vtable_write::UpdateRewrite>,
+) -> Result<RewriteOutput, LixError> {
+    match rewritten {
+        Some(vtable_write::UpdateRewrite::Statement(rewrite)) => Ok(RewriteOutput {
+            statements: vec![rewrite.statement],
+            effect_only: false,
+            params: Vec::new(),
+            registrations: Vec::new(),
+            postprocess: None,
+            mutations: Vec::new(),
+            update_validations: rewrite.validation.into_iter().collect(),
+        }),
+        Some(vtable_write::UpdateRewrite::Planned(rewrite)) => {
+            let mut statements = rewrite.pre_statements;
+            statements.push(rewrite.statement);
+            Ok(RewriteOutput {
+                statements,
+                effect_only: false,
+                params: Vec::new(),
+                registrations: Vec::new(),
+                postprocess: Some(PostprocessPlan::VtableUpdate(rewrite.plan)),
+                mutations: Vec::new(),
+                update_validations: rewrite.validations,
+            })
+        }
+        None => {
+            let target = update_target_name(&update);
+            if is_allowed_internal_write_target(&target) {
+                Ok(RewriteOutput {
+                    statements: vec![Statement::Update(update)],
+                    effect_only: false,
+                    params: Vec::new(),
+                    registrations: Vec::new(),
+                    postprocess: None,
+                    mutations: Vec::new(),
+                    update_validations: Vec::new(),
+                })
+            } else {
+                Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
+                        "strict rewrite violation: statement routing: unsupported UPDATE target '{}'",
+                        target
+                    ),
+                })
+            }
+        }
+    }
+}
+
+fn rewrite_vtable_delete_output(
+    delete: Delete,
+    effective_scope_fallback: bool,
+    params: &[Value],
+) -> Result<RewriteOutput, LixError> {
+    let rewritten = if effective_scope_fallback {
+        vtable_write::rewrite_delete_with_options(delete.clone(), true, params)?
+    } else {
+        vtable_write::rewrite_delete(delete.clone(), params)?
+    };
+
+    match rewritten {
+        Some(vtable_write::DeleteRewrite::Statement(statement)) => Ok(RewriteOutput {
+            statements: vec![statement],
+            effect_only: false,
+            params: Vec::new(),
+            registrations: Vec::new(),
+            postprocess: None,
+            mutations: Vec::new(),
+            update_validations: Vec::new(),
+        }),
+        Some(vtable_write::DeleteRewrite::Planned(rewrite)) => Ok(RewriteOutput {
+            statements: vec![rewrite.statement],
+            effect_only: false,
+            params: Vec::new(),
+            registrations: Vec::new(),
+            postprocess: Some(PostprocessPlan::VtableDelete(rewrite.plan)),
+            mutations: Vec::new(),
+            update_validations: Vec::new(),
+        }),
+        None => {
+            let target = delete_target_name(&delete);
+            if is_allowed_internal_write_target(&target) {
+                Ok(RewriteOutput {
+                    statements: vec![Statement::Delete(delete)],
+                    effect_only: false,
+                    params: Vec::new(),
+                    registrations: Vec::new(),
+                    postprocess: None,
+                    mutations: Vec::new(),
+                    update_validations: Vec::new(),
+                })
+            } else {
+                Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
+                        "strict rewrite violation: statement routing: unsupported DELETE target '{}'",
+                        target
+                    ),
+                })
+            }
+        }
+    }
+}
 
 pub(crate) fn rewrite_sync_statement<P: LixFunctionProvider>(
     statement: Statement,
@@ -131,7 +238,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 lix_state_history_view_write::reject_insert(&insert)?;
 
                 if let Some(version_inserts) =
-                    lix_version_write::rewrite_insert(insert.clone(), context.params)?
+                    lix_version_view_write::rewrite_insert(insert.clone(), context.params)?
                 {
                     let output = rewrite_vtable_inserts(
                         version_inserts,
@@ -142,7 +249,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                     return Ok(StatementRuleOutcome::Emit(output));
                 }
                 if let Some(active_account_inserts) =
-                    lix_active_account_write::rewrite_insert(insert.clone(), context.params)?
+                    lix_active_account_view_write::rewrite_insert(insert.clone(), context.params)?
                 {
                     let output = rewrite_vtable_inserts(
                         active_account_inserts,
@@ -162,12 +269,12 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 let mut current_insert = insert;
                 let mut supplemental_statements = Vec::new();
                 if let Some(rewritten) =
-                    lix_state_by_version_write::rewrite_insert(current_insert.clone())?
+                    lix_state_by_version_view_write::rewrite_insert(current_insert.clone())?
                 {
                     current_insert = rewritten;
                 }
                 if let Some(rewritten) =
-                    stored_schema_write::rewrite_insert(current_insert.clone(), context.params)?
+                    stored_schema::rewrite_insert(current_insert.clone(), context.params)?
                 {
                     context.registrations.push(rewritten.registration);
                     context.mutations.push(rewritten.mutation);
@@ -221,14 +328,17 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 }
 
                 let update = if let Some(rewritten) =
-                    lix_state_by_version_write::rewrite_update(update.clone())?
+                    lix_state_by_version_view_write::rewrite_update(update.clone())?
                 {
                     rewritten
                 } else {
                     update
                 };
 
-                let output = vtable_write::rewrite_update(update, context.params)?;
+                let output = rewrite_vtable_update_output(
+                    update.clone(),
+                    vtable_write::rewrite_update(update, context.params)?,
+                )?;
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             Statement::Delete(delete) => {
@@ -242,7 +352,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
 
                 let mut effective_scope_fallback = false;
                 let delete = if let Some(rewritten) =
-                    lix_state_by_version_write::rewrite_delete(delete.clone())?
+                    lix_state_by_version_view_write::rewrite_delete(delete.clone())?
                 {
                     effective_scope_fallback = true;
                     rewritten
@@ -251,7 +361,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 };
 
                 let output =
-                    vtable_write::rewrite_delete(delete, effective_scope_fallback, context.params)?;
+                    rewrite_vtable_delete_output(delete, effective_scope_fallback, context.params)?;
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             other => {
@@ -301,7 +411,7 @@ where
                 lix_change_view_write::reject_insert(&insert)?;
                 lix_state_history_view_write::reject_insert(&insert)?;
 
-                if let Some(version_rewrite) = lix_version_write::rewrite_insert_with_backend(
+                if let Some(version_rewrite) = lix_version_view_write::rewrite_insert_with_backend(
                     backend,
                     insert.clone(),
                     context.params,
@@ -323,7 +433,7 @@ where
                 }
 
                 if let Some(active_account_inserts) =
-                    lix_active_account_write::rewrite_insert(insert.clone(), context.params)?
+                    lix_active_account_view_write::rewrite_insert(insert.clone(), context.params)?
                 {
                     let output = rewrite_vtable_inserts_with_backend(
                         backend,
@@ -336,14 +446,14 @@ where
                     return Ok(StatementRuleOutcome::Emit(output));
                 }
 
-                let insert = if let Some(rewritten) =
-                    entity_view_write::rewrite_insert_with_backend(
-                        backend,
-                        insert.clone(),
-                        context.params,
-                        functions,
-                    )
-                    .await?
+                let insert = if let Some(rewritten) = entity_view_write::rewrite_insert_with_backend(
+                    backend,
+                    insert.clone(),
+                    context.params,
+                    &CelEvaluator::new(),
+                    SharedFunctionProvider::new(functions.clone()),
+                )
+                .await?
                 {
                     rewritten
                 } else {
@@ -352,20 +462,20 @@ where
 
                 let mut current_insert = insert;
                 if let Some(rewritten) =
-                    lix_state_write::rewrite_insert_with_backend(backend, current_insert.clone())
+                    lix_state_view_write::rewrite_insert_with_backend(backend, current_insert.clone())
                         .await?
                 {
                     current_insert = rewritten;
                 }
                 if let Some(rewritten) =
-                    lix_state_by_version_write::rewrite_insert(current_insert.clone())?
+                    lix_state_by_version_view_write::rewrite_insert(current_insert.clone())?
                 {
                     current_insert = rewritten;
                 }
 
                 let mut supplemental_statements = Vec::new();
                 if let Some(rewritten) =
-                    stored_schema_write::rewrite_insert(current_insert.clone(), context.params)?
+                    stored_schema::rewrite_insert(current_insert.clone(), context.params)?
                 {
                     context.registrations.push(rewritten.registration);
                     context.mutations.push(rewritten.mutation);
@@ -437,7 +547,7 @@ where
                 };
 
                 if let Some(active_version_inserts) =
-                    lix_active_version_write::rewrite_update_with_backend(
+                    lix_active_version_view_write::rewrite_update_with_backend(
                         backend,
                         update.clone(),
                         context.params,
@@ -455,7 +565,7 @@ where
                     return Ok(StatementRuleOutcome::Emit(output));
                 }
 
-                if let Some(rewritten) = lix_state_write::rewrite_update_with_backend(
+                if let Some(rewritten) = lix_state_view_write::rewrite_update_with_backend(
                     backend,
                     update.clone(),
                     context.params,
@@ -466,13 +576,13 @@ where
                     continue;
                 }
 
-                if let Some(rewritten) = lix_state_by_version_write::rewrite_update(update.clone())?
+                if let Some(rewritten) = lix_state_by_version_view_write::rewrite_update(update.clone())?
                 {
                     current = Statement::Update(rewritten);
                     continue;
                 }
 
-                if let Some(version_rewrite) = lix_version_write::rewrite_update_with_backend(
+                if let Some(version_rewrite) = lix_version_view_write::rewrite_update_with_backend(
                     backend,
                     update.clone(),
                     context.params,
@@ -493,7 +603,10 @@ where
                     return Ok(StatementRuleOutcome::Emit(output));
                 }
 
-                let output = vtable_write::rewrite_update(update, context.params)?;
+                let output = rewrite_vtable_update_output(
+                    update.clone(),
+                    vtable_write::rewrite_update(update, context.params)?,
+                )?;
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             Statement::Delete(delete) => {
@@ -510,7 +623,7 @@ where
                 };
 
                 let delete = if let Some(rewritten) =
-                    lix_state_write::rewrite_delete_with_backend(backend, delete.clone()).await?
+                    lix_state_view_write::rewrite_delete_with_backend(backend, delete.clone()).await?
                 {
                     rewritten
                 } else {
@@ -518,7 +631,7 @@ where
                 };
 
                 let delete = if let Some(rewritten) =
-                    lix_state_by_version_write::rewrite_delete(delete.clone())?
+                    lix_state_by_version_view_write::rewrite_delete(delete.clone())?
                 {
                     effective_scope_fallback = true;
                     rewritten
@@ -526,7 +639,7 @@ where
                     delete
                 };
 
-                if let Some(rewritten) = lix_active_account_write::rewrite_delete_with_backend(
+                if let Some(rewritten) = lix_active_account_view_write::rewrite_delete_with_backend(
                     backend,
                     delete.clone(),
                     context.params,
@@ -537,7 +650,7 @@ where
                     continue;
                 }
 
-                if let Some(version_rewrite) = lix_version_write::rewrite_delete_with_backend(
+                if let Some(version_rewrite) = lix_version_view_write::rewrite_delete_with_backend(
                     backend,
                     delete.clone(),
                     context.params,
@@ -559,7 +672,7 @@ where
                 }
 
                 let output =
-                    vtable_write::rewrite_delete(delete, effective_scope_fallback, context.params)?;
+                    rewrite_vtable_delete_output(delete, effective_scope_fallback, context.params)?;
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             other => {
@@ -584,6 +697,27 @@ fn insert_target_name(insert: &sqlparser::ast::Insert) -> String {
         sqlparser::ast::TableObject::TableName(name) => name.to_string(),
         _ => "<non-table-target>".to_string(),
     }
+}
+
+fn update_target_name(update: &Update) -> String {
+    match &update.table.relation {
+        sqlparser::ast::TableFactor::Table { name, .. } => name.to_string(),
+        _ => "<non-table-target>".to_string(),
+    }
+}
+
+fn delete_target_name(delete: &Delete) -> String {
+    let tables = match &delete.from {
+        sqlparser::ast::FromTable::WithFromKeyword(tables)
+        | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+    };
+    tables
+        .first()
+        .map(|table| match &table.relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => name.to_string(),
+            _ => "<non-table-target>".to_string(),
+        })
+        .unwrap_or_else(|| "<missing-target>".to_string())
 }
 
 fn is_allowed_internal_write_target(target: &str) -> bool {
