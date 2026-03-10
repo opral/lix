@@ -11,7 +11,7 @@ use crate::engine::sql::planning::param_context::{
     expr_last_identifier_eq, extract_string_column_values_from_expr, normalize_query_placeholders,
     PlaceholderOrdinalState,
 };
-use crate::engine::sql::planning::internal_vtable::{object_name_matches, quote_ident};
+use crate::internal_state::{object_name_matches, quote_ident};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{errors, LixBackend, LixError, Value as LixValue};
 

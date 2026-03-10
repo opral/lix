@@ -4,7 +4,7 @@ use serde_json::Value as JsonValue;
 
 use crate::{LixError, Value};
 
-use super::postprocess_actions::PostprocessPlan;
+use crate::internal_state::PostprocessPlan;
 use super::prepared_statement::PreparedStatement;
 use sqlparser::ast::Expr;
 

@@ -256,9 +256,7 @@ fn guardrail_filesystem_public_surfaces_do_not_enter_legacy_query_rewrite() {
 fn guardrail_legacy_filesystem_step_wrapper_is_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !root
-            .join("src/sql/planning/internal_vtable/filesystem_step.rs")
-            .exists(),
+        !root.join("src/sql/planning/internal_vtable").exists(),
         "legacy filesystem step wrapper must stay removed"
     );
 }
@@ -266,9 +264,8 @@ fn guardrail_legacy_filesystem_step_wrapper_is_removed() {
 #[test]
 fn guardrail_vtable_read_stays_filesystem_blind() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let vtable_read_source =
-        fs::read_to_string(root.join("src/sql/planning/internal_vtable/vtable_read.rs"))
-            .expect("vtable_read.rs should be readable");
+    let vtable_read_source = fs::read_to_string(root.join("src/internal_state/vtable_read.rs"))
+        .expect("vtable_read.rs should be readable");
 
     for forbidden in ["lix_file", "lix_directory", "filesystem::"] {
         assert!(
@@ -298,9 +295,7 @@ fn guardrail_legacy_filesystem_select_rewrite_is_removed() {
 fn guardrail_dead_rewrite_engine_filesystem_coalescer_stays_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !root
-            .join("src/sql/planning/internal_vtable/rewrite.rs")
-            .exists(),
+        !root.join("src/internal_state/rewrite.rs").exists(),
         "dead rewrite_engine filesystem coalescer must stay removed"
     );
 }
@@ -309,9 +304,7 @@ fn guardrail_dead_rewrite_engine_filesystem_coalescer_stays_removed() {
 fn guardrail_dead_rewrite_engine_filesystem_analysis_stays_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !root
-            .join("src/sql/planning/internal_vtable/analysis.rs")
-            .exists(),
+        !root.join("src/internal_state/analysis.rs").exists(),
         "dead rewrite_engine filesystem analysis helper must stay removed"
     );
 }
@@ -320,7 +313,7 @@ fn guardrail_dead_rewrite_engine_filesystem_analysis_stays_removed() {
 fn guardrail_dead_canonical_filesystem_write_wrapper_stays_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !root.join("src/sql/planning/internal_vtable/filesystem_write.rs").exists(),
+        !root.join("src/internal_state/filesystem_write.rs").exists(),
         "dead canonical filesystem write wrapper must stay removed"
     );
 }
@@ -328,10 +321,9 @@ fn guardrail_dead_canonical_filesystem_write_wrapper_stays_removed() {
 #[test]
 fn guardrail_legacy_canonical_statement_rewrite_is_filesystem_blind() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let canonical_mod_source = fs::read_to_string(
-        root.join("src/sql/planning/internal_vtable/canonical_write.rs"),
-    )
-    .expect("canonical_write.rs should be readable");
+    let canonical_mod_source =
+        fs::read_to_string(root.join("src/internal_state/canonical_write.rs"))
+            .expect("canonical_write.rs should be readable");
 
     for forbidden in [
         "mutation_rewrite::rewrite_insert(",

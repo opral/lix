@@ -3,7 +3,6 @@ pub(crate) mod dependency_spec;
 pub(crate) mod derive_effects;
 pub(crate) mod derive_requirements;
 pub(crate) mod inline_functions;
-pub(crate) mod internal_vtable;
 pub(crate) mod invariants;
 pub(crate) mod lower_sql;
 pub(crate) mod materialize;

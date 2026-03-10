@@ -4,9 +4,9 @@ use sqlparser::ast::{
     Delete, FromTable, Insert, Statement, TableFactor, TableObject, TableWithJoins, Update,
 };
 
-use crate::engine::sql::planning::internal_vtable::object_name_matches;
-use crate::engine::sql::planning::internal_vtable::{stored_schema, vtable_write};
-use crate::engine::sql::planning::internal_vtable::{PostprocessPlan, RewriteOutput};
+use crate::internal_state::object_name_matches;
+use crate::internal_state::{stored_schema, vtable_write};
+use crate::internal_state::{PostprocessPlan, RewriteOutput};
 use crate::functions::LixFunctionProvider;
 use crate::errors;
 use crate::{LixBackend, LixError, Value};
@@ -21,11 +21,11 @@ struct StatementContext<'a> {
     writer_key: Option<&'a str>,
     backend: Option<&'a dyn LixBackend>,
     side_effects: Vec<Statement>,
-    registrations: Vec<crate::engine::sql::planning::internal_vtable::SchemaRegistration>,
+    registrations: Vec<crate::internal_state::SchemaRegistration>,
     generated_params: Vec<Value>,
-    mutations: Vec<crate::engine::sql::planning::internal_vtable::MutationRow>,
-    update_validations: Vec<crate::engine::sql::planning::internal_vtable::UpdateValidationPlan>,
-    postprocess: Option<crate::engine::sql::planning::internal_vtable::PostprocessPlan>,
+    mutations: Vec<crate::internal_state::MutationRow>,
+    update_validations: Vec<crate::internal_state::UpdateValidationPlan>,
+    postprocess: Option<crate::internal_state::PostprocessPlan>,
 }
 
 impl<'a> StatementContext<'a> {

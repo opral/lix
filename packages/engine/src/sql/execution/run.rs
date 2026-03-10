@@ -13,13 +13,13 @@ use crate::{Engine, LixError, LixTransaction, QueryResult};
 use super::super::contracts::effects::PlanEffects;
 use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::executor_error::ExecutorError;
-use super::super::contracts::postprocess_actions::PostprocessPlan;
+use crate::internal_state::followup::{
+    build_delete_followup_statements, build_update_followup_statements,
+};
+use crate::internal_state::PostprocessPlan;
 use super::super::contracts::result_contract::ResultContract;
 use super::super::planning::lower_sql::lower_to_prepared_statements;
 use super::execute_prepared::{execute_prepared_with_backend, execute_prepared_with_transaction};
-use super::internal_vtable_followup::{
-    build_delete_followup_statements, build_update_followup_statements,
-};
 
 pub(crate) struct SqlExecutionOutcome {
     pub(crate) public_result: QueryResult,
