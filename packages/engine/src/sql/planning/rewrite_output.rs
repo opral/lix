@@ -1,7 +1,7 @@
 use super::super::contracts::planned_statement::{
     MutationRow, SchemaRegistration, UpdateValidationPlan,
 };
-use super::super::contracts::postprocess_actions::PostprocessPlan;
+use crate::internal_state::PostprocessPlan;
 use crate::Value;
 use sqlparser::ast::Statement;
 

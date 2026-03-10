@@ -12,16 +12,16 @@ use crate::version::{
 };
 use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value as EngineValue};
 
-use super::super::ast::lowering::lower_statement;
-use super::super::ast::utils::{bind_sql_with_state, PlaceholderState};
-use super::super::contracts::postprocess_actions::{VtableDeletePlan, VtableUpdatePlan};
-use super::super::contracts::prepared_statement::PreparedStatement;
-use super::super::history::commit_runtime::{
+use crate::engine::sql::ast::lowering::lower_statement;
+use crate::engine::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
+use crate::internal_state::{VtableDeletePlan, VtableUpdatePlan};
+use crate::engine::sql::contracts::prepared_statement::PreparedStatement;
+use crate::engine::sql::history::commit_runtime::{
     bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
     load_commit_active_accounts, load_version_info_for_versions, CommitQueryExecutor,
     StatementBatch,
 };
-use super::super::storage::sql_text::escape_sql_string;
+use crate::engine::sql::storage::sql_text::escape_sql_string;
 
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
 const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";

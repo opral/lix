@@ -1,5 +1,5 @@
 use super::super::contracts::execution_plan::ExecutionPlan;
-use super::super::contracts::postprocess_actions::PostprocessPlan;
+use crate::internal_state::PostprocessPlan;
 use super::super::contracts::planner_error::PlannerError;
 use super::super::contracts::result_contract::ResultContract;
 use crate::LixError;
@@ -81,10 +81,10 @@ fn allows_effect_only_execution(plan: &ExecutionPlan) -> bool {
 }
 
 fn requires_single_statement_postprocess(
-    plan: Option<&crate::engine::sql::contracts::postprocess_actions::PostprocessPlan>,
+    plan: Option<&crate::internal_state::PostprocessPlan>,
 ) -> bool {
     matches!(
         plan,
-        Some(crate::engine::sql::contracts::postprocess_actions::PostprocessPlan::VtableDelete(_))
+        Some(crate::internal_state::PostprocessPlan::VtableDelete(_))
     )
 }

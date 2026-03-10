@@ -3,6 +3,8 @@ pub(crate) mod vtable_read;
 pub(crate) mod vtable_write;
 #[path = "canonical_write.rs"]
 mod canonical;
+pub(crate) mod followup;
+pub(crate) mod postprocess;
 
 use crate::functions::LixFunctionProvider;
 use crate::engine::sql::contracts::planned_statement::PlannedStatementSet;
@@ -22,14 +24,9 @@ pub(crate) type MutationOperation =
 pub(crate) type MutationRow = crate::engine::sql::contracts::planned_statement::MutationRow;
 pub(crate) type UpdateValidationPlan =
     crate::engine::sql::contracts::planned_statement::UpdateValidationPlan;
-pub(crate) type PostprocessPlan =
-    crate::engine::sql::contracts::postprocess_actions::PostprocessPlan;
-pub(crate) type VtableDeletePlan =
-    crate::engine::sql::contracts::postprocess_actions::VtableDeletePlan;
-pub(crate) type VtableUpdatePlan =
-    crate::engine::sql::contracts::postprocess_actions::VtableUpdatePlan;
 pub(crate) type PreparedStatement =
     crate::engine::sql::contracts::prepared_statement::PreparedStatement;
+pub(crate) use postprocess::{PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RewriteOutput {

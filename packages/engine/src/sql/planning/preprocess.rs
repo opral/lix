@@ -22,13 +22,13 @@ use super::super::ast::utils::parse_sql_statements;
 use super::super::contracts::planned_statement::{
     MutationRow, PlannedStatementSet, SchemaRegistration, UpdateValidationPlan,
 };
-use super::super::contracts::postprocess_actions::PostprocessPlan;
+use crate::internal_state::PostprocessPlan;
 use super::super::contracts::prepared_statement::PreparedStatement;
 use super::bind_once::{bind_statements_with_appended_params_once, StatementWithAppendedParams};
 use super::inline_functions::inline_lix_functions_with_provider;
 use super::materialize::materialize_vtable_insert_select_sources;
 use super::param_context::normalize_statement_placeholders_in_batch;
-use super::internal_vtable::{
+use crate::internal_state::{
     rewrite_statement, rewrite_statement_with_backend, vtable_read, RewriteOutput,
 };
 use super::rewrite_output::StatementRewriteOutput;
@@ -577,7 +577,7 @@ fn render_statements_with_params(
     Ok((normalized_sql, prepared_statements))
 }
 
-fn from_rewrite_output(output: super::internal_vtable::RewriteOutput) -> StatementRewriteOutput {
+fn from_rewrite_output(output: crate::internal_state::RewriteOutput) -> StatementRewriteOutput {
     StatementRewriteOutput {
         statements: output.statements,
         params: output.params,
