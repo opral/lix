@@ -5,10 +5,13 @@ use std::string::String;
 #[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(test)]
 use sqlparser::ast::Statement;
 #[cfg(test)]
 use sqlparser::ast::{Expr, Insert, Query, SetExpr, Value as SqlAstValue};
+#[cfg(test)]
 use sqlparser::dialect::GenericDialect;
+#[cfg(test)]
 use sqlparser::parser::Parser;
 
 #[cfg(test)]
@@ -31,6 +34,7 @@ use crate::engine::sql::planning::rewrite_engine::{
 };
 #[cfg(test)]
 use crate::functions::{LixFunctionProvider, SystemFunctionProvider};
+#[cfg(test)]
 use crate::LixError;
 #[cfg(test)]
 use crate::Value;
