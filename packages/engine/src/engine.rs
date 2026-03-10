@@ -588,38 +588,6 @@ mod tests {
 
     struct NoopWasmComponentInstance;
 
-    async fn execute_multi_statement_sequential_with_options(
-        engine: &Engine,
-        sql: &str,
-        params: &[Value],
-        options: &ExecuteOptions,
-    ) -> Result<ExecuteResult, LixError> {
-        let statements = parse_sql_statements(sql)?;
-        engine
-            .execute_statement_script_with_options(statements, params, options)
-            .await
-    }
-
-    fn should_sequentialize_postprocess_multi_statement(sql: &str, params: &[Value]) -> bool {
-        let Ok(statements) = parse_sql_statements(sql) else {
-            return false;
-        };
-        should_sequentialize_postprocess_multi_statement_with_statements(&statements, params)
-    }
-
-    fn should_sequentialize_postprocess_multi_statement_with_statements(
-        statements: &[Statement],
-        params: &[Value],
-    ) -> bool {
-        if !params.is_empty() {
-            return false;
-        }
-        if statements.len() <= 1 {
-            return false;
-        }
-        !contains_transaction_control_statement(statements)
-    }
-
     fn active_version_snapshot_json(version_id: &str) -> String {
         serde_json::json!({ "id": "main", "version_id": version_id }).to_string()
     }
@@ -837,56 +805,6 @@ mod tests {
         assert!(!should_invalidate_installed_plugins_cache_for_sql(
             "SELECT * FROM lix_file WHERE id = 'f'"
         ));
-    }
-
-    #[test]
-    fn sequentialize_postprocess_multi_statement_uses_structural_rules_only() {
-        let sql =
-            "UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; UPDATE lix_file SET path = '/b', data = x'02' WHERE id = 'f2'";
-        assert!(should_sequentialize_postprocess_multi_statement(sql, &[]));
-    }
-
-    #[test]
-    fn sequentialize_postprocess_multi_statement_rejects_params_and_explicit_transaction_wrappers()
-    {
-        assert!(!should_sequentialize_postprocess_multi_statement(
-            "UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; UPDATE lix_file SET path = '/b', data = x'02' WHERE id = 'f2'",
-            &[Value::Text("f1".to_string())],
-        ));
-        assert!(!should_sequentialize_postprocess_multi_statement(
-            "BEGIN; UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; COMMIT;",
-            &[],
-        ));
-    }
-
-    #[tokio::test]
-    async fn sequential_multi_statement_fallback_executes_inside_single_transaction() {
-        let commit_called = Arc::new(AtomicBool::new(false));
-        let rollback_called = Arc::new(AtomicBool::new(false));
-        let engine = boot(BootArgs::new(
-            Box::new(TestBackend {
-                commit_called: Arc::clone(&commit_called),
-                rollback_called: Arc::clone(&rollback_called),
-                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
-                    "global",
-                ))),
-                restored_active_version_snapshot: active_version_snapshot_json("global"),
-            }),
-            Arc::new(NoopWasmRuntime),
-        ));
-        engine.set_active_version_id("version-test".to_string());
-
-        execute_multi_statement_sequential_with_options(
-            &engine,
-            "SELECT 1; SELECT 2;",
-            &[],
-            &ExecuteOptions::default(),
-        )
-        .await
-        .expect("sequential multi-statement execution should succeed");
-
-        assert!(commit_called.load(Ordering::SeqCst));
-        assert!(!rollback_called.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

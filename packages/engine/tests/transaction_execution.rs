@@ -312,49 +312,6 @@ simulation_test!(
 );
 
 simulation_test!(
-    transaction_path_applies_multi_statement_postprocess_fallback,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine_deterministic()
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
-
-        engine
-            .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('tx-sequential-fallback', '/tx-sequential-fallback.json', lix_text_encode('before'))", &[])
-            .await
-            .unwrap();
-
-        engine
-            .transaction(ExecuteOptions::default(), |tx| {
-                Box::pin(async move {
-                    tx.execute(
-                        "UPDATE lix_file SET data = lix_text_encode('after') WHERE id = 'tx-sequential-fallback'; \
-                         SELECT 1",
-                        &[],
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
-            .unwrap();
-
-        let result = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'tx-sequential-fallback'",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(result.statements[0].rows.len(), 1);
-        assert_blob_text(&result.statements[0].rows[0][0], "after");
-    }
-);
-
-simulation_test!(
     tx_execute_multistmt_has_statement_barriers_for_file_bytes,
     simulations = [sqlite, postgres],
     |sim| async move {

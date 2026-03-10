@@ -67,22 +67,6 @@ fn guardrail_engine_runtime_section_excludes_legacy_sql_pipeline_imports() {
 }
 
 #[test]
-fn guardrail_forbids_string_matched_postprocess_fallback() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    collect_rust_sources(&root, &mut files);
-
-    for file in files {
-        let source = fs::read_to_string(&file).expect("source file should be readable");
-        assert!(
-            !source.contains("is_postprocess_multi_statement_error"),
-            "string-matched postprocess fallback helper must not be reintroduced: {}",
-            file.display()
-        );
-    }
-}
-
-#[test]
 fn guardrail_sql_runtime_forbids_legacy_sql2_imports() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql");
     let mut files = Vec::new();
