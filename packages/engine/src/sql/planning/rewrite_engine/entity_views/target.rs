@@ -1,5 +1,3 @@
-use std::collections::{BTreeSet, HashMap};
-
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectName, ObjectNamePart};
@@ -110,70 +108,6 @@ pub(crate) async fn resolve_target_from_view_name_with_backend(
     };
 
     build_target_from_schema(view_name, &schema_key, variant, &schema)
-}
-
-pub(crate) async fn resolve_targets_with_backend(
-    backend: &dyn LixBackend,
-    view_names: &[String],
-) -> Result<HashMap<String, EntityViewTarget>, LixError> {
-    let mut out = HashMap::new();
-    let unique = view_names
-        .iter()
-        .map(|name| name.to_ascii_lowercase())
-        .collect::<BTreeSet<_>>();
-    for name in unique {
-        if let Some(target) = resolve_target_from_view_name_with_backend(backend, &name).await? {
-            out.insert(name, target);
-        }
-    }
-    Ok(out)
-}
-
-pub(crate) fn projected_lixcol_aliases_for_variant(
-    variant: EntityViewVariant,
-) -> &'static [(&'static str, &'static str)] {
-    match variant {
-        EntityViewVariant::Base => &[
-            ("entity_id", "lixcol_entity_id"),
-            ("schema_key", "lixcol_schema_key"),
-            ("file_id", "lixcol_file_id"),
-            ("plugin_key", "lixcol_plugin_key"),
-            ("schema_version", "lixcol_schema_version"),
-            ("created_at", "lixcol_created_at"),
-            ("updated_at", "lixcol_updated_at"),
-            ("global", "lixcol_global"),
-            ("change_id", "lixcol_change_id"),
-            ("untracked", "lixcol_untracked"),
-            ("metadata", "lixcol_metadata"),
-        ],
-        EntityViewVariant::ByVersion => &[
-            ("entity_id", "lixcol_entity_id"),
-            ("schema_key", "lixcol_schema_key"),
-            ("file_id", "lixcol_file_id"),
-            ("version_id", "lixcol_version_id"),
-            ("plugin_key", "lixcol_plugin_key"),
-            ("schema_version", "lixcol_schema_version"),
-            ("created_at", "lixcol_created_at"),
-            ("updated_at", "lixcol_updated_at"),
-            ("global", "lixcol_global"),
-            ("change_id", "lixcol_change_id"),
-            ("untracked", "lixcol_untracked"),
-            ("metadata", "lixcol_metadata"),
-        ],
-        EntityViewVariant::History => &[
-            ("entity_id", "lixcol_entity_id"),
-            ("schema_key", "lixcol_schema_key"),
-            ("file_id", "lixcol_file_id"),
-            ("version_id", "lixcol_version_id"),
-            ("plugin_key", "lixcol_plugin_key"),
-            ("schema_version", "lixcol_schema_version"),
-            ("change_id", "lixcol_change_id"),
-            ("metadata", "lixcol_metadata"),
-            ("commit_id", "lixcol_commit_id"),
-            ("root_commit_id", "lixcol_root_commit_id"),
-            ("depth", "lixcol_depth"),
-        ],
-    }
 }
 
 fn build_target_from_schema(

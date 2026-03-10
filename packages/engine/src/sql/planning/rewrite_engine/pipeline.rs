@@ -52,6 +52,7 @@ struct RewrittenStatementBinding {
     appended_params: Arc<Vec<Value>>,
 }
 
+#[cfg(test)]
 pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
     let dialect = GenericDialect {};
     Parser::parse_sql(&dialect, sql).map_err(|err| LixError {

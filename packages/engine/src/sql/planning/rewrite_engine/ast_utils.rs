@@ -1,7 +1,7 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Ident, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement, TableAlias, TableFactor,
+    Ident, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement, TableFactor,
 };
 use sqlparser::ast::{Visit, VisitMut, Visitor, VisitorMut};
 use sqlparser::dialect::GenericDialect;
@@ -18,14 +18,6 @@ pub(crate) fn object_name_matches(name: &ObjectName, target: &str) -> bool {
         .and_then(ObjectNamePart::as_ident)
         .map(|ident| ident.value.eq_ignore_ascii_case(target))
         .unwrap_or(false)
-}
-
-pub(crate) fn default_alias(name: &str) -> TableAlias {
-    TableAlias {
-        explicit: false,
-        name: Ident::new(name),
-        columns: Vec::new(),
-    }
 }
 
 pub(crate) fn parse_single_query(sql: &str) -> Result<Query, LixError> {
@@ -100,25 +92,6 @@ pub(crate) fn visit_query_selects(
     Ok(())
 }
 
-// Compatibility wrapper for existing rewrite steps.
-pub(crate) fn rewrite_query_with_select_rewriter(
-    query: Query,
-    rewrite_select: &mut dyn FnMut(&mut Select, &mut bool) -> Result<(), LixError>,
-) -> Result<Option<Query>, LixError> {
-    let mut query = query;
-    normalize_query_placeholders(&mut query, &mut PlaceholderOrdinalState::new())?;
-
-    rewrite_query_selects(query, &mut |select| {
-        let mut changed = false;
-        rewrite_select(select, &mut changed)?;
-        if changed {
-            Ok(RewriteDecision::Changed)
-        } else {
-            Ok(RewriteDecision::Unchanged)
-        }
-    })
-}
-
 pub(crate) fn rewrite_table_factors_in_select_decision(
     select: &mut Select,
     rewrite_table_factor: &mut dyn FnMut(&mut TableFactor) -> Result<RewriteDecision, LixError>,
@@ -148,27 +121,6 @@ pub(crate) fn visit_table_factors_in_select(
         for join in &table.joins {
             visit_table_factor_in_place(&join.relation, visit_table_factor)?;
         }
-    }
-    Ok(())
-}
-
-// Compatibility wrapper for existing rewrite steps.
-pub(crate) fn rewrite_table_factors_in_select(
-    select: &mut Select,
-    rewrite_table_factor: &mut dyn FnMut(&mut TableFactor, &mut bool) -> Result<(), LixError>,
-    changed: &mut bool,
-) -> Result<(), LixError> {
-    let decision = rewrite_table_factors_in_select_decision(select, &mut |relation| {
-        let mut local_changed = false;
-        rewrite_table_factor(relation, &mut local_changed)?;
-        if local_changed {
-            Ok(RewriteDecision::Changed)
-        } else {
-            Ok(RewriteDecision::Unchanged)
-        }
-    })?;
-    if decision == RewriteDecision::Changed {
-        *changed = true;
     }
     Ok(())
 }
@@ -285,9 +237,10 @@ mod tests {
     use sqlparser::ast::{Query, Select, Statement, TableFactor};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
+    use sqlparser::ast::TableAlias;
 
     use super::{
-        default_alias, object_name_matches, parse_single_query, rewrite_query_selects,
+        object_name_matches, parse_single_query, rewrite_query_selects,
         rewrite_table_factors_in_select_decision, visit_query_selects,
         visit_table_factors_in_select, RewriteDecision,
     };
@@ -310,7 +263,13 @@ mod tests {
                 return Ok(RewriteDecision::Unchanged);
             }
             let derived_query = parse_single_query("SELECT 1 AS id")?;
-            let derived_alias = alias.clone().or_else(|| Some(default_alias("foo")));
+            let derived_alias = alias.clone().or_else(|| {
+                Some(TableAlias {
+                    explicit: false,
+                    name: Ident::new("foo"),
+                    columns: Vec::new(),
+                })
+            });
             *relation = TableFactor::Derived {
                 lateral: false,
                 subquery: Box::new(derived_query),

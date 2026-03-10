@@ -9,9 +9,8 @@ mod types;
 
 pub(crate) use crate::engine::sql::storage::sql_text::escape_sql_string;
 pub(crate) use ast_utils::{
-    default_alias, object_name_matches, parse_single_query, quote_ident, rewrite_query_selects,
-    rewrite_query_with_select_rewriter, rewrite_table_factors_in_select, visit_query_selects,
-    visit_table_factors_in_select, RewriteDecision,
+    object_name_matches, parse_single_query, quote_ident, rewrite_query_selects,
+    visit_query_selects, visit_table_factors_in_select, RewriteDecision,
 };
 #[cfg(test)]
 pub(crate) use params::bind_sql_with_state_and_appended_params;
