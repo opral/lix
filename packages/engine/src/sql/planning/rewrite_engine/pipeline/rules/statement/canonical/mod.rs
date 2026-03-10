@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 
 use sqlparser::ast::Statement;
 
-use crate::engine::sql::planning::rewrite_engine::pipeline::query_engine::rewrite_read_query_with_backend_and_params;
 use crate::engine::sql::planning::rewrite_engine::steps::lix_change_view_write;
 use crate::engine::sql::planning::rewrite_engine::steps::lix_state_history_view_write;
 use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
@@ -254,53 +253,6 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 let output =
                     vtable_write::rewrite_delete(delete, effective_scope_fallback, context.params)?;
                 return Ok(StatementRuleOutcome::Emit(output));
-            }
-            Statement::Query(query) => {
-                let query = crate::engine::sql::planning::rewrite_engine::pipeline::query_engine::rewrite_read_query(*query)?;
-                return Ok(StatementRuleOutcome::Emit(RewriteOutput {
-                    statements: vec![Statement::Query(Box::new(query))],
-                    effect_only: false,
-                    params: Vec::new(),
-                    registrations: Vec::new(),
-                    postprocess: None,
-                    mutations: Vec::new(),
-                    update_validations: Vec::new(),
-                }));
-            }
-            Statement::Explain {
-                describe_alias,
-                analyze,
-                verbose,
-                query_plan,
-                estimate,
-                statement,
-                format,
-                options,
-            } => {
-                let statement = match *statement {
-                    Statement::Query(query) => Statement::Query(Box::new(
-                        crate::engine::sql::planning::rewrite_engine::pipeline::query_engine::rewrite_read_query(*query)?,
-                    )),
-                    other => other,
-                };
-                return Ok(StatementRuleOutcome::Emit(RewriteOutput {
-                    statements: vec![Statement::Explain {
-                        describe_alias,
-                        analyze,
-                        verbose,
-                        query_plan,
-                        estimate,
-                        statement: Box::new(statement),
-                        format,
-                        options,
-                    }],
-                    effect_only: false,
-                    params: Vec::new(),
-                    registrations: Vec::new(),
-                    postprocess: None,
-                    mutations: Vec::new(),
-                    update_validations: Vec::new(),
-                }));
             }
             other => {
                 return Ok(StatementRuleOutcome::Emit(RewriteOutput {
@@ -609,56 +561,6 @@ where
                 let output =
                     vtable_write::rewrite_delete(delete, effective_scope_fallback, context.params)?;
                 return Ok(StatementRuleOutcome::Emit(output));
-            }
-            Statement::Query(query) => {
-                let query =
-                    rewrite_read_query_with_backend_and_params(backend, *query, context.params)
-                        .await?;
-                return Ok(StatementRuleOutcome::Emit(RewriteOutput {
-                    statements: vec![Statement::Query(Box::new(query))],
-                    effect_only: false,
-                    params: Vec::new(),
-                    registrations: Vec::new(),
-                    postprocess: context.postprocess.take(),
-                    mutations: Vec::new(),
-                    update_validations: Vec::new(),
-                }));
-            }
-            Statement::Explain {
-                describe_alias,
-                analyze,
-                verbose,
-                query_plan,
-                estimate,
-                statement,
-                format,
-                options,
-            } => {
-                let statement = match *statement {
-                    Statement::Query(query) => Statement::Query(Box::new(
-                        rewrite_read_query_with_backend_and_params(backend, *query, context.params)
-                            .await?,
-                    )),
-                    other => other,
-                };
-                return Ok(StatementRuleOutcome::Emit(RewriteOutput {
-                    statements: vec![Statement::Explain {
-                        describe_alias,
-                        analyze,
-                        verbose,
-                        query_plan,
-                        estimate,
-                        statement: Box::new(statement),
-                        format,
-                        options,
-                    }],
-                    effect_only: false,
-                    params: Vec::new(),
-                    registrations: Vec::new(),
-                    postprocess: context.postprocess.take(),
-                    mutations: Vec::new(),
-                    update_validations: Vec::new(),
-                }));
             }
             other => {
                 return Ok(StatementRuleOutcome::Emit(RewriteOutput {

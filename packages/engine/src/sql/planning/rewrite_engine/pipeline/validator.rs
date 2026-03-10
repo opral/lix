@@ -1,46 +1,6 @@
-use std::collections::BTreeSet;
-
-use sqlparser::ast::Query;
-
 use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
 use crate::engine::sql::planning::rewrite_engine::PostprocessPlan;
-use crate::engine::sql::planning::rewrite_engine::{
-    object_name_matches, visit_query_selects, visit_table_factors_in_select,
-};
 use crate::LixError;
-
-use super::context::AnalysisContext;
-use super::registry::RewritePhase;
-
-const LOGICAL_READ_VIEW_NAMES: &[&str] = &[
-    "lix_active_account",
-    "lix_active_version",
-    "lix_change",
-    "lix_state",
-    "lix_state_by_version",
-    "lix_state_history",
-    "lix_state_history_by_version",
-    "lix_working_changes",
-    "lix_version",
-];
-
-pub(crate) fn validate_final_read_query(query: &Query) -> Result<(), LixError> {
-    validate_no_unresolved_logical_read_views(query)
-}
-
-pub(crate) fn validate_phase_invariants(
-    phase: RewritePhase,
-    query: &Query,
-    _context: &AnalysisContext,
-) -> Result<(), LixError> {
-    match phase {
-        RewritePhase::Analyze => Ok(()),
-        RewritePhase::Canonicalize => validate_no_unresolved_logical_read_views(query),
-        RewritePhase::Optimize => validate_no_unresolved_logical_read_views(query),
-        // Lower can expand SQL substantially; final invariant check covers output.
-        RewritePhase::Lower => validate_no_unresolved_logical_read_views(query),
-    }
-}
 
 pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), LixError> {
     if output.statements.is_empty()
@@ -121,71 +81,21 @@ fn requires_single_statement_postprocess(plan: Option<&PostprocessPlan>) -> bool
     matches!(plan, Some(PostprocessPlan::VtableDelete(_)))
 }
 
-pub(crate) fn validate_no_unresolved_logical_read_views(query: &Query) -> Result<(), LixError> {
-    validate_no_unresolved_logical_read_views_except(query, &[])
-}
-
-pub(crate) fn validate_no_unresolved_logical_read_views_except(
-    query: &Query,
-    allowed: &[&str],
-) -> Result<(), LixError> {
-    let allowed: BTreeSet<&str> = allowed.iter().copied().collect();
-    let mut unresolved = BTreeSet::new();
-    visit_query_selects(query, &mut |select| {
-        visit_table_factors_in_select(select, &mut |relation| {
-            let sqlparser::ast::TableFactor::Table { name, .. } = relation else {
-                return Ok(());
-            };
-            for candidate in LOGICAL_READ_VIEW_NAMES {
-                if object_name_matches(name, candidate) {
-                    if allowed.contains(candidate) {
-                        continue;
-                    }
-                    unresolved.insert((*candidate).to_string());
-                }
-            }
-            Ok(())
-        })
-    })?;
-
-    if unresolved.is_empty() {
-        return Ok(());
-    }
-
-    Err(LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "read rewrite left unresolved logical views: {}",
-            unresolved.into_iter().collect::<Vec<_>>().join(", ")
-        ),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use sqlparser::ast::Statement;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
-    use crate::engine::sql::planning::rewrite_engine::pipeline::context::AnalysisContext;
-    use crate::engine::sql::planning::rewrite_engine::pipeline::registry::RewritePhase;
     use crate::engine::sql::planning::rewrite_engine::types::{
         PostprocessPlan, RewriteOutput, VtableDeletePlan, VtableUpdatePlan,
     };
 
-    use super::{validate_phase_invariants, validate_statement_output};
-
-    fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
-        assert_eq!(statements.len(), 1);
-        match statements.remove(0) {
-            Statement::Query(query) => *query,
-            other => panic!("expected query, got {other:?}"),
-        }
-    }
+    use super::validate_statement_output;
 
     fn empty_statement() -> Statement {
-        Statement::Query(Box::new(parse_query("SELECT 1")))
+        let mut statements = Parser::parse_sql(&GenericDialect {}, "SELECT 1").expect("parse SQL");
+        statements.remove(0)
     }
 
     fn empty_update_statement() -> Statement {
@@ -195,24 +105,6 @@ mod tests {
         )
         .expect("parse SQL");
         statements.remove(0)
-    }
-
-    #[test]
-    fn canonical_phase_rejects_unresolved_state_views() {
-        let query = parse_query("SELECT * FROM lix_state_by_version");
-        let context = AnalysisContext::from_query(&query);
-        let err = validate_phase_invariants(RewritePhase::Canonicalize, &query, &context)
-            .expect_err("canonical phase should reject unresolved state views");
-        assert!(err.description.contains("lix_state_by_version"));
-    }
-
-    #[test]
-    fn optimize_phase_rejects_unresolved_state_views() {
-        let query = parse_query("SELECT * FROM lix_state_by_version");
-        let context = AnalysisContext::from_query(&query);
-        let err = validate_phase_invariants(RewritePhase::Optimize, &query, &context)
-            .expect_err("optimize phase should reject unresolved state views");
-        assert!(err.description.contains("lix_state_by_version"));
     }
 
     #[test]
