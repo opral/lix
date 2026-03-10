@@ -14,9 +14,8 @@ use sqlparser::parser::Parser;
 
 use crate::backend::SqlDialect;
 use crate::cel::CelEvaluator;
-use crate::engine::sql::planning::rewrite_engine::lowering::lower_statement;
-use crate::engine::sql::planning::rewrite_engine::pipeline::query_engine::{
-    rewrite_read_query, rewrite_read_query_with_backend,
+use crate::engine::sql::planning::preprocess::{
+    lower_public_read_query_with_sql2_backend, rewrite_public_read_statement_to_lowered_sql,
 };
 use crate::engine::sql::planning::rewrite_engine::row_resolution::resolve_values_rows;
 use crate::engine::sql::planning::rewrite_engine::{
@@ -1343,27 +1342,21 @@ fn rewrite_and_lower_read_subquery(
     subquery: Query,
     dialect: SqlDialect,
 ) -> Result<Query, LixError> {
-    let rewritten = rewrite_read_query(subquery)?;
-    lower_query(rewritten, dialect)
-}
-
-async fn rewrite_and_lower_read_subquery_with_backend(
-    backend: &dyn LixBackend,
-    subquery: Query,
-) -> Result<Query, LixError> {
-    let rewritten = rewrite_read_query_with_backend(backend, subquery).await?;
-    lower_query(rewritten, backend.dialect())
-}
-
-fn lower_query(query: Query, dialect: SqlDialect) -> Result<Query, LixError> {
-    let statement = Statement::Query(Box::new(query));
-    match lower_statement(statement, dialect)? {
+    let mut statement = Statement::Query(Box::new(subquery));
+    match rewrite_public_read_statement_to_lowered_sql(&mut statement, dialect)? {
         Statement::Query(query) => Ok(*query),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "expected lowered subquery to remain a SELECT query".to_string(),
         }),
     }
+}
+
+async fn rewrite_and_lower_read_subquery_with_backend(
+    backend: &dyn LixBackend,
+    subquery: Query,
+) -> Result<Query, LixError> {
+    lower_public_read_query_with_sql2_backend(backend, subquery).await
 }
 
 fn rewrite_column_reference_expr(

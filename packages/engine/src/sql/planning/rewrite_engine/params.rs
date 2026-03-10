@@ -28,6 +28,7 @@ pub(crate) struct BoundSql {
     pub(crate) state: PlaceholderState,
 }
 
+#[cfg(test)]
 pub(crate) fn bind_sql(
     sql: &str,
     params: &[Value],

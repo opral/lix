@@ -4,6 +4,11 @@ use crate::cel::CelEvaluator;
 use crate::default_values::apply_vtable_insert_defaults;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::sql2::planner::backend::lowerer::rewrite_supported_public_read_surfaces_in_statement;
+use crate::sql2::runtime::prepare_sql2_read;
+use crate::version::{
+    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
+    parse_active_version_snapshot,
+};
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 use super::super::ast::lowering::lower_statement;
@@ -28,6 +33,79 @@ pub(crate) fn rewrite_public_read_statement_to_lowered_sql(
 ) -> Result<Statement, LixError> {
     rewrite_supported_public_read_surfaces_in_statement(statement)?;
     lower_statement(statement.clone(), dialect)
+}
+
+pub(crate) async fn lower_public_read_query_with_sql2_backend(
+    backend: &dyn LixBackend,
+    query: sqlparser::ast::Query,
+) -> Result<sqlparser::ast::Query, LixError> {
+    let active_version_id = load_active_version_id_for_sql2_read(backend).await?;
+    let parsed = vec![Statement::Query(Box::new(query))];
+    let prepared = prepare_sql2_read(backend, &parsed, &[], &active_version_id, None)
+        .await
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "sql2 could not prepare read subquery".to_string(),
+        })?;
+    let lowered = prepared.lowered_read.ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: "sql2 read subquery did not lower to executable SQL".to_string(),
+    })?;
+    let statement = lowered
+        .statements
+        .into_iter()
+        .next()
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "sql2 read subquery lowered to no statements".to_string(),
+        })?;
+    let statement = lower_statement(statement, backend.dialect())?;
+    match statement {
+        Statement::Query(query) => Ok(*query),
+        _ => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "expected lowered subquery to remain a SELECT query".to_string(),
+        }),
+    }
+}
+
+async fn load_active_version_id_for_sql2_read(backend: &dyn LixBackend) -> Result<String, LixError> {
+    let result = backend
+        .execute(
+            "SELECT snapshot_content \
+             FROM lix_internal_state_untracked \
+             WHERE schema_key = $1 \
+               AND file_id = $2 \
+               AND version_id = $3 \
+               AND snapshot_content IS NOT NULL \
+             ORDER BY updated_at DESC \
+             LIMIT 1",
+            &[
+                Value::Text(active_version_schema_key().to_string()),
+                Value::Text(active_version_file_id().to_string()),
+                Value::Text(active_version_storage_version_id().to_string()),
+            ],
+        )
+        .await?;
+
+    let row = result.rows.first().ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: "sql2 read subquery requires an active version".to_string(),
+    })?;
+    let snapshot_content = row.first().ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: "active version query row is missing snapshot_content".to_string(),
+    })?;
+    let snapshot_content = match snapshot_content {
+        Value::Text(value) => value.as_str(),
+        other => {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!("active version snapshot_content must be text, got {other:?}"),
+            })
+        }
+    };
+    parse_active_version_snapshot(snapshot_content)
 }
 
 struct RewrittenStatementBinding {
