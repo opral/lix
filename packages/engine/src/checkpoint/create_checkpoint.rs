@@ -100,15 +100,10 @@ async fn load_commit(
     commit_id: &str,
 ) -> Result<Option<CommitRow>, LixError> {
     let result = tx
-        .execute_internal(
-            "SELECT lix_json_extract(snapshot_content, 'change_set_id') \
-             FROM lix_internal_state_vtable \
-             WHERE schema_key = 'lix_commit' \
-               AND entity_id = $1 \
-               AND file_id = 'lix' \
-               AND version_id = 'global' \
-               AND snapshot_content IS NOT NULL \
-             ORDER BY updated_at DESC, created_at DESC, change_id DESC \
+        .execute(
+            "SELECT change_set_id \
+             FROM lix_commit \
+             WHERE id = $1 \
              LIMIT 1",
             &[Value::Text(commit_id.to_string())],
         )
@@ -130,18 +125,12 @@ async fn load_commit(
 
 async fn load_global_version_commit_id(tx: &mut EngineTransaction<'_>) -> Result<String, LixError> {
     let result = tx
-        .execute_internal(
-            "SELECT lix_json_extract(snapshot_content, 'commit_id') \
-             FROM lix_internal_state_materialized_v1_lix_version_pointer \
-             WHERE schema_key = 'lix_version_pointer' \
-               AND entity_id = 'global' \
-               AND file_id = 'lix' \
-               AND version_id = 'global' \
-               AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
-             ORDER BY updated_at DESC, created_at DESC, change_id DESC \
+        .execute(
+            "SELECT commit_id \
+             FROM lix_version \
+             WHERE id = $1 \
              LIMIT 1",
-            &[],
+            &[Value::Text(crate::version::GLOBAL_VERSION_ID.to_string())],
         )
         .await?;
     let [statement] = result.statements.as_slice() else {
@@ -157,7 +146,7 @@ async fn load_global_version_commit_id(tx: &mut EngineTransaction<'_>) -> Result
             description: "hidden global version pointer row is missing".to_string(),
         });
     };
-    text_at(row, 0, "lix_version_pointer.commit_id")
+    text_at(row, 0, "lix_version.commit_id")
 }
 
 async fn ensure_checkpoint_label_on_commit(
@@ -165,19 +154,20 @@ async fn ensure_checkpoint_label_on_commit(
     commit_id: &str,
 ) -> Result<(), LixError> {
     let checkpoint_label_id = load_checkpoint_label_id(tx).await?;
-    let entity_label_id = format!("{commit_id}~lix_commit~lix~{checkpoint_label_id}");
+    let state_entity_id = format!("{commit_id}~lix_commit~lix~{checkpoint_label_id}");
     let exists = tx
-        .execute(
+        .execute_internal(
             "SELECT 1 \
-             FROM lix_entity_label \
+             FROM lix_internal_state_vtable \
              WHERE entity_id = $1 \
-               AND schema_key = 'lix_commit' \
+               AND schema_key = 'lix_entity_label' \
                AND file_id = 'lix' \
-               AND label_id = $2 \
+               AND version_id = $2 \
+               AND snapshot_content IS NOT NULL \
              LIMIT 1",
             &[
-                Value::Text(commit_id.to_string()),
-                Value::Text(checkpoint_label_id.clone()),
+                Value::Text(state_entity_id.clone()),
+                Value::Text(crate::version::GLOBAL_VERSION_ID.to_string()),
             ],
         )
         .await?;
@@ -197,16 +187,17 @@ async fn ensure_checkpoint_label_on_commit(
          WHERE entity_id = $1 \
            AND schema_key = 'lix_entity_label' \
            AND file_id = 'lix' \
-           AND version_id = 'global'",
-        &[Value::Text(entity_label_id.clone())],
+           AND version_id = $2",
+        &[Value::Text(state_entity_id.clone()), Value::Text(crate::version::GLOBAL_VERSION_ID.to_string())],
     )
     .await?;
     tx.execute_internal(
         "INSERT INTO lix_internal_state_vtable (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
-         ) VALUES ($1, 'lix_entity_label', 'lix', 'global', 'lix', $2, '1', true)",
+         ) VALUES ($1, 'lix_entity_label', 'lix', $2, 'lix', $3, '1', true)",
         &[
-            Value::Text(entity_label_id),
+            Value::Text(state_entity_id),
+            Value::Text(crate::version::GLOBAL_VERSION_ID.to_string()),
             Value::Text(
                 serde_json::json!({
                     "entity_id": commit_id,
@@ -224,13 +215,12 @@ async fn ensure_checkpoint_label_on_commit(
 
 async fn load_checkpoint_label_id(tx: &mut EngineTransaction<'_>) -> Result<String, LixError> {
     let result = tx
-        .execute_internal(
-            "SELECT snapshot_content \
-             FROM lix_internal_state_vtable \
-             WHERE schema_key = 'lix_label' \
-               AND file_id = 'lix' \
-               AND version_id = 'global' \
-               AND snapshot_content IS NOT NULL",
+        .execute(
+            "SELECT id \
+             FROM lix_label \
+             WHERE name = 'checkpoint' \
+               AND lixcol_global = true \
+             LIMIT 1",
             &[],
         )
         .await?;
@@ -241,22 +231,10 @@ async fn load_checkpoint_label_id(tx: &mut EngineTransaction<'_>) -> Result<Stri
             result.statements.len(),
         ));
     };
-    for row in &statement.rows {
-        let snapshot_content = text_at(row, 0, "snapshot_content")?;
-        let parsed: serde_json::Value =
-            serde_json::from_str(&snapshot_content).map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("checkpoint label snapshot invalid JSON: {error}"),
-            })?;
-        if parsed.get("name").and_then(serde_json::Value::as_str) != Some("checkpoint") {
-            continue;
-        }
-        if let Some(label_id) = parsed
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .filter(|id| !id.is_empty())
-        {
-            return Ok(label_id.to_string());
+    if let Some(row) = statement.rows.first() {
+        let label_id = text_at(row, 0, "id")?;
+        if !label_id.is_empty() {
+            return Ok(label_id);
         }
     }
     Err(LixError {

@@ -8,11 +8,14 @@ use crate::filesystem::live_projection::{
 };
 use crate::sql2::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql2::catalog::{
-    SurfaceBinding, SurfaceFamily, SurfaceOverridePredicate, SurfaceOverrideValue, SurfaceVariant,
+    SurfaceBinding, SurfaceFamily, SurfaceOverridePredicate, SurfaceOverrideValue, SurfaceRegistry,
+    SurfaceVariant,
 };
 use crate::sql2::core::parser::parse_sql_script;
 use crate::sql2::planner::canonicalize::CanonicalizedRead;
-use crate::sql2::planner::ir::{CanonicalAdminKind, FilesystemKind, ReadPlan, VersionScope};
+use crate::sql2::planner::ir::{
+    CanonicalAdminKind, CanonicalStateScan, FilesystemKind, ReadPlan, VersionScope,
+};
 use crate::sql2::planner::semantics::effective_state_resolver::{
     EffectiveStatePlan, EffectiveStateRequest,
 };
@@ -26,6 +29,7 @@ use sqlparser::ast::{
     BinaryOperator, Expr, Ident, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
     TableFactor, TableWithJoins,
 };
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LoweredReadProgram {
@@ -426,8 +430,21 @@ fn rewrite_supported_public_read_surfaces_in_expr(expr: &mut Expr) -> Result<(),
 
 fn build_supported_public_read_surface_query(
     surface_name: &str,
-    top_level: bool,
+    _top_level: bool,
 ) -> Result<Option<Query>, LixError> {
+    let registry = SurfaceRegistry::with_builtin_surfaces();
+    if let Some(surface_binding) = registry.bind_relation_name(surface_name) {
+        match surface_binding.descriptor.surface_family {
+            SurfaceFamily::Entity => {
+                return build_builtin_entity_surface_query(&surface_binding).map(Some);
+            }
+            SurfaceFamily::Filesystem => {
+                return build_nested_filesystem_surface_query(surface_name);
+            }
+            SurfaceFamily::State | SurfaceFamily::Admin | SurfaceFamily::Change => {}
+        }
+    }
+
     match surface_name.to_ascii_lowercase().as_str() {
         "lix_state_history" => parse_single_query(&build_state_history_source_sql(&[], true)).map(Some),
         "lix_active_version" => build_admin_source_query(CanonicalAdminKind::ActiveVersion).map(Some),
@@ -436,11 +453,49 @@ fn build_supported_public_read_surface_query(
         "lix_stored_schema" => build_admin_source_query(CanonicalAdminKind::StoredSchema).map(Some),
         "lix_change" => build_change_source_query().map(Some),
         "lix_working_changes" => build_working_changes_source_query().map(Some),
-        _ if !top_level && is_filesystem_public_surface_name(surface_name) => {
-            build_nested_filesystem_surface_query(surface_name)
-        }
         _ => Ok(None),
     }
+}
+
+fn build_builtin_entity_surface_query(surface_binding: &SurfaceBinding) -> Result<Query, LixError> {
+    let Some(schema_key) = surface_binding
+        .implicit_overrides
+        .fixed_schema_key
+        .clone()
+    else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "sql2 public-surface rewrite requires fixed schema binding for '{}'",
+                surface_binding.descriptor.public_name
+            ),
+        });
+    };
+    let Some(state_scan) = CanonicalStateScan::from_surface_binding(surface_binding.clone()) else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "sql2 public-surface rewrite could not build canonical state scan for '{}'",
+                surface_binding.descriptor.public_name
+            ),
+        });
+    };
+    let request = EffectiveStateRequest {
+        schema_set: BTreeSet::from([schema_key]),
+        version_scope: state_scan.version_scope,
+        include_global_overlay: true,
+        include_untracked_overlay: true,
+        include_tombstones: state_scan.include_tombstones,
+        predicate_classes: Vec::new(),
+        required_columns: surface_binding.exposed_columns.clone(),
+    };
+    build_entity_source_query(surface_binding, &request, &[])?.ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!(
+            "sql2 public-surface rewrite could not lower entity surface '{}'",
+            surface_binding.descriptor.public_name
+        ),
+    })
 }
 
 fn rewrite_nested_filesystem_surfaces_in_set_expr(
@@ -2615,7 +2670,10 @@ fn escape_sql_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{lower_read_for_execution, LoweredReadProgram};
+    use super::{
+        lower_read_for_execution, rewrite_supported_public_read_surfaces_in_statement,
+        LoweredReadProgram,
+    };
     use crate::sql2::catalog::SurfaceRegistry;
     use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql2::planner::canonicalize::canonicalize_read;
@@ -2666,6 +2724,30 @@ mod tests {
             lowered.pushdown_decision.accepted_predicates,
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn rewrites_joined_builtin_entity_surfaces_to_internal_queries() {
+        let mut statements = crate::sql2::core::parser::parse_sql_script(
+            "SELECT COUNT(*) \
+             FROM lix_entity_label el \
+             JOIN lix_label l ON l.id = el.label_id \
+             WHERE el.entity_id = 'commit-1' \
+               AND el.schema_key = 'lix_commit' \
+               AND el.file_id = 'lix' \
+               AND l.name = 'checkpoint'",
+        )
+        .expect("SQL should parse");
+        let mut statement = statements.pop().expect("single statement");
+
+        rewrite_supported_public_read_surfaces_in_statement(&mut statement)
+            .expect("joined entity surfaces should rewrite");
+        let lowered_sql = statement.to_string();
+
+        assert!(!lowered_sql.contains("FROM lix_entity_label"));
+        assert!(!lowered_sql.contains("JOIN lix_label"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_entity_label"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_label"));
     }
 
     #[test]
