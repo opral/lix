@@ -17,32 +17,6 @@ impl Default for ColumnReferenceOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FileReadMaterializationScope {
-    ActiveVersionOnly,
-    AllVersions,
-}
-
-pub(crate) fn file_read_materialization_scope_for_statements(
-    statements: &[Statement],
-) -> Option<FileReadMaterializationScope> {
-    let mut scope = None;
-    for statement in statements {
-        let Some(statement_scope) = file_read_materialization_scope_for_statement(statement) else {
-            continue;
-        };
-        match statement_scope {
-            FileReadMaterializationScope::AllVersions => {
-                return Some(FileReadMaterializationScope::AllVersions);
-            }
-            FileReadMaterializationScope::ActiveVersionOnly => {
-                scope.get_or_insert(FileReadMaterializationScope::ActiveVersionOnly);
-            }
-        }
-    }
-    scope
-}
-
 pub(crate) fn file_history_read_materialization_required_for_statements(
     statements: &[Statement],
 ) -> bool {
@@ -54,91 +28,6 @@ pub(crate) fn file_history_read_materialization_required_for_statements(
 fn file_history_read_materialization_required_for_statement(statement: &Statement) -> bool {
     statement_reads_table_name(statement, "lix_file_history")
         || statement_reads_table_name(statement, "lix_file_history_by_version")
-}
-
-fn file_read_materialization_scope_for_statement(
-    statement: &Statement,
-) -> Option<FileReadMaterializationScope> {
-    let mentions_by_version = statement_reads_table_name(statement, "lix_file_by_version")
-        || statement_reads_table_name(statement, "lix_file_history_by_version");
-    if mentions_by_version {
-        return Some(FileReadMaterializationScope::AllVersions);
-    }
-    let active_version_requires_data =
-        statement_requires_file_data_materialization(statement, "lix_file");
-    if active_version_requires_data {
-        return Some(FileReadMaterializationScope::ActiveVersionOnly);
-    }
-    None
-}
-
-fn statement_requires_file_data_materialization(statement: &Statement, table_name: &str) -> bool {
-    if !statement_reads_table_name(statement, table_name) {
-        return false;
-    }
-    statement_references_file_data(statement)
-}
-
-fn statement_references_file_data(statement: &Statement) -> bool {
-    match statement {
-        Statement::Query(query) => query_references_file_data(query),
-        Statement::Insert(insert) => insert
-            .source
-            .as_deref()
-            .is_some_and(query_references_file_data),
-        Statement::Update(update) => update_references_data_column(update),
-        Statement::Delete(delete) => delete
-            .selection
-            .as_ref()
-            .is_some_and(expr_references_data_column),
-        _ => false,
-    }
-}
-
-fn query_references_file_data(query: &Query) -> bool {
-    query_references_column_name(
-        query,
-        "data",
-        ColumnReferenceOptions {
-            include_from_derived_subqueries: true,
-        },
-    ) || query_selects_wildcard(query)
-}
-
-fn query_selects_wildcard(query: &Query) -> bool {
-    if query_set_expr_selects_wildcard(query.body.as_ref()) {
-        return true;
-    }
-
-    query.with.as_ref().is_some_and(|with| {
-        with.cte_tables
-            .iter()
-            .any(|cte| query_selects_wildcard(&cte.query))
-    })
-}
-
-fn query_set_expr_selects_wildcard(expr: &SetExpr) -> bool {
-    match expr {
-        SetExpr::Select(select) => select.projection.iter().any(select_item_is_wildcard),
-        SetExpr::Query(query) => query_selects_wildcard(query),
-        SetExpr::SetOperation { left, right, .. } => {
-            query_set_expr_selects_wildcard(left.as_ref())
-                || query_set_expr_selects_wildcard(right.as_ref())
-        }
-        SetExpr::Insert(statement)
-        | SetExpr::Update(statement)
-        | SetExpr::Delete(statement)
-        | SetExpr::Merge(statement) => statement_references_file_data(statement),
-        _ => false,
-    }
-}
-
-fn select_item_is_wildcard(item: &sqlparser::ast::SelectItem) -> bool {
-    matches!(
-        item,
-        sqlparser::ast::SelectItem::Wildcard(_)
-            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _)
-    )
 }
 
 fn statement_reads_table_name(statement: &Statement, table_name: &str) -> bool {
@@ -775,47 +664,4 @@ mod tests {
     use super::*;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
-
-    fn materialization_scope(sql: &str) -> Option<FileReadMaterializationScope> {
-        let statements =
-            Parser::parse_sql(&GenericDialect {}, sql).expect("expected valid SQL statements");
-        file_read_materialization_scope_for_statements(&statements)
-    }
-
-    #[test]
-    fn metadata_only_lix_file_reads_do_not_materialize() {
-        assert_eq!(materialization_scope("SELECT COUNT(*) FROM lix_file"), None);
-        assert_eq!(
-            materialization_scope("SELECT path FROM lix_file WHERE path LIKE '/docs/%'"),
-            None
-        );
-        assert_eq!(
-            materialization_scope("SELECT 1 FROM lix_file LIMIT 1"),
-            None
-        );
-    }
-
-    #[test]
-    fn data_and_wildcard_lix_file_reads_materialize_active_version() {
-        assert_eq!(
-            materialization_scope("SELECT data FROM lix_file LIMIT 1"),
-            Some(FileReadMaterializationScope::ActiveVersionOnly)
-        );
-        assert_eq!(
-            materialization_scope("SELECT * FROM lix_file LIMIT 1"),
-            Some(FileReadMaterializationScope::ActiveVersionOnly)
-        );
-    }
-
-    #[test]
-    fn data_and_wildcard_lix_file_by_version_reads_materialize_all_versions() {
-        assert_eq!(
-            materialization_scope("SELECT data FROM lix_file_by_version LIMIT 1"),
-            Some(FileReadMaterializationScope::AllVersions)
-        );
-        assert_eq!(
-            materialization_scope("SELECT * FROM lix_file_by_version LIMIT 1"),
-            Some(FileReadMaterializationScope::AllVersions)
-        );
-    }
 }
