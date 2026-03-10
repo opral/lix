@@ -8,9 +8,7 @@ use crate::materialization::{MaterializationPlan, MaterializationWrite, Material
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::matching::select_best_glob_match;
 use crate::plugin::storage::plugin_key_from_archive_path;
-use crate::plugin::types::{
-    InstalledPlugin, PluginContentType, PluginManifest, StateContextColumn,
-};
+use crate::plugin::types::{InstalledPlugin, PluginContentType};
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,35 +21,12 @@ const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 pub(crate) const BUILTIN_BINARY_FALLBACK_PLUGIN_KEY: &str = "lix_builtin_binary_fallback";
 const BUILTIN_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
-const DETECT_CHANGES_EXPORTS: &[&str] = &["detect-changes", "api#detect-changes"];
 const APPLY_CHANGES_EXPORTS: &[&str] = &["apply-changes", "api#apply-changes"];
 const BINARY_CHUNK_CODEC_LEGACY: &str = "legacy";
 const BINARY_CHUNK_CODEC_RAW: &str = "raw";
 const BINARY_CHUNK_CODEC_ZSTD: &str = "zstd";
 const BINARY_CHUNK_CODEC_PREFIX_RAW: &[u8] = b"LIXRAW01";
 const BINARY_CHUNK_CODEC_PREFIX_ZSTD: &[u8] = b"LIXZSTD1";
-
-#[derive(Debug, Clone)]
-pub(crate) struct FileChangeDetectionRequest {
-    pub file_id: String,
-    pub version_id: String,
-    pub before_path: Option<String>,
-    pub after_path: Option<String>,
-    pub data_is_authoritative: bool,
-    pub before_data: Option<Vec<u8>>,
-    pub after_data: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct DetectedFileChange {
-    pub entity_id: String,
-    pub schema_key: String,
-    pub schema_version: String,
-    pub file_id: String,
-    pub version_id: String,
-    pub plugin_key: String,
-    pub snapshot_content: Option<String>,
-}
 
 #[derive(Debug, Clone)]
 struct FileDescriptorRow {
@@ -96,371 +71,12 @@ struct ApplyChangesRequest {
     changes: Vec<PluginEntityChange>,
 }
 
-#[derive(Debug, Serialize)]
-struct DetectChangesRequest {
-    before: Option<PluginFile>,
-    after: PluginFile,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    state_context: Option<DetectStateContext>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DetectStateContext {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    active_state: Option<Vec<PluginActiveStateRow>>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct PluginActiveStateRow {
-    entity_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    schema_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    schema_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    snapshot_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    file_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    plugin_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    version_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    change_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    created_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    updated_at: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BuiltinBinaryBlobRefSnapshot {
     pub(crate) id: String,
     pub(crate) blob_hash: String,
     pub(crate) size_bytes: u64,
-}
-
-#[allow(dead_code)]
-pub(crate) async fn detect_file_changes_with_plugins(
-    backend: &dyn LixBackend,
-    runtime: &dyn WasmRuntime,
-    writes: &[FileChangeDetectionRequest],
-    installed_plugins: &[InstalledPlugin],
-) -> Result<Vec<DetectedFileChange>, LixError> {
-    let mut loaded_instances: BTreeMap<String, CachedPluginComponent> = BTreeMap::new();
-    detect_file_changes_with_plugins_with_cache(
-        backend,
-        runtime,
-        writes,
-        installed_plugins,
-        &mut loaded_instances,
-    )
-    .await
-}
-
-pub(crate) async fn detect_file_changes_with_plugins_with_cache(
-    backend: &dyn LixBackend,
-    runtime: &dyn WasmRuntime,
-    writes: &[FileChangeDetectionRequest],
-    installed_plugins: &[InstalledPlugin],
-    loaded_instances: &mut BTreeMap<String, CachedPluginComponent>,
-) -> Result<Vec<DetectedFileChange>, LixError> {
-    if writes.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut detected = Vec::new();
-    let mut state_context_columns_by_plugin: BTreeMap<String, Option<Vec<StateContextColumn>>> =
-        BTreeMap::new();
-    for write in writes {
-        let has_before_context = write.before_path.is_some() || write.before_data.is_some();
-        let before_path = write
-            .before_path
-            .as_deref()
-            .or(write.after_path.as_deref())
-            .unwrap_or("");
-        let before_content_type = write
-            .before_data
-            .as_deref()
-            .map(classify_content_type_from_bytes);
-        let before_plugin = if has_before_context {
-            select_plugin_for_path(before_path, before_content_type, installed_plugins)
-        } else {
-            None
-        };
-        let before_uses_builtin_fallback = has_before_context && before_plugin.is_none();
-        let after_content_type = classify_content_type_from_bytes(&write.after_data);
-        let after_plugin = write.after_path.as_deref().and_then(|path| {
-            select_plugin_for_path(path, Some(after_content_type), installed_plugins)
-        });
-        let is_delete_without_after_path =
-            write.after_path.is_none() && write.after_data.is_empty();
-        let after_uses_builtin_fallback =
-            !is_delete_without_after_path && write.after_path.is_some() && after_plugin.is_none();
-
-        if let Some(previous_plugin) = before_plugin {
-            let plugin_changed = after_plugin
-                .map(|plugin| plugin.key.as_str())
-                .unwrap_or_default()
-                != previous_plugin.key.as_str();
-            if plugin_changed {
-                for existing in load_existing_plugin_entities(
-                    backend,
-                    &write.file_id,
-                    &write.version_id,
-                    &previous_plugin.key,
-                )
-                .await?
-                {
-                    detected.push(DetectedFileChange {
-                        entity_id: existing.entity_id,
-                        schema_key: existing.schema_key,
-                        schema_version: existing.schema_version,
-                        file_id: write.file_id.clone(),
-                        version_id: write.version_id.clone(),
-                        plugin_key: previous_plugin.key.clone(),
-                        snapshot_content: None,
-                    });
-                }
-            }
-        }
-
-        if before_uses_builtin_fallback {
-            let fallback_changed = after_plugin.is_some() || is_delete_without_after_path;
-            if fallback_changed {
-                for existing in load_existing_plugin_entities(
-                    backend,
-                    &write.file_id,
-                    &write.version_id,
-                    BUILTIN_BINARY_FALLBACK_PLUGIN_KEY,
-                )
-                .await?
-                {
-                    detected.push(DetectedFileChange {
-                        entity_id: existing.entity_id,
-                        schema_key: existing.schema_key,
-                        schema_version: existing.schema_version,
-                        file_id: write.file_id.clone(),
-                        version_id: write.version_id.clone(),
-                        plugin_key: BUILTIN_BINARY_FALLBACK_PLUGIN_KEY.to_string(),
-                        snapshot_content: None,
-                    });
-                }
-            }
-        }
-
-        if is_delete_without_after_path {
-            // Deletes flow through with no "after" path/data.
-            // In that case, we already emitted tombstones above for the previous plugin.
-            continue;
-        }
-
-        if after_uses_builtin_fallback {
-            // Path-only writes (no authoritative data assignment) must not rewrite builtin
-            // blob refs to an "empty" hash when bytes are unknown/missing from prefetch.
-            // In that case, preserve existing fallback state unless we have real before bytes.
-            if !write.data_is_authoritative {
-                if write.before_data.is_none() && before_uses_builtin_fallback {
-                    continue;
-                }
-            }
-
-            let blob_bytes = if write.data_is_authoritative {
-                write.after_data.as_slice()
-            } else if let Some(before_data) = write.before_data.as_ref() {
-                before_data.as_slice()
-            } else {
-                continue;
-            };
-
-            let after_blob_hash = binary_blob_hash_hex(blob_bytes);
-            let before_blob_hash = if before_uses_builtin_fallback {
-                load_builtin_binary_blob_ref_for_file(backend, &write.file_id, &write.version_id)
-                    .await?
-                    .map(|snapshot| snapshot.blob_hash)
-            } else {
-                None
-            };
-            if before_blob_hash.as_deref() == Some(after_blob_hash.as_str()) {
-                continue;
-            }
-
-            let snapshot_content = serde_json::to_string(&BuiltinBinaryBlobRefSnapshot {
-                id: write.file_id.clone(),
-                blob_hash: after_blob_hash,
-                size_bytes: blob_bytes.len() as u64,
-            })
-            .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                    "plugin detect-changes: failed to encode builtin binary fallback snapshot: {error}"
-                ),
-            })?;
-
-            detected.push(DetectedFileChange {
-                entity_id: write.file_id.clone(),
-                schema_key: BUILTIN_BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
-                schema_version: BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION.to_string(),
-                file_id: write.file_id.clone(),
-                version_id: write.version_id.clone(),
-                plugin_key: BUILTIN_BINARY_FALLBACK_PLUGIN_KEY.to_string(),
-                snapshot_content: Some(snapshot_content),
-            });
-            continue;
-        }
-
-        let Some(plugin) = after_plugin else {
-            return Err(no_matching_plugin_for_detect_error(
-                write,
-                after_content_type,
-                "install a plugin whose match.path_glob and optional match.content_type cover this file",
-            ));
-        };
-
-        let plugin_changed = before_plugin
-            .map(|entry| entry.key.as_str())
-            .unwrap_or_default()
-            != plugin.key.as_str();
-
-        let instance = load_or_init_plugin_component(runtime, loaded_instances, plugin).await?;
-
-        let mut before_data = if plugin_changed || !has_before_context {
-            None
-        } else {
-            write.before_data.clone()
-        };
-        if before_data.is_none() && !plugin_changed && has_before_context {
-            let cached = load_file_cache_data(backend, &write.file_id, &write.version_id).await?;
-            if !cached.is_empty() {
-                before_data = Some(cached);
-            }
-        }
-        if before_data.is_none() && !plugin_changed && has_before_context {
-            before_data = reconstruct_before_file_data_from_state(
-                backend,
-                instance.as_ref(),
-                plugin,
-                &write.file_id,
-                &write.version_id,
-                before_path,
-            )
-            .await?;
-        }
-
-        let before = before_data.as_ref().map(|data| PluginFile {
-            id: write.file_id.clone(),
-            path: before_path.to_string(),
-            data: data.clone(),
-        });
-        let after = PluginFile {
-            id: write.file_id.clone(),
-            path: write
-                .after_path
-                .clone()
-                .unwrap_or_else(|| before_path.to_string()),
-            data: write.after_data.clone(),
-        };
-
-        let selected_state_columns =
-            if let Some(cached) = state_context_columns_by_plugin.get(&plugin.key).cloned() {
-                cached
-            } else {
-                let resolved = resolve_state_context_columns(plugin)?;
-                state_context_columns_by_plugin.insert(plugin.key.clone(), resolved.clone());
-                resolved
-            };
-        let state_context = match selected_state_columns {
-            Some(columns) => {
-                let rows = load_active_state_context_rows(
-                    backend,
-                    &write.file_id,
-                    &write.version_id,
-                    &plugin.key,
-                    &columns,
-                )
-                .await?;
-                Some(DetectStateContext {
-                    active_state: Some(rows),
-                })
-            }
-            None => None,
-        };
-
-        let detect_payload = serde_json::to_vec(&DetectChangesRequest {
-            before: before.clone(),
-            after: after.clone(),
-            state_context,
-        })
-        .map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin detect-changes: failed to encode request payload: {error}"
-            ),
-        })?;
-        let detect_output = call_detect_changes(instance.as_ref(), &detect_payload).await?;
-        let mut plugin_changes: Vec<PluginEntityChange> = serde_json::from_slice(&detect_output)
-            .map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "plugin detect-changes: failed to decode plugin output for key '{}': {error}",
-                    plugin.key
-                ),
-            })?;
-
-        let mut plugin_change_keys = plugin_changes
-            .iter()
-            .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
-            .collect::<BTreeSet<_>>();
-
-        if has_before_context {
-            if plugin_detect_emits_complete_diff(plugin) {
-                // This plugin computes explicit add/remove changes from before/after file bytes,
-                // so no DB reconciliation is needed for missing tombstones.
-            } else {
-                let existing_entities = load_existing_plugin_entities(
-                    backend,
-                    &write.file_id,
-                    &write.version_id,
-                    &plugin.key,
-                )
-                .await?;
-                append_implicit_tombstones_for_projection(
-                    &mut plugin_changes,
-                    &existing_entities,
-                    &mut plugin_change_keys,
-                );
-            }
-        }
-
-        let mut seen_keys: BTreeSet<(String, String)> = BTreeSet::new();
-        for change in plugin_changes {
-            let dedupe_key = (change.schema_key.clone(), change.entity_id.clone());
-            if !seen_keys.insert(dedupe_key.clone()) {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                        "plugin detect-changes: duplicate change key for plugin '{}' file '{}' version '{}': schema_key='{}' entity_id='{}'",
-                        plugin.key,
-                        write.file_id,
-                        write.version_id,
-                        dedupe_key.0,
-                        dedupe_key.1
-                    ),
-                });
-            }
-
-            detected.push(DetectedFileChange {
-                entity_id: change.entity_id,
-                schema_key: change.schema_key,
-                schema_version: change.schema_version,
-                file_id: write.file_id.clone(),
-                version_id: write.version_id.clone(),
-                plugin_key: plugin.key.clone(),
-                snapshot_content: change.snapshot_content,
-            });
-        }
-    }
-
-    Ok(detected)
 }
 
 async fn load_or_init_plugin_component(
@@ -544,8 +160,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
             .push(write);
     }
 
-    let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmComponentInstance>> =
-        BTreeMap::new();
+    let mut loaded_instances: BTreeMap<String, CachedPluginComponent> = BTreeMap::new();
 
     for descriptor in descriptors.values() {
         let plugin = select_plugin_for_file(descriptor, &installed_plugins);
@@ -634,108 +249,8 @@ pub(crate) async fn materialize_file_data_with_plugins(
             ),
         })?;
 
-        let instance = if let Some(existing) = loaded_instances.get(&plugin.key) {
-            existing.clone()
-        } else {
-            let loaded = runtime
-                .init_component(plugin.wasm.clone(), WasmLimits::default())
-                .await?;
-            loaded_instances.insert(plugin.key.clone(), loaded.clone());
-            loaded
-        };
-        let output = call_apply_changes(instance.as_ref(), &payload).await?;
-        upsert_file_cache_data(
-            backend,
-            &descriptor.file_id,
-            &descriptor.version_id,
-            &output,
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
-pub(crate) async fn materialize_missing_file_data_with_plugins(
-    backend: &dyn LixBackend,
-    runtime: &dyn WasmRuntime,
-    versions: Option<&BTreeSet<String>>,
-) -> Result<(), LixError> {
-    let descriptors = load_missing_file_descriptors(backend, versions).await?;
-    if descriptors.is_empty() {
-        return Ok(());
-    }
-
-    let installed_plugins = load_installed_plugins(backend).await?;
-
-    let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmComponentInstance>> =
-        BTreeMap::new();
-
-    for descriptor in descriptors.values() {
-        let plugin = select_plugin_for_file(descriptor, &installed_plugins);
-        if plugin.is_none() {
-            let blob_ref = load_builtin_binary_blob_ref_for_file(
-                backend,
-                &descriptor.file_id,
-                &descriptor.version_id,
-            )
-            .await?;
-            let Some(blob_ref) = blob_ref else {
-                continue;
-            };
-            let blob_data = load_binary_blob_data_by_hash(backend, &blob_ref.blob_hash)
-                .await?
-                .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                        "plugin materialization: missing builtin binary blob payload for hash '{}' (file_id='{}' version_id='{}')",
-                        blob_ref.blob_hash, descriptor.file_id, descriptor.version_id
-                    ),
-                })?;
-            upsert_file_cache_data(
-                backend,
-                &descriptor.file_id,
-                &descriptor.version_id,
-                &blob_data,
-            )
-            .await?;
-            continue;
-        }
-        let plugin = plugin.expect("plugin must be present");
-
-        let changes = load_plugin_state_changes_for_file(
-            backend,
-            &descriptor.file_id,
-            &descriptor.version_id,
-            &plugin.key,
-        )
-        .await?;
-        if changes.is_empty() {
-            continue;
-        }
-
-        let payload = serde_json::to_vec(&ApplyChangesRequest {
-            file: PluginFile {
-                id: descriptor.file_id.clone(),
-                path: descriptor.path.clone(),
-                data: Vec::new(),
-            },
-            changes,
-        })
-        .map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: failed to encode on-demand apply-changes payload: {error}"
-            ),
-        })?;
-
-        let instance = if let Some(existing) = loaded_instances.get(&plugin.key) {
-            existing.clone()
-        } else {
-            let loaded = runtime
-                .init_component(plugin.wasm.clone(), WasmLimits::default())
-                .await?;
-            loaded_instances.insert(plugin.key.clone(), loaded.clone());
-            loaded
-        };
+        let instance =
+            load_or_init_plugin_component(runtime, &mut loaded_instances, plugin).await?;
         let output = call_apply_changes(instance.as_ref(), &payload).await?;
         upsert_file_cache_data(
             backend,
@@ -760,8 +275,7 @@ pub(crate) async fn materialize_missing_file_history_data_with_plugins(
 
     let installed_plugins = load_installed_plugins(backend).await?;
 
-    let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmComponentInstance>> =
-        BTreeMap::new();
+    let mut loaded_instances: BTreeMap<String, CachedPluginComponent> = BTreeMap::new();
 
     for descriptor in descriptors.values() {
         let plugin = select_plugin_for_path(&descriptor.path, None, &installed_plugins);
@@ -830,15 +344,8 @@ pub(crate) async fn materialize_missing_file_history_data_with_plugins(
             ),
         })?;
 
-        let instance = if let Some(existing) = loaded_instances.get(&plugin.key) {
-            existing.clone()
-        } else {
-            let loaded = runtime
-                .init_component(plugin.wasm.clone(), WasmLimits::default())
-                .await?;
-            loaded_instances.insert(plugin.key.clone(), loaded.clone());
-            loaded
-        };
+        let instance =
+            load_or_init_plugin_component(runtime, &mut loaded_instances, plugin).await?;
         let output = call_apply_changes(instance.as_ref(), &payload).await?;
         upsert_file_history_cache_data(
             backend,
@@ -874,47 +381,8 @@ fn select_plugin_for_path<'a>(
     )
 }
 
-fn classify_content_type_from_bytes(data: &[u8]) -> PluginContentType {
-    if data.contains(&0) {
-        return PluginContentType::Binary;
-    }
-    if std::str::from_utf8(data).is_ok() {
-        PluginContentType::Text
-    } else {
-        PluginContentType::Binary
-    }
-}
-
-fn plugin_content_type_label(content_type: PluginContentType) -> &'static str {
-    match content_type {
-        PluginContentType::Text => "text",
-        PluginContentType::Binary => "binary",
-    }
-}
-
 pub(crate) fn binary_blob_hash_hex(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
-}
-
-fn no_matching_plugin_for_detect_error(
-    write: &FileChangeDetectionRequest,
-    content_type: PluginContentType,
-    reason: &str,
-) -> LixError {
-    let path = write.after_path.as_deref().unwrap_or("<none>");
-    LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-            "plugin detect-changes: no plugin matched file type for file_id='{}' version_id='{}' path='{}' content_type='{}': {}",
-            write.file_id,
-            write.version_id,
-            path,
-            plugin_content_type_label(content_type),
-            reason,
-        ),
-    }
-}
-
-fn plugin_detect_emits_complete_diff(plugin: &InstalledPlugin) -> bool {
-    plugin.key == "text_plugin"
 }
 
 async fn call_apply_changes(
@@ -936,102 +404,6 @@ async fn call_apply_changes(
             errors.join("; ")
         ),
     })
-}
-
-async fn call_detect_changes(
-    instance: &dyn crate::WasmComponentInstance,
-    payload: &[u8],
-) -> Result<Vec<u8>, LixError> {
-    let mut errors = Vec::new();
-    for export in DETECT_CHANGES_EXPORTS {
-        match instance.call(export, payload).await {
-            Ok(output) => return Ok(output),
-            Err(error) => errors.push(format!("{export}: {}", error.description)),
-        }
-    }
-
-    Err(LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "plugin detect-changes: failed to call detect-changes export ({})",
-            errors.join("; ")
-        ),
-    })
-}
-
-async fn reconstruct_before_file_data_from_state(
-    backend: &dyn LixBackend,
-    instance: &dyn crate::WasmComponentInstance,
-    plugin: &InstalledPlugin,
-    file_id: &str,
-    version_id: &str,
-    path: &str,
-) -> Result<Option<Vec<u8>>, LixError> {
-    let changes =
-        load_plugin_state_changes_for_file(backend, file_id, version_id, &plugin.key).await?;
-    if changes.is_empty() {
-        return Ok(None);
-    }
-
-    let payload = serde_json::to_vec(&ApplyChangesRequest {
-        file: PluginFile {
-            id: file_id.to_string(),
-            path: path.to_string(),
-            data: Vec::new(),
-        },
-        changes,
-    })
-    .map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "plugin detect-changes: failed to encode apply fallback payload: {error}"
-        ),
-    })?;
-
-    match call_apply_changes(instance, &payload).await {
-        Ok(data) => Ok(Some(data)),
-        Err(_) => Ok(None),
-    }
-}
-
-async fn load_plugin_state_changes_for_file(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
-    plugin_key: &str,
-) -> Result<Vec<PluginEntityChange>, LixError> {
-    let params = vec![
-        Value::Text(file_id.to_string()),
-        Value::Text(version_id.to_string()),
-        Value::Text(plugin_key.to_string()),
-    ];
-    let preprocessed = preprocess_sql(
-        backend,
-        &CelEvaluator::new(),
-        "SELECT entity_id, schema_key, schema_version, snapshot_content \
-         FROM lix_state_by_version \
-         WHERE file_id = $1 \
-           AND version_id = $2 \
-           AND plugin_key = $3 \
-           AND snapshot_content IS NOT NULL \
-         ORDER BY entity_id",
-        &params,
-    )
-    .await?;
-    let rows = backend
-        .execute(&preprocessed.sql, preprocessed.single_statement_params()?)
-        .await?;
-
-    let mut changes = Vec::with_capacity(rows.rows.len());
-    for row in rows.rows {
-        changes.push(PluginEntityChange {
-            entity_id: text_required(&row, 0, "entity_id")?,
-            schema_key: text_required(&row, 1, "schema_key")?,
-            schema_version: text_required(&row, 2, "schema_version")?,
-            snapshot_content: Some(text_required(&row, 3, "snapshot_content")?),
-        });
-    }
-    Ok(changes)
 }
 
 fn parse_builtin_binary_blob_ref_snapshot(
@@ -1072,230 +444,6 @@ fn builtin_binary_blob_ref_from_changes(
         return Ok(Some(parsed));
     }
     Ok(None)
-}
-
-async fn load_builtin_binary_blob_ref_for_file(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
-) -> Result<Option<BuiltinBinaryBlobRefSnapshot>, LixError> {
-    let changes = load_plugin_state_changes_for_file(
-        backend,
-        file_id,
-        version_id,
-        BUILTIN_BINARY_FALLBACK_PLUGIN_KEY,
-    )
-    .await?;
-    builtin_binary_blob_ref_from_changes(&changes, file_id)
-}
-
-fn resolve_state_context_columns(
-    plugin: &InstalledPlugin,
-) -> Result<Option<Vec<StateContextColumn>>, LixError> {
-    let manifest: PluginManifest =
-        serde_json::from_str(&plugin.manifest_json).map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin detect-changes: invalid stored manifest_json for plugin '{}': {error}",
-                plugin.key
-            ),
-        })?;
-
-    let Some(state_context) = manifest
-        .detect_changes
-        .as_ref()
-        .and_then(|config| config.state_context.as_ref())
-    else {
-        return Ok(None);
-    };
-
-    if !state_context.includes_active_state() {
-        return Ok(None);
-    }
-
-    let mut columns = state_context
-        .resolved_columns_or_default()
-        .unwrap_or_else(|| StateContextColumn::default_active_state_columns().to_vec());
-
-    if !columns.contains(&StateContextColumn::EntityId) {
-        columns.insert(0, StateContextColumn::EntityId);
-    }
-
-    let mut deduped = Vec::new();
-    for column in columns {
-        if !deduped.contains(&column) {
-            deduped.push(column);
-        }
-    }
-
-    Ok(Some(deduped))
-}
-
-async fn load_active_state_context_rows(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
-    plugin_key: &str,
-    columns: &[StateContextColumn],
-) -> Result<Vec<PluginActiveStateRow>, LixError> {
-    if columns.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let select_columns = columns
-        .iter()
-        .map(|column| state_context_column_sql_name(*column))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let sql = format!(
-        "SELECT {select_columns} \
-         FROM lix_state_by_version \
-         WHERE file_id = $1 \
-           AND version_id = $2 \
-           AND plugin_key = $3 \
-           AND snapshot_content IS NOT NULL \
-         ORDER BY entity_id"
-    );
-
-    let params = vec![
-        Value::Text(file_id.to_string()),
-        Value::Text(version_id.to_string()),
-        Value::Text(plugin_key.to_string()),
-    ];
-
-    let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
-    let rows = backend
-        .execute(&preprocessed.sql, preprocessed.single_statement_params()?)
-        .await?;
-
-    let mut result = Vec::with_capacity(rows.rows.len());
-    for row in rows.rows {
-        let mut payload = PluginActiveStateRow::default();
-        for (index, column) in columns.iter().enumerate() {
-            match column {
-                StateContextColumn::EntityId => {
-                    payload.entity_id = text_required(&row, index, "entity_id")?;
-                }
-                StateContextColumn::SchemaKey => {
-                    payload.schema_key = nullable_text(&row, index, "schema_key")?;
-                }
-                StateContextColumn::SchemaVersion => {
-                    payload.schema_version = nullable_text(&row, index, "schema_version")?;
-                }
-                StateContextColumn::SnapshotContent => {
-                    payload.snapshot_content = nullable_text(&row, index, "snapshot_content")?;
-                }
-                StateContextColumn::FileId => {
-                    payload.file_id = nullable_text(&row, index, "file_id")?;
-                }
-                StateContextColumn::PluginKey => {
-                    payload.plugin_key = nullable_text(&row, index, "plugin_key")?;
-                }
-                StateContextColumn::VersionId => {
-                    payload.version_id = nullable_text(&row, index, "version_id")?;
-                }
-                StateContextColumn::ChangeId => {
-                    payload.change_id = nullable_text(&row, index, "change_id")?;
-                }
-                StateContextColumn::Metadata => {
-                    payload.metadata = nullable_text(&row, index, "metadata")?;
-                }
-                StateContextColumn::CreatedAt => {
-                    payload.created_at = nullable_text(&row, index, "created_at")?;
-                }
-                StateContextColumn::UpdatedAt => {
-                    payload.updated_at = nullable_text(&row, index, "updated_at")?;
-                }
-            }
-        }
-        if payload.entity_id.is_empty() {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description:
-                    "plugin detect-changes: state_context row is missing required entity_id"
-                        .to_string(),
-            });
-        }
-        result.push(payload);
-    }
-
-    Ok(result)
-}
-
-fn state_context_column_sql_name(column: StateContextColumn) -> &'static str {
-    match column {
-        StateContextColumn::EntityId => "entity_id",
-        StateContextColumn::SchemaKey => "schema_key",
-        StateContextColumn::SchemaVersion => "schema_version",
-        StateContextColumn::SnapshotContent => "snapshot_content",
-        StateContextColumn::FileId => "file_id",
-        StateContextColumn::PluginKey => "plugin_key",
-        StateContextColumn::VersionId => "version_id",
-        StateContextColumn::ChangeId => "change_id",
-        StateContextColumn::Metadata => "metadata",
-        StateContextColumn::CreatedAt => "created_at",
-        StateContextColumn::UpdatedAt => "updated_at",
-    }
-}
-
-async fn load_missing_file_descriptors(
-    backend: &dyn LixBackend,
-    versions: Option<&BTreeSet<String>>,
-) -> Result<BTreeMap<(String, String), FileDescriptorRow>, LixError> {
-    let file_projection_sql =
-        build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, false);
-    let mut sql = String::from(
-        "SELECT id, lixcol_version_id, path \
-         FROM (",
-    );
-    sql.push_str(&file_projection_sql);
-    sql.push_str(
-        ") file_view \
-         WHERE path IS NOT NULL \
-           AND NOT EXISTS (\
-               SELECT 1 \
-               FROM lix_internal_file_data_cache cache \
-               WHERE cache.file_id = id \
-                 AND cache.version_id = lixcol_version_id\
-           )",
-    );
-    let mut params = Vec::new();
-    if let Some(versions) = versions {
-        if versions.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        let mut placeholders = Vec::with_capacity(versions.len());
-        for version in versions {
-            placeholders.push(format!("${}", params.len() + 1));
-            params.push(Value::Text(version.clone()));
-        }
-        sql.push_str(" AND lixcol_version_id IN (");
-        sql.push_str(&placeholders.join(", "));
-        sql.push(')');
-    }
-    sql.push_str(" ORDER BY lixcol_version_id, id");
-
-    let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
-    let rows = backend
-        .execute(&preprocessed.sql, preprocessed.single_statement_params()?)
-        .await?;
-
-    let mut descriptors: BTreeMap<(String, String), FileDescriptorRow> = BTreeMap::new();
-    for row in rows.rows {
-        let file_id = text_required(&row, 0, "id")?;
-        let version_id = text_required(&row, 1, "lixcol_version_id")?;
-        let path = text_required(&row, 2, "path")?;
-        descriptors.insert(
-            (version_id.clone(), file_id.clone()),
-            FileDescriptorRow {
-                file_id,
-                version_id,
-                path,
-            },
-        );
-    }
-    Ok(descriptors)
 }
 
 async fn load_file_paths_for_descriptors(
@@ -1472,65 +620,6 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
         });
     }
     Ok(changes)
-}
-
-struct PluginEntityKey {
-    entity_id: String,
-    schema_key: String,
-    schema_version: String,
-}
-
-fn append_implicit_tombstones_for_projection(
-    plugin_changes: &mut Vec<PluginEntityChange>,
-    existing_entities: &[PluginEntityKey],
-    plugin_change_keys: &mut BTreeSet<(String, String)>,
-) {
-    // Treat non-complete detect output as a delta by default.
-    // Seed from existing entities so unchanged rows are preserved, then apply explicit
-    // upserts/tombstones from plugin output.
-    let mut full_after_keys = existing_entities
-        .iter()
-        .map(|existing| (existing.schema_key.clone(), existing.entity_id.clone()))
-        .collect::<BTreeSet<_>>();
-
-    for change in plugin_changes.iter() {
-        let key = (change.schema_key.clone(), change.entity_id.clone());
-        if change.snapshot_content.is_some() {
-            full_after_keys.insert(key);
-        } else {
-            full_after_keys.remove(&key);
-        }
-    }
-
-    for existing in existing_entities {
-        let key = (existing.schema_key.clone(), existing.entity_id.clone());
-        if !full_after_keys.contains(&key) && plugin_change_keys.insert(key) {
-            plugin_changes.push(PluginEntityChange {
-                entity_id: existing.entity_id.clone(),
-                schema_key: existing.schema_key.clone(),
-                schema_version: existing.schema_version.clone(),
-                snapshot_content: None,
-            });
-        }
-    }
-}
-
-async fn load_existing_plugin_entities(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
-    plugin_key: &str,
-) -> Result<Vec<PluginEntityKey>, LixError> {
-    let changes =
-        load_plugin_state_changes_for_file(backend, file_id, version_id, plugin_key).await?;
-    Ok(changes
-        .into_iter()
-        .map(|change| PluginEntityKey {
-            entity_id: change.entity_id,
-            schema_key: change.schema_key,
-            schema_version: change.schema_version,
-        })
-        .collect())
 }
 
 pub(crate) async fn load_installed_plugins(
@@ -2190,18 +1279,11 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        append_implicit_tombstones_for_projection, classify_content_type_from_bytes,
-        load_or_init_plugin_component, resolve_state_context_columns, select_plugin_for_path,
-        CachedPluginComponent, PluginEntityChange, PluginEntityKey,
-    };
+    use super::{load_or_init_plugin_component, select_plugin_for_path, CachedPluginComponent};
     use crate::plugin::matching::glob_matches_path;
-    use crate::plugin::types::{
-        InstalledPlugin, PluginContentType, PluginRuntime, StateContextColumn,
-    };
+    use crate::plugin::types::{InstalledPlugin, PluginContentType, PluginRuntime};
     use crate::{LixError, WasmComponentInstance, WasmLimits, WasmRuntime};
     use async_trait::async_trait;
-    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -2249,73 +1331,6 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_preserves_unchanged_entities_for_delta_output() {
-        let mut plugin_changes = vec![PluginEntityChange {
-            entity_id: "a".to_string(),
-            schema_key: "json_pointer".to_string(),
-            schema_version: "1".to_string(),
-            snapshot_content: Some("{\"path\":\"/a\"}".to_string()),
-        }];
-        let existing = vec![
-            PluginEntityKey {
-                entity_id: "a".to_string(),
-                schema_key: "json_pointer".to_string(),
-                schema_version: "1".to_string(),
-            },
-            PluginEntityKey {
-                entity_id: "b".to_string(),
-                schema_key: "json_pointer".to_string(),
-                schema_version: "1".to_string(),
-            },
-        ];
-        let mut keys = plugin_changes
-            .iter()
-            .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
-            .collect::<BTreeSet<_>>();
-
-        append_implicit_tombstones_for_projection(&mut plugin_changes, &existing, &mut keys);
-
-        let tombstone = plugin_changes
-            .iter()
-            .find(|change| change.entity_id == "b" && change.schema_key == "json_pointer");
-        assert!(
-            tombstone.is_none(),
-            "delta output must not infer tombstones for unchanged entities"
-        );
-    }
-
-    #[test]
-    fn reconciliation_does_not_duplicate_explicit_tombstones() {
-        let mut plugin_changes = vec![PluginEntityChange {
-            entity_id: "b".to_string(),
-            schema_key: "json_pointer".to_string(),
-            schema_version: "1".to_string(),
-            snapshot_content: None,
-        }];
-        let existing = vec![PluginEntityKey {
-            entity_id: "b".to_string(),
-            schema_key: "json_pointer".to_string(),
-            schema_version: "1".to_string(),
-        }];
-        let mut keys = plugin_changes
-            .iter()
-            .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
-            .collect::<BTreeSet<_>>();
-
-        append_implicit_tombstones_for_projection(&mut plugin_changes, &existing, &mut keys);
-
-        let tombstones = plugin_changes
-            .iter()
-            .filter(|change| {
-                change.entity_id == "b"
-                    && change.schema_key == "json_pointer"
-                    && change.snapshot_content.is_none()
-            })
-            .count();
-        assert_eq!(tombstones, 1);
-    }
-
-    #[test]
     fn match_path_glob_matches_paths() {
         assert!(glob_matches_path("*.{md,mdx}", "/notes.md"));
         assert!(glob_matches_path("*.{md,mdx}", "/notes.MDX"));
@@ -2360,118 +1375,6 @@ mod tests {
         )
         .expect("binary plugin should match");
         assert_eq!(selected.key, "binary_plugin");
-    }
-
-    #[test]
-    fn classify_content_type_detects_text_and_binary() {
-        assert_eq!(
-            classify_content_type_from_bytes(br#"{"hello":"world"}"#),
-            PluginContentType::Text
-        );
-        assert_eq!(
-            classify_content_type_from_bytes(&[0x89, 0x50, 0x4e, 0x47]),
-            PluginContentType::Binary
-        );
-    }
-
-    #[test]
-    fn state_context_columns_disabled_by_default() {
-        let plugin = InstalledPlugin {
-            key: "k".to_string(),
-            runtime: PluginRuntime::WasmComponentV1,
-            api_version: "0.1.0".to_string(),
-            path_glob: "*.md".to_string(),
-            content_type: None,
-            entry: "plugin.wasm".to_string(),
-            manifest_json: r#"{
-                "key":"k",
-                "runtime":"wasm-component-v1",
-                "api_version":"0.1.0",
-                "match":{"path_glob":"*.md"},
-                "entry":"plugin.wasm",
-                "schemas":["schema/default.json"]
-            }"#
-            .to_string(),
-            wasm: vec![1],
-        };
-
-        let resolved = resolve_state_context_columns(&plugin).expect("resolution should succeed");
-        assert_eq!(resolved, None);
-    }
-
-    #[test]
-    fn state_context_columns_default_to_core_set() {
-        let plugin = InstalledPlugin {
-            key: "k".to_string(),
-            runtime: PluginRuntime::WasmComponentV1,
-            api_version: "0.1.0".to_string(),
-            path_glob: "*.md".to_string(),
-            content_type: None,
-            entry: "plugin.wasm".to_string(),
-            manifest_json: r#"{
-                "key":"k",
-                "runtime":"wasm-component-v1",
-                "api_version":"0.1.0",
-                "match":{"path_glob":"*.md"},
-                "entry":"plugin.wasm",
-                "schemas":["schema/default.json"],
-                "detect_changes": {
-                    "state_context": {
-                        "include_active_state": true
-                    }
-                }
-            }"#
-            .to_string(),
-            wasm: vec![1],
-        };
-
-        let resolved = resolve_state_context_columns(&plugin).expect("resolution should succeed");
-        assert_eq!(
-            resolved,
-            Some(vec![
-                StateContextColumn::EntityId,
-                StateContextColumn::SchemaKey,
-                StateContextColumn::SchemaVersion,
-                StateContextColumn::SnapshotContent
-            ])
-        );
-    }
-
-    #[test]
-    fn state_context_columns_respect_explicit_manifest_selection() {
-        let plugin = InstalledPlugin {
-            key: "k".to_string(),
-            runtime: PluginRuntime::WasmComponentV1,
-            api_version: "0.1.0".to_string(),
-            path_glob: "*.md".to_string(),
-            content_type: None,
-            entry: "plugin.wasm".to_string(),
-            manifest_json: r#"{
-                "key":"k",
-                "runtime":"wasm-component-v1",
-                "api_version":"0.1.0",
-                "match":{"path_glob":"*.md"},
-                "entry":"plugin.wasm",
-                "schemas":["schema/default.json"],
-                "detect_changes": {
-                    "state_context": {
-                        "include_active_state": true,
-                        "columns": ["entity_id", "snapshot_content"]
-                    }
-                }
-            }"#
-            .to_string(),
-            wasm: vec![1],
-        };
-
-        let resolved = resolve_state_context_columns(&plugin).expect("resolution should succeed");
-        assert_eq!(
-            resolved,
-            Some(vec![
-                StateContextColumn::EntityId,
-                StateContextColumn::SnapshotContent
-            ])
-        );
     }
 
     #[tokio::test]
