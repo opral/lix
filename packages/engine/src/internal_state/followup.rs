@@ -19,7 +19,7 @@ use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value as EngineVa
 
 use crate::engine::sql::ast::lowering::lower_statement;
 use crate::engine::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
-use crate::engine::sql::execution::execute_prepared::{
+use crate::query_runtime::execute_prepared::{
     execute_prepared_with_backend, execute_prepared_with_transaction,
 };
 use crate::internal_state::{InternalStatePlan, PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};

@@ -347,7 +347,7 @@ fn guardrail_sql_side_effects_stays_off_legacy_filesystem_update_detector() {
     let side_effects_source =
         fs::read_to_string(root.join("src/runtime_effects.rs")).expect("runtime_effects readable");
     let intent_source =
-        fs::read_to_string(root.join("src/sql/execution/intent.rs")).expect("intent readable");
+        fs::read_to_string(root.join("src/query_runtime/intent.rs")).expect("intent readable");
     let shared_path_source = fs::read_to_string(root.join("src/sql/execution/shared_path.rs"))
         .expect("shared_path readable");
 
@@ -463,7 +463,7 @@ fn guardrail_live_filesystem_intent_path_has_no_plugin_detection_branch() {
         .expect("runtime_effects.rs should be readable");
     let shared_path_source = fs::read_to_string(root.join("src/sql/execution/shared_path.rs"))
         .expect("shared_path.rs should be readable");
-    let intent_source = fs::read_to_string(root.join("src/sql/execution/intent.rs"))
+    let intent_source = fs::read_to_string(root.join("src/query_runtime/intent.rs"))
         .expect("intent.rs should be readable");
 
     assert!(

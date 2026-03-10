@@ -247,8 +247,8 @@ pub(crate) struct TransactionBackendAdapter<'a> {
 }
 
 pub(crate) struct CollectedExecutionSideEffects {
-    pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
-    pending_file_delete_targets: BTreeSet<(String, String)>,
+    pub(crate) pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
+    pub(crate) pending_file_delete_targets: BTreeSet<(String, String)>,
 }
 
 #[derive(Default)]
@@ -433,7 +433,7 @@ fn direct_state_file_cache_refresh_targets(
         .collect()
 }
 
-fn should_run_binary_cas_gc(
+pub(crate) fn should_run_binary_cas_gc(
     mutations: &[MutationRow],
     filesystem_payload_domain_changes: &[FilesystemPayloadDomainChange],
 ) -> bool {
@@ -525,7 +525,7 @@ where
         .collect()
 }
 
-fn dedupe_filesystem_payload_domain_changes(
+pub(crate) fn dedupe_filesystem_payload_domain_changes(
     changes: &[FilesystemPayloadDomainChange],
 ) -> Vec<FilesystemPayloadDomainChange> {
     dedupe_detected_changes(changes)

@@ -22,6 +22,8 @@ mod materialization;
 mod observe;
 mod plugin;
 mod query_runtime;
+mod runtime_post_commit;
+mod runtime_sql_effects;
 mod schema;
 mod schema_registry;
 mod snapshot;

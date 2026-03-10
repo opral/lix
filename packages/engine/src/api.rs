@@ -1,7 +1,9 @@
-use super::sql::execution::{apply_effects_post_commit, apply_effects_tx, shared_path};
+use super::sql::execution::shared_path;
 use crate::internal_state::script::extract_explicit_transaction_script_from_statements;
 use crate::query_runtime::parse::parse_sql;
 use crate::query_runtime::execute;
+use crate::runtime_post_commit;
+use crate::runtime_sql_effects;
 use super::*;
 use crate::errors;
 
@@ -228,7 +230,7 @@ impl Engine {
             execution.postprocess_file_cache_targets.clone(),
         );
 
-        apply_effects_tx::apply_sql_backed_effects(
+        runtime_sql_effects::apply_sql_backed_effects(
             self,
             &prepared.plan.preprocess.mutations,
             &prepared.intent.pending_file_writes,
@@ -243,7 +245,7 @@ impl Engine {
         state_commit_stream_changes.extend(execution.state_commit_stream_changes);
         let should_emit_observe_tick = !state_commit_stream_changes.is_empty();
 
-        apply_effects_post_commit::apply_runtime_post_commit_effects(
+        runtime_post_commit::apply_runtime_post_commit_effects(
             self,
             cache_targets.file_cache_refresh_targets,
             if effects_are_authoritative {
