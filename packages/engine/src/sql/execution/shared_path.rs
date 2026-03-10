@@ -204,7 +204,6 @@ pub(crate) async fn prepare_execution_with_backend(
                 .as_ref()
                 .and_then(|prepared| prepared.dependency_spec.clone()),
             functions.clone(),
-            &intent.detected_file_domain_changes_by_statement,
             &intent.pending_file_delete_targets,
             &authoritative_pending_file_write_targets(&intent.pending_file_writes),
             writer_key,
