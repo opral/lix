@@ -1,4 +1,4 @@
-use crate::engine::sql::ast::utils::{
+use crate::engine::sql_ast::utils::{
     bind_sql_with_state, bind_sql_with_state_and_appended_params, PlaceholderState,
 };
 use crate::query_runtime::contracts::planner_error::PlannerError;

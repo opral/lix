@@ -17,19 +17,19 @@ use crate::version::{
 };
 use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value as EngineValue};
 
-use crate::engine::sql::ast::lowering::lower_statement;
-use crate::engine::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
+use crate::engine::sql_ast::lowering::lower_statement;
+use crate::engine::sql_ast::utils::{bind_sql_with_state, PlaceholderState};
 use crate::query_runtime::execute_prepared::{
     execute_prepared_with_backend, execute_prepared_with_transaction,
 };
 use crate::internal_state::{InternalStatePlan, PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
 use crate::query_runtime::contracts::prepared_statement::PreparedStatement;
-use crate::engine::sql::history::commit_runtime::{
+use crate::engine::query_history::commit_runtime::{
     bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
     load_commit_active_accounts, load_version_info_for_versions, CommitQueryExecutor,
     StatementBatch,
 };
-use crate::engine::sql::storage::sql_text::escape_sql_string;
+use crate::engine::query_storage::sql_text::escape_sql_string;
 use crate::LixBackend;
 
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";

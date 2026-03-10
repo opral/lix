@@ -1,6 +1,6 @@
 use std::ops::ControlFlow;
 
-use crate::engine::sql::ast::walk::object_name_matches;
+use crate::engine::sql_ast::walk::object_name_matches;
 use crate::functions::LixFunctionProvider;
 use sqlparser::ast::{Expr, Function, FunctionArguments, Statement, Value as SqlValue};
 use sqlparser::ast::{VisitMut, VisitorMut};

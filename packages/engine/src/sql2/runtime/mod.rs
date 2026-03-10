@@ -1,5 +1,5 @@
 use crate::commit::load_committed_version_tip_commit_id;
-use crate::engine::sql::semantics::state_resolution::canonical::statement_targets_table_name;
+use crate::engine::query_semantics::state_resolution::canonical::statement_targets_table_name;
 use crate::errors::file_data_expects_bytes_error;
 use crate::history_timeline::ensure_history_timeline_materialized_for_root;
 use crate::sql2::backend::PushdownDecision;

@@ -68,35 +68,14 @@ fn guardrail_engine_runtime_section_excludes_legacy_sql_pipeline_imports() {
 
 #[test]
 fn guardrail_sql_runtime_forbids_legacy_sql2_imports() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql");
-    let mut files = Vec::new();
-    collect_rust_sources(&root, &mut files);
-
-    for file in files {
-        let source = fs::read_to_string(&file).expect("source file should be readable");
-        let is_transition_shim =
-            file.ends_with(Path::new("src/query_runtime/shared_path.rs"));
-        assert!(
-            !source.contains("crate::engine::sql2::"),
-            "sql runtime must not depend on removed engine::sql2 bridge paths: {}",
-            file.display()
-        );
-        assert!(
-            is_transition_shim || !source.contains("crate::sql2::"),
-            "sql runtime must not depend on sql2 outside the shared_path transition shim: {}",
-            file.display()
-        );
-        assert!(
-            !source.contains("contracts::legacy_sql"),
-            "sql runtime must not depend on removed legacy_sql contracts: {}",
-            file.display()
-        );
-    }
-
     let shared_path_source = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/query_runtime/shared_path.rs"),
     )
         .expect("shared_path.rs should be readable");
+    assert!(
+        !shared_path_source.contains("crate::engine::sql2::"),
+        "shared_path must not depend on removed engine::sql2 bridge paths"
+    );
     assert!(
         shared_path_source.contains("prepare_sql2_read"),
         "shared_path transition shim should invoke sql2 read preparation during migration"
@@ -114,7 +93,7 @@ fn guardrail_sql_legacy_contract_adapter_directory_stays_removed() {
 
 #[test]
 fn guardrail_sql_runtime_forbids_legacy_bridge_usage() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     collect_rust_sources(&root, &mut files);
 
@@ -178,8 +157,8 @@ fn guardrail_sql2_directory_exists_alongside_legacy_sql_runtime() {
         "src/sql2 directory must exist for the semantic rewrite"
     );
     assert!(
-        root.join("src/sql").exists(),
-        "src/sql runtime directory must remain available during migration"
+        !root.join("src/sql").exists(),
+        "src/sql runtime directory should be removed once only generic namespaces remain"
     );
 }
 
@@ -202,8 +181,8 @@ fn guardrail_sql2_stays_isolated_from_legacy_rewrite_followup_and_classifier_mod
         let source = fs::read_to_string(&file).expect("source file should be readable");
         for forbidden in [
             "crate::engine::sql::planning::",
-            "crate::engine::sql::ast::utils",
-            "crate::sql::ast::utils",
+            "crate::engine::sql_ast::utils",
+            "crate::sql_ast::utils",
             "crate::engine::sql::execution::followup",
             "crate::engine::sql::surfaces",
             "rewrite_engine",
@@ -404,8 +383,8 @@ fn guardrail_runtime_source_forbids_crate_sql_imports() {
 #[test]
 fn guardrail_side_effect_placeholder_advancement_is_ast_based() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let ast_utils_source = fs::read_to_string(root.join("src/sql/ast/utils.rs"))
-        .expect("sql/ast/utils.rs should be readable");
+    let ast_utils_source = fs::read_to_string(root.join("src/sql_ast/utils.rs"))
+        .expect("sql_ast/utils.rs should be readable");
 
     assert!(
         ast_utils_source.contains("advance_placeholder_state_for_statement_ast"),
@@ -425,7 +404,7 @@ fn guardrail_side_effect_placeholder_advancement_is_ast_based() {
 fn guardrail_live_filesystem_effects_do_not_carry_cache_invalidation_targets() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let effects_source =
-        fs::read_to_string(root.join("src/sql/semantics/state_resolution/effects.rs"))
+        fs::read_to_string(root.join("src/query_semantics/state_resolution/effects.rs"))
             .expect("effects.rs should be readable");
 
     assert!(

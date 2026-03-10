@@ -3,13 +3,13 @@ use super::{
     should_run_binary_cas_gc, CollectedExecutionSideEffects, DeferredTransactionSideEffects,
     Engine, TransactionBackendAdapter,
 };
-use crate::engine::sql::history::plugin_inputs as history_plugin_inputs;
+use crate::engine::query_history::plugin_inputs as history_plugin_inputs;
 use crate::query_runtime::execute_prepared::execute_prepared_with_transaction;
 use crate::query_runtime::preprocess::preprocess_sql_to_plan;
-use crate::engine::sql::storage::queries::{
+use crate::engine::query_storage::queries::{
     filesystem as filesystem_queries, history as history_queries, state as state_queries,
 };
-use crate::engine::sql::storage::tables;
+use crate::engine::query_storage::tables;
 use crate::query_runtime::contracts::effects::FilesystemPayloadDomainChange;
 use crate::{ExecuteOptions, LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
 use sqlparser::ast::Statement;

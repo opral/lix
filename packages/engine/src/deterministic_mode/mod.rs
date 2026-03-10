@@ -1,8 +1,8 @@
 use serde_json::Value as JsonValue;
 
-use crate::engine::sql::ast::utils::parse_sql_statements;
+use crate::engine::sql_ast::utils::parse_sql_statements;
 use crate::query_runtime::preprocess::preprocess_statements_with_provider_to_plan as preprocess_statements_with_provider;
-use crate::engine::sql::storage::sql_text::escape_sql_string;
+use crate::engine::query_storage::sql_text::escape_sql_string;
 use crate::error_classification::is_missing_relation_error;
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};

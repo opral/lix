@@ -4,7 +4,7 @@ use crate::account::{
     active_account_storage_version_id, parse_active_account_snapshot,
 };
 use crate::builtin_schema::builtin_schema_definition;
-use crate::engine::sql::storage::sql_text::escape_sql_string;
+use crate::engine::query_storage::sql_text::escape_sql_string;
 use crate::filesystem::live_projection::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
     FilesystemProjectionScope,
