@@ -927,11 +927,33 @@ mod tests {
     use super::{
         build_untracked_union_query, extract_plugin_keys_from_query,
         extract_plugin_keys_from_top_level_derived_subquery, extract_pushdown_predicate,
+        rewrite_query,
     };
-    use crate::engine::sql::planning::rewrite_engine::preprocess_sql_rewrite_only as preprocess_sql;
+    use crate::sql_shared::ast::parse_sql_statements;
+    use crate::LixError;
     use sqlparser::ast::{Query, Statement};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
+
+    struct PreprocessSqlOutput {
+        sql: String,
+    }
+
+    fn preprocess_sql(sql: &str) -> Result<PreprocessSqlOutput, LixError> {
+        let mut statements = parse_sql_statements(sql)?;
+        let statement = statements.remove(0);
+        let rewritten = match statement {
+            Statement::Query(query) => {
+                let original_query = *query;
+                let query = rewrite_query(original_query.clone(), &[])?.unwrap_or(original_query);
+                Statement::Query(Box::new(query))
+            }
+            other => other,
+        };
+        Ok(PreprocessSqlOutput {
+            sql: rewritten.to_string(),
+        })
+    }
 
     fn compact_sql(sql: &str) -> String {
         sql.chars().filter(|c| !c.is_whitespace()).collect()

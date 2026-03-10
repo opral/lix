@@ -416,7 +416,7 @@ fn hex_nibble(byte: u8) -> Result<u8, LixError> {
 #[cfg(test)]
 mod tests {
     use super::{resolve_values_rows, RowSourceResolver};
-    use crate::engine::sql::planning::rewrite_engine::parse_sql_statements;
+    use crate::sql_shared::ast::parse_sql_statements;
     use crate::Value;
     use sqlparser::ast::{Insert, SetExpr, Statement};
 
