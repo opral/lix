@@ -325,6 +325,48 @@ fn guardrail_dead_rewrite_engine_filesystem_coalescer_stays_removed() {
 }
 
 #[test]
+fn guardrail_dead_rewrite_engine_filesystem_analysis_stays_removed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !root.join("src/sql/planning/rewrite_engine/analysis.rs").exists(),
+        "dead rewrite_engine filesystem analysis helper must stay removed"
+    );
+}
+
+#[test]
+fn guardrail_dead_canonical_filesystem_write_wrapper_stays_removed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !root.join("src/sql/planning/rewrite_engine/pipeline/rules/statement/canonical/filesystem_write.rs").exists(),
+        "dead canonical filesystem write wrapper must stay removed"
+    );
+}
+
+#[test]
+fn guardrail_live_transaction_script_filesystem_coalescer_stays_removed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script_source = fs::read_to_string(root.join("src/sql/planning/script.rs"))
+        .expect("script.rs should be readable");
+    let scripts_source =
+        fs::read_to_string(root.join("src/sql/scripts.rs")).expect("scripts.rs readable");
+    let engine_source =
+        fs::read_to_string(root.join("src/engine.rs")).expect("engine.rs should be readable");
+
+    assert!(
+        !script_source.contains("coalesce_lix_file_transaction_statements"),
+        "live transaction-script filesystem coalescer must stay removed from script.rs"
+    );
+    assert!(
+        !scripts_source.contains("coalesce_lix_file_transaction_statements"),
+        "sql/scripts.rs must not call the removed lix_file transaction coalescer"
+    );
+    assert!(
+        !engine_source.contains("coalesce_lix_file_transaction_statements"),
+        "engine.rs tests must not pin the removed lix_file transaction coalescer"
+    );
+}
+
+#[test]
 fn guardrail_legacy_query_pipeline_context_and_validator_are_filesystem_blind() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let context_source = fs::read_to_string(

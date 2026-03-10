@@ -8,12 +8,12 @@ use crate::engine::sql::planning::rewrite_engine::steps::lix_change_view_write;
 use crate::engine::sql::planning::rewrite_engine::steps::lix_state_history_view_write;
 use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
 use crate::engine::sql::planning::rewrite_engine::DetectedFileDomainChange;
+use crate::filesystem::mutation_rewrite;
 use crate::filesystem::mutation_rewrite::FilesystemUpdateRewrite;
 use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) mod entity_view_write;
-pub(crate) mod filesystem_write;
 pub(crate) mod lix_active_account_write;
 pub(crate) mod lix_active_version_write;
 pub(crate) mod lix_state_by_version_write;
@@ -140,7 +140,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 lix_change_view_write::reject_insert(&insert)?;
                 lix_state_history_view_write::reject_insert(&insert)?;
 
-                if let Some(rewritten) = filesystem_write::rewrite_insert(insert.clone())? {
+                if let Some(rewritten) = mutation_rewrite::rewrite_insert(insert.clone())? {
                     current = Statement::Insert(rewritten);
                     continue;
                 }
@@ -227,7 +227,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 lix_change_view_write::reject_update(&update)?;
                 lix_state_history_view_write::reject_update(&update)?;
 
-                if let Some(rewritten) = filesystem_write::rewrite_update(update.clone())? {
+                if let Some(rewritten) = mutation_rewrite::rewrite_update(update.clone())? {
                     match rewritten {
                         FilesystemUpdateRewrite::EffectOnly => {
                             return Ok(StatementRuleOutcome::Emit(
@@ -262,7 +262,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 lix_change_view_write::reject_delete(&delete)?;
                 lix_state_history_view_write::reject_delete(&delete)?;
 
-                if let Some(rewritten) = filesystem_write::rewrite_delete(delete.clone())? {
+                if let Some(rewritten) = mutation_rewrite::rewrite_delete(delete.clone())? {
                     current = Statement::Delete(rewritten);
                     continue;
                 }
@@ -380,7 +380,7 @@ where
                 lix_state_history_view_write::reject_insert(&insert)?;
 
                 let filesystem_insert_side_effects =
-                    filesystem_write::insert_side_effects_with_backend(
+                    mutation_rewrite::insert_side_effect_statements_with_backend(
                         backend,
                         &insert,
                         context.params,
@@ -405,7 +405,7 @@ where
                         .map(sql_change_to_detected_file_domain_change),
                 );
 
-                let insert = if let Some(rewritten) = filesystem_write::rewrite_insert_with_backend(
+                let insert = if let Some(rewritten) = mutation_rewrite::rewrite_insert_with_backend(
                     backend,
                     insert.clone(),
                     context.params,
@@ -550,7 +550,7 @@ where
                 lix_change_view_write::reject_update(&update)?;
                 lix_state_history_view_write::reject_update(&update)?;
 
-                if let Some(rewritten) = filesystem_write::rewrite_update_with_backend(
+                if let Some(rewritten) = mutation_rewrite::rewrite_update_with_backend(
                     backend,
                     update.clone(),
                     context.params,
@@ -651,7 +651,7 @@ where
                 lix_state_history_view_write::reject_delete(&delete)?;
 
                 let mut effective_scope_fallback = false;
-                let delete = if let Some(rewritten) = filesystem_write::rewrite_delete_with_backend(
+                let delete = if let Some(rewritten) = mutation_rewrite::rewrite_delete_with_backend(
                     backend,
                     delete.clone(),
                     context.params,
