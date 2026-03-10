@@ -22,6 +22,14 @@ use super::rewrite_output::StatementRewriteOutput;
 use super::script::coalesce_vtable_inserts_in_transactions;
 use sqlparser::ast::Statement;
 
+pub(crate) fn rewrite_public_read_statement_to_lowered_sql(
+    statement: &mut Statement,
+    dialect: SqlDialect,
+) -> Result<Statement, LixError> {
+    rewrite_supported_public_read_surfaces_in_statement(statement)?;
+    lower_statement(statement.clone(), dialect)
+}
+
 struct RewrittenStatementBinding {
     statement: Statement,
     appended_params: Arc<Vec<Value>>,

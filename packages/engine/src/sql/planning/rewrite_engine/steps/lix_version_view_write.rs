@@ -7,8 +7,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::engine::sql::planning::rewrite_engine::lowering::lower_statement;
-use crate::engine::sql::planning::rewrite_engine::steps::{lix_version_view_read, vtable_read};
+use crate::engine::sql::planning::preprocess::rewrite_public_read_statement_to_lowered_sql;
 use crate::engine::sql::planning::rewrite_engine::{
     bind_sql_with_state, escape_sql_string, object_name_matches, resolve_expr_cell_with_state,
     PlaceholderState, RowSourceResolver,
@@ -484,17 +483,8 @@ async fn query_lix_version_rows(
                 .to_string(),
         });
     }
-    let Statement::Query(query) = statements.remove(0) else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "version row loader query must be SELECT".to_string(),
-        });
-    };
-
-    let query = *query;
-    let query = lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = vtable_read::rewrite_query(query.clone(), params)?.unwrap_or(query);
-    let lowered = lower_statement(Statement::Query(Box::new(query)), backend.dialect())?;
+    let mut statement = statements.remove(0);
+    let lowered = rewrite_public_read_statement_to_lowered_sql(&mut statement, backend.dialect())?;
     let bound = bind_sql_with_state(
         &lowered.to_string(),
         params,
