@@ -12,7 +12,7 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::schema_from_stored_snapshot;
 use crate::schema_registry::register_schema_sql_statements;
 use crate::sql2::runtime::{
-    prepare_sql2_read, try_prepare_sql2_write, Sql2PreparedRead, Sql2PreparedWrite,
+    prepare_sql2_read, try_prepare_sql2_write, Sql2PreparedWrite,
 };
 use crate::state_commit_stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
@@ -58,7 +58,6 @@ pub(crate) struct PreparedExecutionContext {
     pub(crate) sequence_start: i64,
     pub(crate) functions: SharedFunctionProvider<RuntimeFunctionProvider>,
     pub(crate) plan: ExecutionPlan,
-    pub(crate) sql2_read: Option<Sql2PreparedRead>,
     pub(crate) sql2_write: Option<Sql2PreparedWrite>,
 }
 
@@ -264,7 +263,6 @@ pub(crate) async fn prepare_execution_with_backend(
         sequence_start,
         functions,
         plan,
-        sql2_read,
         sql2_write,
     })
 }

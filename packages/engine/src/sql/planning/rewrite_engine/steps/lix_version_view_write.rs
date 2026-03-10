@@ -743,25 +743,6 @@ fn field_required_string(
     })
 }
 
-fn field_optional_string(
-    index: Option<&usize>,
-    resolved_row: &[crate::engine::sql::planning::rewrite_engine::ResolvedCell],
-    _original_row: &[Expr],
-    field: &str,
-) -> Result<Option<String>, LixError> {
-    let Some(index) = index else {
-        return Ok(None);
-    };
-    let value = resolved_row
-        .get(*index)
-        .and_then(|cell| cell.value.as_ref())
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("lix_version insert '{field}' must be literal or parameter"),
-        })?;
-    value_optional_string(value, field)
-}
-
 fn field_optional_bool(
     index: Option<&usize>,
     resolved_row: &[crate::engine::sql::planning::rewrite_engine::ResolvedCell],
@@ -791,17 +772,6 @@ fn value_required_string(value: &EngineValue, field: &str) -> Result<String, Lix
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("lix_version field '{field}' must be a string"),
-        }),
-    }
-}
-
-fn value_optional_string(value: &EngineValue, field: &str) -> Result<Option<String>, LixError> {
-    match value {
-        EngineValue::Text(text) => Ok(Some(text.clone())),
-        EngineValue::Null => Ok(None),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("lix_version field '{field}' must be a string or NULL"),
         }),
     }
 }

@@ -97,7 +97,6 @@ pub struct Engine {
     access_to_internal: bool,
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
     plugin_component_cache: Mutex<BTreeMap<String, crate::plugin::runtime::CachedPluginComponent>>,
-    intent_pipeline_telemetry: IntentPipelineTelemetry,
     state_commit_stream_bus: Arc<StateCommitStreamBus>,
     pub(crate) observe_shared_sources:
         Mutex<BTreeMap<String, Arc<Mutex<crate::observe::SharedObserveSource>>>>,
@@ -248,12 +247,6 @@ pub(crate) struct DeferredTransactionSideEffects {
     pending_file_delete_targets: BTreeSet<(String, String)>,
 }
 
-#[derive(Default)]
-struct IntentPipelineTelemetry {
-    verification_checks: AtomicU64,
-    verification_failures: AtomicU64,
-}
-
 fn reject_internal_table_writes(statements: &[Statement]) -> Result<(), LixError> {
     for statement in statements {
         if statement_writes_to_lix_internal_table(statement) {
@@ -376,27 +369,11 @@ impl Engine {
             access_to_internal: args.access_to_internal,
             installed_plugins_cache: RwLock::new(None),
             plugin_component_cache: Mutex::new(BTreeMap::new()),
-            intent_pipeline_telemetry: IntentPipelineTelemetry::default(),
             state_commit_stream_bus: Arc::new(StateCommitStreamBus::default()),
             observe_shared_sources: Mutex::new(BTreeMap::new()),
             active_transactions: Mutex::new(BTreeMap::new()),
             next_transaction_handle_id: AtomicU64::new(1),
         }
-    }
-
-    pub(crate) fn record_intent_verification_checks(&self, count: usize) {
-        if count == 0 {
-            return;
-        }
-        self.intent_pipeline_telemetry
-            .verification_checks
-            .fetch_add(count as u64, Ordering::Relaxed);
-    }
-
-    pub(crate) fn record_intent_verification_failure(&self) {
-        self.intent_pipeline_telemetry
-            .verification_failures
-            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -569,8 +546,10 @@ mod tests {
         boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
-    use crate::engine::sql::ast::utils::parse_sql_statements;
-    use crate::engine::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
+    use crate::engine::sql::ast::utils::{
+        advance_placeholder_state_for_statement_ast, bind_sql_with_state, parse_sql_statements,
+        PlaceholderState,
+    };
     use crate::engine::sql::ast::walk::contains_transaction_control_statement;
     use crate::engine::sql::contracts::planned_statement::UpdateValidationPlan;
     use crate::engine::sql::history::plugin_inputs::file_history_read_materialization_required_for_statements;
@@ -578,7 +557,6 @@ mod tests {
     use crate::engine::sql::semantics::state_resolution::canonical::is_query_only_statements;
     use crate::engine::sql::semantics::state_resolution::effects::active_version_from_update_validations;
     use crate::engine::sql::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
-    use crate::engine::sql::side_effects::advance_placeholder_state_for_statement;
     use crate::engine::Engine;
     use crate::plugin::types::{InstalledPlugin, PluginRuntime};
     use crate::version::active_version_schema_key;
@@ -1097,9 +1075,9 @@ mod tests {
             Value::Text("/archive/b.json".to_string()),
         ];
         let mut placeholder_state = PlaceholderState::new();
-        advance_placeholder_state_for_statement(
+        advance_placeholder_state_for_statement_ast(
             &statements.remove(0),
-            &params,
+            params.len(),
             &mut placeholder_state,
         )
         .expect("advance placeholder state for first statement");
