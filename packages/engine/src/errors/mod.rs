@@ -312,12 +312,12 @@ mod tests {
         assert!(classification_src.contains("errors::table_not_found_read_error()"));
 
         let state_history_write_src = include_str!(
-            "../sql/planning/rewrite_engine/pipeline/rules/statement/canonical/mod.rs"
+            "../sql/planning/rewrite_engine/canonical_write.rs"
         );
         assert!(state_history_write_src.contains("errors::read_only_view_write_error("));
 
         let change_write_src = include_str!(
-            "../sql/planning/rewrite_engine/pipeline/rules/statement/canonical/mod.rs"
+            "../sql/planning/rewrite_engine/canonical_write.rs"
         );
         assert!(change_write_src.contains("errors::read_only_view_write_error("));
 

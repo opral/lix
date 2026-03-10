@@ -329,9 +329,9 @@ fn guardrail_dead_canonical_filesystem_write_wrapper_stays_removed() {
 fn guardrail_legacy_canonical_statement_rewrite_is_filesystem_blind() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let canonical_mod_source = fs::read_to_string(
-        root.join("src/sql/planning/rewrite_engine/pipeline/rules/statement/canonical/mod.rs"),
+        root.join("src/sql/planning/rewrite_engine/canonical_write.rs"),
     )
-    .expect("canonical/mod.rs should be readable");
+    .expect("canonical_write.rs should be readable");
 
     for forbidden in [
         "mutation_rewrite::rewrite_insert(",

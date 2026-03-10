@@ -4,7 +4,7 @@ pub(crate) mod stored_schema;
 pub(crate) mod vtable_read;
 #[path = "steps/vtable_write.rs"]
 pub(crate) mod vtable_write;
-#[path = "pipeline/rules/statement/canonical/mod.rs"]
+#[path = "canonical_write.rs"]
 mod canonical;
 
 use crate::functions::LixFunctionProvider;
