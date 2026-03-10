@@ -5,9 +5,9 @@ use sqlparser::ast::{
 };
 
 use crate::engine::sql::planning::rewrite_engine::{
-    object_name_matches, MutationOperation, MutationRow, ResolvedCell, RowSourceResolver,
-    SchemaRegistration,
+    object_name_matches, ResolvedCell, RowSourceResolver, SchemaRegistration,
 };
+use crate::engine::sql::planning::rewrite_engine::types::{MutationOperation, MutationRow};
 use crate::{LixError, Value as EngineValue};
 
 const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
