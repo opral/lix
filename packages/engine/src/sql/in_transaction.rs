@@ -121,33 +121,9 @@ impl Engine {
                     .detected_file_domain_changes
                     .extend(prepared.intent.detected_file_domain_changes.clone());
             }
-            deferred.untracked_filesystem_update_domain_changes.extend(
-                prepared
-                    .intent
-                    .untracked_filesystem_update_domain_changes
-                    .clone(),
-            );
         } else {
             let filesystem_payload_changes_already_committed =
                 shared_path::sql2_commits_filesystem_payload_domain_changes(&prepared);
-            if !prepared
-                .intent
-                .untracked_filesystem_update_domain_changes
-                .is_empty()
-            {
-                self.persist_untracked_file_domain_changes_in_transaction(
-                    transaction,
-                    &prepared.intent.untracked_filesystem_update_domain_changes,
-                )
-                .await
-                .map_err(|error| LixError {
-                    code: error.code,
-                    description: format!(
-                        "transaction untracked filesystem side effects failed: {}",
-                        error.description
-                    ),
-                })?;
-            }
             if !filesystem_payload_changes_already_committed {
                 self.persist_pending_file_data_updates_in_transaction(
                     transaction,
