@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::planner_error::PlannerError;
 use super::super::contracts::result_contract::ResultContract;
-use super::super::surfaces::registry::preprocess_with_surfaces;
+use super::preprocess::preprocess_with_surfaces_to_plan;
 use super::dependency_spec::derive_dependency_spec_from_statements;
 use super::derive_effects::derive_plan_effects;
 use super::derive_requirements::derive_plan_requirements;
@@ -30,7 +30,7 @@ where
     P: LixFunctionProvider + Send + 'static,
 {
     let result_contract = derive_result_contract(&parsed_statements)?;
-    let preprocess = preprocess_with_surfaces(
+    let preprocess = preprocess_with_surfaces_to_plan(
         backend,
         evaluator,
         parsed_statements.clone(),

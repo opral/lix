@@ -3019,7 +3019,7 @@ mod tests {
                    ) VALUES ('ovr-1', 'Original', 'lix', 'lix', '1')";
         let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
         let statement = statements.remove(0);
-        let pipeline = StatementPipeline::new(&[], None, None);
+        let pipeline = StatementPipeline::new(&[], None);
         let mut provider = SystemFunctionProvider;
 
         let output = pipeline

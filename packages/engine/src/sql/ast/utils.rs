@@ -5,8 +5,6 @@ use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Insert, ObjectNamePart,
     SetExpr, Statement, Value as SqlValue, VisitMut, VisitorMut,
 };
-#[cfg(test)]
-use sqlparser::ast::Visitor;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -89,7 +87,7 @@ pub(crate) fn bind_sql_with_state_and_appended_params(
 
 #[cfg(test)]
 pub(crate) fn advance_placeholder_state_for_statement_ast(
-    statement: &Statement,
+    statement: &mut Statement,
     params_len: usize,
     state: &mut PlaceholderState,
 ) -> Result<(), LixError> {
@@ -175,10 +173,10 @@ struct PlaceholderStateAdvancer<'a> {
 }
 
 #[cfg(test)]
-impl Visitor for PlaceholderStateAdvancer<'_> {
+impl VisitorMut for PlaceholderStateAdvancer<'_> {
     type Break = LixError;
 
-    fn pre_visit_value(&mut self, value: &SqlValue) -> ControlFlow<Self::Break> {
+    fn pre_visit_value(&mut self, value: &mut SqlValue) -> ControlFlow<Self::Break> {
         let SqlValue::Placeholder(token) = value else {
             return ControlFlow::Continue(());
         };

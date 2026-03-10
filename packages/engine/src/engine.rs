@@ -1076,7 +1076,7 @@ mod tests {
         ];
         let mut placeholder_state = PlaceholderState::new();
         advance_placeholder_state_for_statement_ast(
-            &statements.remove(0),
+            &mut statements[0],
             params.len(),
             &mut placeholder_state,
         )
