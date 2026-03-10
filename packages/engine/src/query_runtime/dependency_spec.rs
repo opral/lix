@@ -7,7 +7,7 @@ use sqlparser::ast::{
 };
 use sqlparser::ast::{Visit, Visitor};
 
-use super::super::ast::utils::{bind_sql_with_state, parse_sql_statements, PlaceholderState};
+use crate::engine::sql::ast::utils::{bind_sql_with_state, parse_sql_statements, PlaceholderState};
 use crate::query_runtime::contracts::dependency_spec::{DependencyPrecision, DependencySpec};
 use crate::state_commit_stream::StateCommitStreamFilter;
 use crate::{LixError, SqlDialect, Value};

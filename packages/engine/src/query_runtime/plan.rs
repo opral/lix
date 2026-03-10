@@ -9,11 +9,11 @@ use crate::query_runtime::contracts::result_contract::ResultContract;
 use crate::{LixBackend, Value};
 use sqlparser::ast::Statement;
 
-use crate::engine::sql::planning::dependency_spec::derive_dependency_spec_from_statements;
-use crate::engine::sql::planning::derive_effects::derive_plan_effects;
-use crate::engine::sql::planning::derive_requirements::derive_plan_requirements;
-use crate::engine::sql::planning::invariants::validate_execution_plan;
 use crate::engine::sql::planning::preprocess::preprocess_with_surfaces_to_plan;
+use crate::query_runtime::dependency_spec::derive_dependency_spec_from_statements;
+use crate::query_runtime::derive_effects::derive_plan_effects;
+use crate::query_runtime::derive_requirements::derive_plan_requirements;
+use crate::query_runtime::invariants::validate_execution_plan;
 
 pub(crate) async fn build_execution_plan<P>(
     backend: &dyn LixBackend,
