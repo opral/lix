@@ -17,7 +17,9 @@ use super::super::contracts::postprocess_actions::PostprocessPlan;
 use super::super::contracts::result_contract::ResultContract;
 use super::super::planning::lower_sql::lower_to_prepared_statements;
 use super::execute_prepared::{execute_prepared_with_backend, execute_prepared_with_transaction};
-use super::followup::{build_delete_followup_statements, build_update_followup_statements};
+use super::internal_vtable_followup::{
+    build_delete_followup_statements, build_update_followup_statements,
+};
 
 pub(crate) struct SqlExecutionOutcome {
     pub(crate) public_result: QueryResult,
