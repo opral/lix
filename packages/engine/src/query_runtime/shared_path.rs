@@ -451,7 +451,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_backend(
         return Ok(None);
     }
 
-    let mut transaction = engine.backend.begin_transaction().await?;
+    let mut transaction: Box<dyn LixTransaction> = engine.backend.begin_transaction().await?;
     let execution = match maybe_execute_sql2_write_with_transaction(
         engine,
         transaction.as_mut(),

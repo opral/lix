@@ -74,7 +74,8 @@ fn guardrail_sql_runtime_forbids_legacy_sql2_imports() {
 
     for file in files {
         let source = fs::read_to_string(&file).expect("source file should be readable");
-        let is_transition_shim = file.ends_with(Path::new("src/sql/execution/shared_path.rs"));
+        let is_transition_shim =
+            file.ends_with(Path::new("src/query_runtime/shared_path.rs"));
         assert!(
             !source.contains("crate::engine::sql2::"),
             "sql runtime must not depend on removed engine::sql2 bridge paths: {}",
@@ -92,7 +93,9 @@ fn guardrail_sql_runtime_forbids_legacy_sql2_imports() {
         );
     }
 
-    let shared_path_source = fs::read_to_string(root.join("execution/shared_path.rs"))
+    let shared_path_source = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/query_runtime/shared_path.rs"),
+    )
         .expect("shared_path.rs should be readable");
     assert!(
         shared_path_source.contains("prepare_sql2_read"),
@@ -239,8 +242,8 @@ fn guardrail_filesystem_public_surfaces_do_not_enter_legacy_query_rewrite() {
 fn guardrail_legacy_filesystem_step_wrapper_is_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !root.join("src/sql/planning/internal_vtable").exists(),
-        "legacy filesystem step wrapper must stay removed"
+        !root.join("src/sql/execution").exists(),
+        "legacy sql/execution directory must stay removed once the shared-path shim is rehomed"
     );
 }
 
@@ -348,7 +351,7 @@ fn guardrail_sql_side_effects_stays_off_legacy_filesystem_update_detector() {
         fs::read_to_string(root.join("src/runtime_effects.rs")).expect("runtime_effects readable");
     let intent_source =
         fs::read_to_string(root.join("src/query_runtime/intent.rs")).expect("intent readable");
-    let shared_path_source = fs::read_to_string(root.join("src/sql/execution/shared_path.rs"))
+    let shared_path_source = fs::read_to_string(root.join("src/query_runtime/shared_path.rs"))
         .expect("shared_path readable");
 
     for forbidden in [
@@ -461,7 +464,8 @@ fn guardrail_live_filesystem_intent_path_has_no_plugin_detection_branch() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let side_effects_source = fs::read_to_string(root.join("src/runtime_effects.rs"))
         .expect("runtime_effects.rs should be readable");
-    let shared_path_source = fs::read_to_string(root.join("src/sql/execution/shared_path.rs"))
+    let shared_path_source =
+        fs::read_to_string(root.join("src/query_runtime/shared_path.rs"))
         .expect("shared_path.rs should be readable");
     let intent_source = fs::read_to_string(root.join("src/query_runtime/intent.rs"))
         .expect("intent.rs should be readable");
