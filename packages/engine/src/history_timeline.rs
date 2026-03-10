@@ -17,9 +17,13 @@ pub(crate) async fn ensure_history_timeline_materialized_for_root(
 
     let start_depth = built_max_depth.map_or(0, |built| built.saturating_add(1));
     let query_start = if start_depth > 0 { start_depth - 1 } else { 0 };
-    let source_rows =
-        load_phase1_source_rows_for_root_range(backend, root_commit_id, query_start, required_depth)
-            .await?;
+    let source_rows = load_phase1_source_rows_for_root_range(
+        backend,
+        root_commit_id,
+        query_start,
+        required_depth,
+    )
+    .await?;
     let breakpoints = derive_breakpoints_from_source_rows(root_commit_id, start_depth, source_rows);
     insert_breakpoints(backend, &breakpoints).await?;
     upsert_timeline_status(backend, root_commit_id, required_depth).await?;

@@ -9,8 +9,8 @@ use crate::materialization::{
     MaterializationWrite, MaterializationWriteOp,
 };
 use crate::version::{
-    version_pointer_storage_version_id, version_pointer_file_id, version_pointer_plugin_key,
-    version_pointer_schema_key, GLOBAL_VERSION_ID,
+    version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key,
+    version_pointer_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 
@@ -242,15 +242,15 @@ async fn select_tip_commit_from_ancestry(
     let mut resolved_tip = None;
     for candidate in candidate_commit_ids {
         let dominates_all = candidate_commit_ids.iter().all(|other| {
-            candidate == other
-                || ancestry_pairs.contains(&(candidate.clone(), other.clone()))
+            candidate == other || ancestry_pairs.contains(&(candidate.clone(), other.clone()))
         });
         if dominates_all {
             if resolved_tip.is_some() {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "pointer tip fallback found multiple candidate tips in commit ancestry"
-                        .to_string(),
+                    description:
+                        "pointer tip fallback found multiple candidate tips in commit ancestry"
+                            .to_string(),
                 });
             }
             resolved_tip = Some(candidate.clone());

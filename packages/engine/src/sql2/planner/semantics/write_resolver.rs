@@ -30,9 +30,8 @@ use crate::version::{
     active_version_storage_version_id, parse_active_version_snapshot, version_descriptor_file_id,
     version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content,
-    version_descriptor_storage_version_id,
-    version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key,
-    version_pointer_schema_version, version_pointer_snapshot_content,
+    version_descriptor_storage_version_id, version_pointer_file_id, version_pointer_plugin_key,
+    version_pointer_schema_key, version_pointer_schema_version, version_pointer_snapshot_content,
     version_pointer_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, Value};
@@ -416,8 +415,8 @@ async fn load_active_filesystem_version_id(
     };
     let Some(snapshot_content) = row.first().and_then(text_from_value) else {
         return Err(WriteResolveError {
-            message:
-                "sql2 filesystem active-version lookup expected snapshot_content text".to_string(),
+            message: "sql2 filesystem active-version lookup expected snapshot_content text"
+                .to_string(),
         });
     };
     parse_active_version_snapshot(&snapshot_content).map_err(write_resolve_backend_error)
@@ -437,14 +436,9 @@ async fn resolve_directory_insert_write_plan(
     let version_id = resolved_filesystem_version_id(backend, planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
 
-    let computed = resolve_directory_insert_target(
-        backend,
-        planned_write,
-        payload,
-        &version_id,
-        lookup_scope,
-    )
-    .await?;
+    let computed =
+        resolve_directory_insert_target(backend, planned_write, payload, &version_id, lookup_scope)
+            .await?;
     let mut intended_post_state = Vec::new();
     let mut lineage = Vec::new();
 
@@ -705,14 +699,9 @@ async fn resolve_file_insert_write_plan(
     };
     let version_id = resolved_filesystem_version_id(backend, planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
-    let computed = resolve_file_insert_target(
-        backend,
-        planned_write,
-        payload,
-        &version_id,
-        lookup_scope,
-    )
-    .await?;
+    let computed =
+        resolve_file_insert_target(backend, planned_write, payload, &version_id, lookup_scope)
+            .await?;
     let payload_bytes = payload_binary_value(payload, "data")?;
 
     let mut intended_post_state = Vec::new();
@@ -969,8 +958,7 @@ async fn resolve_file_insert_target(
     .await?;
 
     if let Some(existing_id) =
-        lookup_file_id_by_path(backend, version_id, &parsed.normalized_path, lookup_scope)
-            .await?
+        lookup_file_id_by_path(backend, version_id, &parsed.normalized_path, lookup_scope).await?
     {
         let same_id = explicit_id
             .as_deref()
@@ -1119,8 +1107,7 @@ async fn resolve_missing_directory_rows(
 
     for candidate_path in paths {
         if let Some(existing_id) =
-            lookup_directory_id_by_path(backend, version_id, &candidate_path, lookup_scope)
-                .await?
+            lookup_directory_id_by_path(backend, version_id, &candidate_path, lookup_scope).await?
         {
             known_ids.insert(candidate_path, existing_id);
             continue;
@@ -1261,14 +1248,11 @@ async fn resolve_directory_insert_target(
                 message: "Directory name must be provided".to_string(),
             })?;
         let derived_parent_id = match parent_directory_path(&normalized_path) {
-            Some(parent_path) => lookup_directory_id_by_path(
-                backend,
-                version_id,
-                &parent_path,
-                lookup_scope,
-            )
-            .await?
-            .or_else(|| Some(auto_directory_id(version_id, &parent_path))),
+            Some(parent_path) => {
+                lookup_directory_id_by_path(backend, version_id, &parent_path, lookup_scope)
+                    .await?
+                    .or_else(|| Some(auto_directory_id(version_id, &parent_path)))
+            }
             None => None,
         };
 
@@ -1299,16 +1283,13 @@ async fn resolve_directory_insert_target(
         })?;
         let name = normalize_path_segment(&raw_name).map_err(write_resolve_backend_error)?;
         let parent_path = match explicit_parent_id.as_deref() {
-            Some(parent_id) => lookup_directory_path_by_id(
-                backend,
-                version_id,
-                parent_id,
-                lookup_scope,
-            )
-            .await?
-            .ok_or_else(|| WriteResolveError {
-                message: format!("Parent directory does not exist for id {parent_id}"),
-            })?,
+            Some(parent_id) => {
+                lookup_directory_path_by_id(backend, version_id, parent_id, lookup_scope)
+                    .await?
+                    .ok_or_else(|| WriteResolveError {
+                        message: format!("Parent directory does not exist for id {parent_id}"),
+                    })?
+            }
             None => "/".to_string(),
         };
         let computed_path = compose_directory_path(parent_path.as_str(), &name)
@@ -1332,8 +1313,7 @@ async fn resolve_directory_insert_target(
             });
         }
     }
-    ensure_no_file_at_directory_path(backend, version_id, &normalized_path, lookup_scope)
-        .await?;
+    ensure_no_file_at_directory_path(backend, version_id, &normalized_path, lookup_scope).await?;
 
     let mut ancestor_rows = Vec::new();
     for ancestor_path in directory_ancestor_paths(&normalized_path) {
@@ -1344,9 +1324,9 @@ async fn resolve_directory_insert_target(
             continue;
         }
         let ancestor_parent_id = match parent_directory_path(&ancestor_path) {
-            Some(path) => Some(
-                lookup_or_auto_directory_id(backend, version_id, &path, lookup_scope).await?,
-            ),
+            Some(path) => {
+                Some(lookup_or_auto_directory_id(backend, version_id, &path, lookup_scope).await?)
+            }
             None => None,
         };
         ancestor_rows.push(DirectoryFilesystemRow {
@@ -1399,16 +1379,16 @@ async fn resolve_directory_update_target(
             message: "Directory name must be provided".to_string(),
         })?;
         let parent_id = match parent_directory_path(&normalized_path) {
-            Some(parent_path) => lookup_directory_id_by_path(
-                backend,
-                version_id,
-                &parent_path,
-                lookup_scope,
-            )
-            .await?
-            .ok_or_else(|| WriteResolveError {
-                message: format!("Parent directory does not exist for path {}", parent_path),
-            })?,
+            Some(parent_path) => {
+                lookup_directory_id_by_path(backend, version_id, &parent_path, lookup_scope)
+                    .await?
+                    .ok_or_else(|| WriteResolveError {
+                        message: format!(
+                            "Parent directory does not exist for path {}",
+                            parent_path
+                        ),
+                    })?
+            }
             None => String::new(),
         };
         let parent_id_opt = if parent_id.is_empty() {
@@ -1422,16 +1402,13 @@ async fn resolve_directory_update_target(
         let name_raw = next_name.unwrap_or_else(|| current_row.name.clone());
         let name = normalize_path_segment(&name_raw).map_err(write_resolve_backend_error)?;
         let parent_path = match parent_id.as_deref() {
-            Some(parent_id) => lookup_directory_path_by_id(
-                backend,
-                version_id,
-                parent_id,
-                lookup_scope,
-            )
-                .await?
-                .ok_or_else(|| WriteResolveError {
-                    message: format!("Parent directory does not exist for id {}", parent_id),
-                })?,
+            Some(parent_id) => {
+                lookup_directory_path_by_id(backend, version_id, parent_id, lookup_scope)
+                    .await?
+                    .ok_or_else(|| WriteResolveError {
+                        message: format!("Parent directory does not exist for id {}", parent_id),
+                    })?
+            }
             None => "/".to_string(),
         };
         let path = compose_directory_path(parent_path.as_str(), &name)
@@ -1560,9 +1537,11 @@ async fn lookup_or_auto_directory_id(
     path: &str,
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<String, WriteResolveError> {
-    Ok(lookup_directory_id_by_path(backend, version_id, path, lookup_scope)
-        .await?
-        .unwrap_or_else(|| auto_directory_id(version_id, path)))
+    Ok(
+        lookup_directory_id_by_path(backend, version_id, path, lookup_scope)
+            .await?
+            .unwrap_or_else(|| auto_directory_id(version_id, path)),
+    )
 }
 
 async fn lookup_directory_id_by_path(
@@ -1571,9 +1550,11 @@ async fn lookup_directory_id_by_path(
     path: &str,
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<Option<String>, WriteResolveError> {
-    Ok(load_directory_row_by_path(backend, version_id, path, lookup_scope)
-        .await?
-        .map(|row| row.id))
+    Ok(
+        load_directory_row_by_path(backend, version_id, path, lookup_scope)
+            .await?
+            .map(|row| row.id),
+    )
 }
 
 async fn lookup_file_id_by_path(
@@ -1582,9 +1563,11 @@ async fn lookup_file_id_by_path(
     path: &str,
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<Option<String>, WriteResolveError> {
-    Ok(load_file_row_by_path(backend, version_id, path, lookup_scope)
-        .await?
-        .map(|row| row.id))
+    Ok(
+        load_file_row_by_path(backend, version_id, path, lookup_scope)
+            .await?
+            .map(|row| row.id),
+    )
 }
 
 async fn lookup_directory_path_by_id(
@@ -1593,9 +1576,11 @@ async fn lookup_directory_path_by_id(
     directory_id: &str,
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<Option<String>, WriteResolveError> {
-    Ok(load_directory_row_by_id(backend, version_id, directory_id, lookup_scope)
-        .await?
-        .map(|row| row.path))
+    Ok(
+        load_directory_row_by_id(backend, version_id, directory_id, lookup_scope)
+            .await?
+            .map(|row| row.path),
+    )
 }
 
 async fn ensure_no_file_at_directory_path(

@@ -1,8 +1,8 @@
 use sqlparser::ast::{Delete, Insert, Update};
 
+use crate::filesystem::mutation_rewrite;
 pub(crate) use crate::filesystem::mutation_rewrite::FilesystemUpdateRewrite;
 use crate::filesystem::mutation_rewrite::{FilesystemInsertSideEffects, ResolvedDirectoryIdMap};
-use crate::filesystem::mutation_rewrite;
 use crate::{LixBackend, LixError, Value as EngineValue};
 
 pub fn rewrite_insert(insert: Insert) -> Result<Option<Insert>, LixError> {

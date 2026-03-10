@@ -1352,8 +1352,7 @@ simulation_test!(
             "SELECT * should expose columns for comparison"
         );
         assert!(
-            select_star
-                .statements[0]
+            select_star.statements[0]
                 .columns
                 .contains(&"lixcol_commit_created_at".to_string()),
             "filesystem history select-star columns should expose lixcol_commit_created_at"

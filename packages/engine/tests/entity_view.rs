@@ -525,8 +525,7 @@ simulation_test!(
             .await
             .expect_err("expected schema validation failure");
         assert!(
-            err.description
-                .contains("is not of type \"string\""),
+            err.description.contains("is not of type \"string\""),
             "unexpected error: {}",
             err.description
         );
@@ -678,23 +677,27 @@ simulation_test!(
             .collect::<Vec<_>>();
         let global_name = versioned_names
             .iter()
-            .find_map(|(_, global, name)| {
-                if *global {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            })
+            .find_map(
+                |(_, global, name)| {
+                    if *global {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                },
+            )
             .expect("expected global-backed row");
         let main_name = versioned_names
             .iter()
-            .find_map(|(_, global, name)| {
-                if !*global {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            })
+            .find_map(
+                |(_, global, name)| {
+                    if !*global {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                },
+            )
             .expect("expected main row");
         assert_eq!(global_name, "Updated");
         assert_eq!(main_name, "Main");

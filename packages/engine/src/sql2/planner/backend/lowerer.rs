@@ -425,9 +425,9 @@ fn build_nested_filesystem_surface_query(surface_name: &str) -> Result<Option<Qu
         "lix_directory" => parse_single_query(&build_filesystem_directory_projection_sql(
             FilesystemProjectionScope::ActiveVersion,
         ))?,
-        "lix_directory_by_version" => parse_single_query(&build_filesystem_directory_projection_sql(
-            FilesystemProjectionScope::ExplicitVersion,
-        ))?,
+        "lix_directory_by_version" => parse_single_query(
+            &build_filesystem_directory_projection_sql(FilesystemProjectionScope::ExplicitVersion),
+        )?,
         "lix_file_history" => {
             let state_history_source_sql = build_filesystem_history_source_sql(&[], true);
             parse_single_query(&build_filesystem_file_history_projection_sql(
@@ -476,7 +476,10 @@ fn select_contains_nested_filesystem_surface(select: &Select, top_level: bool) -
             .selection
             .as_ref()
             .is_some_and(expr_contains_nested_filesystem_surface)
-        || select.projection.iter().any(select_item_contains_nested_filesystem_surface)
+        || select
+            .projection
+            .iter()
+            .any(select_item_contains_nested_filesystem_surface)
 }
 
 fn table_with_joins_contains_nested_filesystem_surface(
@@ -496,14 +499,11 @@ fn table_factor_contains_nested_filesystem_surface(
 ) -> bool {
     match relation {
         TableFactor::Table { name, .. } => {
-            !top_level
-                && table_name_terminal(name)
-                    .is_some_and(is_filesystem_public_surface_name)
+            !top_level && table_name_terminal(name).is_some_and(is_filesystem_public_surface_name)
         }
-        TableFactor::Derived { subquery, .. } => query_set_expr_contains_nested_filesystem_surface(
-            subquery.body.as_ref(),
-            false,
-        ),
+        TableFactor::Derived { subquery, .. } => {
+            query_set_expr_contains_nested_filesystem_surface(subquery.body.as_ref(), false)
+        }
         TableFactor::NestedJoin {
             table_with_joins, ..
         } => table_with_joins_contains_nested_filesystem_surface(table_with_joins, false),
@@ -556,7 +556,10 @@ fn expr_contains_nested_filesystem_surface(expr: &Expr) -> bool {
 }
 
 fn table_name_terminal(name: &sqlparser::ast::ObjectName) -> Option<&str> {
-    name.0.last().and_then(|part| part.as_ident()).map(|ident| ident.value.as_str())
+    name.0
+        .last()
+        .and_then(|part| part.as_ident())
+        .map(|ident| ident.value.as_str())
 }
 
 fn is_filesystem_public_surface_name(name: &str) -> bool {
@@ -1213,7 +1216,8 @@ fn build_state_history_source_sql(
     requested_predicates.extend(requested_root_predicates.clone());
     requested_predicates.extend(requested_version_predicates);
     if force_active_scope && requested_root_predicates.is_empty() {
-        requested_predicates.push("c.id IN (SELECT root_commit_id FROM default_root_commits)".to_string());
+        requested_predicates
+            .push("c.id IN (SELECT root_commit_id FROM default_root_commits)".to_string());
     }
     let requested_where_sql = render_where_clause_sql(&requested_predicates, "WHERE ");
 
@@ -1388,8 +1392,7 @@ fn build_filesystem_history_source_sql(
     let requested_root_predicates = history_requested_root_predicates(pushdown_predicates);
     let requested_version_predicates = history_requested_version_predicates(pushdown_predicates);
     let requested_roots_where = render_where_clause_sql(&requested_root_predicates, " AND ");
-    let requested_versions_where =
-        render_where_clause_sql(&requested_version_predicates, " AND ");
+    let requested_versions_where = render_where_clause_sql(&requested_version_predicates, " AND ");
     let default_root_scope = if force_active_scope && requested_root_predicates.is_empty() {
         "AND ( \
            d.root_commit_id IS NOT NULL \

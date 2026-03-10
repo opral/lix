@@ -8,10 +8,7 @@ use super::{
     lix_state_by_version, lix_state_history, lix_version, lix_working_changes,
 };
 
-pub(crate) fn rewrite_query(
-    query: Query,
-    _params: &[Value],
-) -> Result<QueryRuleOutcome, LixError> {
+pub(crate) fn rewrite_query(query: Query, _params: &[Value]) -> Result<QueryRuleOutcome, LixError> {
     let mut current = query;
     let mut changed = false;
 

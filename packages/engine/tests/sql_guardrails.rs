@@ -251,10 +251,11 @@ fn guardrail_filesystem_public_surfaces_do_not_enter_legacy_surface_classifier()
 #[test]
 fn guardrail_filesystem_public_surfaces_do_not_enter_legacy_query_rewrite() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let logical_views_source = fs::read_to_string(
-        root.join("src/sql/planning/rewrite_engine/pipeline/rules/query/canonical/logical_views.rs"),
-    )
-    .expect("logical_views.rs should be readable");
+    let logical_views_source =
+        fs::read_to_string(root.join(
+            "src/sql/planning/rewrite_engine/pipeline/rules/query/canonical/logical_views.rs",
+        ))
+        .expect("logical_views.rs should be readable");
 
     assert!(
         !logical_views_source.contains("filesystem_views::rewrite_query"),

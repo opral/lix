@@ -726,7 +726,10 @@ fn reject_forbidden_default_state_write_column(
         return Ok(());
     }
 
-    if matches!(raw_column.to_ascii_lowercase().as_str(), "version_id" | "lixcol_version_id") {
+    if matches!(
+        raw_column.to_ascii_lowercase().as_str(),
+        "version_id" | "lixcol_version_id"
+    ) {
         return Err(CanonicalizeError::unsupported(format!(
             "lix_state {operation} cannot set version_id; active version is resolved automatically"
         )));
@@ -751,11 +754,15 @@ fn reject_forbidden_default_state_selector(
 }
 
 fn default_state_surface_rejects_version_id(surface_binding: &SurfaceBinding) -> bool {
-    surface_binding.descriptor.public_name.eq_ignore_ascii_case("lix_state")
+    surface_binding
+        .descriptor
+        .public_name
+        .eq_ignore_ascii_case("lix_state")
 }
 
 fn contains_version_id_reference(expr: &Expr) -> bool {
-    contains_column_reference(expr, "version_id") || contains_column_reference(expr, "lixcol_version_id")
+    contains_column_reference(expr, "version_id")
+        || contains_column_reference(expr, "lixcol_version_id")
 }
 
 fn contains_column_reference(expr: &Expr, column: &str) -> bool {

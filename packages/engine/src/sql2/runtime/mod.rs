@@ -273,10 +273,7 @@ fn requested_history_root_commit_ids(statement: &Statement) -> Vec<String> {
     roots.into_iter().collect()
 }
 
-fn collect_history_root_commit_ids(
-    expr: &Expr,
-    roots: &mut std::collections::BTreeSet<String>,
-) {
+fn collect_history_root_commit_ids(expr: &Expr, roots: &mut std::collections::BTreeSet<String>) {
     match expr {
         Expr::BinaryOp { left, op, right } => {
             if *op == BinaryOperator::And {

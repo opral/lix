@@ -521,11 +521,8 @@ impl Engine {
             return Ok(());
         }
 
-        let snapshot_content = version_descriptor_snapshot_content(
-            entity_id,
-            name,
-            entity_id == GLOBAL_VERSION_ID,
-        );
+        let snapshot_content =
+            version_descriptor_snapshot_content(entity_id, name, entity_id == GLOBAL_VERSION_ID);
         let change_id = format!("seed~{}~{}", version_descriptor_schema_key(), entity_id);
         let insert_sql = format!(
             "INSERT INTO {table} (\
