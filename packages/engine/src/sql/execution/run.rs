@@ -10,10 +10,11 @@ use crate::{Engine, LixError, LixTransaction, QueryResult};
 use super::super::contracts::effects::PlanEffects;
 use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::executor_error::ExecutorError;
-use crate::internal_state::followup::execute_postprocess_with_transaction;
+use crate::internal_state::followup::{
+    execute_internal_state_plan_with_backend, execute_internal_state_plan_with_transaction,
+};
 use super::super::contracts::result_contract::ResultContract;
 use super::super::planning::lower_sql::lower_to_prepared_statements;
-use super::execute_prepared::{execute_prepared_with_backend, execute_prepared_with_transaction};
 
 pub(crate) struct SqlExecutionOutcome {
     pub(crate) public_result: QueryResult,
@@ -38,51 +39,20 @@ pub(crate) async fn execute_plan_sql(
             .map_err(ExecutorError::execute)?;
     }
 
-    let mut postprocess_file_cache_targets = BTreeSet::new();
-    let mut plugin_changes_committed = false;
-    let mut state_commit_stream_changes = Vec::new();
-    let internal_result = match plan
-        .preprocess
-        .internal_state
-        .as_ref()
-        .and_then(|plan| plan.postprocess.as_ref())
-    {
-        None => {
-            let result =
-                execute_prepared_with_backend(engine.backend.as_ref(), &prepared_statements)
-                    .await
-                    .map_err(ExecutorError::execute)?;
-            result
-        }
-        Some(postprocess_plan) => {
-            let mut transaction = engine
-                .backend
-                .begin_transaction()
-                .await
-                .map_err(ExecutorError::execute)?;
-            let outcome = match execute_postprocess_with_transaction(
-                transaction.as_mut(),
-                &prepared_statements,
-                postprocess_plan,
-                should_refresh_file_cache,
-                functions,
-                writer_key,
-            )
-            .await
-            {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(ExecutorError::execute(error));
-                }
-            };
-            transaction.commit().await.map_err(ExecutorError::execute)?;
-            plugin_changes_committed = true;
-            postprocess_file_cache_targets = outcome.postprocess_file_cache_targets;
-            state_commit_stream_changes = outcome.state_commit_stream_changes;
-            outcome.internal_result
-        }
-    };
+    let outcome = execute_internal_state_plan_with_backend(
+        engine.backend.as_ref(),
+        &prepared_statements,
+        plan.preprocess.internal_state.as_ref(),
+        should_refresh_file_cache,
+        functions,
+        writer_key,
+    )
+    .await
+    .map_err(ExecutorError::execute)?;
+    let plugin_changes_committed = plan.preprocess.internal_state.is_some();
+    let postprocess_file_cache_targets = outcome.postprocess_file_cache_targets;
+    let state_commit_stream_changes = outcome.state_commit_stream_changes;
+    let internal_result = outcome.internal_result;
     let public_result = public_result_from_contract(plan.result_contract, &internal_result);
 
     Ok(SqlExecutionOutcome {
@@ -114,39 +84,20 @@ pub(crate) async fn execute_plan_sql_with_transaction(
         }
     }
 
-    let mut postprocess_file_cache_targets = BTreeSet::new();
-    let mut plugin_changes_committed = false;
-    let mut state_commit_stream_changes = Vec::new();
-
-    let internal_result = match plan
-        .preprocess
-        .internal_state
-        .as_ref()
-        .and_then(|plan| plan.postprocess.as_ref())
-    {
-        None => {
-            let result = execute_prepared_with_transaction(transaction, &prepared_statements)
-                .await
-                .map_err(ExecutorError::execute)?;
-            result
-        }
-        Some(postprocess_plan) => {
-            let outcome = execute_postprocess_with_transaction(
-                transaction,
-                &prepared_statements,
-                postprocess_plan,
-                should_refresh_file_cache,
-                functions,
-                writer_key,
-            )
-            .await
-                .map_err(ExecutorError::execute)?;
-            postprocess_file_cache_targets = outcome.postprocess_file_cache_targets;
-            state_commit_stream_changes = outcome.state_commit_stream_changes;
-            plugin_changes_committed = true;
-            outcome.internal_result
-        }
-    };
+    let outcome = execute_internal_state_plan_with_transaction(
+        transaction,
+        &prepared_statements,
+        plan.preprocess.internal_state.as_ref(),
+        should_refresh_file_cache,
+        functions,
+        writer_key,
+    )
+    .await
+    .map_err(ExecutorError::execute)?;
+    let postprocess_file_cache_targets = outcome.postprocess_file_cache_targets;
+    let state_commit_stream_changes = outcome.state_commit_stream_changes;
+    let plugin_changes_committed = plan.preprocess.internal_state.is_some();
+    let internal_result = outcome.internal_result;
     let public_result = public_result_from_contract(plan.result_contract, &internal_result);
 
     Ok(SqlExecutionOutcome {
