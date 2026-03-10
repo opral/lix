@@ -11,7 +11,6 @@ pub(crate) async fn apply_sql_backed_effects(
     pending_file_writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
     pending_file_delete_targets: &BTreeSet<(String, String)>,
     detected_file_domain_changes: &[DetectedFileDomainChange],
-    untracked_filesystem_update_domain_changes: &[DetectedFileDomainChange],
     plugin_changes_committed: bool,
     filesystem_payload_changes_already_committed: bool,
     writer_key: Option<&str>,
@@ -45,11 +44,6 @@ pub(crate) async fn apply_sql_backed_effects(
     if !tracked_domain_changes_to_persist.is_empty() {
         engine
             .persist_detected_file_domain_changes(&tracked_domain_changes_to_persist)
-            .await?;
-    }
-    if !untracked_filesystem_update_domain_changes.is_empty() {
-        engine
-            .persist_untracked_file_domain_changes(untracked_filesystem_update_domain_changes)
             .await?;
     }
     if should_run_binary_gc {

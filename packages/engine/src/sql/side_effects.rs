@@ -159,7 +159,7 @@ impl Engine {
         statements: &[Statement],
         params: &[Value],
         active_version_id: &str,
-        writer_key: Option<&str>,
+        _writer_key: Option<&str>,
     ) -> Result<CollectedExecutionSideEffects, LixError> {
         let pending_file_write_collection =
             crate::filesystem::pending_file_writes::collect_pending_file_writes_from_statements(
@@ -198,40 +198,18 @@ impl Engine {
 
         let mut detected_file_domain_changes_by_statement =
             vec![Vec::new(); pending_file_writes_by_statement.len()];
-
-        let filesystem_update_tracked_changes_by_statement = vec![Vec::new(); statements.len()]
-            .iter()
-            .map(|changes| detected_file_domain_changes_with_writer_key(changes, writer_key))
-            .collect::<Vec<_>>();
-        let statement_count = detected_file_domain_changes_by_statement
-            .len()
-            .max(filesystem_update_tracked_changes_by_statement.len());
-        detected_file_domain_changes_by_statement.resize_with(statement_count, Vec::new);
-        for (index, tracked_changes) in filesystem_update_tracked_changes_by_statement
-            .into_iter()
-            .enumerate()
-        {
-            detected_file_domain_changes_by_statement[index].extend(tracked_changes);
-            detected_file_domain_changes_by_statement[index] = dedupe_detected_file_domain_changes(
-                &detected_file_domain_changes_by_statement[index],
-            );
-        }
+        detected_file_domain_changes_by_statement.resize_with(statements.len(), Vec::new);
         let mut detected_file_domain_changes = detected_file_domain_changes_by_statement
             .iter()
             .flat_map(|changes| changes.iter().cloned())
             .collect::<Vec<_>>();
         detected_file_domain_changes =
             dedupe_detected_file_domain_changes(&detected_file_domain_changes);
-        let untracked_filesystem_update_domain_changes = dedupe_detected_file_domain_changes(
-            &detected_file_domain_changes_with_writer_key(&[], writer_key),
-        );
-
         Ok(CollectedExecutionSideEffects {
             pending_file_writes,
             pending_file_delete_targets,
             detected_file_domain_changes_by_statement,
             detected_file_domain_changes,
-            untracked_filesystem_update_domain_changes,
         })
     }
 
@@ -259,9 +237,6 @@ impl Engine {
         detected_file_domain_changes =
             dedupe_detected_file_domain_changes(&detected_file_domain_changes);
         let should_run_binary_gc = should_run_binary_cas_gc(&[], &detected_file_domain_changes);
-        let untracked_filesystem_update_domain_changes = dedupe_detected_file_domain_changes(
-            &std::mem::take(&mut side_effects.untracked_filesystem_update_domain_changes),
-        );
         let _ = std::mem::take(&mut side_effects.pending_file_delete_targets);
 
         self.persist_pending_file_data_updates_in_transaction(
@@ -273,13 +248,6 @@ impl Engine {
             self.persist_detected_file_domain_changes_in_transaction(
                 transaction,
                 &detected_file_domain_changes,
-            )
-            .await?;
-        }
-        if !untracked_filesystem_update_domain_changes.is_empty() {
-            self.persist_untracked_file_domain_changes_in_transaction(
-                transaction,
-                &untracked_filesystem_update_domain_changes,
             )
             .await?;
         }
@@ -299,14 +267,6 @@ impl Engine {
             .await
     }
 
-    pub(crate) async fn persist_untracked_file_domain_changes(
-        &self,
-        changes: &[DetectedFileDomainChange],
-    ) -> Result<(), LixError> {
-        self.persist_detected_file_domain_changes_with_untracked(changes, true)
-            .await
-    }
-
     pub(crate) async fn persist_detected_file_domain_changes_in_transaction(
         &self,
         transaction: &mut dyn LixTransaction,
@@ -316,19 +276,6 @@ impl Engine {
             transaction,
             changes,
             false,
-        )
-        .await
-    }
-
-    pub(crate) async fn persist_untracked_file_domain_changes_in_transaction(
-        &self,
-        transaction: &mut dyn LixTransaction,
-        changes: &[DetectedFileDomainChange],
-    ) -> Result<(), LixError> {
-        self.persist_detected_file_domain_changes_with_untracked_in_transaction(
-            transaction,
-            changes,
-            true,
         )
         .await
     }

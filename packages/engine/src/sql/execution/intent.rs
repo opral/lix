@@ -16,7 +16,6 @@ pub(crate) struct ExecutionIntent {
     pub(crate) pending_file_delete_targets: BTreeSet<(String, String)>,
     pub(crate) detected_file_domain_changes_by_statement: Vec<Vec<DetectedFileDomainChange>>,
     pub(crate) detected_file_domain_changes: Vec<DetectedFileDomainChange>,
-    pub(crate) untracked_filesystem_update_domain_changes: Vec<DetectedFileDomainChange>,
 }
 
 pub(crate) async fn collect_execution_intent_with_backend(
@@ -34,14 +33,12 @@ pub(crate) async fn collect_execution_intent_with_backend(
         pending_file_delete_targets,
         detected_file_domain_changes_by_statement,
         detected_file_domain_changes,
-        untracked_filesystem_update_domain_changes,
     } = if policy.skip_side_effect_collection || requirements.read_only_query {
         CollectedExecutionSideEffects {
             pending_file_writes: Vec::new(),
             pending_file_delete_targets: BTreeSet::new(),
             detected_file_domain_changes_by_statement: Vec::new(),
             detected_file_domain_changes: Vec::new(),
-            untracked_filesystem_update_domain_changes: Vec::new(),
         }
     } else {
         engine
@@ -60,7 +57,6 @@ pub(crate) async fn collect_execution_intent_with_backend(
         pending_file_delete_targets,
         detected_file_domain_changes_by_statement,
         detected_file_domain_changes,
-        untracked_filesystem_update_domain_changes,
     })
 }
 

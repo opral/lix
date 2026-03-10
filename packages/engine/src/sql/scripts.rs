@@ -77,7 +77,6 @@ impl Engine {
                 pending_file_writes,
                 pending_file_delete_targets,
                 detected_file_domain_changes: filesystem_tracked_domain_changes,
-                untracked_filesystem_update_domain_changes,
                 ..
             } = {
                 let backend = TransactionBackendAdapter::new(transaction);
@@ -94,7 +93,6 @@ impl Engine {
                 pending_file_writes,
                 pending_file_delete_targets: pending_file_delete_targets.clone(),
                 detected_file_domain_changes: filesystem_tracked_domain_changes,
-                untracked_filesystem_update_domain_changes,
             })
         } else {
             None
