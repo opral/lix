@@ -2,7 +2,6 @@ use crate::cel::CelEvaluator;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::{LixBackend, LixError, Value};
 
-use super::super::contracts::effects::DetectedFileDomainChange;
 use super::super::contracts::planned_statement::PlannedStatementSet;
 use super::super::planning::preprocess::preprocess_with_surfaces_to_plan;
 use super::super::vtable;
@@ -10,8 +9,6 @@ use super::{
     entity, lix_change, lix_state, lix_state_by_version, lix_state_history, lix_working_changes,
 };
 use sqlparser::ast::Statement;
-
-pub(crate) type DetectedFileDomainChangesByStatement = [Vec<DetectedFileDomainChange>];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SurfaceKind {
@@ -114,7 +111,6 @@ pub(crate) async fn preprocess_with_surfaces<P: LixFunctionProvider>(
     params: &[Value],
     active_version_id_hint: Option<&str>,
     functions: SharedFunctionProvider<P>,
-    detected_file_domain_changes_by_statement: &DetectedFileDomainChangesByStatement,
     writer_key: Option<&str>,
 ) -> Result<PlannedStatementSet, LixError>
 where
@@ -128,7 +124,6 @@ where
         params,
         active_version_id_hint,
         functions,
-        detected_file_domain_changes_by_statement,
         writer_key,
     )
     .await

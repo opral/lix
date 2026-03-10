@@ -178,7 +178,7 @@ impl Engine {
             })?;
         let crate::filesystem::pending_file_writes::PendingFileWriteCollection {
             writes: pending_file_writes,
-            writes_by_statement: pending_file_writes_by_statement,
+            writes_by_statement: _pending_file_writes_by_statement,
         } = pending_file_write_collection;
         let pending_file_delete_targets =
             crate::filesystem::pending_file_writes::collect_pending_file_delete_targets_from_statements(
@@ -196,19 +196,12 @@ impl Engine {
                 ),
             })?;
 
-        let mut detected_file_domain_changes_by_statement =
-            vec![Vec::new(); pending_file_writes_by_statement.len()];
-        detected_file_domain_changes_by_statement.resize_with(statements.len(), Vec::new);
-        let mut detected_file_domain_changes = detected_file_domain_changes_by_statement
-            .iter()
-            .flat_map(|changes| changes.iter().cloned())
-            .collect::<Vec<_>>();
+        let mut detected_file_domain_changes = Vec::new();
         detected_file_domain_changes =
             dedupe_detected_file_domain_changes(&detected_file_domain_changes);
         Ok(CollectedExecutionSideEffects {
             pending_file_writes,
             pending_file_delete_targets,
-            detected_file_domain_changes_by_statement,
             detected_file_domain_changes,
         })
     }

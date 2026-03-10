@@ -7,7 +7,6 @@ use crate::{LixBackend, LixError, SqlDialect, Value};
 
 use super::super::ast::lowering::lower_statement;
 use super::super::ast::utils::parse_sql_statements;
-use super::super::contracts::effects::DetectedFileDomainChange;
 use super::super::contracts::planned_statement::{
     MutationRow, PlannedStatementSet, SchemaRegistration, UpdateValidationPlan,
 };
@@ -93,7 +92,6 @@ async fn preprocess_statements_with_provider_and_backend<P>(
     params: &[Value],
     active_version_id_hint: Option<&str>,
     provider: &mut P,
-    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
     writer_key: Option<&str>,
 ) -> Result<PlannedStatementSet, LixError>
 where
@@ -106,21 +104,11 @@ where
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
 
     for (statement_index, statement) in statements.into_iter().enumerate() {
-        let statement_detected_file_domain_changes = detected_file_domain_changes_by_statement
-            .get(statement_index)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-
         // Keep this async rewrite future boxed to avoid infinitely sized
         // futures in recursive rewrite call paths.
         let output = Box::pin(
             StatementPipeline::new(params, writer_key, active_version_id_hint)
-                .rewrite_statement_with_backend(
-                    backend,
-                    statement,
-                    provider,
-                    statement_detected_file_domain_changes,
-                ),
+                .rewrite_statement_with_backend(backend, statement, provider, &[]),
         )
         .await
         .map_err(|error| LixError {
@@ -189,7 +177,6 @@ where
         sql_text,
         params,
         functions,
-        &[],
         None,
     )
     .await
@@ -201,7 +188,6 @@ async fn preprocess_sql_with_provider_and_detected_file_domain_changes<P: LixFun
     sql_text: &str,
     params: &[Value],
     functions: SharedFunctionProvider<P>,
-    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
     writer_key: Option<&str>,
 ) -> Result<PlannedStatementSet, LixError>
 where
@@ -214,7 +200,6 @@ where
         params,
         None,
         functions,
-        detected_file_domain_changes_by_statement,
         writer_key,
     )
     .await
@@ -227,7 +212,6 @@ pub(crate) async fn preprocess_with_surfaces_to_plan<P: LixFunctionProvider>(
     params: &[Value],
     active_version_id_hint: Option<&str>,
     functions: SharedFunctionProvider<P>,
-    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
     writer_key: Option<&str>,
 ) -> Result<PlannedStatementSet, LixError>
 where
@@ -270,7 +254,6 @@ where
         &params,
         active_version_id_hint,
         &mut provider,
-        detected_file_domain_changes_by_statement,
         writer_key,
     )
     .await

@@ -8,9 +8,7 @@ use std::collections::BTreeSet;
 use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::planner_error::PlannerError;
 use super::super::contracts::result_contract::ResultContract;
-use super::super::surfaces::registry::{
-    preprocess_with_surfaces, DetectedFileDomainChangesByStatement,
-};
+use super::super::surfaces::registry::preprocess_with_surfaces;
 use super::dependency_spec::derive_dependency_spec_from_statements;
 use super::derive_effects::derive_plan_effects;
 use super::derive_requirements::derive_plan_requirements;
@@ -25,7 +23,6 @@ pub(crate) async fn build_execution_plan<P>(
     active_version_id_hint: Option<&str>,
     dependency_spec_override: Option<DependencySpec>,
     functions: SharedFunctionProvider<P>,
-    detected_file_domain_changes_by_statement: &DetectedFileDomainChangesByStatement,
     pending_file_delete_targets: &BTreeSet<(String, String)>,
     authoritative_pending_file_write_targets: &BTreeSet<(String, String)>,
     writer_key: Option<&str>,
@@ -41,7 +38,6 @@ where
         params,
         active_version_id_hint,
         functions,
-        detected_file_domain_changes_by_statement,
         writer_key,
     )
     .await
