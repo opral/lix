@@ -444,18 +444,25 @@ fn guardrail_preprocess_uses_bind_once_path_for_placeholder_binding() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let preprocess_source = fs::read_to_string(root.join("src/sql/planning/preprocess.rs"))
         .expect("sql/planning/preprocess.rs should be readable");
+    let internal_state_source = fs::read_to_string(root.join("src/internal_state/mod.rs"))
+        .expect("internal_state/mod.rs should be readable");
 
     assert!(
-        preprocess_source.contains("bind_statements_with_appended_params_once"),
-        "preprocess should bind placeholders through bind_once helper"
+        preprocess_source.contains("prepare_statements_with_backend_to_plan")
+            && preprocess_source.contains("prepare_statements_sync_to_plan"),
+        "preprocess should delegate statement preparation to the internal_state entrypoints"
     );
     assert!(
-        !preprocess_source.contains("bind_sql_with_state_and_appended_params("),
-        "preprocess should not bind placeholders directly through ast utils"
+        internal_state_source.contains("bind_statements_with_appended_params_once"),
+        "internal_state preparation should bind placeholders through bind_once helper"
     );
     assert!(
-        !preprocess_source.contains("PlaceholderState::new()"),
-        "preprocess should not own placeholder state directly"
+        !internal_state_source.contains("bind_sql_with_state_and_appended_params("),
+        "internal_state preparation should not bind placeholders directly through ast utils"
+    );
+    assert!(
+        !internal_state_source.contains("PlaceholderState::new()"),
+        "internal_state preparation should not own placeholder state directly"
     );
 }
 

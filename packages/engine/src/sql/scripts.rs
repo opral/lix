@@ -1,6 +1,5 @@
 use super::super::*;
-use super::planning::bind_once::bind_script_placeholders_once;
-use crate::internal_state::script::coalesce_vtable_inserts_in_statement_list;
+use crate::internal_state::script::prepare_statement_script_sql_statements;
 use super::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 
 impl Engine {
@@ -95,15 +94,11 @@ impl Engine {
         } else {
             None
         };
-        let sql_statements = if params.is_empty() {
-            coalesce_vtable_inserts_in_statement_list(original_statements)?
-                .into_iter()
-                .map(|statement| (statement.to_string(), Vec::new()))
-                .collect::<Vec<_>>()
-        } else {
-            bind_script_placeholders_once(&original_statements, params, transaction.dialect())
-                .map_err(LixError::from)?
-        };
+        let sql_statements = prepare_statement_script_sql_statements(
+            original_statements,
+            params,
+            transaction.dialect(),
+        )?;
         let skip_statement_side_effect_collection = deferred_side_effects.is_some();
 
         let mut statement_results = Vec::with_capacity(sql_statements.len());

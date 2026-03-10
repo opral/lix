@@ -19,8 +19,10 @@ use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value as EngineVa
 
 use crate::engine::sql::ast::lowering::lower_statement;
 use crate::engine::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
-use crate::engine::sql::execution::execute_prepared::execute_prepared_with_transaction;
-use crate::internal_state::{PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
+use crate::engine::sql::execution::execute_prepared::{
+    execute_prepared_with_backend, execute_prepared_with_transaction,
+};
+use crate::internal_state::{InternalStatePlan, PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
 use crate::engine::sql::contracts::prepared_statement::PreparedStatement;
 use crate::engine::sql::history::commit_runtime::{
     bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
@@ -28,6 +30,7 @@ use crate::engine::sql::history::commit_runtime::{
     StatementBatch,
 };
 use crate::engine::sql::storage::sql_text::escape_sql_string;
+use crate::LixBackend;
 
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
 const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
@@ -47,6 +50,71 @@ pub(crate) struct PostprocessExecutionOutcome {
     pub(crate) internal_result: QueryResult,
     pub(crate) postprocess_file_cache_targets: BTreeSet<(String, String)>,
     pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
+}
+
+pub(crate) async fn execute_internal_state_plan_with_backend(
+    backend: &dyn LixBackend,
+    prepared_statements: &[PreparedStatement],
+    internal_state: Option<&InternalStatePlan>,
+    should_refresh_file_cache: bool,
+    functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
+    writer_key: Option<&str>,
+) -> Result<PostprocessExecutionOutcome, LixError> {
+    let Some(postprocess_plan) = internal_state.and_then(|plan| plan.postprocess.as_ref()) else {
+        return Ok(PostprocessExecutionOutcome {
+            internal_result: execute_prepared_with_backend(backend, prepared_statements).await?,
+            postprocess_file_cache_targets: BTreeSet::new(),
+            state_commit_stream_changes: Vec::new(),
+        });
+    };
+
+    let mut transaction = backend.begin_transaction().await?;
+    let outcome = match execute_postprocess_with_transaction(
+        transaction.as_mut(),
+        prepared_statements,
+        postprocess_plan,
+        should_refresh_file_cache,
+        functions,
+        writer_key,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+    };
+    transaction.commit().await?;
+    Ok(outcome)
+}
+
+pub(crate) async fn execute_internal_state_plan_with_transaction(
+    transaction: &mut dyn LixTransaction,
+    prepared_statements: &[PreparedStatement],
+    internal_state: Option<&InternalStatePlan>,
+    should_refresh_file_cache: bool,
+    functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
+    writer_key: Option<&str>,
+) -> Result<PostprocessExecutionOutcome, LixError> {
+    let Some(postprocess_plan) = internal_state.and_then(|plan| plan.postprocess.as_ref()) else {
+        return Ok(PostprocessExecutionOutcome {
+            internal_result: execute_prepared_with_transaction(transaction, prepared_statements)
+                .await?,
+            postprocess_file_cache_targets: BTreeSet::new(),
+            state_commit_stream_changes: Vec::new(),
+        });
+    };
+
+    execute_postprocess_with_transaction(
+        transaction,
+        prepared_statements,
+        postprocess_plan,
+        should_refresh_file_cache,
+        functions,
+        writer_key,
+    )
+    .await
 }
 
 pub(crate) async fn execute_postprocess_with_transaction(
