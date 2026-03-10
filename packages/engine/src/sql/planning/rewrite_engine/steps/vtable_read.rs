@@ -1067,8 +1067,7 @@ fn expr_references_column(expr: &Expr, column_name: &str) -> bool {
 
     match expr {
         Expr::BinaryOp { left, right, .. } => {
-            expr_references_column(left, column_name)
-                || expr_references_column(right, column_name)
+            expr_references_column(left, column_name) || expr_references_column(right, column_name)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Cast { expr, .. }

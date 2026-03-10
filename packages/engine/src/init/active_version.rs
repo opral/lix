@@ -1,5 +1,8 @@
 use super::*;
-use crate::version::{version_pointer_file_id, version_pointer_schema_key, version_pointer_storage_version_id, GLOBAL_VERSION_ID};
+use crate::version::{
+    version_pointer_file_id, version_pointer_schema_key, version_pointer_storage_version_id,
+    GLOBAL_VERSION_ID,
+};
 
 impl Engine {
     pub(crate) async fn load_latest_commit_id(&self) -> Result<Option<String>, LixError> {

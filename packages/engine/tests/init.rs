@@ -723,7 +723,10 @@ simulation_test!(
             .unwrap();
         assert_eq!(main_authoritative_tip.statements[0].rows.len(), 1);
         assert_eq!(
-            text_value(&main_authoritative_tip.statements[0].rows[0][0], "commit_id"),
+            text_value(
+                &main_authoritative_tip.statements[0].rows[0][0],
+                "commit_id"
+            ),
             baselines.statements[0]
                 .rows
                 .iter()
@@ -752,7 +755,10 @@ simulation_test!(
             .unwrap();
         assert_eq!(global_authoritative_tip.statements[0].rows.len(), 1);
         assert_eq!(
-            text_value(&global_authoritative_tip.statements[0].rows[0][0], "commit_id"),
+            text_value(
+                &global_authoritative_tip.statements[0].rows[0][0],
+                "commit_id"
+            ),
             baselines.statements[0]
                 .rows
                 .iter()

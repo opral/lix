@@ -16,8 +16,8 @@ use super::state_source::{
     load_version_info_for_versions, CommitQueryExecutor,
 };
 use super::types::{
-    DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange,
-    VersionInfo, VersionSnapshot,
+    DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange, VersionInfo,
+    VersionSnapshot,
 };
 
 const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
@@ -557,10 +557,12 @@ mod tests {
                     .version_tips
                     .get(GLOBAL_VERSION_ID)
                     .map(|commit_id| {
-                        vec![Value::Text(crate::version::version_pointer_snapshot_content(
-                            GLOBAL_VERSION_ID,
-                            commit_id,
-                        ))]
+                        vec![Value::Text(
+                            crate::version::version_pointer_snapshot_content(
+                                GLOBAL_VERSION_ID,
+                                commit_id,
+                            ),
+                        )]
                     })
                     .into_iter()
                     .collect::<Vec<_>>();

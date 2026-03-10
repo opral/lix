@@ -1,9 +1,9 @@
 use super::*;
-use crate::SqlDialect;
 use crate::version::{
     version_pointer_file_id, version_pointer_schema_key, version_pointer_storage_version_id,
     GLOBAL_VERSION_ID,
 };
+use crate::SqlDialect;
 
 impl Engine {
     pub async fn init(&self) -> Result<(), LixError> {

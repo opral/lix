@@ -409,9 +409,8 @@ async fn load_exact_tracked_effective_row(
     )
     .await?;
 
-    Ok(row.map(|row| {
-        exact_effective_state_row_from_tracked(row, &request.version_id, overlay_lane)
-    }))
+    Ok(row
+        .map(|row| exact_effective_state_row_from_tracked(row, &request.version_id, overlay_lane)))
 }
 
 async fn load_exact_untracked_effective_row(
@@ -449,7 +448,10 @@ fn exact_effective_state_row_from_tracked(
         row.version_id.clone()
     };
     let mut values = row.values;
-    values.insert("version_id".to_string(), Value::Text(projected_version_id.clone()));
+    values.insert(
+        "version_id".to_string(),
+        Value::Text(projected_version_id.clone()),
+    );
     ExactEffectiveStateRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
@@ -474,7 +476,10 @@ fn exact_effective_state_row_from_untracked(
         row.version_id.clone()
     };
     let mut values = row.values;
-    values.insert("version_id".to_string(), Value::Text(projected_version_id.clone()));
+    values.insert(
+        "version_id".to_string(),
+        Value::Text(projected_version_id.clone()),
+    );
     ExactEffectiveStateRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),

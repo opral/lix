@@ -1039,9 +1039,10 @@ fn entity_hidden_columns() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        builtin_public_surface_columns, builtin_public_surface_names, entity_surface_spec_from_schema,
-        CatalogEpoch, DefaultScopeSemantics, DynamicEntitySurfaceSpec, SurfaceFamily,
-        SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
+        builtin_public_surface_columns, builtin_public_surface_names,
+        entity_surface_spec_from_schema, CatalogEpoch, DefaultScopeSemantics,
+        DynamicEntitySurfaceSpec, SurfaceFamily, SurfaceOverrideValue, SurfaceRegistry,
+        SurfaceVariant,
     };
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
@@ -1110,7 +1111,10 @@ mod tests {
         let names = builtin_public_surface_names();
         let mut seen = HashSet::new();
         for name in names {
-            assert!(seen.insert(name.clone()), "duplicate public surface: {name}");
+            assert!(
+                seen.insert(name.clone()),
+                "duplicate public surface: {name}"
+            );
         }
     }
 

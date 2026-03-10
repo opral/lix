@@ -3887,8 +3887,7 @@ simulation_test!(
             .expect("SELECT * on lix_directory_history should succeed");
         assert_eq!(select_star.statements[0].rows.len(), 1);
         assert!(
-            select_star
-                .statements[0]
+            select_star.statements[0]
                 .columns
                 .contains(&"lixcol_commit_created_at".to_string()),
             "directory history select-star columns should expose lixcol_commit_created_at"

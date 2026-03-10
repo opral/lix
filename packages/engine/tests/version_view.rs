@@ -84,28 +84,31 @@ simulation_test!(
     }
 );
 
-simulation_test!(lix_version_exposes_hidden_global_version, |sim| async move {
-    let engine = sim
-        .boot_simulated_engine(None)
-        .await
-        .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+simulation_test!(
+    lix_version_exposes_hidden_global_version,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
 
-    let result = engine
-        .execute(
-            "SELECT id, name, hidden \
+        let result = engine
+            .execute(
+                "SELECT id, name, hidden \
              FROM lix_version \
              WHERE id = 'global'",
-            &[],
-        )
-        .await
-        .unwrap();
+                &[],
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(result.statements[0].rows.len(), 1);
-    assert_text(&result.statements[0].rows[0][0], "global");
-    assert_text(&result.statements[0].rows[0][1], "global");
-    assert_bool(&result.statements[0].rows[0][2], true);
-});
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_text(&result.statements[0].rows[0][0], "global");
+        assert_text(&result.statements[0].rows[0][1], "global");
+        assert_bool(&result.statements[0].rows[0][2], true);
+    }
+);
 
 simulation_test!(
     lix_version_select_reads_seeded_main_version,

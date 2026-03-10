@@ -1357,8 +1357,7 @@ async fn load_missing_file_history_descriptors(
     backend: &dyn LixBackend,
 ) -> Result<BTreeMap<(String, String, i64), FileHistoryDescriptorRow>, LixError> {
     let history_source_sql = build_filesystem_state_history_source_sql("", "", "", false);
-    let history_projection_sql =
-        build_filesystem_file_history_projection_sql(&history_source_sql);
+    let history_projection_sql = build_filesystem_file_history_projection_sql(&history_source_sql);
     let sql = format!(
         "SELECT \
              history.id AS file_id, \

@@ -243,9 +243,7 @@ fn summarize_planned_rows(rows: &[PlannedStateRow]) -> JsonValue {
     )
 }
 
-fn summarize_value_map(
-    values: &std::collections::BTreeMap<String, crate::Value>,
-) -> JsonValue {
+fn summarize_value_map(values: &std::collections::BTreeMap<String, crate::Value>) -> JsonValue {
     let mut map = Map::new();
     for (key, value) in values {
         map.insert(key.clone(), summarize_engine_value(value));
