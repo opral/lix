@@ -163,6 +163,19 @@ pub(crate) async fn prepare_execution_with_backend(
         &requirements,
         IntentCollectionPolicy {
             skip_side_effect_collection: policy.skip_side_effect_collection,
+            skip_legacy_filesystem_update_side_effect_detection:
+                should_skip_legacy_filesystem_update_side_effect_detection(
+                    derive_result_contract_for_statements(&statements),
+                    sql2_write.as_ref().map(|prepared| {
+                        prepared
+                            .planned_write
+                            .command
+                            .target
+                            .descriptor
+                            .public_name
+                            .as_str()
+                    }),
+                ),
         },
     )
     .await
@@ -280,6 +293,20 @@ fn passthrough_execution_plan_for_sql2_write(
     }
 }
 
+fn should_skip_legacy_filesystem_update_side_effect_detection(
+    result_contract: ResultContract,
+    sql2_write_target_name: Option<&str>,
+) -> bool {
+    matches!(result_contract, ResultContract::DmlNoReturning)
+        && matches!(
+            sql2_write_target_name,
+            Some("lix_file")
+                | Some("lix_file_by_version")
+                | Some("lix_directory")
+                | Some("lix_directory_by_version")
+        )
+}
+
 fn sql2_schema_registrations(sql2_write: &Sql2PreparedWrite) -> Vec<SchemaRegistration> {
     let mut schema_keys = BTreeSet::new();
     if let Some(resolved) = sql2_write.planned_write.resolved_write_plan.as_ref() {
@@ -336,6 +363,53 @@ fn derive_result_contract_for_statements(statements: &[Statement]) -> ResultCont
             }
         }
         Some(_) | None => ResultContract::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_skip_legacy_filesystem_update_side_effect_detection, ResultContract};
+
+    #[test]
+    fn skips_legacy_filesystem_update_detection_for_sql2_filesystem_writes_without_returning() {
+        for target in [
+            "lix_file",
+            "lix_file_by_version",
+            "lix_directory",
+            "lix_directory_by_version",
+        ] {
+            assert!(
+                should_skip_legacy_filesystem_update_side_effect_detection(
+                    ResultContract::DmlNoReturning,
+                    Some(target),
+                ),
+                "expected sql2 filesystem target {target} to bypass legacy update detection"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_legacy_filesystem_update_detection_for_other_shapes() {
+        assert!(!should_skip_legacy_filesystem_update_side_effect_detection(
+            ResultContract::DmlReturning,
+            Some("lix_file"),
+        ));
+        assert!(!should_skip_legacy_filesystem_update_side_effect_detection(
+            ResultContract::DmlNoReturning,
+            Some("lix_file_history"),
+        ));
+        assert!(!should_skip_legacy_filesystem_update_side_effect_detection(
+            ResultContract::DmlNoReturning,
+            Some("lix_state"),
+        ));
+        assert!(!should_skip_legacy_filesystem_update_side_effect_detection(
+            ResultContract::Select,
+            Some("lix_directory"),
+        ));
+        assert!(!should_skip_legacy_filesystem_update_side_effect_detection(
+            ResultContract::DmlNoReturning,
+            None,
+        ));
     }
 }
 
