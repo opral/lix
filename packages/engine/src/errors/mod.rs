@@ -311,17 +311,15 @@ mod tests {
         assert!(classification_src.contains("errors::sql_unknown_column_error("));
         assert!(classification_src.contains("errors::table_not_found_read_error()"));
 
-        let state_history_write_src =
-            include_str!("../sql/planning/rewrite_engine/steps/lix_state_history_view_write.rs");
+        let state_history_write_src = include_str!(
+            "../sql/planning/rewrite_engine/pipeline/rules/statement/canonical/mod.rs"
+        );
         assert!(state_history_write_src.contains("errors::read_only_view_write_error("));
 
-        let change_write_src =
-            include_str!("../sql/planning/rewrite_engine/steps/lix_change_view_write.rs");
+        let change_write_src = include_str!(
+            "../sql/planning/rewrite_engine/pipeline/rules/statement/canonical/mod.rs"
+        );
         assert!(change_write_src.contains("errors::read_only_view_write_error("));
-
-        let entity_view_write_src =
-            include_str!("../sql/planning/rewrite_engine/entity_views/write.rs");
-        assert!(entity_view_write_src.contains("errors::read_only_view_write_error("));
 
         let vtable_write_src = include_str!("../sql/planning/rewrite_engine/steps/vtable_write.rs");
         assert!(vtable_write_src.contains("errors::vtable_schema_key_required_error"));
