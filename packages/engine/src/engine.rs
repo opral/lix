@@ -659,10 +659,7 @@ mod tests {
         file_history_read_materialization_required_for_statements,
         file_read_materialization_scope_for_statements, FileReadMaterializationScope,
     };
-    use crate::engine::sql::planning::script::{
-        coalesce_lix_file_transaction_statements,
-        extract_explicit_transaction_script_from_statements,
-    };
+    use crate::engine::sql::planning::script::extract_explicit_transaction_script_from_statements;
     use crate::engine::sql::semantics::state_resolution::canonical::is_query_only_statements;
     use crate::engine::sql::semantics::state_resolution::effects::active_version_from_update_validations;
     use crate::engine::sql::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
@@ -1444,61 +1441,6 @@ mod tests {
         let statements = parsed.expect("expected explicit transaction script");
         assert_eq!(statements.len(), 1);
         assert!(matches!(statements[0], Statement::Insert(_)));
-    }
-
-    #[test]
-    fn coalesce_lix_file_transaction_statements_rewrites_replay_shape() {
-        let statements = parse_sql_statements(
-            "DELETE FROM lix_file WHERE id IN ('d1');\
-             INSERT INTO lix_file (id, path, data) VALUES ('i1', '/inserted.txt', x'01');\
-             UPDATE lix_file SET path = '/updated-a.txt', data = x'0A' WHERE id = 'u1';\
-             UPDATE lix_file SET path = '/updated-b.txt', data = x'0B' WHERE id = 'u2';",
-        )
-        .expect("parse");
-
-        let rewritten =
-            coalesce_lix_file_transaction_statements(&statements, Some(SqlDialect::Sqlite))
-                .expect("expected coalesced rewrite");
-
-        assert_eq!(rewritten.len(), 3);
-        assert!(rewritten[0].starts_with("DELETE FROM lix_file WHERE id IN ('d1')"));
-        assert!(rewritten[1].starts_with("INSERT INTO lix_file (id, path, data) VALUES "));
-        assert!(rewritten[1].contains("('i1', '/inserted.txt', X'01')"));
-        assert!(rewritten[2].starts_with("UPDATE lix_file SET path = CASE id "));
-        assert!(rewritten[2].contains("WHEN 'u1' THEN '/updated-a.txt'"));
-        assert!(rewritten[2].contains("WHEN 'u2' THEN '/updated-b.txt'"));
-        assert!(rewritten[2].contains("WHEN 'u1' THEN X'0A'"));
-        assert!(rewritten[2].contains("WHEN 'u2' THEN X'0B'"));
-        assert!(rewritten[2].contains("WHERE id IN ('u1', 'u2')"));
-    }
-
-    #[test]
-    fn coalesce_lix_file_transaction_statements_returns_none_for_duplicate_ids() {
-        let statements = parse_sql_statements(
-            "UPDATE lix_file SET path = '/updated-a.txt', data = x'0A' WHERE id = 'u1';\
-             UPDATE lix_file SET path = '/updated-b.txt', data = x'0B' WHERE id = 'u1';",
-        )
-        .expect("parse");
-
-        let rewritten =
-            coalesce_lix_file_transaction_statements(&statements, Some(SqlDialect::Sqlite));
-        assert!(rewritten.is_none());
-    }
-
-    #[test]
-    fn coalesce_lix_file_transaction_statements_returns_none_for_insert_with_extra_columns() {
-        let statements = parse_sql_statements(
-            "INSERT INTO lix_file (id, path, data, metadata) \
-             VALUES ('i1', '/inserted.txt', x'01', '{\"owner\":\"sam\"}');",
-        )
-        .expect("parse");
-
-        let rewritten =
-            coalesce_lix_file_transaction_statements(&statements, Some(SqlDialect::Sqlite));
-        assert!(
-            rewritten.is_none(),
-            "coalescer must not drop non-replay columns from lix_file inserts"
-        );
     }
 
     fn is_query_only_sql(sql: &str) -> bool {

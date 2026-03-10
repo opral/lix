@@ -1,8 +1,6 @@
 use super::super::*;
 use super::planning::bind_once::bind_script_placeholders_once;
-use super::planning::script::{
-    coalesce_lix_file_transaction_statements, coalesce_vtable_inserts_in_statement_list,
-};
+use super::planning::script::coalesce_vtable_inserts_in_statement_list;
 use super::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 
 impl Engine {
@@ -73,14 +71,6 @@ impl Engine {
         active_version_id: &mut String,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
     ) -> Result<ExecuteResult, LixError> {
-        let coalesced_statements = if params.is_empty() {
-            coalesce_lix_file_transaction_statements(
-                &original_statements,
-                Some(transaction.dialect()),
-            )
-        } else {
-            None
-        };
         let can_defer_side_effects = false;
         let mut deferred_side_effects = if can_defer_side_effects {
             let CollectedExecutionSideEffects {
@@ -110,12 +100,7 @@ impl Engine {
         } else {
             None
         };
-        let sql_statements = if let Some(coalesced) = coalesced_statements {
-            coalesced
-                .into_iter()
-                .map(|sql| (sql, Vec::new()))
-                .collect::<Vec<_>>()
-        } else if params.is_empty() {
+        let sql_statements = if params.is_empty() {
             coalesce_vtable_inserts_in_statement_list(original_statements)?
                 .into_iter()
                 .map(|statement| (statement.to_string(), Vec::new()))
