@@ -38,33 +38,8 @@ impl AnalysisContext {
         self.relation_names.contains(name)
     }
 
-    pub(crate) fn references_state_views(&self) -> bool {
-        self.references_relation("lix_state")
-            || self.references_relation("lix_state_by_version")
-            || self.references_relation("lix_working_changes")
-    }
-
-    pub(crate) fn references_entity_views(&self) -> bool {
-        self.relation_names
-            .iter()
-            .any(|name| !is_physical_internal_relation(name) && !is_builtin_logical_relation(name))
-    }
-
     pub(crate) fn has_nested_query_shapes(&self) -> bool {
         self.has_cte || self.has_derived_tables || self.has_expression_subqueries
-    }
-
-    pub(crate) fn references_any_logical_read_view(&self) -> bool {
-        self.references_entity_views()
-            || self.references_relation("lix_change")
-            || self.references_relation("lix_version")
-            || self.references_relation("lix_active_version")
-            || self.references_relation("lix_active_account")
-            || self.references_relation("lix_state")
-            || self.references_relation("lix_state_by_version")
-            || self.references_relation("lix_state_history")
-            || self.references_relation("lix_state_history_by_version")
-            || self.references_relation("lix_working_changes")
     }
 
     pub(crate) fn materialized_schema_keys_cache(&self) -> Option<&[String]> {
@@ -74,22 +49,4 @@ impl AnalysisContext {
     pub(crate) fn set_materialized_schema_keys_cache(&mut self, keys: Vec<String>) {
         self.materialized_schema_keys_cache = Some(keys);
     }
-}
-
-fn is_physical_internal_relation(name: &str) -> bool {
-    name == "lix_internal_state_vtable"
-        || name == "lix_internal_state_untracked"
-        || name.starts_with("lix_internal_state_materialized_v1_")
-}
-
-fn is_builtin_logical_relation(name: &str) -> bool {
-    name == "lix_change"
-        || name == "lix_version"
-        || name == "lix_active_version"
-        || name == "lix_active_account"
-        || name == "lix_state"
-        || name == "lix_state_by_version"
-        || name == "lix_state_history"
-        || name == "lix_state_history_by_version"
-        || name == "lix_working_changes"
 }

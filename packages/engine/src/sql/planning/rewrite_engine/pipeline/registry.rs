@@ -3,7 +3,7 @@ use sqlparser::ast::Query;
 use crate::{LixBackend, LixError, Value};
 
 use super::context::AnalysisContext;
-use super::rules::query::{analyze, canonical, lower, optimize};
+use super::rules::query::{analyze, lower, optimize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RewritePhase {
@@ -16,8 +16,6 @@ pub(crate) enum RewritePhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueryRule {
     AnalyzeRelationDiscovery,
-    CanonicalLogicalViews,
-    Pushdown,
     ProjectionCleanup,
     VtableRead,
 }
@@ -39,9 +37,9 @@ pub(crate) enum StatementRule {
 
 const ANALYZE_RULES: &[QueryRule] = &[QueryRule::AnalyzeRelationDiscovery];
 
-const CANONICALIZE_RULES: &[QueryRule] = &[QueryRule::CanonicalLogicalViews];
+const CANONICALIZE_RULES: &[QueryRule] = &[];
 
-const OPTIMIZE_RULES: &[QueryRule] = &[QueryRule::Pushdown, QueryRule::ProjectionCleanup];
+const OPTIMIZE_RULES: &[QueryRule] = &[QueryRule::ProjectionCleanup];
 
 const LOWER_RULES: &[QueryRule] = &[QueryRule::VtableRead];
 
@@ -79,8 +77,6 @@ impl QueryRule {
     pub(crate) fn matches_context(self, context: &AnalysisContext) -> bool {
         match self {
             Self::AnalyzeRelationDiscovery => true,
-            Self::CanonicalLogicalViews => context.references_any_logical_read_view(),
-            Self::Pushdown => context.references_state_views(),
             Self::ProjectionCleanup => context.has_nested_query_shapes(),
             Self::VtableRead => context.references_relation("lix_internal_state_vtable"),
         }
@@ -101,10 +97,6 @@ impl QueryRule {
                 analyze::relation_discovery::validate_relation_discovery_consistency(&query)?;
                 Ok(QueryRuleOutcome::NoChange)
             }
-            Self::CanonicalLogicalViews => canonical::logical_views::rewrite_query(query, params),
-            Self::Pushdown => Ok(QueryRuleOutcome::from_option(
-                optimize::pushdown::rewrite_query(query)?,
-            )),
             Self::ProjectionCleanup => Ok(QueryRuleOutcome::from_option(
                 optimize::projection_cleanup::rewrite_query(query)?,
             )),
@@ -130,12 +122,6 @@ impl QueryRule {
                 analyze::relation_discovery::validate_relation_discovery_consistency(&query)?;
                 Ok(QueryRuleOutcome::NoChange)
             }
-            Self::CanonicalLogicalViews => {
-                canonical::logical_views::rewrite_query_with_backend(backend, query, params).await
-            }
-            Self::Pushdown => Ok(QueryRuleOutcome::from_option(
-                optimize::pushdown::rewrite_query(query)?,
-            )),
             Self::ProjectionCleanup => Ok(QueryRuleOutcome::from_option(
                 optimize::projection_cleanup::rewrite_query(query)?,
             )),

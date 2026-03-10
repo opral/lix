@@ -106,6 +106,18 @@ pub(crate) fn lower_read_for_execution(
     }
 }
 
+pub(crate) fn rewrite_supported_public_read_surfaces_in_statement(
+    statement: &mut Statement,
+) -> Result<(), LixError> {
+    match statement {
+        Statement::Query(query) => rewrite_supported_public_read_surfaces_in_query(query),
+        Statement::Explain { statement, .. } => {
+            rewrite_supported_public_read_surfaces_in_statement(statement)
+        }
+        _ => Ok(()),
+    }
+}
+
 fn lower_state_read_for_execution(
     canonicalized: &CanonicalizedRead,
     effective_state_request: &EffectiveStateRequest,
@@ -282,6 +294,153 @@ fn rewrite_nested_filesystem_surfaces_in_query(
 ) -> Result<(), LixError> {
     rewrite_nested_filesystem_surfaces_in_set_expr(query.body.as_mut(), top_level)?;
     Ok(())
+}
+
+fn rewrite_supported_public_read_surfaces_in_query(query: &mut Query) -> Result<(), LixError> {
+    rewrite_supported_public_read_surfaces_in_set_expr(query.body.as_mut(), true)
+}
+
+fn rewrite_supported_public_read_surfaces_in_set_expr(
+    expr: &mut SetExpr,
+    top_level: bool,
+) -> Result<(), LixError> {
+    match expr {
+        SetExpr::Select(select) => rewrite_supported_public_read_surfaces_in_select(select, top_level),
+        SetExpr::Query(query) => rewrite_supported_public_read_surfaces_in_set_expr(query.body.as_mut(), false),
+        SetExpr::SetOperation { left, right, .. } => {
+            rewrite_supported_public_read_surfaces_in_set_expr(left.as_mut(), false)?;
+            rewrite_supported_public_read_surfaces_in_set_expr(right.as_mut(), false)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn rewrite_supported_public_read_surfaces_in_select(
+    select: &mut Select,
+    top_level: bool,
+) -> Result<(), LixError> {
+    for table in &mut select.from {
+        rewrite_supported_public_read_surfaces_in_table_with_joins(table, top_level)?;
+    }
+    if let Some(selection) = &mut select.selection {
+        rewrite_supported_public_read_surfaces_in_expr(selection)?;
+    }
+    for item in &mut select.projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                rewrite_supported_public_read_surfaces_in_expr(expr)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_supported_public_read_surfaces_in_table_with_joins(
+    table: &mut TableWithJoins,
+    top_level: bool,
+) -> Result<(), LixError> {
+    rewrite_supported_public_read_surfaces_in_table_factor(&mut table.relation, top_level)?;
+    for join in &mut table.joins {
+        rewrite_supported_public_read_surfaces_in_table_factor(&mut join.relation, top_level)?;
+    }
+    Ok(())
+}
+
+fn rewrite_supported_public_read_surfaces_in_table_factor(
+    relation: &mut TableFactor,
+    top_level: bool,
+) -> Result<(), LixError> {
+    match relation {
+        TableFactor::Table { name, alias, .. } => {
+            let Some(surface_name) = table_name_terminal(name) else {
+                return Ok(());
+            };
+            let Some(derived_query) =
+                build_supported_public_read_surface_query(surface_name, top_level)?
+            else {
+                return Ok(());
+            };
+            let derived_alias = alias.clone().or_else(|| {
+                Some(TableAlias {
+                    explicit: false,
+                    name: Ident::new(surface_name),
+                    columns: Vec::new(),
+                })
+            });
+            *relation = TableFactor::Derived {
+                lateral: false,
+                subquery: Box::new(derived_query),
+                alias: derived_alias,
+            };
+            Ok(())
+        }
+        TableFactor::Derived { subquery, .. } => {
+            rewrite_supported_public_read_surfaces_in_set_expr(subquery.body.as_mut(), false)
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => rewrite_supported_public_read_surfaces_in_table_with_joins(table_with_joins, false),
+        _ => Ok(()),
+    }
+}
+
+fn rewrite_supported_public_read_surfaces_in_expr(expr: &mut Expr) -> Result<(), LixError> {
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_supported_public_read_surfaces_in_expr(left)?;
+            rewrite_supported_public_read_surfaces_in_expr(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => rewrite_supported_public_read_surfaces_in_expr(expr),
+        Expr::InList { expr, list, .. } => {
+            rewrite_supported_public_read_surfaces_in_expr(expr)?;
+            for item in list {
+                rewrite_supported_public_read_surfaces_in_expr(item)?;
+            }
+            Ok(())
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rewrite_supported_public_read_surfaces_in_expr(expr)?;
+            rewrite_supported_public_read_surfaces_in_expr(low)?;
+            rewrite_supported_public_read_surfaces_in_expr(high)
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            rewrite_supported_public_read_surfaces_in_expr(expr)?;
+            rewrite_supported_public_read_surfaces_in_expr(pattern)
+        }
+        Expr::Subquery(query) => rewrite_supported_public_read_surfaces_in_query(query),
+        Expr::Exists { subquery, .. } => rewrite_supported_public_read_surfaces_in_query(subquery),
+        Expr::InSubquery { expr, subquery, .. } => {
+            rewrite_supported_public_read_surfaces_in_expr(expr)?;
+            rewrite_supported_public_read_surfaces_in_query(subquery)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn build_supported_public_read_surface_query(
+    surface_name: &str,
+    top_level: bool,
+) -> Result<Option<Query>, LixError> {
+    match surface_name.to_ascii_lowercase().as_str() {
+        "lix_state_history" => parse_single_query(&build_state_history_source_sql(&[], true)).map(Some),
+        "lix_active_version" => build_admin_source_query(CanonicalAdminKind::ActiveVersion).map(Some),
+        "lix_active_account" => build_admin_source_query(CanonicalAdminKind::ActiveAccount).map(Some),
+        "lix_version" => build_admin_source_query(CanonicalAdminKind::Version).map(Some),
+        "lix_stored_schema" => build_admin_source_query(CanonicalAdminKind::StoredSchema).map(Some),
+        "lix_change" => build_change_source_query().map(Some),
+        "lix_working_changes" => build_working_changes_source_query().map(Some),
+        _ if !top_level && is_filesystem_public_surface_name(surface_name) => {
+            build_nested_filesystem_surface_query(surface_name)
+        }
+        _ => Ok(None),
+    }
 }
 
 fn rewrite_nested_filesystem_surfaces_in_set_expr(

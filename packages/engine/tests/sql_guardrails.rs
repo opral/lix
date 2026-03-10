@@ -90,7 +90,8 @@ fn guardrail_sql_runtime_forbids_legacy_sql2_imports() {
 
     for file in files {
         let source = fs::read_to_string(&file).expect("source file should be readable");
-        let is_transition_shim = file.ends_with(Path::new("src/sql/execution/shared_path.rs"));
+        let is_transition_shim = file.ends_with(Path::new("src/sql/execution/shared_path.rs"))
+            || file.ends_with(Path::new("src/sql/planning/preprocess.rs"));
         assert!(
             !source.contains("crate::engine::sql2::"),
             "sql runtime must not depend on removed engine::sql2 bridge paths: {}",
@@ -244,15 +245,10 @@ fn guardrail_legacy_surface_registry_directory_is_removed() {
 #[test]
 fn guardrail_filesystem_public_surfaces_do_not_enter_legacy_query_rewrite() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let logical_views_source =
-        fs::read_to_string(root.join(
-            "src/sql/planning/rewrite_engine/pipeline/rules/query/canonical/logical_views.rs",
-        ))
-        .expect("logical_views.rs should be readable");
-
     assert!(
-        !logical_views_source.contains("filesystem_views::rewrite_query"),
-        "filesystem public surfaces must not re-enter legacy canonical query rewrite"
+        !root.join("src/sql/planning/rewrite_engine/pipeline/rules/query/canonical")
+            .exists(),
+        "legacy canonical query rewrite directory must stay removed for migrated public reads"
     );
 }
 

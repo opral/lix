@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::cel::CelEvaluator;
 use crate::default_values::apply_vtable_insert_defaults;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
+use crate::sql2::planner::backend::lowerer::rewrite_supported_public_read_surfaces_in_statement;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 use super::super::ast::lowering::lower_statement;
@@ -238,6 +239,16 @@ where
             error.description
         ),
     })?;
+
+    for statement in &mut statements {
+        rewrite_supported_public_read_surfaces_in_statement(statement).map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "preprocess_with_surfaces_to_plan sql2 public-surface lowering failed: {}",
+                error.description
+            ),
+        })?;
+    }
 
     let mut provider = functions.clone();
     preprocess_statements_with_provider_and_backend(
