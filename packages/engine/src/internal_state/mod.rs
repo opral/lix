@@ -1,6 +1,7 @@
 pub(crate) mod stored_schema;
 pub(crate) mod vtable_read;
 pub(crate) mod vtable_write;
+pub(crate) mod materialize;
 #[path = "canonical_write.rs"]
 mod canonical;
 pub(crate) mod followup;
@@ -10,7 +11,9 @@ use crate::functions::LixFunctionProvider;
 use crate::engine::sql::contracts::planned_statement::PlannedStatementSet;
 use crate::sql_shared::ast::parse_sql_statements;
 use crate::{LixBackend, LixError, Value};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{ObjectNamePart, Query, Statement, TableFactor, Visit, Visitor};
+use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 
 pub(crate) use crate::engine::sql::ast::walk::object_name_matches;
 pub(crate) use crate::engine::sql::ast::utils::PlaceholderState;
@@ -81,6 +84,74 @@ pub(crate) fn parse_single_query(sql: &str) -> Result<sqlparser::ast::Query, Lix
 
 pub(crate) fn quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+pub(crate) fn rewrite_internal_state_query_read(
+    query: Query,
+    params: &[Value],
+) -> Result<Query, LixError> {
+    let original = query.clone();
+    Ok(vtable_read::rewrite_query(query, params)?.unwrap_or(original))
+}
+
+pub(crate) async fn rewrite_internal_state_query_read_with_backend(
+    backend: &dyn LixBackend,
+    query: Query,
+    params: &[Value],
+) -> Result<Query, LixError> {
+    let original = query.clone();
+    Ok(vtable_read::rewrite_query_with_backend(backend, query, params)
+        .await?
+        .unwrap_or(original))
+}
+
+pub(crate) fn statement_references_internal_state_vtable(statement: &Statement) -> bool {
+    match statement {
+        Statement::Query(query) => collect_query_relation_names(query).contains("lix_internal_state_vtable"),
+        Statement::Explain { statement, .. } => {
+            statement_references_internal_state_vtable(statement)
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn requires_single_statement_postprocess(plan: Option<&PostprocessPlan>) -> bool {
+    matches!(plan, Some(PostprocessPlan::VtableDelete(_)))
+}
+
+fn collect_query_relation_names(query: &Query) -> BTreeSet<String> {
+    struct Collector {
+        relation_names: BTreeSet<String>,
+    }
+
+    impl Visitor for Collector {
+        type Break = ();
+
+        fn pre_visit_table_factor(
+            &mut self,
+            table_factor: &TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            if let TableFactor::Table { name, .. } = table_factor {
+                let relation_name = name
+                    .0
+                    .iter()
+                    .map(|part| match part {
+                        ObjectNamePart::Identifier(identifier) => identifier.value.clone(),
+                        ObjectNamePart::Function(function) => function.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(".");
+                self.relation_names.insert(relation_name);
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut collector = Collector {
+        relation_names: BTreeSet::new(),
+    };
+    let _ = query.visit(&mut collector);
+    collector.relation_names
 }
 
 pub(crate) fn rewrite_statement<P: LixFunctionProvider>(
@@ -213,10 +284,6 @@ fn validate_statement_output(output: &RewriteOutput) -> Result<(), LixError> {
         }
     }
     Ok(())
-}
-
-fn requires_single_statement_postprocess(plan: Option<&PostprocessPlan>) -> bool {
-    matches!(plan, Some(PostprocessPlan::VtableDelete(_)))
 }
 
 #[cfg(test)]

@@ -26,10 +26,12 @@ use crate::internal_state::PostprocessPlan;
 use super::super::contracts::prepared_statement::PreparedStatement;
 use super::bind_once::{bind_statements_with_appended_params_once, StatementWithAppendedParams};
 use super::inline_functions::inline_lix_functions_with_provider;
-use super::materialize::materialize_vtable_insert_select_sources;
 use super::param_context::normalize_statement_placeholders_in_batch;
 use crate::internal_state::{
-    rewrite_statement, rewrite_statement_with_backend, vtable_read, RewriteOutput,
+    materialize::materialize_vtable_insert_select_sources, requires_single_statement_postprocess,
+    rewrite_internal_state_query_read, rewrite_internal_state_query_read_with_backend,
+    rewrite_statement, rewrite_statement_with_backend, statement_references_internal_state_vtable,
+    RewriteOutput,
 };
 use super::script::coalesce_vtable_inserts_in_transactions;
 use std::collections::BTreeSet;
@@ -59,17 +61,6 @@ pub(crate) fn statement_references_public_sql2_surface(statement: &Statement) ->
     match statement {
         Statement::Query(query) => query_references_builtin_public_sql2_surface(query),
         Statement::Explain { statement, .. } => statement_references_public_sql2_surface(statement),
-        _ => false,
-    }
-}
-
-pub(crate) fn statement_references_internal_state_vtable(statement: &Statement) -> bool {
-    match statement {
-        Statement::Query(query) => collect_query_relation_names(query)
-            .contains("lix_internal_state_vtable"),
-        Statement::Explain { statement, .. } => {
-            statement_references_internal_state_vtable(statement)
-        }
         _ => false,
     }
 }
@@ -712,8 +703,7 @@ fn rewrite_query_read_sync(
 ) -> Result<Option<RewriteOutput>, LixError> {
     let statement = Statement::Query(Box::new(query.clone()));
     if statement_references_internal_state_vtable(&statement) {
-        let original = query.clone();
-        let rewritten = vtable_read::rewrite_query(query, &[])?.unwrap_or(original);
+        let rewritten = rewrite_internal_state_query_read(query, &[])?;
         return Ok(Some(rewrite_output_from_statement(Statement::Query(Box::new(
             rewritten,
         )))));
@@ -734,10 +724,8 @@ async fn rewrite_query_read_backend(
 ) -> Result<Option<RewriteOutput>, LixError> {
     let statement = Statement::Query(Box::new(query.clone()));
     if statement_references_internal_state_vtable(&statement) {
-        let original = query.clone();
-        let rewritten = vtable_read::rewrite_query_with_backend(backend, query, params)
-            .await?
-            .unwrap_or(original);
+        let rewritten = rewrite_internal_state_query_read_with_backend(backend, query, params)
+            .await?;
         return Ok(Some(rewrite_output_from_statement(Statement::Query(Box::new(
             rewritten,
         )))));
@@ -768,8 +756,4 @@ fn empty_rewrite_output() -> RewriteOutput {
         mutations: Vec::new(),
         update_validations: Vec::new(),
     }
-}
-
-fn requires_single_statement_postprocess(plan: Option<&PostprocessPlan>) -> bool {
-    matches!(plan, Some(PostprocessPlan::VtableDelete(_)))
 }

@@ -2,13 +2,11 @@ use sqlparser::ast::{
     Expr, Insert, Query, SetExpr, Statement, TableObject, Value as SqlValue, Values,
 };
 
+use crate::engine::sql::ast::lowering::lower_statement;
+use crate::engine::sql::ast::utils::{bind_sql, parse_sql_statements};
+use crate::engine::sql::ast::walk::object_name_matches;
+use crate::engine::sql::planning::preprocess::lower_public_read_query_with_sql2_backend;
 use crate::{LixBackend, LixError, Value};
-
-use super::super::ast::lowering::lower_statement;
-use super::super::ast::utils::bind_sql;
-use super::super::ast::utils::parse_sql_statements;
-use super::super::ast::walk::object_name_matches;
-use super::preprocess::lower_public_read_query_with_sql2_backend;
 
 pub(crate) async fn materialize_vtable_insert_select_sources(
     backend: &dyn LixBackend,
