@@ -21,7 +21,6 @@ pub(crate) enum SurfaceKind {
     LixStateByVersion,
     LixStateHistory,
     LixWorkingChanges,
-    Filesystem,
     Entity,
     Generic,
 }
@@ -34,7 +33,6 @@ pub(crate) struct SurfaceCoverage {
     pub(crate) lix_state_by_version: usize,
     pub(crate) lix_state_history: usize,
     pub(crate) lix_working_changes: usize,
-    pub(crate) filesystem: usize,
     pub(crate) entity: usize,
     pub(crate) generic: usize,
 }
@@ -96,9 +94,6 @@ pub(crate) fn collect_surface_coverage(statements: &[Statement]) -> SurfaceCover
             SurfaceKind::LixWorkingChanges => {
                 let _ = lix_working_changes::lower::lowering_kind(statement);
                 coverage.lix_working_changes += 1;
-            }
-            SurfaceKind::Filesystem => {
-                coverage.filesystem += 1;
             }
             SurfaceKind::Entity => {
                 let _ = entity::lower::lowering_kind(statement);
