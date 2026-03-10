@@ -47,6 +47,10 @@ use std::sync::RwLock;
 
 #[path = "api.rs"]
 mod api;
+#[path = "engine_in_transaction.rs"]
+mod engine_in_transaction;
+#[path = "engine_transaction.rs"]
+mod engine_transaction;
 #[path = "init/active_version.rs"]
 mod init_active_version;
 #[path = "init/bootstrap.rs"]
@@ -88,10 +92,10 @@ pub struct ExecuteOptions {
 pub type EngineTransactionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, LixError>> + 'a>>;
 
 pub struct Engine {
-    backend: Box<dyn LixBackend + Send + Sync>,
+    pub(crate) backend: Box<dyn LixBackend + Send + Sync>,
     wasm_runtime: Arc<dyn WasmRuntime>,
-    cel_evaluator: CelEvaluator,
-    schema_cache: SchemaCache,
+    pub(crate) cel_evaluator: CelEvaluator,
+    pub(crate) schema_cache: SchemaCache,
     boot_key_values: Vec<BootKeyValue>,
     boot_active_account: Option<BootAccount>,
     boot_deterministic_settings: Option<DeterministicSettings>,

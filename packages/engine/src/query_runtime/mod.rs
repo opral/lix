@@ -10,3 +10,4 @@ pub(crate) mod lower_sql;
 pub(crate) mod plan;
 pub(crate) mod parse;
 pub(crate) mod preprocess;
+pub(crate) mod shared_path;

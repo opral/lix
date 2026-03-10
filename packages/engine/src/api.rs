@@ -1,7 +1,7 @@
-use super::sql::execution::shared_path;
 use crate::internal_state::script::extract_explicit_transaction_script_from_statements;
-use crate::query_runtime::parse::parse_sql;
 use crate::query_runtime::execute;
+use crate::query_runtime::parse::parse_sql;
+use crate::query_runtime::shared_path;
 use crate::runtime_post_commit;
 use crate::runtime_sql_effects;
 use super::*;
