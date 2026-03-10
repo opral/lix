@@ -429,26 +429,12 @@ fn guardrail_legacy_query_pipeline_context_is_removed_and_validator_is_filesyste
             .exists(),
         "legacy query rewrite context.rs should be removed"
     );
-    let validator_source =
-        fs::read_to_string(root.join("src/sql/planning/rewrite_engine/pipeline/validator.rs"))
-            .expect("validator.rs should be readable");
-
-    for forbidden in [
-        "lix_file",
-        "lix_file_by_version",
-        "lix_file_history",
-        "lix_file_history_by_version",
-        "lix_directory",
-        "lix_directory_by_version",
-        "lix_directory_history",
-        "FILESYSTEM_VIEW_NAMES",
-        "references_any_filesystem_view",
-    ] {
-        assert!(
-            !validator_source.contains(forbidden),
-            "legacy query rewrite validator must not carry filesystem surface awareness: {forbidden}"
-        );
-    }
+    assert!(
+        !root
+            .join("src/sql/planning/rewrite_engine/pipeline/validator.rs")
+            .exists(),
+        "legacy rewrite validator wrapper should be removed"
+    );
 }
 
 #[test]
