@@ -14,6 +14,7 @@ use crate::schema_registry::register_schema_sql_statements;
 use crate::sql2::runtime::{
     prepare_sql2_read, try_prepare_sql2_write, Sql2PreparedWrite,
 };
+use crate::sql2::catalog::{SurfaceCapability, SurfaceRegistry};
 use crate::state_commit_stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamOperation,
@@ -35,7 +36,6 @@ use super::super::contracts::requirements::PlanRequirements;
 use super::super::contracts::result_contract::ResultContract;
 use super::super::planning::derive_requirements::derive_plan_requirements;
 use super::super::planning::plan::build_execution_plan;
-use super::super::semantics::state_resolution::canonical::statement_targets_table_name;
 use super::intent::{
     authoritative_pending_file_write_targets, collect_execution_intent_with_backend,
     ExecutionIntent, IntentCollectionPolicy,
@@ -146,12 +146,14 @@ pub(crate) async fn prepare_execution_with_backend(
                     error.description
                 ),
             })?;
-    if let Some(target_name) = filesystem_public_write_target_name(&statements) {
+    if let Some(target_name) =
+        migrated_public_write_target_name_with_backend(backend, &statements).await?
+    {
         if sql2_write.is_none() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
-                    "filesystem public write target '{target_name}' must route through sql2"
+                    "public write target '{target_name}' must route through sql2"
                 ),
             });
         }
@@ -345,60 +347,78 @@ fn derive_result_contract_for_statements(statements: &[Statement]) -> ResultCont
     }
 }
 
-fn filesystem_public_write_target_name(statements: &[Statement]) -> Option<&'static str> {
-    [
-        "lix_file",
-        "lix_file_by_version",
-        "lix_file_history",
-        "lix_file_history_by_version",
-        "lix_directory",
-        "lix_directory_by_version",
-        "lix_directory_history",
-    ]
-    .into_iter()
-    .find(|target_name| {
-        statements
-            .iter()
-            .any(|statement| statement_targets_table_name(statement, target_name))
-    })
+async fn migrated_public_write_target_name_with_backend(
+    backend: &dyn LixBackend,
+    statements: &[Statement],
+) -> Result<Option<String>, LixError> {
+    let registry = SurfaceRegistry::bootstrap_with_backend(backend).await?;
+
+    Ok(statements.iter().find_map(|statement| {
+        let target_name = top_level_write_target_name(statement)?;
+        let binding = registry.bind_relation_name(&target_name)?;
+        (binding.capability == SurfaceCapability::ReadWrite
+            && binding.resolution_capabilities.semantic_write)
+            .then_some(binding.descriptor.public_name)
+    }))
+}
+
+fn top_level_write_target_name(statement: &Statement) -> Option<String> {
+    match statement {
+        Statement::Insert(insert) => match &insert.table {
+            sqlparser::ast::TableObject::TableName(name) => Some(name.to_string()),
+            _ => None,
+        },
+        Statement::Update(update) => match &update.table.relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => Some(name.to_string()),
+            _ => None,
+        },
+        Statement::Delete(delete) => {
+            let tables = match &delete.from {
+                sqlparser::ast::FromTable::WithFromKeyword(tables)
+                | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+            };
+            match &tables.first()?.relation {
+                sqlparser::ast::TableFactor::Table { name, .. } => Some(name.to_string()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::filesystem_public_write_target_name;
+    use super::top_level_write_target_name;
     use crate::engine::sql::ast::utils::parse_sql_statements;
 
     #[test]
-    fn detects_top_level_filesystem_public_write_targets() {
+    fn detects_top_level_write_targets() {
         let statements = parse_sql_statements(
             "UPDATE lix_file SET data = X'01' WHERE id = 'f1'; \
              DELETE FROM some_other_table WHERE id = 'x'",
         )
         .expect("parse");
-        assert_eq!(
-            filesystem_public_write_target_name(&statements),
-            Some("lix_file")
-        );
+        assert_eq!(top_level_write_target_name(&statements[0]).as_deref(), Some("lix_file"));
 
         let statements = parse_sql_statements(
             "INSERT INTO lix_directory_by_version (id, path, lixcol_version_id) VALUES ('d1', '/docs', 'v1')",
         )
         .expect("parse");
         assert_eq!(
-            filesystem_public_write_target_name(&statements),
+            top_level_write_target_name(&statements[0]).as_deref(),
             Some("lix_directory_by_version")
         );
 
         let statements =
             parse_sql_statements("DELETE FROM lix_file_history WHERE id = 'f1'").expect("parse");
         assert_eq!(
-            filesystem_public_write_target_name(&statements),
+            top_level_write_target_name(&statements[0]).as_deref(),
             Some("lix_file_history")
         );
 
         let statements =
             parse_sql_statements("SELECT * FROM lix_file WHERE id = 'f1'").expect("parse");
-        assert_eq!(filesystem_public_write_target_name(&statements), None);
+        assert_eq!(top_level_write_target_name(&statements[0]), None);
     }
 }
 
