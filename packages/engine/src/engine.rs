@@ -573,10 +573,7 @@ mod tests {
     use crate::engine::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
     use crate::engine::sql::ast::walk::contains_transaction_control_statement;
     use crate::engine::sql::contracts::planned_statement::UpdateValidationPlan;
-    use crate::engine::sql::history::plugin_inputs::{
-        file_history_read_materialization_required_for_statements,
-        file_read_materialization_scope_for_statements, FileReadMaterializationScope,
-    };
+    use crate::engine::sql::history::plugin_inputs::file_history_read_materialization_required_for_statements;
     use crate::engine::sql::planning::script::extract_explicit_transaction_script_from_statements;
     use crate::engine::sql::semantics::state_resolution::canonical::is_query_only_statements;
     use crate::engine::sql::semantics::state_resolution::effects::active_version_from_update_validations;
@@ -1115,166 +1112,6 @@ mod tests {
     }
 
     #[test]
-    fn file_read_materialization_scope_detects_insert_select_lix_file() {
-        let scope = file_read_materialization_scope_for_sql(
-            "INSERT INTO some_table (payload) \
-             SELECT data FROM lix_file WHERE id = 'file-a'",
-        );
-        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
-    }
-
-    #[test]
-    fn file_read_materialization_scope_detects_insert_select_lix_file_by_version() {
-        let scope = file_read_materialization_scope_for_sql(
-            "INSERT INTO some_table (payload) \
-             SELECT data FROM lix_file_by_version \
-             WHERE id = 'file-a' AND lixcol_version_id = 'version-a'",
-        );
-        assert_eq!(scope, Some(FileReadMaterializationScope::AllVersions));
-    }
-
-    #[test]
-    fn file_read_materialization_scope_detects_select_projection_subquery_lix_file_by_version() {
-        let scope = file_read_materialization_scope_for_sql(
-            "SELECT (\
-                SELECT data FROM lix_file_by_version \
-                WHERE id = 'file-a' AND lixcol_version_id = 'version-a'\
-             ) AS payload",
-        );
-        assert_eq!(scope, Some(FileReadMaterializationScope::AllVersions));
-    }
-
-    #[test]
-    fn file_read_materialization_scope_ignores_select_where_exists_subquery_lix_file_metadata_only()
-    {
-        let scope = file_read_materialization_scope_for_sql(
-            "SELECT 1 \
-             WHERE EXISTS (\
-                SELECT 1 FROM lix_file WHERE id = 'file-a'\
-             )",
-        );
-        assert_eq!(scope, None);
-    }
-
-    #[test]
-    fn file_read_materialization_scope_ignores_select_join_on_subquery_lix_file_metadata_only() {
-        let scope = file_read_materialization_scope_for_sql(
-            "SELECT t.id \
-             FROM some_table t \
-             LEFT JOIN other_table o \
-               ON EXISTS (SELECT 1 FROM lix_file WHERE id = 'file-a')",
-        );
-        assert_eq!(scope, None);
-    }
-
-    #[test]
-    fn file_read_materialization_scope_ignores_update_where_subquery_lix_file_metadata_only() {
-        let scope = file_read_materialization_scope_for_sql(
-            "UPDATE some_table \
-             SET payload = 'x' \
-             WHERE id IN (SELECT id FROM lix_file WHERE id = 'file-a')",
-        );
-        assert_eq!(scope, None);
-    }
-
-    #[test]
-    fn file_read_materialization_scope_ignores_update_target_lix_file() {
-        let scope = file_read_materialization_scope_for_sql(
-            "UPDATE lix_file \
-             SET path = '/renamed.json' \
-             WHERE id = 'file-a'",
-        );
-        assert_eq!(scope, None);
-    }
-
-    #[test]
-    fn file_read_materialization_scope_ignores_update_target_lix_file_by_version() {
-        let scope = file_read_materialization_scope_for_sql(
-            "UPDATE lix_file_by_version \
-             SET path = '/renamed.json' \
-             WHERE id = 'file-a' \
-               AND lixcol_version_id = 'version-a'",
-        );
-        assert_eq!(scope, None);
-    }
-
-    #[test]
-    fn regression_update_target_lix_file_with_data_predicate_requires_active_materialization_scope()
-    {
-        let scope = file_read_materialization_scope_for_sql(
-            "UPDATE lix_file \
-             SET path = '/renamed.json' \
-             WHERE data IS NOT NULL",
-        );
-        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
-    }
-
-    #[test]
-    fn regression_update_target_lix_file_by_version_with_data_predicate_requires_all_versions_scope(
-    ) {
-        let scope = file_read_materialization_scope_for_sql(
-            "UPDATE lix_file_by_version \
-             SET path = '/renamed.json' \
-             WHERE data IS NOT NULL \
-               AND lixcol_version_id = 'version-a'",
-        );
-        assert_eq!(scope, Some(FileReadMaterializationScope::AllVersions));
-    }
-
-    #[test]
-    fn regression_update_target_lix_file_string_literal_data_does_not_trigger_materialization() {
-        let scope = file_read_materialization_scope_for_sql(
-            "UPDATE lix_file \
-             SET path = '/renamed.json' \
-             WHERE metadata = 'data'",
-        );
-        assert_eq!(scope, None);
-    }
-
-    #[test]
-    fn regression_update_target_lix_file_exists_subquery_data_requires_active_materialization_scope(
-    ) {
-        let scope = file_read_materialization_scope_for_sql(
-            "UPDATE lix_file \
-             SET path = '/renamed.json' \
-             WHERE EXISTS (SELECT 1 WHERE data IS NOT NULL)",
-        );
-        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
-    }
-
-    #[test]
-    fn regression_update_target_lix_file_case_data_requires_active_materialization_scope() {
-        let scope = file_read_materialization_scope_for_sql(
-            "UPDATE lix_file \
-             SET path = '/renamed.json' \
-             WHERE CASE WHEN data IS NULL THEN 0 ELSE 1 END = 1",
-        );
-        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
-    }
-
-    #[test]
-    fn regression_update_target_lix_file_tuple_data_requires_active_materialization_scope() {
-        let scope = file_read_materialization_scope_for_sql(
-            "UPDATE lix_file \
-             SET path = '/renamed.json' \
-             WHERE (data, id) IN (('x', 'file-a'))",
-        );
-        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
-    }
-
-    #[test]
-    fn file_read_materialization_scope_detects_delete_where_subquery_lix_file_by_version() {
-        let scope = file_read_materialization_scope_for_sql(
-            "DELETE FROM some_table \
-             WHERE EXISTS (\
-                 SELECT 1 FROM lix_file_by_version \
-                 WHERE id = 'file-a' AND lixcol_version_id = 'version-a'\
-             )",
-        );
-        assert_eq!(scope, Some(FileReadMaterializationScope::AllVersions));
-    }
-
-    #[test]
     fn file_history_materialization_detection_includes_insert_select_sources() {
         assert!(file_history_read_materialization_required_for_sql(
             "INSERT INTO some_table (payload) \
@@ -1329,12 +1166,6 @@ mod tests {
         parse_sql_statements(sql)
             .map(|statements| should_refresh_file_cache_for_statements(&statements))
             .unwrap_or(false)
-    }
-
-    fn file_read_materialization_scope_for_sql(sql: &str) -> Option<FileReadMaterializationScope> {
-        parse_sql_statements(sql)
-            .ok()
-            .and_then(|statements| file_read_materialization_scope_for_statements(&statements))
     }
 
     fn file_history_read_materialization_required_for_sql(sql: &str) -> bool {
