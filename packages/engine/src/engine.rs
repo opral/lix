@@ -59,6 +59,8 @@ mod plugin_install;
 mod runtime_functions;
 #[path = "runtime_effects.rs"]
 mod runtime_effects;
+#[path = "statement_scripts.rs"]
+mod statement_scripts;
 #[path = "sql/mod.rs"]
 pub(crate) mod sql;
 
@@ -221,6 +223,12 @@ impl<'a> EngineTransaction<'a> {
             description: "transaction is no longer active".to_string(),
         })?;
         transaction.rollback().await
+    }
+}
+
+impl Engine {
+    pub(crate) fn backend_ref(&self) -> &(dyn LixBackend + Send + Sync) {
+        self.backend.as_ref()
     }
 }
 

@@ -1,6 +1,7 @@
 use super::super::*;
-use super::execution::{run, shared_path};
+use super::execution::shared_path;
 use super::planning::parse::parse_sql;
+use crate::query_runtime::execute;
 
 impl Engine {
     pub(crate) async fn execute_with_options_in_transaction(
@@ -57,7 +58,7 @@ impl Engine {
         .await
         {
             Ok(Some(execution)) => execution,
-            Ok(None) => match run::execute_plan_sql_with_transaction(
+            Ok(None) => match execute::execute_plan_sql_with_transaction(
                 transaction,
                 &prepared.plan,
                 prepared.plan.requirements.should_refresh_file_cache,

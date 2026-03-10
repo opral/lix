@@ -40,7 +40,7 @@ use super::intent::{
     authoritative_pending_file_write_targets, collect_execution_intent_with_backend,
     ExecutionIntent, IntentCollectionPolicy,
 };
-use super::run::SqlExecutionOutcome;
+use crate::query_runtime::execute::SqlExecutionOutcome;
 use sqlparser::ast::Statement;
 
 const STORED_SCHEMA_KEY: &str = "lix_stored_schema";

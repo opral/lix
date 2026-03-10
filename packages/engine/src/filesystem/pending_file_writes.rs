@@ -5,7 +5,7 @@ use crate::engine::sql::ast::utils::{
     bind_sql_with_state, insert_values_rows_mut, resolve_expr_cell_with_state, resolve_values_rows,
     PlaceholderState, ResolvedCell,
 };
-use crate::engine::sql::planning::preprocess::preprocess_sql_to_plan as preprocess_sql;
+use crate::query_runtime::preprocess::preprocess_sql_to_plan as preprocess_sql;
 use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::errors;
 use crate::filesystem::live_projection::{

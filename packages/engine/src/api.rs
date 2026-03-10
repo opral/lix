@@ -1,6 +1,7 @@
-use super::sql::execution::{apply_effects_post_commit, apply_effects_tx, run, shared_path};
+use super::sql::execution::{apply_effects_post_commit, apply_effects_tx, shared_path};
 use super::sql::planning::parse::parse_sql;
 use crate::internal_state::script::extract_explicit_transaction_script_from_statements;
+use crate::query_runtime::execute;
 use super::*;
 use crate::errors;
 
@@ -179,7 +180,7 @@ impl Engine {
                 .await
             {
                 Ok(Some(execution)) => execution,
-                Ok(None) => match run::execute_plan_sql(
+                Ok(None) => match execute::execute_plan_sql(
                     self,
                     &prepared.plan,
                     prepared.plan.requirements.should_refresh_file_cache,
@@ -202,7 +203,7 @@ impl Engine {
                 Err(error) => return Err(error),
             };
 
-        run::persist_runtime_sequence(
+        execute::persist_runtime_sequence(
             self,
             prepared.settings,
             prepared.sequence_start,
