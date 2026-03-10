@@ -28,7 +28,7 @@ use super::bind_once::{bind_statements_with_appended_params_once, StatementWithA
 use super::inline_functions::inline_lix_functions_with_provider;
 use super::materialize::materialize_vtable_insert_select_sources;
 use super::param_context::normalize_statement_placeholders_in_batch;
-use super::rewrite_engine::{vtable_read, RewriteOutput, StatementPipeline};
+use super::rewrite_engine::{rewrite_statement, rewrite_statement_with_backend, vtable_read, RewriteOutput};
 use super::rewrite_output::StatementRewriteOutput;
 use super::script::coalesce_vtable_inserts_in_transactions;
 use std::collections::BTreeSet;
@@ -288,7 +288,7 @@ fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider>(
         {
             output
         } else {
-            StatementPipeline::new(params, writer_key).rewrite_statement(statement, provider)?
+            rewrite_statement(statement, params, writer_key, provider)?
         };
         accumulate_rewrite_output(
             from_rewrite_output(output),
@@ -346,10 +346,13 @@ where
         {
             output
         } else {
-            Box::pin(
-                StatementPipeline::new(params, writer_key)
-                    .rewrite_statement_with_backend(backend, statement, provider),
-            )
+            Box::pin(rewrite_statement_with_backend(
+                backend,
+                statement,
+                params,
+                writer_key,
+                provider,
+            ))
             .await
             .map_err(|error| LixError {
                 code: error.code,

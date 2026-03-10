@@ -2658,7 +2658,7 @@ mod tests {
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
     use crate::cel::CelEvaluator;
     use crate::engine::sql::planning::rewrite_engine::entity_views::target::resolve_target_from_view_name;
-    use crate::engine::sql::planning::rewrite_engine::pipeline::statement_pipeline::StatementPipeline;
+    use crate::engine::sql::planning::rewrite_engine::rewrite_statement_with_backend;
     use crate::functions::{SharedFunctionProvider, SystemFunctionProvider};
     use crate::Value as EngineValue;
     use crate::{LixError, QueryResult};
@@ -3012,11 +3012,9 @@ mod tests {
                    ) VALUES ('ovr-1', 'Original', 'lix', 'lix', '1')";
         let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
         let statement = statements.remove(0);
-        let pipeline = StatementPipeline::new(&[], None);
         let mut provider = SystemFunctionProvider;
 
-        let output = pipeline
-            .rewrite_statement_with_backend(&backend, statement, &mut provider)
+        let output = rewrite_statement_with_backend(&backend, statement, &[], None, &mut provider)
             .await
             .expect("pipeline rewrite should succeed");
 
