@@ -11,8 +11,8 @@ use std::ops::ControlFlow;
 
 use crate::commit::{generate_commit, DomainChangeInput, GenerateCommitArgs};
 #[cfg(test)]
-use crate::engine::sql::history::commit_runtime::bind_statement_batch_for_dialect as bind_shared_statement_batch_for_dialect;
-use crate::engine::sql::history::commit_runtime::{
+use crate::engine::query_history::commit_runtime::bind_statement_batch_for_dialect as bind_shared_statement_batch_for_dialect;
+use crate::engine::query_history::commit_runtime::{
     build_statement_batch_from_generate_commit_result, load_commit_active_accounts,
     load_version_info_for_versions, CommitQueryExecutor, StatementBatch,
 };
@@ -1492,7 +1492,7 @@ fn advance_placeholder_state_for_expr(
             };
 
             if let Err(error) =
-                crate::engine::sql::ast::utils::resolve_placeholder_index(
+                crate::engine::sql_ast::utils::resolve_placeholder_index(
                     token,
                     self.params_len,
                     self.state,

@@ -1,6 +1,6 @@
 use sqlparser::ast::Statement;
 
-use crate::engine::sql::ast::{lowering, utils};
+use crate::engine::sql_ast::{lowering, utils};
 use crate::{LixError, SqlDialect};
 
 pub(crate) fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {

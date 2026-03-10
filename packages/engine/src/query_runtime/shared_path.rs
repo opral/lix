@@ -6,7 +6,7 @@ use crate::commit::{
     AppendCommitPreconditions, AppendExpectedTip, AppendWriteLane,
 };
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
-use crate::engine::sql::storage::sql_text::escape_sql_string;
+use crate::engine::query_storage::sql_text::escape_sql_string;
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::schema_from_stored_snapshot;
@@ -389,7 +389,7 @@ fn top_level_write_target_name(statement: &Statement) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::top_level_write_target_name;
-    use crate::engine::sql::ast::utils::parse_sql_statements;
+    use crate::engine::sql_ast::utils::parse_sql_statements;
 
     #[test]
     fn detects_top_level_write_targets() {

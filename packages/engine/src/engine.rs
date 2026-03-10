@@ -65,14 +65,20 @@ mod runtime_functions;
 mod runtime_effects;
 #[path = "statement_scripts.rs"]
 mod statement_scripts;
-#[path = "sql/mod.rs"]
-pub(crate) mod sql;
+#[path = "query_history/mod.rs"]
+pub(crate) mod query_history;
+#[path = "query_semantics/mod.rs"]
+pub(crate) mod query_semantics;
+#[path = "query_storage/mod.rs"]
+pub(crate) mod query_storage;
+#[path = "sql_ast/mod.rs"]
+pub(crate) mod sql_ast;
 
 use crate::query_runtime::contracts::effects::FilesystemPayloadDomainChange;
 use crate::query_runtime::contracts::planned_statement::MutationRow;
 use crate::query_runtime::parse::parse_sql;
-use self::sql::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
-use self::sql::storage::sql_text::escape_sql_string;
+use self::query_semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
+use self::query_storage::sql_text::escape_sql_string;
 
 pub use crate::boot::{
     boot, init_lix, BootAccount, BootArgs, BootKeyValue, InitLixArgs, InitLixResult,
@@ -560,17 +566,17 @@ mod tests {
         boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
-    use crate::engine::sql::ast::utils::{
+    use crate::engine::sql_ast::utils::{
         advance_placeholder_state_for_statement_ast, bind_sql_with_state, parse_sql_statements,
         PlaceholderState,
     };
-    use crate::engine::sql::ast::walk::contains_transaction_control_statement;
+    use crate::engine::sql_ast::walk::contains_transaction_control_statement;
     use crate::query_runtime::contracts::planned_statement::UpdateValidationPlan;
-    use crate::engine::sql::history::plugin_inputs::file_history_read_materialization_required_for_statements;
+    use crate::engine::query_history::plugin_inputs::file_history_read_materialization_required_for_statements;
     use crate::internal_state::script::extract_explicit_transaction_script_from_statements;
-    use crate::engine::sql::semantics::state_resolution::canonical::is_query_only_statements;
-    use crate::engine::sql::semantics::state_resolution::effects::active_version_from_update_validations;
-    use crate::engine::sql::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
+    use crate::engine::query_semantics::state_resolution::canonical::is_query_only_statements;
+    use crate::engine::query_semantics::state_resolution::effects::active_version_from_update_validations;
+    use crate::engine::query_semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
     use crate::engine::Engine;
     use crate::plugin::types::{InstalledPlugin, PluginRuntime};
     use crate::version::active_version_schema_key;

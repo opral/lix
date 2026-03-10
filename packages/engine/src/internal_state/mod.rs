@@ -36,16 +36,16 @@ use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use crate::engine::sql::ast::lowering::lower_statement;
+use crate::engine::sql_ast::lowering::lower_statement;
 use crate::internal_state::bind_once::{
     bind_statements_with_appended_params_once, StatementWithAppendedParams,
 };
 use crate::internal_state::inline_functions::inline_lix_functions_with_provider;
 use crate::internal_state::param_context::normalize_statement_placeholders_in_batch;
 
-pub(crate) use crate::engine::sql::ast::walk::object_name_matches;
-pub(crate) use crate::engine::sql::ast::utils::PlaceholderState;
-pub(crate) use crate::engine::sql::ast::utils::{
+pub(crate) use crate::engine::sql_ast::walk::object_name_matches;
+pub(crate) use crate::engine::sql_ast::utils::PlaceholderState;
+pub(crate) use crate::engine::sql_ast::utils::{
     resolve_expr_cell_with_state, ResolvedCell, RowSourceResolver,
 };
 pub(crate) type SchemaRegistration =

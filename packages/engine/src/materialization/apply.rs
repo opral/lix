@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::engine::sql::storage::sql_text::escape_sql_string;
+use crate::engine::query_storage::sql_text::escape_sql_string;
 use crate::materialization::types::{
     MaterializationApplyReport, MaterializationPlan, MaterializationScope, MaterializationWriteOp,
 };

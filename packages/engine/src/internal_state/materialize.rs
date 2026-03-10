@@ -2,9 +2,9 @@ use sqlparser::ast::{
     Expr, Insert, Query, SetExpr, Statement, TableObject, Value as SqlValue, Values,
 };
 
-use crate::engine::sql::ast::lowering::lower_statement;
-use crate::engine::sql::ast::utils::{bind_sql, parse_sql_statements};
-use crate::engine::sql::ast::walk::object_name_matches;
+use crate::engine::sql_ast::lowering::lower_statement;
+use crate::engine::sql_ast::utils::{bind_sql, parse_sql_statements};
+use crate::engine::sql_ast::walk::object_name_matches;
 use crate::internal_state::lower_public_read_query_with_sql2_backend;
 use crate::{LixBackend, LixError, Value};
 
