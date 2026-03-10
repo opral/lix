@@ -5,7 +5,6 @@ pub(crate) mod derive_requirements;
 pub(crate) mod inline_functions;
 pub(crate) mod invariants;
 pub(crate) mod lower_sql;
-pub(crate) mod materialize;
 pub(crate) mod param_context;
 pub(crate) mod parse;
 pub(crate) mod plan;
