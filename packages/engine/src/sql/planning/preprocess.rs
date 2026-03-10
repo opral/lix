@@ -28,7 +28,7 @@ use super::bind_once::{bind_statements_with_appended_params_once, StatementWithA
 use super::inline_functions::inline_lix_functions_with_provider;
 use super::materialize::materialize_vtable_insert_select_sources;
 use super::param_context::normalize_statement_placeholders_in_batch;
-use super::rewrite_engine::StatementPipeline;
+use super::rewrite_engine::{vtable_read, RewriteOutput, StatementPipeline};
 use super::rewrite_output::StatementRewriteOutput;
 use super::script::coalesce_vtable_inserts_in_transactions;
 use std::collections::BTreeSet;
@@ -283,8 +283,13 @@ fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider>(
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
 
     for statement in statements {
-        let output = StatementPipeline::new(params, writer_key)
-            .rewrite_statement(statement, provider)?;
+        let output = if let Some(output) =
+            rewrite_top_level_read_statement_sync(statement.clone(), SqlDialect::Sqlite)?
+        {
+            output
+        } else {
+            StatementPipeline::new(params, writer_key).rewrite_statement(statement, provider)?
+        };
         accumulate_rewrite_output(
             from_rewrite_output(output),
             provider,
@@ -336,18 +341,24 @@ where
     for (statement_index, statement) in statements.into_iter().enumerate() {
         // Keep this async rewrite future boxed to avoid infinitely sized
         // futures in recursive rewrite call paths.
-        let output = Box::pin(
-            StatementPipeline::new(params, writer_key)
-                .rewrite_statement_with_backend(backend, statement, provider),
-        )
-        .await
-        .map_err(|error| LixError {
-            code: error.code,
-            description: format!(
-                "preprocess_with_surfaces_to_plan backend rewrite failed for statement {}: {}",
-                statement_index, error.description
-            ),
-        })?;
+        let output = if let Some(output) =
+            rewrite_top_level_read_statement_backend(backend, statement.clone(), params).await?
+        {
+            output
+        } else {
+            Box::pin(
+                StatementPipeline::new(params, writer_key)
+                    .rewrite_statement_with_backend(backend, statement, provider),
+            )
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "preprocess_with_surfaces_to_plan backend rewrite failed for statement {}: {}",
+                    statement_index, error.description
+                ),
+            })?
+        };
 
         accumulate_rewrite_output(
             from_rewrite_output(output),
@@ -569,6 +580,179 @@ fn from_rewrite_output(output: super::rewrite_engine::RewriteOutput) -> Statemen
         postprocess: output.postprocess,
         mutations: output.mutations,
         update_validations: output.update_validations,
+    }
+}
+
+fn rewrite_top_level_read_statement_sync(
+    statement: Statement,
+    dialect: SqlDialect,
+) -> Result<Option<RewriteOutput>, LixError> {
+    match statement {
+        Statement::Query(query) => rewrite_query_read_sync(*query, dialect),
+        Statement::Explain {
+            describe_alias,
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+        } => {
+            let rewritten_statement = match *statement {
+                Statement::Query(query) => match rewrite_query_read_sync(*query, dialect)? {
+                    Some(output) => Statement::Query(Box::new(
+                        output
+                            .statements
+                            .into_iter()
+                            .next()
+                            .and_then(|stmt| match stmt {
+                                Statement::Query(query) => Some(*query),
+                                _ => None,
+                            })
+                            .ok_or_else(|| LixError {
+                                code: "LIX_ERROR_UNKNOWN".to_string(),
+                                description: "expected rewritten read query to remain a SELECT query".to_string(),
+                            })?,
+                    )),
+                    None => return Ok(None),
+                },
+                _ => return Ok(None),
+            };
+            Ok(Some(RewriteOutput {
+                statements: vec![Statement::Explain {
+                    describe_alias,
+                    analyze,
+                    verbose,
+                    query_plan,
+                    estimate,
+                    statement: Box::new(rewritten_statement),
+                    format,
+                    options,
+                }],
+                ..empty_rewrite_output()
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn rewrite_top_level_read_statement_backend(
+    backend: &dyn LixBackend,
+    statement: Statement,
+    params: &[Value],
+) -> Result<Option<RewriteOutput>, LixError> {
+    match statement {
+        Statement::Query(query) => rewrite_query_read_backend(backend, *query, params).await,
+        Statement::Explain {
+            describe_alias,
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+        } => {
+            let rewritten_statement = match *statement {
+                Statement::Query(query) => match rewrite_query_read_backend(backend, *query, params).await? {
+                    Some(output) => Statement::Query(Box::new(
+                        output
+                            .statements
+                            .into_iter()
+                            .next()
+                            .and_then(|stmt| match stmt {
+                                Statement::Query(query) => Some(*query),
+                                _ => None,
+                            })
+                            .ok_or_else(|| LixError {
+                                code: "LIX_ERROR_UNKNOWN".to_string(),
+                                description: "expected rewritten backend read query to remain a SELECT query".to_string(),
+                            })?,
+                    )),
+                    None => return Ok(None),
+                },
+                _ => return Ok(None),
+            };
+            Ok(Some(RewriteOutput {
+                statements: vec![Statement::Explain {
+                    describe_alias,
+                    analyze,
+                    verbose,
+                    query_plan,
+                    estimate,
+                    statement: Box::new(rewritten_statement),
+                    format,
+                    options,
+                }],
+                ..empty_rewrite_output()
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn rewrite_query_read_sync(
+    query: Query,
+    dialect: SqlDialect,
+) -> Result<Option<RewriteOutput>, LixError> {
+    let statement = Statement::Query(Box::new(query.clone()));
+    if statement_references_internal_state_vtable(&statement) {
+        let original = query.clone();
+        let rewritten = vtable_read::rewrite_query(query, &[])?.unwrap_or(original);
+        return Ok(Some(rewrite_output_from_statement(Statement::Query(Box::new(
+            rewritten,
+        )))));
+    }
+    if !statement_references_public_sql2_surface(&statement) {
+        return Ok(None);
+    }
+    let rewritten = rewrite_public_read_query_to_lowered_sql(query, dialect)?;
+    Ok(Some(rewrite_output_from_statement(Statement::Query(Box::new(
+        rewritten,
+    )))))
+}
+
+async fn rewrite_query_read_backend(
+    backend: &dyn LixBackend,
+    query: Query,
+    params: &[Value],
+) -> Result<Option<RewriteOutput>, LixError> {
+    let statement = Statement::Query(Box::new(query.clone()));
+    if statement_references_internal_state_vtable(&statement) {
+        let original = query.clone();
+        let rewritten = vtable_read::rewrite_query_with_backend(backend, query, params)
+            .await?
+            .unwrap_or(original);
+        return Ok(Some(rewrite_output_from_statement(Statement::Query(Box::new(
+            rewritten,
+        )))));
+    }
+    if !statement_references_public_sql2_surface_with_backend(backend, &statement).await {
+        return Ok(None);
+    }
+    let rewritten = lower_public_read_query_with_sql2_backend(backend, query, params).await?;
+    Ok(Some(rewrite_output_from_statement(Statement::Query(Box::new(
+        rewritten,
+    )))))
+}
+
+fn rewrite_output_from_statement(statement: Statement) -> RewriteOutput {
+    RewriteOutput {
+        statements: vec![statement],
+        ..empty_rewrite_output()
+    }
+}
+
+fn empty_rewrite_output() -> RewriteOutput {
+    RewriteOutput {
+        statements: Vec::new(),
+        effect_only: false,
+        params: Vec::new(),
+        registrations: Vec::new(),
+        postprocess: None,
+        mutations: Vec::new(),
+        update_validations: Vec::new(),
     }
 }
 

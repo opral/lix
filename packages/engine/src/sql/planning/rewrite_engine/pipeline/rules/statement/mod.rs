@@ -8,11 +8,9 @@ use crate::engine::sql::planning::rewrite_engine::pipeline::registry::StatementR
 
 pub(crate) mod canonical;
 pub(crate) mod context;
-pub(crate) mod explain_read;
 pub(crate) mod helpers;
 pub(crate) mod outcome;
 pub(crate) mod passthrough;
-pub(crate) mod query_read;
 
 pub(crate) fn apply_sync_rule<P: LixFunctionProvider>(
     rule: StatementRule,
@@ -22,8 +20,6 @@ pub(crate) fn apply_sync_rule<P: LixFunctionProvider>(
     provider: &mut P,
 ) -> Result<Option<RewriteOutput>, LixError> {
     match rule {
-        StatementRule::QueryRead => query_read::apply_sync(statement),
-        StatementRule::ExplainRead => explain_read::apply_sync(statement),
         StatementRule::VtableWriteCanonical => {
             canonical::rewrite_sync_statement(statement, params, writer_key, provider)
         }
@@ -43,8 +39,6 @@ where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
     match rule {
-        StatementRule::QueryRead => query_read::apply_backend(backend, statement, params).await,
-        StatementRule::ExplainRead => explain_read::apply_backend(backend, statement, params).await,
         StatementRule::VtableWriteCanonical => {
             canonical::rewrite_backend_statement(backend, statement, params, writer_key, provider)
                 .await
