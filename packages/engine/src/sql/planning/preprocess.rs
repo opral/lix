@@ -171,13 +171,13 @@ async fn preprocess_sql_with_provider<P: LixFunctionProvider>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    preprocess_sql_with_provider_and_detected_file_domain_changes(
+    preprocess_sql_with_provider_and_writer_key(
         backend, evaluator, sql_text, params, functions, None,
     )
     .await
 }
 
-async fn preprocess_sql_with_provider_and_detected_file_domain_changes<P: LixFunctionProvider>(
+async fn preprocess_sql_with_provider_and_writer_key<P: LixFunctionProvider>(
     backend: &dyn LixBackend,
     evaluator: &CelEvaluator,
     sql_text: &str,
