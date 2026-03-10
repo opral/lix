@@ -8,9 +8,7 @@ use super::super::ast::lowering::lower_statement;
 use super::super::ast::utils::bind_sql;
 use super::super::ast::utils::parse_sql_statements;
 use super::super::ast::walk::object_name_matches;
-use super::rewrite_engine::{
-    rewrite_read_query_with_backend_and_params_in_session, ReadRewriteSession,
-};
+use super::preprocess::lower_public_read_query_with_sql2_backend;
 
 pub(crate) async fn materialize_vtable_insert_select_sources(
     backend: &dyn LixBackend,
@@ -35,14 +33,9 @@ pub(crate) async fn materialize_vtable_insert_select_sources(
                 continue;
             };
             let source_query = (**source).clone();
-            let mut session = ReadRewriteSession::default();
-            let rewritten_source = Box::pin(rewrite_read_query_with_backend_and_params_in_session(
-                backend,
-                source_query,
-                params,
-                &mut session,
-            ))
-            .await?;
+            let rewritten_source =
+                Box::pin(lower_public_read_query_with_sql2_backend(backend, source_query, params))
+                    .await?;
             let lowered_source = lower_statement(
                 Statement::Query(Box::new(rewritten_source)),
                 backend.dialect(),
