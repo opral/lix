@@ -31,12 +31,21 @@ use super::param_context::normalize_statement_placeholders_in_batch;
 use crate::internal_state::{
     rewrite_statement, rewrite_statement_with_backend, vtable_read, RewriteOutput,
 };
-use super::rewrite_output::StatementRewriteOutput;
 use super::script::coalesce_vtable_inserts_in_transactions;
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{Expr, ObjectNamePart, Query, Statement, TableFactor, Visit, Visitor};
+
+#[derive(Debug, Clone)]
+struct StatementRewriteOutput {
+    statements: Vec<Statement>,
+    params: Vec<Value>,
+    registrations: Vec<SchemaRegistration>,
+    postprocess: Option<PostprocessPlan>,
+    mutations: Vec<MutationRow>,
+    update_validations: Vec<UpdateValidationPlan>,
+}
 
 pub(crate) fn rewrite_public_read_statement_to_lowered_sql(
     statement: &mut Statement,
