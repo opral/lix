@@ -5,9 +5,8 @@ use sqlparser::ast::{
 };
 
 use crate::engine::sql::planning::rewrite_engine::object_name_matches;
-use crate::engine::sql::planning::rewrite_engine::steps::stored_schema;
-use crate::engine::sql::planning::rewrite_engine::steps::vtable_write;
 use crate::engine::sql::planning::rewrite_engine::{PostprocessPlan, RewriteOutput};
+use crate::engine::sql::planning::rewrite_engine::{stored_schema, vtable_write};
 use crate::functions::LixFunctionProvider;
 use crate::errors;
 use crate::{LixBackend, LixError, Value};
