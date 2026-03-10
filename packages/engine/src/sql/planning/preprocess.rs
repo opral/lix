@@ -33,7 +33,7 @@ use crate::internal_state::{
     rewrite_statement, rewrite_statement_with_backend, statement_references_internal_state_vtable,
     RewriteOutput,
 };
-use super::script::coalesce_vtable_inserts_in_transactions;
+use crate::internal_state::script::coalesce_vtable_inserts_in_transactions;
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 

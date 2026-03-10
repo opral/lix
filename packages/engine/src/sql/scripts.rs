@@ -1,6 +1,6 @@
 use super::super::*;
 use super::planning::bind_once::bind_script_placeholders_once;
-use super::planning::script::coalesce_vtable_inserts_in_statement_list;
+use crate::internal_state::script::coalesce_vtable_inserts_in_statement_list;
 use super::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 
 impl Engine {

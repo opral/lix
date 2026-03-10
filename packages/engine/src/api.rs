@@ -1,6 +1,6 @@
 use super::sql::execution::{apply_effects_post_commit, apply_effects_tx, run, shared_path};
 use super::sql::planning::parse::parse_sql;
-use super::sql::planning::script::extract_explicit_transaction_script_from_statements;
+use crate::internal_state::script::extract_explicit_transaction_script_from_statements;
 use super::*;
 use crate::errors;
 

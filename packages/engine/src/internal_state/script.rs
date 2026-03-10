@@ -1,8 +1,7 @@
-use sqlparser::ast::{Expr, Insert, Query, SetExpr, Statement, TableObject, Value as SqlAstValue};
+use sqlparser::ast::{Expr, Insert, SetExpr, Statement, TableObject, Value as SqlAstValue};
 
+use crate::engine::sql::ast::walk::object_name_matches;
 use crate::{LixError, Value};
-
-use super::super::ast::walk::object_name_matches;
 
 pub(crate) fn extract_explicit_transaction_script_from_statements(
     statements: &[Statement],
@@ -218,47 +217,36 @@ fn insert_targets_stored_schema(insert: &Insert) -> bool {
     })
 }
 
-fn expr_is_stored_schema_literal(expr: &Expr) -> bool {
-    let Expr::Value(value) = expr else {
-        return false;
-    };
-    let literal = match &value.value {
-        SqlAstValue::SingleQuotedString(text) | SqlAstValue::DoubleQuotedString(text) => text,
-        _ => return false,
-    };
-    literal.eq_ignore_ascii_case("lix_stored_schema")
-}
-
-fn plain_values_rows(insert: &Insert) -> Option<&Vec<Vec<Expr>>> {
+fn plain_values_rows(insert: &Insert) -> Option<&[Vec<Expr>]> {
     let source = insert.source.as_ref()?;
-    if !query_is_plain_values(source) {
-        return None;
-    }
     let SetExpr::Values(values) = source.body.as_ref() else {
         return None;
     };
-    Some(&values.rows)
+    if values.explicit_row || values.value_keyword {
+        return None;
+    }
+    Some(values.rows.as_slice())
 }
 
 fn plain_values_rows_mut(insert: &mut Insert) -> Option<&mut Vec<Vec<Expr>>> {
     let source = insert.source.as_mut()?;
-    if !query_is_plain_values(source) {
-        return None;
-    }
     let SetExpr::Values(values) = source.body.as_mut() else {
         return None;
     };
+    if values.explicit_row || values.value_keyword {
+        return None;
+    }
     Some(&mut values.rows)
 }
 
-fn query_is_plain_values(query: &Query) -> bool {
-    query.with.is_none()
-        && query.order_by.is_none()
-        && query.limit_clause.is_none()
-        && query.fetch.is_none()
-        && query.locks.is_empty()
-        && query.for_clause.is_none()
-        && query.settings.is_none()
-        && query.format_clause.is_none()
-        && query.pipe_operators.is_empty()
+fn expr_is_stored_schema_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            SqlAstValue::SingleQuotedString(text) | SqlAstValue::DoubleQuotedString(text) => {
+                text.eq_ignore_ascii_case("lix_stored_schema")
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
