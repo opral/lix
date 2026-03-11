@@ -1,6 +1,5 @@
-use crate::deterministic_mode::DeterministicSettings;
+use crate::deterministic_mode::{parse_deterministic_settings_value, DeterministicSettings};
 use crate::engine::Engine;
-use crate::json_truthiness::{loosely_false, loosely_true};
 use crate::key_value::KEY_VALUE_GLOBAL_VERSION;
 use crate::{LixBackend, LixError, WasmRuntime};
 use serde_json::Value as JsonValue;
@@ -86,22 +85,7 @@ pub(crate) fn infer_boot_deterministic_settings(
         {
             return None;
         }
-        let object = key_value.value.as_object()?;
-        let enabled = object.get("enabled").map(loosely_true).unwrap_or(false);
-        if !enabled {
-            return None;
-        }
-        let uuid_v7_enabled = !object.get("uuid_v7").map(loosely_false).unwrap_or(false);
-        let timestamp_enabled = !object.get("timestamp").map(loosely_false).unwrap_or(false);
-        let timestamp_shuffle_enabled = object
-            .get("timestamp_shuffle")
-            .map(loosely_true)
-            .unwrap_or(false);
-        Some(DeterministicSettings {
-            enabled,
-            uuid_v7_enabled,
-            timestamp_enabled,
-            timestamp_shuffle_enabled,
-        })
+        let settings = parse_deterministic_settings_value(&key_value.value);
+        settings.enabled.then_some(settings)
     })
 }
