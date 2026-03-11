@@ -282,6 +282,7 @@ fn to_sql_value(value: Value) -> rusqlite::types::Value {
         Value::Integer(value) => rusqlite::types::Value::Integer(value),
         Value::Real(value) => rusqlite::types::Value::Real(value),
         Value::Text(value) => rusqlite::types::Value::Text(value),
+        Value::Json(value) => rusqlite::types::Value::Text(value.to_string()),
         Value::Blob(value) => rusqlite::types::Value::Blob(value),
     }
 }

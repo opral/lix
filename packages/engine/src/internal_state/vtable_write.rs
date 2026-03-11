@@ -16,6 +16,8 @@ use crate::engine::query_history::commit_runtime::{
     build_statement_batch_from_generate_commit_result, load_commit_active_accounts,
     load_version_info_for_versions, CommitQueryExecutor, StatementBatch,
 };
+use crate::errors;
+use crate::functions::LixFunctionProvider;
 use crate::internal_state::param_context::{
     expr_last_identifier_eq, extract_string_column_values_from_expr, match_bool_column_equality,
 };
@@ -24,8 +26,6 @@ use crate::internal_state::{
     MutationOperation, MutationRow, PlaceholderState, ResolvedCell, RowSourceResolver,
     SchemaRegistration, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
 };
-use crate::errors;
-use crate::functions::LixFunctionProvider;
 use crate::version::GLOBAL_VERSION_ID;
 #[cfg(test)]
 use crate::SqlDialect;
@@ -1491,13 +1491,11 @@ fn advance_placeholder_state_for_expr(
                 return std::ops::ControlFlow::Continue(());
             };
 
-            if let Err(error) =
-                crate::engine::sql_ast::utils::resolve_placeholder_index(
-                    token,
-                    self.params_len,
-                    self.state,
-                )
-            {
+            if let Err(error) = crate::engine::sql_ast::utils::resolve_placeholder_index(
+                token,
+                self.params_len,
+                self.state,
+            ) {
                 self.error = Some(error);
                 return std::ops::ControlFlow::Break(());
             }
@@ -1577,6 +1575,7 @@ fn value_to_expr(value: &EngineValue) -> Result<Expr, LixError> {
         EngineValue::Null => Ok(null_expr()),
         EngineValue::Boolean(value) => Ok(Expr::Value(Value::Boolean(*value).into())),
         EngineValue::Text(text) => Ok(string_expr(text)),
+        EngineValue::Json(value) => Ok(string_expr(&value.to_string())),
         EngineValue::Integer(value) => {
             Ok(Expr::Value(Value::Number(value.to_string(), false).into()))
         }
@@ -2544,4 +2543,3 @@ fn extract_single_schema_key(expr: &Expr, params: &[EngineValue]) -> Result<Stri
 fn expr_is_schema_key_column(expr: &Expr) -> bool {
     expr_last_identifier_eq(expr, "schema_key")
 }
-

@@ -40,6 +40,9 @@ pub(crate) fn build_domain_change_batch(
         .ok_or_else(|| DomainChangeError {
             message: "sql2 domain-change derivation requires a resolved write plan".to_string(),
         })?;
+    if resolved.intended_post_state.is_empty() {
+        return Ok(None);
+    }
     let write_lane = resolved
         .target_write_lane
         .clone()
@@ -110,6 +113,9 @@ pub(crate) async fn derive_commit_preconditions(
             message: "sql2 commit precondition derivation requires a resolved write plan"
                 .to_string(),
         })?;
+    if resolved.intended_post_state.is_empty() {
+        return Ok(None);
+    }
     let write_lane = resolved
         .target_write_lane
         .clone()
@@ -261,6 +267,14 @@ fn summarize_engine_value(value: &crate::Value) -> JsonValue {
             "sha256": crate::plugin::runtime::binary_blob_hash_hex(text.as_bytes()),
             "len": text.len(),
         }),
+        crate::Value::Json(value) => {
+            let encoded = value.to_string();
+            json!({
+                "kind": "json",
+                "sha256": crate::plugin::runtime::binary_blob_hash_hex(encoded.as_bytes()),
+                "len": encoded.len(),
+            })
+        }
         crate::Value::Blob(bytes) => json!({
             "kind": "blob",
             "sha256": crate::plugin::runtime::binary_blob_hash_hex(bytes),

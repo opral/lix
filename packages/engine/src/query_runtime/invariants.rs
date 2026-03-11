@@ -1,7 +1,7 @@
-use crate::query_runtime::contracts::execution_plan::ExecutionPlan;
 use crate::internal_state::{
     requires_single_statement_internal_state_plan, validate_internal_state_plan,
 };
+use crate::query_runtime::contracts::execution_plan::ExecutionPlan;
 use crate::query_runtime::contracts::planner_error::PlannerError;
 use crate::query_runtime::contracts::result_contract::ResultContract;
 
@@ -35,7 +35,8 @@ pub(crate) fn validate_execution_plan(plan: &ExecutionPlan) -> Result<(), Planne
             "sql planner produced postprocess plan for non-DML contract",
         ));
     }
-    if plan.preprocess.internal_state.is_some() && plan.result_contract.expects_postprocess_output() {
+    if plan.preprocess.internal_state.is_some() && plan.result_contract.expects_postprocess_output()
+    {
         return Err(PlannerError::invariant(
             "sql planner cannot expose postprocess internal rows as public DML RETURNING output",
         ));

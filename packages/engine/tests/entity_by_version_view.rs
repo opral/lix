@@ -208,33 +208,51 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_entity_by_version_insert_on_conflict_do_nothing_is_rejected,
+    lix_entity_by_version_insert_on_conflict_do_nothing_is_supported,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
         engine.init().await.unwrap();
         let version_id = active_version_id(&engine).await;
 
-        let err = engine
+        engine
             .execute(
                 "INSERT INTO lix_key_value_by_version (\
                  key, value, lixcol_version_id\
                  ) VALUES (\
                  'key-upsert-bv', 'value-a', $1\
+                 )",
+                &[Value::Text(version_id.clone())],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_key_value_by_version (\
+                 key, value, lixcol_version_id\
+                 ) VALUES (\
+                 'key-upsert-bv', 'value-b', $1\
                  ) \
                  ON CONFLICT (key, lixcol_version_id) DO NOTHING",
+                &[Value::Text(version_id.clone())],
+            )
+            .await
+            .unwrap();
+
+        let rows = engine
+            .execute(
+                "SELECT value \
+                 FROM lix_key_value_by_version \
+                 WHERE key = 'key-upsert-bv' AND lixcol_version_id = $1",
                 &[Value::Text(version_id)],
             )
             .await
-            .expect_err("DO NOTHING should be rejected");
-
-        assert!(
-            err.description
-                .contains("ON CONFLICT DO NOTHING is not supported"),
-            "unexpected error: {}",
-            err.description
-        );
+            .unwrap();
+        sim.assert_deterministic_normalized(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "value-a");
     }
 );

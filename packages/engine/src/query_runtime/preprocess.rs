@@ -14,9 +14,7 @@ pub(crate) fn preprocess_statements_with_provider_to_plan<P: LixFunctionProvider
     provider: &mut P,
     dialect: SqlDialect,
 ) -> Result<PlannedStatementSet, LixError> {
-    Ok(
-        prepare_statements_sync_to_plan(statements, params, provider, dialect, None)?.into(),
-    )
+    Ok(prepare_statements_sync_to_plan(statements, params, provider, dialect, None)?.into())
 }
 
 pub(crate) async fn preprocess_sql_to_plan(
@@ -78,16 +76,9 @@ pub(crate) async fn preprocess_with_surfaces_to_plan<P: LixFunctionProvider>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    Ok(
-        prepare_statements_with_backend_to_plan(
-            backend,
-            evaluator,
-            statements,
-            params,
-            functions,
-            writer_key,
-        )
-        .await?
-        .into(),
+    Ok(prepare_statements_with_backend_to_plan(
+        backend, evaluator, statements, params, functions, writer_key,
     )
+    .await?
+    .into())
 }

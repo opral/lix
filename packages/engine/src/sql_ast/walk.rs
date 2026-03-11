@@ -2,9 +2,9 @@ use sqlparser::ast::ObjectNamePart;
 
 #[cfg(test)]
 use super::utils::is_transaction_control_statement;
+use sqlparser::ast::ObjectName;
 #[cfg(test)]
 use sqlparser::ast::Statement;
-use sqlparser::ast::ObjectName;
 
 pub(crate) fn object_name_matches(name: &ObjectName, target: &str) -> bool {
     name.0

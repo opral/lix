@@ -279,9 +279,13 @@ fn resolve_explicit_placeholder_value<'a>(
     token: &str,
     params: &'a [EngineValue],
 ) -> Option<&'a EngineValue> {
-    let numeric = token.strip_prefix('?').or_else(|| token.strip_prefix('$'))?;
+    let numeric = token
+        .strip_prefix('?')
+        .or_else(|| token.strip_prefix('$'))?;
     let index = numeric.parse::<usize>().ok()?;
-    index.checked_sub(1).and_then(|zero_based| params.get(zero_based))
+    index
+        .checked_sub(1)
+        .and_then(|zero_based| params.get(zero_based))
 }
 
 fn intersect_values<T>(left: &[T], right: &[T]) -> Vec<T>

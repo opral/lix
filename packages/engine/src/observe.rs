@@ -1,9 +1,9 @@
 use crate::engine::sql_ast::utils::parse_sql_statements;
+use crate::engine::Engine;
+use crate::errors;
 use crate::query_runtime::dependency_spec::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
 };
-use crate::engine::Engine;
-use crate::errors;
 use crate::state_commit_stream::StateCommitStream;
 use crate::{LixError, QueryResult, Value, WireValue};
 use serde::{Deserialize, Serialize};
@@ -831,7 +831,9 @@ fn parse_observe_tick_writer_key(value: &Value) -> Result<Option<String>, LixErr
 
 #[cfg(test)]
 mod tests {
-    use super::{observe_source_key, ObserveEvent, ObserveEvents, ObserveQuery, OBSERVE_TICK_POLL_INTERVAL};
+    use super::{
+        observe_source_key, ObserveEvent, ObserveEvents, ObserveQuery, OBSERVE_TICK_POLL_INTERVAL,
+    };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
     use crate::{boot, BootArgs, LixError, NoopWasmRuntime, QueryResult, Value};
     use async_trait::async_trait;

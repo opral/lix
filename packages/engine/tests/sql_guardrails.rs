@@ -71,7 +71,7 @@ fn guardrail_sql_runtime_forbids_legacy_sql2_imports() {
     let shared_path_source = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/query_runtime/shared_path.rs"),
     )
-        .expect("shared_path.rs should be readable");
+    .expect("shared_path.rs should be readable");
     assert!(
         !shared_path_source.contains("crate::engine::sql2::"),
         "shared_path must not depend on removed engine::sql2 bridge paths"
@@ -211,8 +211,7 @@ fn guardrail_legacy_surface_registry_directory_is_removed() {
 fn guardrail_filesystem_public_surfaces_do_not_enter_legacy_query_rewrite() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !root.join("src/sql/planning/rewrite_engine")
-            .exists(),
+        !root.join("src/sql/planning/rewrite_engine").exists(),
         "legacy rewrite_engine directory must stay removed for migrated public reads"
     );
 }
@@ -357,9 +356,7 @@ fn guardrail_sql_side_effects_stays_off_legacy_filesystem_update_detector() {
 fn guardrail_legacy_query_pipeline_context_is_removed_and_validator_is_filesystem_blind() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !root
-            .join("src/sql/planning/rewrite_engine")
-            .exists(),
+        !root.join("src/sql/planning/rewrite_engine").exists(),
         "legacy rewrite_engine directory should be removed"
     );
 }
@@ -443,8 +440,7 @@ fn guardrail_live_filesystem_intent_path_has_no_plugin_detection_branch() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let side_effects_source = fs::read_to_string(root.join("src/runtime_effects.rs"))
         .expect("runtime_effects.rs should be readable");
-    let shared_path_source =
-        fs::read_to_string(root.join("src/query_runtime/shared_path.rs"))
+    let shared_path_source = fs::read_to_string(root.join("src/query_runtime/shared_path.rs"))
         .expect("shared_path.rs should be readable");
     let intent_source = fs::read_to_string(root.join("src/query_runtime/intent.rs"))
         .expect("intent.rs should be readable");

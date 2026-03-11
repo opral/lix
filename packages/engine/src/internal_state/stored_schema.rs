@@ -330,6 +330,9 @@ fn engine_value_to_expr(value: &EngineValue) -> Expr {
         EngineValue::Text(value) => Expr::Value(ValueWithSpan::from(Value::SingleQuotedString(
             value.clone(),
         ))),
+        EngineValue::Json(value) => Expr::Value(ValueWithSpan::from(Value::SingleQuotedString(
+            value.to_string(),
+        ))),
         EngineValue::Integer(value) => {
             Expr::Value(ValueWithSpan::from(Value::Number(value.to_string(), false)))
         }

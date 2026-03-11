@@ -270,9 +270,16 @@ pub(crate) enum MutationPayload {
     Tombstone,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InsertOnConflictAction {
+    DoUpdate,
+    DoNothing,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InsertOnConflictUpdate {
+pub(crate) struct InsertOnConflict {
     pub(crate) conflict_columns: Vec<String>,
+    pub(crate) action: InsertOnConflictAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -288,7 +295,7 @@ pub(crate) struct WriteCommand {
     pub(crate) target: SurfaceBinding,
     pub(crate) selector: WriteSelector,
     pub(crate) payload: MutationPayload,
-    pub(crate) on_conflict_update: Option<InsertOnConflictUpdate>,
+    pub(crate) on_conflict: Option<InsertOnConflict>,
     pub(crate) mode: WriteMode,
     pub(crate) execution_context: ExecutionContext,
 }
