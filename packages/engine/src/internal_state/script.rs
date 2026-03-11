@@ -207,11 +207,7 @@ fn append_insert_rows(target: &mut Insert, incoming: &Insert) -> Result<(), LixE
 
 fn insert_targets_coalescable_table(insert: &Insert) -> bool {
     match &insert.table {
-        TableObject::TableName(name) => {
-            object_name_matches(name, "lix_internal_state_vtable")
-                || object_name_matches(name, "lix_key_value")
-                || object_name_matches(name, "lix_key_value_by_version")
-        }
+        TableObject::TableName(name) => object_name_matches(name, "lix_internal_state_vtable"),
         _ => false,
     }
 }

@@ -127,6 +127,7 @@ pub struct EngineTransaction<'a> {
     active_version_changed: bool,
     installed_plugins_cache_invalidation_pending: bool,
     pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
+    pending_sql2_append_session: Option<crate::query_runtime::shared_path::PendingSql2AppendSession>,
 }
 
 impl<'a> EngineTransaction<'a> {
@@ -170,6 +171,7 @@ impl<'a> EngineTransaction<'a> {
                     &self.options,
                     &mut self.active_version_id,
                     &mut self.pending_state_commit_stream_changes,
+                    &mut self.pending_sql2_append_session,
                 )
                 .await?
         } else {
@@ -184,6 +186,7 @@ impl<'a> EngineTransaction<'a> {
                     None,
                     false,
                     &mut self.pending_state_commit_stream_changes,
+                    &mut self.pending_sql2_append_session,
                 )
                 .await?;
             ExecuteResult {

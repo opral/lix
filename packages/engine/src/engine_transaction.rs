@@ -15,6 +15,7 @@ impl Engine {
             active_version_changed: false,
             installed_plugins_cache_invalidation_pending: false,
             pending_state_commit_stream_changes: Vec::new(),
+            pending_sql2_append_session: None,
         })
     }
 

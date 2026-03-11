@@ -2,16 +2,17 @@ use crate::sql2::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
 use crate::sql2::core::contracts::{BoundStatement, StatementKind};
 use crate::sql2::planner::ir::{
     CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan,
-    CanonicalWorkingChangesScan, MutationPayload, PredicateSpec, ProjectionExpr, ReadCommand,
-    ReadContract, ReadPlan, SortKey, WriteCommand, WriteMode, WriteOperationKind, WriteSelector,
+    CanonicalWorkingChangesScan, InsertOnConflictUpdate, MutationPayload, PredicateSpec,
+    ProjectionExpr, ReadCommand, ReadContract, ReadPlan, SortKey, WriteCommand, WriteMode,
+    WriteOperationKind, WriteSelector,
 };
 use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, Insert, LimitClause, ObjectNamePart, OrderBy, OrderByKind,
-    Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Update,
-    Value as SqlValue,
+    AssignmentTarget, BinaryOperator, ConflictTarget, Delete, Expr, FromTable, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, LimitClause, ObjectNamePart,
+    OnConflictAction, OnInsert, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr,
+    Statement, TableFactor, TableWithJoins, Update, Value as SqlValue,
 };
 use std::collections::BTreeMap;
 
@@ -187,13 +188,19 @@ fn canonicalize_insert_write(
     let surface_binding = bind_insert_surface(insert, registry)?;
     reject_filesystem_history_write(&surface_binding, "INSERT")?;
     validate_semantic_write_surface(&surface_binding, insert_write_surface_supported)?;
-    if !insert.assignments.is_empty() || insert.on.is_some() || insert.returning.is_some() {
+    if !insert.assignments.is_empty() || insert.returning.is_some() {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer only supports plain VALUES inserts without ON CONFLICT or RETURNING",
+            "sql2 day-1 write canonicalizer only supports VALUES inserts without assignment targets or RETURNING",
         ));
     }
 
     let payload = insert_payload(&surface_binding, insert, &bound_statement.bound_parameters)?;
+    let on_conflict_update = insert_on_conflict_update(
+        &surface_binding,
+        insert,
+        &bound_statement.bound_parameters,
+        &payload,
+    )?;
     let mode = write_mode_for_surface_and_selector(&surface_binding, &payload, None);
 
     Ok(CanonicalizedWrite {
@@ -204,6 +211,7 @@ fn canonicalize_insert_write(
             target: surface_binding,
             selector: WriteSelector::default(),
             payload: MutationPayload::FullSnapshot(payload),
+            on_conflict_update,
             mode,
             execution_context: bound_statement.execution_context,
         },
@@ -261,6 +269,7 @@ fn canonicalize_update_write(
             target: surface_binding.clone(),
             selector,
             payload: MutationPayload::Patch(payload),
+            on_conflict_update: None,
             mode,
             execution_context: bound_statement.execution_context,
         },
@@ -312,6 +321,7 @@ fn canonicalize_delete_write(
             target: surface_binding.clone(),
             selector: selector.clone(),
             payload: MutationPayload::Tombstone,
+            on_conflict_update: None,
             mode: write_mode_for_surface_and_selector(
                 &surface_binding,
                 &BTreeMap::new(),
@@ -320,6 +330,68 @@ fn canonicalize_delete_write(
             execution_context: bound_statement.execution_context,
         },
     })
+}
+
+fn insert_on_conflict_update(
+    surface_binding: &SurfaceBinding,
+    insert: &Insert,
+    params: &[Value],
+    insert_payload: &BTreeMap<String, Value>,
+) -> Result<Option<InsertOnConflictUpdate>, CanonicalizeError> {
+    let Some(on_insert) = &insert.on else {
+        return Ok(None);
+    };
+
+    let OnInsert::OnConflict(on_conflict) = on_insert else {
+        return Err(CanonicalizeError::unsupported(
+            "sql2 day-1 insert canonicalizer only supports ON CONFLICT ... DO UPDATE",
+        ));
+    };
+
+    let conflict_columns = match &on_conflict.conflict_target {
+        Some(ConflictTarget::Columns(columns)) if !columns.is_empty() => columns
+            .iter()
+            .map(|ident| canonical_write_column_key(surface_binding, &ident.value))
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(CanonicalizeError::unsupported(
+                "sql2 day-1 insert canonicalizer only supports explicit ON CONFLICT column targets",
+            ))
+        }
+        None => {
+            return Err(CanonicalizeError::unsupported(
+                "sql2 day-1 insert canonicalizer requires explicit ON CONFLICT columns",
+            ))
+        }
+    };
+
+    match &on_conflict.action {
+        OnConflictAction::DoNothing => Err(CanonicalizeError::unsupported(
+            "sql2 day-1 insert canonicalizer does not support ON CONFLICT DO NOTHING",
+        )),
+        OnConflictAction::DoUpdate(update) => {
+            if update.selection.is_some() {
+                return Err(CanonicalizeError::unsupported(
+                    "sql2 day-1 insert canonicalizer does not support ON CONFLICT DO UPDATE WHERE",
+                ));
+            }
+            let mut placeholder_state = PlaceholderState::new();
+            let update_payload = assignment_payload(
+                surface_binding,
+                &update.assignments,
+                params,
+                &mut placeholder_state,
+            )?;
+            for (key, value) in update_payload {
+                if insert_payload.get(&key) != Some(&value) {
+                    return Err(CanonicalizeError::unsupported(
+                        "sql2 day-1 insert canonicalizer only supports ON CONFLICT DO UPDATE assignments that match inserted values",
+                    ));
+                }
+            }
+            Ok(Some(InsertOnConflictUpdate { conflict_columns }))
+        }
+    }
 }
 
 fn extract_supported_select(query: &Query) -> Result<&Select, CanonicalizeError> {
