@@ -757,11 +757,6 @@ async fn collect_delete_targets(
         target,
         active_version_id,
     )? {
-        for key in exact_targets {
-            statement_targets.insert(key.clone());
-            targets.insert(key);
-        }
-
         let overlay_rows = execute_delete_overlay_prefetch_query(
             backend,
             delete,
@@ -772,6 +767,26 @@ async fn collect_delete_targets(
         )
         .await?;
         for row in overlay_rows {
+            let Some(file_id) = row.first().and_then(value_as_text) else {
+                continue;
+            };
+            let version_id = row
+                .get(1)
+                .and_then(value_as_text)
+                .unwrap_or_else(|| active_version_id.to_string());
+            let key = (file_id, version_id);
+            statement_targets.insert(key.clone());
+            targets.insert(key);
+        }
+
+        let live_rows = execute_exact_delete_target_prefetch_query(
+            backend,
+            &exact_targets,
+            active_version_id,
+            target,
+        )
+        .await?;
+        for row in live_rows {
             let Some(file_id) = row.first().and_then(value_as_text) else {
                 continue;
             };
@@ -2423,6 +2438,68 @@ async fn execute_delete_overlay_prefetch_query(
     )?;
     let rows = backend.execute(&bound.sql, &bound.params).await?.rows;
     Ok(rows)
+}
+
+async fn execute_exact_delete_target_prefetch_query(
+    backend: &dyn LixBackend,
+    exact_targets: &BTreeSet<(String, String)>,
+    active_version_id: &str,
+    target: FileWriteTarget,
+) -> Result<Vec<Vec<Value>>, LixError> {
+    if exact_targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let query_sql = match target {
+        FileWriteTarget::ActiveVersion => {
+            let ids = exact_targets
+                .iter()
+                .map(|(file_id, _)| format!("'{}'", escape_sql_string(file_id)))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "SELECT id, lixcol_version_id \
+                 FROM ({live_projection_sql}) AS live_files \
+                 WHERE lixcol_version_id = '{active_version_id}' \
+                   AND id IN ({ids})",
+                live_projection_sql = build_live_file_prefetch_projection_sql(),
+                active_version_id = escape_sql_string(active_version_id),
+            )
+        }
+        FileWriteTarget::ExplicitVersion => {
+            let requested_rows = exact_targets
+                .iter()
+                .map(|(file_id, version_id)| {
+                    format!(
+                        "('{}', '{}')",
+                        escape_sql_string(file_id),
+                        escape_sql_string(version_id)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "WITH requested(file_id, version_id) AS (VALUES {requested_rows}) \
+                 SELECT live_files.id, live_files.lixcol_version_id \
+                 FROM ({live_projection_sql}) AS live_files \
+                 JOIN requested \
+                   ON requested.file_id = live_files.id \
+                  AND requested.version_id = live_files.lixcol_version_id",
+                live_projection_sql = build_live_file_prefetch_projection_sql(),
+            )
+        }
+    };
+
+    execute_prefetch_query(
+        backend,
+        "pending.collect_delete_targets.exact",
+        &query_sql,
+        &[],
+    )
+    .await
+    .map(|result| result.rows)
 }
 
 fn overlay_rows_for_target(

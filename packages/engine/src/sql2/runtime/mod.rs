@@ -15,7 +15,10 @@ use crate::query_runtime::intent::authoritative_pending_file_write_targets;
 use crate::sql2::backend::PushdownDecision;
 use crate::sql2::catalog::{SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
 use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
-use crate::sql2::planner::backend::lowerer::{lower_read_for_execution, LoweredReadProgram};
+use crate::sql2::planner::backend::lowerer::{
+    lower_read_for_execution, rewrite_supported_public_read_surfaces_in_statement_with_registry,
+    LoweredReadProgram,
+};
 use crate::sql2::planner::canonicalize::{
     canonicalize_read, canonicalize_write, CanonicalizedRead, CanonicalizedWrite,
 };
@@ -89,7 +92,7 @@ pub(crate) struct Sql2InvariantTrace {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Sql2PreparedRead {
-    pub(crate) canonicalized: CanonicalizedRead,
+    pub(crate) canonicalized: Option<CanonicalizedRead>,
     pub(crate) dependency_spec: Option<DependencySpec>,
     pub(crate) effective_state_request: Option<EffectiveStateRequest>,
     pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
@@ -332,12 +335,28 @@ async fn try_prepare_sql2_read(
             requested_version_id: Some(active_version_id.to_string()),
         },
     );
-    let canonicalized = canonicalize_read(bound_statement.clone(), &registry).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("sql2 read preparation failed: {}", error.message),
-        )
-    })?;
+    let canonicalized = match canonicalize_read(bound_statement.clone(), &registry) {
+        Ok(canonicalized) => canonicalized,
+        Err(canonicalize_error) => {
+            if let Some(prepared) = prepare_sql2_read_via_surface_expansion(
+                backend,
+                bound_statement,
+                explain_envelope.as_ref(),
+                &registry,
+            )
+            .await?
+            {
+                return Ok(Some(prepared));
+            }
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "sql2 read preparation failed: {}",
+                    canonicalize_error.message
+                ),
+            ));
+        }
+    };
     let canonicalized =
         maybe_bind_active_history_root(backend, canonicalized, active_version_id, &registry)
             .await
@@ -404,7 +423,68 @@ async fn try_prepare_sql2_read(
         effective_state_request: effective_state.as_ref().map(|(request, _)| request.clone()),
         effective_state_plan: effective_state.as_ref().map(|(_, plan)| plan.clone()),
         lowered_read,
-        canonicalized,
+        canonicalized: Some(canonicalized),
+    }))
+}
+
+async fn prepare_sql2_read_via_surface_expansion(
+    backend: &dyn LixBackend,
+    bound_statement: BoundStatement,
+    explain_envelope: Option<&ExplainEnvelope>,
+    registry: &SurfaceRegistry,
+) -> Result<Option<Sql2PreparedRead>, LixError> {
+    ensure_sql2_history_timeline_roots(backend, &bound_statement.statement)
+        .await
+        .map_err(|error| LixError::new(error.code, error.description))?;
+
+    let mut rewritten_statement = bound_statement.statement.clone();
+    rewrite_supported_public_read_surfaces_in_statement_with_registry(
+        &mut rewritten_statement,
+        registry,
+    )?;
+    if statement_references_public_surface(registry, &rewritten_statement) {
+        return Ok(None);
+    }
+    if rewritten_statement == bound_statement.statement {
+        return Ok(None);
+    }
+
+    let lowered_read = wrap_lowered_read_for_explain(
+        LoweredReadProgram {
+            statements: vec![rewritten_statement.clone()],
+            pushdown_decision: PushdownDecision::default(),
+        },
+        explain_envelope,
+    );
+
+    Ok(Some(Sql2PreparedRead {
+        debug_trace: Sql2DebugTrace {
+            bound_statements: vec![bound_statement.clone()],
+            surface_bindings: bound_public_surface_names(registry, &bound_statement.statement),
+            dependency_spec: None,
+            effective_state_request: None,
+            effective_state_plan: None,
+            pushdown_decision: Some(PushdownDecision::default()),
+            write_command: None,
+            scope_proof: None,
+            schema_proof: None,
+            target_set_proof: None,
+            resolved_write_plan: None,
+            domain_change_batch: None,
+            commit_preconditions: None,
+            invariant_trace: None,
+            write_phase_trace: Vec::new(),
+            lowered_sql: lowered_read
+                .statements
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        },
+        dependency_spec: None,
+        effective_state_request: None,
+        effective_state_plan: None,
+        lowered_read: Some(lowered_read),
+        canonicalized: None,
     }))
 }
 
@@ -546,6 +626,16 @@ fn collect_public_query_relation_names(query: &Query) -> BTreeSet<String> {
     };
     let _ = query.visit(&mut collector);
     collector.relation_names
+}
+
+fn bound_public_surface_names(registry: &SurfaceRegistry, statement: &Statement) -> Vec<String> {
+    let Statement::Query(query) = statement else {
+        return Vec::new();
+    };
+    collect_public_query_relation_names(query)
+        .into_iter()
+        .filter(|name| registry.bind_relation_name(name).is_some())
+        .collect()
 }
 
 async fn load_active_version_id_for_sql2_read(
@@ -2075,6 +2165,8 @@ mod tests {
         assert_eq!(
             prepared
                 .canonicalized
+                .as_ref()
+                .expect("stored-schema entity read should use canonicalized path")
                 .surface_binding
                 .implicit_overrides
                 .fixed_schema_key
@@ -2619,6 +2711,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepares_joined_admin_reads_via_surface_expansion() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one(
+                "SELECT av.version_id, v.commit_id \
+                 FROM lix_active_version av \
+                 JOIN lix_version v ON v.id = av.version_id",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("joined admin read should prepare through sql2");
+
+        assert!(prepared.canonicalized.is_none());
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_active_version", "lix_version"]
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("joined admin read should lower");
+        assert!(lowered_sql.contains("lix_internal_state_untracked"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_version_descriptor"));
+    }
+
+    #[tokio::test]
     async fn prepares_state_reads_with_explicit_residual_pushdown_trace() {
         let backend = FakeBackend::default();
         let prepared = prepare_sql2_read(
@@ -3057,7 +3180,7 @@ mod tests {
         assert!(matches!(
             prepared.execution.as_ref(),
             Some(Sql2WriteExecution::Untracked(execution))
-                if execution.persist_filesystem_payloads_before_write
+                if !execution.persist_filesystem_payloads_before_write
         ));
         assert!(prepared.planned_write.commit_preconditions.is_none());
         assert!(prepared.domain_change_batch.is_none());

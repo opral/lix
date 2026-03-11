@@ -223,6 +223,7 @@ fn canonicalize_insert_write(
             payload,
             on_conflict,
             requested_mode,
+            bound_parameters: bound_statement.bound_parameters.clone(),
             execution_context: bound_statement.execution_context,
         },
     })
@@ -282,6 +283,7 @@ fn canonicalize_update_write(
             payload: MutationPayload::Patch(payload),
             on_conflict: None,
             requested_mode,
+            bound_parameters: bound_statement.bound_parameters.clone(),
             execution_context: bound_statement.execution_context,
         },
     })
@@ -338,6 +340,7 @@ fn canonicalize_delete_write(
                 &BTreeMap::new(),
                 Some(&selector),
             ),
+            bound_parameters: bound_statement.bound_parameters.clone(),
             execution_context: bound_statement.execution_context,
         },
     })

@@ -137,17 +137,30 @@ pub async fn load_settings(backend: &dyn LixBackend) -> Result<DeterministicSett
 }
 
 pub async fn load_persisted_sequence_next(backend: &dyn LixBackend) -> Result<i64, LixError> {
-    let sequence_value = match load_key_value_payload(backend, SEQUENCE_KEY).await {
-        Ok(value) => value,
+    let sql = format!(
+        "SELECT snapshot_content \
+         FROM lix_internal_state_untracked \
+         WHERE schema_key = '{schema_key}' \
+           AND entity_id = '{entity_id}' \
+           AND version_id = '{version_id}' \
+           AND snapshot_content IS NOT NULL",
+        schema_key = escape_sql_string(key_value_schema_key()),
+        entity_id = escape_sql_string(SEQUENCE_KEY),
+        version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
+    );
+    let result = match backend.execute(&sql, &[]).await {
+        Ok(result) => result,
         Err(err) if is_missing_relation_error(&err) => return Ok(0),
         Err(err) => return Err(err),
     };
-    let next = sequence_value
-        .as_ref()
-        .and_then(parse_integer_value)
-        .map(|highest| highest + 1)
-        .unwrap_or(0);
-    Ok(next)
+    let highest_seen = result
+        .rows
+        .iter()
+        .filter_map(|row| parse_first_payload(Some(row)).ok().flatten())
+        .filter_map(|value| parse_integer_value(&value))
+        .max()
+        .unwrap_or(-1);
+    Ok(highest_seen + 1)
 }
 
 pub async fn persist_sequence_highest(
