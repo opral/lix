@@ -15,7 +15,7 @@ pub(crate) struct FilesystemPayloadDomainChange {
     pub(crate) writer_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct PlanEffects {
     pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
     pub(crate) next_active_version_id: Option<String>,

@@ -236,7 +236,7 @@ impl Engine {
             &prepared.intent.pending_file_writes,
             &prepared.intent.pending_file_delete_targets,
             execution.plugin_changes_committed,
-            shared_path::sql2_commits_filesystem_payload_domain_changes(&prepared),
+            shared_path::sql2_filesystem_payload_changes_already_committed(&prepared),
             writer_key,
         )
         .await?;

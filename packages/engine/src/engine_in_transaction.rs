@@ -129,7 +129,7 @@ impl Engine {
                 .extend(prepared.intent.pending_file_writes.clone());
         } else {
             let filesystem_payload_changes_already_committed =
-                shared_path::sql2_commits_filesystem_payload_domain_changes(&prepared);
+                shared_path::sql2_filesystem_payload_changes_already_committed(&prepared);
             if !filesystem_payload_changes_already_committed {
                 self.persist_pending_file_data_updates_in_transaction(
                     transaction,

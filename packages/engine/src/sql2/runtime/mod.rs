@@ -1,9 +1,17 @@
-use crate::commit::load_committed_version_tip_commit_id;
+use crate::commit::{
+    load_committed_version_tip_commit_id, AppendCommitPreconditions, AppendExpectedTip,
+    AppendWriteLane, ProposedDomainChange,
+};
 use crate::engine::query_semantics::state_resolution::canonical::statement_targets_table_name;
 use crate::engine::sql_ast::lowering::lower_statement;
 use crate::errors::schema_not_registered_error;
 use crate::errors::{file_data_expects_bytes_error, read_only_view_write_error};
+use crate::filesystem::pending_file_writes::PendingFileWrite;
 use crate::history_timeline::ensure_history_timeline_materialized_for_root;
+use crate::query_runtime::contracts::effects::PlanEffects;
+use crate::query_runtime::contracts::planned_statement::SchemaRegistration;
+use crate::query_runtime::contracts::result_contract::ResultContract;
+use crate::query_runtime::intent::authoritative_pending_file_write_targets;
 use crate::sql2::backend::PushdownDecision;
 use crate::sql2::catalog::{SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
 use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
@@ -25,6 +33,14 @@ use crate::sql2::planner::semantics::effective_state_resolver::{
 use crate::sql2::planner::semantics::proof_engine::prove_write;
 use crate::sql2::planner::semantics::write_resolver::resolve_write_plan;
 use crate::sql_shared::dependency_spec::DependencySpec;
+use crate::state_commit_stream::{
+    state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
+    StateCommitStreamOperation,
+};
+use crate::version::{
+    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
+    parse_active_version_snapshot,
+};
 use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::{
     BinaryOperator, Expr, Ident, ObjectNamePart, Query, SetExpr, Statement, TableFactor,
@@ -86,7 +102,31 @@ pub(crate) struct Sql2PreparedWrite {
     pub(crate) canonicalized: CanonicalizedWrite,
     pub(crate) planned_write: PlannedWrite,
     pub(crate) domain_change_batch: Option<DomainChangeBatch>,
+    pub(crate) execution: Option<Sql2WriteExecution>,
     pub(crate) debug_trace: Sql2DebugTrace,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Sql2WriteExecution {
+    Tracked(Sql2TrackedWriteExecution),
+    Untracked(Sql2UntrackedWriteExecution),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Sql2TrackedWriteExecution {
+    pub(crate) schema_registrations: Vec<SchemaRegistration>,
+    pub(crate) domain_change_batch: DomainChangeBatch,
+    pub(crate) append_preconditions: AppendCommitPreconditions,
+    pub(crate) semantic_effects: PlanEffects,
+    pub(crate) persist_filesystem_payloads_before_write: bool,
+    pub(crate) filesystem_payload_changes_committed_by_write: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Sql2UntrackedWriteExecution {
+    pub(crate) intended_post_state: Vec<crate::sql2::planner::ir::PlannedStateRow>,
+    pub(crate) semantic_effects: PlanEffects,
+    pub(crate) persist_filesystem_payloads_before_write: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -941,6 +981,12 @@ pub(crate) async fn try_prepare_sql2_write(
     };
     planned_write.commit_preconditions = commit_preconditions.clone();
     let invariant_trace = Some(build_sql2_invariant_trace(&planned_write));
+    let execution = build_sql2_write_execution(
+        &bound_statement.statement,
+        &planned_write,
+        domain_change_batch.as_ref(),
+        commit_preconditions.as_ref(),
+    )?;
 
     Ok(Some(Sql2PreparedWrite {
         debug_trace: Sql2DebugTrace {
@@ -963,6 +1009,7 @@ pub(crate) async fn try_prepare_sql2_write(
         },
         planned_write,
         domain_change_batch,
+        execution,
         canonicalized,
     }))
 }
@@ -984,6 +1031,370 @@ pub(crate) async fn prepare_sql2_write(
     .await
     .ok()
     .flatten()
+}
+
+fn build_sql2_write_execution(
+    statement: &Statement,
+    planned_write: &PlannedWrite,
+    domain_change_batch: Option<&DomainChangeBatch>,
+    commit_preconditions: Option<&CommitPreconditions>,
+) -> Result<Option<Sql2WriteExecution>, LixError> {
+    if !matches!(
+        write_result_contract(statement),
+        ResultContract::DmlNoReturning
+    ) {
+        return Ok(None);
+    }
+
+    let Some(resolved) = planned_write.resolved_write_plan.as_ref() else {
+        return Ok(None);
+    };
+    match resolved.execution_mode {
+        crate::sql2::planner::ir::WriteMode::Tracked => {
+            let Some(domain_change_batch) = domain_change_batch.cloned() else {
+                return Ok(None);
+            };
+            let Some(commit_preconditions) = commit_preconditions else {
+                return Ok(None);
+            };
+            if !tracked_sql2_operation_supported(planned_write) {
+                return Ok(None);
+            }
+
+            Ok(Some(Sql2WriteExecution::Tracked(
+                Sql2TrackedWriteExecution {
+                    schema_registrations: sql2_schema_registrations_from_planned_write(
+                        planned_write,
+                    ),
+                    append_preconditions: append_commit_preconditions_for_sql2_write(
+                        planned_write,
+                        &domain_change_batch,
+                        commit_preconditions,
+                    )?,
+                    semantic_effects: semantic_plan_effects_from_domain_changes(
+                        &domain_change_batch.changes,
+                        state_commit_stream_operation(planned_write.command.operation_kind),
+                    )?,
+                    persist_filesystem_payloads_before_write: sql2_persists_filesystem_payloads(
+                        planned_write,
+                    ),
+                    filesystem_payload_changes_committed_by_write:
+                        sql2_commits_filesystem_payload_domain_changes(planned_write),
+                    domain_change_batch,
+                },
+            )))
+        }
+        crate::sql2::planner::ir::WriteMode::Untracked => {
+            if !sql2_untracked_operation_supported(planned_write) {
+                return Ok(None);
+            }
+            Ok(Some(Sql2WriteExecution::Untracked(
+                Sql2UntrackedWriteExecution {
+                    intended_post_state: resolved.intended_post_state.clone(),
+                    semantic_effects: PlanEffects::default(),
+                    persist_filesystem_payloads_before_write: sql2_persists_filesystem_payloads(
+                        planned_write,
+                    ),
+                },
+            )))
+        }
+    }
+}
+
+pub(crate) fn finalize_sql2_write_execution(
+    execution: &mut Sql2WriteExecution,
+    planned_write: &PlannedWrite,
+    pending_file_writes: &[PendingFileWrite],
+    pending_file_delete_targets: &BTreeSet<(String, String)>,
+) -> Result<(), LixError> {
+    if let Sql2WriteExecution::Untracked(untracked) = execution {
+        untracked.semantic_effects = semantic_plan_effects_from_untracked_sql2_write(
+            planned_write,
+            &untracked.intended_post_state,
+            pending_file_writes,
+            pending_file_delete_targets,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_result_contract(statement: &Statement) -> ResultContract {
+    match statement {
+        Statement::Insert(insert) => {
+            if insert.returning.is_some() {
+                ResultContract::DmlReturning
+            } else {
+                ResultContract::DmlNoReturning
+            }
+        }
+        Statement::Update(update) => {
+            if update.returning.is_some() {
+                ResultContract::DmlReturning
+            } else {
+                ResultContract::DmlNoReturning
+            }
+        }
+        Statement::Delete(delete) => {
+            if delete.returning.is_some() {
+                ResultContract::DmlReturning
+            } else {
+                ResultContract::DmlNoReturning
+            }
+        }
+        _ => ResultContract::Other,
+    }
+}
+
+fn sql2_schema_registrations_from_planned_write(
+    planned_write: &PlannedWrite,
+) -> Vec<SchemaRegistration> {
+    let mut schema_keys = BTreeSet::new();
+    let Some(resolved) = planned_write.resolved_write_plan.as_ref() else {
+        return Vec::new();
+    };
+    for row in &resolved.intended_post_state {
+        if row.schema_key != "lix_stored_schema" {
+            schema_keys.insert(row.schema_key.clone());
+        }
+
+        if row.schema_key != "lix_stored_schema" || row.tombstone {
+            continue;
+        }
+
+        let Some(Value::Text(snapshot_content)) = row.values.get("snapshot_content") else {
+            continue;
+        };
+        let Ok(snapshot) = serde_json::from_str(snapshot_content) else {
+            continue;
+        };
+        let Ok((schema_key, _)) = crate::schema::schema_from_stored_snapshot(&snapshot) else {
+            continue;
+        };
+        schema_keys.insert(schema_key.schema_key);
+    }
+
+    schema_keys
+        .into_iter()
+        .map(|schema_key| SchemaRegistration { schema_key })
+        .collect()
+}
+
+fn tracked_sql2_operation_supported(planned_write: &PlannedWrite) -> bool {
+    match planned_write.command.operation_kind {
+        WriteOperationKind::Insert => true,
+        WriteOperationKind::Update | WriteOperationKind::Delete => matches!(
+            planned_write
+                .commit_preconditions
+                .as_ref()
+                .map(|preconditions| &preconditions.write_lane),
+            Some(crate::sql2::planner::ir::WriteLane::SingleVersion(_))
+                | Some(crate::sql2::planner::ir::WriteLane::ActiveVersion)
+                | Some(crate::sql2::planner::ir::WriteLane::GlobalAdmin)
+        ),
+    }
+}
+
+fn sql2_untracked_operation_supported(planned_write: &PlannedWrite) -> bool {
+    matches!(
+        planned_write.command.target.descriptor.surface_family,
+        SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
+    ) || matches!(
+        planned_write.command.target.descriptor.public_name.as_str(),
+        "lix_active_version" | "lix_active_account"
+    )
+}
+
+fn sql2_commits_filesystem_payload_domain_changes(planned_write: &PlannedWrite) -> bool {
+    matches!(
+        planned_write.command.target.descriptor.public_name.as_str(),
+        "lix_file" | "lix_file_by_version"
+    ) && matches!(
+        planned_write
+            .resolved_write_plan
+            .as_ref()
+            .map(|plan| plan.execution_mode),
+        Some(crate::sql2::planner::ir::WriteMode::Tracked)
+    )
+}
+
+fn sql2_persists_filesystem_payloads(planned_write: &PlannedWrite) -> bool {
+    matches!(
+        planned_write.command.target.descriptor.public_name.as_str(),
+        "lix_file" | "lix_file_by_version"
+    ) && matches!(
+        planned_write
+            .resolved_write_plan
+            .as_ref()
+            .map(|plan| plan.execution_mode),
+        Some(crate::sql2::planner::ir::WriteMode::Tracked)
+            | Some(crate::sql2::planner::ir::WriteMode::Untracked)
+    )
+}
+
+fn state_commit_stream_operation(operation_kind: WriteOperationKind) -> StateCommitStreamOperation {
+    match operation_kind {
+        WriteOperationKind::Insert => StateCommitStreamOperation::Insert,
+        WriteOperationKind::Update => StateCommitStreamOperation::Update,
+        WriteOperationKind::Delete => StateCommitStreamOperation::Delete,
+    }
+}
+
+fn append_commit_preconditions_for_sql2_write(
+    planned_write: &PlannedWrite,
+    batch: &DomainChangeBatch,
+    commit_preconditions: &CommitPreconditions,
+) -> Result<AppendCommitPreconditions, LixError> {
+    let write_lane = match &commit_preconditions.write_lane {
+        crate::sql2::planner::ir::WriteLane::SingleVersion(version_id) => {
+            AppendWriteLane::Version(version_id.clone())
+        }
+        crate::sql2::planner::ir::WriteLane::ActiveVersion => {
+            let version_id = batch
+                .changes
+                .first()
+                .map(|change| change.version_id.clone())
+                .or_else(|| {
+                    planned_write
+                        .command
+                        .execution_context
+                        .requested_version_id
+                        .clone()
+                })
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "sql2 append execution requires a concrete active version id",
+                    )
+                })?;
+            AppendWriteLane::Version(version_id)
+        }
+        crate::sql2::planner::ir::WriteLane::GlobalAdmin => AppendWriteLane::GlobalAdmin,
+    };
+    let expected_tip = match &commit_preconditions.expected_tip {
+        crate::sql2::planner::ir::ExpectedTip::CommitId(commit_id) => {
+            AppendExpectedTip::CommitId(commit_id.clone())
+        }
+        crate::sql2::planner::ir::ExpectedTip::CreateIfMissing => {
+            AppendExpectedTip::CreateIfMissing
+        }
+    };
+
+    Ok(AppendCommitPreconditions {
+        write_lane,
+        expected_tip,
+        idempotency_key: commit_preconditions.idempotency_key.0.clone(),
+    })
+}
+
+fn semantic_plan_effects_from_untracked_sql2_write(
+    planned_write: &PlannedWrite,
+    intended_post_state: &[crate::sql2::planner::ir::PlannedStateRow],
+    pending_file_writes: &[PendingFileWrite],
+    pending_file_delete_targets: &BTreeSet<(String, String)>,
+) -> Result<PlanEffects, LixError> {
+    let mut effects = PlanEffects {
+        state_commit_stream_changes: state_commit_stream_changes_from_planned_rows(
+            intended_post_state,
+            state_commit_stream_operation(planned_write.command.operation_kind),
+            true,
+            planned_write
+                .command
+                .execution_context
+                .writer_key
+                .as_deref(),
+        )?,
+        ..PlanEffects::default()
+    };
+    if matches!(
+        planned_write.command.target.descriptor.public_name.as_str(),
+        "lix_file" | "lix_file_by_version"
+    ) {
+        effects.file_cache_refresh_targets =
+            authoritative_pending_file_write_targets(pending_file_writes);
+        effects
+            .file_cache_refresh_targets
+            .extend(pending_file_delete_targets.iter().cloned());
+    }
+    if planned_write.command.target.descriptor.public_name != "lix_active_version" {
+        return Ok(effects);
+    }
+    for row in intended_post_state.iter().rev() {
+        if row.schema_key != active_version_schema_key()
+            || planned_row_optional_text_value(row, "file_id") != Some(active_version_file_id())
+            || row.version_id.as_deref() != Some(active_version_storage_version_id())
+            || row.tombstone
+        {
+            continue;
+        }
+        let Some(snapshot_content) = planned_row_optional_text_value(row, "snapshot_content")
+        else {
+            continue;
+        };
+        effects.next_active_version_id = Some(parse_active_version_snapshot(snapshot_content)?);
+        break;
+    }
+    Ok(effects)
+}
+
+fn semantic_plan_effects_from_domain_changes(
+    changes: &[ProposedDomainChange],
+    stream_operation: StateCommitStreamOperation,
+) -> Result<PlanEffects, LixError> {
+    Ok(PlanEffects {
+        state_commit_stream_changes: state_commit_stream_changes_from_domain_changes(
+            changes,
+            stream_operation,
+        )?,
+        next_active_version_id: next_active_version_id_from_domain_changes(changes)?,
+        file_cache_refresh_targets: file_cache_refresh_targets_from_domain_changes(changes),
+    })
+}
+
+fn next_active_version_id_from_domain_changes(
+    changes: &[ProposedDomainChange],
+) -> Result<Option<String>, LixError> {
+    for change in changes.iter().rev() {
+        if change.schema_key != active_version_schema_key()
+            || change.file_id.as_deref() != Some(active_version_file_id())
+            || change.version_id != active_version_storage_version_id()
+        {
+            continue;
+        }
+
+        let Some(snapshot_content) = change.snapshot_content.as_deref() else {
+            continue;
+        };
+        return parse_active_version_snapshot(snapshot_content).map(Some);
+    }
+
+    Ok(None)
+}
+
+fn file_cache_refresh_targets_from_domain_changes(
+    changes: &[ProposedDomainChange],
+) -> BTreeSet<(String, String)> {
+    changes
+        .iter()
+        .filter(|change| change.file_id.as_deref() != Some("lix"))
+        .filter(|change| change.schema_key != "lix_file_descriptor")
+        .filter(|change| change.schema_key != "lix_directory_descriptor")
+        .filter_map(|change| {
+            change
+                .file_id
+                .as_ref()
+                .map(|file_id| (file_id.clone(), change.version_id.clone()))
+        })
+        .collect()
+}
+
+fn planned_row_optional_text_value<'a>(
+    row: &'a crate::sql2::planner::ir::PlannedStateRow,
+    key: &str,
+) -> Option<&'a str> {
+    match row.values.get(key) {
+        Some(Value::Text(value)) => Some(value.as_str()),
+        _ => None,
+    }
 }
 
 fn sql2_authoritative_write_error(
@@ -1208,8 +1619,9 @@ fn build_sql2_invariant_trace(planned_write: &PlannedWrite) -> Sql2InvariantTrac
 mod tests {
     use super::{
         prepare_sql2_public_execution, prepare_sql2_read, prepare_sql2_write,
-        Sql2PreparedPublicExecution,
+        Sql2PreparedPublicExecution, Sql2WriteExecution,
     };
+    use crate::commit::AppendWriteLane;
     use crate::sql2::catalog::SurfaceRegistry;
     use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql2::planner::canonicalize::canonicalize_write;
@@ -2401,6 +2813,12 @@ mod tests {
                 .write_lane,
             WriteLane::SingleVersion("version-a".to_string())
         );
+        assert!(matches!(
+            prepared.execution.as_ref(),
+            Some(Sql2WriteExecution::Tracked(execution))
+                if execution.append_preconditions.write_lane
+                    == AppendWriteLane::Version("version-a".to_string())
+        ));
         assert_eq!(
             prepared
                 .debug_trace
@@ -2575,6 +2993,10 @@ mod tests {
             prepared.planned_write.command.requested_mode,
             WriteModeRequest::ForceUntracked
         );
+        assert!(matches!(
+            prepared.execution.as_ref(),
+            Some(Sql2WriteExecution::Untracked(_))
+        ));
         assert!(prepared.planned_write.commit_preconditions.is_none());
         assert!(prepared.domain_change_batch.is_none());
         assert_eq!(
@@ -2615,6 +3037,11 @@ mod tests {
             prepared.planned_write.command.requested_mode,
             WriteModeRequest::ForceUntracked
         );
+        assert!(matches!(
+            prepared.execution.as_ref(),
+            Some(Sql2WriteExecution::Untracked(execution))
+                if execution.persist_filesystem_payloads_before_write
+        ));
         assert!(prepared.planned_write.commit_preconditions.is_none());
         assert!(prepared.domain_change_batch.is_none());
         assert!(
