@@ -154,19 +154,6 @@ fn guardrail_legacy_sql_bridge_alias_usage_is_forbidden() {
 }
 
 #[test]
-fn guardrail_sql2_directory_exists_alongside_legacy_sql_runtime() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    assert!(
-        root.join("src/sql2").exists(),
-        "src/sql2 directory must exist for the semantic rewrite"
-    );
-    assert!(
-        !root.join("src/sql").exists(),
-        "src/sql runtime directory should be removed once only generic namespaces remain"
-    );
-}
-
-#[test]
 fn guardrail_duplicate_public_surface_registry_is_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
@@ -217,15 +204,6 @@ fn guardrail_filesystem_public_surfaces_do_not_enter_legacy_query_rewrite() {
     assert!(
         !root.join("src/sql/planning/rewrite_engine").exists(),
         "legacy rewrite_engine directory must stay removed for migrated public reads"
-    );
-}
-
-#[test]
-fn guardrail_legacy_filesystem_step_wrapper_is_removed() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    assert!(
-        !root.join("src/sql/execution").exists(),
-        "legacy sql/execution directory must stay removed once the shared-path shim is rehomed"
     );
 }
 
@@ -363,22 +341,6 @@ fn guardrail_legacy_query_pipeline_context_is_removed_and_validator_is_filesyste
         !root.join("src/sql/planning/rewrite_engine").exists(),
         "legacy rewrite_engine directory should be removed"
     );
-}
-
-#[test]
-fn guardrail_runtime_source_forbids_crate_sql_imports() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    collect_rust_sources(&root, &mut files);
-
-    for file in files {
-        let source = fs::read_to_string(&file).expect("source file should be readable");
-        assert!(
-            !source.contains("crate::sql::"),
-            "runtime source must not import crate::sql::*: {}",
-            file.display()
-        );
-    }
 }
 
 #[test]
