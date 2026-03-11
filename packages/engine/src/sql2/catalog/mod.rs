@@ -220,11 +220,15 @@ impl SurfaceRegistry {
         &mut self,
         spec: DynamicEntitySurfaceSpec,
     ) -> CatalogEpoch {
-        if self.entity_surface_name_conflicts(&spec.schema_key) {
+        let descriptors = entity_descriptors_from_spec(&spec, CatalogSource::Dynamic)
+            .into_iter()
+            .filter(|descriptor| self.entity_descriptor_name_available(&descriptor.public_name))
+            .collect::<Vec<_>>();
+        if descriptors.is_empty() {
             return self.epoch;
         }
         self.epoch.bump();
-        for descriptor in entity_descriptors_from_spec(&spec, CatalogSource::Dynamic) {
+        for descriptor in descriptors {
             self.insert_descriptor(descriptor);
         }
         self.epoch
@@ -243,27 +247,19 @@ impl SurfaceRegistry {
             let Ok(spec) = entity_surface_spec_from_schema(schema) else {
                 continue;
             };
-            if self.entity_surface_name_conflicts(&spec.schema_key) {
-                continue;
-            }
             for descriptor in entity_descriptors_from_spec(&spec, CatalogSource::Builtin) {
+                if !self.entity_descriptor_name_available(&descriptor.public_name) {
+                    continue;
+                }
                 self.insert_descriptor(descriptor);
             }
         }
     }
 
-    fn entity_surface_name_conflicts(&self, schema_key: &str) -> bool {
-        [
-            schema_key.to_string(),
-            format!("{schema_key}_by_version"),
-            format!("{schema_key}_history"),
-        ]
-        .into_iter()
-        .any(|name| {
-            self.descriptors
-                .get(&normalize_surface_name(&name))
-                .is_some_and(|descriptor| descriptor.surface_family != SurfaceFamily::Entity)
-        })
+    fn entity_descriptor_name_available(&self, public_name: &str) -> bool {
+        self.descriptors
+            .get(&normalize_surface_name(public_name))
+            .is_none_or(|descriptor| descriptor.surface_family == SurfaceFamily::Entity)
     }
 }
 
@@ -1103,6 +1099,24 @@ mod tests {
         assert_eq!(
             binding.implicit_overrides.fixed_schema_key.as_deref(),
             Some("lix_key_value")
+        );
+    }
+
+    #[test]
+    fn builtin_registry_exposes_stored_schema_by_version_entity_surface() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let binding = registry
+            .bind_relation_name("lix_stored_schema_by_version")
+            .expect("stored schema by-version surface should bind");
+
+        assert_eq!(binding.descriptor.surface_family, SurfaceFamily::Entity);
+        assert_eq!(
+            binding.descriptor.surface_variant,
+            SurfaceVariant::ByVersion
+        );
+        assert_eq!(
+            binding.implicit_overrides.fixed_schema_key.as_deref(),
+            Some("lix_stored_schema")
         );
     }
 

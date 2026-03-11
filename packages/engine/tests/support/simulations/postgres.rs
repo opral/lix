@@ -361,6 +361,7 @@ fn bind_param_postgres<'q>(
         Value::Integer(v) => query.bind(*v),
         Value::Real(v) => query.bind(*v),
         Value::Text(v) => query.bind(v.as_str()),
+        Value::Json(v) => query.bind(v.to_string()),
         Value::Blob(v) => query.bind(v.as_slice()),
     }
 }

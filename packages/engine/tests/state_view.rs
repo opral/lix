@@ -712,10 +712,10 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_state_insert_on_conflict_do_nothing_is_rejected,
+    lix_state_insert_on_conflict_do_nothing_is_supported,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
         engine.init().await.unwrap();
@@ -730,23 +730,43 @@ simulation_test!(
             .await
             .unwrap();
 
-        let err = engine
+        engine
             .execute(
                 "INSERT INTO lix_state (\
                  entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
                  'entity-upsert', 'file-upsert', 'test_state_schema', 'lix', '1', '{\"value\":\"A\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'entity-upsert', 'file-upsert', 'test_state_schema', 'lix', '1', '{\"value\":\"B\"}'\
                  ) \
                  ON CONFLICT (entity_id, schema_key, file_id) DO NOTHING", &[])
             .await
-            .expect_err("DO NOTHING should be rejected");
+            .unwrap();
 
-        assert!(
-            err.description
-                .contains("ON CONFLICT DO NOTHING is not supported"),
-            "unexpected error: {}",
-            err.description
-        );
+        let rows = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-upsert' \
+                   AND file_id = 'file-upsert'",
+                &[],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "{\"value\":\"A\"}");
     }
 );
 

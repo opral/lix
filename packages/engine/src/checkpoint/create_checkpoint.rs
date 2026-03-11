@@ -188,7 +188,10 @@ async fn ensure_checkpoint_label_on_commit(
            AND schema_key = 'lix_entity_label' \
            AND file_id = 'lix' \
            AND version_id = $2",
-        &[Value::Text(state_entity_id.clone()), Value::Text(crate::version::GLOBAL_VERSION_ID.to_string())],
+        &[
+            Value::Text(state_entity_id.clone()),
+            Value::Text(crate::version::GLOBAL_VERSION_ID.to_string()),
+        ],
     )
     .await?;
     tx.execute_internal(

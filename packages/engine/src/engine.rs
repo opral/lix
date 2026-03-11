@@ -59,26 +59,26 @@ mod init_bootstrap;
 mod init_seed;
 #[path = "plugin/install.rs"]
 mod plugin_install;
-#[path = "runtime_functions.rs"]
-mod runtime_functions;
-#[path = "runtime_effects.rs"]
-mod runtime_effects;
-#[path = "statement_scripts.rs"]
-mod statement_scripts;
 #[path = "query_history/mod.rs"]
 pub(crate) mod query_history;
 #[path = "query_semantics/mod.rs"]
 pub(crate) mod query_semantics;
 #[path = "query_storage/mod.rs"]
 pub(crate) mod query_storage;
+#[path = "runtime_effects.rs"]
+mod runtime_effects;
+#[path = "runtime_functions.rs"]
+mod runtime_functions;
 #[path = "sql_ast/mod.rs"]
 pub(crate) mod sql_ast;
+#[path = "statement_scripts.rs"]
+mod statement_scripts;
 
+use self::query_semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
+use self::query_storage::sql_text::escape_sql_string;
 use crate::query_runtime::contracts::effects::FilesystemPayloadDomainChange;
 use crate::query_runtime::contracts::planned_statement::MutationRow;
 use crate::query_runtime::parse::parse_sql;
-use self::query_semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
-use self::query_storage::sql_text::escape_sql_string;
 
 pub use crate::boot::{
     boot, init_lix, BootAccount, BootArgs, BootKeyValue, InitLixArgs, InitLixResult,
@@ -127,7 +127,8 @@ pub struct EngineTransaction<'a> {
     active_version_changed: bool,
     installed_plugins_cache_invalidation_pending: bool,
     pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
-    pending_sql2_append_session: Option<crate::query_runtime::shared_path::PendingSql2AppendSession>,
+    pending_sql2_append_session:
+        Option<crate::query_runtime::shared_path::PendingSql2AppendSession>,
 }
 
 impl<'a> EngineTransaction<'a> {
@@ -569,19 +570,19 @@ mod tests {
         boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
+    use crate::engine::query_history::plugin_inputs::file_history_read_materialization_required_for_statements;
+    use crate::engine::query_semantics::state_resolution::canonical::is_query_only_statements;
+    use crate::engine::query_semantics::state_resolution::effects::active_version_from_update_validations;
+    use crate::engine::query_semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
     use crate::engine::sql_ast::utils::{
         advance_placeholder_state_for_statement_ast, bind_sql_with_state, parse_sql_statements,
         PlaceholderState,
     };
     use crate::engine::sql_ast::walk::contains_transaction_control_statement;
-    use crate::query_runtime::contracts::planned_statement::UpdateValidationPlan;
-    use crate::engine::query_history::plugin_inputs::file_history_read_materialization_required_for_statements;
-    use crate::internal_state::script::extract_explicit_transaction_script_from_statements;
-    use crate::engine::query_semantics::state_resolution::canonical::is_query_only_statements;
-    use crate::engine::query_semantics::state_resolution::effects::active_version_from_update_validations;
-    use crate::engine::query_semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
     use crate::engine::Engine;
+    use crate::internal_state::script::extract_explicit_transaction_script_from_statements;
     use crate::plugin::types::{InstalledPlugin, PluginRuntime};
+    use crate::query_runtime::contracts::planned_statement::UpdateValidationPlan;
     use crate::version::active_version_schema_key;
     use crate::{
         ExecuteResult, LixError, NoopWasmRuntime, QueryResult, SnapshotChunkReader, Value,

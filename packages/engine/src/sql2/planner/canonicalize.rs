@@ -2,9 +2,9 @@ use crate::sql2::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
 use crate::sql2::core::contracts::{BoundStatement, StatementKind};
 use crate::sql2::planner::ir::{
     CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan,
-    CanonicalWorkingChangesScan, InsertOnConflictUpdate, MutationPayload, PredicateSpec,
-    ProjectionExpr, ReadCommand, ReadContract, ReadPlan, SortKey, WriteCommand, WriteMode,
-    WriteOperationKind, WriteSelector,
+    CanonicalWorkingChangesScan, InsertOnConflict, InsertOnConflictAction, MutationPayload,
+    PredicateSpec, ProjectionExpr, ReadCommand, ReadContract, ReadPlan, SortKey, WriteCommand,
+    WriteMode, WriteOperationKind, WriteSelector,
 };
 use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
@@ -195,7 +195,7 @@ fn canonicalize_insert_write(
     }
 
     let payload = insert_payload(&surface_binding, insert, &bound_statement.bound_parameters)?;
-    let on_conflict_update = insert_on_conflict_update(
+    let on_conflict = insert_on_conflict(
         &surface_binding,
         insert,
         &bound_statement.bound_parameters,
@@ -211,7 +211,7 @@ fn canonicalize_insert_write(
             target: surface_binding,
             selector: WriteSelector::default(),
             payload: MutationPayload::FullSnapshot(payload),
-            on_conflict_update,
+            on_conflict,
             mode,
             execution_context: bound_statement.execution_context,
         },
@@ -269,7 +269,7 @@ fn canonicalize_update_write(
             target: surface_binding.clone(),
             selector,
             payload: MutationPayload::Patch(payload),
-            on_conflict_update: None,
+            on_conflict: None,
             mode,
             execution_context: bound_statement.execution_context,
         },
@@ -321,7 +321,7 @@ fn canonicalize_delete_write(
             target: surface_binding.clone(),
             selector: selector.clone(),
             payload: MutationPayload::Tombstone,
-            on_conflict_update: None,
+            on_conflict: None,
             mode: write_mode_for_surface_and_selector(
                 &surface_binding,
                 &BTreeMap::new(),
@@ -332,12 +332,12 @@ fn canonicalize_delete_write(
     })
 }
 
-fn insert_on_conflict_update(
+fn insert_on_conflict(
     surface_binding: &SurfaceBinding,
     insert: &Insert,
     params: &[Value],
     insert_payload: &BTreeMap<String, Value>,
-) -> Result<Option<InsertOnConflictUpdate>, CanonicalizeError> {
+) -> Result<Option<InsertOnConflict>, CanonicalizeError> {
     let Some(on_insert) = &insert.on else {
         return Ok(None);
     };
@@ -348,27 +348,27 @@ fn insert_on_conflict_update(
         ));
     };
 
-    let conflict_columns = match &on_conflict.conflict_target {
-        Some(ConflictTarget::Columns(columns)) if !columns.is_empty() => columns
-            .iter()
-            .map(|ident| canonical_write_column_key(surface_binding, &ident.value))
-            .collect::<Result<Vec<_>, _>>()?,
-        Some(_) => {
-            return Err(CanonicalizeError::unsupported(
+    let conflict_columns =
+        match &on_conflict.conflict_target {
+            Some(ConflictTarget::Columns(columns)) if !columns.is_empty() => columns
+                .iter()
+                .map(|ident| canonical_write_column_key(surface_binding, &ident.value))
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err(CanonicalizeError::unsupported(
                 "sql2 day-1 insert canonicalizer only supports explicit ON CONFLICT column targets",
-            ))
-        }
-        None => {
-            return Err(CanonicalizeError::unsupported(
-                "sql2 day-1 insert canonicalizer requires explicit ON CONFLICT columns",
-            ))
-        }
-    };
+            )),
+            None => {
+                return Err(CanonicalizeError::unsupported(
+                    "sql2 day-1 insert canonicalizer requires explicit ON CONFLICT columns",
+                ))
+            }
+        };
 
     match &on_conflict.action {
-        OnConflictAction::DoNothing => Err(CanonicalizeError::unsupported(
-            "sql2 day-1 insert canonicalizer does not support ON CONFLICT DO NOTHING",
-        )),
+        OnConflictAction::DoNothing => Ok(Some(InsertOnConflict {
+            conflict_columns,
+            action: InsertOnConflictAction::DoNothing,
+        })),
         OnConflictAction::DoUpdate(update) => {
             if update.selection.is_some() {
                 return Err(CanonicalizeError::unsupported(
@@ -389,7 +389,10 @@ fn insert_on_conflict_update(
                     ));
                 }
             }
-            Ok(Some(InsertOnConflictUpdate { conflict_columns }))
+            Ok(Some(InsertOnConflict {
+                conflict_columns,
+                action: InsertOnConflictAction::DoUpdate,
+            }))
         }
     }
 }
@@ -1022,28 +1025,11 @@ fn canonical_write_column_key(
     raw_column: &str,
 ) -> Result<String, CanonicalizeError> {
     let column = raw_column.to_ascii_lowercase();
-    let canonical = match column.as_str() {
-        "lixcol_entity_id" => "entity_id",
-        "lixcol_schema_key" => "schema_key",
-        "lixcol_file_id" => "file_id",
-        "lixcol_version_id" => "version_id",
-        "lixcol_plugin_key" => "plugin_key",
-        "lixcol_schema_version" => "schema_version",
-        "lixcol_global" => "global",
-        "lixcol_writer_key" => "writer_key",
-        "lixcol_untracked" => "untracked",
-        "lixcol_metadata" => "metadata",
-        other => other,
-    }
-    .to_string();
+    let canonical = candidate_column_key(&column);
 
     match surface_binding.descriptor.surface_family {
         SurfaceFamily::State => {
-            let supported = surface_binding
-                .exposed_columns
-                .iter()
-                .chain(surface_binding.descriptor.hidden_columns.iter())
-                .any(|candidate| candidate.eq_ignore_ascii_case(raw_column));
+            let supported = write_surface_supports_column(surface_binding, raw_column, &canonical);
             if supported {
                 Ok(canonical)
             } else {
@@ -1054,11 +1040,7 @@ fn canonical_write_column_key(
             }
         }
         SurfaceFamily::Entity => {
-            let supported = surface_binding
-                .exposed_columns
-                .iter()
-                .chain(surface_binding.descriptor.hidden_columns.iter())
-                .any(|candidate| candidate.eq_ignore_ascii_case(raw_column));
+            let supported = write_surface_supports_column(surface_binding, raw_column, &canonical);
             if supported {
                 Ok(canonical)
             } else {
@@ -1119,6 +1101,38 @@ fn canonical_write_column_key(
     }
 }
 
+fn write_surface_supports_column(
+    surface_binding: &SurfaceBinding,
+    raw_column: &str,
+    canonical_column: &str,
+) -> bool {
+    surface_binding
+        .exposed_columns
+        .iter()
+        .chain(surface_binding.descriptor.hidden_columns.iter())
+        .any(|candidate| {
+            candidate.eq_ignore_ascii_case(raw_column)
+                || candidate_column_key(candidate) == canonical_column
+        })
+}
+
+fn candidate_column_key(candidate: &str) -> String {
+    match candidate.to_ascii_lowercase().as_str() {
+        "lixcol_entity_id" => "entity_id",
+        "lixcol_schema_key" => "schema_key",
+        "lixcol_file_id" => "file_id",
+        "lixcol_version_id" => "version_id",
+        "lixcol_plugin_key" => "plugin_key",
+        "lixcol_schema_version" => "schema_version",
+        "lixcol_global" => "global",
+        "lixcol_writer_key" => "writer_key",
+        "lixcol_untracked" => "untracked",
+        "lixcol_metadata" => "metadata",
+        other => other,
+    }
+    .to_string()
+}
+
 fn unknown_write_column_error(
     surface_binding: &SurfaceBinding,
     raw_column: &str,
@@ -1162,6 +1176,14 @@ fn expr_to_value(
                 )),
             }
         }
+        Expr::Function(function)
+            if function_name(function)
+                .is_some_and(|name| name.eq_ignore_ascii_case("lix_json")) =>
+        {
+            let json_expr = single_function_arg_expr(function, "lix_json")?;
+            let value = expr_to_value(json_expr, params, placeholder_state)?;
+            value_to_json_value(value)
+        }
         Expr::Nested(inner) => expr_to_value(inner, params, placeholder_state),
         Expr::UnaryOp { op, expr } if op.to_string() == "-" => {
             match expr_to_value(expr, params, placeholder_state)? {
@@ -1174,6 +1196,31 @@ fn expr_to_value(
         }
         _ => Err(CanonicalizeError::unsupported(
             "sql2 day-1 write canonicalizer only supports literal and placeholder VALUES",
+        )),
+    }
+}
+
+fn value_to_json_value(value: Value) -> Result<Value, CanonicalizeError> {
+    match value {
+        Value::Json(value) => Ok(Value::Json(value)),
+        Value::Text(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .map(Value::Json)
+            .map_err(|error| {
+                CanonicalizeError::unsupported(format!(
+                    "lix_json() requires valid JSON text: {error}"
+                ))
+            }),
+        Value::Null => Ok(Value::Json(serde_json::Value::Null)),
+        Value::Boolean(value) => Ok(Value::Json(serde_json::Value::Bool(value))),
+        Value::Integer(value) => Ok(Value::Json(serde_json::Value::Number(value.into()))),
+        Value::Real(value) => serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .map(Value::Json)
+            .ok_or_else(|| {
+                CanonicalizeError::unsupported("lix_json() does not support NaN/inf numeric values")
+            }),
+        Value::Blob(_) => Err(CanonicalizeError::unsupported(
+            "lix_json() does not support blob arguments",
         )),
     }
 }

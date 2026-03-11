@@ -460,7 +460,8 @@ pub(crate) async fn try_prepare_sql2_write(
             if let Some(binding) = top_level_write_target_name(&bound_statement.statement)
                 .and_then(|name| registry.bind_relation_name(&name))
             {
-                if let Some(operation_kind) = statement_write_operation_kind(&bound_statement.statement)
+                if let Some(operation_kind) =
+                    statement_write_operation_kind(&bound_statement.statement)
                 {
                     if let Some(error) = sql2_public_write_preparation_error_for_surface(
                         &binding,
@@ -482,8 +483,7 @@ pub(crate) async fn try_prepare_sql2_write(
     let mut planned_write = match prove_write(&canonicalized) {
         Ok(planned_write) => planned_write,
         Err(error) => {
-            if let Some(error) =
-                sql2_public_write_preparation_error(&canonicalized, &error.message)
+            if let Some(error) = sql2_public_write_preparation_error(&canonicalized, &error.message)
             {
                 return Err(error);
             }
@@ -501,8 +501,7 @@ pub(crate) async fn try_prepare_sql2_write(
     let domain_change_batch = match build_domain_change_batch(&planned_write) {
         Ok(domain_change_batch) => domain_change_batch,
         Err(error) => {
-            if let Some(error) =
-                sql2_public_write_preparation_error(&canonicalized, &error.message)
+            if let Some(error) = sql2_public_write_preparation_error(&canonicalized, &error.message)
             {
                 return Err(error);
             }
@@ -512,8 +511,7 @@ pub(crate) async fn try_prepare_sql2_write(
     let commit_preconditions = match derive_commit_preconditions(backend, &planned_write).await {
         Ok(commit_preconditions) => commit_preconditions,
         Err(error) => {
-            if let Some(error) =
-                sql2_public_write_preparation_error(&canonicalized, &error.message)
+            if let Some(error) = sql2_public_write_preparation_error(&canonicalized, &error.message)
             {
                 return Err(error);
             }
@@ -604,18 +602,16 @@ fn sql2_public_write_preparation_error_for_surface(
         };
         return Some(read_only_view_write_error(public_name, operation));
     }
+    if message.contains("does not support ON CONFLICT DO NOTHING") {
+        return Some(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "ON CONFLICT DO NOTHING is not supported",
+        ));
+    }
 
     match surface_binding.descriptor.surface_family {
         SurfaceFamily::Filesystem => Some(sql2_filesystem_write_error(public_name, message)),
-        _ if matches!(
-            public_name,
-            "lix_state"
-                | "lix_state_by_version"
-                | "lix_active_version"
-                | "lix_active_account"
-                | "lix_version"
-        ) =>
-        {
+        SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Admin => {
             Some(LixError::new("LIX_ERROR_UNKNOWN", message))
         }
         _ => None,

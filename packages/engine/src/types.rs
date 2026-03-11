@@ -5,6 +5,7 @@ pub enum Value {
     Integer(i64),
     Real(f64),
     Text(String),
+    Json(serde_json::Value),
     Blob(Vec<u8>),
 }
 

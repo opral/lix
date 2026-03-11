@@ -16,8 +16,9 @@ use crate::filesystem::path::{
 use crate::schema::{SchemaProvider, SqlStoredSchemaProvider};
 use crate::sql2::catalog::SurfaceFamily;
 use crate::sql2::planner::ir::{
-    MutationPayload, PlannedStateRow, PlannedWrite, ResolvedRowRef, ResolvedWritePlan, RowLineage,
-    SchemaProof, ScopeProof, TargetSetProof, WriteLane, WriteMode, WriteOperationKind,
+    InsertOnConflictAction, MutationPayload, PlannedStateRow, PlannedWrite, ResolvedRowRef,
+    ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, TargetSetProof, WriteLane, WriteMode,
+    WriteOperationKind,
 };
 use crate::sql2::planner::semantics::effective_state_resolver::{
     resolve_exact_effective_state_row, ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
@@ -64,7 +65,7 @@ pub(crate) async fn resolve_write_plan(
     match planned_write.command.target.descriptor.surface_family {
         SurfaceFamily::State => match planned_write.command.operation_kind {
             WriteOperationKind::Insert => {
-                resolve_state_insert_write_plan(planned_write, target_write_lane)
+                resolve_state_insert_write_plan(backend, planned_write, target_write_lane).await
             }
             WriteOperationKind::Update | WriteOperationKind::Delete => {
                 resolve_existing_state_write(backend, planned_write, target_write_lane).await
@@ -111,23 +112,31 @@ pub(crate) async fn resolve_write_plan(
     }
 }
 
-fn resolve_state_insert_write_plan(
+async fn resolve_state_insert_write_plan(
+    backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
     target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let entity_id = resolved_entity_id(planned_write)?;
     let schema_key = resolved_schema_key(planned_write)?;
     let version_id = resolved_version_id(planned_write)?;
+    let row = PlannedStateRow {
+        entity_id: entity_id.clone(),
+        schema_key,
+        version_id,
+        values: payload_map(planned_write)?,
+        tombstone: false,
+    };
+
+    if insert_on_conflict_action(planned_write) == Some(InsertOnConflictAction::DoNothing)
+        && state_insert_conflicts_with_existing_row(backend, &row).await?
+    {
+        return Ok(noop_resolved_write_plan(target_write_lane));
+    }
 
     Ok(ResolvedWritePlan {
         authoritative_pre_state: Vec::new(),
-        intended_post_state: vec![PlannedStateRow {
-            entity_id: entity_id.clone(),
-            schema_key,
-            version_id,
-            values: payload_map(planned_write)?,
-            tombstone: false,
-        }],
+        intended_post_state: vec![row],
         tombstones: Vec::new(),
         lineage: vec![RowLineage {
             entity_id,
@@ -235,7 +244,7 @@ async fn resolve_existing_entity_write(
     entity_schema: &EntityWriteSchema,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     ensure_exact_selector(planned_write)?;
-    reject_unsupported_entity_overrides(entity_schema)?;
+    reject_unsupported_entity_overrides(planned_write, entity_schema)?;
     let version_id = resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
         message: "sql2 entity write resolver requires a concrete version_id".to_string(),
     })?;
@@ -320,9 +329,9 @@ async fn resolve_entity_insert_write_plan(
     target_write_lane: Option<WriteLane>,
     entity_schema: &EntityWriteSchema,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    reject_unsupported_entity_overrides(entity_schema)?;
+    reject_unsupported_entity_overrides(planned_write, entity_schema)?;
     let row = build_entity_insert_row(planned_write, entity_schema)?;
-    if planned_write.command.on_conflict_update.is_some() {
+    if let Some(conflict) = planned_write.command.on_conflict.as_ref() {
         let exact_filters = entity_insert_exact_filters(entity_schema, &row)?;
         if let Some(current_row) = resolve_exact_effective_state_row(
             backend,
@@ -340,6 +349,9 @@ async fn resolve_entity_insert_write_plan(
         .await
         .map_err(write_resolve_backend_error)?
         {
+            if conflict.action == InsertOnConflictAction::DoNothing {
+                return Ok(noop_resolved_write_plan(target_write_lane));
+            }
             let row_ref = ResolvedRowRef {
                 entity_id: current_row.entity_id.clone(),
                 schema_key: current_row.schema_key.clone(),
@@ -3171,6 +3183,7 @@ async fn load_entity_schema(
 }
 
 fn reject_unsupported_entity_overrides(
+    planned_write: &PlannedWrite,
     entity_schema: &EntityWriteSchema,
 ) -> Result<(), WriteResolveError> {
     if entity_schema
@@ -3179,10 +3192,14 @@ fn reject_unsupported_entity_overrides(
         .and_then(value_as_bool)
         == Some(true)
     {
-        return Err(WriteResolveError {
-            message: "sql2 entity live slice does not yet support lixcol_global write overrides"
-                .to_string(),
-        });
+        let version_id = resolved_version_id(planned_write)?;
+        if version_id.as_deref() != Some(GLOBAL_VERSION_ID) {
+            return Err(WriteResolveError {
+                message:
+                    "sql2 entity write resolver requires a concrete global version_id for lixcol_global write overrides"
+                        .to_string(),
+            });
+        }
     }
     if entity_schema
         .state_defaults
@@ -3330,7 +3347,13 @@ fn entity_insert_exact_filters(
 ) -> Result<BTreeMap<String, Value>, WriteResolveError> {
     let mut filters = BTreeMap::new();
     filters.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
-    for key in ["file_id", "plugin_key", "schema_version", "global", "untracked"] {
+    for key in [
+        "file_id",
+        "plugin_key",
+        "schema_version",
+        "global",
+        "untracked",
+    ] {
         if let Some(value) = row.values.get(key) {
             filters.insert(key.to_string(), value.clone());
             continue;
@@ -3501,6 +3524,63 @@ fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, W
             message: "sql2 day-1 write resolver requires a bounded scope proof".to_string(),
         }),
     }
+}
+
+fn insert_on_conflict_action(planned_write: &PlannedWrite) -> Option<InsertOnConflictAction> {
+    planned_write
+        .command
+        .on_conflict
+        .as_ref()
+        .map(|conflict| conflict.action)
+}
+
+fn noop_resolved_write_plan(target_write_lane: Option<WriteLane>) -> ResolvedWritePlan {
+    ResolvedWritePlan {
+        authoritative_pre_state: Vec::new(),
+        intended_post_state: Vec::new(),
+        tombstones: Vec::new(),
+        lineage: Vec::new(),
+        target_write_lane,
+    }
+}
+
+async fn state_insert_conflicts_with_existing_row(
+    backend: &dyn LixBackend,
+    row: &PlannedStateRow,
+) -> Result<bool, WriteResolveError> {
+    let version_id = row.version_id.clone().ok_or_else(|| WriteResolveError {
+        message: "sql2 state insert resolver requires a concrete version_id".to_string(),
+    })?;
+    let current_row = resolve_exact_effective_state_row(
+        backend,
+        &ExactEffectiveStateRowRequest {
+            schema_key: row.schema_key.clone(),
+            version_id,
+            exact_filters: state_insert_exact_filters(row),
+            include_global_overlay: true,
+            include_untracked_overlay: true,
+        },
+    )
+    .await
+    .map_err(write_resolve_backend_error)?;
+    Ok(current_row.is_some())
+}
+
+fn state_insert_exact_filters(row: &PlannedStateRow) -> BTreeMap<String, Value> {
+    let mut filters = BTreeMap::new();
+    filters.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
+    for key in [
+        "file_id",
+        "plugin_key",
+        "schema_version",
+        "global",
+        "untracked",
+    ] {
+        if let Some(value) = row.values.get(key) {
+            filters.insert(key.to_string(), value.clone());
+        }
+    }
+    filters
 }
 
 fn write_lane_from_scope(scope_proof: &ScopeProof) -> Result<WriteLane, WriteResolveError> {
@@ -3695,6 +3775,7 @@ fn engine_value_to_json_value(value: &Value) -> Result<JsonValue, WriteResolveEr
     match value {
         Value::Null => Ok(JsonValue::Null),
         Value::Text(value) => Ok(JsonValue::String(value.clone())),
+        Value::Json(value) => Ok(value.clone()),
         Value::Boolean(value) => Ok(JsonValue::Bool(*value)),
         Value::Integer(value) => Ok(JsonValue::Number((*value).into())),
         Value::Real(value) => JsonNumber::from_f64(*value)
@@ -3718,7 +3799,7 @@ fn json_value_to_engine_value(value: &JsonValue) -> Value {
             .map(Value::Integer)
             .or_else(|| number.as_f64().map(Value::Real))
             .unwrap_or_else(|| Value::Text(number.to_string())),
-        JsonValue::Array(_) | JsonValue::Object(_) => Value::Text(value.to_string()),
+        JsonValue::Array(_) | JsonValue::Object(_) => Value::Json(value.clone()),
     }
 }
 
@@ -3727,6 +3808,7 @@ fn json_value_matches_engine_value(actual: Option<&JsonValue>, expected: &Value)
         (Some(JsonValue::Null), Value::Null) => true,
         (Some(JsonValue::Bool(actual)), Value::Boolean(expected)) => actual == expected,
         (Some(JsonValue::String(actual)), Value::Text(expected)) => actual == expected,
+        (Some(actual), Value::Json(expected)) => actual == expected,
         (Some(JsonValue::Number(actual)), Value::Integer(expected)) => {
             actual.as_i64() == Some(*expected)
         }

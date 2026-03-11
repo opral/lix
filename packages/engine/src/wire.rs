@@ -10,6 +10,7 @@ pub enum WireValue {
     Int { value: i64 },
     Float { value: f64 },
     Text { value: String },
+    Json { value: serde_json::Value },
     Blob { base64: String },
 }
 
@@ -39,6 +40,9 @@ impl WireValue {
             Value::Text(value) => Ok(Self::Text {
                 value: value.clone(),
             }),
+            Value::Json(value) => Ok(Self::Json {
+                value: value.clone(),
+            }),
             Value::Blob(value) => Ok(Self::Blob {
                 base64: base64::engine::general_purpose::STANDARD.encode(value),
             }),
@@ -61,6 +65,7 @@ impl WireValue {
                 Ok(Value::Real(value))
             }
             Self::Text { value } => Ok(Value::Text(value)),
+            Self::Json { value } => Ok(Value::Json(value)),
             Self::Blob { base64 } => {
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(base64.as_bytes())
@@ -120,6 +125,7 @@ mod tests {
             Value::Integer(42),
             Value::Real(1.5),
             Value::Text("hello".to_string()),
+            Value::Json(json!({"hello": "world"})),
             Value::Blob(vec![1, 2, 3]),
         ];
 
@@ -164,6 +170,9 @@ mod tests {
                 WireValue::Text {
                     value: "hello".to_string(),
                 },
+                WireValue::Json {
+                    value: json!({"hello": "world"}),
+                },
                 WireValue::Blob {
                     base64: "AQI=".to_string(),
                 },
@@ -178,12 +187,14 @@ mod tests {
         assert!(serialized.contains("\"kind\":\"int\""));
         assert!(serialized.contains("\"kind\":\"float\""));
         assert!(serialized.contains("\"kind\":\"text\""));
+        assert!(serialized.contains("\"kind\":\"json\""));
         assert!(serialized.contains("\"kind\":\"blob\""));
         assert!(!serialized.contains("\"kind\":\"Null\""));
         assert!(!serialized.contains("\"kind\":\"Bool\""));
         assert!(!serialized.contains("\"kind\":\"Integer\""));
         assert!(!serialized.contains("\"kind\":\"Real\""));
         assert!(!serialized.contains("\"kind\":\"Text\""));
+        assert!(!serialized.contains("\"kind\":\"Json\""));
         assert!(!serialized.contains("\"kind\":\"Blob\""));
     }
 

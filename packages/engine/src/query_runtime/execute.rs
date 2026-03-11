@@ -10,8 +10,8 @@ use crate::query_runtime::contracts::effects::PlanEffects;
 use crate::query_runtime::contracts::execution_plan::ExecutionPlan;
 use crate::query_runtime::contracts::executor_error::ExecutorError;
 use crate::query_runtime::contracts::result_contract::ResultContract;
-use crate::schema_registry::register_schema_sql_statements;
 use crate::query_runtime::lower_sql::lower_to_prepared_statements;
+use crate::schema_registry::register_schema_sql_statements;
 use crate::state_commit_stream::StateCommitStreamChange;
 use crate::{Engine, LixError, LixTransaction, QueryResult};
 

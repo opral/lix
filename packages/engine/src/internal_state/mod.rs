@@ -1,20 +1,21 @@
 pub(crate) mod bind_once;
-pub(crate) mod inline_functions;
-pub(crate) mod stored_schema;
-pub(crate) mod vtable_read;
-pub(crate) mod vtable_write;
-pub(crate) mod materialize;
-pub(crate) mod param_context;
-pub(crate) mod script;
 #[path = "canonical_write.rs"]
 mod canonical;
 pub(crate) mod followup;
+pub(crate) mod inline_functions;
+pub(crate) mod materialize;
+pub(crate) mod param_context;
 pub(crate) mod postprocess;
+pub(crate) mod script;
+pub(crate) mod stored_schema;
+pub(crate) mod vtable_read;
+pub(crate) mod vtable_write;
 
 use crate::cel::CelEvaluator;
 use crate::default_values::apply_vtable_insert_defaults;
 use crate::functions::LixFunctionProvider;
 use crate::functions::SharedFunctionProvider;
+use crate::query_runtime::contracts::planned_statement::PlannedStatementSet;
 use crate::sql2::catalog::SurfaceRegistry;
 use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
 use crate::sql2::planner::backend::lowerer::{
@@ -24,12 +25,11 @@ use crate::sql2::planner::canonicalize::canonicalize_read;
 use crate::sql2::planner::semantics::dependency_spec::derive_dependency_spec_from_canonicalized_read;
 use crate::sql2::planner::semantics::effective_state_resolver::build_effective_state;
 use crate::sql2::runtime::prepare_sql2_read;
+use crate::sql_shared::ast::parse_sql_statements;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot, DEFAULT_ACTIVE_VERSION_NAME,
 };
-use crate::query_runtime::contracts::planned_statement::PlannedStatementSet;
-use crate::sql_shared::ast::parse_sql_statements;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use sqlparser::ast::{ObjectNamePart, Query, Statement, TableFactor, Visit, Visitor};
 use std::collections::BTreeSet;
@@ -43,11 +43,11 @@ use crate::internal_state::bind_once::{
 use crate::internal_state::inline_functions::inline_lix_functions_with_provider;
 use crate::internal_state::param_context::normalize_statement_placeholders_in_batch;
 
-pub(crate) use crate::engine::sql_ast::walk::object_name_matches;
 pub(crate) use crate::engine::sql_ast::utils::PlaceholderState;
 pub(crate) use crate::engine::sql_ast::utils::{
     resolve_expr_cell_with_state, ResolvedCell, RowSourceResolver,
 };
+pub(crate) use crate::engine::sql_ast::walk::object_name_matches;
 pub(crate) type SchemaRegistration =
     crate::query_runtime::contracts::planned_statement::SchemaRegistration;
 pub(crate) type MutationOperation =
@@ -157,14 +157,18 @@ pub(crate) async fn rewrite_internal_state_query_read_with_backend(
     params: &[Value],
 ) -> Result<Query, LixError> {
     let original = query.clone();
-    Ok(vtable_read::rewrite_query_with_backend(backend, query, params)
-        .await?
-        .unwrap_or(original))
+    Ok(
+        vtable_read::rewrite_query_with_backend(backend, query, params)
+            .await?
+            .unwrap_or(original),
+    )
 }
 
 pub(crate) fn statement_references_internal_state_vtable(statement: &Statement) -> bool {
     match statement {
-        Statement::Query(query) => collect_query_relation_names(query).contains("lix_internal_state_vtable"),
+        Statement::Query(query) => {
+            collect_query_relation_names(query).contains("lix_internal_state_vtable")
+        }
         Statement::Explain { statement, .. } => {
             statement_references_internal_state_vtable(statement)
         }
@@ -182,7 +186,9 @@ pub(crate) fn requires_single_statement_internal_state_plan(
     requires_single_statement_postprocess(plan.and_then(|plan| plan.postprocess.as_ref()))
 }
 
-pub(crate) fn validate_internal_state_plan(plan: Option<&InternalStatePlan>) -> Result<(), LixError> {
+pub(crate) fn validate_internal_state_plan(
+    plan: Option<&InternalStatePlan>,
+) -> Result<(), LixError> {
     let Some(plan) = plan else {
         return Ok(());
     };
@@ -267,15 +273,14 @@ pub(crate) async fn rewrite_statement_with_backend<P>(
 where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
-    let output = if let Some(output) =
-        canonical::rewrite_backend_statement(
-            backend,
-            statement.clone(),
-            params,
-            writer_key,
-            provider,
-        )
-        .await?
+    let output = if let Some(output) = canonical::rewrite_backend_statement(
+        backend,
+        statement.clone(),
+        params,
+        writer_key,
+        provider,
+    )
+    .await?
     {
         output
     } else {
@@ -405,7 +410,10 @@ pub(crate) async fn statement_references_public_sql2_surface_with_backend(
     if relation_names.is_empty() {
         return false;
     }
-    if relation_names.iter().all(|name| name.starts_with("lix_internal_")) {
+    if relation_names
+        .iter()
+        .all(|name| name.starts_with("lix_internal_"))
+    {
         return false;
     }
 
@@ -464,10 +472,14 @@ pub(crate) async fn lower_public_read_query_with_sql2_backend(
                 requested_version_id: Some(active_version_id),
             },
         );
-        let canonicalized = canonicalize_read(bound_statement, &registry).map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("sql2 read subquery canonicalization failed: {}", error.message),
-        })?;
+        let canonicalized =
+            canonicalize_read(bound_statement, &registry).map_err(|error| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "sql2 read subquery canonicalization failed: {}",
+                    error.message
+                ),
+            })?;
         let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
         let effective_state = build_effective_state(&canonicalized, dependency_spec.as_ref());
         lower_read_for_execution(
@@ -515,12 +527,13 @@ pub(crate) fn prepare_statements_sync_to_plan<P: LixFunctionProvider>(
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
 
     for statement in statements {
-        let output =
-            if let Some(output) = rewrite_top_level_read_statement_sync(statement.clone(), SqlDialect::Sqlite)? {
-                output
-            } else {
-                rewrite_statement(statement, params, writer_key, provider)?
-            };
+        let output = if let Some(output) =
+            rewrite_top_level_read_statement_sync(statement.clone(), SqlDialect::Sqlite)?
+        {
+            output
+        } else {
+            rewrite_statement(statement, params, writer_key, provider)?
+        };
         accumulate_rewrite_output(
             from_rewrite_output(output),
             provider,
@@ -534,7 +547,9 @@ pub(crate) fn prepare_statements_sync_to_plan<P: LixFunctionProvider>(
     }
 
     if requires_single_statement_postprocess(
-        internal_state.as_ref().and_then(|plan| plan.postprocess.as_ref()),
+        internal_state
+            .as_ref()
+            .and_then(|plan| plan.postprocess.as_ref()),
     ) && rewritten.len() != 1
     {
         return Err(LixError {
@@ -601,12 +616,14 @@ where
         if matches!(statement, Statement::Query(_) | Statement::Explain { .. }) {
             continue;
         }
-        rewrite_supported_public_read_surfaces_in_statement(statement).map_err(|error| LixError {
-            code: error.code,
-            description: format!(
-                "preprocess_with_surfaces_to_plan sql2 public-surface lowering failed: {}",
-                error.description
-            ),
+        rewrite_supported_public_read_surfaces_in_statement(statement).map_err(|error| {
+            LixError {
+                code: error.code,
+                description: format!(
+                    "preprocess_with_surfaces_to_plan sql2 public-surface lowering failed: {}",
+                    error.description
+                ),
+            }
         })?;
     }
 
@@ -657,7 +674,9 @@ fn query_references_builtin_public_sql2_surface(query: &Query) -> bool {
         .any(|name| registry.bind_relation_name(&name).is_some())
 }
 
-async fn load_active_version_id_for_sql2_read(backend: &dyn LixBackend) -> Result<String, LixError> {
+async fn load_active_version_id_for_sql2_read(
+    backend: &dyn LixBackend,
+) -> Result<String, LixError> {
     let result = backend
         .execute(
             "SELECT snapshot_content \
@@ -718,11 +737,7 @@ where
             output
         } else {
             Box::pin(rewrite_statement_with_backend(
-                backend,
-                statement,
-                params,
-                writer_key,
-                provider,
+                backend, statement, params, writer_key, provider,
             ))
             .await
             .map_err(|error| LixError {
@@ -747,7 +762,9 @@ where
     }
 
     if requires_single_statement_postprocess(
-        internal_state.as_ref().and_then(|plan| plan.postprocess.as_ref()),
+        internal_state
+            .as_ref()
+            .and_then(|plan| plan.postprocess.as_ref()),
     ) && rewritten.len() != 1
     {
         return Err(LixError {
@@ -875,7 +892,9 @@ fn rewrite_top_level_read_statement_sync(
                             })
                             .ok_or_else(|| LixError {
                                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                                description: "expected rewritten read query to remain a SELECT query".to_string(),
+                                description:
+                                    "expected rewritten read query to remain a SELECT query"
+                                        .to_string(),
                             })?,
                     )),
                     None => return Ok(None),
@@ -918,23 +937,29 @@ async fn rewrite_top_level_read_statement_backend(
             options,
         } => {
             let rewritten_statement = match *statement {
-                Statement::Query(query) => match rewrite_query_read_backend(backend, *query, params).await? {
-                    Some(output) => Statement::Query(Box::new(
-                        output
-                            .statements
-                            .into_iter()
-                            .next()
-                            .and_then(|stmt| match stmt {
-                                Statement::Query(query) => Some(*query),
-                                _ => None,
-                            })
-                            .ok_or_else(|| LixError {
+                Statement::Query(query) => {
+                    match rewrite_query_read_backend(backend, *query, params).await? {
+                        Some(output) => Statement::Query(Box::new(
+                            output
+                                .statements
+                                .into_iter()
+                                .next()
+                                .and_then(|stmt| match stmt {
+                                    Statement::Query(query) => Some(*query),
+                                    _ => None,
+                                })
+                                .ok_or_else(|| {
+                                    LixError {
                                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                                description: "expected rewritten backend read query to remain a SELECT query".to_string(),
-                            })?,
-                    )),
-                    None => return Ok(None),
-                },
+                                description:
+                                    "expected rewritten backend read query to remain a SELECT query"
+                                        .to_string(),
+                            }
+                                })?,
+                        )),
+                        None => return Ok(None),
+                    }
+                }
                 _ => return Ok(None),
             };
             Ok(Some(RewriteOutput {
@@ -962,13 +987,17 @@ fn rewrite_query_read_sync(
     let statement = Statement::Query(Box::new(query.clone()));
     if statement_references_internal_state_vtable(&statement) {
         let rewritten = rewrite_internal_state_query_read(query, &[])?;
-        return Ok(Some(rewrite_output_from_statement(Statement::Query(Box::new(rewritten)))));
+        return Ok(Some(rewrite_output_from_statement(Statement::Query(
+            Box::new(rewritten),
+        ))));
     }
     if !statement_references_public_sql2_surface(&statement) {
         return Ok(None);
     }
     let rewritten = rewrite_public_read_query_to_lowered_sql(query, dialect)?;
-    Ok(Some(rewrite_output_from_statement(Statement::Query(Box::new(rewritten)))))
+    Ok(Some(rewrite_output_from_statement(Statement::Query(
+        Box::new(rewritten),
+    ))))
 }
 
 async fn rewrite_query_read_backend(
@@ -978,14 +1007,19 @@ async fn rewrite_query_read_backend(
 ) -> Result<Option<RewriteOutput>, LixError> {
     let statement = Statement::Query(Box::new(query.clone()));
     if statement_references_internal_state_vtable(&statement) {
-        let rewritten = rewrite_internal_state_query_read_with_backend(backend, query, params).await?;
-        return Ok(Some(rewrite_output_from_statement(Statement::Query(Box::new(rewritten)))));
+        let rewritten =
+            rewrite_internal_state_query_read_with_backend(backend, query, params).await?;
+        return Ok(Some(rewrite_output_from_statement(Statement::Query(
+            Box::new(rewritten),
+        ))));
     }
     if !statement_references_public_sql2_surface_with_backend(backend, &statement).await {
         return Ok(None);
     }
     let rewritten = lower_public_read_query_with_sql2_backend(backend, query, params).await?;
-    Ok(Some(rewrite_output_from_statement(Statement::Query(Box::new(rewritten)))))
+    Ok(Some(rewrite_output_from_statement(Statement::Query(
+        Box::new(rewritten),
+    ))))
 }
 
 fn rewrite_output_from_statement(statement: Statement) -> RewriteOutput {

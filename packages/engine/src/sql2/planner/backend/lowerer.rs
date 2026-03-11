@@ -309,8 +309,12 @@ fn rewrite_supported_public_read_surfaces_in_set_expr(
     top_level: bool,
 ) -> Result<(), LixError> {
     match expr {
-        SetExpr::Select(select) => rewrite_supported_public_read_surfaces_in_select(select, top_level),
-        SetExpr::Query(query) => rewrite_supported_public_read_surfaces_in_set_expr(query.body.as_mut(), false),
+        SetExpr::Select(select) => {
+            rewrite_supported_public_read_surfaces_in_select(select, top_level)
+        }
+        SetExpr::Query(query) => {
+            rewrite_supported_public_read_surfaces_in_set_expr(query.body.as_mut(), false)
+        }
         SetExpr::SetOperation { left, right, .. } => {
             rewrite_supported_public_read_surfaces_in_set_expr(left.as_mut(), false)?;
             rewrite_supported_public_read_surfaces_in_set_expr(right.as_mut(), false)
@@ -446,9 +450,15 @@ fn build_supported_public_read_surface_query(
     }
 
     match surface_name.to_ascii_lowercase().as_str() {
-        "lix_state_history" => parse_single_query(&build_state_history_source_sql(&[], true)).map(Some),
-        "lix_active_version" => build_admin_source_query(CanonicalAdminKind::ActiveVersion).map(Some),
-        "lix_active_account" => build_admin_source_query(CanonicalAdminKind::ActiveAccount).map(Some),
+        "lix_state_history" => {
+            parse_single_query(&build_state_history_source_sql(&[], true)).map(Some)
+        }
+        "lix_active_version" => {
+            build_admin_source_query(CanonicalAdminKind::ActiveVersion).map(Some)
+        }
+        "lix_active_account" => {
+            build_admin_source_query(CanonicalAdminKind::ActiveAccount).map(Some)
+        }
         "lix_version" => build_admin_source_query(CanonicalAdminKind::Version).map(Some),
         "lix_stored_schema" => build_admin_source_query(CanonicalAdminKind::StoredSchema).map(Some),
         "lix_change" => build_change_source_query().map(Some),
@@ -458,11 +468,7 @@ fn build_supported_public_read_surface_query(
 }
 
 fn build_builtin_entity_surface_query(surface_binding: &SurfaceBinding) -> Result<Query, LixError> {
-    let Some(schema_key) = surface_binding
-        .implicit_overrides
-        .fixed_schema_key
-        .clone()
-    else {
+    let Some(schema_key) = surface_binding.implicit_overrides.fixed_schema_key.clone() else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(

@@ -313,30 +313,42 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_entity_view_insert_on_conflict_do_nothing_is_rejected,
+    lix_entity_view_insert_on_conflict_do_nothing_is_supported,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
         engine.init().await.unwrap();
 
-        let err = engine
+        engine
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('key-upsert', 'value-a')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('key-upsert', 'value-a') \
+                 VALUES ('key-upsert', 'value-b') \
                  ON CONFLICT (key) DO NOTHING",
                 &[],
             )
             .await
-            .expect_err("DO NOTHING should be rejected");
+            .unwrap();
 
-        assert!(
-            err.description
-                .contains("ON CONFLICT DO NOTHING is not supported"),
-            "unexpected error: {}",
-            err.description
-        );
+        let rows = engine
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'key-upsert'",
+                &[],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "value-a");
     }
 );
 

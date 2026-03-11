@@ -62,3 +62,5 @@ Net:
 - 2026-03-09 18:26 PST - initial plan draft
 - 2026-03-10 09:42 PST - started implementation; wiring a transaction-scoped sql2 append session through EngineTransaction and explicit BEGIN/COMMIT script execution
 - 2026-03-11 09:22 PDT - verified single-commit behavior end to end; explicit BEGIN/COMMIT and EngineTransaction multi-call regressions now pass across sqlite, postgres, and materialization
+- 2026-03-11 11:05 PDT - enabled sql2 ON CONFLICT DO NOTHING for public state/entity inserts, including explicit-version paths; tracked no-op inserts now skip empty commit generation
+- 2026-03-11 12:02 PDT - added first-principles sql2 support for `lix_json(...)` values and restored builtin `lix_stored_schema_by_version` entity routing so stored-schema `ON CONFLICT DO NOTHING` now works through sql2 across sqlite, postgres, and materialization

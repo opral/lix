@@ -17,19 +17,21 @@ use crate::version::{
 };
 use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value as EngineValue};
 
-use crate::engine::sql_ast::lowering::lower_statement;
-use crate::engine::sql_ast::utils::{bind_sql_with_state, PlaceholderState};
-use crate::query_runtime::execute_prepared::{
-    execute_prepared_with_backend, execute_prepared_with_transaction,
-};
-use crate::internal_state::{InternalStatePlan, PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
-use crate::query_runtime::contracts::prepared_statement::PreparedStatement;
 use crate::engine::query_history::commit_runtime::{
     bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
     load_commit_active_accounts, load_version_info_for_versions, CommitQueryExecutor,
     StatementBatch,
 };
 use crate::engine::query_storage::sql_text::escape_sql_string;
+use crate::engine::sql_ast::lowering::lower_statement;
+use crate::engine::sql_ast::utils::{bind_sql_with_state, PlaceholderState};
+use crate::internal_state::{
+    InternalStatePlan, PostprocessPlan, VtableDeletePlan, VtableUpdatePlan,
+};
+use crate::query_runtime::contracts::prepared_statement::PreparedStatement;
+use crate::query_runtime::execute_prepared::{
+    execute_prepared_with_backend, execute_prepared_with_transaction,
+};
 use crate::LixBackend;
 
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
@@ -125,7 +127,8 @@ pub(crate) async fn execute_postprocess_with_transaction(
     functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
     writer_key: Option<&str>,
 ) -> Result<PostprocessExecutionOutcome, LixError> {
-    let internal_result = execute_prepared_with_transaction(transaction, prepared_statements).await?;
+    let internal_result =
+        execute_prepared_with_transaction(transaction, prepared_statements).await?;
 
     let mut postprocess_file_cache_targets = BTreeSet::new();
     if should_refresh_file_cache {

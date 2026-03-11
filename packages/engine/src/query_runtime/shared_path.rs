@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::commit::{
-    append_commit_if_preconditions_hold, AppendCommitArgs, AppendCommitDisposition,
-    AppendCommitError, AppendCommitErrorKind, AppendCommitInvariantChecker,
-    AppendCommitPreconditions, AppendExpectedTip, AppendWriteLane, CommitQueryExecutor,
-    DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow,
-    VersionInfo, generate_commit, build_statement_batch_from_generate_commit_result,
-    bind_statement_batch_for_dialect, load_commit_active_accounts, load_version_info_for_versions,
+    append_commit_if_preconditions_hold, bind_statement_batch_for_dialect,
+    build_statement_batch_from_generate_commit_result, generate_commit,
+    load_commit_active_accounts, load_version_info_for_versions, AppendCommitArgs,
+    AppendCommitDisposition, AppendCommitError, AppendCommitErrorKind,
+    AppendCommitInvariantChecker, AppendCommitPreconditions, AppendExpectedTip, AppendWriteLane,
+    CommitQueryExecutor, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
+    MaterializedStateRow, VersionInfo,
 };
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::engine::query_storage::sql_text::escape_sql_string;
@@ -14,10 +15,8 @@ use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::schema_from_stored_snapshot;
 use crate::schema_registry::register_schema_sql_statements;
-use crate::sql2::runtime::{
-    prepare_sql2_read, try_prepare_sql2_write, Sql2PreparedWrite,
-};
 use crate::sql2::catalog::{SurfaceCapability, SurfaceRegistry};
+use crate::sql2::runtime::{prepare_sql2_read, try_prepare_sql2_write, Sql2PreparedWrite};
 use crate::state_commit_stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamOperation,
@@ -38,12 +37,12 @@ use crate::query_runtime::contracts::planned_statement::{PlannedStatementSet, Sc
 use crate::query_runtime::contracts::requirements::PlanRequirements;
 use crate::query_runtime::contracts::result_contract::ResultContract;
 use crate::query_runtime::derive_requirements::derive_plan_requirements;
-use crate::query_runtime::plan::build_execution_plan;
+use crate::query_runtime::execute::SqlExecutionOutcome;
 use crate::query_runtime::intent::{
     authoritative_pending_file_write_targets, collect_execution_intent_with_backend,
     ExecutionIntent, IntentCollectionPolicy,
 };
-use crate::query_runtime::execute::SqlExecutionOutcome;
+use crate::query_runtime::plan::build_execution_plan;
 use serde_json::{json, Value as JsonValue};
 use sqlparser::ast::Statement;
 
@@ -122,11 +121,7 @@ struct TransactionCommitExecutor<'a> {
 
 #[async_trait::async_trait(?Send)]
 impl CommitQueryExecutor for TransactionCommitExecutor<'_> {
-    async fn execute(
-        &mut self,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<QueryResult, LixError> {
+    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         self.transaction.execute(sql, params).await
     }
 }
@@ -185,9 +180,7 @@ pub(crate) async fn prepare_execution_with_backend(
         if sql2_write.is_none() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "public write target '{target_name}' must route through sql2"
-                ),
+                description: format!("public write target '{target_name}' must route through sql2"),
             });
         }
     }
@@ -451,7 +444,10 @@ mod tests {
              DELETE FROM some_other_table WHERE id = 'x'",
         )
         .expect("parse");
-        assert_eq!(top_level_write_target_name(&statements[0]).as_deref(), Some("lix_file"));
+        assert_eq!(
+            top_level_write_target_name(&statements[0]).as_deref(),
+            Some("lix_file")
+        );
 
         let statements = parse_sql_statements(
             "INSERT INTO lix_directory_by_version (id, path, lixcol_version_id) VALUES ('d1', '/docs', 'v1')",
@@ -623,8 +619,10 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
             )
             .await?;
 
-            let plan_effects_override =
-                semantic_plan_effects_from_domain_changes(&domain_change_batch.changes, stream_operation)?;
+            let plan_effects_override = semantic_plan_effects_from_domain_changes(
+                &domain_change_batch.changes,
+                stream_operation,
+            )?;
 
             let _ = writer_key;
             return Ok(Some(SqlExecutionOutcome {
@@ -737,11 +735,18 @@ async fn build_pending_sql2_append_session(
         .materialized_state
         .iter()
         .find(|row| row.schema_key == "lix_commit")
-        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "sql2 append session requires a lix_commit materialized row"))?;
-    let commit_snapshot = commit_row
-        .snapshot_content
-        .as_deref()
-        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "sql2 append session requires commit snapshot_content"))?;
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "sql2 append session requires a lix_commit materialized row",
+            )
+        })?;
+    let commit_snapshot = commit_row.snapshot_content.as_deref().ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "sql2 append session requires commit snapshot_content",
+        )
+    })?;
     let commit_snapshot: JsonValue = serde_json::from_str(commit_snapshot).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -752,14 +757,24 @@ async fn build_pending_sql2_append_session(
         .get("change_set_id")
         .and_then(JsonValue::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "sql2 append session commit snapshot is missing change_set_id"))?
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "sql2 append session commit snapshot is missing change_set_id",
+            )
+        })?
         .to_string();
     let commit_change_id = commit_result
         .changes
         .iter()
         .find(|row| row.schema_key == "lix_commit" && row.entity_id == commit_row.entity_id)
         .map(|row| row.id.clone())
-        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "sql2 append session requires a lix_commit change row"))?;
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "sql2 append session requires a lix_commit change row",
+            )
+        })?;
     let snapshot_id_result = transaction
         .execute(
             "SELECT snapshot_id \
@@ -782,7 +797,12 @@ async fn build_pending_sql2_append_session(
             Value::Text(text) => Some(text.clone()),
             _ => None,
         })
-        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "sql2 append session could not load commit snapshot_id"))?;
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "sql2 append session could not load commit snapshot_id",
+            )
+        })?;
 
     Ok(PendingSql2AppendSession {
         lane,
@@ -813,18 +833,15 @@ async fn merge_sql2_domain_change_batch_into_pending_commit(
                 id: functions.uuid_v7(),
                 entity_id: change.entity_id.clone(),
                 schema_key: change.schema_key.clone(),
-                schema_version: change
-                    .schema_version
-                    .clone()
-                    .ok_or_else(|| {
-                        LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            format!(
-                                "sql2 merge requires schema_version for '{}:{}'",
-                                change.schema_key, change.entity_id
-                            ),
-                        )
-                    })?,
+                schema_version: change.schema_version.clone().ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "sql2 merge requires schema_version for '{}:{}'",
+                            change.schema_key, change.entity_id
+                        ),
+                    )
+                })?,
                 file_id: change.file_id.clone().ok_or_else(|| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
@@ -922,13 +939,23 @@ fn rewrite_generated_commit_result_for_pending_session(
         .iter()
         .find(|row| row.schema_key == "lix_commit")
         .map(|row| row.entity_id.clone())
-        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "sql2 merge rewrite requires a generated lix_commit row"))?;
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "sql2 merge rewrite requires a generated lix_commit row",
+            )
+        })?;
     let temporary_change_set_id = generated
         .materialized_state
         .iter()
         .find(|row| row.schema_key == "lix_change_set")
         .map(|row| row.entity_id.clone())
-        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "sql2 merge rewrite requires a generated lix_change_set row"))?;
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "sql2 merge rewrite requires a generated lix_change_set row",
+            )
+        })?;
     let version_pointer_entity_id = pending_session_version_pointer_entity_id(&session.lane);
 
     let mut materialized_state = Vec::new();
@@ -979,7 +1006,11 @@ fn rewrite_generated_commit_result_for_pending_session(
     });
 
     Ok(GenerateCommitResult {
-        changes: generated.changes.into_iter().take(domain_change_count).collect(),
+        changes: generated
+            .changes
+            .into_iter()
+            .take(domain_change_count)
+            .collect(),
         materialized_state,
     })
 }
@@ -1049,11 +1080,7 @@ fn pending_session_version_pointer_entity_id(lane: &AppendWriteLane) -> &str {
     }
 }
 
-fn extend_json_array_strings<I>(
-    snapshot: &mut JsonValue,
-    key: &str,
-    values: I,
-)
+fn extend_json_array_strings<I>(snapshot: &mut JsonValue, key: &str, values: I)
 where
     I: IntoIterator<Item = String>,
 {
@@ -1089,11 +1116,18 @@ async fn execute_generated_commit_result(
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
 ) -> Result<(), LixError> {
     let prepared = bind_statement_batch_for_dialect(
-        build_statement_batch_from_generate_commit_result(result, functions, 0, transaction.dialect())?,
+        build_statement_batch_from_generate_commit_result(
+            result,
+            functions,
+            0,
+            transaction.dialect(),
+        )?,
         transaction.dialect(),
     )?;
     for statement in prepared {
-        transaction.execute(&statement.sql, &statement.params).await?;
+        transaction
+            .execute(&statement.sql, &statement.params)
+            .await?;
     }
     Ok(())
 }
@@ -1203,13 +1237,6 @@ fn sql2_untracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     let Some(sql2_write) = prepared.sql2_write.as_ref() else {
         return false;
     };
-    let target_name = sql2_write
-        .planned_write
-        .command
-        .target
-        .descriptor
-        .public_name
-        .as_str();
     matches!(
         prepared.plan.result_contract,
         ResultContract::DmlNoReturning
@@ -1217,13 +1244,30 @@ fn sql2_untracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
         sql2_write.planned_write.command.mode,
         crate::sql2::planner::ir::WriteMode::Untracked
     ) && matches!(
-        target_name,
-        "lix_active_version"
-            | "lix_active_account"
-            | "lix_file"
-            | "lix_file_by_version"
-            | "lix_directory"
-            | "lix_directory_by_version"
+        sql2_write
+            .planned_write
+            .command
+            .target
+            .descriptor
+            .surface_family,
+        crate::sql2::catalog::SurfaceFamily::State
+            | crate::sql2::catalog::SurfaceFamily::Entity
+            | crate::sql2::catalog::SurfaceFamily::Filesystem
+    ) || matches!(
+        prepared.plan.result_contract,
+        ResultContract::DmlNoReturning
+    ) && matches!(
+        sql2_write.planned_write.command.mode,
+        crate::sql2::planner::ir::WriteMode::Untracked
+    ) && matches!(
+        sql2_write
+            .planned_write
+            .command
+            .target
+            .descriptor
+            .public_name
+            .as_str(),
+        "lix_active_version" | "lix_active_account"
     )
 }
 

@@ -634,10 +634,10 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_state_by_version_insert_on_conflict_do_nothing_is_rejected,
+    lix_state_by_version_insert_on_conflict_do_nothing_is_supported,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
         engine.init().await.unwrap();
@@ -645,23 +645,44 @@ simulation_test!(
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
 
-        let err = engine
+        engine
             .execute(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
                  'entity-upsert-bv', 'test_state_schema', 'file-upsert-bv', 'version-a', 'lix', '1', '{\"value\":\"A\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'entity-upsert-bv', 'test_state_schema', 'file-upsert-bv', 'version-a', 'lix', '1', '{\"value\":\"B\"}'\
                  ) \
                  ON CONFLICT (entity_id, schema_key, file_id, version_id) DO NOTHING", &[])
             .await
-            .expect_err("DO NOTHING should be rejected");
+            .unwrap();
 
-        assert!(
-            err.description
-                .contains("ON CONFLICT DO NOTHING is not supported"),
-            "unexpected error: {}",
-            err.description
-        );
+        let rows = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-upsert-bv' \
+                   AND file_id = 'file-upsert-bv' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "{\"value\":\"A\"}");
     }
 );
 

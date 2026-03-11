@@ -31,9 +31,12 @@ pub(crate) async fn materialize_vtable_insert_select_sources(
                 continue;
             };
             let source_query = (**source).clone();
-            let rewritten_source =
-                Box::pin(lower_public_read_query_with_sql2_backend(backend, source_query, params))
-                    .await?;
+            let rewritten_source = Box::pin(lower_public_read_query_with_sql2_backend(
+                backend,
+                source_query,
+                params,
+            ))
+            .await?;
             let lowered_source = lower_statement(
                 Statement::Query(Box::new(rewritten_source)),
                 backend.dialect(),
@@ -120,6 +123,9 @@ fn engine_value_to_expr(value: &Value) -> Result<Expr, LixError> {
         Value::Boolean(value) => Ok(Expr::Value(SqlValue::Boolean(*value).into())),
         Value::Text(value) => Ok(Expr::Value(
             SqlValue::SingleQuotedString(value.clone()).into(),
+        )),
+        Value::Json(value) => Ok(Expr::Value(
+            SqlValue::SingleQuotedString(value.to_string()).into(),
         )),
         Value::Integer(value) => Ok(Expr::Value(
             SqlValue::Number(value.to_string(), false).into(),

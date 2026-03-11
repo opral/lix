@@ -4,11 +4,11 @@ use sqlparser::ast::{
     Delete, FromTable, Insert, Statement, TableFactor, TableObject, TableWithJoins, Update,
 };
 
+use crate::errors;
+use crate::functions::LixFunctionProvider;
 use crate::internal_state::object_name_matches;
 use crate::internal_state::{stored_schema, vtable_write};
 use crate::internal_state::{PostprocessPlan, RewriteOutput};
-use crate::functions::LixFunctionProvider;
-use crate::errors;
 use crate::{LixBackend, LixError, Value};
 
 const MAX_REWRITE_PASSES: usize = 32;
@@ -103,12 +103,18 @@ fn reject_read_only_public_write(statement: &Statement) -> Result<(), LixError> 
     match statement {
         Statement::Insert(insert) => {
             if table_object_is_read_only_public_surface(&insert.table) {
-                return Err(read_only_public_write_error(read_only_insert_target_name(insert), "INSERT"));
+                return Err(read_only_public_write_error(
+                    read_only_insert_target_name(insert),
+                    "INSERT",
+                ));
             }
         }
         Statement::Update(update) => {
             if table_with_joins_is_read_only_public_surface(&update.table) {
-                return Err(read_only_public_write_error(read_only_update_target_name(update), "UPDATE"));
+                return Err(read_only_public_write_error(
+                    read_only_update_target_name(update),
+                    "UPDATE",
+                ));
             }
         }
         Statement::Delete(delete) => {
@@ -349,11 +355,7 @@ where
                 merge_rewrite_output(&mut final_output, output)?;
             }
             Pending::Statement(statement) => {
-                let mut context = StatementContext::new_backend(
-                    backend,
-                    params,
-                    writer_key,
-                );
+                let mut context = StatementContext::new_backend(backend, params, writer_key);
                 let outcome = rewrite_backend_loop(statement, &mut context, functions).await?;
                 let side_effects = std::mem::take(&mut context.side_effects);
 
@@ -459,8 +461,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
             Statement::Delete(delete) => {
                 reject_read_only_public_write(&Statement::Delete(delete.clone()))?;
 
-                let output =
-                    rewrite_vtable_delete_output(delete, false, context.params)?;
+                let output = rewrite_vtable_delete_output(delete, false, context.params)?;
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             other => {
@@ -577,8 +578,7 @@ where
             Statement::Delete(delete) => {
                 reject_read_only_public_write(&Statement::Delete(delete.clone()))?;
 
-                let output =
-                    rewrite_vtable_delete_output(delete, false, context.params)?;
+                let output = rewrite_vtable_delete_output(delete, false, context.params)?;
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             other => {
@@ -630,4 +630,3 @@ fn is_allowed_internal_write_target(target: &str) -> bool {
     let normalized = target.trim_matches('"').to_ascii_lowercase();
     normalized.starts_with("lix_internal_")
 }
-

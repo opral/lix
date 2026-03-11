@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
+use crate::engine::query_semantics::state_resolution::effects::derive_effects_from_state_resolution;
 use crate::query_runtime::contracts::effects::PlanEffects;
 use crate::query_runtime::contracts::planned_statement::PlannedStatementSet;
 use crate::query_runtime::contracts::planner_error::PlannerError;
-use crate::engine::query_semantics::state_resolution::effects::derive_effects_from_state_resolution;
 
 pub(crate) fn derive_plan_effects(
     output: &PlannedStatementSet,

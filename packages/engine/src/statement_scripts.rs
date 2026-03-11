@@ -1,9 +1,9 @@
+use crate::engine::query_semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use crate::engine::{
-    CollectedExecutionSideEffects, DeferredTransactionSideEffects, Engine,
-    ExecuteOptions, StateCommitStreamChange, TransactionBackendAdapter,
+    CollectedExecutionSideEffects, DeferredTransactionSideEffects, Engine, ExecuteOptions,
+    StateCommitStreamChange, TransactionBackendAdapter,
 };
 use crate::internal_state::script::prepare_statement_script_sql_statements;
-use crate::engine::query_semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use crate::{ExecuteResult, LixError, LixTransaction, Value};
 use sqlparser::ast::Statement;
 
@@ -76,7 +76,9 @@ impl Engine {
         options: &ExecuteOptions,
         active_version_id: &mut String,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
-        pending_sql2_append_session: &mut Option<crate::query_runtime::shared_path::PendingSql2AppendSession>,
+        pending_sql2_append_session: &mut Option<
+            crate::query_runtime::shared_path::PendingSql2AppendSession,
+        >,
     ) -> Result<ExecuteResult, LixError> {
         let can_defer_side_effects = false;
         let mut deferred_side_effects = if can_defer_side_effects {
