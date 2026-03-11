@@ -145,7 +145,12 @@ impl Engine {
             extract_explicit_transaction_script_from_statements(&parsed_statements, params)?
         {
             return self
-                .execute_transaction_script_with_options(statements, params, options)
+                .execute_transaction_script_with_options(
+                    statements,
+                    params,
+                    options,
+                    allow_internal_sql,
+                )
                 .await;
         }
         if !allow_internal_sql && contains_transaction_control_statement(&parsed_statements) {
@@ -153,7 +158,12 @@ impl Engine {
         }
         if parsed_statements.len() > 1 {
             return self
-                .execute_statement_script_with_options(parsed_statements, params, &options)
+                .execute_statement_script_with_options(
+                    parsed_statements,
+                    params,
+                    &options,
+                    allow_internal_sql,
+                )
                 .await;
         }
 
@@ -171,6 +181,7 @@ impl Engine {
             params,
             &active_version_id,
             writer_key,
+            allow_internal_sql,
             shared_path::PreparationPolicy {
                 skip_side_effect_collection: false,
             },

@@ -15,7 +15,8 @@ use crate::sql2::catalog::{
 use crate::sql2::core::parser::parse_sql_script;
 use crate::sql2::planner::canonicalize::CanonicalizedRead;
 use crate::sql2::planner::ir::{
-    CanonicalAdminKind, CanonicalStateScan, FilesystemKind, ReadPlan, VersionScope,
+    CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan, CanonicalStateScan,
+    CanonicalWorkingChangesScan, FilesystemKind, ReadPlan, VersionScope,
 };
 use crate::sql2::planner::semantics::effective_state_resolver::{
     EffectiveStatePlan, EffectiveStateRequest,
@@ -27,8 +28,9 @@ use crate::version::{
 };
 use crate::LixError;
 use sqlparser::ast::{
-    BinaryOperator, Expr, Ident, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
-    TableFactor, TableWithJoins,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
+    JoinConstraint, JoinOperator, LimitClause, OrderBy, OrderByExpr, Query, Select, SelectItem,
+    SetExpr, Statement, TableAlias, TableFactor, TableWithJoins,
 };
 use std::collections::BTreeSet;
 
@@ -36,6 +38,21 @@ use std::collections::BTreeSet;
 pub(crate) struct LoweredReadProgram {
     pub(crate) statements: Vec<Statement>,
     pub(crate) pushdown_decision: PushdownDecision,
+}
+
+mod expand;
+
+pub(crate) fn rewrite_supported_public_read_surfaces_in_statement(
+    statement: &mut Statement,
+) -> Result<(), LixError> {
+    expand::rewrite_supported_public_read_surfaces_in_statement(statement)
+}
+
+pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry(
+    statement: &mut Statement,
+    registry: &SurfaceRegistry,
+) -> Result<(), LixError> {
+    expand::rewrite_supported_public_read_surfaces_in_statement_with_registry(statement, registry)
 }
 
 pub(crate) fn lower_read_for_execution(
@@ -108,28 +125,6 @@ pub(crate) fn lower_read_for_execution(
                 })
             })
         }
-    }
-}
-
-pub(crate) fn rewrite_supported_public_read_surfaces_in_statement(
-    statement: &mut Statement,
-) -> Result<(), LixError> {
-    rewrite_supported_public_read_surfaces_in_statement_with_registry(
-        statement,
-        &SurfaceRegistry::with_builtin_surfaces(),
-    )
-}
-
-pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry(
-    statement: &mut Statement,
-    registry: &SurfaceRegistry,
-) -> Result<(), LixError> {
-    match statement {
-        Statement::Query(query) => rewrite_supported_public_read_surfaces_in_query(query, registry),
-        Statement::Explain { statement, .. } => {
-            rewrite_supported_public_read_surfaces_in_statement_with_registry(statement, registry)
-        }
-        _ => Ok(()),
     }
 }
 
@@ -337,238 +332,6 @@ fn rewrite_nested_filesystem_surfaces_in_query(
 ) -> Result<(), LixError> {
     rewrite_nested_filesystem_surfaces_in_set_expr(query.body.as_mut(), top_level)?;
     Ok(())
-}
-
-fn rewrite_supported_public_read_surfaces_in_query(
-    query: &mut Query,
-    registry: &SurfaceRegistry,
-) -> Result<(), LixError> {
-    rewrite_supported_public_read_surfaces_in_set_expr(query.body.as_mut(), registry, true)
-}
-
-fn rewrite_supported_public_read_surfaces_in_set_expr(
-    expr: &mut SetExpr,
-    registry: &SurfaceRegistry,
-    top_level: bool,
-) -> Result<(), LixError> {
-    match expr {
-        SetExpr::Select(select) => {
-            rewrite_supported_public_read_surfaces_in_select(select, registry, top_level)
-        }
-        SetExpr::Query(query) => {
-            rewrite_supported_public_read_surfaces_in_set_expr(query.body.as_mut(), registry, false)
-        }
-        SetExpr::SetOperation { left, right, .. } => {
-            rewrite_supported_public_read_surfaces_in_set_expr(left.as_mut(), registry, false)?;
-            rewrite_supported_public_read_surfaces_in_set_expr(right.as_mut(), registry, false)
-        }
-        _ => Ok(()),
-    }
-}
-
-fn rewrite_supported_public_read_surfaces_in_select(
-    select: &mut Select,
-    registry: &SurfaceRegistry,
-    top_level: bool,
-) -> Result<(), LixError> {
-    for table in &mut select.from {
-        rewrite_supported_public_read_surfaces_in_table_with_joins(table, registry, top_level)?;
-    }
-    if let Some(selection) = &mut select.selection {
-        rewrite_supported_public_read_surfaces_in_expr(selection, registry)?;
-    }
-    for item in &mut select.projection {
-        match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                rewrite_supported_public_read_surfaces_in_expr(expr, registry)?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn rewrite_supported_public_read_surfaces_in_table_with_joins(
-    table: &mut TableWithJoins,
-    registry: &SurfaceRegistry,
-    top_level: bool,
-) -> Result<(), LixError> {
-    rewrite_supported_public_read_surfaces_in_table_factor(
-        &mut table.relation,
-        registry,
-        top_level,
-    )?;
-    for join in &mut table.joins {
-        rewrite_supported_public_read_surfaces_in_table_factor(
-            &mut join.relation,
-            registry,
-            top_level,
-        )?;
-    }
-    Ok(())
-}
-
-fn rewrite_supported_public_read_surfaces_in_table_factor(
-    relation: &mut TableFactor,
-    registry: &SurfaceRegistry,
-    top_level: bool,
-) -> Result<(), LixError> {
-    match relation {
-        TableFactor::Table { name, alias, .. } => {
-            let Some(surface_name) = table_name_terminal(name) else {
-                return Ok(());
-            };
-            let Some(derived_query) =
-                build_supported_public_read_surface_query(surface_name, registry, top_level)?
-            else {
-                return Ok(());
-            };
-            let derived_alias = alias.clone().or_else(|| {
-                Some(TableAlias {
-                    explicit: false,
-                    name: Ident::new(surface_name),
-                    columns: Vec::new(),
-                })
-            });
-            *relation = TableFactor::Derived {
-                lateral: false,
-                subquery: Box::new(derived_query),
-                alias: derived_alias,
-            };
-            Ok(())
-        }
-        TableFactor::Derived { subquery, .. } => {
-            rewrite_supported_public_read_surfaces_in_set_expr(
-                subquery.body.as_mut(),
-                registry,
-                false,
-            )
-        }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => rewrite_supported_public_read_surfaces_in_table_with_joins(
-            table_with_joins,
-            registry,
-            false,
-        ),
-        _ => Ok(()),
-    }
-}
-
-fn rewrite_supported_public_read_surfaces_in_expr(
-    expr: &mut Expr,
-    registry: &SurfaceRegistry,
-) -> Result<(), LixError> {
-    match expr {
-        Expr::BinaryOp { left, right, .. } => {
-            rewrite_supported_public_read_surfaces_in_expr(left, registry)?;
-            rewrite_supported_public_read_surfaces_in_expr(right, registry)
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::Nested(expr)
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::Cast { expr, .. } => rewrite_supported_public_read_surfaces_in_expr(expr, registry),
-        Expr::InList { expr, list, .. } => {
-            rewrite_supported_public_read_surfaces_in_expr(expr, registry)?;
-            for item in list {
-                rewrite_supported_public_read_surfaces_in_expr(item, registry)?;
-            }
-            Ok(())
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            rewrite_supported_public_read_surfaces_in_expr(expr, registry)?;
-            rewrite_supported_public_read_surfaces_in_expr(low, registry)?;
-            rewrite_supported_public_read_surfaces_in_expr(high, registry)
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            rewrite_supported_public_read_surfaces_in_expr(expr, registry)?;
-            rewrite_supported_public_read_surfaces_in_expr(pattern, registry)
-        }
-        Expr::Subquery(query) => rewrite_supported_public_read_surfaces_in_query(query, registry),
-        Expr::Exists { subquery, .. } => {
-            rewrite_supported_public_read_surfaces_in_query(subquery, registry)
-        }
-        Expr::InSubquery { expr, subquery, .. } => {
-            rewrite_supported_public_read_surfaces_in_expr(expr, registry)?;
-            rewrite_supported_public_read_surfaces_in_query(subquery, registry)
-        }
-        _ => Ok(()),
-    }
-}
-
-fn build_supported_public_read_surface_query(
-    surface_name: &str,
-    registry: &SurfaceRegistry,
-    _top_level: bool,
-) -> Result<Option<Query>, LixError> {
-    if let Some(surface_binding) = registry.bind_relation_name(surface_name) {
-        match surface_binding.descriptor.surface_family {
-            SurfaceFamily::Entity => {
-                return build_builtin_entity_surface_query(&surface_binding).map(Some);
-            }
-            SurfaceFamily::Filesystem => {
-                return build_nested_filesystem_surface_query(surface_name);
-            }
-            SurfaceFamily::State | SurfaceFamily::Admin | SurfaceFamily::Change => {}
-        }
-    }
-
-    match surface_name.to_ascii_lowercase().as_str() {
-        "lix_state_history" => {
-            parse_single_query(&build_state_history_source_sql(&[], true)).map(Some)
-        }
-        "lix_active_version" => {
-            build_admin_source_query(CanonicalAdminKind::ActiveVersion).map(Some)
-        }
-        "lix_active_account" => {
-            build_admin_source_query(CanonicalAdminKind::ActiveAccount).map(Some)
-        }
-        "lix_version" => build_admin_source_query(CanonicalAdminKind::Version).map(Some),
-        "lix_stored_schema" => build_admin_source_query(CanonicalAdminKind::StoredSchema).map(Some),
-        "lix_change" => build_change_source_query().map(Some),
-        "lix_working_changes" => build_working_changes_source_query().map(Some),
-        _ => Ok(None),
-    }
-}
-
-fn build_builtin_entity_surface_query(surface_binding: &SurfaceBinding) -> Result<Query, LixError> {
-    let Some(schema_key) = surface_binding.implicit_overrides.fixed_schema_key.clone() else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "sql2 public-surface rewrite requires fixed schema binding for '{}'",
-                surface_binding.descriptor.public_name
-            ),
-        });
-    };
-    let Some(state_scan) = CanonicalStateScan::from_surface_binding(surface_binding.clone()) else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "sql2 public-surface rewrite could not build canonical state scan for '{}'",
-                surface_binding.descriptor.public_name
-            ),
-        });
-    };
-    let request = EffectiveStateRequest {
-        schema_set: BTreeSet::from([schema_key]),
-        version_scope: state_scan.version_scope,
-        include_global_overlay: true,
-        include_untracked_overlay: true,
-        include_tombstones: state_scan.include_tombstones,
-        predicate_classes: Vec::new(),
-        required_columns: surface_binding.exposed_columns.clone(),
-    };
-    build_entity_source_query(surface_binding, &request, &[])?.ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "sql2 public-surface rewrite could not lower entity surface '{}'",
-            surface_binding.descriptor.public_name
-        ),
-    })
 }
 
 fn rewrite_nested_filesystem_surfaces_in_set_expr(
@@ -2824,6 +2587,53 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_cte_and_joined_state_surfaces_to_internal_queries() {
+        let mut statements = crate::sql2::core::parser::parse_sql_script(
+            "WITH keyed AS ( \
+               SELECT entity_id, schema_key \
+               FROM lix_state \
+               WHERE schema_key = 'lix_key_value' \
+             ) \
+             SELECT keyed.schema_key, COUNT(*) \
+             FROM keyed \
+             JOIN lix_state_by_version sv \
+               ON sv.entity_id = keyed.entity_id \
+             WHERE sv.lixcol_version_id = 'main' \
+             GROUP BY keyed.schema_key \
+             ORDER BY keyed.schema_key",
+        )
+        .expect("SQL should parse");
+        let mut statement = statements.pop().expect("single statement");
+
+        rewrite_supported_public_read_surfaces_in_statement(&mut statement)
+            .expect("cte and joined state surfaces should rewrite");
+        let lowered_sql = statement.to_string();
+
+        assert!(!lowered_sql.contains("FROM lix_state "));
+        assert!(!lowered_sql.contains("JOIN lix_state_by_version"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(lowered_sql.contains("all_target_versions AS"));
+    }
+
+    #[test]
+    fn does_not_rewrite_cte_names_that_shadow_public_surfaces() {
+        let mut statements = crate::sql2::core::parser::parse_sql_script(
+            "WITH lix_state AS (SELECT 'shadow' AS entity_id) \
+             SELECT entity_id FROM lix_state",
+        )
+        .expect("SQL should parse");
+        let mut statement = statements.pop().expect("single statement");
+
+        rewrite_supported_public_read_surfaces_in_statement(&mut statement)
+            .expect("shadowing cte should remain untouched");
+        let lowered_sql = statement.to_string();
+
+        assert!(lowered_sql.contains("FROM lix_state"));
+        assert!(!lowered_sql.contains("lix_internal_state_materialized_v1_"));
+        assert!(!lowered_sql.contains("FROM lix_internal_state_untracked"));
+    }
+
+    #[test]
     fn lowers_dynamic_entity_reads_with_scalar_override_predicates() {
         let mut registry = SurfaceRegistry::with_builtin_surfaces();
         registry.register_dynamic_entity_surfaces(crate::sql2::catalog::DynamicEntitySurfaceSpec {
@@ -2963,7 +2773,7 @@ mod tests {
         assert!(
             by_version_sql.contains("lix_internal_state_materialized_v1_lix_directory_descriptor")
         );
-        assert!(by_version_sql.contains("WITH RECURSIVE all_target_versions AS"));
+        assert!(by_version_sql.contains("all_target_versions AS"));
         assert!(!by_version_sql.contains("FROM lix_directory_by_version"));
         assert_eq!(
             by_version.pushdown_decision.residual_predicates,

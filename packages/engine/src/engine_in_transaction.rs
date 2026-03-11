@@ -10,6 +10,7 @@ impl Engine {
         sql: &str,
         params: &[Value],
         options: &ExecuteOptions,
+        allow_internal_tables: bool,
         active_version_id: &mut String,
         deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
         skip_side_effect_collection: bool,
@@ -36,6 +37,7 @@ impl Engine {
                 params,
                 active_version_id.as_str(),
                 writer_key,
+                allow_internal_tables,
                 shared_path::PreparationPolicy {
                     skip_side_effect_collection,
                 },

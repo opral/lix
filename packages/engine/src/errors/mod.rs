@@ -160,6 +160,25 @@ pub(crate) fn internal_table_access_denied_error() -> LixError {
     )
 }
 
+pub(crate) fn mixed_public_internal_query_error(internal_tables: &[String]) -> LixError {
+    let available_tables = builtin_public_surface_names().join(", ");
+    let internal_tables = if internal_tables.is_empty() {
+        "`lix_internal_*`".to_string()
+    } else {
+        internal_tables
+            .iter()
+            .map(|table| format!("`{table}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    build_error(
+        ErrorCode::InternalTableAccessDenied,
+        &format!(
+            "Queries that reference public Lix tables must not also access internal engine tables in the same statement. Internal tables referenced: {internal_tables}. Public SQL tables: {available_tables}."
+        ),
+    )
+}
+
 pub(crate) fn read_only_view_write_error(view_name: &str, operation: &str) -> LixError {
     let guidance = if let Some(base_view) = view_name.strip_suffix("_history") {
         format!("Use `{base_view}` or `{base_view}_by_version` for writes.")
@@ -215,11 +234,11 @@ pub(crate) fn unexpected_statement_count_error(
 mod tests {
     use super::{
         already_initialized_error, file_data_expects_bytes_error,
-        internal_table_access_denied_error, not_initialized_error, read_only_view_write_error,
-        schema_not_registered_error, sql_unknown_column_error, sql_unknown_table_error,
-        table_not_found_read_error, transaction_control_statement_denied_error,
-        transaction_handle_not_found_error, unexpected_statement_count_error,
-        vtable_schema_key_required_error, ErrorCode,
+        internal_table_access_denied_error, mixed_public_internal_query_error,
+        not_initialized_error, read_only_view_write_error, schema_not_registered_error,
+        sql_unknown_column_error, sql_unknown_table_error, table_not_found_read_error,
+        transaction_control_statement_denied_error, transaction_handle_not_found_error,
+        unexpected_statement_count_error, vtable_schema_key_required_error, ErrorCode,
     };
     use std::collections::HashSet;
 
@@ -253,6 +272,13 @@ mod tests {
         let internal_access = internal_table_access_denied_error();
         assert_eq!(
             internal_access.code,
+            "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED"
+        );
+
+        let mixed_public_internal =
+            mixed_public_internal_query_error(&["lix_internal_state_untracked".to_string()]);
+        assert_eq!(
+            mixed_public_internal.code,
             "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED"
         );
 

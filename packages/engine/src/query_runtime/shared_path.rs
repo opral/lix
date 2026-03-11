@@ -15,8 +15,8 @@ use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema_registry::register_schema_sql_statements;
 use crate::sql2::runtime::{
-    finalize_sql2_write_execution, prepare_sql2_public_execution, Sql2PreparedPublicExecution,
-    Sql2PreparedWrite, Sql2WriteExecution,
+    finalize_sql2_write_execution, prepare_sql2_public_execution_with_internal_access,
+    Sql2PreparedPublicExecution, Sql2PreparedWrite, Sql2WriteExecution,
 };
 use crate::validation::{
     validate_inserts, validate_sql2_append_time_write, validate_sql2_batch_local_write,
@@ -123,6 +123,7 @@ pub(crate) async fn prepare_execution_with_backend(
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
+    allow_internal_tables: bool,
     policy: PreparationPolicy,
 ) -> Result<PreparedExecutionContext, LixError> {
     let (settings, sequence_start, functions) = engine
@@ -152,16 +153,22 @@ pub(crate) async fn prepare_execution_with_backend(
             ),
         })?;
 
-    let sql2_public_execution =
-        prepare_sql2_public_execution(backend, &statements, params, active_version_id, writer_key)
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "prepare_execution_with_backend sql2 public preparation failed: {}",
-                    error.description
-                ),
-            })?;
+    let sql2_public_execution = prepare_sql2_public_execution_with_internal_access(
+        backend,
+        &statements,
+        params,
+        active_version_id,
+        writer_key,
+        allow_internal_tables,
+    )
+    .await
+    .map_err(|error| LixError {
+        code: error.code,
+        description: format!(
+            "prepare_execution_with_backend sql2 public preparation failed: {}",
+            error.description
+        ),
+    })?;
     let (sql2_read, mut sql2_write) = match sql2_public_execution {
         Some(Sql2PreparedPublicExecution::Read(prepared)) => (Some(prepared), None),
         Some(Sql2PreparedPublicExecution::Write(prepared)) => (None, Some(prepared)),

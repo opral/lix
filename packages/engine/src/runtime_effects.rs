@@ -280,6 +280,7 @@ impl Engine {
                 &sql,
                 &params,
                 &ExecuteOptions::default(),
+                true,
                 &mut active_version_id,
                 None,
                 true,
@@ -330,6 +331,7 @@ impl Engine {
                 &params,
                 &active_version_id,
                 None,
+                true,
                 shared_path::PreparationPolicy {
                     skip_side_effect_collection: true,
                 },
