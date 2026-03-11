@@ -569,6 +569,23 @@ pub(crate) async fn prepare_sql2_read(
     .flatten()
 }
 
+pub(crate) async fn prepare_sql2_read_strict(
+    backend: &dyn LixBackend,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+) -> Result<Option<Sql2PreparedRead>, LixError> {
+    try_prepare_sql2_read(
+        backend,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+    )
+    .await
+}
+
 fn statements_reference_public_surface(
     registry: &SurfaceRegistry,
     parsed_statements: &[Statement],
@@ -1251,10 +1268,11 @@ fn sql2_schema_registrations_from_planned_write(
             continue;
         }
 
-        let Some(Value::Text(snapshot_content)) = row.values.get("snapshot_content") else {
+        let Some(snapshot_content) = planned_row_optional_json_text_value(row, "snapshot_content")
+        else {
             continue;
         };
-        let Ok(snapshot) = serde_json::from_str(snapshot_content) else {
+        let Ok(snapshot) = serde_json::from_str(&snapshot_content) else {
             continue;
         };
         let Ok((schema_key, _)) = crate::schema::schema_from_stored_snapshot(&snapshot) else {
@@ -1416,11 +1434,12 @@ fn semantic_plan_effects_from_untracked_sql2_write(
         {
             continue;
         }
-        let Some(snapshot_content) = planned_row_optional_text_value(row, "snapshot_content")
+        let Some(snapshot_content) = planned_row_optional_json_text_value(row, "snapshot_content")
         else {
             continue;
         };
-        effects.next_active_version_id = Some(parse_active_version_snapshot(snapshot_content)?);
+        effects.next_active_version_id =
+            Some(parse_active_version_snapshot(snapshot_content.as_ref())?);
         break;
     }
     Ok(effects)
@@ -1487,6 +1506,17 @@ fn planned_row_optional_text_value<'a>(
     }
 }
 
+fn planned_row_optional_json_text_value<'a>(
+    row: &'a crate::sql2::planner::ir::PlannedStateRow,
+    key: &str,
+) -> Option<std::borrow::Cow<'a, str>> {
+    match row.values.get(key) {
+        Some(Value::Text(value)) => Some(std::borrow::Cow::Borrowed(value.as_str())),
+        Some(Value::Json(value)) => Some(std::borrow::Cow::Owned(value.to_string())),
+        _ => None,
+    }
+}
+
 fn sql2_authoritative_write_error(
     canonicalized: &CanonicalizedWrite,
     message: String,
@@ -1544,10 +1574,27 @@ fn sql2_public_write_preparation_error_for_surface(
 
     match surface_binding.descriptor.surface_family {
         SurfaceFamily::Filesystem => Some(sql2_filesystem_write_error(public_name, message)),
-        SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Admin => {
+        SurfaceFamily::State | SurfaceFamily::Entity => {
             Some(LixError::new("LIX_ERROR_UNKNOWN", message))
         }
+        SurfaceFamily::Admin => Some(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            normalize_admin_public_write_message(public_name, message),
+        )),
         _ => None,
+    }
+}
+
+fn normalize_admin_public_write_message<'a>(
+    public_name: &str,
+    message: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    match public_name {
+        "lix_version" => message
+            .strip_prefix("sql2 version ")
+            .map(|suffix| std::borrow::Cow::Owned(format!("{public_name} {suffix}")))
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed(message)),
+        _ => std::borrow::Cow::Borrowed(message),
     }
 }
 

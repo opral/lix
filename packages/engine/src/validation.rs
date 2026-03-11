@@ -589,6 +589,7 @@ fn planned_row_snapshot(row: &PlannedStateRow) -> Result<Option<JsonValue>, LixE
 
     match value {
         Value::Null => Ok(None),
+        Value::Json(json) => Ok(Some(json.clone())),
         Value::Text(text) => serde_json::from_str::<JsonValue>(text)
             .map(Some)
             .map_err(|err| LixError {
@@ -601,7 +602,7 @@ fn planned_row_snapshot(row: &PlannedStateRow) -> Result<Option<JsonValue>, LixE
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
-                "snapshot_content for schema '{}' must be text or null during sql2 validation, got {other:?}",
+                "snapshot_content for schema '{}' must be JSON, text, or null during sql2 validation, got {other:?}",
                 row.schema_key
             ),
         }),

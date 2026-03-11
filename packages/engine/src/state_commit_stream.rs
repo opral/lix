@@ -657,6 +657,7 @@ fn planned_row_snapshot_content(
 ) -> Result<Option<JsonValue>, LixError> {
     match row.values.get("snapshot_content") {
         None | Some(Value::Null) => Ok(None),
+        Some(Value::Json(value)) => Ok(Some(value.clone())),
         Some(Value::Text(text)) => {
             let parsed = serde_json::from_str(text).map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -712,10 +713,13 @@ fn map_mutation_operation(operation: &MutationOperation) -> StateCommitStreamOpe
 mod tests {
     use super::{
         state_commit_stream_changes_from_domain_changes,
+        state_commit_stream_changes_from_planned_rows,
         state_commit_stream_changes_from_postprocess_rows, StateCommitStreamOperation,
     };
     use crate::commit::ProposedDomainChange;
+    use crate::sql2::planner::ir::PlannedStateRow;
     use crate::Value;
+    use std::collections::BTreeMap;
 
     #[test]
     fn postprocess_rows_map_to_update_changes() {
@@ -798,5 +802,44 @@ mod tests {
         assert_eq!(changes[0].entity_id, "entity-1");
         assert_eq!(changes[0].schema_key, "lix_key_value");
         assert_eq!(changes[0].writer_key.as_deref(), Some("writer-a"));
+    }
+
+    #[test]
+    fn planned_rows_accept_structured_json_snapshot_content() {
+        let mut values = BTreeMap::new();
+        values.insert("file_id".to_string(), Value::Text("lix".to_string()));
+        values.insert("plugin_key".to_string(), Value::Text("lix".to_string()));
+        values.insert("schema_version".to_string(), Value::Text("1".to_string()));
+        values.insert(
+            "snapshot_content".to_string(),
+            Value::Json(serde_json::json!({
+                "key": "observe-untracked-external",
+                "value": "u1"
+            })),
+        );
+
+        let changes = state_commit_stream_changes_from_planned_rows(
+            &[PlannedStateRow {
+                entity_id: "observe-untracked-external".to_string(),
+                schema_key: "lix_key_value".to_string(),
+                version_id: Some("global".to_string()),
+                values,
+                tombstone: false,
+            }],
+            StateCommitStreamOperation::Insert,
+            true,
+            None,
+        )
+        .expect("planned rows should accept structured JSON snapshot_content");
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0].snapshot_content,
+            Some(serde_json::json!({
+                "key": "observe-untracked-external",
+                "value": "u1"
+            }))
+        );
+        assert!(changes[0].untracked);
     }
 }
