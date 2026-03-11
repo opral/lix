@@ -24,7 +24,7 @@ use crate::sql2::planner::backend::lowerer::rewrite_supported_public_read_surfac
 use crate::sql2::planner::ir::{
     InsertOnConflictAction, MutationPayload, PlannedStateRow, PlannedWrite, ResolvedRowRef,
     ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, TargetSetProof, WriteLane, WriteMode,
-    WriteOperationKind,
+    WriteModeRequest, WriteOperationKind,
 };
 use crate::sql2::planner::semantics::effective_state_resolver::{
     resolve_exact_effective_state_row, ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
@@ -64,18 +64,13 @@ pub(crate) async fn resolve_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let target_write_lane = match planned_write.command.mode {
-        WriteMode::Tracked => Some(write_lane_from_scope(&planned_write.scope_proof)?),
-        WriteMode::Untracked => None,
-    };
-
-    match planned_write.command.target.descriptor.surface_family {
+    let resolved = match planned_write.command.target.descriptor.surface_family {
         SurfaceFamily::State => match planned_write.command.operation_kind {
             WriteOperationKind::Insert => {
-                resolve_state_insert_write_plan(backend, planned_write, target_write_lane).await
+                resolve_state_insert_write_plan(backend, planned_write).await
             }
             WriteOperationKind::Update | WriteOperationKind::Delete => {
-                resolve_existing_state_write(backend, planned_write, target_write_lane).await
+                resolve_existing_state_write(backend, planned_write).await
             }
         },
         SurfaceFamily::Entity => {
@@ -85,44 +80,29 @@ pub(crate) async fn resolve_write_plan(
                 .map_err(write_resolve_backend_error)?;
             match planned_write.command.operation_kind {
                 WriteOperationKind::Insert => {
-                    resolve_entity_insert_write_plan(
-                        backend,
-                        planned_write,
-                        target_write_lane,
-                        &entity_schema,
-                    )
-                    .await
+                    resolve_entity_insert_write_plan(backend, planned_write, &entity_schema).await
                 }
                 WriteOperationKind::Update | WriteOperationKind::Delete => {
-                    resolve_existing_entity_write(
-                        backend,
-                        planned_write,
-                        target_write_lane,
-                        &entity_schema,
-                    )
-                    .await
+                    resolve_existing_entity_write(backend, planned_write, &entity_schema).await
                 }
             }
         }
-        SurfaceFamily::Admin => {
-            resolve_admin_write(backend, planned_write, target_write_lane).await
-        }
-        SurfaceFamily::Filesystem => {
-            resolve_filesystem_write(backend, planned_write, target_write_lane).await
-        }
+        SurfaceFamily::Admin => resolve_admin_write(backend, planned_write).await,
+        SurfaceFamily::Filesystem => resolve_filesystem_write(backend, planned_write).await,
         SurfaceFamily::Change => Err(WriteResolveError {
             message: format!(
                 "sql2 write resolver does not support '{}' writes",
                 planned_write.command.target.descriptor.public_name
             ),
         }),
-    }
+    }?;
+
+    finalize_resolved_write_plan(planned_write, resolved)
 }
 
 async fn resolve_state_insert_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let entity_id = resolved_entity_id(planned_write)?;
     let schema_key = resolved_schema_key(planned_write)?;
@@ -138,10 +118,13 @@ async fn resolve_state_insert_write_plan(
     if insert_on_conflict_action(planned_write) == Some(InsertOnConflictAction::DoNothing)
         && state_insert_conflicts_with_existing_row(backend, &row).await?
     {
-        return Ok(noop_resolved_write_plan(target_write_lane));
+        return Ok(noop_resolved_write_plan(
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+        ));
     }
 
     Ok(ResolvedWritePlan {
+        execution_mode: default_execution_mode_for_request(planned_write.command.requested_mode),
         authoritative_pre_state: Vec::new(),
         intended_post_state: vec![row],
         tombstones: Vec::new(),
@@ -150,14 +133,13 @@ async fn resolve_state_insert_write_plan(
             source_change_id: None,
             source_commit_id: None,
         }],
-        target_write_lane,
+        target_write_lane: None,
     })
 }
 
 async fn resolve_existing_state_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     ensure_exact_selector(planned_write)?;
     let schema_key = resolved_schema_key(planned_write)?;
@@ -177,15 +159,14 @@ async fn resolve_existing_state_write(
     .await
     .map_err(write_resolve_backend_error)?
     else {
-        return Ok(ResolvedWritePlan {
-            authoritative_pre_state: Vec::new(),
-            intended_post_state: Vec::new(),
-            tombstones: Vec::new(),
-            lineage: Vec::new(),
-            target_write_lane,
-        });
+        return Ok(noop_resolved_write_plan(
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+        ));
     };
-    ensure_local_tracked_overlay(&current_row)?;
+    let execution_mode = resolve_execution_mode_for_effective_row(
+        planned_write.command.requested_mode,
+        &current_row,
+    )?;
 
     let row_ref = ResolvedRowRef {
         entity_id: current_row.entity_id.clone(),
@@ -212,6 +193,7 @@ async fn resolve_existing_state_write(
             )?;
 
             Ok(ResolvedWritePlan {
+                execution_mode,
                 authoritative_pre_state: vec![row_ref],
                 intended_post_state: vec![PlannedStateRow {
                     entity_id: current_row.entity_id.clone(),
@@ -222,10 +204,11 @@ async fn resolve_existing_state_write(
                 }],
                 tombstones: Vec::new(),
                 lineage,
-                target_write_lane,
+                target_write_lane: None,
             })
         }
         WriteOperationKind::Delete => Ok(ResolvedWritePlan {
+            execution_mode,
             authoritative_pre_state: vec![row_ref.clone()],
             intended_post_state: vec![PlannedStateRow {
                 entity_id: current_row.entity_id,
@@ -236,7 +219,7 @@ async fn resolve_existing_state_write(
             }],
             tombstones: vec![row_ref],
             lineage,
-            target_write_lane,
+            target_write_lane: None,
         }),
         WriteOperationKind::Insert => Err(WriteResolveError {
             message: "sql2 existing-row resolver does not handle inserts".to_string(),
@@ -247,14 +230,19 @@ async fn resolve_existing_state_write(
 async fn resolve_existing_entity_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
     entity_schema: &EntityWriteSchema,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     reject_unsupported_entity_overrides(planned_write, entity_schema)?;
     let current_rows = resolve_target_entity_rows(backend, planned_write, entity_schema).await?;
     if current_rows.is_empty() {
-        return Ok(noop_resolved_write_plan(target_write_lane));
+        return Ok(noop_resolved_write_plan(
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+        ));
     }
+    let execution_mode = resolve_execution_mode_for_effective_rows(
+        planned_write.command.requested_mode,
+        &current_rows,
+    )?;
 
     let mut authoritative_pre_state = Vec::new();
     let mut intended_post_state = Vec::new();
@@ -288,11 +276,12 @@ async fn resolve_existing_entity_write(
                 });
             }
             Ok(ResolvedWritePlan {
+                execution_mode,
                 authoritative_pre_state,
                 intended_post_state,
                 tombstones,
                 lineage,
-                target_write_lane,
+                target_write_lane: None,
             })
         }
         WriteOperationKind::Delete => {
@@ -320,11 +309,12 @@ async fn resolve_existing_entity_write(
                 });
             }
             Ok(ResolvedWritePlan {
+                execution_mode,
                 authoritative_pre_state,
                 intended_post_state,
                 tombstones,
                 lineage,
-                target_write_lane,
+                target_write_lane: None,
             })
         }
         WriteOperationKind::Insert => Err(WriteResolveError {
@@ -336,7 +326,6 @@ async fn resolve_existing_entity_write(
 async fn resolve_entity_insert_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
     entity_schema: &EntityWriteSchema,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     reject_unsupported_entity_overrides(planned_write, entity_schema)?;
@@ -344,6 +333,9 @@ async fn resolve_entity_insert_write_plan(
     let mut authoritative_pre_state = Vec::new();
     let mut intended_post_state = Vec::new();
     let mut lineage = Vec::new();
+    let mut resolved_execution_mode = Some(default_execution_mode_for_request(
+        planned_write.command.requested_mode,
+    ));
 
     for row in rows {
         if let Some(conflict) = planned_write.command.on_conflict.as_ref() {
@@ -367,6 +359,15 @@ async fn resolve_entity_insert_write_plan(
                 if conflict.action == InsertOnConflictAction::DoNothing {
                     continue;
                 }
+                let row_execution_mode = resolve_execution_mode_for_effective_row(
+                    planned_write.command.requested_mode,
+                    &current_row,
+                )?;
+                ensure_consistent_execution_mode(
+                    &mut resolved_execution_mode,
+                    row_execution_mode,
+                    "sql2 entity insert resolver does not yet support mixing tracked and untracked conflict winners",
+                )?;
                 let row_ref = ResolvedRowRef {
                     entity_id: current_row.entity_id.clone(),
                     schema_key: current_row.schema_key.clone(),
@@ -384,6 +385,11 @@ async fn resolve_entity_insert_write_plan(
                 continue;
             }
         }
+        ensure_consistent_execution_mode(
+            &mut resolved_execution_mode,
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+            "sql2 entity insert resolver does not yet support mixing tracked and untracked rows in one INSERT",
+        )?;
         lineage.push(RowLineage {
             entity_id: row.entity_id.clone(),
             source_change_id: None,
@@ -393,37 +399,37 @@ async fn resolve_entity_insert_write_plan(
     }
 
     Ok(ResolvedWritePlan {
+        execution_mode: resolved_execution_mode.unwrap_or(default_execution_mode_for_request(
+            planned_write.command.requested_mode,
+        )),
         authoritative_pre_state,
         intended_post_state,
         tombstones: Vec::new(),
         lineage,
-        target_write_lane,
+        target_write_lane: None,
     })
 }
 
 async fn resolve_filesystem_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     match planned_write.command.target.descriptor.public_name.as_str() {
         "lix_file" | "lix_file_by_version" => match planned_write.command.operation_kind {
             WriteOperationKind::Insert => {
-                resolve_file_insert_write_plan(backend, planned_write, target_write_lane).await
+                resolve_file_insert_write_plan(backend, planned_write).await
             }
             WriteOperationKind::Update | WriteOperationKind::Delete => {
-                resolve_existing_file_write(backend, planned_write, target_write_lane).await
+                resolve_existing_file_write(backend, planned_write).await
             }
         },
         "lix_directory" | "lix_directory_by_version" => {
             match planned_write.command.operation_kind {
                 WriteOperationKind::Insert => {
-                    resolve_directory_insert_write_plan(backend, planned_write, target_write_lane)
-                        .await
+                    resolve_directory_insert_write_plan(backend, planned_write).await
                 }
                 WriteOperationKind::Update | WriteOperationKind::Delete => {
-                    resolve_existing_directory_write(backend, planned_write, target_write_lane)
-                        .await
+                    resolve_existing_directory_write(backend, planned_write).await
                 }
             }
         }
@@ -496,7 +502,6 @@ async fn load_active_filesystem_version_id(
 async fn resolve_directory_insert_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let MutationPayload::FullSnapshot(payload) = &planned_write.command.payload else {
         return Err(WriteResolveError {
@@ -544,18 +549,18 @@ async fn resolve_directory_insert_write_plan(
     });
 
     Ok(ResolvedWritePlan {
+        execution_mode: default_execution_mode_for_request(planned_write.command.requested_mode),
         authoritative_pre_state: Vec::new(),
         intended_post_state,
         tombstones: Vec::new(),
         lineage,
-        target_write_lane,
+        target_write_lane: None,
     })
 }
 
 async fn resolve_existing_directory_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     ensure_exact_selector(planned_write)?;
     let version_id = resolved_filesystem_version_id(backend, planned_write).await?;
@@ -563,28 +568,20 @@ async fn resolve_existing_directory_write(
     let Some(current_row) =
         load_target_directory_row(backend, planned_write, &version_id, lookup_scope).await?
     else {
-        return Ok(ResolvedWritePlan {
-            authoritative_pre_state: Vec::new(),
-            intended_post_state: Vec::new(),
-            tombstones: Vec::new(),
-            lineage: Vec::new(),
-            target_write_lane,
-        });
+        return Ok(noop_resolved_write_plan(
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+        ));
     };
     if !directory_row_matches_exact_filters(
         &current_row,
         &planned_write.command.selector.exact_filters,
     ) {
-        return Ok(ResolvedWritePlan {
-            authoritative_pre_state: Vec::new(),
-            intended_post_state: Vec::new(),
-            tombstones: Vec::new(),
-            lineage: Vec::new(),
-            target_write_lane,
-        });
+        return Ok(noop_resolved_write_plan(
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+        ));
     }
 
-    match planned_write.command.mode {
+    match default_execution_mode_for_request(planned_write.command.requested_mode) {
         WriteMode::Tracked if current_row.untracked => {
             return Err(WriteResolveError {
                 message: "sql2 live tracked filesystem writes do not yet support untracked winners"
@@ -633,6 +630,9 @@ async fn resolve_existing_directory_write(
             };
 
             Ok(ResolvedWritePlan {
+                execution_mode: default_execution_mode_for_request(
+                    planned_write.command.requested_mode,
+                ),
                 authoritative_pre_state: vec![row_ref.clone()],
                 intended_post_state: vec![directory_descriptor_row(
                     &current_row.id,
@@ -648,7 +648,7 @@ async fn resolve_existing_directory_write(
                     source_change_id: row_ref.source_change_id,
                     source_commit_id: None,
                 }],
-                target_write_lane,
+                target_write_lane: None,
             })
         }
         WriteOperationKind::Delete => {
@@ -657,7 +657,7 @@ async fn resolve_existing_directory_write(
             let descendant_files =
                 load_file_rows_under_path(backend, &version_id, &current_row.path).await?;
 
-            match planned_write.command.mode {
+            match default_execution_mode_for_request(planned_write.command.requested_mode) {
                 WriteMode::Tracked
                     if descendant_directories.iter().any(|row| row.untracked)
                         || descendant_files.iter().any(|row| row.untracked) =>
@@ -744,11 +744,14 @@ async fn resolve_existing_directory_write(
             }
 
             Ok(ResolvedWritePlan {
+                execution_mode: default_execution_mode_for_request(
+                    planned_write.command.requested_mode,
+                ),
                 authoritative_pre_state,
                 intended_post_state,
                 tombstones,
                 lineage,
-                target_write_lane,
+                target_write_lane: None,
             })
         }
         WriteOperationKind::Insert => Err(WriteResolveError {
@@ -761,7 +764,6 @@ async fn resolve_existing_directory_write(
 async fn resolve_file_insert_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let MutationPayload::FullSnapshot(payload) = &planned_write.command.payload else {
         return Err(WriteResolveError {
@@ -814,18 +816,18 @@ async fn resolve_file_insert_write_plan(
     }
 
     Ok(ResolvedWritePlan {
+        execution_mode: default_execution_mode_for_request(planned_write.command.requested_mode),
         authoritative_pre_state: Vec::new(),
         intended_post_state,
         tombstones: Vec::new(),
         lineage,
-        target_write_lane,
+        target_write_lane: None,
     })
 }
 
 async fn resolve_existing_file_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     ensure_exact_selector(planned_write)?;
     let version_id = resolved_filesystem_version_id(backend, planned_write).await?;
@@ -833,26 +835,18 @@ async fn resolve_existing_file_write(
     let Some(current_row) =
         load_target_file_row(backend, planned_write, &version_id, lookup_scope).await?
     else {
-        return Ok(ResolvedWritePlan {
-            authoritative_pre_state: Vec::new(),
-            intended_post_state: Vec::new(),
-            tombstones: Vec::new(),
-            lineage: Vec::new(),
-            target_write_lane,
-        });
+        return Ok(noop_resolved_write_plan(
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+        ));
     };
     if !file_row_matches_exact_filters(&current_row, &planned_write.command.selector.exact_filters)
     {
-        return Ok(ResolvedWritePlan {
-            authoritative_pre_state: Vec::new(),
-            intended_post_state: Vec::new(),
-            tombstones: Vec::new(),
-            lineage: Vec::new(),
-            target_write_lane,
-        });
+        return Ok(noop_resolved_write_plan(
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+        ));
     }
 
-    match planned_write.command.mode {
+    match default_execution_mode_for_request(planned_write.command.requested_mode) {
         WriteMode::Tracked if current_row.untracked => {
             return Err(WriteResolveError {
                 message: "sql2 live tracked filesystem writes do not yet support untracked winners"
@@ -946,11 +940,14 @@ async fn resolve_existing_file_write(
             }
 
             Ok(ResolvedWritePlan {
+                execution_mode: default_execution_mode_for_request(
+                    planned_write.command.requested_mode,
+                ),
                 authoritative_pre_state: vec![row_ref],
                 intended_post_state,
                 tombstones: Vec::new(),
                 lineage,
-                target_write_lane,
+                target_write_lane: None,
             })
         }
         WriteOperationKind::Delete => {
@@ -962,6 +959,9 @@ async fn resolve_existing_file_write(
                 source_commit_id: None,
             };
             Ok(ResolvedWritePlan {
+                execution_mode: default_execution_mode_for_request(
+                    planned_write.command.requested_mode,
+                ),
                 authoritative_pre_state: vec![row_ref.clone(), blob_ref.clone()],
                 intended_post_state: vec![
                     file_descriptor_tombstone_row(
@@ -981,7 +981,7 @@ async fn resolve_existing_file_write(
                     source_change_id: current_row.change_id,
                     source_commit_id: None,
                 }],
-                target_write_lane,
+                target_write_lane: None,
             })
         }
         WriteOperationKind::Insert => Err(WriteResolveError {
@@ -1031,7 +1031,8 @@ async fn resolve_file_insert_target(
         backend,
         version_id,
         parsed.directory_path.as_deref(),
-        planned_write.command.mode == WriteMode::Untracked,
+        default_execution_mode_for_request(planned_write.command.requested_mode)
+            == WriteMode::Untracked,
         lookup_scope,
     )
     .await?;
@@ -1419,7 +1420,8 @@ async fn resolve_directory_insert_target(
             path: ancestor_path,
             hidden: false,
             version_id: version_id.to_string(),
-            untracked: planned_write.command.mode == WriteMode::Untracked,
+            untracked: default_execution_mode_for_request(planned_write.command.requested_mode)
+                == WriteMode::Untracked,
             metadata: None,
             change_id: None,
         });
@@ -2196,13 +2198,11 @@ struct FileFilesystemRow {
 async fn resolve_admin_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     match planned_write.command.target.descriptor.public_name.as_str() {
         "lix_active_version" => match planned_write.command.operation_kind {
             WriteOperationKind::Update => {
-                resolve_active_version_update_write_plan(backend, planned_write, target_write_lane)
-                    .await
+                resolve_active_version_update_write_plan(backend, planned_write).await
             }
             _ => Err(WriteResolveError {
                 message: "sql2 write resolver only supports UPDATE for 'lix_active_version'"
@@ -2210,12 +2210,9 @@ async fn resolve_admin_write(
             }),
         },
         "lix_active_account" => match planned_write.command.operation_kind {
-            WriteOperationKind::Insert => {
-                resolve_active_account_insert_write_plan(planned_write, target_write_lane)
-            }
+            WriteOperationKind::Insert => resolve_active_account_insert_write_plan(planned_write),
             WriteOperationKind::Delete => {
-                resolve_active_account_delete_write_plan(backend, planned_write, target_write_lane)
-                    .await
+                resolve_active_account_delete_write_plan(backend, planned_write).await
             }
             WriteOperationKind::Update => Err(WriteResolveError {
                 message: "sql2 write resolver does not support UPDATE for 'lix_active_account'"
@@ -2224,10 +2221,10 @@ async fn resolve_admin_write(
         },
         "lix_version" => match planned_write.command.operation_kind {
             WriteOperationKind::Insert => {
-                resolve_version_insert_write_plan(backend, planned_write, target_write_lane).await
+                resolve_version_insert_write_plan(backend, planned_write).await
             }
             WriteOperationKind::Update | WriteOperationKind::Delete => {
-                resolve_existing_version_write(backend, planned_write, target_write_lane).await
+                resolve_existing_version_write(backend, planned_write).await
             }
         },
         other => Err(WriteResolveError {
@@ -2242,7 +2239,6 @@ async fn resolve_admin_write(
 async fn resolve_active_version_update_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     ensure_exact_or_unfiltered_selector(planned_write)?;
     let MutationPayload::Patch(payload) = &planned_write.command.payload else {
@@ -2295,13 +2291,9 @@ async fn resolve_active_version_update_write_plan(
         })
         .collect::<Vec<_>>();
     if matching_rows.is_empty() {
-        return Ok(ResolvedWritePlan {
-            authoritative_pre_state: Vec::new(),
-            intended_post_state: Vec::new(),
-            tombstones: Vec::new(),
-            lineage: Vec::new(),
-            target_write_lane,
-        });
+        return Ok(noop_resolved_write_plan(
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+        ));
     }
 
     let authoritative_pre_state = matching_rows
@@ -2322,17 +2314,17 @@ async fn resolve_active_version_update_write_plan(
         .collect::<Vec<_>>();
 
     Ok(ResolvedWritePlan {
+        execution_mode: default_execution_mode_for_request(planned_write.command.requested_mode),
         authoritative_pre_state,
         intended_post_state,
         tombstones: Vec::new(),
         lineage,
-        target_write_lane,
+        target_write_lane: None,
     })
 }
 
 fn resolve_active_account_insert_write_plan(
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let MutationPayload::FullSnapshot(payload) = &planned_write.command.payload else {
         return Err(WriteResolveError {
@@ -2355,6 +2347,7 @@ fn resolve_active_account_insert_write_plan(
     }
 
     Ok(ResolvedWritePlan {
+        execution_mode: default_execution_mode_for_request(planned_write.command.requested_mode),
         authoritative_pre_state: Vec::new(),
         intended_post_state: vec![active_account_admin_row(&account_id)],
         tombstones: Vec::new(),
@@ -2363,14 +2356,13 @@ fn resolve_active_account_insert_write_plan(
             source_change_id: None,
             source_commit_id: None,
         }],
-        target_write_lane,
+        target_write_lane: None,
     })
 }
 
 async fn resolve_active_account_delete_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     ensure_exact_or_unfiltered_selector(planned_write)?;
     let current_rows = load_active_account_admin_rows(backend)
@@ -2386,13 +2378,9 @@ async fn resolve_active_account_delete_write_plan(
         })
         .collect::<Vec<_>>();
     if matching_rows.is_empty() {
-        return Ok(ResolvedWritePlan {
-            authoritative_pre_state: Vec::new(),
-            intended_post_state: Vec::new(),
-            tombstones: Vec::new(),
-            lineage: Vec::new(),
-            target_write_lane,
-        });
+        return Ok(noop_resolved_write_plan(
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+        ));
     }
 
     let authoritative_pre_state = matching_rows
@@ -2417,11 +2405,12 @@ async fn resolve_active_account_delete_write_plan(
         .collect::<Vec<_>>();
 
     Ok(ResolvedWritePlan {
+        execution_mode: default_execution_mode_for_request(planned_write.command.requested_mode),
         authoritative_pre_state,
         intended_post_state,
         tombstones,
         lineage,
-        target_write_lane,
+        target_write_lane: None,
     })
 }
 
@@ -2609,7 +2598,6 @@ fn active_account_admin_tombstone_row(account_id: &str) -> PlannedStateRow {
 async fn resolve_version_insert_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let version_id = version_admin_id_from_payload(planned_write)?;
     let name = version_admin_required_text(planned_write, "name")?;
@@ -2625,6 +2613,7 @@ async fn resolve_version_insert_write_plan(
         .unwrap_or_default();
 
     Ok(ResolvedWritePlan {
+        execution_mode: default_execution_mode_for_request(planned_write.command.requested_mode),
         authoritative_pre_state,
         intended_post_state: vec![
             version_descriptor_row(&version_id, &name, hidden),
@@ -2636,14 +2625,13 @@ async fn resolve_version_insert_write_plan(
             source_change_id: None,
             source_commit_id: None,
         }],
-        target_write_lane,
+        target_write_lane: None,
     })
 }
 
 async fn resolve_existing_version_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     ensure_exact_selector(planned_write)?;
     let version_id = version_admin_target_id(planned_write)?;
@@ -2651,13 +2639,9 @@ async fn resolve_existing_version_write(
         .await
         .map_err(write_resolve_backend_error)?
     else {
-        return Ok(ResolvedWritePlan {
-            authoritative_pre_state: Vec::new(),
-            intended_post_state: Vec::new(),
-            tombstones: Vec::new(),
-            lineage: Vec::new(),
-            target_write_lane,
-        });
+        return Ok(noop_resolved_write_plan(
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+        ));
     };
 
     let authoritative_pre_state = version_admin_pre_state_refs(&current_row);
@@ -2719,16 +2703,22 @@ async fn resolve_existing_version_write(
             }
 
             Ok(ResolvedWritePlan {
+                execution_mode: default_execution_mode_for_request(
+                    planned_write.command.requested_mode,
+                ),
                 authoritative_pre_state,
                 intended_post_state,
                 tombstones: Vec::new(),
                 lineage,
-                target_write_lane,
+                target_write_lane: None,
             })
         }
         WriteOperationKind::Delete => {
             let tombstones = version_admin_tombstone_refs(&current_row);
             Ok(ResolvedWritePlan {
+                execution_mode: default_execution_mode_for_request(
+                    planned_write.command.requested_mode,
+                ),
                 authoritative_pre_state,
                 intended_post_state: vec![
                     version_descriptor_tombstone_row(&current_row.id),
@@ -2736,7 +2726,7 @@ async fn resolve_existing_version_write(
                 ],
                 tombstones,
                 lineage,
-                target_write_lane,
+                target_write_lane: None,
             })
         }
         WriteOperationKind::Insert => Err(WriteResolveError {
@@ -3039,18 +3029,73 @@ fn ensure_exact_or_unfiltered_selector(
     })
 }
 
-fn ensure_local_tracked_overlay(
+fn default_execution_mode_for_request(requested_mode: WriteModeRequest) -> WriteMode {
+    match requested_mode {
+        WriteModeRequest::Auto | WriteModeRequest::ForceTracked => WriteMode::Tracked,
+        WriteModeRequest::ForceUntracked => WriteMode::Untracked,
+    }
+}
+
+fn execution_mode_for_overlay_lane(overlay_lane: OverlayLane) -> WriteMode {
+    match overlay_lane {
+        OverlayLane::LocalTracked | OverlayLane::GlobalTracked => WriteMode::Tracked,
+        OverlayLane::LocalUntracked | OverlayLane::GlobalUntracked => WriteMode::Untracked,
+    }
+}
+
+fn resolve_execution_mode_for_effective_row(
+    requested_mode: WriteModeRequest,
     current_row: &ExactEffectiveStateRow,
-) -> Result<(), WriteResolveError> {
-    if current_row.overlay_lane != OverlayLane::LocalTracked {
-        return Err(WriteResolveError {
+) -> Result<WriteMode, WriteResolveError> {
+    let execution_mode = execution_mode_for_overlay_lane(current_row.overlay_lane);
+    match (requested_mode, execution_mode) {
+        (WriteModeRequest::ForceTracked, WriteMode::Untracked) => Err(WriteResolveError {
             message: format!(
-                "sql2 live tracked writes do not yet support {:?} effective-state winners",
+                "sql2 tracked write requires a tracked effective-state winner, found {:?}",
                 current_row.overlay_lane
             ),
-        });
+        }),
+        (WriteModeRequest::ForceUntracked, WriteMode::Tracked) => Err(WriteResolveError {
+            message: format!(
+                "sql2 untracked write requires an untracked effective-state winner, found {:?}",
+                current_row.overlay_lane
+            ),
+        }),
+        _ => Ok(execution_mode),
     }
-    Ok(())
+}
+
+fn resolve_execution_mode_for_effective_rows(
+    requested_mode: WriteModeRequest,
+    current_rows: &[ExactEffectiveStateRow],
+) -> Result<WriteMode, WriteResolveError> {
+    let mut resolved_mode = None;
+    for current_row in current_rows {
+        let row_mode = resolve_execution_mode_for_effective_row(requested_mode, current_row)?;
+        ensure_consistent_execution_mode(
+            &mut resolved_mode,
+            row_mode,
+            "sql2 write resolver does not yet support mixing tracked and untracked effective-state winners",
+        )?;
+    }
+    Ok(resolved_mode.unwrap_or(default_execution_mode_for_request(requested_mode)))
+}
+
+fn ensure_consistent_execution_mode(
+    resolved_mode: &mut Option<WriteMode>,
+    row_mode: WriteMode,
+    mixed_mode_error: &str,
+) -> Result<(), WriteResolveError> {
+    match resolved_mode {
+        Some(existing) if *existing != row_mode => Err(WriteResolveError {
+            message: mixed_mode_error.to_string(),
+        }),
+        Some(_) => Ok(()),
+        None => {
+            *resolved_mode = Some(row_mode);
+            Ok(())
+        }
+    }
 }
 
 fn directory_row_matches_exact_filters(
@@ -3381,7 +3426,6 @@ async fn resolve_target_entity_rows(
         else {
             continue;
         };
-        ensure_local_tracked_overlay(&current_row)?;
         rows.push(current_row);
     }
     Ok(rows)
@@ -3630,13 +3674,25 @@ fn insert_on_conflict_action(planned_write: &PlannedWrite) -> Option<InsertOnCon
         .map(|conflict| conflict.action)
 }
 
-fn noop_resolved_write_plan(target_write_lane: Option<WriteLane>) -> ResolvedWritePlan {
+fn finalize_resolved_write_plan(
+    planned_write: &PlannedWrite,
+    mut resolved: ResolvedWritePlan,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    resolved.target_write_lane = match resolved.execution_mode {
+        WriteMode::Tracked => Some(write_lane_from_scope(&planned_write.scope_proof)?),
+        WriteMode::Untracked => None,
+    };
+    Ok(resolved)
+}
+
+fn noop_resolved_write_plan(execution_mode: WriteMode) -> ResolvedWritePlan {
     ResolvedWritePlan {
+        execution_mode,
         authoritative_pre_state: Vec::new(),
         intended_post_state: Vec::new(),
         tombstones: Vec::new(),
         lineage: Vec::new(),
-        target_write_lane,
+        target_write_lane: None,
     }
 }
 
@@ -4116,7 +4172,7 @@ mod tests {
     use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql2::core::parser::parse_sql_script;
     use crate::sql2::planner::canonicalize::canonicalize_write;
-    use crate::sql2::planner::ir::WriteLane;
+    use crate::sql2::planner::ir::{WriteLane, WriteMode};
     use crate::sql2::planner::semantics::proof_engine::prove_write;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
@@ -4124,6 +4180,7 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         change_rows: Vec<Vec<Value>>,
+        untracked_rows: Vec<Vec<Value>>,
         version_descriptor_rows: Vec<Vec<Value>>,
         version_pointer_rows: Vec<Vec<Value>>,
     }
@@ -4167,6 +4224,21 @@ mod tests {
                         "snapshot_content".to_string(),
                         "metadata".to_string(),
                         "created_at".to_string(),
+                    ],
+                });
+            }
+            if sql.contains("FROM lix_internal_state_untracked") {
+                return Ok(QueryResult {
+                    rows: self.untracked_rows.clone(),
+                    columns: vec![
+                        "entity_id".to_string(),
+                        "schema_key".to_string(),
+                        "schema_version".to_string(),
+                        "file_id".to_string(),
+                        "version_id".to_string(),
+                        "plugin_key".to_string(),
+                        "snapshot_content".to_string(),
+                        "metadata".to_string(),
                     ],
                 });
             }
@@ -4254,6 +4326,28 @@ mod tests {
                 Value::Text("2026-03-06T18:00:02Z".to_string()),
             ],
         ]
+    }
+
+    fn build_untracked_state_rows(
+        entity_id: &str,
+        version_id: &str,
+        file_id: &str,
+        plugin_key: &str,
+        snapshot_content: &str,
+        metadata: Option<&str>,
+    ) -> Vec<Vec<Value>> {
+        vec![vec![
+            Value::Text(entity_id.to_string()),
+            Value::Text("lix_key_value".to_string()),
+            Value::Text("1".to_string()),
+            Value::Text(file_id.to_string()),
+            Value::Text(version_id.to_string()),
+            Value::Text(plugin_key.to_string()),
+            Value::Text(snapshot_content.to_string()),
+            metadata
+                .map(|value| Value::Text(value.to_string()))
+                .unwrap_or(Value::Null),
+        ]]
     }
 
     fn planned_write(
@@ -4518,6 +4612,95 @@ mod tests {
         .expect("mismatched exact filters should resolve as a no-op");
 
         assert!(resolved.intended_post_state.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolves_state_update_against_explicit_untracked_winner() {
+        let backend = FakeBackend {
+            untracked_rows: build_untracked_state_rows(
+                "entity-1",
+                "version-a",
+                "lix",
+                "lix",
+                "{\"value\":\"before\"}",
+                None,
+            ),
+            ..FakeBackend::default()
+        };
+        let resolved = resolve_write_plan(
+            &backend,
+            &planned_write(
+                "UPDATE lix_state \
+                 SET snapshot_content = '{\"value\":\"after\"}' \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = 'entity-1' \
+                   AND file_id = 'lix' \
+                   AND untracked = true",
+                "version-a",
+            ),
+        )
+        .await
+        .expect("explicit untracked winner should resolve");
+
+        assert_eq!(resolved.execution_mode, WriteMode::Untracked);
+        assert_eq!(resolved.target_write_lane, None);
+        assert_eq!(
+            resolved.intended_post_state[0]
+                .values
+                .get("snapshot_content")
+                .and_then(super::text_from_value)
+                .as_deref(),
+            Some("{\"value\":\"after\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_state_update_against_visible_untracked_winner_without_selector_hint() {
+        let backend = FakeBackend {
+            change_rows: build_committed_state_change_rows(
+                "entity-1",
+                "version-a",
+                "lix",
+                "lix",
+                "{\"value\":\"tracked-before\"}",
+                None,
+                "change-1",
+                "commit-1",
+            ),
+            untracked_rows: build_untracked_state_rows(
+                "entity-1",
+                "version-a",
+                "lix",
+                "lix",
+                "{\"value\":\"untracked-before\"}",
+                None,
+            ),
+            ..FakeBackend::default()
+        };
+        let resolved = resolve_write_plan(
+            &backend,
+            &planned_write(
+                "UPDATE lix_state \
+                 SET snapshot_content = '{\"value\":\"after\"}' \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = 'entity-1' \
+                   AND file_id = 'lix'",
+                "version-a",
+            ),
+        )
+        .await
+        .expect("visible untracked winner should resolve");
+
+        assert_eq!(resolved.execution_mode, WriteMode::Untracked);
+        assert_eq!(resolved.target_write_lane, None);
+        assert_eq!(
+            resolved.intended_post_state[0]
+                .values
+                .get("snapshot_content")
+                .and_then(super::text_from_value)
+                .as_deref(),
+            Some("{\"value\":\"after\"}")
+        );
     }
 
     #[tokio::test]

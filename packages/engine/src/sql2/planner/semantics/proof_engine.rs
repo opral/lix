@@ -2,7 +2,7 @@ use crate::sql2::catalog::SurfaceOverrideValue;
 use crate::sql2::planner::canonicalize::CanonicalizedWrite;
 use crate::sql2::planner::ir::{
     MutationPayload, PlannedWrite, SchemaProof, ScopeProof, StateSourceKind, TargetSetProof,
-    WriteMode,
+    WriteModeRequest,
 };
 use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::version::GLOBAL_VERSION_ID;
@@ -17,8 +17,10 @@ pub(crate) struct ProofError {
 
 pub(crate) fn prove_write(canonicalized: &CanonicalizedWrite) -> Result<PlannedWrite, ProofError> {
     let scope_proof = prove_scope(canonicalized)?;
-    if canonicalized.write_command.mode == WriteMode::Tracked
-        && matches!(scope_proof, ScopeProof::Unknown | ScopeProof::Unbounded)
+    if !matches!(
+        canonicalized.write_command.requested_mode,
+        WriteModeRequest::ForceUntracked
+    ) && matches!(scope_proof, ScopeProof::Unknown | ScopeProof::Unbounded)
     {
         return Err(ProofError {
             message: "tracked sql2 writes require a bounded scope proof".to_string(),
@@ -33,9 +35,11 @@ pub(crate) fn prove_write(canonicalized: &CanonicalizedWrite) -> Result<PlannedW
         scope_proof,
         schema_proof,
         target_set_proof,
-        state_source: match canonicalized.write_command.mode {
-            WriteMode::Tracked => StateSourceKind::AuthoritativeCommitted,
-            WriteMode::Untracked => StateSourceKind::UntrackedOverlay,
+        state_source: match canonicalized.write_command.requested_mode {
+            WriteModeRequest::ForceUntracked => StateSourceKind::UntrackedOverlay,
+            WriteModeRequest::Auto | WriteModeRequest::ForceTracked => {
+                StateSourceKind::AuthoritativeCommitted
+            }
         },
         resolved_write_plan: None,
         commit_preconditions: None,
