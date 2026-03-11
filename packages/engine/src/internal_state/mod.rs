@@ -21,12 +21,6 @@ use crate::internal_state::bind_once::{
 use crate::internal_state::inline_functions::inline_lix_functions_with_provider;
 use crate::internal_state::param_context::normalize_statement_placeholders_in_batch;
 use crate::query_runtime::contracts::planned_statement::PlannedStatementSet;
-use crate::sql2::planner::backend::lowerer::rewrite_supported_public_read_surfaces_in_statement;
-use crate::sql2::runtime::{
-    lower_public_read_query_with_sql2_backend, rewrite_public_read_query_to_lowered_sql,
-    statement_references_public_sql2_surface,
-    statement_references_public_sql2_surface_with_backend,
-};
 use crate::sql_shared::ast::parse_sql_statements;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use sqlparser::ast::{ObjectNamePart, Query, Statement, TableFactor, Visit, Visitor};
@@ -386,9 +380,10 @@ pub(crate) fn prepare_statements_sync_to_plan<P: LixFunctionProvider>(
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
 
     for statement in statements {
-        let output = if let Some(output) =
-            rewrite_top_level_read_statement_sync(statement.clone(), SqlDialect::Sqlite)?
-        {
+        let output = if let Some(output) = rewrite_top_level_internal_state_read_statement_sync(
+            statement.clone(),
+            SqlDialect::Sqlite,
+        )? {
             output
         } else {
             rewrite_statement(statement, params, writer_key, provider)?
@@ -471,21 +466,6 @@ where
         ),
     })?;
 
-    for statement in &mut statements {
-        if matches!(statement, Statement::Query(_) | Statement::Explain { .. }) {
-            continue;
-        }
-        rewrite_supported_public_read_surfaces_in_statement(statement).map_err(|error| {
-            LixError {
-                code: error.code,
-                description: format!(
-                    "preprocess_with_surfaces_to_plan sql2 public-surface lowering failed: {}",
-                    error.description
-                ),
-            }
-        })?;
-    }
-
     let mut provider = functions.clone();
     prepare_rewritten_statements_with_backend(
         backend,
@@ -514,8 +494,12 @@ where
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
 
     for (statement_index, statement) in statements.into_iter().enumerate() {
-        let output = if let Some(output) =
-            rewrite_top_level_read_statement_backend(backend, statement.clone(), params).await?
+        let output = if let Some(output) = rewrite_top_level_internal_state_read_statement_backend(
+            backend,
+            statement.clone(),
+            params,
+        )
+        .await?
         {
             output
         } else {
@@ -646,12 +630,12 @@ fn from_rewrite_output(output: RewriteOutput) -> StatementRewriteOutput {
     }
 }
 
-fn rewrite_top_level_read_statement_sync(
+fn rewrite_top_level_internal_state_read_statement_sync(
     statement: Statement,
     dialect: SqlDialect,
 ) -> Result<Option<RewriteOutput>, LixError> {
     match statement {
-        Statement::Query(query) => rewrite_query_read_sync(*query, dialect),
+        Statement::Query(query) => rewrite_internal_state_query_read_sync(*query, dialect),
         Statement::Explain {
             describe_alias,
             analyze,
@@ -663,25 +647,27 @@ fn rewrite_top_level_read_statement_sync(
             options,
         } => {
             let rewritten_statement = match *statement {
-                Statement::Query(query) => match rewrite_query_read_sync(*query, dialect)? {
-                    Some(output) => Statement::Query(Box::new(
-                        output
-                            .statements
-                            .into_iter()
-                            .next()
-                            .and_then(|stmt| match stmt {
-                                Statement::Query(query) => Some(*query),
-                                _ => None,
-                            })
-                            .ok_or_else(|| LixError {
-                                code: "LIX_ERROR_UNKNOWN".to_string(),
-                                description:
-                                    "expected rewritten read query to remain a SELECT query"
-                                        .to_string(),
-                            })?,
-                    )),
-                    None => return Ok(None),
-                },
+                Statement::Query(query) => {
+                    match rewrite_internal_state_query_read_sync(*query, dialect)? {
+                        Some(output) => Statement::Query(Box::new(
+                            output
+                                .statements
+                                .into_iter()
+                                .next()
+                                .and_then(|stmt| match stmt {
+                                    Statement::Query(query) => Some(*query),
+                                    _ => None,
+                                })
+                                .ok_or_else(|| LixError {
+                                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                                    description:
+                                        "expected rewritten read query to remain a SELECT query"
+                                            .to_string(),
+                                })?,
+                        )),
+                        None => return Ok(None),
+                    }
+                }
                 _ => return Ok(None),
             };
             Ok(Some(RewriteOutput {
@@ -702,13 +688,15 @@ fn rewrite_top_level_read_statement_sync(
     }
 }
 
-async fn rewrite_top_level_read_statement_backend(
+async fn rewrite_top_level_internal_state_read_statement_backend(
     backend: &dyn LixBackend,
     statement: Statement,
     params: &[Value],
 ) -> Result<Option<RewriteOutput>, LixError> {
     match statement {
-        Statement::Query(query) => rewrite_query_read_backend(backend, *query, params).await,
+        Statement::Query(query) => {
+            rewrite_internal_state_query_read_backend(backend, *query, params).await
+        }
         Statement::Explain {
             describe_alias,
             analyze,
@@ -721,7 +709,8 @@ async fn rewrite_top_level_read_statement_backend(
         } => {
             let rewritten_statement = match *statement {
                 Statement::Query(query) => {
-                    match rewrite_query_read_backend(backend, *query, params).await? {
+                    match rewrite_internal_state_query_read_backend(backend, *query, params).await?
+                    {
                         Some(output) => Statement::Query(Box::new(
                             output
                                 .statements
@@ -763,9 +752,9 @@ async fn rewrite_top_level_read_statement_backend(
     }
 }
 
-fn rewrite_query_read_sync(
+fn rewrite_internal_state_query_read_sync(
     query: Query,
-    dialect: SqlDialect,
+    _dialect: SqlDialect,
 ) -> Result<Option<RewriteOutput>, LixError> {
     let statement = Statement::Query(Box::new(query.clone()));
     if statement_references_internal_state_vtable(&statement) {
@@ -774,16 +763,10 @@ fn rewrite_query_read_sync(
             Box::new(rewritten),
         ))));
     }
-    if !statement_references_public_sql2_surface(&statement) {
-        return Ok(None);
-    }
-    let rewritten = rewrite_public_read_query_to_lowered_sql(query, dialect)?;
-    Ok(Some(rewrite_output_from_statement(Statement::Query(
-        Box::new(rewritten),
-    ))))
+    Ok(None)
 }
 
-async fn rewrite_query_read_backend(
+async fn rewrite_internal_state_query_read_backend(
     backend: &dyn LixBackend,
     query: Query,
     params: &[Value],
@@ -796,13 +779,7 @@ async fn rewrite_query_read_backend(
             Box::new(rewritten),
         ))));
     }
-    if !statement_references_public_sql2_surface_with_backend(backend, &statement).await {
-        return Ok(None);
-    }
-    let rewritten = lower_public_read_query_with_sql2_backend(backend, query, params).await?;
-    Ok(Some(rewrite_output_from_statement(Statement::Query(
-        Box::new(rewritten),
-    ))))
+    Ok(None)
 }
 
 fn rewrite_output_from_statement(statement: Statement) -> RewriteOutput {

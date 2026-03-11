@@ -1,6 +1,5 @@
 use crate::cel::CelEvaluator;
 use crate::engine::query_storage::sql_text::escape_sql_string;
-#[cfg(test)]
 use crate::engine::sql_ast::utils::parse_sql_statements;
 use crate::engine::sql_ast::utils::{
     bind_sql_with_state, insert_values_rows_mut, resolve_expr_cell_with_state, resolve_values_rows,
@@ -12,9 +11,11 @@ use crate::filesystem::live_projection::{
 };
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::query_runtime::preprocess::preprocess_sql_to_plan as preprocess_sql;
+use crate::sql2::runtime::prepare_sql2_read;
+use crate::sql_shared::ast::lower_statement;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot,
+    parse_active_version_snapshot, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::{
@@ -988,26 +989,55 @@ async fn active_version_id_from_lix_active_version_update(
         query_sql.push_str(&selection.to_string());
     }
     let bound = bind_sql_with_state(&query_sql, params, backend.dialect(), placeholder_state)?;
-    let rows = execute_prefetch_query(
-        backend,
-        "pending.active_version_update",
-        &bound.sql,
-        &bound.params,
-    )
-    .await
-    .map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "active version update prefetch failed for '{}': {}",
-            bound.sql, error.description
-        ),
-    })?
-    .rows;
+    let rows =
+        execute_sql2_public_prefetch_query(backend, &bound.sql, &bound.params, GLOBAL_VERSION_ID)
+            .await
+            .map_err(|error| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "active version update prefetch failed for '{}': {}",
+                    bound.sql, error.description
+                ),
+            })?
+            .rows;
     if rows.is_empty() {
         return Ok(None);
     }
 
     Ok(Some(next_active_version_id))
+}
+
+async fn execute_sql2_public_prefetch_query(
+    backend: &dyn LixBackend,
+    sql: &str,
+    params: &[Value],
+    requested_version_id: &str,
+) -> Result<QueryResult, LixError> {
+    let statements = parse_sql_statements(sql)?;
+    let prepared =
+        prepare_sql2_read(backend, &statements, params, requested_version_id, None).await;
+    let Some(prepared) = prepared else {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "sql2 public prefetch could not prepare query",
+        ));
+    };
+    let lowered = prepared.lowered_read.ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "sql2 public prefetch could not lower query",
+        )
+    })?;
+
+    let mut result = QueryResult {
+        rows: Vec::new(),
+        columns: Vec::new(),
+    };
+    for statement in lowered.statements {
+        let statement = lower_statement(statement, backend.dialect())?;
+        result = backend.execute(&statement.to_string(), &[]).await?;
+    }
+    Ok(result)
 }
 
 async fn active_version_id_from_internal_state_update(

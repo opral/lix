@@ -1479,9 +1479,7 @@ fn public_write_target_name(
     }
     let target_name = top_level_write_target_name(&parsed_statements[0])?;
     let binding = registry.bind_relation_name(&target_name)?;
-    (binding.capability == SurfaceCapability::ReadWrite
-        && binding.resolution_capabilities.semantic_write)
-        .then_some(binding.descriptor.public_name)
+    Some(binding.descriptor.public_name)
 }
 
 fn top_level_filesystem_write_target_name(statement: &Statement) -> Option<&'static str> {
@@ -2582,6 +2580,25 @@ mod tests {
             prepared,
             Some(Sql2PreparedPublicExecution::Write(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn read_only_public_writes_are_owned_by_sql2_and_rejected_semantically() {
+        let backend = FakeBackend::default();
+        let error = prepare_sql2_public_execution(
+            &backend,
+            &parse_one(
+                "INSERT INTO lix_change (id, entity_id, schema_key, schema_version, file_id, plugin_key, created_at) \
+                 VALUES ('c1', 'e1', 's1', '1', 'lix', 'lix', '2026-01-01T00:00:00Z')",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect_err("read-only public write should be rejected by sql2");
+
+        assert_eq!(error.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");
     }
 
     #[tokio::test]

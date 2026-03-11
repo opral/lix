@@ -4,7 +4,6 @@ use crate::account::{
     active_account_storage_version_id, parse_active_account_snapshot,
 };
 use crate::builtin_schema::builtin_schema_definition;
-use crate::cel::CelEvaluator;
 use crate::default_values::apply_schema_defaults_with_system_functions;
 use crate::engine::query_storage::sql_text::escape_sql_string;
 use crate::filesystem::live_projection::{
@@ -15,11 +14,10 @@ use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     normalize_directory_path, normalize_path_segment, parent_directory_path, parse_file_path,
 };
-use crate::functions::{SharedFunctionProvider, SystemFunctionProvider};
-use crate::query_runtime::preprocess::preprocess_with_surfaces_to_plan;
+use crate::internal_state::rewrite_internal_state_query_read_with_backend;
 use crate::schema::{SchemaProvider, SqlStoredSchemaProvider};
-use crate::sql2::catalog::SurfaceFamily;
-use crate::sql2::catalog::SurfaceRegistry;
+use crate::schema_registry::register_schema_sql_statements;
+use crate::sql2::catalog::{SurfaceFamily, SurfaceRegistry};
 use crate::sql2::planner::backend::lowerer::rewrite_supported_public_read_surfaces_in_statement_with_registry;
 use crate::sql2::planner::ir::{
     InsertOnConflictAction, MutationPayload, PlannedStateRow, PlannedWrite, ResolvedRowRef,
@@ -44,6 +42,7 @@ use crate::version::{
 };
 use crate::{LixBackend, Value};
 use serde_json::{json, Map as JsonMap, Number as JsonNumber, Value as JsonValue};
+use sqlparser::ast::Statement;
 use std::collections::BTreeMap;
 
 const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
@@ -3478,40 +3477,59 @@ async fn query_entity_ids_for_selector(
     let lowered = prepared.lowered_read.ok_or_else(|| WriteResolveError {
         message: "sql2 entity selector resolver could not lower selector read".to_string(),
     })?;
+    let mut lowered_statements = lowered.statements;
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
         .map_err(write_resolve_backend_error)?;
-    let mut lowered_statements = lowered.statements;
+    let mut schema_keys = prepared
+        .dependency_spec
+        .as_ref()
+        .map(|spec| spec.schema_keys.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Some(schema_key) = prepared
+        .canonicalized
+        .surface_binding
+        .implicit_overrides
+        .fixed_schema_key
+        .clone()
+    {
+        if !schema_keys.iter().any(|existing| existing == &schema_key) {
+            schema_keys.push(schema_key);
+        }
+    }
+    for schema_key in &schema_keys {
+        for statement in register_schema_sql_statements(schema_key, backend.dialect()) {
+            backend
+                .execute(&statement, &[])
+                .await
+                .map_err(write_resolve_backend_error)?;
+        }
+    }
     for statement in &mut lowered_statements {
         *statement = lower_statement(statement.clone(), backend.dialect())
             .map_err(write_resolve_backend_error)?;
         rewrite_supported_public_read_surfaces_in_statement_with_registry(statement, &registry)
             .map_err(write_resolve_backend_error)?;
+        *statement = lower_statement(statement.clone(), backend.dialect())
+            .map_err(write_resolve_backend_error)?;
+        if let Statement::Query(query) = statement {
+            let rewritten =
+                rewrite_internal_state_query_read_with_backend(backend, (**query).clone(), &[])
+                    .await
+                    .map_err(write_resolve_backend_error)?;
+            *statement = Statement::Query(Box::new(rewritten));
+            *statement = lower_statement(statement.clone(), backend.dialect())
+                .map_err(write_resolve_backend_error)?;
+        }
     }
-    let planned = preprocess_with_surfaces_to_plan(
-        backend,
-        &CelEvaluator::new(),
-        lowered_statements,
-        &[],
-        SharedFunctionProvider::new(SystemFunctionProvider),
-        planned_write
-            .command
-            .execution_context
-            .writer_key
-            .as_deref(),
-    )
-    .await
-    .map_err(|error| WriteResolveError {
-        message: error.description,
-    })?;
 
     let mut query_result = crate::QueryResult {
         rows: Vec::new(),
         columns: Vec::new(),
     };
-    for statement in planned.prepared_statements {
+    for statement in lowered_statements {
         query_result = backend
-            .execute(&statement.sql, &statement.params)
+            .execute(&statement.to_string(), &[])
             .await
             .map_err(write_resolve_backend_error)?;
     }

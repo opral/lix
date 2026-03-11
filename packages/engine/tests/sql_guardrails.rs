@@ -77,8 +77,12 @@ fn guardrail_sql_runtime_forbids_legacy_sql2_imports() {
         "shared_path must not depend on removed engine::sql2 bridge paths"
     );
     assert!(
-        shared_path_source.contains("prepare_sql2_read"),
-        "shared_path transition shim should invoke sql2 read preparation during migration"
+        shared_path_source.contains("prepare_sql2_public_execution"),
+        "shared_path must route public batches through the single sql2 public-preparation entrypoint"
+    );
+    assert!(
+        !shared_path_source.contains("prepare_sql2_read"),
+        "shared_path must not reintroduce direct public-read bridge probing once sql2 owns dispatch"
     );
 }
 
