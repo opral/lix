@@ -4,7 +4,7 @@ use sqlparser::ast::{Expr, Insert, ObjectName, ObjectNamePart, Statement, TableO
 
 use crate::cel::CelEvaluator;
 use crate::engine::sql_ast::utils::{insert_values_rows_mut, resolve_insert_rows, ResolvedCell};
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::schema::{OverlaySchemaProvider, SchemaKey, SchemaProvider};
 use crate::{LixBackend, LixError, Value};
 
@@ -152,6 +152,23 @@ where
     }
 
     Ok(())
+}
+
+pub(crate) fn apply_schema_defaults_with_system_functions(
+    snapshot: &mut JsonMap<String, JsonValue>,
+    schema: &JsonValue,
+    schema_key: &str,
+    schema_version: &str,
+) -> Result<bool, LixError> {
+    apply_defaults_to_snapshot(
+        snapshot,
+        schema,
+        &snapshot.clone(),
+        &CelEvaluator::new(),
+        SharedFunctionProvider::new(SystemFunctionProvider),
+        schema_key,
+        schema_version,
+    )
 }
 
 fn apply_defaults_to_snapshot<P>(

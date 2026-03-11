@@ -266,6 +266,7 @@ pub(crate) enum WriteMode {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum MutationPayload {
     FullSnapshot(BTreeMap<String, Value>),
+    BulkFullSnapshot(Vec<BTreeMap<String, Value>>),
     Patch(BTreeMap<String, Value>),
     Tombstone,
 }

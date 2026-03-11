@@ -194,14 +194,24 @@ fn canonicalize_insert_write(
         ));
     }
 
-    let payload = insert_payload(&surface_binding, insert, &bound_statement.bound_parameters)?;
-    let on_conflict = insert_on_conflict(
-        &surface_binding,
-        insert,
-        &bound_statement.bound_parameters,
-        &payload,
-    )?;
-    let mode = write_mode_for_surface_and_selector(&surface_binding, &payload, None);
+    let payloads = insert_payloads(&surface_binding, insert, &bound_statement.bound_parameters)?;
+    let on_conflict = match payloads.as_slice() {
+        [payload] => insert_on_conflict(
+            &surface_binding,
+            insert,
+            &bound_statement.bound_parameters,
+            payload,
+        )?,
+        _ if insert.on.is_some() => return Err(CanonicalizeError::unsupported(
+            "sql2 day-1 insert canonicalizer does not yet support ON CONFLICT on multi-row inserts",
+        )),
+        _ => None,
+    };
+    let mode = write_mode_for_insert_payloads(&surface_binding, &payloads)?;
+    let payload = match payloads.as_slice() {
+        [payload] => MutationPayload::FullSnapshot(payload.clone()),
+        _ => MutationPayload::BulkFullSnapshot(payloads),
+    };
 
     Ok(CanonicalizedWrite {
         bound_statement: bound_statement.clone(),
@@ -210,7 +220,7 @@ fn canonicalize_insert_write(
             operation_kind: WriteOperationKind::Insert,
             target: surface_binding,
             selector: WriteSelector::default(),
-            payload: MutationPayload::FullSnapshot(payload),
+            payload,
             on_conflict,
             mode,
             execution_context: bound_statement.execution_context,
@@ -631,12 +641,15 @@ fn update_delete_surface_supported(surface_binding: &SurfaceBinding) -> bool {
     )
 }
 
-fn insert_payload(
+fn insert_payloads(
     surface_binding: &SurfaceBinding,
     insert: &Insert,
     params: &[Value],
-) -> Result<BTreeMap<String, Value>, CanonicalizeError> {
+) -> Result<Vec<BTreeMap<String, Value>>, CanonicalizeError> {
     let Some(source) = &insert.source else {
+        if insert.columns.is_empty() {
+            return Ok(vec![BTreeMap::new()]);
+        }
         return Err(CanonicalizeError::unsupported(
             "sql2 day-1 write canonicalizer requires VALUES inserts",
         ));
@@ -646,32 +659,56 @@ fn insert_payload(
             "sql2 day-1 write canonicalizer requires VALUES inserts",
         ));
     };
-    if values.rows.len() != 1 {
+    if values.rows.is_empty() {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer only supports single-row inserts",
-        ));
-    }
-
-    let row = &values.rows[0];
-    if row.len() != insert.columns.len() {
-        return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer requires one value per inserted column",
+            "sql2 day-1 write canonicalizer requires at least one insert row",
         ));
     }
 
     let mut placeholder_state = PlaceholderState::new();
-    let mut payload = BTreeMap::new();
-    for (column, expr) in insert.columns.iter().zip(row.iter()) {
-        reject_forbidden_default_state_write_column(surface_binding, &column.value, "insert")?;
-        let key = canonical_write_column_key(surface_binding, &column.value)?;
-        let value = match expr_to_value(expr, params, &mut placeholder_state) {
-            Ok(value) => value,
-            Err(error) if key == "data" => return Err(filesystem_file_data_error(error)),
-            Err(error) => return Err(error),
-        };
-        payload.insert(key, value);
+    let mut payloads = Vec::with_capacity(values.rows.len());
+    for row in &values.rows {
+        if row.len() != insert.columns.len() {
+            return Err(CanonicalizeError::unsupported(
+                "sql2 day-1 write canonicalizer requires one value per inserted column",
+            ));
+        }
+
+        let mut payload = BTreeMap::new();
+        for (column, expr) in insert.columns.iter().zip(row.iter()) {
+            reject_forbidden_default_state_write_column(surface_binding, &column.value, "insert")?;
+            let key = canonical_write_column_key(surface_binding, &column.value)?;
+            let value = match expr_to_value(expr, params, &mut placeholder_state) {
+                Ok(value) => value,
+                Err(error) if key == "data" => return Err(filesystem_file_data_error(error)),
+                Err(error) => return Err(error),
+            };
+            payload.insert(key, value);
+        }
+        payloads.push(payload);
     }
-    Ok(payload)
+    Ok(payloads)
+}
+
+fn write_mode_for_insert_payloads(
+    surface_binding: &SurfaceBinding,
+    payloads: &[BTreeMap<String, Value>],
+) -> Result<WriteMode, CanonicalizeError> {
+    let Some(first) = payloads.first() else {
+        return Err(CanonicalizeError::unsupported(
+            "sql2 day-1 write canonicalizer requires at least one insert row",
+        ));
+    };
+    let mode = write_mode_for_surface_and_selector(surface_binding, first, None);
+    for payload in &payloads[1..] {
+        let row_mode = write_mode_for_surface_and_selector(surface_binding, payload, None);
+        if row_mode != mode {
+            return Err(CanonicalizeError::unsupported(
+                "sql2 day-1 insert canonicalizer does not support mixing tracked and untracked rows in one INSERT",
+            ));
+        }
+    }
+    Ok(mode)
 }
 
 fn assignment_payload(
@@ -1033,10 +1070,7 @@ fn canonical_write_column_key(
             if supported {
                 Ok(canonical)
             } else {
-                Err(CanonicalizeError::unsupported(format!(
-                    "sql2 day-1 write canonicalizer does not support column '{raw_column}' on '{}'",
-                    surface_binding.descriptor.public_name
-                )))
+                Err(unknown_write_column_error(surface_binding, raw_column))
             }
         }
         SurfaceFamily::Entity => {
@@ -1044,10 +1078,7 @@ fn canonical_write_column_key(
             if supported {
                 Ok(canonical)
             } else {
-                Err(CanonicalizeError::unsupported(format!(
-                    "sql2 day-1 write canonicalizer does not support column '{raw_column}' on '{}'",
-                    surface_binding.descriptor.public_name
-                )))
+                Err(unknown_write_column_error(surface_binding, raw_column))
             }
         }
         SurfaceFamily::Admin => match surface_binding.descriptor.public_name.as_str() {
@@ -1137,16 +1168,10 @@ fn unknown_write_column_error(
     surface_binding: &SurfaceBinding,
     raw_column: &str,
 ) -> CanonicalizeError {
-    match surface_binding.descriptor.surface_family {
-        SurfaceFamily::Filesystem => CanonicalizeError::unsupported(format!(
-            "strict rewrite violation: unknown column '{raw_column}' on '{}'",
-            surface_binding.descriptor.public_name
-        )),
-        _ => CanonicalizeError::unsupported(format!(
-            "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
-            surface_binding.descriptor.public_name
-        )),
-    }
+    CanonicalizeError::unsupported(format!(
+        "strict rewrite violation: unknown column '{raw_column}' on '{}'",
+        surface_binding.descriptor.public_name
+    ))
 }
 
 fn filesystem_file_data_error(_error: CanonicalizeError) -> CanonicalizeError {

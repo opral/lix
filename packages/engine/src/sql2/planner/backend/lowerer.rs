@@ -113,10 +113,20 @@ pub(crate) fn lower_read_for_execution(
 pub(crate) fn rewrite_supported_public_read_surfaces_in_statement(
     statement: &mut Statement,
 ) -> Result<(), LixError> {
+    rewrite_supported_public_read_surfaces_in_statement_with_registry(
+        statement,
+        &SurfaceRegistry::with_builtin_surfaces(),
+    )
+}
+
+pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry(
+    statement: &mut Statement,
+    registry: &SurfaceRegistry,
+) -> Result<(), LixError> {
     match statement {
-        Statement::Query(query) => rewrite_supported_public_read_surfaces_in_query(query),
+        Statement::Query(query) => rewrite_supported_public_read_surfaces_in_query(query, registry),
         Statement::Explain { statement, .. } => {
-            rewrite_supported_public_read_surfaces_in_statement(statement)
+            rewrite_supported_public_read_surfaces_in_statement_with_registry(statement, registry)
         }
         _ => Ok(()),
     }
@@ -300,24 +310,28 @@ fn rewrite_nested_filesystem_surfaces_in_query(
     Ok(())
 }
 
-fn rewrite_supported_public_read_surfaces_in_query(query: &mut Query) -> Result<(), LixError> {
-    rewrite_supported_public_read_surfaces_in_set_expr(query.body.as_mut(), true)
+fn rewrite_supported_public_read_surfaces_in_query(
+    query: &mut Query,
+    registry: &SurfaceRegistry,
+) -> Result<(), LixError> {
+    rewrite_supported_public_read_surfaces_in_set_expr(query.body.as_mut(), registry, true)
 }
 
 fn rewrite_supported_public_read_surfaces_in_set_expr(
     expr: &mut SetExpr,
+    registry: &SurfaceRegistry,
     top_level: bool,
 ) -> Result<(), LixError> {
     match expr {
         SetExpr::Select(select) => {
-            rewrite_supported_public_read_surfaces_in_select(select, top_level)
+            rewrite_supported_public_read_surfaces_in_select(select, registry, top_level)
         }
         SetExpr::Query(query) => {
-            rewrite_supported_public_read_surfaces_in_set_expr(query.body.as_mut(), false)
+            rewrite_supported_public_read_surfaces_in_set_expr(query.body.as_mut(), registry, false)
         }
         SetExpr::SetOperation { left, right, .. } => {
-            rewrite_supported_public_read_surfaces_in_set_expr(left.as_mut(), false)?;
-            rewrite_supported_public_read_surfaces_in_set_expr(right.as_mut(), false)
+            rewrite_supported_public_read_surfaces_in_set_expr(left.as_mut(), registry, false)?;
+            rewrite_supported_public_read_surfaces_in_set_expr(right.as_mut(), registry, false)
         }
         _ => Ok(()),
     }
@@ -325,18 +339,19 @@ fn rewrite_supported_public_read_surfaces_in_set_expr(
 
 fn rewrite_supported_public_read_surfaces_in_select(
     select: &mut Select,
+    registry: &SurfaceRegistry,
     top_level: bool,
 ) -> Result<(), LixError> {
     for table in &mut select.from {
-        rewrite_supported_public_read_surfaces_in_table_with_joins(table, top_level)?;
+        rewrite_supported_public_read_surfaces_in_table_with_joins(table, registry, top_level)?;
     }
     if let Some(selection) = &mut select.selection {
-        rewrite_supported_public_read_surfaces_in_expr(selection)?;
+        rewrite_supported_public_read_surfaces_in_expr(selection, registry)?;
     }
     for item in &mut select.projection {
         match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                rewrite_supported_public_read_surfaces_in_expr(expr)?;
+                rewrite_supported_public_read_surfaces_in_expr(expr, registry)?;
             }
             _ => {}
         }
@@ -346,17 +361,27 @@ fn rewrite_supported_public_read_surfaces_in_select(
 
 fn rewrite_supported_public_read_surfaces_in_table_with_joins(
     table: &mut TableWithJoins,
+    registry: &SurfaceRegistry,
     top_level: bool,
 ) -> Result<(), LixError> {
-    rewrite_supported_public_read_surfaces_in_table_factor(&mut table.relation, top_level)?;
+    rewrite_supported_public_read_surfaces_in_table_factor(
+        &mut table.relation,
+        registry,
+        top_level,
+    )?;
     for join in &mut table.joins {
-        rewrite_supported_public_read_surfaces_in_table_factor(&mut join.relation, top_level)?;
+        rewrite_supported_public_read_surfaces_in_table_factor(
+            &mut join.relation,
+            registry,
+            top_level,
+        )?;
     }
     Ok(())
 }
 
 fn rewrite_supported_public_read_surfaces_in_table_factor(
     relation: &mut TableFactor,
+    registry: &SurfaceRegistry,
     top_level: bool,
 ) -> Result<(), LixError> {
     match relation {
@@ -365,7 +390,7 @@ fn rewrite_supported_public_read_surfaces_in_table_factor(
                 return Ok(());
             };
             let Some(derived_query) =
-                build_supported_public_read_surface_query(surface_name, top_level)?
+                build_supported_public_read_surface_query(surface_name, registry, top_level)?
             else {
                 return Ok(());
             };
@@ -384,49 +409,62 @@ fn rewrite_supported_public_read_surfaces_in_table_factor(
             Ok(())
         }
         TableFactor::Derived { subquery, .. } => {
-            rewrite_supported_public_read_surfaces_in_set_expr(subquery.body.as_mut(), false)
+            rewrite_supported_public_read_surfaces_in_set_expr(
+                subquery.body.as_mut(),
+                registry,
+                false,
+            )
         }
         TableFactor::NestedJoin {
             table_with_joins, ..
-        } => rewrite_supported_public_read_surfaces_in_table_with_joins(table_with_joins, false),
+        } => rewrite_supported_public_read_surfaces_in_table_with_joins(
+            table_with_joins,
+            registry,
+            false,
+        ),
         _ => Ok(()),
     }
 }
 
-fn rewrite_supported_public_read_surfaces_in_expr(expr: &mut Expr) -> Result<(), LixError> {
+fn rewrite_supported_public_read_surfaces_in_expr(
+    expr: &mut Expr,
+    registry: &SurfaceRegistry,
+) -> Result<(), LixError> {
     match expr {
         Expr::BinaryOp { left, right, .. } => {
-            rewrite_supported_public_read_surfaces_in_expr(left)?;
-            rewrite_supported_public_read_surfaces_in_expr(right)
+            rewrite_supported_public_read_surfaces_in_expr(left, registry)?;
+            rewrite_supported_public_read_surfaces_in_expr(right, registry)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
-        | Expr::Cast { expr, .. } => rewrite_supported_public_read_surfaces_in_expr(expr),
+        | Expr::Cast { expr, .. } => rewrite_supported_public_read_surfaces_in_expr(expr, registry),
         Expr::InList { expr, list, .. } => {
-            rewrite_supported_public_read_surfaces_in_expr(expr)?;
+            rewrite_supported_public_read_surfaces_in_expr(expr, registry)?;
             for item in list {
-                rewrite_supported_public_read_surfaces_in_expr(item)?;
+                rewrite_supported_public_read_surfaces_in_expr(item, registry)?;
             }
             Ok(())
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            rewrite_supported_public_read_surfaces_in_expr(expr)?;
-            rewrite_supported_public_read_surfaces_in_expr(low)?;
-            rewrite_supported_public_read_surfaces_in_expr(high)
+            rewrite_supported_public_read_surfaces_in_expr(expr, registry)?;
+            rewrite_supported_public_read_surfaces_in_expr(low, registry)?;
+            rewrite_supported_public_read_surfaces_in_expr(high, registry)
         }
         Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            rewrite_supported_public_read_surfaces_in_expr(expr)?;
-            rewrite_supported_public_read_surfaces_in_expr(pattern)
+            rewrite_supported_public_read_surfaces_in_expr(expr, registry)?;
+            rewrite_supported_public_read_surfaces_in_expr(pattern, registry)
         }
-        Expr::Subquery(query) => rewrite_supported_public_read_surfaces_in_query(query),
-        Expr::Exists { subquery, .. } => rewrite_supported_public_read_surfaces_in_query(subquery),
+        Expr::Subquery(query) => rewrite_supported_public_read_surfaces_in_query(query, registry),
+        Expr::Exists { subquery, .. } => {
+            rewrite_supported_public_read_surfaces_in_query(subquery, registry)
+        }
         Expr::InSubquery { expr, subquery, .. } => {
-            rewrite_supported_public_read_surfaces_in_expr(expr)?;
-            rewrite_supported_public_read_surfaces_in_query(subquery)
+            rewrite_supported_public_read_surfaces_in_expr(expr, registry)?;
+            rewrite_supported_public_read_surfaces_in_query(subquery, registry)
         }
         _ => Ok(()),
     }
@@ -434,9 +472,9 @@ fn rewrite_supported_public_read_surfaces_in_expr(expr: &mut Expr) -> Result<(),
 
 fn build_supported_public_read_surface_query(
     surface_name: &str,
+    registry: &SurfaceRegistry,
     _top_level: bool,
 ) -> Result<Option<Query>, LixError> {
-    let registry = SurfaceRegistry::with_builtin_surfaces();
     if let Some(surface_binding) = registry.bind_relation_name(surface_name) {
         match surface_binding.descriptor.surface_family {
             SurfaceFamily::Entity => {
