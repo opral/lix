@@ -13,9 +13,15 @@ impl Engine {
         statements: Vec<Statement>,
         params: &[Value],
         options: ExecuteOptions,
+        allow_internal_tables: bool,
     ) -> Result<ExecuteResult, LixError> {
-        self.execute_statement_script_with_options(statements, params, &options)
-            .await
+        self.execute_statement_script_with_options(
+            statements,
+            params,
+            &options,
+            allow_internal_tables,
+        )
+        .await
     }
 
     pub(crate) async fn execute_statement_script_with_options(
@@ -23,6 +29,7 @@ impl Engine {
         statements: Vec<Statement>,
         params: &[Value],
         options: &ExecuteOptions,
+        allow_internal_tables: bool,
     ) -> Result<ExecuteResult, LixError> {
         let mut transaction = self.backend.begin_transaction().await?;
         let mut active_version_id = self.require_active_version_id()?;
@@ -37,6 +44,7 @@ impl Engine {
                 statements,
                 params,
                 options,
+                allow_internal_tables,
                 &mut active_version_id,
                 &mut pending_state_commit_stream_changes,
                 &mut pending_sql2_append_session,
@@ -74,6 +82,7 @@ impl Engine {
         original_statements: Vec<Statement>,
         params: &[Value],
         options: &ExecuteOptions,
+        allow_internal_tables: bool,
         active_version_id: &mut String,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
         pending_sql2_append_session: &mut Option<
@@ -119,6 +128,7 @@ impl Engine {
                     &sql,
                     &statement_params,
                     options,
+                    allow_internal_tables,
                     active_version_id,
                     deferred_side_effects.as_mut(),
                     true,
@@ -132,6 +142,7 @@ impl Engine {
                     &sql,
                     &statement_params,
                     options,
+                    allow_internal_tables,
                     active_version_id,
                     None,
                     false,

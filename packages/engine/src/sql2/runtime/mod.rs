@@ -5,7 +5,9 @@ use crate::commit::{
 use crate::engine::query_semantics::state_resolution::canonical::statement_targets_table_name;
 use crate::engine::sql_ast::lowering::lower_statement;
 use crate::errors::schema_not_registered_error;
-use crate::errors::{file_data_expects_bytes_error, read_only_view_write_error};
+use crate::errors::{
+    file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
+};
 use crate::filesystem::pending_file_writes::PendingFileWrite;
 use crate::history_timeline::ensure_history_timeline_materialized_for_root;
 use crate::query_runtime::contracts::effects::PlanEffects;
@@ -26,7 +28,10 @@ use crate::sql2::planner::ir::{
     CommitPreconditions, PlannedWrite, ResolvedWritePlan, SchemaProof, ScopeProof, TargetSetProof,
     WriteCommand, WriteOperationKind,
 };
-use crate::sql2::planner::semantics::dependency_spec::derive_dependency_spec_from_canonicalized_read;
+use crate::sql2::planner::semantics::dependency_spec::{
+    derive_dependency_spec_from_bound_public_surface_bindings,
+    derive_dependency_spec_from_canonicalized_read,
+};
 use crate::sql2::planner::semantics::domain_changes::{
     build_domain_change_batch, derive_commit_preconditions, DomainChangeBatch,
 };
@@ -46,8 +51,9 @@ use crate::version::{
 };
 use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::{
-    BinaryOperator, Expr, Ident, ObjectNamePart, Query, SetExpr, Statement, TableFactor,
-    Value as SqlValue, Visit, Visitor,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
+    JoinConstraint, JoinOperator, LimitClause, ObjectNamePart, OrderBy, OrderByExpr, Query, Select,
+    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value as SqlValue, Visit, Visitor,
 };
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -67,6 +73,7 @@ struct ExplainEnvelope {
 pub(crate) struct Sql2DebugTrace {
     pub(crate) bound_statements: Vec<BoundStatement>,
     pub(crate) surface_bindings: Vec<String>,
+    pub(crate) bound_public_leaves: Vec<Sql2BoundPublicLeaf>,
     pub(crate) dependency_spec: Option<DependencySpec>,
     pub(crate) effective_state_request: Option<EffectiveStateRequest>,
     pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
@@ -98,6 +105,15 @@ pub(crate) struct Sql2PreparedRead {
     pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
     pub(crate) lowered_read: Option<LoweredReadProgram>,
     pub(crate) debug_trace: Sql2DebugTrace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Sql2BoundPublicLeaf {
+    pub(crate) public_name: String,
+    pub(crate) surface_family: SurfaceFamily,
+    pub(crate) surface_variant: SurfaceVariant,
+    pub(crate) capability: SurfaceCapability,
+    pub(crate) requires_effective_state: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -138,12 +154,40 @@ pub(crate) enum Sql2PreparedPublicExecution {
     Write(Sql2PreparedWrite),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BoundPublicReadSummary {
+    bound_surface_bindings: Vec<crate::sql2::catalog::SurfaceBinding>,
+    internal_relations: Vec<String>,
+    external_relations: Vec<String>,
+}
+
+mod read;
+
 pub(crate) async fn prepare_sql2_public_execution(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
+) -> Result<Option<Sql2PreparedPublicExecution>, LixError> {
+    prepare_sql2_public_execution_with_internal_access(
+        backend,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_sql2_public_execution_with_internal_access(
+    backend: &dyn LixBackend,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+    allow_internal_tables: bool,
 ) -> Result<Option<Sql2PreparedPublicExecution>, LixError> {
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
@@ -185,6 +229,7 @@ pub(crate) async fn prepare_sql2_public_execution(
         params,
         active_version_id,
         writer_key,
+        allow_internal_tables,
     )
     .await?
     .map(Sql2PreparedPublicExecution::Read)
@@ -216,9 +261,19 @@ pub(crate) fn rewrite_public_read_statement_to_lowered_sql(
     statement: &mut Statement,
     dialect: crate::SqlDialect,
 ) -> Result<Statement, LixError> {
-    crate::sql2::planner::backend::lowerer::rewrite_supported_public_read_surfaces_in_statement(
+    rewrite_public_read_statement_to_lowered_sql_with_registry(
         statement,
-    )?;
+        dialect,
+        &SurfaceRegistry::with_builtin_surfaces(),
+    )
+}
+
+fn rewrite_public_read_statement_to_lowered_sql_with_registry(
+    statement: &mut Statement,
+    dialect: crate::SqlDialect,
+    registry: &SurfaceRegistry,
+) -> Result<Statement, LixError> {
+    rewrite_supported_public_read_surfaces_in_statement_with_registry(statement, registry)?;
     lower_statement(statement.clone(), dialect)
 }
 
@@ -226,8 +281,24 @@ pub(crate) fn rewrite_public_read_query_to_lowered_sql(
     query: Query,
     dialect: crate::SqlDialect,
 ) -> Result<Query, LixError> {
+    rewrite_public_read_query_to_lowered_sql_with_registry(
+        query,
+        dialect,
+        &SurfaceRegistry::with_builtin_surfaces(),
+    )
+}
+
+fn rewrite_public_read_query_to_lowered_sql_with_registry(
+    query: Query,
+    dialect: crate::SqlDialect,
+    registry: &SurfaceRegistry,
+) -> Result<Query, LixError> {
     let mut statement = Statement::Query(Box::new(query));
-    match rewrite_public_read_statement_to_lowered_sql(&mut statement, dialect)? {
+    match rewrite_public_read_statement_to_lowered_sql_with_registry(
+        &mut statement,
+        dialect,
+        registry,
+    )? {
         Statement::Query(query) => Ok(*query),
         _ => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -241,69 +312,7 @@ pub(crate) async fn lower_public_read_query_with_sql2_backend(
     query: Query,
     params: &[Value],
 ) -> Result<Query, LixError> {
-    if !statement_references_public_surface(
-        &SurfaceRegistry::with_builtin_surfaces(),
-        &Statement::Query(Box::new(query.clone())),
-    ) {
-        return Ok(query);
-    }
-    let active_version_id = load_active_version_id_for_sql2_read(backend).await?;
-    let parsed = vec![Statement::Query(Box::new(query.clone()))];
-    let prepared =
-        try_prepare_sql2_read(backend, &parsed, params, &active_version_id, None).await?;
-    let lowered = if let Some(lowered) = prepared.and_then(|prepared| prepared.lowered_read) {
-        lowered
-    } else {
-        let rewritten = rewrite_public_read_query_to_lowered_sql(query.clone(), backend.dialect())?;
-        if rewritten != query {
-            return Ok(rewritten);
-        }
-        let registry = SurfaceRegistry::bootstrap_with_backend(backend).await?;
-        let bound_statement = BoundStatement::from_statement(
-            Statement::Query(Box::new(query)),
-            params.to_vec(),
-            ExecutionContext {
-                dialect: Some(backend.dialect()),
-                writer_key: None,
-                requested_version_id: Some(active_version_id),
-            },
-        );
-        let canonicalized = canonicalize_read(bound_statement, &registry).map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "sql2 read subquery canonicalization failed: {}",
-                    error.message
-                ),
-            )
-        })?;
-        let dependency_spec = augment_dependency_spec_for_public_read(
-            &registry,
-            &canonicalized,
-            derive_dependency_spec_from_canonicalized_read(&canonicalized),
-        );
-        let effective_state = build_effective_state(&canonicalized, dependency_spec.as_ref());
-        lower_read_for_execution(
-            &canonicalized,
-            effective_state.as_ref().map(|(request, _)| request),
-            effective_state.as_ref().map(|(_, plan)| plan),
-        )?
-        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "sql2 could not prepare read subquery"))?
-    };
-    let statement = lowered.statements.into_iter().next().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "sql2 read subquery lowered to no statements",
-        )
-    })?;
-    let statement = lower_statement(statement, backend.dialect())?;
-    match statement {
-        Statement::Query(query) => Ok(*query),
-        _ => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "expected lowered subquery to remain a SELECT query",
-        )),
-    }
+    read::lower_public_read_query_with_sql2_backend(backend, query, params).await
 }
 
 async fn try_prepare_sql2_read(
@@ -312,189 +321,44 @@ async fn try_prepare_sql2_read(
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
+    allow_internal_tables: bool,
 ) -> Result<Option<Sql2PreparedRead>, LixError> {
-    if parsed_statements.len() != 1 {
-        return Ok(None);
-    }
-    if let Some(error) = sql2_public_read_preflight_error(&parsed_statements[0]) {
-        return Err(error);
-    }
-
-    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
-        .await
-        .map_err(|error| LixError::new(error.code, error.description))?;
-    let Some((statement, explain_envelope)) = explain_query_statement(&parsed_statements[0]) else {
-        return Ok(None);
-    };
-    let bound_statement = BoundStatement::from_statement(
-        statement,
-        params.to_vec(),
-        ExecutionContext {
-            dialect: Some(backend.dialect()),
-            writer_key: writer_key.map(ToString::to_string),
-            requested_version_id: Some(active_version_id.to_string()),
-        },
-    );
-    let canonicalized = match canonicalize_read(bound_statement.clone(), &registry) {
-        Ok(canonicalized) => canonicalized,
-        Err(canonicalize_error) => {
-            if let Some(prepared) = prepare_sql2_read_via_surface_expansion(
-                backend,
-                bound_statement,
-                explain_envelope.as_ref(),
-                &registry,
-            )
-            .await?
-            {
-                return Ok(Some(prepared));
-            }
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "sql2 read preparation failed: {}",
-                    canonicalize_error.message
-                ),
-            ));
-        }
-    };
-    let canonicalized =
-        maybe_bind_active_history_root(backend, canonicalized, active_version_id, &registry)
-            .await
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "sql2 read preparation could not bind active history root",
-                )
-            })?;
-    ensure_sql2_history_timeline_roots(backend, &canonicalized.bound_statement.statement)
-        .await
-        .map_err(|error| LixError::new(error.code, error.description))?;
-    let dependency_spec = augment_dependency_spec_for_public_read(
-        &registry,
-        &canonicalized,
-        derive_dependency_spec_from_canonicalized_read(&canonicalized),
-    );
-    if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::State {
-        if let Some(error) = unknown_public_state_schema_error(&registry, dependency_spec.as_ref())
-        {
-            return Err(error);
-        }
-    }
-    let effective_state = build_effective_state(&canonicalized, dependency_spec.as_ref());
-    let lowered_read = lower_read_for_execution(
-        &canonicalized,
-        effective_state.as_ref().map(|(request, _)| request),
-        effective_state.as_ref().map(|(_, plan)| plan),
-    )?
-    .map(|program| wrap_lowered_read_for_explain(program, explain_envelope.as_ref()));
-    let lowered_sql = lowered_read
-        .as_ref()
-        .map(|program| {
-            program
-                .statements
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    Ok(Some(Sql2PreparedRead {
-        debug_trace: Sql2DebugTrace {
-            bound_statements: vec![bound_statement],
-            surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
-            dependency_spec: dependency_spec.clone(),
-            effective_state_request: effective_state.as_ref().map(|(request, _)| request.clone()),
-            effective_state_plan: effective_state.as_ref().map(|(_, plan)| plan.clone()),
-            pushdown_decision: lowered_read
-                .as_ref()
-                .map(|program| program.pushdown_decision.clone()),
-            write_command: None,
-            scope_proof: None,
-            schema_proof: None,
-            target_set_proof: None,
-            resolved_write_plan: None,
-            domain_change_batch: None,
-            commit_preconditions: None,
-            invariant_trace: None,
-            write_phase_trace: Vec::new(),
-            lowered_sql,
-        },
-        dependency_spec,
-        effective_state_request: effective_state.as_ref().map(|(request, _)| request.clone()),
-        effective_state_plan: effective_state.as_ref().map(|(_, plan)| plan.clone()),
-        lowered_read,
-        canonicalized: Some(canonicalized),
-    }))
+    read::try_prepare_sql2_read_with_internal_access(
+        backend,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+        allow_internal_tables,
+    )
+    .await
 }
 
-async fn prepare_sql2_read_via_surface_expansion(
-    backend: &dyn LixBackend,
-    bound_statement: BoundStatement,
-    explain_envelope: Option<&ExplainEnvelope>,
+fn sql2_public_read_preflight_error(
     registry: &SurfaceRegistry,
-) -> Result<Option<Sql2PreparedRead>, LixError> {
-    ensure_sql2_history_timeline_roots(backend, &bound_statement.statement)
-        .await
-        .map_err(|error| LixError::new(error.code, error.description))?;
-
-    let mut rewritten_statement = bound_statement.statement.clone();
-    rewrite_supported_public_read_surfaces_in_statement_with_registry(
-        &mut rewritten_statement,
-        registry,
-    )?;
-    if statement_references_public_surface(registry, &rewritten_statement) {
-        return Ok(None);
-    }
-    if rewritten_statement == bound_statement.statement {
-        return Ok(None);
-    }
-
-    let lowered_read = wrap_lowered_read_for_explain(
-        LoweredReadProgram {
-            statements: vec![rewritten_statement.clone()],
-            pushdown_decision: PushdownDecision::default(),
-        },
-        explain_envelope,
-    );
-
-    Ok(Some(Sql2PreparedRead {
-        debug_trace: Sql2DebugTrace {
-            bound_statements: vec![bound_statement.clone()],
-            surface_bindings: bound_public_surface_names(registry, &bound_statement.statement),
-            dependency_spec: None,
-            effective_state_request: None,
-            effective_state_plan: None,
-            pushdown_decision: Some(PushdownDecision::default()),
-            write_command: None,
-            scope_proof: None,
-            schema_proof: None,
-            target_set_proof: None,
-            resolved_write_plan: None,
-            domain_change_batch: None,
-            commit_preconditions: None,
-            invariant_trace: None,
-            write_phase_trace: Vec::new(),
-            lowered_sql: lowered_read
-                .statements
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-        },
-        dependency_spec: None,
-        effective_state_request: None,
-        effective_state_plan: None,
-        lowered_read: Some(lowered_read),
-        canonicalized: None,
-    }))
-}
-
-fn sql2_public_read_preflight_error(statement: &Statement) -> Option<LixError> {
+    statement: &Statement,
+) -> Option<LixError> {
     let Statement::Query(query) = statement else {
         return None;
     };
-    if !query_references_named_surface(query, "lix_state")
+    let referenced_surfaces = collect_public_query_relation_names(query);
+    if !referenced_surfaces.contains("lix_state")
         || !query_references_any_column(query, &["version_id", "lixcol_version_id"])
     {
+        return None;
+    }
+    let other_version_exposing_surface_present = referenced_surfaces.iter().any(|surface_name| {
+        !surface_name.eq_ignore_ascii_case("lix_state")
+            && registry
+                .bind_relation_name(surface_name)
+                .is_some_and(|binding| {
+                    binding
+                        .exposed_columns
+                        .iter()
+                        .any(|column| matches!(column.as_str(), "version_id" | "lixcol_version_id"))
+                })
+    });
+    if other_version_exposing_surface_present {
         return None;
     }
     Some(LixError::new(
@@ -557,7 +421,7 @@ pub(crate) async fn prepare_sql2_read(
     active_version_id: &str,
     writer_key: Option<&str>,
 ) -> Option<Sql2PreparedRead> {
-    try_prepare_sql2_read(
+    read::prepare_sql2_read(
         backend,
         parsed_statements,
         params,
@@ -565,8 +429,6 @@ pub(crate) async fn prepare_sql2_read(
         writer_key,
     )
     .await
-    .ok()
-    .flatten()
 }
 
 pub(crate) async fn prepare_sql2_read_strict(
@@ -576,7 +438,7 @@ pub(crate) async fn prepare_sql2_read_strict(
     active_version_id: &str,
     writer_key: Option<&str>,
 ) -> Result<Option<Sql2PreparedRead>, LixError> {
-    try_prepare_sql2_read(
+    read::prepare_sql2_read_strict(
         backend,
         parsed_statements,
         params,
@@ -616,42 +478,477 @@ fn query_references_public_surface(registry: &SurfaceRegistry, query: &Query) ->
         .any(|name| registry.bind_relation_name(&name).is_some())
 }
 
-fn collect_public_query_relation_names(query: &Query) -> BTreeSet<String> {
-    struct Collector {
-        relation_names: BTreeSet<String>,
-    }
+fn summarize_bound_public_read_statement(
+    registry: &SurfaceRegistry,
+    statement: &Statement,
+) -> BoundPublicReadSummary {
+    let Statement::Query(query) = statement else {
+        return BoundPublicReadSummary::default();
+    };
+    summarize_bound_public_read_query(registry, query)
+}
 
-    impl Visitor for Collector {
-        type Break = ();
-
-        fn pre_visit_table_factor(
-            &mut self,
-            table_factor: &TableFactor,
-        ) -> ControlFlow<Self::Break> {
-            if let TableFactor::Table { name, .. } = table_factor {
-                if let Some(identifier) = name.0.last().and_then(ObjectNamePart::as_ident) {
-                    self.relation_names
-                        .insert(identifier.value.to_ascii_lowercase());
-                }
-            }
-            ControlFlow::Continue(())
+fn summarize_bound_public_read_query(
+    registry: &SurfaceRegistry,
+    query: &Query,
+) -> BoundPublicReadSummary {
+    let mut bound_surface_bindings = Vec::new();
+    let mut internal_relations = Vec::new();
+    let mut external_relations = Vec::new();
+    for relation_name in collect_public_query_relation_names(query) {
+        if let Some(binding) = registry.bind_relation_name(&relation_name) {
+            bound_surface_bindings.push(binding);
+        } else if relation_name.starts_with("lix_internal_") {
+            internal_relations.push(relation_name);
+        } else {
+            external_relations.push(relation_name);
         }
     }
+    BoundPublicReadSummary {
+        bound_surface_bindings,
+        internal_relations,
+        external_relations,
+    }
+}
 
-    let mut collector = Collector {
-        relation_names: BTreeSet::new(),
+fn sql2_bound_public_leaf(binding: &crate::sql2::catalog::SurfaceBinding) -> Sql2BoundPublicLeaf {
+    Sql2BoundPublicLeaf {
+        public_name: binding.descriptor.public_name.clone(),
+        surface_family: binding.descriptor.surface_family,
+        surface_variant: binding.descriptor.surface_variant,
+        capability: binding.capability,
+        requires_effective_state: matches!(
+            binding.descriptor.surface_family,
+            SurfaceFamily::State | SurfaceFamily::Entity
+        ),
+    }
+}
+
+fn collect_public_query_relation_names(query: &Query) -> BTreeSet<String> {
+    let mut relation_names = BTreeSet::new();
+    collect_public_query_relation_names_scoped(query, &BTreeSet::new(), &mut relation_names);
+    relation_names
+}
+
+fn collect_public_query_relation_names_scoped(
+    query: &Query,
+    visible_ctes: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    let mut scoped_ctes = visible_ctes.clone();
+    if let Some(with) = &query.with {
+        let mut cte_scope = visible_ctes.clone();
+        for cte in &with.cte_tables {
+            collect_public_query_relation_names_scoped(&cte.query, &cte_scope, out);
+            cte_scope.insert(cte.alias.name.value.to_ascii_lowercase());
+        }
+        scoped_ctes = cte_scope;
+    }
+
+    collect_public_query_relation_names_in_set_expr(query.body.as_ref(), &scoped_ctes, out);
+    if let Some(order_by) = &query.order_by {
+        collect_public_query_relation_names_in_order_by(order_by, &scoped_ctes, out);
+    }
+    if let Some(limit_clause) = &query.limit_clause {
+        collect_public_query_relation_names_in_limit_clause(limit_clause, &scoped_ctes, out);
+    }
+    if let Some(quantity) = query
+        .fetch
+        .as_ref()
+        .and_then(|fetch| fetch.quantity.as_ref())
+    {
+        collect_public_query_relation_names_in_expr(quantity, &scoped_ctes, out);
+    }
+}
+
+fn collect_public_query_relation_names_in_set_expr(
+    expr: &SetExpr,
+    visible_ctes: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    match expr {
+        SetExpr::Select(select) => {
+            collect_public_query_relation_names_in_select(select, visible_ctes, out)
+        }
+        SetExpr::Query(query) => {
+            collect_public_query_relation_names_scoped(query, visible_ctes, out)
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_public_query_relation_names_in_set_expr(left.as_ref(), visible_ctes, out);
+            collect_public_query_relation_names_in_set_expr(right.as_ref(), visible_ctes, out);
+        }
+        SetExpr::Values(values) => {
+            for row in &values.rows {
+                for expr in row {
+                    collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+                }
+            }
+        }
+        SetExpr::Insert(statement)
+        | SetExpr::Update(statement)
+        | SetExpr::Delete(statement)
+        | SetExpr::Merge(statement) => {
+            let _ = statement.visit(&mut PublicRelationCollectorVisitor { visible_ctes, out });
+        }
+        SetExpr::Table(table) => {
+            if let Some(table_name) = &table.table_name {
+                let normalized = table_name.to_ascii_lowercase();
+                if !visible_ctes.contains(&normalized) {
+                    out.insert(normalized);
+                }
+            }
+        }
+    }
+}
+
+fn collect_public_query_relation_names_in_select(
+    select: &Select,
+    visible_ctes: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    for table in &select.from {
+        collect_public_query_relation_names_in_table_with_joins(table, visible_ctes, out);
+    }
+    if let Some(prewhere) = &select.prewhere {
+        collect_public_query_relation_names_in_expr(prewhere, visible_ctes, out);
+    }
+    if let Some(selection) = &select.selection {
+        collect_public_query_relation_names_in_expr(selection, visible_ctes, out);
+    }
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+            }
+            SelectItem::QualifiedWildcard(
+                sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr),
+                _,
+            ) => collect_public_query_relation_names_in_expr(expr, visible_ctes, out),
+            _ => {}
+        }
+    }
+    collect_public_query_relation_names_in_group_by(&select.group_by, visible_ctes, out);
+    for expr in &select.cluster_by {
+        collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+    }
+    for expr in &select.distribute_by {
+        collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+    }
+    for expr in &select.sort_by {
+        collect_public_query_relation_names_in_order_by_expr(expr, visible_ctes, out);
+    }
+    if let Some(having) = &select.having {
+        collect_public_query_relation_names_in_expr(having, visible_ctes, out);
+    }
+    if let Some(qualify) = &select.qualify {
+        collect_public_query_relation_names_in_expr(qualify, visible_ctes, out);
+    }
+    if let Some(connect_by) = &select.connect_by {
+        collect_public_query_relation_names_in_expr(&connect_by.condition, visible_ctes, out);
+        for expr in &connect_by.relationships {
+            collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+        }
+    }
+}
+
+fn collect_public_query_relation_names_in_table_with_joins(
+    table: &TableWithJoins,
+    visible_ctes: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    collect_public_query_relation_names_in_table_factor(&table.relation, visible_ctes, out);
+    for join in &table.joins {
+        collect_public_query_relation_names_in_table_factor(&join.relation, visible_ctes, out);
+        collect_public_query_relation_names_in_join_operator(
+            &join.join_operator,
+            visible_ctes,
+            out,
+        );
+    }
+}
+
+fn collect_public_query_relation_names_in_table_factor(
+    relation: &TableFactor,
+    visible_ctes: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    match relation {
+        TableFactor::Table { name, .. } => {
+            if let Some(identifier) = name.0.last().and_then(ObjectNamePart::as_ident) {
+                let normalized = identifier.value.to_ascii_lowercase();
+                if !visible_ctes.contains(&normalized) {
+                    out.insert(normalized);
+                }
+            }
+        }
+        TableFactor::Derived { subquery, .. } => {
+            collect_public_query_relation_names_scoped(subquery, visible_ctes, out);
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => collect_public_query_relation_names_in_table_with_joins(
+            table_with_joins,
+            visible_ctes,
+            out,
+        ),
+        _ => {}
+    }
+}
+
+fn collect_public_query_relation_names_in_group_by(
+    group_by: &GroupByExpr,
+    visible_ctes: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    match group_by {
+        GroupByExpr::All(_) => {}
+        GroupByExpr::Expressions(expressions, _) => {
+            for expr in expressions {
+                collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+            }
+        }
+    }
+}
+
+fn collect_public_query_relation_names_in_order_by(
+    order_by: &OrderBy,
+    visible_ctes: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    match &order_by.kind {
+        sqlparser::ast::OrderByKind::All(_) => {}
+        sqlparser::ast::OrderByKind::Expressions(expressions) => {
+            for expr in expressions {
+                collect_public_query_relation_names_in_order_by_expr(expr, visible_ctes, out);
+            }
+        }
+    }
+}
+
+fn collect_public_query_relation_names_in_order_by_expr(
+    order_by_expr: &OrderByExpr,
+    visible_ctes: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    collect_public_query_relation_names_in_expr(&order_by_expr.expr, visible_ctes, out);
+    if let Some(with_fill) = &order_by_expr.with_fill {
+        if let Some(from) = &with_fill.from {
+            collect_public_query_relation_names_in_expr(from, visible_ctes, out);
+        }
+        if let Some(to) = &with_fill.to {
+            collect_public_query_relation_names_in_expr(to, visible_ctes, out);
+        }
+        if let Some(step) = &with_fill.step {
+            collect_public_query_relation_names_in_expr(step, visible_ctes, out);
+        }
+    }
+}
+
+fn collect_public_query_relation_names_in_limit_clause(
+    limit_clause: &LimitClause,
+    visible_ctes: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    match limit_clause {
+        LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => {
+            if let Some(limit) = limit {
+                collect_public_query_relation_names_in_expr(limit, visible_ctes, out);
+            }
+            if let Some(offset) = offset {
+                collect_public_query_relation_names_in_expr(&offset.value, visible_ctes, out);
+            }
+            for expr in limit_by {
+                collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+            }
+        }
+        LimitClause::OffsetCommaLimit { offset, limit } => {
+            collect_public_query_relation_names_in_expr(offset, visible_ctes, out);
+            collect_public_query_relation_names_in_expr(limit, visible_ctes, out);
+        }
+    }
+}
+
+fn collect_public_query_relation_names_in_join_operator(
+    join_operator: &JoinOperator,
+    visible_ctes: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    let (match_condition, constraint) = match join_operator {
+        JoinOperator::AsOf {
+            match_condition,
+            constraint,
+        } => (Some(match_condition), Some(constraint)),
+        JoinOperator::Join(constraint)
+        | JoinOperator::Inner(constraint)
+        | JoinOperator::Left(constraint)
+        | JoinOperator::LeftOuter(constraint)
+        | JoinOperator::Right(constraint)
+        | JoinOperator::RightOuter(constraint)
+        | JoinOperator::FullOuter(constraint)
+        | JoinOperator::CrossJoin(constraint)
+        | JoinOperator::Semi(constraint)
+        | JoinOperator::LeftSemi(constraint)
+        | JoinOperator::RightSemi(constraint)
+        | JoinOperator::Anti(constraint)
+        | JoinOperator::LeftAnti(constraint)
+        | JoinOperator::RightAnti(constraint)
+        | JoinOperator::StraightJoin(constraint) => (None, Some(constraint)),
+        JoinOperator::CrossApply | JoinOperator::OuterApply => (None, None),
     };
-    let _ = query.visit(&mut collector);
-    collector.relation_names
+    if let Some(match_condition) = match_condition {
+        collect_public_query_relation_names_in_expr(match_condition, visible_ctes, out);
+    }
+    if let Some(constraint) = constraint {
+        collect_public_query_relation_names_in_join_constraint(constraint, visible_ctes, out);
+    }
+}
+
+fn collect_public_query_relation_names_in_join_constraint(
+    constraint: &JoinConstraint,
+    visible_ctes: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    if let JoinConstraint::On(expr) = constraint {
+        collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+    }
+}
+
+fn collect_public_query_relation_names_in_expr(
+    expr: &Expr,
+    visible_ctes: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            collect_public_query_relation_names_in_expr(left, visible_ctes, out);
+            collect_public_query_relation_names_in_expr(right, visible_ctes, out);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => {
+            collect_public_query_relation_names_in_expr(expr, visible_ctes, out)
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+            for item in list {
+                collect_public_query_relation_names_in_expr(item, visible_ctes, out);
+            }
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+            collect_public_query_relation_names_scoped(subquery, visible_ctes, out);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+            collect_public_query_relation_names_in_expr(low, visible_ctes, out);
+            collect_public_query_relation_names_in_expr(high, visible_ctes, out);
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+            collect_public_query_relation_names_in_expr(pattern, visible_ctes, out);
+        }
+        Expr::InUnnest {
+            expr, array_expr, ..
+        } => {
+            collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+            collect_public_query_relation_names_in_expr(array_expr, visible_ctes, out);
+        }
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            collect_public_query_relation_names_in_expr(left, visible_ctes, out);
+            collect_public_query_relation_names_in_expr(right, visible_ctes, out);
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            collect_public_query_relation_names_scoped(subquery, visible_ctes, out);
+        }
+        Expr::Function(function) => {
+            collect_public_query_relation_names_in_function_args(&function.args, visible_ctes, out);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                collect_public_query_relation_names_in_expr(operand, visible_ctes, out);
+            }
+            for condition in conditions {
+                collect_public_query_relation_names_in_expr(
+                    &condition.condition,
+                    visible_ctes,
+                    out,
+                );
+                collect_public_query_relation_names_in_expr(&condition.result, visible_ctes, out);
+            }
+            if let Some(else_result) = else_result {
+                collect_public_query_relation_names_in_expr(else_result, visible_ctes, out);
+            }
+        }
+        Expr::Tuple(items) => {
+            for item in items {
+                collect_public_query_relation_names_in_expr(item, visible_ctes, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_public_query_relation_names_in_function_args(
+    args: &FunctionArguments,
+    visible_ctes: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    if let FunctionArguments::List(list) = args {
+        for arg in &list.args {
+            match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                    collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+                }
+                FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
+                    if let FunctionArgExpr::Expr(expr) = arg {
+                        collect_public_query_relation_names_in_expr(expr, visible_ctes, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+struct PublicRelationCollectorVisitor<'a> {
+    visible_ctes: &'a BTreeSet<String>,
+    out: &'a mut BTreeSet<String>,
+}
+
+impl Visitor for PublicRelationCollectorVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<Self::Break> {
+        if let TableFactor::Table { name, .. } = table_factor {
+            if let Some(identifier) = name.0.last().and_then(ObjectNamePart::as_ident) {
+                let normalized = identifier.value.to_ascii_lowercase();
+                if !self.visible_ctes.contains(&normalized) {
+                    self.out.insert(normalized);
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 fn bound_public_surface_names(registry: &SurfaceRegistry, statement: &Statement) -> Vec<String> {
-    let Statement::Query(query) = statement else {
-        return Vec::new();
-    };
-    collect_public_query_relation_names(query)
+    summarize_bound_public_read_statement(registry, statement)
+        .bound_surface_bindings
         .into_iter()
-        .filter(|name| registry.bind_relation_name(name).is_some())
+        .map(|binding| binding.descriptor.public_name)
         .collect()
 }
 
@@ -922,18 +1219,49 @@ fn augment_dependency_spec_for_public_read(
     canonicalized: &CanonicalizedRead,
     dependency_spec: Option<DependencySpec>,
 ) -> Option<DependencySpec> {
+    let dependency_spec = dependency_spec?;
+    augment_dependency_spec_for_broad_public_read(registry, Some(dependency_spec)).map(
+        |mut dependency_spec| {
+            let has_state_schema_keys = dependency_spec
+                .schema_keys
+                .iter()
+                .any(|schema_key| schema_key != "lix_active_version");
+            if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::State
+                && !has_state_schema_keys
+            {
+                dependency_spec.schema_keys = registry
+                    .registered_state_backed_schema_keys()
+                    .into_iter()
+                    .collect();
+            }
+            dependency_spec
+        },
+    )
+}
+
+fn augment_dependency_spec_for_broad_public_read(
+    registry: &SurfaceRegistry,
+    dependency_spec: Option<DependencySpec>,
+) -> Option<DependencySpec> {
     let mut dependency_spec = dependency_spec?;
+    let references_state_like_surface = dependency_spec.relations.iter().any(|relation| {
+        registry
+            .bind_relation_name(relation)
+            .is_some_and(|binding| {
+                matches!(
+                    binding.descriptor.surface_family,
+                    SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
+                )
+            })
+    });
     let has_state_schema_keys = dependency_spec
         .schema_keys
         .iter()
         .any(|schema_key| schema_key != "lix_active_version");
-    if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::State
-        && !has_state_schema_keys
-    {
-        dependency_spec.schema_keys = registry
-            .registered_state_backed_schema_keys()
-            .into_iter()
-            .collect();
+    if references_state_like_surface && !has_state_schema_keys {
+        dependency_spec
+            .schema_keys
+            .extend(registry.registered_state_backed_schema_keys());
     }
     Some(dependency_spec)
 }
@@ -1099,6 +1427,7 @@ pub(crate) async fn try_prepare_sql2_write(
         debug_trace: Sql2DebugTrace {
             bound_statements: vec![bound_statement],
             surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
+            bound_public_leaves: vec![sql2_bound_public_leaf(&canonicalized.surface_binding)],
             dependency_spec: None,
             effective_state_request: None,
             effective_state_plan: None,
@@ -1753,8 +2082,10 @@ fn build_sql2_invariant_trace(planned_write: &PlannedWrite) -> Sql2InvariantTrac
 #[cfg(test)]
 mod tests {
     use super::{
-        prepare_sql2_public_execution, prepare_sql2_read, prepare_sql2_write,
-        Sql2PreparedPublicExecution, Sql2WriteExecution,
+        lower_public_read_query_with_sql2_backend, prepare_sql2_public_execution,
+        prepare_sql2_public_execution_with_internal_access, prepare_sql2_read,
+        prepare_sql2_read_strict, prepare_sql2_write, Sql2PreparedPublicExecution,
+        Sql2WriteExecution,
     };
     use crate::commit::AppendWriteLane;
     use crate::sql2::catalog::SurfaceRegistry;
@@ -2232,6 +2563,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lowers_backend_registered_public_queries_with_sql2_surface_expansion() {
+        let mut backend = FakeBackend::default();
+        backend.stored_schema_rows.insert(
+            "message".to_string(),
+            json!({
+                "value": {
+                    "x-lix-key": "message",
+                    "x-lix-version": "1",
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "body": { "type": "string" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let mut statements = parse_one("SELECT body FROM message WHERE id = 'm1'");
+        let Statement::Query(query) = statements.remove(0) else {
+            panic!("expected SELECT query");
+        };
+
+        let lowered = lower_public_read_query_with_sql2_backend(&backend, *query, &[])
+            .await
+            .expect("stored-schema derived public query should lower through backend registry");
+        let lowered_sql = lowered.to_string();
+
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_message"));
+        assert!(!lowered_sql.contains("FROM message"));
+    }
+
+    #[tokio::test]
     async fn prepares_builtin_entity_by_version_reads() {
         let backend = FakeBackend::default();
         let prepared = prepare_sql2_read(
@@ -2339,7 +2702,14 @@ mod tests {
         assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_change"]);
         assert!(prepared.effective_state_request.is_none());
         assert!(prepared.effective_state_plan.is_none());
-        assert_eq!(prepared.dependency_spec, None);
+        assert_eq!(
+            prepared
+                .dependency_spec
+                .as_ref()
+                .expect("change read should derive dependency spec")
+                .relations,
+            ["lix_change".to_string()].into_iter().collect()
+        );
         assert_eq!(
             prepared
                 .debug_trace
@@ -2498,7 +2868,7 @@ mod tests {
             .lowered_sql
             .first()
             .expect("filesystem by-version read should lower");
-        assert!(lowered_sql.contains("WITH RECURSIVE all_target_versions AS"));
+        assert!(lowered_sql.contains("all_target_versions AS"));
         assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_directory_descriptor"));
         assert!(!lowered_sql.contains("FROM lix_directory_by_version"));
     }
@@ -2741,18 +3111,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_none_for_unsupported_day_one_query_shapes() {
+    async fn prepares_bindable_cte_join_group_by_reads_via_surface_expansion() {
         let backend = FakeBackend::default();
-        let prepared = prepare_sql2_read(
+        let prepared = prepare_sql2_read_strict(
             &backend,
             &parse_one(
-                "SELECT * FROM lix_state s JOIN lix_state_by_version b ON s.entity_id = b.entity_id",
+                "WITH keyed AS ( \
+                   SELECT entity_id, schema_key \
+                   FROM lix_state \
+                   WHERE schema_key = 'lix_key_value' \
+                 ) \
+                 SELECT keyed.schema_key, COUNT(*) \
+                 FROM keyed \
+                 JOIN lix_state_by_version sv \
+                   ON sv.entity_id = keyed.entity_id \
+                 WHERE sv.lixcol_version_id = 'main' \
+                 GROUP BY keyed.schema_key \
+                 ORDER BY keyed.schema_key",
             ),
             &[],
             "main",
             None,
         )
-        .await;
+        .await
+        .expect("bindable cte/join/group-by read should not error")
+        .expect("bindable cte/join/group-by read should prepare through sql2");
+
+        assert!(prepared.canonicalized.is_none());
+        assert!(prepared.dependency_spec.is_some());
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_state", "lix_state_by_version"]
+        );
+        assert_eq!(
+            prepared
+                .debug_trace
+                .bound_public_leaves
+                .iter()
+                .map(|leaf| leaf.public_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lix_state", "lix_state_by_version"]
+        );
+        assert_eq!(
+            prepared
+                .dependency_spec
+                .as_ref()
+                .expect("broad read should derive dependency spec")
+                .precision,
+            crate::sql_shared::dependency_spec::DependencyPrecision::Conservative
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("surface-expanded read should lower");
+        assert!(!lowered_sql.contains("FROM lix_state "));
+        assert!(!lowered_sql.contains("JOIN lix_state_by_version"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(lowered_sql.contains("all_target_versions AS"));
+    }
+
+    #[tokio::test]
+    async fn prepares_group_by_having_reads_via_surface_expansion() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read_strict(
+            &backend,
+            &parse_one(
+                "SELECT schema_key, COUNT(*) AS count_rows \
+                 FROM lix_state \
+                 WHERE schema_key = 'lix_key_value' \
+                 GROUP BY schema_key \
+                 HAVING COUNT(*) > 0 \
+                 ORDER BY schema_key",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("group-by/having public read should not error")
+        .expect("group-by/having public read should prepare through sql2");
+
+        assert!(prepared.canonicalized.is_none());
+        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_state"]);
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("group-by/having read should lower");
+        assert!(!lowered_sql.contains("FROM lix_state"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(lowered_sql.contains("GROUP BY"));
+        assert!(lowered_sql.contains("HAVING"));
+    }
+
+    #[tokio::test]
+    async fn cte_shadowing_public_surface_names_stays_non_public() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_public_execution(
+            &backend,
+            &parse_one(
+                "WITH lix_state AS (SELECT 'shadow' AS entity_id) SELECT entity_id FROM lix_state",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("cte shadowing should classify cleanly");
 
         assert!(prepared.is_none());
     }
@@ -2775,9 +3241,29 @@ mod tests {
         .expect("joined admin read should prepare through sql2");
 
         assert!(prepared.canonicalized.is_none());
+        assert!(prepared.dependency_spec.is_some());
         assert_eq!(
             prepared.debug_trace.surface_bindings,
             vec!["lix_active_version", "lix_version"]
+        );
+        assert_eq!(
+            prepared
+                .debug_trace
+                .bound_public_leaves
+                .iter()
+                .map(|leaf| leaf.public_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lix_active_version", "lix_version"]
+        );
+        assert_eq!(
+            prepared
+                .dependency_spec
+                .as_ref()
+                .expect("joined admin read should derive dependency spec")
+                .relations,
+            ["lix_active_version".to_string(), "lix_version".to_string()]
+                .into_iter()
+                .collect()
         );
         let lowered_sql = prepared
             .debug_trace
@@ -2786,6 +3272,92 @@ mod tests {
             .expect("joined admin read should lower");
         assert!(lowered_sql.contains("lix_internal_state_untracked"));
         assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_version_descriptor"));
+    }
+
+    #[tokio::test]
+    async fn prepares_public_reads_joined_with_backend_real_tables() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read_strict(
+            &backend,
+            &parse_one(
+                "SELECT av.version_id \
+                 FROM app_versions app \
+                 JOIN lix_active_version av \
+                   ON av.version_id = app.id",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("public/external mixed read should not error")
+        .expect("public/external mixed read should prepare through sql2");
+
+        assert!(prepared.canonicalized.is_none());
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_active_version"]
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("mixed read should lower");
+        assert!(lowered_sql.contains("app_versions"));
+        assert!(lowered_sql.contains("lix_internal_state_untracked"));
+    }
+
+    #[tokio::test]
+    async fn rejects_public_reads_mixed_with_internal_engine_tables() {
+        let backend = FakeBackend::default();
+        let error = prepare_sql2_read_strict(
+            &backend,
+            &parse_one(
+                "SELECT av.version_id \
+                 FROM lix_active_version av \
+                 JOIN lix_internal_state_untracked u ON u.entity_id = av.id",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect_err("public/internal mixed read should be rejected");
+
+        assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
+        assert!(error.description.contains("lix_internal_state_untracked"));
+    }
+
+    #[tokio::test]
+    async fn allows_public_reads_mixed_with_internal_engine_tables_when_internal_access_enabled() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_public_execution_with_internal_access(
+            &backend,
+            &parse_one(
+                "SELECT av.version_id \
+                 FROM lix_active_version av \
+                 JOIN lix_internal_state_untracked u ON u.entity_id = av.id",
+            ),
+            &[],
+            "main",
+            None,
+            true,
+        )
+        .await
+        .expect("public/internal mixed read should prepare when internal access is enabled")
+        .expect("public/internal mixed read should return a prepared sql2 read");
+
+        let Sql2PreparedPublicExecution::Read(prepared) = prepared else {
+            panic!("expected prepared public read");
+        };
+
+        assert!(prepared.canonicalized.is_none());
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("public/internal mixed read should lower");
+        assert!(lowered_sql.contains("lix_internal_state_untracked"));
     }
 
     #[tokio::test]
@@ -2861,7 +3433,7 @@ mod tests {
             .first()
             .expect("state-by-version read should lower");
         assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
-        assert!(lowered_sql.contains("WITH all_target_versions AS"));
+        assert!(lowered_sql.contains("all_target_versions AS"));
     }
 
     #[tokio::test]

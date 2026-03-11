@@ -1,5 +1,9 @@
+use crate::sql2::catalog::{SurfaceBinding, SurfaceFamily};
 use crate::sql2::planner::canonicalize::CanonicalizedRead;
-use crate::sql2::planner::ir::{CanonicalAdminKind, FilesystemKind, ReadPlan, VersionScope};
+use crate::sql2::planner::ir::{
+    CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan,
+    CanonicalWorkingChangesScan, FilesystemKind, ReadPlan, VersionScope,
+};
 use crate::sql_shared::dependency_spec::{DependencyPrecision, DependencySpec};
 use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
@@ -16,6 +20,9 @@ pub(crate) fn derive_dependency_spec_from_canonicalized_read(
     let Statement::Query(query) = &canonicalized.bound_statement.statement else {
         return None;
     };
+    if let Some(change_scan) = canonical_change_scan(&canonicalized.read_command.root) {
+        return Some(dependency_spec_for_change_scan(&change_scan.binding));
+    }
     if canonical_working_changes_scan(&canonicalized.read_command.root).is_some() {
         return Some(dependency_spec_for_working_changes_scan());
     }
@@ -70,12 +77,7 @@ pub(crate) fn derive_dependency_spec_from_canonicalized_read(
     }
 
     let mut spec = collector.spec;
-    if scan.version_scope == VersionScope::ActiveVersion
-        || matches!(
-            scan.binding.descriptor.public_name.as_str(),
-            "lix_file_history" | "lix_directory_history"
-        )
-    {
+    if state_like_surface_depends_on_active_version(&scan.binding, scan.version_scope) {
         spec.depends_on_active_version = true;
         spec.schema_keys.insert("lix_active_version".to_string());
         spec.entity_ids.clear();
@@ -84,6 +86,22 @@ pub(crate) fn derive_dependency_spec_from_canonicalized_read(
     }
 
     Some(spec)
+}
+
+pub(crate) fn derive_dependency_spec_from_bound_public_surface_bindings(
+    bindings: &[SurfaceBinding],
+) -> Option<DependencySpec> {
+    let mut iter = bindings.iter();
+    let first = iter.next()?;
+    let mut merged = dependency_spec_for_bound_surface(first);
+    for binding in iter {
+        merged = merge_dependency_specs(merged, dependency_spec_for_bound_surface(binding));
+    }
+    merged.precision = DependencyPrecision::Conservative;
+    merged.entity_ids.clear();
+    merged.file_ids.clear();
+    merged.version_ids.clear();
+    Some(merged)
 }
 
 fn dependency_spec_for_admin_scan(kind: CanonicalAdminKind) -> DependencySpec {
@@ -109,6 +127,23 @@ fn dependency_spec_for_admin_scan(kind: CanonicalAdminKind) -> DependencySpec {
         }
     }
     spec
+}
+
+fn dependency_spec_for_bound_surface(binding: &SurfaceBinding) -> DependencySpec {
+    if let Some(admin_scan) = CanonicalAdminScan::from_surface_binding(binding.clone()) {
+        return dependency_spec_for_admin_scan(admin_scan.kind);
+    }
+    if let Some(filesystem_scan) = CanonicalFilesystemScan::from_surface_binding(binding.clone()) {
+        return dependency_spec_for_filesystem_scan(filesystem_scan.kind, binding);
+    }
+    if CanonicalWorkingChangesScan::from_surface_binding(binding.clone()).is_some() {
+        return dependency_spec_for_working_changes_scan();
+    }
+    if CanonicalChangeScan::from_surface_binding(binding.clone()).is_some() {
+        return dependency_spec_for_change_scan(binding);
+    }
+
+    dependency_spec_for_state_like_surface(binding)
 }
 
 fn dependency_spec_for_working_changes_scan() -> DependencySpec {
@@ -153,6 +188,84 @@ fn dependency_spec_for_filesystem_scan(
 
     spec.precision = DependencyPrecision::Conservative;
     spec
+}
+
+fn dependency_spec_for_change_scan(binding: &SurfaceBinding) -> DependencySpec {
+    DependencySpec {
+        relations: [binding.descriptor.public_name.clone()]
+            .into_iter()
+            .collect(),
+        precision: DependencyPrecision::Conservative,
+        ..DependencySpec::default()
+    }
+}
+
+fn dependency_spec_for_state_like_surface(binding: &SurfaceBinding) -> DependencySpec {
+    let mut spec = DependencySpec {
+        relations: [binding.descriptor.public_name.clone()]
+            .into_iter()
+            .collect(),
+        ..DependencySpec::default()
+    };
+    if matches!(
+        binding.descriptor.surface_family,
+        SurfaceFamily::State | SurfaceFamily::Entity
+    ) {
+        if let Some(schema_key) = binding.implicit_overrides.fixed_schema_key.clone() {
+            spec.schema_keys.insert(schema_key);
+        }
+        let version_scope = match binding.default_scope {
+            crate::sql2::catalog::DefaultScopeSemantics::ActiveVersion => {
+                Some(VersionScope::ActiveVersion)
+            }
+            crate::sql2::catalog::DefaultScopeSemantics::ExplicitVersion => {
+                Some(VersionScope::ExplicitVersion)
+            }
+            crate::sql2::catalog::DefaultScopeSemantics::History => Some(VersionScope::History),
+            crate::sql2::catalog::DefaultScopeSemantics::GlobalAdmin
+            | crate::sql2::catalog::DefaultScopeSemantics::WorkingChanges => None,
+        };
+        if version_scope
+            .is_some_and(|scope| state_like_surface_depends_on_active_version(binding, scope))
+        {
+            spec.depends_on_active_version = true;
+            spec.schema_keys.insert("lix_active_version".to_string());
+        }
+        spec.precision = DependencyPrecision::Conservative;
+    }
+    spec
+}
+
+fn state_like_surface_depends_on_active_version(
+    binding: &SurfaceBinding,
+    version_scope: VersionScope,
+) -> bool {
+    version_scope == VersionScope::ActiveVersion
+        || (version_scope == VersionScope::History
+            && !binding
+                .descriptor
+                .public_name
+                .ends_with("_history_by_version"))
+}
+
+fn merge_dependency_specs(mut left: DependencySpec, right: DependencySpec) -> DependencySpec {
+    left.relations.extend(right.relations);
+    left.schema_keys.extend(right.schema_keys);
+    left.entity_ids.extend(right.entity_ids);
+    left.file_ids.extend(right.file_ids);
+    left.version_ids.extend(right.version_ids);
+    left.writer_filter
+        .include
+        .extend(right.writer_filter.include);
+    left.writer_filter
+        .exclude
+        .extend(right.writer_filter.exclude);
+    left.include_untracked |= right.include_untracked;
+    left.depends_on_active_version |= right.depends_on_active_version;
+    if left.precision != right.precision {
+        left.precision = DependencyPrecision::Conservative;
+    }
+    left
 }
 
 fn canonical_state_scan(
@@ -216,6 +329,22 @@ fn canonical_working_changes_scan(
         | ReadPlan::Project { input, .. }
         | ReadPlan::Sort { input, .. }
         | ReadPlan::Limit { input, .. } => canonical_working_changes_scan(input),
+    }
+}
+
+fn canonical_change_scan(
+    read_plan: &ReadPlan,
+) -> Option<&crate::sql2::planner::ir::CanonicalChangeScan> {
+    match read_plan {
+        ReadPlan::ChangeScan(scan) => Some(scan),
+        ReadPlan::Scan(_)
+        | ReadPlan::FilesystemScan(_)
+        | ReadPlan::AdminScan(_)
+        | ReadPlan::WorkingChangesScan(_) => None,
+        ReadPlan::Filter { input, .. }
+        | ReadPlan::Project { input, .. }
+        | ReadPlan::Sort { input, .. }
+        | ReadPlan::Limit { input, .. } => canonical_change_scan(input),
     }
 }
 

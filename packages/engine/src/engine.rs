@@ -141,7 +141,8 @@ impl<'a> EngineTransaction<'a> {
             let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
             reject_internal_table_writes(&parsed_statements)?;
         }
-        self.execute_with_access(sql, params).await
+        self.execute_with_access(sql, params, self.engine.access_to_internal)
+            .await
     }
 
     pub(crate) async fn execute_internal(
@@ -149,13 +150,14 @@ impl<'a> EngineTransaction<'a> {
         sql: &str,
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
-        self.execute_with_access(sql, params).await
+        self.execute_with_access(sql, params, true).await
     }
 
     async fn execute_with_access(
         &mut self,
         sql: &str,
         params: &[Value],
+        allow_internal_tables: bool,
     ) -> Result<ExecuteResult, LixError> {
         let previous_active_version_id = self.active_version_id.clone();
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
@@ -170,6 +172,7 @@ impl<'a> EngineTransaction<'a> {
                     parsed_statements.clone(),
                     params,
                     &self.options,
+                    allow_internal_tables,
                     &mut self.active_version_id,
                     &mut self.pending_state_commit_stream_changes,
                     &mut self.pending_sql2_append_session,
@@ -183,6 +186,7 @@ impl<'a> EngineTransaction<'a> {
                     sql,
                     params,
                     &self.options,
+                    allow_internal_tables,
                     &mut self.active_version_id,
                     None,
                     false,
