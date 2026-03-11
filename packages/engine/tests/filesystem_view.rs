@@ -1100,12 +1100,9 @@ simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
         )
         .await
         .expect_err("lix_file_history insert should fail");
-    assert!(
-        file_history_err
-            .description
-            .contains("lix_file_history does not support INSERT"),
-        "unexpected error: {}",
-        file_history_err.description
+    assert_eq!(
+        file_history_err.code,
+        "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED"
     );
 
     let file_history_update_err = engine
@@ -1115,24 +1112,18 @@ simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
         )
         .await
         .expect_err("lix_file_history update should fail");
-    assert!(
-        file_history_update_err
-            .description
-            .contains("lix_file_history does not support UPDATE"),
-        "unexpected error: {}",
-        file_history_update_err.description
+    assert_eq!(
+        file_history_update_err.code,
+        "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED"
     );
 
     let file_history_delete_err = engine
         .execute("DELETE FROM lix_file_history WHERE id = 'f-history'", &[])
         .await
         .expect_err("lix_file_history delete should fail");
-    assert!(
-        file_history_delete_err
-            .description
-            .contains("lix_file_history does not support DELETE"),
-        "unexpected error: {}",
-        file_history_delete_err.description
+    assert_eq!(
+        file_history_delete_err.code,
+        "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED"
     );
 
     let directory_history_err = engine
@@ -1142,12 +1133,9 @@ simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
         )
         .await
         .expect_err("lix_directory_history delete should fail");
-    assert!(
-        directory_history_err
-            .description
-            .contains("lix_directory_history does not support DELETE"),
-        "unexpected error: {}",
-        directory_history_err.description
+    assert_eq!(
+        directory_history_err.code,
+        "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED"
     );
 
     let directory_history_insert_err = engine
@@ -1157,12 +1145,9 @@ simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
         )
         .await
         .expect_err("lix_directory_history insert should fail");
-    assert!(
-        directory_history_insert_err
-            .description
-            .contains("lix_directory_history does not support INSERT"),
-        "unexpected error: {}",
-        directory_history_insert_err.description
+    assert_eq!(
+        directory_history_insert_err.code,
+        "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED"
     );
 
     let directory_history_update_err = engine
@@ -1172,12 +1157,9 @@ simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
         )
         .await
         .expect_err("lix_directory_history update should fail");
-    assert!(
-        directory_history_update_err
-            .description
-            .contains("lix_directory_history does not support UPDATE"),
-        "unexpected error: {}",
-        directory_history_update_err.description
+    assert_eq!(
+        directory_history_update_err.code,
+        "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED"
     );
 });
 

@@ -72,9 +72,9 @@ pub(crate) fn build_domain_change_batch(
             snapshot_content: if row.tombstone {
                 None
             } else {
-                text_value(&row.values, "snapshot_content")
+                serialized_value(&row.values, "snapshot_content")
             },
-            metadata: text_value(&row.values, "metadata"),
+            metadata: serialized_value(&row.values, "metadata"),
             version_id: row.version_id.clone().ok_or_else(|| DomainChangeError {
                 message: "sql2 domain-change derivation requires a concrete version_id".to_string(),
             })?,
@@ -313,6 +313,16 @@ fn text_value(
         Some(crate::Value::Boolean(value)) => Some(value.to_string()),
         Some(crate::Value::Real(value)) => Some(value.to_string()),
         _ => None,
+    }
+}
+
+fn serialized_value(
+    values: &std::collections::BTreeMap<String, crate::Value>,
+    key: &str,
+) -> Option<String> {
+    match values.get(key) {
+        Some(crate::Value::Json(value)) => Some(value.to_string()),
+        _ => text_value(values, key),
     }
 }
 

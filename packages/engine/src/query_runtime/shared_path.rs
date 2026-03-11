@@ -1145,7 +1145,7 @@ async fn apply_sql2_untracked_upsert(
     let file_id = planned_row_text_value(row, "file_id")?;
     let plugin_key = planned_row_text_value(row, "plugin_key")?;
     let schema_version = planned_row_text_value(row, "schema_version")?;
-    let snapshot_content = planned_row_text_value(row, "snapshot_content")?;
+    let snapshot_content = planned_row_json_text_value(row, "snapshot_content")?;
     let metadata_sql = planned_row_optional_text_value(row, "metadata")
         .map(|value| format!("'{}'", escape_sql_string(value)))
         .unwrap_or_else(|| "NULL".to_string());
@@ -1178,7 +1178,7 @@ async fn apply_sql2_untracked_upsert(
         version_id = escape_sql_string(row.version_id.as_deref().unwrap_or(GLOBAL_VERSION_ID)),
         global = if global { "true" } else { "false" },
         plugin_key = escape_sql_string(plugin_key),
-        snapshot_content = escape_sql_string(snapshot_content),
+        snapshot_content = escape_sql_string(&snapshot_content),
         metadata = metadata_sql,
         writer_key = writer_key_sql,
         schema_version = escape_sql_string(schema_version),
@@ -1219,12 +1219,35 @@ fn planned_row_text_value<'a>(
     })
 }
 
+fn planned_row_json_text_value(
+    row: &crate::sql2::planner::ir::PlannedStateRow,
+    key: &str,
+) -> Result<String, LixError> {
+    planned_row_optional_json_text_value(row, key)
+        .map(|value| value.into_owned())
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("sql2 untracked execution requires '{key}' in the resolved row"),
+        })
+}
+
 fn planned_row_optional_text_value<'a>(
     row: &'a crate::sql2::planner::ir::PlannedStateRow,
     key: &str,
 ) -> Option<&'a str> {
     match row.values.get(key) {
         Some(Value::Text(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn planned_row_optional_json_text_value<'a>(
+    row: &'a crate::sql2::planner::ir::PlannedStateRow,
+    key: &str,
+) -> Option<std::borrow::Cow<'a, str>> {
+    match row.values.get(key) {
+        Some(Value::Text(value)) => Some(std::borrow::Cow::Borrowed(value.as_str())),
+        Some(Value::Json(value)) => Some(std::borrow::Cow::Owned(value.to_string())),
         _ => None,
     }
 }
@@ -1368,13 +1391,10 @@ fn version_checkpoint_rows(
     rows.iter()
         .filter(|row| row.schema_key == crate::version::version_pointer_schema_key())
         .filter_map(|row| {
-            row.values
-                .get("snapshot_content")
-                .and_then(|value| match value {
-                    Value::Text(text) => Some(text.as_str()),
-                    _ => None,
+            planned_row_optional_json_text_value(row, "snapshot_content")
+                .and_then(|snapshot| {
+                    serde_json::from_str::<serde_json::Value>(snapshot.as_ref()).ok()
                 })
-                .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
                 .and_then(|snapshot| {
                     snapshot
                         .get("commit_id")

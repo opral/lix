@@ -28,7 +28,7 @@ use crate::sql2::planner::semantics::effective_state_resolver::{
     resolve_exact_effective_state_row, ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
     OverlayLane,
 };
-use crate::sql2::runtime::prepare_sql2_read;
+use crate::sql2::runtime::prepare_sql2_read_strict;
 use crate::sql_shared::ast::{lower_statement, parse_sql_statements};
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
@@ -140,7 +140,23 @@ async fn resolve_existing_state_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    ensure_exact_selector(planned_write)?;
+    if planned_write.command.selector.exact_only {
+        return resolve_existing_state_write_exact(backend, planned_write).await;
+    }
+    if !supports_selector_driven_state_resolution(planned_write) {
+        return Err(WriteResolveError {
+            message: "sql2 day-1 update/delete resolver only supports exact conjunctive selectors"
+                .to_string(),
+        });
+    }
+    let current_rows = resolve_target_state_rows(backend, planned_write).await?;
+    resolve_existing_state_write_from_rows(planned_write, current_rows)
+}
+
+async fn resolve_existing_state_write_exact(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
     let schema_key = resolved_schema_key(planned_write)?;
     let version_id = resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
         message: "sql2 existing-row write resolver requires a concrete version_id".to_string(),
@@ -162,64 +178,102 @@ async fn resolve_existing_state_write(
             default_execution_mode_for_request(planned_write.command.requested_mode),
         ));
     };
-    let execution_mode = resolve_execution_mode_for_effective_row(
+    resolve_existing_state_write_from_rows(planned_write, vec![current_row])
+}
+
+fn resolve_existing_state_write_from_rows(
+    planned_write: &PlannedWrite,
+    current_rows: Vec<ExactEffectiveStateRow>,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    if current_rows.is_empty() {
+        return Ok(noop_resolved_write_plan(
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+        ));
+    }
+    let execution_mode = resolve_execution_mode_for_effective_rows(
         planned_write.command.requested_mode,
-        &current_row,
+        &current_rows,
     )?;
 
-    let row_ref = ResolvedRowRef {
-        entity_id: current_row.entity_id.clone(),
-        schema_key: current_row.schema_key.clone(),
-        version_id: Some(current_row.version_id.clone()),
-        source_change_id: current_row.source_change_id.clone(),
-        source_commit_id: None,
-    };
-    let lineage = vec![RowLineage {
-        entity_id: current_row.entity_id.clone(),
-        source_change_id: current_row.source_change_id.clone(),
-        source_commit_id: None,
-    }];
+    let mut authoritative_pre_state = Vec::new();
+    let mut intended_post_state = Vec::new();
+    let mut tombstones = Vec::new();
+    let mut lineage = Vec::new();
 
     match planned_write.command.operation_kind {
         WriteOperationKind::Update => {
-            let values = merged_update_values(&current_row.values, planned_write)?;
-            ensure_identity_columns_preserved(
-                &current_row.entity_id,
-                &current_row.schema_key,
-                &current_row.file_id,
-                &current_row.version_id,
-                &values,
-            )?;
-
-            Ok(ResolvedWritePlan {
-                execution_mode,
-                authoritative_pre_state: vec![row_ref],
-                intended_post_state: vec![PlannedStateRow {
+            for current_row in current_rows {
+                let values = merged_update_values(&current_row.values, planned_write)?;
+                ensure_identity_columns_preserved(
+                    &current_row.entity_id,
+                    &current_row.schema_key,
+                    &current_row.file_id,
+                    &current_row.version_id,
+                    &values,
+                )?;
+                let row_ref = ResolvedRowRef {
+                    entity_id: current_row.entity_id.clone(),
+                    schema_key: current_row.schema_key.clone(),
+                    version_id: Some(current_row.version_id.clone()),
+                    source_change_id: current_row.source_change_id.clone(),
+                    source_commit_id: None,
+                };
+                authoritative_pre_state.push(row_ref.clone());
+                intended_post_state.push(PlannedStateRow {
                     entity_id: current_row.entity_id.clone(),
                     schema_key: current_row.schema_key.clone(),
                     version_id: Some(current_row.version_id.clone()),
                     values,
                     tombstone: false,
-                }],
-                tombstones: Vec::new(),
+                });
+                lineage.push(RowLineage {
+                    entity_id: current_row.entity_id,
+                    source_change_id: row_ref.source_change_id,
+                    source_commit_id: None,
+                });
+            }
+            Ok(ResolvedWritePlan {
+                execution_mode,
+                authoritative_pre_state,
+                intended_post_state,
+                tombstones,
                 lineage,
                 target_write_lane: None,
             })
         }
-        WriteOperationKind::Delete => Ok(ResolvedWritePlan {
-            execution_mode,
-            authoritative_pre_state: vec![row_ref.clone()],
-            intended_post_state: vec![PlannedStateRow {
-                entity_id: current_row.entity_id,
-                schema_key: current_row.schema_key,
-                version_id: Some(current_row.version_id),
-                values: current_row.values,
-                tombstone: true,
-            }],
-            tombstones: vec![row_ref],
-            lineage,
-            target_write_lane: None,
-        }),
+        WriteOperationKind::Delete => {
+            for current_row in current_rows {
+                let row_ref = ResolvedRowRef {
+                    entity_id: current_row.entity_id.clone(),
+                    schema_key: current_row.schema_key.clone(),
+                    version_id: Some(current_row.version_id.clone()),
+                    source_change_id: current_row.source_change_id.clone(),
+                    source_commit_id: None,
+                };
+                authoritative_pre_state.push(row_ref.clone());
+                intended_post_state.push(PlannedStateRow {
+                    entity_id: current_row.entity_id.clone(),
+                    schema_key: current_row.schema_key.clone(),
+                    version_id: Some(current_row.version_id.clone()),
+                    values: current_row.values,
+                    tombstone: true,
+                });
+                tombstones.push(row_ref.clone());
+                lineage.push(RowLineage {
+                    entity_id: current_row.entity_id,
+                    source_change_id: row_ref.source_change_id,
+                    source_commit_id: None,
+                });
+            }
+            Ok(ResolvedWritePlan {
+                execution_mode,
+                authoritative_pre_state,
+                intended_post_state,
+                tombstones,
+                lineage,
+                target_write_lane: None,
+            })
+        }
         WriteOperationKind::Insert => Err(WriteResolveError {
             message: "sql2 existing-row resolver does not handle inserts".to_string(),
         }),
@@ -3406,7 +3460,13 @@ async fn resolve_target_entity_rows(
     let version_id = resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
         message: "sql2 entity write resolver requires a concrete version_id".to_string(),
     })?;
-    let entity_ids = query_entity_ids_for_selector(backend, planned_write).await?;
+    let entity_ids = query_entity_ids_for_selector(
+        backend,
+        planned_write,
+        "lixcol_entity_id",
+        "sql2 entity selector resolver expected lixcol_entity_id text rows",
+    )
+    .await?;
     let mut rows = Vec::new();
     for entity_id in entity_ids {
         let exact_filters = entity_state_exact_filters(planned_write, entity_schema, &entity_id)?;
@@ -3433,6 +3493,8 @@ async fn resolve_target_entity_rows(
 async fn query_entity_ids_for_selector(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    selector_column: &str,
+    error_message: &str,
 ) -> Result<Vec<String>, WriteResolveError> {
     let predicate_sql = planned_write
         .command
@@ -3441,12 +3503,12 @@ async fn query_entity_ids_for_selector(
         .join(" AND ");
     let sql = if predicate_sql.is_empty() {
         format!(
-            "SELECT lixcol_entity_id FROM {}",
-            planned_write.command.target.descriptor.public_name
+            "SELECT {selector_column} FROM {}",
+            planned_write.command.target.descriptor.public_name,
         )
     } else {
         format!(
-            "SELECT lixcol_entity_id FROM {} WHERE {}",
+            "SELECT {selector_column} FROM {} WHERE {}",
             planned_write.command.target.descriptor.public_name, predicate_sql
         )
     };
@@ -3459,7 +3521,7 @@ async fn query_entity_ids_for_selector(
         .requested_version_id
         .as_deref()
         .unwrap_or(GLOBAL_VERSION_ID);
-    let prepared = prepare_sql2_read(
+    let prepared = prepare_sql2_read_strict(
         backend,
         &statements,
         &planned_write.command.bound_parameters,
@@ -3471,6 +3533,7 @@ async fn query_entity_ids_for_selector(
             .as_deref(),
     )
     .await
+    .map_err(write_resolve_backend_error)?
     .ok_or_else(|| WriteResolveError {
         message: "sql2 entity selector resolver could not prepare selector read".to_string(),
     })?;
@@ -3529,7 +3592,10 @@ async fn query_entity_ids_for_selector(
     };
     for statement in lowered_statements {
         query_result = backend
-            .execute(&statement.to_string(), &planned_write.command.bound_parameters)
+            .execute(
+                &statement.to_string(),
+                &planned_write.command.bound_parameters,
+            )
             .await
             .map_err(write_resolve_backend_error)?;
     }
@@ -3538,8 +3604,7 @@ async fn query_entity_ids_for_selector(
     for row in query_result.rows {
         let Some(entity_id) = row.first().and_then(text_from_value) else {
             return Err(WriteResolveError {
-                message: "sql2 entity selector resolver expected lixcol_entity_id text rows"
-                    .to_string(),
+                message: error_message.to_string(),
             });
         };
         if !entity_ids.iter().any(|existing| existing == &entity_id) {
@@ -3547,6 +3612,65 @@ async fn query_entity_ids_for_selector(
         }
     }
     Ok(entity_ids)
+}
+
+async fn resolve_target_state_rows(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
+    let schema_key = resolved_schema_key(planned_write)?;
+    let version_id = resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
+        message: "sql2 existing-row write resolver requires a concrete version_id".to_string(),
+    })?;
+    let entity_ids = query_entity_ids_for_selector(
+        backend,
+        planned_write,
+        "entity_id",
+        "sql2 state selector resolver expected entity_id text rows",
+    )
+    .await?;
+    let mut rows = Vec::new();
+    for entity_id in entity_ids {
+        let exact_filters = state_selector_exact_filters(planned_write, &entity_id);
+        let Some(current_row) = resolve_exact_effective_state_row(
+            backend,
+            &ExactEffectiveStateRowRequest {
+                schema_key: schema_key.clone(),
+                version_id: version_id.clone(),
+                exact_filters,
+                include_global_overlay: true,
+                include_untracked_overlay: true,
+            },
+        )
+        .await
+        .map_err(write_resolve_backend_error)?
+        else {
+            continue;
+        };
+        rows.push(current_row);
+    }
+    Ok(rows)
+}
+
+fn state_selector_exact_filters(
+    planned_write: &PlannedWrite,
+    entity_id: &str,
+) -> BTreeMap<String, Value> {
+    let mut exact_filters = planned_write.command.selector.exact_filters.clone();
+    exact_filters.insert("entity_id".to_string(), Value::Text(entity_id.to_string()));
+    exact_filters
+}
+
+fn supports_selector_driven_state_resolution(planned_write: &PlannedWrite) -> bool {
+    if planned_write.command.target.descriptor.public_name != "lix_state" {
+        return false;
+    }
+    planned_write
+        .command
+        .selector
+        .residual_predicates
+        .iter()
+        .all(|predicate| !predicate.to_ascii_uppercase().contains(" OR "))
 }
 
 fn merged_entity_update_values(

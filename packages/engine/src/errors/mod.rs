@@ -311,11 +311,11 @@ mod tests {
         assert!(classification_src.contains("errors::sql_unknown_column_error("));
         assert!(classification_src.contains("errors::table_not_found_read_error()"));
 
-        let state_history_write_src = include_str!("../internal_state/canonical_write.rs");
-        assert!(state_history_write_src.contains("errors::read_only_view_write_error("));
+        let state_history_write_src = include_str!("../sql2/runtime/mod.rs");
+        assert!(state_history_write_src.contains("read_only_view_write_error("));
 
-        let change_write_src = include_str!("../internal_state/canonical_write.rs");
-        assert!(change_write_src.contains("errors::read_only_view_write_error("));
+        let change_write_src = include_str!("../sql2/runtime/mod.rs");
+        assert!(change_write_src.contains("read_only_view_write_error("));
 
         let vtable_write_src = include_str!("../internal_state/vtable_write.rs");
         assert!(vtable_write_src.contains("errors::vtable_schema_key_required_error"));

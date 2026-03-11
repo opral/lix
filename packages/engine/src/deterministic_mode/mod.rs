@@ -137,27 +137,11 @@ pub async fn load_settings(backend: &dyn LixBackend) -> Result<DeterministicSett
 }
 
 pub async fn load_persisted_sequence_next(backend: &dyn LixBackend) -> Result<i64, LixError> {
-    let sql = format!(
-        "SELECT snapshot_content \
-         FROM lix_internal_state_untracked \
-         WHERE schema_key = '{schema_key}' \
-           AND entity_id = '{entity_id}' \
-           AND version_id = '{version_id}' \
-           AND snapshot_content IS NOT NULL",
-        schema_key = escape_sql_string(key_value_schema_key()),
-        entity_id = escape_sql_string(SEQUENCE_KEY),
-        version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
-    );
-    let result = match backend.execute(&sql, &[]).await {
-        Ok(result) => result,
-        Err(err) if is_missing_relation_error(&err) => return Ok(0),
-        Err(err) => return Err(err),
-    };
-    let highest_seen = result
-        .rows
-        .iter()
-        .filter_map(|row| parse_first_payload(Some(row)).ok().flatten())
-        .filter_map(|value| parse_integer_value(&value))
+    let committed_highest = load_sequence_highest_from_committed_state(backend).await?;
+    let untracked_highest = load_sequence_highest_from_untracked_state(backend).await?;
+    let highest_seen = committed_highest
+        .into_iter()
+        .chain(untracked_highest)
         .max()
         .unwrap_or(-1);
     Ok(highest_seen + 1)
@@ -226,6 +210,70 @@ async fn load_key_value_payload(
         .execute(&rewritten.sql, rewritten.single_statement_params()?)
         .await?;
     parse_first_payload(result.rows.first())
+}
+
+async fn load_sequence_highest_from_committed_state(
+    backend: &dyn LixBackend,
+) -> Result<Option<i64>, LixError> {
+    let table_name = format!(
+        "lix_internal_state_materialized_v1_{}",
+        key_value_schema_key()
+    );
+    load_sequence_highest_from_table(
+        backend,
+        &table_name,
+        &format!(
+            "entity_id = '{entity_id}' \
+             AND version_id = '{version_id}' \
+             AND snapshot_content IS NOT NULL \
+             AND is_tombstone = 0",
+            entity_id = escape_sql_string(SEQUENCE_KEY),
+            version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
+        ),
+    )
+    .await
+}
+
+async fn load_sequence_highest_from_untracked_state(
+    backend: &dyn LixBackend,
+) -> Result<Option<i64>, LixError> {
+    load_sequence_highest_from_table(
+        backend,
+        "lix_internal_state_untracked",
+        &format!(
+            "schema_key = '{schema_key}' \
+             AND entity_id = '{entity_id}' \
+             AND version_id = '{version_id}' \
+             AND snapshot_content IS NOT NULL",
+            schema_key = escape_sql_string(key_value_schema_key()),
+            entity_id = escape_sql_string(SEQUENCE_KEY),
+            version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
+        ),
+    )
+    .await
+}
+
+async fn load_sequence_highest_from_table(
+    backend: &dyn LixBackend,
+    table_name: &str,
+    where_clause: &str,
+) -> Result<Option<i64>, LixError> {
+    let sql = format!(
+        "SELECT snapshot_content \
+         FROM {table_name} \
+         WHERE {where_clause}",
+    );
+    let result = match backend.execute(&sql, &[]).await {
+        Ok(result) => result,
+        Err(err) if is_missing_relation_error(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    Ok(result
+        .rows
+        .iter()
+        .filter_map(|row| parse_first_payload(Some(row)).ok().flatten())
+        .filter_map(|value| parse_integer_value(&value))
+        .max())
 }
 
 fn parse_integer_value(value: &JsonValue) -> Option<i64> {
