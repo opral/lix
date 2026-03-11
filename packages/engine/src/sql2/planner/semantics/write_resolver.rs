@@ -3462,7 +3462,7 @@ async fn query_entity_ids_for_selector(
     let prepared = prepare_sql2_read(
         backend,
         &statements,
-        &[],
+        &planned_write.command.bound_parameters,
         active_version_id,
         planned_write
             .command
@@ -3486,13 +3486,13 @@ async fn query_entity_ids_for_selector(
         .as_ref()
         .map(|spec| spec.schema_keys.iter().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
-    if let Some(schema_key) = prepared
-        .canonicalized
-        .surface_binding
-        .implicit_overrides
-        .fixed_schema_key
-        .clone()
-    {
+    if let Some(schema_key) = prepared.canonicalized.as_ref().and_then(|canonicalized| {
+        canonicalized
+            .surface_binding
+            .implicit_overrides
+            .fixed_schema_key
+            .clone()
+    }) {
         if !schema_keys.iter().any(|existing| existing == &schema_key) {
             schema_keys.push(schema_key);
         }
@@ -3529,7 +3529,7 @@ async fn query_entity_ids_for_selector(
     };
     for statement in lowered_statements {
         query_result = backend
-            .execute(&statement.to_string(), &[])
+            .execute(&statement.to_string(), &planned_write.command.bound_parameters)
             .await
             .map_err(write_resolve_backend_error)?;
     }

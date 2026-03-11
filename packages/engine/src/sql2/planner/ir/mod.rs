@@ -305,6 +305,7 @@ pub(crate) struct WriteCommand {
     pub(crate) payload: MutationPayload,
     pub(crate) on_conflict: Option<InsertOnConflict>,
     pub(crate) requested_mode: WriteModeRequest,
+    pub(crate) bound_parameters: Vec<Value>,
     pub(crate) execution_context: ExecutionContext,
 }
 

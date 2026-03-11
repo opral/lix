@@ -1,6 +1,7 @@
 use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
 };
+use crate::errors::sql_unknown_column_error;
 use crate::filesystem::live_projection::{
     build_filesystem_directory_history_projection_sql, build_filesystem_directory_projection_sql,
     build_filesystem_file_history_projection_sql, build_filesystem_file_projection_sql,
@@ -210,13 +211,17 @@ fn state_read_exposed_column_error(
         });
     }
     let column = missing[0].clone();
-    Some(LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "strict rewrite violation: unknown column '{column}' on '{}'",
-            surface_binding.descriptor.public_name
-        ),
-    })
+    let available = surface_binding
+        .exposed_columns
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    Some(sql_unknown_column_error(
+        &column,
+        Some(&surface_binding.descriptor.public_name),
+        &available,
+        None,
+    ))
 }
 
 fn lower_entity_read_for_execution(
