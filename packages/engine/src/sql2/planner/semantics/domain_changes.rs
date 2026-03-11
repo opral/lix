@@ -223,6 +223,10 @@ fn summarize_mutation_payload(payload: &MutationPayload) -> JsonValue {
             "kind": "full_snapshot",
             "values": summarize_value_map(values),
         }),
+        MutationPayload::BulkFullSnapshot(rows) => json!({
+            "kind": "bulk_full_snapshot",
+            "rows": rows.iter().map(summarize_value_map).collect::<Vec<_>>(),
+        }),
         MutationPayload::Patch(values) => json!({
             "kind": "patch",
             "values": summarize_value_map(values),
@@ -327,6 +331,18 @@ fn command_writer_key(planned_write: &PlannedWrite) -> Option<String> {
                 Some(crate::Value::Null) | None => None,
                 _ => None,
             }
+        }
+        crate::sql2::planner::ir::MutationPayload::BulkFullSnapshot(payloads) => {
+            payloads.first().and_then(|payload| {
+                if !payload.contains_key("writer_key") {
+                    return planned_write.command.execution_context.writer_key.clone();
+                }
+                match payload.get("writer_key") {
+                    Some(crate::Value::Text(value)) => Some(value.clone()),
+                    Some(crate::Value::Null) | None => None,
+                    _ => None,
+                }
+            })
         }
         crate::sql2::planner::ir::MutationPayload::Tombstone => {
             planned_write.command.execution_context.writer_key.clone()

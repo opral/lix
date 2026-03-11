@@ -1,9 +1,11 @@
+use crate::sql2::catalog::SurfaceOverrideValue;
 use crate::sql2::planner::canonicalize::CanonicalizedWrite;
 use crate::sql2::planner::ir::{
     MutationPayload, PlannedWrite, SchemaProof, ScopeProof, StateSourceKind, TargetSetProof,
     WriteMode,
 };
 use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::version::GLOBAL_VERSION_ID;
 use crate::Value;
 use sqlparser::ast::{BinaryOperator, Expr, Statement, Value as SqlValue};
 use std::collections::BTreeSet;
@@ -47,6 +49,10 @@ pub(crate) fn prove_write(canonicalized: &CanonicalizedWrite) -> Result<PlannedW
 }
 
 fn prove_scope(canonicalized: &CanonicalizedWrite) -> Result<ScopeProof, ProofError> {
+    if let Some(version_id) = forced_write_version_id(canonicalized) {
+        return Ok(ScopeProof::SingleVersion(version_id));
+    }
+
     match canonicalized.surface_binding.default_scope {
         crate::sql2::catalog::DefaultScopeSemantics::ActiveVersion => {
             if canonicalized
@@ -75,6 +81,34 @@ fn prove_scope(canonicalized: &CanonicalizedWrite) -> Result<ScopeProof, ProofEr
         crate::sql2::catalog::DefaultScopeSemantics::GlobalAdmin => Ok(ScopeProof::GlobalAdmin),
         crate::sql2::catalog::DefaultScopeSemantics::WorkingChanges => Ok(ScopeProof::Unknown),
     }
+}
+
+fn forced_write_version_id(canonicalized: &CanonicalizedWrite) -> Option<String> {
+    canonicalized
+        .surface_binding
+        .implicit_overrides
+        .fixed_version_id
+        .clone()
+        .or_else(|| {
+            if surface_forces_global_scope(canonicalized)
+                || write_bool_value(canonicalized, "global") == Some(true)
+            {
+                Some(GLOBAL_VERSION_ID.to_string())
+            } else {
+                None
+            }
+        })
+}
+
+fn surface_forces_global_scope(canonicalized: &CanonicalizedWrite) -> bool {
+    canonicalized
+        .surface_binding
+        .implicit_overrides
+        .predicate_overrides
+        .iter()
+        .any(|predicate| {
+            predicate.column == "global" && predicate.value == SurfaceOverrideValue::Boolean(true)
+        })
 }
 
 fn prove_schema(canonicalized: &CanonicalizedWrite) -> SchemaProof {
@@ -133,15 +167,62 @@ fn write_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<Str
     payload_text_value(canonicalized, key).or_else(|| selection_text_value(canonicalized, key))
 }
 
-fn payload_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<String> {
-    let (MutationPayload::FullSnapshot(payload) | MutationPayload::Patch(payload)) =
-        &canonicalized.write_command.payload
-    else {
-        return None;
-    };
+fn write_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<bool> {
+    payload_bool_value(canonicalized, key).or_else(|| selection_bool_value(canonicalized, key))
+}
 
+fn payload_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<String> {
+    match &canonicalized.write_command.payload {
+        MutationPayload::FullSnapshot(payload) | MutationPayload::Patch(payload) => {
+            match payload.get(key) {
+                Some(Value::Text(value)) => Some(value.clone()),
+                _ => None,
+            }
+        }
+        MutationPayload::BulkFullSnapshot(payloads) => {
+            let mut values = payloads
+                .iter()
+                .filter_map(|payload| match payload.get(key) {
+                    Some(Value::Text(value)) => Some(value.clone()),
+                    _ => None,
+                });
+            let first = values.next()?;
+            values.all(|candidate| candidate == first).then_some(first)
+        }
+        MutationPayload::Tombstone => None,
+    }
+}
+
+fn payload_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<bool> {
+    match &canonicalized.write_command.payload {
+        MutationPayload::FullSnapshot(payload) | MutationPayload::Patch(payload) => {
+            bool_value_from_payload(payload, key)
+        }
+        MutationPayload::BulkFullSnapshot(payloads) => {
+            let mut values = payloads
+                .iter()
+                .map(|payload| bool_value_from_payload(payload, key));
+            let first = values.next()??;
+            values
+                .all(|candidate| candidate == Some(first))
+                .then_some(first)
+        }
+        MutationPayload::Tombstone => None,
+    }
+}
+
+fn bool_value_from_payload(
+    payload: &std::collections::BTreeMap<String, Value>,
+    key: &str,
+) -> Option<bool> {
     match payload.get(key) {
-        Some(Value::Text(value)) => Some(value.clone()),
+        Some(Value::Boolean(value)) => Some(*value),
+        Some(Value::Integer(value)) => Some(*value != 0),
+        Some(Value::Text(value)) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" => Some(true),
+            "0" | "false" => Some(false),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -163,6 +244,23 @@ fn selection_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option
         &canonicalized.bound_statement.bound_parameters,
         &mut placeholder_state,
     )
+}
+
+fn selection_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<bool> {
+    match canonicalized.write_command.selector.exact_filters.get(key) {
+        Some(Value::Boolean(value)) => return Some(*value),
+        Some(Value::Integer(value)) => return Some(*value != 0),
+        Some(Value::Text(value)) => {
+            return match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" => Some(true),
+                "0" | "false" => Some(false),
+                _ => None,
+            }
+        }
+        _ => {}
+    }
+
+    None
 }
 
 fn extract_string_equality(
