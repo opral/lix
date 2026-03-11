@@ -3,7 +3,6 @@ use serde_json::Value as JsonValue;
 use crate::error_classification::is_missing_relation_error;
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
-use crate::json_truthiness::{loosely_false, loosely_true};
 use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
@@ -100,6 +99,40 @@ fn shuffled_timestamp_millis(counter: i64) -> i64 {
     cycle * WINDOW + shuffled
 }
 
+pub(crate) fn parse_deterministic_settings_value(mode_value: &JsonValue) -> DeterministicSettings {
+    let Some(object) = mode_value.as_object() else {
+        return DeterministicSettings::disabled();
+    };
+
+    let enabled = object
+        .get("enabled")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    if !enabled {
+        return DeterministicSettings::disabled();
+    }
+
+    let uuid_v7_enabled = object
+        .get("uuid_v7")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(true);
+    let timestamp_enabled = object
+        .get("timestamp")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(true);
+    let timestamp_shuffle_enabled = object
+        .get("timestamp_shuffle")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+
+    DeterministicSettings {
+        enabled,
+        uuid_v7_enabled,
+        timestamp_enabled,
+        timestamp_shuffle_enabled,
+    }
+}
+
 pub async fn load_settings(backend: &dyn LixBackend) -> Result<DeterministicSettings, LixError> {
     let mode_value = match load_key_value_payload(backend, DETERMINISTIC_MODE_KEY).await {
         Ok(value) => value,
@@ -110,30 +143,7 @@ pub async fn load_settings(backend: &dyn LixBackend) -> Result<DeterministicSett
         return Ok(DeterministicSettings::disabled());
     };
 
-    let enabled = mode_value.get("enabled").map(loosely_true).unwrap_or(false);
-    if !enabled {
-        return Ok(DeterministicSettings::disabled());
-    }
-
-    let uuid_v7_enabled = !mode_value
-        .get("uuid_v7")
-        .map(loosely_false)
-        .unwrap_or(false);
-    let timestamp_enabled = !mode_value
-        .get("timestamp")
-        .map(loosely_false)
-        .unwrap_or(false);
-    let timestamp_shuffle_enabled = mode_value
-        .get("timestamp_shuffle")
-        .map(loosely_true)
-        .unwrap_or(false);
-
-    Ok(DeterministicSettings {
-        enabled,
-        uuid_v7_enabled,
-        timestamp_enabled,
-        timestamp_shuffle_enabled,
-    })
+    Ok(parse_deterministic_settings_value(&mode_value))
 }
 
 pub async fn load_persisted_sequence_next(backend: &dyn LixBackend) -> Result<i64, LixError> {
@@ -315,5 +325,36 @@ impl LixFunctionProvider for FixedTimestampFunctionProvider {
 
     fn timestamp(&mut self) -> String {
         EPOCH_TIMESTAMP.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{parse_deterministic_settings_value, DeterministicSettings};
+
+    #[test]
+    fn non_boolean_flags_do_not_enable_or_disable_settings() {
+        let settings = parse_deterministic_settings_value(&json!({
+            "enabled": "1",
+            "uuid_v7": "0",
+            "timestamp": "",
+            "timestamp_shuffle": 1
+        }));
+
+        assert_eq!(settings.enabled, DeterministicSettings::disabled().enabled);
+        assert_eq!(
+            settings.uuid_v7_enabled,
+            DeterministicSettings::disabled().uuid_v7_enabled
+        );
+        assert_eq!(
+            settings.timestamp_enabled,
+            DeterministicSettings::disabled().timestamp_enabled
+        );
+        assert_eq!(
+            settings.timestamp_shuffle_enabled,
+            DeterministicSettings::disabled().timestamp_shuffle_enabled
+        );
     }
 }
