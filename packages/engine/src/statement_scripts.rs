@@ -28,6 +28,7 @@ impl Engine {
         let mut active_version_id = self.require_active_version_id()?;
         let starting_active_version_id = active_version_id.clone();
         let mut pending_state_commit_stream_changes = Vec::new();
+        let mut pending_sql2_append_session = None;
         let installed_plugins_cache_invalidation_pending =
             should_invalidate_installed_plugins_cache_for_statements(&statements);
         let result = self
@@ -38,6 +39,7 @@ impl Engine {
                 options,
                 &mut active_version_id,
                 &mut pending_state_commit_stream_changes,
+                &mut pending_sql2_append_session,
             )
             .await;
         let result = match result {
@@ -74,6 +76,7 @@ impl Engine {
         options: &ExecuteOptions,
         active_version_id: &mut String,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
+        pending_sql2_append_session: &mut Option<crate::query_runtime::shared_path::PendingSql2AppendSession>,
     ) -> Result<ExecuteResult, LixError> {
         let can_defer_side_effects = false;
         let mut deferred_side_effects = if can_defer_side_effects {
@@ -118,6 +121,7 @@ impl Engine {
                     deferred_side_effects.as_mut(),
                     true,
                     pending_state_commit_stream_changes,
+                    pending_sql2_append_session,
                 )
                 .await
             } else {
@@ -130,6 +134,7 @@ impl Engine {
                     None,
                     false,
                     pending_state_commit_stream_changes,
+                    pending_sql2_append_session,
                 )
                 .await
             };

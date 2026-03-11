@@ -438,6 +438,9 @@ pub(crate) async fn lower_public_read_query_with_sql2_backend(
     query: Query,
     params: &[Value],
 ) -> Result<Query, LixError> {
+    if !query_references_builtin_public_sql2_surface(&query) {
+        return Ok(query);
+    }
     let active_version_id = load_active_version_id_for_sql2_read(backend).await?;
     let parsed = vec![Statement::Query(Box::new(query.clone()))];
     let prepared = prepare_sql2_read(backend, &parsed, params, &active_version_id, None).await;
@@ -1003,4 +1006,3 @@ fn empty_rewrite_output() -> RewriteOutput {
         update_validations: Vec::new(),
     }
 }
-

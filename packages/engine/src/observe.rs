@@ -831,13 +831,42 @@ fn parse_observe_tick_writer_key(value: &Value) -> Result<Option<String>, LixErr
 
 #[cfg(test)]
 mod tests {
-    use super::{observe_source_key, ObserveQuery, OBSERVE_TICK_POLL_INTERVAL};
+    use super::{observe_source_key, ObserveEvent, ObserveEvents, ObserveQuery, OBSERVE_TICK_POLL_INTERVAL};
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
     use crate::{boot, BootArgs, LixError, NoopWasmRuntime, QueryResult, Value};
     use async_trait::async_trait;
+    use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    async fn next_observe_event(observed: &mut ObserveEvents<'_>, label: &str) -> ObserveEvent {
+        tokio::time::timeout(Duration::from_secs(1), observed.next())
+            .await
+            .unwrap_or_else(|_| panic!("{label} next should not time out"))
+            .unwrap_or_else(|error| panic!("{label} next should succeed: {error:?}"))
+            .unwrap_or_else(|| panic!("{label} event should exist"))
+    }
+
+    fn run_observe_test_with_large_stack<F, Fut>(factory: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        std::thread::Builder::new()
+            .name("observe-test".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("tokio runtime")
+                    .block_on(factory());
+            })
+            .expect("spawn observe test thread")
+            .join()
+            .expect("observe test thread should not panic");
+    }
 
     struct CountingObserveBackend {
         observe_query_hits: Arc<AtomicUsize>,
@@ -902,114 +931,98 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn observe_dedups_initial_query_execution_across_identical_subscribers() {
-        let observe_query_hits = Arc::new(AtomicUsize::new(0));
-        let engine = boot(BootArgs::new(
-            Box::new(CountingObserveBackend {
-                observe_query_hits: Arc::clone(&observe_query_hits),
-            }),
-            Arc::new(NoopWasmRuntime),
-        ));
-        engine.set_active_version_id("version-test".to_string());
+    #[test]
+    fn observe_dedups_initial_query_execution_across_identical_subscribers() {
+        run_observe_test_with_large_stack(|| async move {
+            let observe_query_hits = Arc::new(AtomicUsize::new(0));
+            let engine = boot(BootArgs::new(
+                Box::new(CountingObserveBackend {
+                    observe_query_hits: Arc::clone(&observe_query_hits),
+                }),
+                Arc::new(NoopWasmRuntime),
+            ));
+            engine.set_active_version_id("version-test".to_string());
 
-        let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
-        let mut observed_a = engine
-            .observe(query.clone())
-            .expect("observe should succeed");
-        let mut observed_b = engine.observe(query).expect("observe should succeed");
+            let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
+            let mut observed_a = engine
+                .observe(query.clone())
+                .expect("observe should succeed");
+            let mut observed_b = engine.observe(query).expect("observe should succeed");
 
-        let event_a = tokio::time::timeout(Duration::from_secs(1), observed_a.next())
-            .await
-            .expect("observe_a next should not time out")
-            .expect("observe_a next should succeed")
-            .expect("observe_a event should exist");
-        let event_b = tokio::time::timeout(Duration::from_secs(1), observed_b.next())
-            .await
-            .expect("observe_b next should not time out")
-            .expect("observe_b next should succeed")
-            .expect("observe_b event should exist");
+            let event_a = next_observe_event(&mut observed_a, "observe_a").await;
+            let event_b = next_observe_event(&mut observed_b, "observe_b").await;
 
-        assert_eq!(
-            event_a.rows.rows,
-            vec![vec![Value::Text("observe-shared-sentinel".to_string())]]
-        );
-        assert_eq!(
-            event_b.rows.rows,
-            vec![vec![Value::Text("observe-shared-sentinel".to_string())]]
-        );
-        assert_eq!(
-            observe_query_hits.load(Ordering::SeqCst),
-            1,
-            "identical observe subscribers should share initial query execution"
-        );
+            assert_eq!(
+                event_a.rows.rows,
+                vec![vec![Value::Text("observe-shared-sentinel".to_string())]]
+            );
+            assert_eq!(
+                event_b.rows.rows,
+                vec![vec![Value::Text("observe-shared-sentinel".to_string())]]
+            );
+            assert_eq!(
+                observe_query_hits.load(Ordering::SeqCst),
+                1,
+                "identical observe subscribers should share initial query execution"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn observe_late_subscriber_reuses_cached_initial_snapshot() {
-        let observe_query_hits = Arc::new(AtomicUsize::new(0));
-        let engine = boot(BootArgs::new(
-            Box::new(CountingObserveBackend {
-                observe_query_hits: Arc::clone(&observe_query_hits),
-            }),
-            Arc::new(NoopWasmRuntime),
-        ));
-        engine.set_active_version_id("version-test".to_string());
+    #[test]
+    fn observe_late_subscriber_reuses_cached_initial_snapshot() {
+        run_observe_test_with_large_stack(|| async move {
+            let observe_query_hits = Arc::new(AtomicUsize::new(0));
+            let engine = boot(BootArgs::new(
+                Box::new(CountingObserveBackend {
+                    observe_query_hits: Arc::clone(&observe_query_hits),
+                }),
+                Arc::new(NoopWasmRuntime),
+            ));
+            engine.set_active_version_id("version-test".to_string());
 
-        let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
-        let mut observed_a = engine
-            .observe(query.clone())
-            .expect("observe should succeed");
+            let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
+            let mut observed_a = engine
+                .observe(query.clone())
+                .expect("observe should succeed");
 
-        let _initial_a = tokio::time::timeout(Duration::from_secs(1), observed_a.next())
-            .await
-            .expect("observe_a next should not time out")
-            .expect("observe_a next should succeed")
-            .expect("observe_a event should exist");
+            let _initial_a = next_observe_event(&mut observed_a, "observe_a").await;
 
-        let mut observed_b = engine.observe(query).expect("observe should succeed");
-        let event_b = tokio::time::timeout(Duration::from_secs(1), observed_b.next())
-            .await
-            .expect("observe_b next should not time out")
-            .expect("observe_b next should succeed")
-            .expect("observe_b event should exist");
+            let mut observed_b = engine.observe(query).expect("observe should succeed");
+            let event_b = next_observe_event(&mut observed_b, "observe_b").await;
 
-        assert_eq!(
-            event_b.rows.rows,
-            vec![vec![Value::Text("observe-shared-sentinel".to_string())]]
-        );
-        assert_eq!(
-            observe_query_hits.load(Ordering::SeqCst),
-            1,
-            "late identical subscriber should reuse shared cached initial snapshot"
-        );
+            assert_eq!(
+                event_b.rows.rows,
+                vec![vec![Value::Text("observe-shared-sentinel".to_string())]]
+            );
+            assert_eq!(
+                observe_query_hits.load(Ordering::SeqCst),
+                1,
+                "late identical subscriber should reuse shared cached initial snapshot"
+            );
 
-        observed_a.close();
-        observed_b.close();
-        tokio::time::sleep(OBSERVE_TICK_POLL_INTERVAL).await;
+            observed_a.close();
+            observed_b.close();
+            tokio::time::sleep(OBSERVE_TICK_POLL_INTERVAL).await;
 
-        let mut observed_c = engine
-            .observe(ObserveQuery::new(
-                "SELECT 'observe-shared-sentinel' AS marker",
-                vec![],
-            ))
-            .expect("observe should succeed");
-        let _initial_c = tokio::time::timeout(Duration::from_secs(1), observed_c.next())
-            .await
-            .expect("observe_c next should not time out")
-            .expect("observe_c next should succeed")
-            .expect("observe_c event should exist");
+            let mut observed_c = engine
+                .observe(ObserveQuery::new(
+                    "SELECT 'observe-shared-sentinel' AS marker",
+                    vec![],
+                ))
+                .expect("observe should succeed");
+            let _initial_c = next_observe_event(&mut observed_c, "observe_c").await;
 
-        assert_eq!(
-            observe_query_hits.load(Ordering::SeqCst),
-            2,
-            "new observer after all subscribers close should execute a fresh initial query"
-        );
+            assert_eq!(
+                observe_query_hits.load(Ordering::SeqCst),
+                2,
+                "new observer after all subscribers close should execute a fresh initial query"
+            );
 
-        let _ = engine
-            .execute("SELECT 1", &[])
-            .await
-            .expect("sanity execute should succeed");
+            let _ = engine
+                .execute("SELECT 1", &[])
+                .await
+                .expect("sanity execute should succeed");
+        });
     }
 
     #[test]

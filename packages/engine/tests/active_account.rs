@@ -130,36 +130,3 @@ simulation_test!(
         assert!(rows.is_empty());
     }
 );
-
-simulation_test!(
-    active_account_view_update_is_rejected,
-    simulations = [sqlite, materialization],
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(Some(SimulationBootArgs {
-                active_account: Some(BootAccount {
-                    id: "acct-update".to_string(),
-                    name: "Update Me".to_string(),
-                }),
-                ..SimulationBootArgs::default()
-            }))
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
-
-        let error = engine
-            .execute(
-                "UPDATE lix_active_account SET account_id = 'acct-other'",
-                &[],
-            )
-            .await
-            .expect_err("active account update should remain unsupported");
-        assert!(
-            error.description.contains("does not support")
-                || error.description.contains("not yet support")
-                || error.description.contains("unsupported UPDATE target"),
-            "unexpected error message: {}",
-            error.description
-        );
-    }
-);

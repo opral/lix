@@ -14,6 +14,7 @@ impl Engine {
         deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
         skip_side_effect_collection: bool,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
+        pending_sql2_append_session: &mut Option<shared_path::PendingSql2AppendSession>,
     ) -> Result<QueryResult, LixError> {
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         if parsed_statements.len() != 1 {
@@ -54,6 +55,7 @@ impl Engine {
             transaction,
             &prepared,
             writer_key,
+            Some(pending_sql2_append_session),
         )
         .await
         {
@@ -96,6 +98,15 @@ impl Engine {
                 })
             }
         };
+
+        if execution.plan_effects_override.is_none()
+            && !matches!(
+                parsed_statements[0],
+                sqlparser::ast::Statement::Query(_) | sqlparser::ast::Statement::Explain { .. }
+            )
+        {
+            *pending_sql2_append_session = None;
+        }
 
         let active_effects = execution
             .plan_effects_override

@@ -76,11 +76,15 @@ pub(crate) async fn resolve_write_plan(
                 .await
                 .map_err(write_resolve_backend_error)?;
             match planned_write.command.operation_kind {
-                WriteOperationKind::Insert => resolve_entity_insert_write_plan(
-                    planned_write,
-                    target_write_lane,
-                    &entity_schema,
-                ),
+                WriteOperationKind::Insert => {
+                    resolve_entity_insert_write_plan(
+                        backend,
+                        planned_write,
+                        target_write_lane,
+                        &entity_schema,
+                    )
+                    .await
+                }
                 WriteOperationKind::Update | WriteOperationKind::Delete => {
                     resolve_existing_entity_write(
                         backend,
@@ -310,13 +314,52 @@ async fn resolve_existing_entity_write(
     }
 }
 
-fn resolve_entity_insert_write_plan(
+async fn resolve_entity_insert_write_plan(
+    backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
     target_write_lane: Option<WriteLane>,
     entity_schema: &EntityWriteSchema,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     reject_unsupported_entity_overrides(entity_schema)?;
     let row = build_entity_insert_row(planned_write, entity_schema)?;
+    if planned_write.command.on_conflict_update.is_some() {
+        let exact_filters = entity_insert_exact_filters(entity_schema, &row)?;
+        if let Some(current_row) = resolve_exact_effective_state_row(
+            backend,
+            &ExactEffectiveStateRowRequest {
+                schema_key: entity_schema.schema_key.clone(),
+                version_id: row.version_id.clone().ok_or_else(|| WriteResolveError {
+                    message: "sql2 entity insert resolver requires a concrete version_id"
+                        .to_string(),
+                })?,
+                exact_filters,
+                include_global_overlay: true,
+                include_untracked_overlay: true,
+            },
+        )
+        .await
+        .map_err(write_resolve_backend_error)?
+        {
+            let row_ref = ResolvedRowRef {
+                entity_id: current_row.entity_id.clone(),
+                schema_key: current_row.schema_key.clone(),
+                version_id: Some(current_row.version_id.clone()),
+                source_change_id: current_row.source_change_id.clone(),
+                source_commit_id: None,
+            };
+            return Ok(ResolvedWritePlan {
+                authoritative_pre_state: vec![row_ref.clone()],
+                intended_post_state: vec![row],
+                tombstones: Vec::new(),
+                lineage: vec![RowLineage {
+                    entity_id: row_ref.entity_id,
+                    source_change_id: row_ref.source_change_id,
+                    source_commit_id: None,
+                }],
+                target_write_lane,
+            });
+        }
+    }
     Ok(ResolvedWritePlan {
         authoritative_pre_state: Vec::new(),
         intended_post_state: vec![row.clone()],
@@ -3209,6 +3252,13 @@ fn build_entity_insert_row(
             values.insert("metadata".to_string(), metadata);
         }
     }
+    for key in ["global", "untracked"] {
+        if let Some(value) = resolved_entity_state_value(payload, entity_schema, key) {
+            if value != Value::Null {
+                values.insert(key.to_string(), value);
+            }
+        }
+    }
 
     Ok(PlannedStateRow {
         entity_id,
@@ -3264,6 +3314,24 @@ fn entity_state_exact_filters(
         "untracked",
     ] {
         if let Some(value) = planned_write.command.selector.exact_filters.get(key) {
+            filters.insert(key.to_string(), value.clone());
+            continue;
+        }
+        if let Some(default) = entity_schema.state_defaults.get(key) {
+            filters.insert(key.to_string(), default.clone());
+        }
+    }
+    Ok(filters)
+}
+
+fn entity_insert_exact_filters(
+    entity_schema: &EntityWriteSchema,
+    row: &PlannedStateRow,
+) -> Result<BTreeMap<String, Value>, WriteResolveError> {
+    let mut filters = BTreeMap::new();
+    filters.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
+    for key in ["file_id", "plugin_key", "schema_version", "global", "untracked"] {
+        if let Some(value) = row.values.get(key) {
             filters.insert(key.to_string(), value.clone());
             continue;
         }

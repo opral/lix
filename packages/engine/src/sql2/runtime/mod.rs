@@ -1,9 +1,9 @@
 use crate::commit::load_committed_version_tip_commit_id;
 use crate::engine::query_semantics::state_resolution::canonical::statement_targets_table_name;
-use crate::errors::file_data_expects_bytes_error;
+use crate::errors::{file_data_expects_bytes_error, read_only_view_write_error};
 use crate::history_timeline::ensure_history_timeline_materialized_for_root;
 use crate::sql2::backend::PushdownDecision;
-use crate::sql2::catalog::{SurfaceFamily, SurfaceRegistry, SurfaceVariant};
+use crate::sql2::catalog::{SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
 use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
 use crate::sql2::planner::backend::lowerer::{lower_read_for_execution, LoweredReadProgram};
 use crate::sql2::planner::canonicalize::{
@@ -11,7 +11,7 @@ use crate::sql2::planner::canonicalize::{
 };
 use crate::sql2::planner::ir::{
     CommitPreconditions, PlannedWrite, ResolvedWritePlan, SchemaProof, ScopeProof, TargetSetProof,
-    WriteCommand,
+    WriteCommand, WriteOperationKind,
 };
 use crate::sql2::planner::semantics::dependency_spec::derive_dependency_spec_from_canonicalized_read;
 use crate::sql2::planner::semantics::domain_changes::{
@@ -456,22 +456,36 @@ pub(crate) async fn try_prepare_sql2_write(
         top_level_filesystem_write_target_name(&bound_statement.statement).map(str::to_string);
     let canonicalized = match canonicalize_write(bound_statement.clone(), &registry) {
         Ok(canonicalized) => canonicalized,
-        Err(error) => match filesystem_target_name.as_deref() {
-            Some(target_name) => {
-                return Err(sql2_filesystem_write_error(target_name, &error.message));
+        Err(error) => {
+            if let Some(binding) = top_level_write_target_name(&bound_statement.statement)
+                .and_then(|name| registry.bind_relation_name(&name))
+            {
+                if let Some(operation_kind) = statement_write_operation_kind(&bound_statement.statement)
+                {
+                    if let Some(error) = sql2_public_write_preparation_error_for_surface(
+                        &binding,
+                        operation_kind,
+                        &error.message,
+                    ) {
+                        return Err(error);
+                    }
+                }
             }
-            None => return Ok(None),
-        },
+            match filesystem_target_name.as_deref() {
+                Some(target_name) => {
+                    return Err(sql2_filesystem_write_error(target_name, &error.message));
+                }
+                None => return Ok(None),
+            }
+        }
     };
     let mut planned_write = match prove_write(&canonicalized) {
         Ok(planned_write) => planned_write,
         Err(error) => {
-            if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::Filesystem
+            if let Some(error) =
+                sql2_public_write_preparation_error(&canonicalized, &error.message)
             {
-                return Err(sql2_filesystem_write_error(
-                    &canonicalized.surface_binding.descriptor.public_name,
-                    &error.message,
-                ));
+                return Err(error);
             }
             return Ok(None);
         }
@@ -487,12 +501,10 @@ pub(crate) async fn try_prepare_sql2_write(
     let domain_change_batch = match build_domain_change_batch(&planned_write) {
         Ok(domain_change_batch) => domain_change_batch,
         Err(error) => {
-            if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::Filesystem
+            if let Some(error) =
+                sql2_public_write_preparation_error(&canonicalized, &error.message)
             {
-                return Err(sql2_filesystem_write_error(
-                    &canonicalized.surface_binding.descriptor.public_name,
-                    &error.message,
-                ));
+                return Err(error);
             }
             return Ok(None);
         }
@@ -500,12 +512,10 @@ pub(crate) async fn try_prepare_sql2_write(
     let commit_preconditions = match derive_commit_preconditions(backend, &planned_write).await {
         Ok(commit_preconditions) => commit_preconditions,
         Err(error) => {
-            if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::Filesystem
+            if let Some(error) =
+                sql2_public_write_preparation_error(&canonicalized, &error.message)
             {
-                return Err(sql2_filesystem_write_error(
-                    &canonicalized.surface_binding.descriptor.public_name,
-                    &error.message,
-                ));
+                return Err(error);
             }
             return Ok(None);
         }
@@ -561,11 +571,62 @@ fn sql2_authoritative_write_error(
     canonicalized: &CanonicalizedWrite,
     message: String,
 ) -> Option<LixError> {
-    match canonicalized.surface_binding.descriptor.surface_family {
-        SurfaceFamily::Filesystem => Some(sql2_filesystem_write_error(
-            &canonicalized.surface_binding.descriptor.public_name,
-            &message,
-        )),
+    sql2_public_write_preparation_error(canonicalized, &message)
+}
+
+fn sql2_public_write_preparation_error(
+    canonicalized: &CanonicalizedWrite,
+    message: &str,
+) -> Option<LixError> {
+    sql2_public_write_preparation_error_for_surface(
+        &canonicalized.surface_binding,
+        canonicalized.write_command.operation_kind,
+        message,
+    )
+}
+
+fn sql2_public_write_preparation_error_for_surface(
+    surface_binding: &crate::sql2::catalog::SurfaceBinding,
+    operation_kind: WriteOperationKind,
+    message: &str,
+) -> Option<LixError> {
+    let public_name = surface_binding.descriptor.public_name.as_str();
+    if surface_binding.descriptor.capability == SurfaceCapability::ReadOnly
+        || message.contains("is not writable in sql2")
+        || message.contains("does not support INSERT")
+        || message.contains("does not support UPDATE")
+        || message.contains("does not support DELETE")
+    {
+        let operation = match operation_kind {
+            WriteOperationKind::Insert => "INSERT",
+            WriteOperationKind::Update => "UPDATE",
+            WriteOperationKind::Delete => "DELETE",
+        };
+        return Some(read_only_view_write_error(public_name, operation));
+    }
+
+    match surface_binding.descriptor.surface_family {
+        SurfaceFamily::Filesystem => Some(sql2_filesystem_write_error(public_name, message)),
+        _ if matches!(
+            public_name,
+            "lix_state"
+                | "lix_state_by_version"
+                | "lix_active_version"
+                | "lix_active_account"
+                | "lix_version"
+        ) =>
+        {
+            Some(LixError::new("LIX_ERROR_UNKNOWN", message))
+        }
+        _ => None,
+    }
+}
+
+fn statement_write_operation_kind(statement: &Statement) -> Option<WriteOperationKind> {
+    match statement {
+        Statement::Insert(_) => Some(WriteOperationKind::Insert),
+        Statement::Update(_) => Some(WriteOperationKind::Update),
+        Statement::Delete(_) => Some(WriteOperationKind::Delete),
         _ => None,
     }
 }
@@ -582,6 +643,30 @@ fn top_level_filesystem_write_target_name(statement: &Statement) -> Option<&'sta
     ]
     .into_iter()
     .find(|target_name| statement_targets_table_name(statement, target_name))
+}
+
+fn top_level_write_target_name(statement: &Statement) -> Option<String> {
+    match statement {
+        Statement::Insert(insert) => match &insert.table {
+            sqlparser::ast::TableObject::TableName(name) => Some(name.to_string()),
+            _ => None,
+        },
+        Statement::Update(update) => match &update.table.relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => Some(name.to_string()),
+            _ => None,
+        },
+        Statement::Delete(delete) => {
+            let tables = match &delete.from {
+                sqlparser::ast::FromTable::WithFromKeyword(tables)
+                | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+            };
+            match &tables.first()?.relation {
+                sqlparser::ast::TableFactor::Table { name, .. } => Some(name.to_string()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn sql2_filesystem_write_error(target_name: &str, message: &str) -> LixError {
