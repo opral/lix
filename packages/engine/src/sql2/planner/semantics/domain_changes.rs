@@ -30,16 +30,15 @@ pub(crate) struct DomainChangeError {
 pub(crate) fn build_domain_change_batch(
     planned_write: &PlannedWrite,
 ) -> Result<Option<DomainChangeBatch>, DomainChangeError> {
-    if planned_write.command.mode != WriteMode::Tracked {
-        return Ok(None);
-    }
-
     let resolved = planned_write
         .resolved_write_plan
         .as_ref()
         .ok_or_else(|| DomainChangeError {
             message: "sql2 domain-change derivation requires a resolved write plan".to_string(),
         })?;
+    if resolved.execution_mode != WriteMode::Tracked {
+        return Ok(None);
+    }
     if resolved.intended_post_state.is_empty() {
         return Ok(None);
     }
@@ -102,10 +101,6 @@ pub(crate) async fn derive_commit_preconditions(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<Option<CommitPreconditions>, DomainChangeError> {
-    if planned_write.command.mode != WriteMode::Tracked {
-        return Ok(None);
-    }
-
     let resolved = planned_write
         .resolved_write_plan
         .as_ref()
@@ -113,6 +108,9 @@ pub(crate) async fn derive_commit_preconditions(
             message: "sql2 commit precondition derivation requires a resolved write plan"
                 .to_string(),
         })?;
+    if resolved.execution_mode != WriteMode::Tracked {
+        return Ok(None);
+    }
     if resolved.intended_post_state.is_empty() {
         return Ok(None);
     }

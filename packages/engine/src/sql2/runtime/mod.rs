@@ -1,5 +1,7 @@
 use crate::commit::load_committed_version_tip_commit_id;
 use crate::engine::query_semantics::state_resolution::canonical::statement_targets_table_name;
+use crate::engine::sql_ast::lowering::lower_statement;
+use crate::errors::schema_not_registered_error;
 use crate::errors::{file_data_expects_bytes_error, read_only_view_write_error};
 use crate::history_timeline::ensure_history_timeline_materialized_for_root;
 use crate::sql2::backend::PushdownDecision;
@@ -24,7 +26,12 @@ use crate::sql2::planner::semantics::proof_engine::prove_write;
 use crate::sql2::planner::semantics::write_resolver::resolve_write_plan;
 use crate::sql_shared::dependency_spec::DependencySpec;
 use crate::{LixBackend, LixError, Value};
-use sqlparser::ast::{BinaryOperator, Expr, Ident, SetExpr, Statement, Value as SqlValue};
+use sqlparser::ast::{
+    BinaryOperator, Expr, Ident, ObjectNamePart, Query, SetExpr, Statement, TableFactor,
+    Value as SqlValue, Visit, Visitor,
+};
+use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, PartialEq)]
 struct ExplainEnvelope {
@@ -82,21 +89,200 @@ pub(crate) struct Sql2PreparedWrite {
     pub(crate) debug_trace: Sql2DebugTrace,
 }
 
-pub(crate) async fn prepare_sql2_read(
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Sql2PreparedPublicExecution {
+    Read(Sql2PreparedRead),
+    Write(Sql2PreparedWrite),
+}
+
+pub(crate) async fn prepare_sql2_public_execution(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
-) -> Option<Sql2PreparedRead> {
+) -> Result<Option<Sql2PreparedPublicExecution>, LixError> {
+    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
+        .await
+        .map_err(|error| LixError::new(error.code, error.description))?;
+    if !statements_reference_public_surface(&registry, parsed_statements) {
+        return Ok(None);
+    }
+
+    if let Some(target_name) = public_write_target_name(&registry, parsed_statements) {
+        let prepared = try_prepare_sql2_write(
+            backend,
+            parsed_statements,
+            params,
+            active_version_id,
+            writer_key,
+        )
+        .await?;
+        return prepared
+            .map(Sql2PreparedPublicExecution::Write)
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("public write target '{target_name}' must route through sql2"),
+                )
+            })
+            .map(Some);
+    }
+
     if parsed_statements.len() != 1 {
-        return None;
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "public read statement batches must route through sql2 one statement at a time",
+        ));
+    }
+
+    try_prepare_sql2_read(
+        backend,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+    )
+    .await?
+    .map(Sql2PreparedPublicExecution::Read)
+    .ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "public read statements must route through sql2",
+        )
+    })
+    .map(Some)
+}
+
+pub(crate) fn statement_references_public_sql2_surface(statement: &Statement) -> bool {
+    statement_references_public_surface(&SurfaceRegistry::with_builtin_surfaces(), statement)
+}
+
+pub(crate) async fn statement_references_public_sql2_surface_with_backend(
+    backend: &dyn LixBackend,
+    statement: &Statement,
+) -> bool {
+    let registry = match SurfaceRegistry::bootstrap_with_backend(backend).await {
+        Ok(registry) => registry,
+        Err(_) => return statement_references_public_sql2_surface(statement),
+    };
+    statement_references_public_surface(&registry, statement)
+}
+
+pub(crate) fn rewrite_public_read_statement_to_lowered_sql(
+    statement: &mut Statement,
+    dialect: crate::SqlDialect,
+) -> Result<Statement, LixError> {
+    crate::sql2::planner::backend::lowerer::rewrite_supported_public_read_surfaces_in_statement(
+        statement,
+    )?;
+    lower_statement(statement.clone(), dialect)
+}
+
+pub(crate) fn rewrite_public_read_query_to_lowered_sql(
+    query: Query,
+    dialect: crate::SqlDialect,
+) -> Result<Query, LixError> {
+    let mut statement = Statement::Query(Box::new(query));
+    match rewrite_public_read_statement_to_lowered_sql(&mut statement, dialect)? {
+        Statement::Query(query) => Ok(*query),
+        _ => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "expected lowered read query to remain a SELECT query",
+        )),
+    }
+}
+
+pub(crate) async fn lower_public_read_query_with_sql2_backend(
+    backend: &dyn LixBackend,
+    query: Query,
+    params: &[Value],
+) -> Result<Query, LixError> {
+    if !statement_references_public_surface(
+        &SurfaceRegistry::with_builtin_surfaces(),
+        &Statement::Query(Box::new(query.clone())),
+    ) {
+        return Ok(query);
+    }
+    let active_version_id = load_active_version_id_for_sql2_read(backend).await?;
+    let parsed = vec![Statement::Query(Box::new(query.clone()))];
+    let prepared =
+        try_prepare_sql2_read(backend, &parsed, params, &active_version_id, None).await?;
+    let lowered = if let Some(lowered) = prepared.and_then(|prepared| prepared.lowered_read) {
+        lowered
+    } else {
+        let rewritten = rewrite_public_read_query_to_lowered_sql(query.clone(), backend.dialect())?;
+        if rewritten != query {
+            return Ok(rewritten);
+        }
+        let registry = SurfaceRegistry::bootstrap_with_backend(backend).await?;
+        let bound_statement = BoundStatement::from_statement(
+            Statement::Query(Box::new(query)),
+            params.to_vec(),
+            ExecutionContext {
+                dialect: Some(backend.dialect()),
+                writer_key: None,
+                requested_version_id: Some(active_version_id),
+            },
+        );
+        let canonicalized = canonicalize_read(bound_statement, &registry).map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "sql2 read subquery canonicalization failed: {}",
+                    error.message
+                ),
+            )
+        })?;
+        let dependency_spec = augment_dependency_spec_for_public_read(
+            &registry,
+            &canonicalized,
+            derive_dependency_spec_from_canonicalized_read(&canonicalized),
+        );
+        let effective_state = build_effective_state(&canonicalized, dependency_spec.as_ref());
+        lower_read_for_execution(
+            &canonicalized,
+            effective_state.as_ref().map(|(request, _)| request),
+            effective_state.as_ref().map(|(_, plan)| plan),
+        )?
+        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "sql2 could not prepare read subquery"))?
+    };
+    let statement = lowered.statements.into_iter().next().ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "sql2 read subquery lowered to no statements",
+        )
+    })?;
+    let statement = lower_statement(statement, backend.dialect())?;
+    match statement {
+        Statement::Query(query) => Ok(*query),
+        _ => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "expected lowered subquery to remain a SELECT query",
+        )),
+    }
+}
+
+async fn try_prepare_sql2_read(
+    backend: &dyn LixBackend,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+) -> Result<Option<Sql2PreparedRead>, LixError> {
+    if parsed_statements.len() != 1 {
+        return Ok(None);
+    }
+    if let Some(error) = sql2_public_read_preflight_error(&parsed_statements[0]) {
+        return Err(error);
     }
 
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
-        .ok()?;
-    let (statement, explain_envelope) = explain_query_statement(&parsed_statements[0])?;
+        .map_err(|error| LixError::new(error.code, error.description))?;
+    let Some((statement, explain_envelope)) = explain_query_statement(&parsed_statements[0]) else {
+        return Ok(None);
+    };
     let bound_statement = BoundStatement::from_statement(
         statement,
         params.to_vec(),
@@ -106,27 +292,41 @@ pub(crate) async fn prepare_sql2_read(
             requested_version_id: Some(active_version_id.to_string()),
         },
     );
-    let canonicalized = canonicalize_read(bound_statement.clone(), &registry).ok()?;
+    let canonicalized = canonicalize_read(bound_statement.clone(), &registry).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("sql2 read preparation failed: {}", error.message),
+        )
+    })?;
     let canonicalized =
         maybe_bind_active_history_root(backend, canonicalized, active_version_id, &registry)
-            .await?;
+            .await
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "sql2 read preparation could not bind active history root",
+                )
+            })?;
     ensure_sql2_history_timeline_roots(backend, &canonicalized.bound_statement.statement)
         .await
-        .ok()?;
-    let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
-    if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::State
-        && dependency_spec_has_unknown_schema_keys(&registry, dependency_spec.as_ref())
-    {
-        return None;
+        .map_err(|error| LixError::new(error.code, error.description))?;
+    let dependency_spec = augment_dependency_spec_for_public_read(
+        &registry,
+        &canonicalized,
+        derive_dependency_spec_from_canonicalized_read(&canonicalized),
+    );
+    if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::State {
+        if let Some(error) = unknown_public_state_schema_error(&registry, dependency_spec.as_ref())
+        {
+            return Err(error);
+        }
     }
     let effective_state = build_effective_state(&canonicalized, dependency_spec.as_ref());
     let lowered_read = lower_read_for_execution(
         &canonicalized,
         effective_state.as_ref().map(|(request, _)| request),
         effective_state.as_ref().map(|(_, plan)| plan),
-    )
-    .ok()
-    .flatten()
+    )?
     .map(|program| wrap_lowered_read_for_explain(program, explain_envelope.as_ref()));
     let lowered_sql = lowered_read
         .as_ref()
@@ -139,7 +339,7 @@ pub(crate) async fn prepare_sql2_read(
         })
         .unwrap_or_default();
 
-    Some(Sql2PreparedRead {
+    Ok(Some(Sql2PreparedRead {
         debug_trace: Sql2DebugTrace {
             bound_statements: vec![bound_statement],
             surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
@@ -165,7 +365,189 @@ pub(crate) async fn prepare_sql2_read(
         effective_state_plan: effective_state.as_ref().map(|(_, plan)| plan.clone()),
         lowered_read,
         canonicalized,
-    })
+    }))
+}
+
+fn sql2_public_read_preflight_error(statement: &Statement) -> Option<LixError> {
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+    if !query_references_named_surface(query, "lix_state")
+        || !query_references_any_column(query, &["version_id", "lixcol_version_id"])
+    {
+        return None;
+    }
+    Some(LixError::new(
+        "LIX_ERROR_UNKNOWN",
+        "lix_state does not expose version_id; use lix_state_by_version for explicit version filters",
+    ))
+}
+
+fn query_references_named_surface(query: &Query, surface_name: &str) -> bool {
+    collect_public_query_relation_names(query)
+        .into_iter()
+        .any(|name| name.eq_ignore_ascii_case(surface_name))
+}
+
+fn query_references_any_column(query: &Query, columns: &[&str]) -> bool {
+    struct Collector<'a> {
+        columns: &'a [&'a str],
+        matched: bool,
+    }
+
+    impl Visitor for Collector<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            let matches_identifier = |value: &str| {
+                self.columns
+                    .iter()
+                    .any(|column| value.eq_ignore_ascii_case(column))
+            };
+            match expr {
+                Expr::Identifier(identifier) if matches_identifier(&identifier.value) => {
+                    self.matched = true;
+                    ControlFlow::Break(())
+                }
+                Expr::CompoundIdentifier(parts)
+                    if parts
+                        .last()
+                        .is_some_and(|identifier| matches_identifier(&identifier.value)) =>
+                {
+                    self.matched = true;
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+
+    let mut collector = Collector {
+        columns,
+        matched: false,
+    };
+    let _ = query.visit(&mut collector);
+    collector.matched
+}
+
+pub(crate) async fn prepare_sql2_read(
+    backend: &dyn LixBackend,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+) -> Option<Sql2PreparedRead> {
+    try_prepare_sql2_read(
+        backend,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+fn statements_reference_public_surface(
+    registry: &SurfaceRegistry,
+    parsed_statements: &[Statement],
+) -> bool {
+    parsed_statements
+        .iter()
+        .any(|statement| statement_references_public_surface(registry, statement))
+}
+
+fn statement_references_public_surface(registry: &SurfaceRegistry, statement: &Statement) -> bool {
+    match statement {
+        Statement::Query(query) => query_references_public_surface(registry, query),
+        Statement::Explain { statement, .. } => {
+            statement_references_public_surface(registry, statement.as_ref())
+        }
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+            top_level_write_target_name(statement)
+                .and_then(|name| registry.bind_relation_name(&name))
+                .is_some()
+        }
+        _ => false,
+    }
+}
+
+fn query_references_public_surface(registry: &SurfaceRegistry, query: &Query) -> bool {
+    collect_public_query_relation_names(query)
+        .into_iter()
+        .any(|name| registry.bind_relation_name(&name).is_some())
+}
+
+fn collect_public_query_relation_names(query: &Query) -> BTreeSet<String> {
+    struct Collector {
+        relation_names: BTreeSet<String>,
+    }
+
+    impl Visitor for Collector {
+        type Break = ();
+
+        fn pre_visit_table_factor(
+            &mut self,
+            table_factor: &TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            if let TableFactor::Table { name, .. } = table_factor {
+                if let Some(identifier) = name.0.last().and_then(ObjectNamePart::as_ident) {
+                    self.relation_names
+                        .insert(identifier.value.to_ascii_lowercase());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut collector = Collector {
+        relation_names: BTreeSet::new(),
+    };
+    let _ = query.visit(&mut collector);
+    collector.relation_names
+}
+
+async fn load_active_version_id_for_sql2_read(
+    backend: &dyn LixBackend,
+) -> Result<String, LixError> {
+    let result = backend
+        .execute(
+            "SELECT snapshot_content \
+             FROM lix_internal_state_untracked \
+             WHERE schema_key = $1 \
+               AND file_id = $2 \
+               AND version_id = $3 \
+               AND snapshot_content IS NOT NULL \
+             ORDER BY updated_at DESC \
+             LIMIT 1",
+            &[
+                Value::Text(crate::version::active_version_schema_key().to_string()),
+                Value::Text(crate::version::active_version_file_id().to_string()),
+                Value::Text(crate::version::active_version_storage_version_id().to_string()),
+            ],
+        )
+        .await?;
+
+    let Some(row) = result.rows.first() else {
+        return Ok(crate::version::DEFAULT_ACTIVE_VERSION_NAME.to_string());
+    };
+    let snapshot_content = row.first().ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "active version query row is missing snapshot_content",
+        )
+    })?;
+    let snapshot_content = match snapshot_content {
+        Value::Text(value) => value.as_str(),
+        other => {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("active version snapshot_content must be text, got {other:?}"),
+            ))
+        }
+    };
+    crate::version::parse_active_version_snapshot(snapshot_content)
 }
 
 async fn maybe_bind_active_history_root(
@@ -368,6 +750,45 @@ fn dependency_spec_has_unknown_schema_keys(
         .schema_keys
         .iter()
         .any(|schema_key| !registered.contains(schema_key))
+}
+
+fn unknown_public_state_schema_error(
+    registry: &SurfaceRegistry,
+    dependency_spec: Option<&DependencySpec>,
+) -> Option<LixError> {
+    if !dependency_spec_has_unknown_schema_keys(registry, dependency_spec) {
+        return None;
+    }
+    let dependency_spec = dependency_spec?;
+    let registered = registry.registered_state_backed_schema_keys();
+    let available_refs = registered.iter().map(String::as_str).collect::<Vec<_>>();
+    let unknown = dependency_spec.schema_keys.iter().find(|schema_key| {
+        !registered
+            .iter()
+            .any(|registered| registered == *schema_key)
+    })?;
+    Some(schema_not_registered_error(unknown, &available_refs))
+}
+
+fn augment_dependency_spec_for_public_read(
+    registry: &SurfaceRegistry,
+    canonicalized: &CanonicalizedRead,
+    dependency_spec: Option<DependencySpec>,
+) -> Option<DependencySpec> {
+    let mut dependency_spec = dependency_spec?;
+    let has_state_schema_keys = dependency_spec
+        .schema_keys
+        .iter()
+        .any(|schema_key| schema_key != "lix_active_version");
+    if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::State
+        && !has_state_schema_keys
+    {
+        dependency_spec.schema_keys = registry
+            .registered_state_backed_schema_keys()
+            .into_iter()
+            .collect();
+    }
+    Some(dependency_spec)
 }
 
 fn explain_query_statement(statement: &Statement) -> Option<(Statement, Option<ExplainEnvelope>)> {
@@ -608,6 +1029,17 @@ fn sql2_public_write_preparation_error_for_surface(
             "ON CONFLICT DO NOTHING is not supported",
         ));
     }
+    if message.contains("write proof requires version_id") && public_name.ends_with("_by_version") {
+        let action = match operation_kind {
+            WriteOperationKind::Insert => "insert requires version_id",
+            WriteOperationKind::Update => "update requires a version_id predicate",
+            WriteOperationKind::Delete => "delete requires a version_id predicate",
+        };
+        return Some(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("{public_name} {action}"),
+        ));
+    }
 
     match surface_binding.descriptor.surface_family {
         SurfaceFamily::Filesystem => Some(sql2_filesystem_write_error(public_name, message)),
@@ -625,6 +1057,20 @@ fn statement_write_operation_kind(statement: &Statement) -> Option<WriteOperatio
         Statement::Delete(_) => Some(WriteOperationKind::Delete),
         _ => None,
     }
+}
+
+fn public_write_target_name(
+    registry: &SurfaceRegistry,
+    parsed_statements: &[Statement],
+) -> Option<String> {
+    if parsed_statements.len() != 1 {
+        return None;
+    }
+    let target_name = top_level_write_target_name(&parsed_statements[0])?;
+    let binding = registry.bind_relation_name(&target_name)?;
+    (binding.capability == SurfaceCapability::ReadWrite
+        && binding.resolution_capabilities.semantic_write)
+        .then_some(binding.descriptor.public_name)
 }
 
 fn top_level_filesystem_write_target_name(statement: &Statement) -> Option<&'static str> {
@@ -742,10 +1188,11 @@ fn build_sql2_invariant_trace(planned_write: &PlannedWrite) -> Sql2InvariantTrac
         }
     }
 
-    if !planned_write
-        .command
-        .mode
-        .eq(&crate::sql2::planner::ir::WriteMode::Untracked)
+    if planned_write
+        .resolved_write_plan
+        .as_ref()
+        .map(|plan| plan.execution_mode != crate::sql2::planner::ir::WriteMode::Untracked)
+        .unwrap_or(true)
     {
         physical_checks.push("backend_constraints.defense_in_depth".to_string());
     }
@@ -759,11 +1206,16 @@ fn build_sql2_invariant_trace(planned_write: &PlannedWrite) -> Sql2InvariantTrac
 
 #[cfg(test)]
 mod tests {
-    use super::{prepare_sql2_read, prepare_sql2_write};
+    use super::{
+        prepare_sql2_public_execution, prepare_sql2_read, prepare_sql2_write,
+        Sql2PreparedPublicExecution,
+    };
     use crate::sql2::catalog::SurfaceRegistry;
     use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql2::planner::canonicalize::canonicalize_write;
-    use crate::sql2::planner::ir::{ExpectedTip, ScopeProof, WriteLane, WriteMode};
+    use crate::sql2::planner::ir::{
+        ExpectedTip, ScopeProof, WriteLane, WriteMode, WriteModeRequest,
+    };
     use crate::sql2::planner::semantics::domain_changes::{
         build_domain_change_batch, derive_commit_preconditions,
     };
@@ -1679,6 +2131,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classifies_public_reads_through_sql2_public_execution() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_public_execution(
+            &backend,
+            &parse_one("SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'"),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("public read classification should succeed");
+
+        assert!(matches!(
+            prepared,
+            Some(Sql2PreparedPublicExecution::Read(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn classifies_public_writes_through_sql2_public_execution() {
+        let mut backend = FakeBackend::default();
+        backend.version_pointer_rows.insert(
+            "main".to_string(),
+            crate::version::version_pointer_snapshot_content("main", "commit-active-root"),
+        );
+        let prepared = prepare_sql2_public_execution(
+            &backend,
+            &parse_one("INSERT INTO lix_key_value (key, value) VALUES ('phase1-boundary', 'ok')"),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("public write classification should succeed");
+
+        assert!(matches!(
+            prepared,
+            Some(Sql2PreparedPublicExecution::Write(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn returns_none_for_unsupported_day_one_query_shapes() {
         let backend = FakeBackend::default();
         let prepared = prepare_sql2_read(
@@ -1868,7 +2362,19 @@ mod tests {
             prepared.planned_write.scope_proof,
             ScopeProof::SingleVersion("version-a".to_string())
         );
-        assert_eq!(prepared.planned_write.command.mode, WriteMode::Tracked);
+        assert_eq!(
+            prepared.planned_write.command.requested_mode,
+            WriteModeRequest::Auto
+        );
+        assert_eq!(
+            prepared
+                .planned_write
+                .resolved_write_plan
+                .as_ref()
+                .expect("resolved write plan should exist")
+                .execution_mode,
+            WriteMode::Tracked
+        );
         assert_eq!(
             prepared
                 .planned_write
@@ -2065,7 +2571,10 @@ mod tests {
             prepared.debug_trace.surface_bindings,
             vec!["lix_active_version"]
         );
-        assert_eq!(prepared.planned_write.command.mode, WriteMode::Untracked);
+        assert_eq!(
+            prepared.planned_write.command.requested_mode,
+            WriteModeRequest::ForceUntracked
+        );
         assert!(prepared.planned_write.commit_preconditions.is_none());
         assert!(prepared.domain_change_batch.is_none());
         assert_eq!(
@@ -2102,7 +2611,10 @@ mod tests {
             prepared.debug_trace.surface_bindings,
             vec!["lix_active_account"]
         );
-        assert_eq!(prepared.planned_write.command.mode, WriteMode::Untracked);
+        assert_eq!(
+            prepared.planned_write.command.requested_mode,
+            WriteModeRequest::ForceUntracked
+        );
         assert!(prepared.planned_write.commit_preconditions.is_none());
         assert!(prepared.domain_change_batch.is_none());
         assert!(
@@ -2135,7 +2647,10 @@ mod tests {
             prepared.debug_trace.surface_bindings,
             vec!["lix_file_by_version"]
         );
-        assert_eq!(prepared.planned_write.command.mode, WriteMode::Untracked);
+        assert_eq!(
+            prepared.planned_write.command.requested_mode,
+            WriteModeRequest::ForceUntracked
+        );
         assert!(prepared.planned_write.commit_preconditions.is_none());
         assert!(prepared.domain_change_batch.is_none());
         let rows = &prepared
@@ -2171,7 +2686,10 @@ mod tests {
             prepared.debug_trace.surface_bindings,
             vec!["lix_directory_by_version"]
         );
-        assert_eq!(prepared.planned_write.command.mode, WriteMode::Untracked);
+        assert_eq!(
+            prepared.planned_write.command.requested_mode,
+            WriteModeRequest::ForceUntracked
+        );
         assert!(prepared.planned_write.commit_preconditions.is_none());
         assert!(prepared.domain_change_batch.is_none());
         let rows = &prepared

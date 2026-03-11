@@ -4,7 +4,7 @@ use crate::sql2::planner::ir::{
     CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan,
     CanonicalWorkingChangesScan, InsertOnConflict, InsertOnConflictAction, MutationPayload,
     PredicateSpec, ProjectionExpr, ReadCommand, ReadContract, ReadPlan, SortKey, WriteCommand,
-    WriteMode, WriteOperationKind, WriteSelector,
+    WriteModeRequest, WriteOperationKind, WriteSelector,
 };
 use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
@@ -207,7 +207,7 @@ fn canonicalize_insert_write(
         )),
         _ => None,
     };
-    let mode = write_mode_for_insert_payloads(&surface_binding, &payloads)?;
+    let requested_mode = write_mode_request_for_insert_payloads(&surface_binding, &payloads)?;
     let payload = match payloads.as_slice() {
         [payload] => MutationPayload::FullSnapshot(payload.clone()),
         _ => MutationPayload::BulkFullSnapshot(payloads),
@@ -222,7 +222,7 @@ fn canonicalize_insert_write(
             selector: WriteSelector::default(),
             payload,
             on_conflict,
-            mode,
+            requested_mode,
             execution_context: bound_statement.execution_context,
         },
     })
@@ -269,7 +269,8 @@ fn canonicalize_update_write(
             ))
         }
     };
-    let mode = write_mode_for_surface_and_selector(&surface_binding, &payload, Some(&selector));
+    let requested_mode =
+        write_mode_request_for_surface_and_selector(&surface_binding, &payload, Some(&selector));
 
     Ok(CanonicalizedWrite {
         bound_statement: bound_statement.clone(),
@@ -280,7 +281,7 @@ fn canonicalize_update_write(
             selector,
             payload: MutationPayload::Patch(payload),
             on_conflict: None,
-            mode,
+            requested_mode,
             execution_context: bound_statement.execution_context,
         },
     })
@@ -332,7 +333,7 @@ fn canonicalize_delete_write(
             selector: selector.clone(),
             payload: MutationPayload::Tombstone,
             on_conflict: None,
-            mode: write_mode_for_surface_and_selector(
+            requested_mode: write_mode_request_for_surface_and_selector(
                 &surface_binding,
                 &BTreeMap::new(),
                 Some(&selector),
@@ -690,18 +691,18 @@ fn insert_payloads(
     Ok(payloads)
 }
 
-fn write_mode_for_insert_payloads(
+fn write_mode_request_for_insert_payloads(
     surface_binding: &SurfaceBinding,
     payloads: &[BTreeMap<String, Value>],
-) -> Result<WriteMode, CanonicalizeError> {
+) -> Result<WriteModeRequest, CanonicalizeError> {
     let Some(first) = payloads.first() else {
         return Err(CanonicalizeError::unsupported(
             "sql2 day-1 write canonicalizer requires at least one insert row",
         ));
     };
-    let mode = write_mode_for_surface_and_selector(surface_binding, first, None);
+    let mode = write_mode_request_for_surface_and_selector(surface_binding, first, None);
     for payload in &payloads[1..] {
-        let row_mode = write_mode_for_surface_and_selector(surface_binding, payload, None);
+        let row_mode = write_mode_request_for_surface_and_selector(surface_binding, payload, None);
         if row_mode != mode {
             return Err(CanonicalizeError::unsupported(
                 "sql2 day-1 insert canonicalizer does not support mixing tracked and untracked rows in one INSERT",
@@ -1386,39 +1387,38 @@ fn supports_implicit_admin_selector(surface_binding: &SurfaceBinding) -> bool {
     )
 }
 
-fn write_mode_for_surface(
+fn write_mode_request_for_surface(
     surface_binding: &SurfaceBinding,
     payload: &BTreeMap<String, Value>,
-) -> WriteMode {
+) -> WriteModeRequest {
     if matches!(
         surface_binding.descriptor.public_name.as_str(),
         "lix_active_version" | "lix_active_account"
     ) {
-        return WriteMode::Untracked;
+        return WriteModeRequest::ForceUntracked;
     }
 
-    write_mode_from_payload(payload)
+    write_mode_request_from_payload(payload)
 }
 
-fn write_mode_for_surface_and_selector(
+fn write_mode_request_for_surface_and_selector(
     surface_binding: &SurfaceBinding,
     payload: &BTreeMap<String, Value>,
     selector: Option<&WriteSelector>,
-) -> WriteMode {
-    let payload_mode = write_mode_for_surface(surface_binding, payload);
-    if payload_mode == WriteMode::Untracked {
+) -> WriteModeRequest {
+    let payload_mode = write_mode_request_for_surface(surface_binding, payload);
+    if !matches!(payload_mode, WriteModeRequest::Auto) {
         return payload_mode;
     }
 
-    if selector
+    match selector
         .and_then(|selector| selector.exact_filters.get("untracked"))
         .and_then(value_as_bool)
-        == Some(true)
     {
-        return WriteMode::Untracked;
+        Some(true) => WriteModeRequest::ForceUntracked,
+        Some(false) => WriteModeRequest::ForceTracked,
+        None => payload_mode,
     }
-
-    payload_mode
 }
 
 fn value_as_bool(value: &Value) -> Option<bool> {
@@ -1434,19 +1434,26 @@ fn value_as_bool(value: &Value) -> Option<bool> {
     }
 }
 
-fn write_mode_from_payload(payload: &BTreeMap<String, Value>) -> WriteMode {
+fn write_mode_request_from_payload(payload: &BTreeMap<String, Value>) -> WriteModeRequest {
     match payload
         .get("untracked")
         .or_else(|| payload.get("lixcol_untracked"))
     {
-        Some(Value::Boolean(true)) => WriteMode::Untracked,
-        Some(Value::Integer(value)) if *value != 0 => WriteMode::Untracked,
+        Some(Value::Boolean(true)) => WriteModeRequest::ForceUntracked,
+        Some(Value::Boolean(false)) => WriteModeRequest::ForceTracked,
+        Some(Value::Integer(value)) if *value != 0 => WriteModeRequest::ForceUntracked,
+        Some(Value::Integer(_)) => WriteModeRequest::ForceTracked,
         Some(Value::Text(value))
             if matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true") =>
         {
-            WriteMode::Untracked
+            WriteModeRequest::ForceUntracked
         }
-        _ => WriteMode::Tracked,
+        Some(Value::Text(value))
+            if matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false") =>
+        {
+            WriteModeRequest::ForceTracked
+        }
+        _ => WriteModeRequest::Auto,
     }
 }
 
@@ -1576,7 +1583,7 @@ mod tests {
     use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql2::core::parser::parse_sql_script;
     use crate::sql2::planner::ir::{
-        MutationPayload, ReadContract, ReadPlan, VersionScope, WriteMode, WriteOperationKind,
+        MutationPayload, ReadContract, ReadPlan, VersionScope, WriteModeRequest, WriteOperationKind,
     };
     use crate::Value;
 
@@ -1747,7 +1754,10 @@ mod tests {
             canonicalized.write_command.operation_kind,
             WriteOperationKind::Insert
         );
-        assert_eq!(canonicalized.write_command.mode, WriteMode::Tracked);
+        assert_eq!(
+            canonicalized.write_command.requested_mode,
+            WriteModeRequest::Auto
+        );
         let MutationPayload::FullSnapshot(payload) = &canonicalized.write_command.payload else {
             panic!("expected full snapshot payload");
         };

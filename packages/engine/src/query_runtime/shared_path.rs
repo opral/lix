@@ -15,8 +15,9 @@ use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::schema_from_stored_snapshot;
 use crate::schema_registry::register_schema_sql_statements;
-use crate::sql2::catalog::{SurfaceCapability, SurfaceRegistry};
-use crate::sql2::runtime::{prepare_sql2_read, try_prepare_sql2_write, Sql2PreparedWrite};
+use crate::sql2::runtime::{
+    prepare_sql2_public_execution, Sql2PreparedPublicExecution, Sql2PreparedWrite,
+};
 use crate::state_commit_stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamOperation,
@@ -162,28 +163,21 @@ pub(crate) async fn prepare_execution_with_backend(
             ),
         })?;
 
-    let sql2_read =
-        prepare_sql2_read(backend, &statements, params, active_version_id, writer_key).await;
-    let sql2_write =
-        try_prepare_sql2_write(backend, &statements, params, active_version_id, writer_key)
+    let sql2_public_execution =
+        prepare_sql2_public_execution(backend, &statements, params, active_version_id, writer_key)
             .await
             .map_err(|error| LixError {
                 code: error.code,
                 description: format!(
-                    "prepare_execution_with_backend sql2 write preparation failed: {}",
+                    "prepare_execution_with_backend sql2 public preparation failed: {}",
                     error.description
                 ),
             })?;
-    if let Some(target_name) =
-        migrated_public_write_target_name_with_backend(backend, &statements).await?
-    {
-        if sql2_write.is_none() {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("public write target '{target_name}' must route through sql2"),
-            });
-        }
-    }
+    let (sql2_read, sql2_write) = match sql2_public_execution {
+        Some(Sql2PreparedPublicExecution::Read(prepared)) => (Some(prepared), None),
+        Some(Sql2PreparedPublicExecution::Write(prepared)) => (None, Some(prepared)),
+        None => (None, None),
+    };
     let plan_statements = sql2_read
         .as_ref()
         .and_then(|prepared| prepared.lowered_read.as_ref())
@@ -373,41 +367,7 @@ fn derive_result_contract_for_statements(statements: &[Statement]) -> ResultCont
     }
 }
 
-async fn migrated_public_write_target_name_with_backend(
-    backend: &dyn LixBackend,
-    statements: &[Statement],
-) -> Result<Option<String>, LixError> {
-    if statements.len() != 1 {
-        return Ok(None);
-    }
-    if statement_is_multi_row_insert(&statements[0]) {
-        return Ok(None);
-    }
-    let registry = SurfaceRegistry::bootstrap_with_backend(backend).await?;
-
-    Ok(statements.iter().find_map(|statement| {
-        let target_name = top_level_write_target_name(statement)?;
-        let binding = registry.bind_relation_name(&target_name)?;
-        (binding.capability == SurfaceCapability::ReadWrite
-            && binding.descriptor.surface_family != crate::sql2::catalog::SurfaceFamily::Entity
-            && binding.resolution_capabilities.semantic_write)
-            .then_some(binding.descriptor.public_name)
-    }))
-}
-
-fn statement_is_multi_row_insert(statement: &Statement) -> bool {
-    let Statement::Insert(insert) = statement else {
-        return false;
-    };
-    let Some(source) = insert.source.as_ref() else {
-        return false;
-    };
-    let sqlparser::ast::SetExpr::Values(values) = source.body.as_ref() else {
-        return false;
-    };
-    values.rows.len() > 1
-}
-
+#[cfg(test)]
 fn top_level_write_target_name(statement: &Statement) -> Option<String> {
     match statement {
         Statement::Insert(insert) => match &insert.table {
@@ -1183,6 +1143,11 @@ pub(crate) fn sql2_commits_filesystem_payload_domain_changes(
     let Some(sql2_write) = prepared.sql2_write.as_ref() else {
         return false;
     };
+    let execution_mode = sql2_write
+        .planned_write
+        .resolved_write_plan
+        .as_ref()
+        .map(|plan| plan.execution_mode);
     matches!(
         sql2_write
             .planned_write
@@ -1193,8 +1158,8 @@ pub(crate) fn sql2_commits_filesystem_payload_domain_changes(
             .as_str(),
         "lix_file" | "lix_file_by_version"
     ) && matches!(
-        sql2_write.planned_write.command.mode,
-        crate::sql2::planner::ir::WriteMode::Tracked
+        execution_mode,
+        Some(crate::sql2::planner::ir::WriteMode::Tracked)
     ) && sql2_tracked_write_is_live(prepared)
 }
 
@@ -1202,6 +1167,11 @@ fn sql2_persists_filesystem_payload_writes(prepared: &PreparedExecutionContext) 
     let Some(sql2_write) = prepared.sql2_write.as_ref() else {
         return false;
     };
+    let execution_mode = sql2_write
+        .planned_write
+        .resolved_write_plan
+        .as_ref()
+        .map(|plan| plan.execution_mode);
     matches!(
         sql2_write
             .planned_write
@@ -1212,9 +1182,9 @@ fn sql2_persists_filesystem_payload_writes(prepared: &PreparedExecutionContext) 
             .as_str(),
         "lix_file" | "lix_file_by_version"
     ) && matches!(
-        sql2_write.planned_write.command.mode,
-        crate::sql2::planner::ir::WriteMode::Tracked
-            | crate::sql2::planner::ir::WriteMode::Untracked
+        execution_mode,
+        Some(crate::sql2::planner::ir::WriteMode::Tracked)
+            | Some(crate::sql2::planner::ir::WriteMode::Untracked)
     ) && !prepared.intent.pending_file_writes.is_empty()
 }
 
@@ -1222,12 +1192,17 @@ fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     let Some(sql2_write) = prepared.sql2_write.as_ref() else {
         return false;
     };
+    let execution_mode = sql2_write
+        .planned_write
+        .resolved_write_plan
+        .as_ref()
+        .map(|plan| plan.execution_mode);
     matches!(
         prepared.plan.result_contract,
         ResultContract::DmlNoReturning
     ) && matches!(
-        sql2_write.planned_write.command.mode,
-        crate::sql2::planner::ir::WriteMode::Tracked
+        execution_mode,
+        Some(crate::sql2::planner::ir::WriteMode::Tracked)
     ) && sql2_write.domain_change_batch.is_some()
         && sql2_write.planned_write.commit_preconditions.is_some()
         && live_sql2_operation_supported(sql2_write)
@@ -1237,12 +1212,17 @@ fn sql2_untracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     let Some(sql2_write) = prepared.sql2_write.as_ref() else {
         return false;
     };
+    let execution_mode = sql2_write
+        .planned_write
+        .resolved_write_plan
+        .as_ref()
+        .map(|plan| plan.execution_mode);
     matches!(
         prepared.plan.result_contract,
         ResultContract::DmlNoReturning
     ) && matches!(
-        sql2_write.planned_write.command.mode,
-        crate::sql2::planner::ir::WriteMode::Untracked
+        execution_mode,
+        Some(crate::sql2::planner::ir::WriteMode::Untracked)
     ) && matches!(
         sql2_write
             .planned_write
@@ -1257,8 +1237,8 @@ fn sql2_untracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
         prepared.plan.result_contract,
         ResultContract::DmlNoReturning
     ) && matches!(
-        sql2_write.planned_write.command.mode,
-        crate::sql2::planner::ir::WriteMode::Untracked
+        execution_mode,
+        Some(crate::sql2::planner::ir::WriteMode::Untracked)
     ) && matches!(
         sql2_write
             .planned_write

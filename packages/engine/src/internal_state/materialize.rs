@@ -5,7 +5,7 @@ use sqlparser::ast::{
 use crate::engine::sql_ast::lowering::lower_statement;
 use crate::engine::sql_ast::utils::{bind_sql, parse_sql_statements};
 use crate::engine::sql_ast::walk::object_name_matches;
-use crate::internal_state::lower_public_read_query_with_sql2_backend;
+use crate::sql2::runtime::lower_public_read_query_with_sql2_backend;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) async fn materialize_vtable_insert_select_sources(

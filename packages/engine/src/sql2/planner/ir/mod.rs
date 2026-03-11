@@ -263,6 +263,13 @@ pub(crate) enum WriteMode {
     Untracked,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteModeRequest {
+    Auto,
+    ForceTracked,
+    ForceUntracked,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum MutationPayload {
     FullSnapshot(BTreeMap<String, Value>),
@@ -297,7 +304,7 @@ pub(crate) struct WriteCommand {
     pub(crate) selector: WriteSelector,
     pub(crate) payload: MutationPayload,
     pub(crate) on_conflict: Option<InsertOnConflict>,
-    pub(crate) mode: WriteMode,
+    pub(crate) requested_mode: WriteModeRequest,
     pub(crate) execution_context: ExecutionContext,
 }
 
@@ -379,6 +386,7 @@ pub(crate) struct RowLineage {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedWritePlan {
+    pub(crate) execution_mode: WriteMode,
     pub(crate) authoritative_pre_state: Vec<ResolvedRowRef>,
     pub(crate) intended_post_state: Vec<PlannedStateRow>,
     pub(crate) tombstones: Vec<ResolvedRowRef>,
@@ -401,7 +409,15 @@ pub(crate) struct PlannedWrite {
 
 impl PlannedWrite {
     pub(crate) fn requires_single_write_lane(&self) -> bool {
-        self.command.mode == WriteMode::Tracked
+        self.resolved_write_plan
+            .as_ref()
+            .map(|plan| plan.execution_mode == WriteMode::Tracked)
+            .unwrap_or_else(|| {
+                !matches!(
+                    self.command.requested_mode,
+                    WriteModeRequest::ForceUntracked
+                )
+            })
     }
 
     pub(crate) fn target_is_writable(&self) -> bool {

@@ -15,21 +15,19 @@ use crate::cel::CelEvaluator;
 use crate::default_values::apply_vtable_insert_defaults;
 use crate::functions::LixFunctionProvider;
 use crate::functions::SharedFunctionProvider;
+use crate::internal_state::bind_once::{
+    bind_statements_with_appended_params_once, StatementWithAppendedParams,
+};
+use crate::internal_state::inline_functions::inline_lix_functions_with_provider;
+use crate::internal_state::param_context::normalize_statement_placeholders_in_batch;
 use crate::query_runtime::contracts::planned_statement::PlannedStatementSet;
-use crate::sql2::catalog::SurfaceRegistry;
-use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
-use crate::sql2::planner::backend::lowerer::{
-    lower_read_for_execution, rewrite_supported_public_read_surfaces_in_statement,
+use crate::sql2::planner::backend::lowerer::rewrite_supported_public_read_surfaces_in_statement;
+use crate::sql2::runtime::{
+    lower_public_read_query_with_sql2_backend, rewrite_public_read_query_to_lowered_sql,
+    statement_references_public_sql2_surface,
+    statement_references_public_sql2_surface_with_backend,
 };
-use crate::sql2::planner::canonicalize::canonicalize_read;
-use crate::sql2::planner::semantics::dependency_spec::derive_dependency_spec_from_canonicalized_read;
-use crate::sql2::planner::semantics::effective_state_resolver::build_effective_state;
-use crate::sql2::runtime::prepare_sql2_read;
 use crate::sql_shared::ast::parse_sql_statements;
-use crate::version::{
-    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot, DEFAULT_ACTIVE_VERSION_NAME,
-};
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use sqlparser::ast::{ObjectNamePart, Query, Statement, TableFactor, Visit, Visitor};
 use std::collections::BTreeSet;
@@ -37,12 +35,6 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use crate::engine::sql_ast::lowering::lower_statement;
-use crate::internal_state::bind_once::{
-    bind_statements_with_appended_params_once, StatementWithAppendedParams,
-};
-use crate::internal_state::inline_functions::inline_lix_functions_with_provider;
-use crate::internal_state::param_context::normalize_statement_placeholders_in_batch;
-
 pub(crate) use crate::engine::sql_ast::utils::PlaceholderState;
 pub(crate) use crate::engine::sql_ast::utils::{
     resolve_expr_cell_with_state, ResolvedCell, RowSourceResolver,
@@ -377,139 +369,6 @@ fn validate_statement_output(output: &RewriteOutput) -> Result<(), LixError> {
     Ok(())
 }
 
-pub(crate) fn rewrite_public_read_statement_to_lowered_sql(
-    statement: &mut Statement,
-    dialect: SqlDialect,
-) -> Result<Statement, LixError> {
-    rewrite_supported_public_read_surfaces_in_statement(statement)?;
-    lower_statement(statement.clone(), dialect)
-}
-
-pub(crate) fn statement_references_public_sql2_surface(statement: &Statement) -> bool {
-    match statement {
-        Statement::Query(query) => query_references_builtin_public_sql2_surface(query),
-        Statement::Explain { statement, .. } => statement_references_public_sql2_surface(statement),
-        _ => false,
-    }
-}
-
-pub(crate) async fn statement_references_public_sql2_surface_with_backend(
-    backend: &dyn LixBackend,
-    statement: &Statement,
-) -> bool {
-    let query = match statement {
-        Statement::Query(query) => query,
-        Statement::Explain { statement, .. } => match statement.as_ref() {
-            Statement::Query(query) => query,
-            _ => return false,
-        },
-        _ => return false,
-    };
-
-    let relation_names = collect_public_query_relation_names(query);
-    if relation_names.is_empty() {
-        return false;
-    }
-    if relation_names
-        .iter()
-        .all(|name| name.starts_with("lix_internal_"))
-    {
-        return false;
-    }
-
-    let registry = match SurfaceRegistry::bootstrap_with_backend(backend).await {
-        Ok(registry) => registry,
-        Err(_) => return query_references_builtin_public_sql2_surface(query),
-    };
-
-    relation_names
-        .iter()
-        .any(|name| registry.bind_relation_name(name).is_some())
-}
-
-pub(crate) fn rewrite_public_read_query_to_lowered_sql(
-    query: Query,
-    dialect: SqlDialect,
-) -> Result<Query, LixError> {
-    let mut statement = Statement::Query(Box::new(query));
-    match rewrite_public_read_statement_to_lowered_sql(&mut statement, dialect)? {
-        Statement::Query(query) => Ok(*query),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "expected lowered read query to remain a SELECT query".to_string(),
-        }),
-    }
-}
-
-pub(crate) async fn lower_public_read_query_with_sql2_backend(
-    backend: &dyn LixBackend,
-    query: Query,
-    params: &[Value],
-) -> Result<Query, LixError> {
-    if !query_references_builtin_public_sql2_surface(&query) {
-        return Ok(query);
-    }
-    let active_version_id = load_active_version_id_for_sql2_read(backend).await?;
-    let parsed = vec![Statement::Query(Box::new(query.clone()))];
-    let prepared = prepare_sql2_read(backend, &parsed, params, &active_version_id, None).await;
-    let lowered = if let Some(prepared) = prepared {
-        prepared.lowered_read.ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "sql2 read subquery did not lower to executable SQL".to_string(),
-        })?
-    } else {
-        let rewritten = rewrite_public_read_query_to_lowered_sql(query.clone(), backend.dialect())?;
-        if rewritten != query {
-            return Ok(rewritten);
-        }
-        let registry = SurfaceRegistry::bootstrap_with_backend(backend).await?;
-        let bound_statement = BoundStatement::from_statement(
-            Statement::Query(Box::new(query)),
-            params.to_vec(),
-            ExecutionContext {
-                dialect: Some(backend.dialect()),
-                writer_key: None,
-                requested_version_id: Some(active_version_id),
-            },
-        );
-        let canonicalized =
-            canonicalize_read(bound_statement, &registry).map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "sql2 read subquery canonicalization failed: {}",
-                    error.message
-                ),
-            })?;
-        let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
-        let effective_state = build_effective_state(&canonicalized, dependency_spec.as_ref());
-        lower_read_for_execution(
-            &canonicalized,
-            effective_state.as_ref().map(|(request, _)| request),
-            effective_state.as_ref().map(|(_, plan)| plan),
-        )?
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "sql2 could not prepare read subquery".to_string(),
-        })?
-    };
-    let statement = lowered
-        .statements
-        .into_iter()
-        .next()
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "sql2 read subquery lowered to no statements".to_string(),
-        })?;
-    let statement = lower_statement(statement, backend.dialect())?;
-    match statement {
-        Statement::Query(query) => Ok(*query),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "expected lowered subquery to remain a SELECT query".to_string(),
-        }),
-    }
-}
-
 pub(crate) fn prepare_statements_sync_to_plan<P: LixFunctionProvider>(
     statements: Vec<Statement>,
     params: &[Value],
@@ -636,82 +495,6 @@ where
         writer_key,
     )
     .await
-}
-
-fn collect_public_query_relation_names(query: &Query) -> BTreeSet<String> {
-    struct Collector {
-        relation_names: BTreeSet<String>,
-    }
-
-    impl Visitor for Collector {
-        type Break = ();
-
-        fn pre_visit_table_factor(
-            &mut self,
-            table_factor: &TableFactor,
-        ) -> ControlFlow<Self::Break> {
-            if let TableFactor::Table { name, .. } = table_factor {
-                if let Some(identifier) = name.0.last().and_then(ObjectNamePart::as_ident) {
-                    self.relation_names
-                        .insert(identifier.value.to_ascii_lowercase());
-                }
-            }
-            ControlFlow::Continue(())
-        }
-    }
-
-    let mut collector = Collector {
-        relation_names: BTreeSet::new(),
-    };
-    let _ = query.visit(&mut collector);
-    collector.relation_names
-}
-
-fn query_references_builtin_public_sql2_surface(query: &Query) -> bool {
-    let registry = SurfaceRegistry::with_builtin_surfaces();
-    collect_public_query_relation_names(query)
-        .into_iter()
-        .any(|name| registry.bind_relation_name(&name).is_some())
-}
-
-async fn load_active_version_id_for_sql2_read(
-    backend: &dyn LixBackend,
-) -> Result<String, LixError> {
-    let result = backend
-        .execute(
-            "SELECT snapshot_content \
-             FROM lix_internal_state_untracked \
-             WHERE schema_key = $1 \
-               AND file_id = $2 \
-               AND version_id = $3 \
-               AND snapshot_content IS NOT NULL \
-             ORDER BY updated_at DESC \
-             LIMIT 1",
-            &[
-                Value::Text(active_version_schema_key().to_string()),
-                Value::Text(active_version_file_id().to_string()),
-                Value::Text(active_version_storage_version_id().to_string()),
-            ],
-        )
-        .await?;
-
-    let Some(row) = result.rows.first() else {
-        return Ok(DEFAULT_ACTIVE_VERSION_NAME.to_string());
-    };
-    let snapshot_content = row.first().ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "active version query row is missing snapshot_content".to_string(),
-    })?;
-    let snapshot_content = match snapshot_content {
-        Value::Text(value) => value.as_str(),
-        other => {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("active version snapshot_content must be text, got {other:?}"),
-            })
-        }
-    };
-    parse_active_version_snapshot(snapshot_content)
 }
 
 async fn prepare_rewritten_statements_with_backend<P>(

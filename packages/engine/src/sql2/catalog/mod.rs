@@ -216,6 +216,23 @@ impl SurfaceRegistry {
         schema_keys
     }
 
+    pub(crate) fn registered_state_backed_schema_keys(&self) -> Vec<String> {
+        let mut schema_keys = self
+            .descriptors
+            .values()
+            .filter(|descriptor| {
+                matches!(
+                    descriptor.surface_family,
+                    SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
+                )
+            })
+            .filter_map(|descriptor| descriptor.implicit_overrides.fixed_schema_key.clone())
+            .collect::<Vec<_>>();
+        schema_keys.sort();
+        schema_keys.dedup();
+        schema_keys
+    }
+
     pub(crate) fn register_dynamic_entity_surfaces(
         &mut self,
         spec: DynamicEntitySurfaceSpec,

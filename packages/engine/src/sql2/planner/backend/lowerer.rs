@@ -137,11 +137,10 @@ fn lower_state_read_for_execution(
     effective_state_request: &EffectiveStateRequest,
     effective_state_plan: &EffectiveStatePlan,
 ) -> Result<Option<Statement>, LixError> {
-    if !state_read_references_exposed_columns(
-        &canonicalized.surface_binding,
-        effective_state_request,
-    ) {
-        return Ok(None);
+    if let Some(error) =
+        state_read_exposed_column_error(&canonicalized.surface_binding, effective_state_request)
+    {
+        return Err(error);
     }
 
     let Statement::Query(mut query) = canonicalized.bound_statement.statement.clone() else {
@@ -180,19 +179,44 @@ fn lower_state_read_for_execution(
     Ok(Some(Statement::Query(query)))
 }
 
-fn state_read_references_exposed_columns(
+fn state_read_exposed_column_error(
     surface_binding: &SurfaceBinding,
     effective_state_request: &EffectiveStateRequest,
-) -> bool {
+) -> Option<LixError> {
     let exposed = surface_binding
         .exposed_columns
         .iter()
         .map(|column| column.to_ascii_lowercase())
         .collect::<std::collections::BTreeSet<_>>();
-    effective_state_request
+    let missing = effective_state_request
         .required_columns
         .iter()
-        .all(|column| exposed.contains(&column.to_ascii_lowercase()))
+        .filter(|column| !exposed.contains(&column.to_ascii_lowercase()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return None;
+    }
+    if surface_binding.descriptor.public_name == "lix_state"
+        && missing
+            .iter()
+            .any(|column| matches!(column.as_str(), "version_id" | "lixcol_version_id"))
+    {
+        return Some(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description:
+                "lix_state does not expose version_id; use lix_state_by_version for explicit version filters"
+                    .to_string(),
+        });
+    }
+    let column = missing[0].clone();
+    Some(LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!(
+            "strict rewrite violation: unknown column '{column}' on '{}'",
+            surface_binding.descriptor.public_name
+        ),
+    })
 }
 
 fn lower_entity_read_for_execution(

@@ -9,8 +9,8 @@ use crate::engine::query_storage::queries::{
 };
 use crate::engine::query_storage::tables;
 use crate::query_runtime::contracts::effects::FilesystemPayloadDomainChange;
-use crate::query_runtime::execute_prepared::execute_prepared_with_transaction;
-use crate::query_runtime::preprocess::preprocess_sql_to_plan;
+use crate::query_runtime::parse::parse_sql;
+use crate::query_runtime::shared_path;
 use crate::{ExecuteOptions, LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
 use sqlparser::ast::Statement;
 use std::collections::{BTreeMap, BTreeSet};
@@ -317,11 +317,42 @@ impl Engine {
 
         let (sql, params) =
             build_filesystem_payload_domain_changes_insert(&deduped_changes, untracked);
-        let output = {
+        let parsed_statements = parse_sql(&sql).map_err(LixError::from)?;
+        let active_version_id = self
+            .require_active_version_id()
+            .unwrap_or_else(|_| crate::version::GLOBAL_VERSION_ID.to_string());
+        let prepared = {
             let backend = TransactionBackendAdapter::new(transaction);
-            preprocess_sql_to_plan(&backend, &self.cel_evaluator, &sql, &params).await?
+            shared_path::prepare_execution_with_backend(
+                self,
+                &backend,
+                &parsed_statements,
+                &params,
+                &active_version_id,
+                None,
+                shared_path::PreparationPolicy {
+                    skip_side_effect_collection: true,
+                },
+            )
+            .await?
         };
-        execute_prepared_with_transaction(transaction, &output.prepared_statements).await?;
+        match shared_path::maybe_execute_sql2_write_with_transaction(
+            self,
+            transaction,
+            &prepared,
+            None,
+            None,
+        )
+        .await?
+        {
+            Some(_) => {}
+            None => {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "filesystem payload domain-change persistence must route through sql2",
+                ))
+            }
+        }
 
         Ok(())
     }
