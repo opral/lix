@@ -1,10 +1,10 @@
-use crate::engine::sql_ast::utils::parse_sql_statements;
 use crate::engine::Engine;
 use crate::errors;
-use crate::query_runtime::dependency_spec::{
+use crate::sql::ast::utils::parse_sql_statements;
+use crate::sql::execution::dependency_spec::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
 };
-use crate::state_commit_stream::StateCommitStream;
+use crate::state::stream::StateCommitStream;
 use crate::{LixError, QueryResult, Value, WireValue};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::Statement;

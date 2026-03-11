@@ -1,7 +1,5 @@
 use serde_json::Value as JsonValue;
 
-use crate::engine::query_storage::sql_text::escape_sql_string;
-use crate::engine::sql_ast::utils::parse_sql_statements;
 use crate::error_classification::is_missing_relation_error;
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
@@ -10,7 +8,9 @@ use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
 };
-use crate::query_runtime::preprocess::preprocess_statements_with_provider_to_plan as preprocess_statements_with_provider;
+use crate::sql::ast::utils::parse_sql_statements;
+use crate::sql::execution::preprocess::preprocess_statements_with_provider_to_plan as preprocess_statements_with_provider;
+use crate::sql::storage::sql_text::escape_sql_string;
 use crate::LixBackend;
 use crate::{LixError, Value};
 

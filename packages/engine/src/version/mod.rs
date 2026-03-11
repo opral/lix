@@ -1,8 +1,8 @@
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
-use crate::builtin_schema::types::{LixActiveVersion, LixVersionDescriptor, LixVersionPointer};
-use crate::builtin_schema::{
+use crate::schema::builtin::types::{LixActiveVersion, LixVersionDescriptor, LixVersionPointer};
+use crate::schema::builtin::{
     builtin_schema_definition, builtin_schema_json, decode_lixcol_literal,
 };
 use crate::LixError;

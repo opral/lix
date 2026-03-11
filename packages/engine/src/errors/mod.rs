@@ -1,4 +1,4 @@
-use crate::sql2::catalog::builtin_public_surface_names;
+use crate::sql::public::catalog::builtin_public_surface_names;
 use crate::LixError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -337,13 +337,13 @@ mod tests {
         assert!(classification_src.contains("errors::sql_unknown_column_error("));
         assert!(classification_src.contains("errors::table_not_found_read_error()"));
 
-        let state_history_write_src = include_str!("../sql2/runtime/mod.rs");
+        let state_history_write_src = include_str!("../sql/public/runtime/mod.rs");
         assert!(state_history_write_src.contains("read_only_view_write_error("));
 
-        let change_write_src = include_str!("../sql2/runtime/mod.rs");
+        let change_write_src = include_str!("../sql/public/runtime/mod.rs");
         assert!(change_write_src.contains("read_only_view_write_error("));
 
-        let vtable_write_src = include_str!("../internal_state/vtable_write.rs");
+        let vtable_write_src = include_str!("../state/internal/vtable_write.rs");
         assert!(vtable_write_src.contains("errors::vtable_schema_key_required_error"));
 
         let api_src = include_str!("../api.rs");

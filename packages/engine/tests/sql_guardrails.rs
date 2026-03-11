@@ -69,7 +69,7 @@ fn guardrail_engine_runtime_section_excludes_legacy_sql_pipeline_imports() {
 #[test]
 fn guardrail_sql_runtime_forbids_legacy_sql2_imports() {
     let shared_path_source = fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/query_runtime/shared_path.rs"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql/execution/shared_path.rs"),
     )
     .expect("shared_path.rs should be readable");
     assert!(
@@ -164,7 +164,7 @@ fn guardrail_duplicate_public_surface_registry_is_removed() {
 
 #[test]
 fn guardrail_sql2_stays_isolated_from_legacy_rewrite_followup_and_classifier_modules() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql2");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql/public");
     let mut files = Vec::new();
     collect_rust_sources(&root, &mut files);
 
@@ -172,8 +172,7 @@ fn guardrail_sql2_stays_isolated_from_legacy_rewrite_followup_and_classifier_mod
         let source = fs::read_to_string(&file).expect("source file should be readable");
         for forbidden in [
             "crate::engine::sql::planning::",
-            "crate::engine::sql_ast::utils",
-            "crate::sql_ast::utils",
+            "crate::sql::ast::utils",
             "crate::engine::sql::execution::followup",
             "crate::engine::sql::surfaces",
             "rewrite_engine",
@@ -210,7 +209,7 @@ fn guardrail_filesystem_public_surfaces_do_not_enter_legacy_query_rewrite() {
 #[test]
 fn guardrail_vtable_read_stays_filesystem_blind() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let vtable_read_source = fs::read_to_string(root.join("src/internal_state/vtable_read.rs"))
+    let vtable_read_source = fs::read_to_string(root.join("src/state/internal/vtable_read.rs"))
         .expect("vtable_read.rs should be readable");
 
     for forbidden in ["lix_file", "lix_directory", "filesystem::"] {
@@ -241,7 +240,7 @@ fn guardrail_legacy_filesystem_select_rewrite_is_removed() {
 fn guardrail_dead_rewrite_engine_filesystem_coalescer_stays_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !root.join("src/internal_state/rewrite.rs").exists(),
+        !root.join("src/state/internal/rewrite.rs").exists(),
         "dead rewrite_engine filesystem coalescer must stay removed"
     );
 }
@@ -250,7 +249,7 @@ fn guardrail_dead_rewrite_engine_filesystem_coalescer_stays_removed() {
 fn guardrail_dead_rewrite_engine_filesystem_analysis_stays_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !root.join("src/internal_state/analysis.rs").exists(),
+        !root.join("src/state/internal/analysis.rs").exists(),
         "dead rewrite_engine filesystem analysis helper must stay removed"
     );
 }
@@ -259,7 +258,7 @@ fn guardrail_dead_rewrite_engine_filesystem_analysis_stays_removed() {
 fn guardrail_dead_canonical_filesystem_write_wrapper_stays_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !root.join("src/internal_state/filesystem_write.rs").exists(),
+        !root.join("src/state/internal/filesystem_write.rs").exists(),
         "dead canonical filesystem write wrapper must stay removed"
     );
 }
@@ -268,7 +267,7 @@ fn guardrail_dead_canonical_filesystem_write_wrapper_stays_removed() {
 fn guardrail_legacy_canonical_statement_rewrite_is_filesystem_blind() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let canonical_mod_source =
-        fs::read_to_string(root.join("src/internal_state/canonical_write.rs"))
+        fs::read_to_string(root.join("src/state/internal/canonical_write.rs"))
             .expect("canonical_write.rs should be readable");
 
     for forbidden in [
@@ -307,11 +306,11 @@ fn guardrail_legacy_filesystem_mutation_rewrite_is_removed() {
 #[test]
 fn guardrail_sql_side_effects_stays_off_legacy_filesystem_update_detector() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let side_effects_source =
-        fs::read_to_string(root.join("src/runtime_effects.rs")).expect("runtime_effects readable");
+    let side_effects_source = fs::read_to_string(root.join("src/sql/execution/runtime_effects.rs"))
+        .expect("runtime_effects readable");
     let intent_source =
-        fs::read_to_string(root.join("src/query_runtime/intent.rs")).expect("intent readable");
-    let shared_path_source = fs::read_to_string(root.join("src/query_runtime/shared_path.rs"))
+        fs::read_to_string(root.join("src/sql/execution/intent.rs")).expect("intent readable");
+    let shared_path_source = fs::read_to_string(root.join("src/sql/execution/shared_path.rs"))
         .expect("shared_path readable");
 
     for forbidden in [
@@ -346,7 +345,7 @@ fn guardrail_legacy_query_pipeline_context_is_removed_and_validator_is_filesyste
 #[test]
 fn guardrail_side_effect_placeholder_advancement_is_ast_based() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let ast_utils_source = fs::read_to_string(root.join("src/sql_ast/utils.rs"))
+    let ast_utils_source = fs::read_to_string(root.join("src/sql/ast/utils.rs"))
         .expect("sql_ast/utils.rs should be readable");
 
     assert!(
@@ -367,7 +366,7 @@ fn guardrail_side_effect_placeholder_advancement_is_ast_based() {
 fn guardrail_live_filesystem_effects_do_not_carry_cache_invalidation_targets() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let effects_source =
-        fs::read_to_string(root.join("src/query_semantics/state_resolution/effects.rs"))
+        fs::read_to_string(root.join("src/sql/analysis/state_resolution/effects.rs"))
             .expect("effects.rs should be readable");
 
     assert!(
@@ -404,11 +403,11 @@ fn guardrail_filesystem_noop_sql_synthesis_stays_removed() {
 #[test]
 fn guardrail_live_filesystem_intent_path_has_no_plugin_detection_branch() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let side_effects_source = fs::read_to_string(root.join("src/runtime_effects.rs"))
+    let side_effects_source = fs::read_to_string(root.join("src/sql/execution/runtime_effects.rs"))
         .expect("runtime_effects.rs should be readable");
-    let shared_path_source = fs::read_to_string(root.join("src/query_runtime/shared_path.rs"))
+    let shared_path_source = fs::read_to_string(root.join("src/sql/execution/shared_path.rs"))
         .expect("shared_path.rs should be readable");
-    let intent_source = fs::read_to_string(root.join("src/query_runtime/intent.rs"))
+    let intent_source = fs::read_to_string(root.join("src/sql/execution/intent.rs"))
         .expect("intent.rs should be readable");
 
     assert!(
