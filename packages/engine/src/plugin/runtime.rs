@@ -1,17 +1,19 @@
 use crate::cel::CelEvaluator;
-use crate::engine::sql_ast::lowering::lower_statement;
 use crate::filesystem::live_projection::{
     build_filesystem_file_history_projection_sql, build_filesystem_file_projection_sql,
     build_filesystem_state_history_source_sql, FilesystemProjectionScope,
 };
-use crate::materialization::{MaterializationPlan, MaterializationWrite, MaterializationWriteOp};
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::matching::select_best_glob_match;
 use crate::plugin::storage::plugin_key_from_archive_path;
 use crate::plugin::types::{InstalledPlugin, PluginContentType};
-use crate::query_runtime::parse::parse_sql;
-use crate::query_runtime::preprocess::preprocess_sql_to_plan as preprocess_sql;
-use crate::sql2::runtime::lower_public_read_query_with_sql2_backend;
+use crate::sql::ast::lowering::lower_statement;
+use crate::sql::execution::parse::parse_sql;
+use crate::sql::execution::preprocess::preprocess_sql_to_plan as preprocess_sql;
+use crate::sql::public::runtime::lower_public_read_query_with_sql2_backend;
+use crate::state::materialization::{
+    MaterializationPlan, MaterializationWrite, MaterializationWriteOp,
+};
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::Statement;

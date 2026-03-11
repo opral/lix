@@ -29,7 +29,7 @@ impl Engine {
             .await?;
         if let Some(row) = pointer_result.rows.first() {
             if let Some(Value::Text(snapshot_content)) = row.first() {
-                let snapshot: crate::builtin_schema::types::LixVersionPointer =
+                let snapshot: crate::schema::builtin::types::LixVersionPointer =
                     serde_json::from_str(snapshot_content).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                             "global version pointer snapshot_content invalid JSON while loading latest commit id: {error}"
                         ),

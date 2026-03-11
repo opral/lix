@@ -1,7 +1,10 @@
+pub(crate) mod builtin;
+pub(crate) mod defaults;
 mod definition;
 mod key;
 mod overlay;
 mod provider;
+pub(crate) mod registry;
 
 pub use definition::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,

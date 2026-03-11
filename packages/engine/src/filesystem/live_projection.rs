@@ -1,4 +1,4 @@
-use crate::engine::query_storage::sql_text::escape_sql_string;
+use crate::sql::storage::sql_text::escape_sql_string;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     version_descriptor_schema_key, GLOBAL_VERSION_ID,

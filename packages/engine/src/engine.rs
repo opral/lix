@@ -4,8 +4,6 @@ use crate::account::{
     active_account_plugin_key, active_account_schema_key, active_account_schema_version,
     active_account_snapshot_content, active_account_storage_version_id,
 };
-use crate::builtin_schema::types::LixVersionDescriptor;
-use crate::builtin_schema::{builtin_schema_definition, builtin_schema_keys};
 use crate::cel::CelEvaluator;
 use crate::deterministic_mode::DeterministicSettings;
 use crate::init::init_backend;
@@ -13,14 +11,16 @@ use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
 };
-use crate::materialization::{
+use crate::plugin::types::InstalledPlugin;
+use crate::schema::builtin::types::LixVersionDescriptor;
+use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
+use crate::state::materialization::{
     MaterializationApplyReport, MaterializationPlan, MaterializationReport, MaterializationRequest,
 };
-use crate::plugin::types::InstalledPlugin;
-use crate::state_commit_stream::{
+use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
-use crate::validation::SchemaCache;
+use crate::state::validation::SchemaCache;
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
     active_version_schema_version, active_version_snapshot_content,
@@ -47,10 +47,6 @@ use std::sync::RwLock;
 
 #[path = "api.rs"]
 mod api;
-#[path = "engine_in_transaction.rs"]
-mod engine_in_transaction;
-#[path = "engine_transaction.rs"]
-mod engine_transaction;
 #[path = "init/active_version.rs"]
 mod init_active_version;
 #[path = "init/bootstrap.rs"]
@@ -59,26 +55,20 @@ mod init_bootstrap;
 mod init_seed;
 #[path = "plugin/install.rs"]
 mod plugin_install;
-#[path = "query_history/mod.rs"]
-pub(crate) mod query_history;
-#[path = "query_semantics/mod.rs"]
-pub(crate) mod query_semantics;
-#[path = "query_storage/mod.rs"]
-pub(crate) mod query_storage;
-#[path = "runtime_effects.rs"]
+#[path = "sql/execution/runtime_effects.rs"]
 mod runtime_effects;
-#[path = "runtime_functions.rs"]
+#[path = "sql/execution/runtime_functions.rs"]
 mod runtime_functions;
-#[path = "sql_ast/mod.rs"]
-pub(crate) mod sql_ast;
-#[path = "statement_scripts.rs"]
+#[path = "sql/execution/statement_scripts.rs"]
 mod statement_scripts;
+#[path = "transaction.rs"]
+mod transaction;
+#[path = "sql/execution/transaction_exec.rs"]
+mod transaction_exec;
 
-use self::query_semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
-use self::query_storage::sql_text::escape_sql_string;
-use crate::query_runtime::contracts::effects::FilesystemPayloadDomainChange;
-use crate::query_runtime::contracts::planned_statement::MutationRow;
-use crate::query_runtime::parse::parse_sql;
+use crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange;
+use crate::sql::execution::contracts::planned_statement::MutationRow;
+use crate::sql::storage::sql_text::escape_sql_string;
 
 pub use crate::boot::{
     boot, init_lix, BootAccount, BootArgs, BootKeyValue, InitLixArgs, InitLixResult,
@@ -128,133 +118,12 @@ pub struct EngineTransaction<'a> {
     installed_plugins_cache_invalidation_pending: bool,
     pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
     pending_sql2_append_session:
-        Option<crate::query_runtime::shared_path::PendingSql2AppendSession>,
-}
-
-impl<'a> EngineTransaction<'a> {
-    pub async fn execute(
-        &mut self,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<ExecuteResult, LixError> {
-        if !self.engine.access_to_internal {
-            let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
-            reject_internal_table_writes(&parsed_statements)?;
-        }
-        self.execute_with_access(sql, params, self.engine.access_to_internal)
-            .await
-    }
-
-    pub(crate) async fn execute_internal(
-        &mut self,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<ExecuteResult, LixError> {
-        self.execute_with_access(sql, params, true).await
-    }
-
-    async fn execute_with_access(
-        &mut self,
-        sql: &str,
-        params: &[Value],
-        allow_internal_tables: bool,
-    ) -> Result<ExecuteResult, LixError> {
-        let previous_active_version_id = self.active_version_id.clone();
-        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
-        let transaction = self.transaction.as_mut().ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction is no longer active".to_string(),
-        })?;
-        let result = if parsed_statements.len() > 1 {
-            self.engine
-                .execute_statement_script_with_options_in_transaction(
-                    transaction.as_mut(),
-                    parsed_statements.clone(),
-                    params,
-                    &self.options,
-                    allow_internal_tables,
-                    &mut self.active_version_id,
-                    &mut self.pending_state_commit_stream_changes,
-                    &mut self.pending_sql2_append_session,
-                )
-                .await?
-        } else {
-            let single_statement_result = self
-                .engine
-                .execute_with_options_in_transaction(
-                    transaction.as_mut(),
-                    sql,
-                    params,
-                    &self.options,
-                    allow_internal_tables,
-                    &mut self.active_version_id,
-                    None,
-                    false,
-                    &mut self.pending_state_commit_stream_changes,
-                    &mut self.pending_sql2_append_session,
-                )
-                .await?;
-            ExecuteResult {
-                statements: vec![single_statement_result],
-            }
-        };
-        if self.active_version_id != previous_active_version_id {
-            self.active_version_changed = true;
-        }
-        if should_invalidate_installed_plugins_cache_for_statements(&parsed_statements) {
-            self.installed_plugins_cache_invalidation_pending = true;
-        }
-        Ok(result)
-    }
-
-    pub async fn commit(mut self) -> Result<(), LixError> {
-        let mut transaction = self.transaction.take().ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction is no longer active".to_string(),
-        })?;
-        let should_emit_observe_tick = !self.pending_state_commit_stream_changes.is_empty();
-        if should_emit_observe_tick {
-            self.engine
-                .append_observe_tick_in_transaction(
-                    transaction.as_mut(),
-                    self.options.writer_key.as_deref(),
-                )
-                .await?;
-        }
-        transaction.commit().await?;
-        if self.active_version_changed {
-            self.engine
-                .set_active_version_id(std::mem::take(&mut self.active_version_id));
-        }
-        if self.installed_plugins_cache_invalidation_pending {
-            self.engine.invalidate_installed_plugins_cache()?;
-        }
-        self.engine.emit_state_commit_stream_changes(std::mem::take(
-            &mut self.pending_state_commit_stream_changes,
-        ));
-        Ok(())
-    }
-
-    pub async fn rollback(mut self) -> Result<(), LixError> {
-        let transaction = self.transaction.take().ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction is no longer active".to_string(),
-        })?;
-        transaction.rollback().await
-    }
+        Option<crate::sql::execution::shared_path::PendingSql2AppendSession>,
 }
 
 impl Engine {
     pub(crate) fn backend_ref(&self) -> &(dyn LixBackend + Send + Sync) {
         self.backend.as_ref()
-    }
-}
-
-impl Drop for EngineTransaction<'_> {
-    fn drop(&mut self) {
-        if self.transaction.is_some() && !std::thread::panicking() {
-            panic!("EngineTransaction dropped without commit() or rollback()");
-        }
     }
 }
 
@@ -331,10 +200,10 @@ pub(crate) async fn normalize_sql_execution_error_with_backend(
 
 #[cfg(test)]
 fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
-    let Ok(statements) = parse_sql(sql) else {
+    let Ok(statements) = crate::sql::execution::parse::parse_sql(sql) else {
         return false;
     };
-    should_invalidate_installed_plugins_cache_for_statements(&statements)
+    crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements(&statements)
 }
 
 // SAFETY: `TransactionBackendAdapter` is only used inside a single async execution flow.
@@ -438,7 +307,7 @@ fn collapse_pending_file_writes_for_transaction(
     collapsed
 }
 
-fn direct_state_file_cache_refresh_targets(
+pub(crate) fn direct_state_file_cache_refresh_targets(
     mutations: &[MutationRow],
 ) -> BTreeSet<(String, String)> {
     mutations
@@ -574,19 +443,19 @@ mod tests {
         boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
-    use crate::engine::query_history::plugin_inputs::file_history_read_materialization_required_for_statements;
-    use crate::engine::query_semantics::state_resolution::canonical::is_query_only_statements;
-    use crate::engine::query_semantics::state_resolution::effects::active_version_from_update_validations;
-    use crate::engine::query_semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
-    use crate::engine::sql_ast::utils::{
+    use crate::engine::Engine;
+    use crate::plugin::types::{InstalledPlugin, PluginRuntime};
+    use crate::sql::analysis::history_reads::file_history_read_materialization_required_for_statements;
+    use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
+    use crate::sql::analysis::state_resolution::effects::active_version_from_update_validations;
+    use crate::sql::analysis::state_resolution::optimize::should_refresh_file_cache_for_statements;
+    use crate::sql::ast::utils::{
         advance_placeholder_state_for_statement_ast, bind_sql_with_state, parse_sql_statements,
         PlaceholderState,
     };
-    use crate::engine::sql_ast::walk::contains_transaction_control_statement;
-    use crate::engine::Engine;
-    use crate::internal_state::script::extract_explicit_transaction_script_from_statements;
-    use crate::plugin::types::{InstalledPlugin, PluginRuntime};
-    use crate::query_runtime::contracts::planned_statement::UpdateValidationPlan;
+    use crate::sql::ast::walk::contains_transaction_control_statement;
+    use crate::sql::execution::contracts::planned_statement::UpdateValidationPlan;
+    use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
     use crate::version::active_version_schema_key;
     use crate::{
         ExecuteResult, LixError, NoopWasmRuntime, QueryResult, SnapshotChunkReader, Value,

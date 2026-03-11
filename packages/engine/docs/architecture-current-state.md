@@ -212,9 +212,9 @@ Current hotspots:
   - `packages/engine/src/sql/planning/rewrite_engine/steps/lix_change_view_read.rs`
   - `packages/engine/src/sql/planning/rewrite_engine/steps/lix_change_view_write.rs`
 - Commit generation + runtime SQL batch:
-  - `packages/engine/src/commit/generate_commit.rs`
+  - `packages/engine/src/state/commit/generate_commit.rs`
   - `packages/engine/src/sql/history/commit_runtime.rs`
   - `packages/engine/src/sql/execution/followup.rs`
 - Physical table initialization and schema table registration:
   - `packages/engine/src/init/mod.rs`
-  - `packages/engine/src/schema_registry.rs`
+  - `packages/engine/src/schema/registry.rs`

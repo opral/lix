@@ -1,11 +1,11 @@
 use super::*;
 use crate::errors;
-use crate::internal_state::script::extract_explicit_transaction_script_from_statements;
-use crate::query_runtime::execute;
-use crate::query_runtime::parse::parse_sql;
-use crate::query_runtime::shared_path;
 use crate::runtime_post_commit;
 use crate::runtime_sql_effects;
+use crate::sql::execution::execute;
+use crate::sql::execution::parse::parse_sql;
+use crate::sql::execution::shared_path;
+use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
 
 impl Engine {
     pub async fn open(&self) -> Result<(), LixError> {
@@ -279,7 +279,7 @@ impl Engine {
     }
 
     pub async fn create_checkpoint(&self) -> Result<crate::CreateCheckpointResult, LixError> {
-        crate::checkpoint::create_checkpoint(self).await
+        crate::state::checkpoint::create_checkpoint(self).await
     }
 
     pub async fn create_version(
@@ -315,23 +315,24 @@ impl Engine {
         &self,
         req: &MaterializationRequest,
     ) -> Result<MaterializationPlan, LixError> {
-        crate::materialization::materialization_plan(self.backend.as_ref(), req).await
+        crate::state::materialization::materialization_plan(self.backend.as_ref(), req).await
     }
 
     pub async fn apply_materialization_plan(
         &self,
         plan: &MaterializationPlan,
     ) -> Result<MaterializationApplyReport, LixError> {
-        crate::materialization::apply_materialization_plan(self.backend.as_ref(), plan).await
+        crate::state::materialization::apply_materialization_plan(self.backend.as_ref(), plan).await
     }
 
     pub async fn materialize(
         &self,
         req: &MaterializationRequest,
     ) -> Result<MaterializationReport, LixError> {
-        let plan = crate::materialization::materialization_plan(self.backend.as_ref(), req).await?;
+        let plan =
+            crate::state::materialization::materialization_plan(self.backend.as_ref(), req).await?;
         let apply =
-            crate::materialization::apply_materialization_plan(self.backend.as_ref(), &plan)
+            crate::state::materialization::apply_materialization_plan(self.backend.as_ref(), &plan)
                 .await?;
 
         crate::plugin::runtime::materialize_file_data_with_plugins(
