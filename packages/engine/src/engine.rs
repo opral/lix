@@ -1,39 +1,12 @@
-use crate::account::{
-    account_file_id, account_plugin_key, account_schema_key, account_schema_version,
-    account_snapshot_content, account_storage_version_id, active_account_file_id,
-    active_account_plugin_key, active_account_schema_key, active_account_schema_version,
-    active_account_snapshot_content, active_account_storage_version_id,
-};
 use crate::cel::CelEvaluator;
 use crate::deterministic_mode::DeterministicSettings;
-use crate::init::init_backend;
-use crate::key_value::{
-    key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
-    KEY_VALUE_GLOBAL_VERSION,
-};
 use crate::plugin::types::InstalledPlugin;
-use crate::schema::builtin::types::LixVersionDescriptor;
-use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
-use crate::state::materialization::{
-    MaterializationApplyReport, MaterializationPlan, MaterializationReport, MaterializationRequest,
-};
 use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
 use crate::state::validation::SchemaCache;
-use crate::version::{
-    active_version_file_id, active_version_plugin_key, active_version_schema_key,
-    active_version_schema_version, active_version_snapshot_content,
-    active_version_storage_version_id, parse_active_version_snapshot, version_descriptor_file_id,
-    version_descriptor_plugin_key, version_descriptor_schema_key,
-    version_descriptor_schema_version, version_descriptor_snapshot_content,
-    version_descriptor_storage_version_id, version_pointer_file_id, version_pointer_plugin_key,
-    version_pointer_schema_key, version_pointer_schema_version, version_pointer_snapshot_content,
-    version_pointer_storage_version_id, GLOBAL_VERSION_ID,
-};
 use crate::WasmRuntime;
-use crate::{ExecuteResult, LixBackend, LixError, LixTransaction, QueryResult, Value};
-use futures_util::FutureExt;
+use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,30 +18,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
-#[path = "api.rs"]
-mod api;
-#[path = "init/active_version.rs"]
-mod init_active_version;
-#[path = "init/bootstrap.rs"]
-mod init_bootstrap;
-#[path = "init/seed.rs"]
-mod init_seed;
-#[path = "plugin/install.rs"]
-mod plugin_install;
-#[path = "sql/execution/runtime_effects.rs"]
-mod runtime_effects;
-#[path = "sql/execution/runtime_functions.rs"]
-mod runtime_functions;
-#[path = "sql/execution/statement_scripts.rs"]
-mod statement_scripts;
-#[path = "transaction.rs"]
-mod transaction;
-#[path = "sql/execution/transaction_exec.rs"]
-mod transaction_exec;
-
 use crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange;
 use crate::sql::execution::contracts::planned_statement::MutationRow;
-use crate::sql::storage::sql_text::escape_sql_string;
 
 pub use crate::boot::{
     boot, init_lix, BootAccount, BootArgs, BootKeyValue, InitLixArgs, InitLixResult,
@@ -110,20 +61,151 @@ pub struct Engine {
 
 #[must_use = "EngineTransaction must be committed or rolled back"]
 pub struct EngineTransaction<'a> {
-    engine: &'a Engine,
-    transaction: Option<Box<dyn LixTransaction + 'a>>,
-    options: ExecuteOptions,
-    active_version_id: String,
-    active_version_changed: bool,
-    installed_plugins_cache_invalidation_pending: bool,
-    pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
-    pending_sql2_append_session:
+    pub(crate) engine: &'a Engine,
+    pub(crate) transaction: Option<Box<dyn LixTransaction + 'a>>,
+    pub(crate) options: ExecuteOptions,
+    pub(crate) active_version_id: String,
+    pub(crate) active_version_changed: bool,
+    pub(crate) installed_plugins_cache_invalidation_pending: bool,
+    pub(crate) pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
+    pub(crate) pending_sql2_append_session:
         Option<crate::sql::execution::shared_path::PendingSql2AppendSession>,
 }
 
 impl Engine {
+    pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
+        self.wasm_runtime.clone()
+    }
+
+    pub fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {
+        self.state_commit_stream_bus.subscribe(filter)
+    }
+
     pub(crate) fn backend_ref(&self) -> &(dyn LixBackend + Send + Sync) {
         self.backend.as_ref()
+    }
+
+    pub(crate) fn access_to_internal(&self) -> bool {
+        self.access_to_internal
+    }
+
+    pub(crate) fn wasm_runtime_ref(&self) -> &dyn WasmRuntime {
+        self.wasm_runtime.as_ref()
+    }
+
+    pub(crate) fn deterministic_boot_pending(&self) -> bool {
+        self.deterministic_boot_pending.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn boot_deterministic_settings(&self) -> Option<DeterministicSettings> {
+        self.boot_deterministic_settings
+    }
+
+    pub(crate) fn boot_key_values(&self) -> &[BootKeyValue] {
+        &self.boot_key_values
+    }
+
+    pub(crate) fn boot_active_account(&self) -> Option<&BootAccount> {
+        self.boot_active_account.as_ref()
+    }
+
+    pub(crate) fn require_active_version_id(&self) -> Result<String, LixError> {
+        let guard = self.active_version_id.read().map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "active version cache lock poisoned".to_string(),
+        })?;
+        guard
+            .clone()
+            .ok_or_else(crate::errors::not_initialized_error)
+    }
+
+    pub(crate) fn clear_active_version_id(&self) {
+        let mut guard = self.active_version_id.write().unwrap();
+        *guard = None;
+    }
+
+    pub(crate) fn set_active_version_id(&self, version_id: String) {
+        let mut guard = self.active_version_id.write().unwrap();
+        if guard.as_ref() == Some(&version_id) {
+            return;
+        }
+        *guard = Some(version_id);
+    }
+
+    pub(crate) fn try_mark_init_in_progress(&self) -> Result<(), LixError> {
+        self.init_state
+            .compare_exchange(
+                INIT_STATE_NOT_STARTED,
+                INIT_STATE_IN_PROGRESS,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map(|_| ())
+            .map_err(|_| crate::errors::already_initialized_error())
+    }
+
+    pub(crate) fn clear_deterministic_boot_pending(&self) {
+        self.deterministic_boot_pending
+            .store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn mark_init_completed(&self) {
+        self.init_state
+            .store(INIT_STATE_COMPLETED, Ordering::SeqCst);
+    }
+
+    pub(crate) fn reset_init_state(&self) {
+        self.init_state
+            .store(INIT_STATE_NOT_STARTED, Ordering::SeqCst);
+    }
+
+    pub(crate) fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
+        self.state_commit_stream_bus.emit(changes);
+    }
+
+    pub(crate) fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
+        let mut guard = self.installed_plugins_cache.write().map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "installed plugin cache lock poisoned".to_string(),
+        })?;
+        *guard = None;
+        let mut component_guard = self.plugin_component_cache.lock().map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "plugin component cache lock poisoned".to_string(),
+        })?;
+        component_guard.clear();
+        Ok(())
+    }
+
+    pub(crate) fn next_transaction_handle(&self) -> u64 {
+        self.next_transaction_handle_id
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn take_transaction_handle(
+        &self,
+        handle: u64,
+    ) -> Result<EngineTransaction<'static>, LixError> {
+        let mut guard = self.active_transactions.lock().map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "transaction registry lock poisoned".to_string(),
+        })?;
+        guard
+            .remove(&handle)
+            .ok_or_else(crate::errors::transaction_handle_not_found_error)
+    }
+
+    pub(crate) fn put_transaction_handle(
+        &self,
+        handle: u64,
+        transaction: EngineTransaction<'static>,
+    ) -> Result<(), LixError> {
+        let mut guard = self.active_transactions.lock().map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "transaction registry lock poisoned".to_string(),
+        })?;
+        guard.insert(handle, transaction);
+        Ok(())
     }
 }
 
@@ -140,11 +222,11 @@ pub(crate) struct CollectedExecutionSideEffects {
 
 #[derive(Default)]
 pub(crate) struct DeferredTransactionSideEffects {
-    pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
-    pending_file_delete_targets: BTreeSet<(String, String)>,
+    pub(crate) pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
+    pub(crate) pending_file_delete_targets: BTreeSet<(String, String)>,
 }
 
-fn reject_internal_table_writes(statements: &[Statement]) -> Result<(), LixError> {
+pub(crate) fn reject_internal_table_writes(statements: &[Statement]) -> Result<(), LixError> {
     for statement in statements {
         if statement_writes_to_lix_internal_table(statement) {
             return Err(crate::errors::internal_table_access_denied_error());
@@ -274,7 +356,7 @@ impl Engine {
     }
 }
 
-fn collapse_pending_file_writes_for_transaction(
+pub(crate) fn collapse_pending_file_writes_for_transaction(
     writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
 ) -> Vec<crate::filesystem::pending_file_writes::PendingFileWrite> {
     let mut collapsed =
@@ -418,7 +500,7 @@ pub(crate) fn dedupe_filesystem_payload_domain_changes(
     dedupe_detected_changes(changes)
 }
 
-fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
+pub(crate) fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
     let schema_key = schema
         .get("x-lix-key")
         .and_then(JsonValue::as_str)

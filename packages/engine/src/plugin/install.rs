@@ -5,12 +5,12 @@ use std::path::{Component, Path};
 use serde_json::Value as JsonValue;
 use zip::read::ZipArchive;
 
+use crate::engine::{Engine, ExecuteOptions};
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
 use crate::plugin::types::PluginManifest;
 use crate::schema::{validate_lix_schema_definition, SchemaKey};
-
-use super::*;
+use crate::{LixError, LixTransaction, StateCommitStreamChange, Value};
 
 const INSTALL_STORED_SCHEMA_SQL: &str =
     "INSERT INTO lix_stored_schema_by_version (value, lixcol_version_id) \

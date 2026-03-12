@@ -2,9 +2,9 @@ use crate::deterministic_mode::{
     load_persisted_sequence_next, load_settings, persist_sequence_highest, DeterministicSettings,
     RuntimeFunctionProvider,
 };
+use crate::engine::Engine;
 use crate::functions::SharedFunctionProvider;
-use crate::{Engine, LixBackend, LixError};
-use std::sync::atomic::Ordering;
+use crate::{LixBackend, LixError};
 
 impl Engine {
     pub(crate) async fn prepare_runtime_functions_with_backend(
@@ -19,8 +19,8 @@ impl Engine {
         LixError,
     > {
         let mut settings = load_settings(backend).await?;
-        if self.deterministic_boot_pending.load(Ordering::SeqCst) {
-            if let Some(boot_settings) = self.boot_deterministic_settings {
+        if self.deterministic_boot_pending() {
+            if let Some(boot_settings) = self.boot_deterministic_settings() {
                 settings = boot_settings;
             }
         }

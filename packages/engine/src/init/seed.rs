@@ -1,6 +1,31 @@
-use super::*;
+use crate::account::{
+    account_file_id, account_plugin_key, account_schema_key, account_schema_version,
+    account_snapshot_content, account_storage_version_id, active_account_file_id,
+    active_account_plugin_key, active_account_schema_key, active_account_schema_version,
+    active_account_snapshot_content, active_account_storage_version_id,
+};
+use crate::engine::{builtin_schema_entity_id, Engine, ExecuteOptions};
 use crate::errors;
+use crate::key_value::{
+    key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
+    KEY_VALUE_GLOBAL_VERSION,
+};
+use crate::schema::builtin::types::LixVersionDescriptor;
+use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
+use crate::sql::storage::sql_text::escape_sql_string;
 use crate::version::DEFAULT_ACTIVE_VERSION_NAME;
+use crate::version::{
+    active_version_file_id, active_version_plugin_key, active_version_schema_key,
+    active_version_schema_version, active_version_snapshot_content,
+    active_version_storage_version_id, version_descriptor_file_id, version_descriptor_plugin_key,
+    version_descriptor_schema_key, version_descriptor_schema_version,
+    version_descriptor_snapshot_content, version_descriptor_storage_version_id,
+    version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key,
+    version_pointer_schema_version, version_pointer_snapshot_content,
+    version_pointer_storage_version_id, GLOBAL_VERSION_ID,
+};
+use crate::{LixError, Value};
+use serde_json::Value as JsonValue;
 
 const SYSTEM_ROOT_DIRECTORY_PATH: &str = "/.lix/";
 const SYSTEM_APP_DATA_DIRECTORY_PATH: &str = "/.lix/app_data/";
@@ -61,7 +86,7 @@ impl Engine {
     }
 
     pub(crate) async fn seed_boot_key_values(&self) -> Result<(), LixError> {
-        for key_value in &self.boot_key_values {
+        for key_value in self.boot_key_values() {
             let version_id = key_value
                 .version_id
                 .as_deref()
@@ -407,7 +432,7 @@ impl Engine {
     }
 
     pub(crate) async fn seed_boot_account(&self) -> Result<(), LixError> {
-        let Some(account) = &self.boot_active_account else {
+        let Some(account) = self.boot_active_account() else {
             return Ok(());
         };
 

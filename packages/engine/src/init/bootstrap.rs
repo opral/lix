@@ -1,24 +1,14 @@
-use super::*;
+use crate::engine::Engine;
+use crate::init::init_backend;
 use crate::version::{
     version_pointer_file_id, version_pointer_schema_key, version_pointer_storage_version_id,
     GLOBAL_VERSION_ID,
 };
-use crate::SqlDialect;
+use crate::{LixError, SqlDialect, Value};
 
 impl Engine {
     pub async fn init(&self) -> Result<(), LixError> {
-        if self
-            .init_state
-            .compare_exchange(
-                INIT_STATE_NOT_STARTED,
-                INIT_STATE_IN_PROGRESS,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_err()
-        {
-            return Err(crate::errors::already_initialized_error());
-        }
+        self.try_mark_init_in_progress()?;
 
         let init_result = async {
             init_backend(self.backend.as_ref()).await?;
@@ -46,15 +36,12 @@ impl Engine {
         };
 
         if result.is_ok() {
-            if self.deterministic_boot_pending.load(Ordering::SeqCst) {
-                self.deterministic_boot_pending
-                    .store(false, Ordering::SeqCst);
+            if self.deterministic_boot_pending() {
+                self.clear_deterministic_boot_pending();
             }
-            self.init_state
-                .store(INIT_STATE_COMPLETED, Ordering::SeqCst);
+            self.mark_init_completed();
         } else {
-            self.init_state
-                .store(INIT_STATE_NOT_STARTED, Ordering::SeqCst);
+            self.reset_init_state();
         }
 
         result

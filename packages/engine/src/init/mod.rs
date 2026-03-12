@@ -1,3 +1,7 @@
+pub(crate) mod active_version;
+pub(crate) mod bootstrap;
+pub(crate) mod seed;
+
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 const INIT_STATEMENTS: &[&str] = &[

@@ -1,6 +1,5 @@
 pub(crate) mod bind_once;
-#[path = "canonical_write.rs"]
-mod canonical;
+mod canonical_write;
 pub(crate) mod defaults;
 pub(crate) mod followup;
 pub(crate) mod inline_functions;
@@ -44,6 +43,7 @@ pub(crate) type UpdateValidationPlan =
     crate::sql::execution::contracts::planned_statement::UpdateValidationPlan;
 pub(crate) type PreparedStatement =
     crate::sql::execution::contracts::prepared_statement::PreparedStatement;
+use canonical_write as canonical;
 pub(crate) use postprocess::{PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
 
 #[derive(Debug, Clone)]

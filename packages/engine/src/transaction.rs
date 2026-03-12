@@ -1,7 +1,11 @@
-use super::*;
+use crate::engine::{
+    reject_internal_table_writes, Engine, EngineTransaction, EngineTransactionFuture,
+    ExecuteOptions,
+};
 use crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use crate::sql::execution::parse::parse_sql;
-use std::sync::atomic::Ordering;
+use crate::{ExecuteResult, LixError, Value};
+use futures_util::FutureExt;
 
 impl Engine {
     pub async fn begin_transaction_with_options(
@@ -50,9 +54,7 @@ impl Engine {
         options: ExecuteOptions,
     ) -> Result<u64, LixError> {
         let transaction = self.begin_transaction_with_options(options).await?;
-        let handle = self
-            .next_transaction_handle_id
-            .fetch_add(1, Ordering::Relaxed);
+        let handle = self.next_transaction_handle();
         let transaction = unsafe {
             std::mem::transmute::<EngineTransaction<'_>, EngineTransaction<'static>>(transaction)
         };
@@ -81,29 +83,6 @@ impl Engine {
         let transaction = self.take_transaction_handle(handle)?;
         transaction.rollback().await
     }
-
-    fn take_transaction_handle(&self, handle: u64) -> Result<EngineTransaction<'static>, LixError> {
-        let mut guard = self.active_transactions.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction registry lock poisoned".to_string(),
-        })?;
-        guard
-            .remove(&handle)
-            .ok_or_else(crate::errors::transaction_handle_not_found_error)
-    }
-
-    fn put_transaction_handle(
-        &self,
-        handle: u64,
-        transaction: EngineTransaction<'static>,
-    ) -> Result<(), LixError> {
-        let mut guard = self.active_transactions.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction registry lock poisoned".to_string(),
-        })?;
-        guard.insert(handle, transaction);
-        Ok(())
-    }
 }
 
 impl EngineTransaction<'_> {
@@ -112,11 +91,11 @@ impl EngineTransaction<'_> {
         sql: &str,
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
-        if !self.engine.access_to_internal {
+        if !self.engine.access_to_internal() {
             let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
             reject_internal_table_writes(&parsed_statements)?;
         }
-        self.execute_with_access(sql, params, self.engine.access_to_internal)
+        self.execute_with_access(sql, params, self.engine.access_to_internal())
             .await
     }
 
