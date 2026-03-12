@@ -273,7 +273,7 @@ impl Engine {
         let mut active_version_id = self.require_active_version_id()?;
         let previous_active_version_id = active_version_id.clone();
         let mut pending_state_commit_stream_changes = Vec::new();
-        let mut pending_sql2_append_session = None;
+        let mut pending_public_append_session = None;
         let result = self
             .execute_with_options_in_transaction(
                 transaction.as_mut(),
@@ -285,7 +285,7 @@ impl Engine {
                 None,
                 true,
                 &mut pending_state_commit_stream_changes,
-                &mut pending_sql2_append_session,
+                &mut pending_public_append_session,
             )
             .await;
         match result {
@@ -338,7 +338,7 @@ impl Engine {
             )
             .await?
         };
-        match shared_path::maybe_execute_sql2_write_with_transaction(
+        match shared_path::maybe_execute_public_write_with_transaction(
             self,
             transaction,
             &prepared,

@@ -5,8 +5,8 @@ use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::registry::register_schema_sql_statements;
 use crate::sql::public::runtime::{
-    finalize_sql2_write_execution, prepare_sql2_public_execution_with_internal_access,
-    Sql2PreparedPublicExecution, Sql2PreparedWrite, Sql2WriteExecution,
+    finalize_public_write_execution, prepare_public_execution_with_internal_access,
+    PreparedPublicExecution, PreparedPublicWrite, PublicWriteExecution,
 };
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{
@@ -56,7 +56,7 @@ pub(crate) struct PreparedExecutionContext {
     pub(crate) sequence_start: i64,
     pub(crate) functions: SharedFunctionProvider<RuntimeFunctionProvider>,
     pub(crate) plan: ExecutionPlan,
-    pub(crate) sql2_write: Option<Sql2PreparedWrite>,
+    pub(crate) public_write: Option<PreparedPublicWrite>,
 }
 
 pub(crate) struct CacheTargets {
@@ -64,7 +64,7 @@ pub(crate) struct CacheTargets {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PendingSql2AppendSession {
+pub(crate) struct PendingPublicAppendSession {
     pub(crate) lane: AppendWriteLane,
     pub(crate) commit_id: String,
     pub(crate) change_set_id: String,
@@ -155,7 +155,7 @@ pub(crate) async fn prepare_execution_with_backend(
             ),
         })?;
 
-    let sql2_public_execution = prepare_sql2_public_execution_with_internal_access(
+    let public_execution = prepare_public_execution_with_internal_access(
         backend,
         &statements,
         params,
@@ -167,19 +167,18 @@ pub(crate) async fn prepare_execution_with_backend(
     .map_err(|error| LixError {
         code: error.code,
         description: format!(
-            "prepare_execution_with_backend sql2 public preparation failed: {}",
+            "prepare_execution_with_backend public preparation failed: {}",
             error.description
         ),
     })?;
-    let (sql2_read, mut sql2_write) = match sql2_public_execution {
-        Some(Sql2PreparedPublicExecution::Read(prepared)) => (Some(prepared), None),
-        Some(Sql2PreparedPublicExecution::Write(prepared)) => (None, Some(prepared)),
+    let (public_read, mut public_write) = match public_execution {
+        Some(PreparedPublicExecution::Read(prepared)) => (Some(prepared), None),
+        Some(PreparedPublicExecution::Write(prepared)) => (None, Some(prepared)),
         None => (None, None),
     };
-    let plan_statements = sql2_read
+    let plan_statements = public_read
         .as_ref()
-        .and_then(|prepared| prepared.lowered_read.as_ref())
-        .map(|program| program.statements.clone())
+        .map(|prepared| prepared.lowered_read.statements.clone())
         .unwrap_or_else(|| statements.clone());
 
     let intent = collect_execution_intent_with_backend(
@@ -203,11 +202,11 @@ pub(crate) async fn prepare_execution_with_backend(
         ),
     })?;
 
-    let sql2_write_owned_execution = sql2_write.is_some();
-    if let Some(sql2_write) = sql2_write.as_mut() {
-        if let Some(execution) = sql2_write.execution.as_mut() {
-            let planned_write = &sql2_write.planned_write;
-            finalize_sql2_write_execution(
+    let public_write_owns_execution = public_write.is_some();
+    if let Some(public_write) = public_write.as_mut() {
+        if let Some(execution) = public_write.execution.as_mut() {
+            let planned_write = &public_write.planned_write;
+            finalize_public_write_execution(
                 execution,
                 planned_write,
                 &intent.pending_file_writes,
@@ -216,20 +215,20 @@ pub(crate) async fn prepare_execution_with_backend(
             .map_err(|error| LixError {
                 code: error.code,
                 description: format!(
-                    "prepare_execution_with_backend sql2 execution finalization failed: {}",
+                    "prepare_execution_with_backend public execution finalization failed: {}",
                     error.description
                 ),
             })?;
         }
     }
 
-    let plan = if sql2_write_owned_execution {
-        passthrough_execution_plan_for_sql2_write(
+    let plan = if public_write_owns_execution {
+        passthrough_execution_plan_for_public_write(
             &statements,
-            sql2_write
+            public_write
                 .as_ref()
                 .and_then(|prepared| match prepared.execution.as_ref() {
-                    Some(Sql2WriteExecution::Tracked(execution)) => {
+                    Some(PublicWriteExecution::Tracked(execution)) => {
                         Some(execution.schema_registrations.clone())
                     }
                     _ => None,
@@ -242,7 +241,7 @@ pub(crate) async fn prepare_execution_with_backend(
             &engine.cel_evaluator,
             plan_statements,
             params,
-            sql2_read
+            public_read
                 .as_ref()
                 .and_then(|prepared| prepared.dependency_spec.clone()),
             functions.clone(),
@@ -251,17 +250,17 @@ pub(crate) async fn prepare_execution_with_backend(
             writer_key,
         )
         .await
-        .map_err(LixError::from)
-        .map_err(|error| LixError {
-            code: error.code,
-            description: format!(
+            .map_err(LixError::from)
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
                 "prepare_execution_with_backend plan building failed: {}",
                 error.description
             ),
         })?
     };
 
-    if !sql2_write_owned_execution && !plan.preprocess.mutations.is_empty() {
+    if !public_write_owns_execution && !plan.preprocess.mutations.is_empty() {
         validate_inserts(backend, &engine.schema_cache, &plan.preprocess.mutations)
             .await
             .map_err(|error| LixError {
@@ -272,7 +271,7 @@ pub(crate) async fn prepare_execution_with_backend(
                 ),
             })?;
     }
-    if !sql2_write_owned_execution && !plan.preprocess.update_validations.is_empty() {
+    if !public_write_owns_execution && !plan.preprocess.update_validations.is_empty() {
         validate_updates(
             backend,
             &engine.schema_cache,
@@ -288,13 +287,17 @@ pub(crate) async fn prepare_execution_with_backend(
             ),
         })?;
     }
-    if let Some(sql2_write) = sql2_write.as_ref() {
-        validate_sql2_batch_local_write(backend, &engine.schema_cache, &sql2_write.planned_write)
+    if let Some(public_write) = public_write.as_ref() {
+        validate_sql2_batch_local_write(
+            backend,
+            &engine.schema_cache,
+            &public_write.planned_write,
+        )
             .await
             .map_err(|error| LixError {
                 code: error.code,
                 description: format!(
-                    "prepare_execution_with_backend sql2 batch-local validation failed: {}",
+                    "prepare_execution_with_backend public batch-local validation failed: {}",
                     error.description
                 ),
             })?;
@@ -306,11 +309,11 @@ pub(crate) async fn prepare_execution_with_backend(
         sequence_start,
         functions,
         plan,
-        sql2_write,
+        public_write,
     })
 }
 
-fn passthrough_execution_plan_for_sql2_write(
+fn passthrough_execution_plan_for_public_write(
     statements: &[Statement],
     registrations: Vec<SchemaRegistration>,
 ) -> ExecutionPlan {
@@ -442,20 +445,20 @@ pub(crate) fn derive_cache_targets(
     }
 }
 
-pub(crate) async fn maybe_execute_sql2_write_with_backend(
+pub(crate) async fn maybe_execute_public_write_with_backend(
     engine: &Engine,
     prepared: &PreparedExecutionContext,
     writer_key: Option<&str>,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    let Some(sql2_write) = prepared.sql2_write.as_ref() else {
+    let Some(public_write) = prepared.public_write.as_ref() else {
         return Ok(None);
     };
-    if sql2_write.execution.is_none() {
+    if public_write.execution.is_none() {
         return Ok(None);
     }
 
     let mut transaction: Box<dyn LixTransaction> = engine.backend.begin_transaction().await?;
-    let execution = match maybe_execute_sql2_write_with_transaction(
+    let execution = match maybe_execute_public_write_with_transaction(
         engine,
         transaction.as_mut(),
         prepared,
@@ -471,26 +474,26 @@ pub(crate) async fn maybe_execute_sql2_write_with_backend(
     Ok(Some(execution))
 }
 
-pub(crate) async fn maybe_execute_sql2_write_with_transaction(
+pub(crate) async fn maybe_execute_public_write_with_transaction(
     engine: &Engine,
     transaction: &mut dyn LixTransaction,
     prepared: &PreparedExecutionContext,
     writer_key: Option<&str>,
-    pending_append_session: Option<&mut Option<PendingSql2AppendSession>>,
+    pending_append_session: Option<&mut Option<PendingPublicAppendSession>>,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
     let mut pending_append_session = pending_append_session;
-    let Some(sql2_write) = prepared.sql2_write.as_ref() else {
+    let Some(public_write) = prepared.public_write.as_ref() else {
         return Ok(None);
     };
-    let Some(execution) = sql2_write.execution.as_ref() else {
+    let Some(execution) = public_write.execution.as_ref() else {
         return Ok(None);
     };
 
-    if let Sql2WriteExecution::Untracked(execution) = execution {
+    if let PublicWriteExecution::Untracked(execution) = execution {
         if let Some(session_slot) = pending_append_session.as_mut() {
             **session_slot = None;
         }
-        return execute_sql2_untracked_write_with_transaction(
+        return execute_public_untracked_write_with_transaction(
             engine,
             transaction,
             execution,
@@ -499,7 +502,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
         .await;
     }
 
-    let Sql2WriteExecution::Tracked(execution) = execution else {
+    let PublicWriteExecution::Tracked(execution) = execution else {
         return Ok(None);
     };
     if execution.filesystem_payload_changes_committed_by_write {
@@ -512,7 +515,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
             .map_err(|error| LixError {
                 code: error.code,
                 description: format!(
-                    "sql2 tracked filesystem payload persistence failed before append: {}",
+                    "public tracked filesystem payload persistence failed before append: {}",
                     error.description
                 ),
             })?;
@@ -528,7 +531,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
                 .map_err(|error| LixError {
                     code: error.code,
                     description: format!(
-                        "sql2 tracked write schema registration failed for '{}': {}",
+                        "public tracked write schema registration failed for '{}': {}",
                         registration.schema_key, error.description
                     ),
                 })?;
@@ -556,7 +559,8 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
             pending_session_matches_append(session, &execution.append_preconditions)
         });
         if can_merge {
-            let mut invariant_checker = Sql2AppendInvariantChecker::new(&sql2_write.planned_write);
+            let mut invariant_checker =
+                Sql2AppendInvariantChecker::new(&public_write.planned_write);
             invariant_checker
                 .recheck_invariants(transaction)
                 .await
@@ -564,7 +568,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
             let session = session_slot
                 .as_mut()
                 .expect("session should exist when can_merge is true");
-            merge_sql2_domain_change_batch_into_pending_commit(
+            merge_public_domain_change_batch_into_pending_commit(
                 transaction,
                 session,
                 &execution.domain_change_batch,
@@ -587,7 +591,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
         }
     }
 
-    let mut invariant_checker = Sql2AppendInvariantChecker::new(&sql2_write.planned_write);
+    let mut invariant_checker = Sql2AppendInvariantChecker::new(&public_write.planned_write);
     let append_result = append_commit_if_preconditions_hold(
         transaction,
         AppendCommitArgs {
@@ -602,23 +606,23 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
     .map_err(append_commit_error_to_lix_error)?;
 
     if let Some(commit_result) = append_result.commit_result.as_ref() {
-        mirror_sql2_stored_schema_bootstrap_rows(transaction, commit_result)
+        mirror_public_stored_schema_bootstrap_rows(transaction, commit_result)
             .await
             .map_err(|error| LixError {
                 code: error.code,
                 description: format!(
-                    "sql2 tracked write stored-schema bootstrap mirroring failed: {}",
+                    "public tracked write stored-schema bootstrap mirroring failed: {}",
                     error.description
                 ),
             })?;
     }
     if matches!(append_result.disposition, AppendCommitDisposition::Applied) {
-        apply_sql2_version_last_checkpoint_side_effects(transaction, sql2_write)
+        apply_public_version_last_checkpoint_side_effects(transaction, public_write)
             .await
             .map_err(|error| LixError {
                 code: error.code,
                 description: format!(
-                    "sql2 tracked write version checkpoint side effects failed: {}",
+                    "public tracked write version checkpoint side effects failed: {}",
                     error.description
                 ),
             })?;
@@ -631,7 +635,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
         *session_slot = if plugin_changes_committed {
             if let Some(commit_result) = append_result.commit_result.as_ref() {
                 Some(
-                    build_pending_sql2_append_session(
+                    build_pending_public_append_session(
                         transaction,
                         execution.append_preconditions.write_lane.clone(),
                         commit_result,
@@ -665,7 +669,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
 }
 
 fn pending_session_matches_append(
-    session: &PendingSql2AppendSession,
+    session: &PendingPublicAppendSession,
     preconditions: &AppendCommitPreconditions,
 ) -> bool {
     session.lane == preconditions.write_lane
@@ -675,11 +679,11 @@ fn pending_session_matches_append(
         )
 }
 
-async fn build_pending_sql2_append_session(
+async fn build_pending_public_append_session(
     transaction: &mut dyn LixTransaction,
     lane: AppendWriteLane,
     commit_result: &GenerateCommitResult,
-) -> Result<PendingSql2AppendSession, LixError> {
+) -> Result<PendingPublicAppendSession, LixError> {
     let commit_row = commit_result
         .materialized_state
         .iter()
@@ -687,19 +691,19 @@ async fn build_pending_sql2_append_session(
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "sql2 append session requires a lix_commit materialized row",
+                "public append session requires a lix_commit materialized row",
             )
         })?;
     let commit_snapshot = commit_row.snapshot_content.as_deref().ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "sql2 append session requires commit snapshot_content",
+            "public append session requires commit snapshot_content",
         )
     })?;
     let commit_snapshot: JsonValue = serde_json::from_str(commit_snapshot).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("sql2 append session commit snapshot is invalid JSON: {error}"),
+            format!("public append session commit snapshot is invalid JSON: {error}"),
         )
     })?;
     let change_set_id = commit_snapshot
@@ -709,7 +713,7 @@ async fn build_pending_sql2_append_session(
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "sql2 append session commit snapshot is missing change_set_id",
+                "public append session commit snapshot is missing change_set_id",
             )
         })?
         .to_string();
@@ -721,7 +725,7 @@ async fn build_pending_sql2_append_session(
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "sql2 append session requires a lix_commit change row",
+                "public append session requires a lix_commit change row",
             )
         })?;
     let snapshot_id_result = transaction
@@ -749,11 +753,11 @@ async fn build_pending_sql2_append_session(
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "sql2 append session could not load commit snapshot_id",
+                "public append session could not load commit snapshot_id",
             )
         })?;
 
-    Ok(PendingSql2AppendSession {
+    Ok(PendingPublicAppendSession {
         lane,
         commit_id: commit_row.entity_id.clone(),
         change_set_id,
@@ -767,9 +771,9 @@ async fn build_pending_sql2_append_session(
     })
 }
 
-async fn merge_sql2_domain_change_batch_into_pending_commit(
+async fn merge_public_domain_change_batch_into_pending_commit(
     transaction: &mut dyn LixTransaction,
-    session: &mut PendingSql2AppendSession,
+    session: &mut PendingPublicAppendSession,
     batch: &crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch,
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
     timestamp: &str,
@@ -786,7 +790,7 @@ async fn merge_sql2_domain_change_batch_into_pending_commit(
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!(
-                            "sql2 merge requires schema_version for '{}:{}'",
+                            "public merge requires schema_version for '{}:{}'",
                             change.schema_key, change.entity_id
                         ),
                     )
@@ -795,7 +799,7 @@ async fn merge_sql2_domain_change_batch_into_pending_commit(
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!(
-                            "sql2 merge requires file_id for '{}:{}'",
+                            "public merge requires file_id for '{}:{}'",
                             change.schema_key, change.entity_id
                         ),
                     )
@@ -804,7 +808,7 @@ async fn merge_sql2_domain_change_batch_into_pending_commit(
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!(
-                            "sql2 merge requires plugin_key for '{}:{}'",
+                            "public merge requires plugin_key for '{}:{}'",
                             change.schema_key, change.entity_id
                         ),
                     )
@@ -878,7 +882,7 @@ async fn load_version_info_for_domain_changes(
 }
 
 fn rewrite_generated_commit_result_for_pending_session(
-    session: &PendingSql2AppendSession,
+    session: &PendingPublicAppendSession,
     generated: GenerateCommitResult,
     domain_change_count: usize,
     timestamp: &str,
@@ -891,7 +895,7 @@ fn rewrite_generated_commit_result_for_pending_session(
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "sql2 merge rewrite requires a generated lix_commit row",
+                "public merge rewrite requires a generated lix_commit row",
             )
         })?;
     let temporary_change_set_id = generated
@@ -902,7 +906,7 @@ fn rewrite_generated_commit_result_for_pending_session(
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "sql2 merge rewrite requires a generated lix_change_set row",
+                "public merge rewrite requires a generated lix_change_set row",
             )
         })?;
     let version_pointer_entity_id = pending_session_version_pointer_entity_id(&session.lane);
@@ -979,7 +983,7 @@ fn is_pending_commit_meta_row(
             let parsed: JsonValue = serde_json::from_str(snapshot).map_err(|error| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    format!("sql2 merge rewrite saw invalid version pointer JSON: {error}"),
+                    format!("public merge rewrite saw invalid version pointer JSON: {error}"),
                 )
             })?;
             Ok(parsed
@@ -998,13 +1002,13 @@ fn rewrite_change_set_element_snapshot(
     let snapshot = snapshot.ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "sql2 merge rewrite requires change_set_element snapshot_content",
+            "public merge rewrite requires change_set_element snapshot_content",
         )
     })?;
     let mut parsed: JsonValue = serde_json::from_str(snapshot).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("sql2 merge rewrite saw invalid change_set_element JSON: {error}"),
+            format!("public merge rewrite saw invalid change_set_element JSON: {error}"),
         )
     })?;
     let change_id = parsed
@@ -1014,7 +1018,7 @@ fn rewrite_change_set_element_snapshot(
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "sql2 merge rewrite requires change_set_element change_id",
+                "public merge rewrite requires change_set_element change_id",
             )
         })?
         .to_string();
@@ -1081,10 +1085,10 @@ async fn execute_generated_commit_result(
     Ok(())
 }
 
-async fn execute_sql2_untracked_write_with_transaction(
+async fn execute_public_untracked_write_with_transaction(
     engine: &Engine,
     transaction: &mut dyn LixTransaction,
-    execution: &crate::sql::public::runtime::Sql2UntrackedWriteExecution,
+    execution: &crate::sql::public::runtime::UntrackedWriteExecution,
     prepared: &PreparedExecutionContext,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
     let mut runtime_functions = prepared.functions.clone();
@@ -1099,12 +1103,12 @@ async fn execute_sql2_untracked_write_with_transaction(
             .map_err(|error| LixError {
                 code: error.code,
                 description: format!(
-                    "sql2 untracked filesystem payload persistence failed before state apply: {}",
+                    "public untracked filesystem payload persistence failed before state apply: {}",
                     error.description
                 ),
             })?;
     }
-    apply_sql2_untracked_rows(transaction, &execution.intended_post_state, &timestamp).await?;
+    apply_public_untracked_rows(transaction, &execution.intended_post_state, &timestamp).await?;
 
     Ok(Some(SqlExecutionOutcome {
         public_result: QueryResult {
@@ -1118,35 +1122,35 @@ async fn execute_sql2_untracked_write_with_transaction(
     }))
 }
 
-pub(crate) fn sql2_filesystem_payload_changes_already_committed(
+pub(crate) fn public_write_filesystem_payload_changes_already_committed(
     prepared: &PreparedExecutionContext,
 ) -> bool {
-    let Some(sql2_write) = prepared.sql2_write.as_ref() else {
+    let Some(public_write) = prepared.public_write.as_ref() else {
         return false;
     };
     matches!(
-        sql2_write.execution.as_ref(),
-        Some(Sql2WriteExecution::Tracked(execution))
+        public_write.execution.as_ref(),
+        Some(PublicWriteExecution::Tracked(execution))
             if execution.filesystem_payload_changes_committed_by_write
     )
 }
 
-async fn apply_sql2_untracked_rows(
+async fn apply_public_untracked_rows(
     transaction: &mut dyn LixTransaction,
     rows: &[crate::sql::public::planner::ir::PlannedStateRow],
     timestamp: &str,
 ) -> Result<(), LixError> {
     for row in rows {
         if row.tombstone {
-            apply_sql2_untracked_delete(transaction, row).await?;
+            apply_public_untracked_delete(transaction, row).await?;
         } else {
-            apply_sql2_untracked_upsert(transaction, row, timestamp).await?;
+            apply_public_untracked_upsert(transaction, row, timestamp).await?;
         }
     }
     Ok(())
 }
 
-async fn apply_sql2_untracked_upsert(
+async fn apply_public_untracked_upsert(
     transaction: &mut dyn LixTransaction,
     row: &crate::sql::public::planner::ir::PlannedStateRow,
     timestamp: &str,
@@ -1197,7 +1201,7 @@ async fn apply_sql2_untracked_upsert(
     Ok(())
 }
 
-async fn apply_sql2_untracked_delete(
+async fn apply_public_untracked_delete(
     transaction: &mut dyn LixTransaction,
     row: &crate::sql::public::planner::ir::PlannedStateRow,
 ) -> Result<(), LixError> {
@@ -1224,7 +1228,7 @@ fn planned_row_text_value<'a>(
 ) -> Result<&'a str, LixError> {
     planned_row_optional_text_value(row, key).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("sql2 untracked execution requires '{key}' in the resolved row"),
+        description: format!("public untracked execution requires '{key}' in the resolved row"),
     })
 }
 
@@ -1236,7 +1240,7 @@ fn planned_row_json_text_value(
         .map(|value| value.into_owned())
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("sql2 untracked execution requires '{key}' in the resolved row"),
+            description: format!("public untracked execution requires '{key}' in the resolved row"),
         })
 }
 
@@ -1281,7 +1285,7 @@ fn append_commit_error_to_lix_error(error: crate::state::commit::AppendCommitErr
     }
 }
 
-async fn mirror_sql2_stored_schema_bootstrap_rows(
+async fn mirror_public_stored_schema_bootstrap_rows(
     transaction: &mut dyn LixTransaction,
     commit_result: &crate::state::commit::GenerateCommitResult,
 ) -> Result<(), LixError> {
@@ -1345,11 +1349,11 @@ async fn mirror_sql2_stored_schema_bootstrap_rows(
     Ok(())
 }
 
-async fn apply_sql2_version_last_checkpoint_side_effects(
+async fn apply_public_version_last_checkpoint_side_effects(
     transaction: &mut dyn LixTransaction,
-    sql2_write: &Sql2PreparedWrite,
+    public_write: &PreparedPublicWrite,
 ) -> Result<(), LixError> {
-    if sql2_write
+    if public_write
         .planned_write
         .command
         .target
@@ -1360,11 +1364,11 @@ async fn apply_sql2_version_last_checkpoint_side_effects(
         return Ok(());
     }
 
-    let Some(resolved) = sql2_write.planned_write.resolved_write_plan.as_ref() else {
+    let Some(resolved) = public_write.planned_write.resolved_write_plan.as_ref() else {
         return Ok(());
     };
 
-    match sql2_write.planned_write.command.operation_kind {
+    match public_write.planned_write.command.operation_kind {
         crate::sql::public::planner::ir::WriteOperationKind::Insert => {
             upsert_last_checkpoint_rows(
                 transaction,

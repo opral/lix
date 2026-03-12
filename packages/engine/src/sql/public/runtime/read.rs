@@ -5,6 +5,12 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LoweredPublicReadQuery {
+    pub(crate) query: Query,
+    pub(crate) required_schema_keys: BTreeSet<String>,
+}
+
 pub(super) async fn execute_selector_read_strict(
     backend: &dyn LixBackend,
     surface_binding: &SurfaceBinding,
@@ -13,8 +19,11 @@ pub(super) async fn execute_selector_read_strict(
     schema_key_hint: Option<&str>,
     params: &[Value],
 ) -> Result<QueryResult, LixError> {
+    let (lowered_predicates, nested_schema_keys) =
+        lower_nested_public_read_surfaces_in_predicates(backend, residual_predicates, params)
+            .await?;
     let (compiled_predicates, selector_params) = compile_selector_predicates(
-        residual_predicates,
+        &lowered_predicates,
         params,
         backend.dialect(),
     )?;
@@ -48,26 +57,39 @@ pub(super) async fn execute_selector_read_strict(
             "selector read could not lower structured selector query",
         )
     })?;
-    for schema_key in &effective_state_request.schema_set {
+    let mut required_schema_keys = effective_state_request.schema_set.clone();
+    required_schema_keys.extend(nested_schema_keys);
+    for schema_key in &required_schema_keys {
         crate::schema::registry::register_schema(backend, schema_key).await?;
     }
     execute_lowered_selector_read(backend, lowered, &selector_params).await
 }
 
-pub(super) async fn lower_public_read_query_with_sql2_backend(
+pub(super) async fn lower_public_read_query_with_backend(
     backend: &dyn LixBackend,
     query: Query,
     params: &[Value],
-) -> Result<Query, LixError> {
+) -> Result<LoweredPublicReadQuery, LixError> {
+    lower_public_read_query_with_details(backend, query, params).await
+}
+
+async fn lower_public_read_query_with_details(
+    backend: &dyn LixBackend,
+    query: Query,
+    params: &[Value],
+) -> Result<LoweredPublicReadQuery, LixError> {
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
     if !statement_references_public_surface(&registry, &Statement::Query(Box::new(query.clone()))) {
-        return Ok(query);
+        return Ok(LoweredPublicReadQuery {
+            query,
+            required_schema_keys: BTreeSet::new(),
+        });
     }
-    let active_version_id = load_active_version_id_for_sql2_read(backend).await?;
+    let active_version_id = load_active_version_id_for_public_read(backend).await?;
     let parsed = vec![Statement::Query(Box::new(query.clone()))];
-    let prepared = try_prepare_sql2_read_with_internal_access(
+    let prepared = try_prepare_public_read_with_internal_access(
         backend,
         &parsed,
         params,
@@ -76,8 +98,10 @@ pub(super) async fn lower_public_read_query_with_sql2_backend(
         true,
     )
     .await?;
-    let lowered = if let Some(lowered) = prepared.and_then(|prepared| prepared.lowered_read) {
-        lowered
+    let (lowered, required_schema_keys) = if let Some(prepared) = prepared {
+        let required_schema_keys =
+            required_schema_keys_from_dependency_spec(prepared.dependency_spec.as_ref());
+        (prepared.lowered_read, required_schema_keys)
     } else {
         let rewritten = rewrite_public_read_query_to_lowered_sql_with_registry(
             query.clone(),
@@ -85,7 +109,10 @@ pub(super) async fn lower_public_read_query_with_sql2_backend(
             &registry,
         )?;
         if rewritten != query {
-            return Ok(rewritten);
+            return Ok(LoweredPublicReadQuery {
+                query: rewritten,
+                required_schema_keys: BTreeSet::new(),
+            });
         }
         let bound_statement = BoundStatement::from_statement(
             Statement::Query(Box::new(query)),
@@ -100,7 +127,7 @@ pub(super) async fn lower_public_read_query_with_sql2_backend(
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!(
-                    "sql2 read subquery canonicalization failed: {}",
+                    "public read subquery canonicalization failed: {}",
                     error.message
                 ),
             )
@@ -111,22 +138,34 @@ pub(super) async fn lower_public_read_query_with_sql2_backend(
             derive_dependency_spec_from_canonicalized_read(&canonicalized),
         );
         let effective_state = build_effective_state(&canonicalized, dependency_spec.as_ref());
-        lower_read_for_execution(
+        let lowered = lower_read_for_execution(
             &canonicalized,
             effective_state.as_ref().map(|(request, _)| request),
             effective_state.as_ref().map(|(_, plan)| plan),
         )?
-        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "sql2 could not prepare read subquery"))?
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "public read lowering could not prepare read subquery",
+            )
+        })?;
+        (
+            lowered,
+            required_schema_keys_from_dependency_spec(dependency_spec.as_ref()),
+        )
     };
     let statement = lowered.statements.into_iter().next().ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "sql2 read subquery lowered to no statements",
+            "public read subquery lowered to no statements",
         )
     })?;
     let statement = lower_statement(statement, backend.dialect())?;
     match statement {
-        Statement::Query(query) => Ok(*query),
+        Statement::Query(query) => Ok(LoweredPublicReadQuery {
+            query: *query,
+            required_schema_keys,
+        }),
         _ => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "expected lowered subquery to remain a SELECT query",
@@ -134,14 +173,177 @@ pub(super) async fn lower_public_read_query_with_sql2_backend(
     }
 }
 
-pub(super) async fn try_prepare_sql2_read(
+async fn lower_nested_public_read_surfaces_in_predicates(
+    backend: &dyn LixBackend,
+    residual_predicates: &[Expr],
+    params: &[Value],
+) -> Result<(Vec<Expr>, BTreeSet<String>), LixError> {
+    let mut lowered = Vec::with_capacity(residual_predicates.len());
+    let mut required_schema_keys = BTreeSet::new();
+    for predicate in residual_predicates {
+        let mut predicate = predicate.clone();
+        lower_nested_public_read_surfaces_in_expr(
+            backend,
+            &mut predicate,
+            params,
+            &mut required_schema_keys,
+        )
+        .await?;
+        lowered.push(predicate);
+    }
+    Ok((lowered, required_schema_keys))
+}
+
+async fn lower_nested_public_read_surfaces_in_expr(
+    backend: &dyn LixBackend,
+    expr: &mut Expr,
+    params: &[Value],
+    required_schema_keys: &mut BTreeSet<String>,
+) -> Result<(), LixError> {
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            Box::pin(lower_nested_public_read_surfaces_in_expr(
+                backend,
+                left.as_mut(),
+                params,
+                required_schema_keys,
+            ))
+            .await?;
+            Box::pin(lower_nested_public_read_surfaces_in_expr(
+                backend,
+                right.as_mut(),
+                params,
+                required_schema_keys,
+            ))
+            .await
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => {
+            Box::pin(lower_nested_public_read_surfaces_in_expr(
+                backend,
+                expr.as_mut(),
+                params,
+                required_schema_keys,
+            ))
+            .await
+        }
+        Expr::InList { expr, list, .. } => {
+            Box::pin(lower_nested_public_read_surfaces_in_expr(
+                backend,
+                expr.as_mut(),
+                params,
+                required_schema_keys,
+            ))
+            .await?;
+            for item in list {
+                Box::pin(lower_nested_public_read_surfaces_in_expr(
+                    backend,
+                    item,
+                    params,
+                    required_schema_keys,
+                ))
+                .await?;
+            }
+            Ok(())
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            Box::pin(lower_nested_public_read_surfaces_in_expr(
+                backend,
+                expr.as_mut(),
+                params,
+                required_schema_keys,
+            ))
+            .await?;
+            Box::pin(lower_nested_public_read_surfaces_in_expr(
+                backend,
+                low.as_mut(),
+                params,
+                required_schema_keys,
+            ))
+            .await?;
+            Box::pin(lower_nested_public_read_surfaces_in_expr(
+                backend,
+                high.as_mut(),
+                params,
+                required_schema_keys,
+            ))
+            .await
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            Box::pin(lower_nested_public_read_surfaces_in_expr(
+                backend,
+                expr.as_mut(),
+                params,
+                required_schema_keys,
+            ))
+            .await?;
+            Box::pin(lower_nested_public_read_surfaces_in_expr(
+                backend,
+                pattern.as_mut(),
+                params,
+                required_schema_keys,
+            ))
+            .await
+        }
+        Expr::Subquery(query) => {
+            let lowered =
+                lower_public_read_query_with_details(backend, (**query).clone(), params).await?;
+            required_schema_keys.extend(lowered.required_schema_keys);
+            *query = Box::new(lowered.query);
+            Ok(())
+        }
+        Expr::Exists { subquery, .. } => {
+            let lowered =
+                lower_public_read_query_with_details(backend, (**subquery).clone(), params).await?;
+            required_schema_keys.extend(lowered.required_schema_keys);
+            *subquery = Box::new(lowered.query);
+            Ok(())
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            Box::pin(lower_nested_public_read_surfaces_in_expr(
+                backend,
+                expr.as_mut(),
+                params,
+                required_schema_keys,
+            ))
+            .await?;
+            let lowered =
+                lower_public_read_query_with_details(backend, (**subquery).clone(), params).await?;
+            required_schema_keys.extend(lowered.required_schema_keys);
+            *subquery = Box::new(lowered.query);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn required_schema_keys_from_dependency_spec(
+    dependency_spec: Option<&DependencySpec>,
+) -> BTreeSet<String> {
+    dependency_spec
+        .map(|spec| {
+            spec.schema_keys
+                .iter()
+                .filter(|schema_key| schema_key.as_str() != "lix_active_version")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(super) async fn try_prepare_public_read(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
-) -> Result<Option<Sql2PreparedRead>, LixError> {
-    try_prepare_sql2_read_with_internal_access(
+) -> Result<Option<PreparedPublicRead>, LixError> {
+    try_prepare_public_read_with_internal_access(
         backend,
         parsed_statements,
         params,
@@ -152,21 +354,21 @@ pub(super) async fn try_prepare_sql2_read(
     .await
 }
 
-pub(super) async fn try_prepare_sql2_read_with_internal_access(
+pub(super) async fn try_prepare_public_read_with_internal_access(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
     allow_internal_tables: bool,
-) -> Result<Option<Sql2PreparedRead>, LixError> {
+) -> Result<Option<PreparedPublicRead>, LixError> {
     if parsed_statements.len() != 1 {
         return Ok(None);
     }
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
-    if let Some(error) = sql2_public_read_preflight_error(&registry, &parsed_statements[0]) {
+    if let Some(error) = public_read_preflight_error(&registry, &parsed_statements[0]) {
         return Err(error);
     }
     let Some((statement, explain_envelope)) = explain_query_statement(&parsed_statements[0]) else {
@@ -187,10 +389,23 @@ pub(super) async fn try_prepare_sql2_read_with_internal_access(
             requested_version_id: Some(active_version_id.to_string()),
         },
     );
+    if read_summary.bound_surface_bindings.len() > 1 {
+        if let Some(prepared) = prepare_public_read_via_surface_lowering(
+            backend,
+            bound_statement.clone(),
+            explain_envelope.as_ref(),
+            &registry,
+            allow_internal_tables,
+        )
+        .await?
+        {
+            return Ok(Some(prepared));
+        }
+    }
     let canonicalized = match canonicalize_read(bound_statement.clone(), &registry) {
         Ok(canonicalized) => canonicalized,
         Err(canonicalize_error) => {
-            if let Some(prepared) = prepare_sql2_read_via_surface_expansion(
+            if let Some(prepared) = prepare_public_read_via_surface_lowering(
                 backend,
                 bound_statement,
                 explain_envelope.as_ref(),
@@ -204,7 +419,7 @@ pub(super) async fn try_prepare_sql2_read_with_internal_access(
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!(
-                    "sql2 read preparation failed: {}",
+                    "public read preparation failed: {}",
                     canonicalize_error.message
                 ),
             ));
@@ -216,10 +431,10 @@ pub(super) async fn try_prepare_sql2_read_with_internal_access(
             .ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    "sql2 read preparation could not bind active history root",
+                    "public read preparation could not bind active history root",
                 )
             })?;
-    ensure_sql2_history_timeline_roots(backend, &canonicalized.bound_statement.statement)
+    ensure_public_read_history_timeline_roots(backend, &canonicalized.bound_statement.statement)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
     let dependency_spec = augment_dependency_spec_for_public_read(
@@ -240,28 +455,41 @@ pub(super) async fn try_prepare_sql2_read_with_internal_access(
         effective_state.as_ref().map(|(_, plan)| plan),
     )?
     .map(|program| wrap_lowered_read_for_explain(program, explain_envelope.as_ref()));
+    let lowered_read = match lowered_read {
+        Some(lowered_read) => lowered_read,
+        None => {
+            if let Some(prepared) = prepare_public_read_via_surface_lowering(
+                backend,
+                bound_statement.clone(),
+                explain_envelope.as_ref(),
+                &registry,
+                allow_internal_tables,
+            )
+            .await?
+            {
+                return Ok(Some(prepared));
+            }
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "public read did not lower through either specialized or broad lowering paths",
+            ));
+        }
+    };
     let lowered_sql = lowered_read
-        .as_ref()
-        .map(|program| {
-            program
-                .statements
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        .statements
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
 
-    Ok(Some(Sql2PreparedRead {
-        debug_trace: Sql2DebugTrace {
+    Ok(Some(PreparedPublicRead {
+        debug_trace: PublicExecutionDebugTrace {
             bound_statements: vec![bound_statement],
             surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
-            bound_public_leaves: vec![sql2_bound_public_leaf(&canonicalized.surface_binding)],
+            bound_public_leaves: vec![bound_public_leaf(&canonicalized.surface_binding)],
             dependency_spec: dependency_spec.clone(),
             effective_state_request: effective_state.as_ref().map(|(request, _)| request.clone()),
             effective_state_plan: effective_state.as_ref().map(|(_, plan)| plan.clone()),
-            pushdown_decision: lowered_read
-                .as_ref()
-                .map(|program| program.pushdown_decision.clone()),
+            pushdown_decision: Some(lowered_read.pushdown_decision.clone()),
             write_command: None,
             scope_proof: None,
             schema_proof: None,
@@ -281,14 +509,14 @@ pub(super) async fn try_prepare_sql2_read_with_internal_access(
     }))
 }
 
-async fn prepare_sql2_read_via_surface_expansion(
+async fn prepare_public_read_via_surface_lowering(
     backend: &dyn LixBackend,
     bound_statement: BoundStatement,
     explain_envelope: Option<&ExplainEnvelope>,
     registry: &SurfaceRegistry,
     allow_internal_tables: bool,
-) -> Result<Option<Sql2PreparedRead>, LixError> {
-    ensure_sql2_history_timeline_roots(backend, &bound_statement.statement)
+) -> Result<Option<PreparedPublicRead>, LixError> {
+    ensure_public_read_history_timeline_roots(backend, &bound_statement.statement)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
     let read_summary = summarize_bound_public_read_statement(registry, &bound_statement.statement);
@@ -332,11 +560,11 @@ async fn prepare_sql2_read_via_surface_expansion(
     let bound_public_leaves = read_summary
         .bound_surface_bindings
         .iter()
-        .map(sql2_bound_public_leaf)
+        .map(bound_public_leaf)
         .collect::<Vec<_>>();
 
-    Ok(Some(Sql2PreparedRead {
-        debug_trace: Sql2DebugTrace {
+    Ok(Some(PreparedPublicRead {
+        debug_trace: PublicExecutionDebugTrace {
             bound_statements: vec![bound_statement.clone()],
             surface_bindings: bound_public_surface_names(registry, &bound_statement.statement),
             bound_public_leaves,
@@ -362,19 +590,19 @@ async fn prepare_sql2_read_via_surface_expansion(
         dependency_spec,
         effective_state_request: None,
         effective_state_plan: None,
-        lowered_read: Some(lowered_read),
+        lowered_read,
         canonicalized: None,
     }))
 }
 
-pub(super) async fn prepare_sql2_read(
+pub(super) async fn prepare_public_read(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
-) -> Option<Sql2PreparedRead> {
-    try_prepare_sql2_read(
+) -> Option<PreparedPublicRead> {
+    try_prepare_public_read(
         backend,
         parsed_statements,
         params,
@@ -386,14 +614,14 @@ pub(super) async fn prepare_sql2_read(
     .flatten()
 }
 
-pub(super) async fn prepare_sql2_read_strict(
+pub(super) async fn prepare_public_read_strict(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
-) -> Result<Option<Sql2PreparedRead>, LixError> {
-    try_prepare_sql2_read(
+) -> Result<Option<PreparedPublicRead>, LixError> {
+    try_prepare_public_read(
         backend,
         parsed_statements,
         params,
