@@ -28,6 +28,7 @@ export type LixValue =
   | { kind: "int"; value: number }
   | { kind: "float"; value: number }
   | { kind: "text"; value: string }
+  | { kind: "json"; value: unknown }
   | { kind: "blob"; base64: string };
 
 export type LixQueryResult = {
@@ -95,14 +96,12 @@ export type InitLixResult = {
 export type CreateVersionOptions = {
   id?: string;
   name?: string;
-  inheritsFromVersionId?: string;
   hidden?: boolean;
 };
 
 export type CreateVersionResult = {
   id: string;
   name: string;
-  inheritsFromVersionId: string;
 };
 
 export type ObserveQuery = {
@@ -117,7 +116,6 @@ export type ExecuteOptions = {
 export type ObserveEvent = {
   sequence: number;
   rows: LixQueryResult;
-  stateCommitSequence: number | null;
 };
 
 export type LixObserveEvents = {
@@ -563,26 +561,11 @@ export type LixObserveEvents = {
 
         let id = read_optional_string_property_with_context(&input, "id", "createVersion")?;
         let name = read_optional_string_property_with_context(&input, "name", "createVersion")?;
-        let inherits_from_version_id = read_optional_string_property_with_context(
-            &input,
-            "inheritsFromVersionId",
-            "createVersion",
-        )?
-        .or(read_optional_string_property_with_context(
-            &input,
-            "inherits_from_version_id",
-            "createVersion",
-        )?);
 
         let hidden = read_optional_bool_property_with_context(&input, "hidden", "createVersion")?
             .unwrap_or(false);
 
-        Ok(CreateVersionOptions {
-            id,
-            name,
-            inherits_from_version_id,
-            hidden,
-        })
+        Ok(CreateVersionOptions { id, name, hidden })
     }
 
     fn parse_observe_query(input: JsValue) -> Result<EngineObserveQuery, LixError> {
@@ -685,11 +668,6 @@ export type LixObserveEvents = {
             &JsValue::from_str("name"),
             &JsValue::from_str(&result.name),
         );
-        let _ = Reflect::set(
-            &object,
-            &JsValue::from_str("inheritsFromVersionId"),
-            &JsValue::from_str(&result.inherits_from_version_id),
-        );
         object
     }
 
@@ -704,15 +682,6 @@ export type LixObserveEvents = {
             &object,
             &JsValue::from_str("rows"),
             &query_result_to_js(event.rows)?,
-        );
-        let state_commit_sequence = match event.state_commit_sequence {
-            Some(value) => JsValue::from_f64(value as f64),
-            None => JsValue::NULL,
-        };
-        let _ = Reflect::set(
-            &object,
-            &JsValue::from_str("stateCommitSequence"),
-            &state_commit_sequence,
         );
         Ok(object)
     }
@@ -767,6 +736,14 @@ export type LixObserveEvents = {
             code: "LIX_ERROR_JS_SDK".to_string(),
             description: format!("{context} invalid JSON value: {error}"),
         })
+    }
+
+    fn serde_json_to_js(value: &serde_json::Value) -> Result<JsValue, LixError> {
+        let json_text = serde_json::to_string(value).map_err(|error| LixError {
+            code: "LIX_ERROR_JS_SDK".to_string(),
+            description: format!("failed to serialize JSON value for wasm bridge: {error}"),
+        })?;
+        js_sys::JSON::parse(&json_text).map_err(js_to_lix_error)
     }
 
     struct JsHostWasmRuntime {
@@ -964,7 +941,7 @@ export type LixObserveEvents = {
             let js_params = Array::new();
             for param in params {
                 let wire = WireValue::try_from_engine(param)?;
-                let value = wire_value_to_js(wire);
+                let value = wire_value_to_js(wire)?;
                 js_params.push(&value);
             }
             let result = func
@@ -1282,6 +1259,13 @@ export type LixObserveEvents = {
                 })?;
                 Ok(WireValue::Text { value: parsed })
             }
+            "json" => {
+                let raw =
+                    Reflect::get(&value, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
+                Ok(WireValue::Json {
+                    value: js_to_json_value(raw, "LixValue 'json'.value")?,
+                })
+            }
             "blob" => {
                 let raw =
                     Reflect::get(&value, &JsValue::from_str("base64")).map_err(js_to_lix_error)?;
@@ -1304,7 +1288,7 @@ export type LixObserveEvents = {
         for row in wire.rows {
             let js_row = Array::new();
             for value in row {
-                js_row.push(&wire_value_to_js(value));
+                js_row.push(&wire_value_to_js(value)?);
             }
             rows.push(&js_row);
         }
@@ -1328,7 +1312,7 @@ export type LixObserveEvents = {
         Ok(obj.into())
     }
 
-    fn wire_value_to_js(value: WireValue) -> JsValue {
+    fn wire_value_to_js(value: WireValue) -> Result<JsValue, LixError> {
         let obj = Object::new();
         match value {
             WireValue::Null { value: _ } => {
@@ -1367,6 +1351,14 @@ export type LixObserveEvents = {
                     &JsValue::from_str(&value),
                 );
             }
+            WireValue::Json { value } => {
+                let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("json"));
+                let _ = Reflect::set(
+                    &obj,
+                    &JsValue::from_str("value"),
+                    &serde_json_to_js(&value)?,
+                );
+            }
             WireValue::Blob { base64 } => {
                 let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("blob"));
                 let _ = Reflect::set(
@@ -1376,7 +1368,7 @@ export type LixObserveEvents = {
                 );
             }
         }
-        obj.into()
+        Ok(obj.into())
     }
 
     fn js_error(value: impl std::fmt::Display) -> JsValue {

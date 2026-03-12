@@ -526,7 +526,6 @@ mod tests {
         boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
-    use crate::engine::Engine;
     use crate::plugin::types::{InstalledPlugin, PluginRuntime};
     use crate::sql::analysis::history_reads::file_history_read_materialization_required_for_statements;
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
@@ -536,13 +535,11 @@ mod tests {
         advance_placeholder_state_for_statement_ast, bind_sql_with_state, parse_sql_statements,
         PlaceholderState,
     };
-    use crate::sql::ast::walk::contains_transaction_control_statement;
     use crate::sql::execution::contracts::planned_statement::UpdateValidationPlan;
     use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
     use crate::version::active_version_schema_key;
     use crate::{
-        ExecuteResult, LixError, NoopWasmRuntime, QueryResult, SnapshotChunkReader, Value,
-        WasmComponentInstance,
+        LixError, NoopWasmRuntime, QueryResult, SnapshotChunkReader, Value, WasmComponentInstance,
     };
     use async_trait::async_trait;
     use serde_json::json;

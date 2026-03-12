@@ -187,6 +187,83 @@ simulation_test!(
 );
 
 simulation_test!(
+    observe_stream_recovers_after_transient_query_error,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let key = "observe-recover-json";
+        engine
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)",
+                &[
+                    Value::Text(key.to_string()),
+                    Value::Text(r#"{"value":"ok-0"}"#.to_string()),
+                ],
+            )
+            .await
+            .expect("seed insert should succeed");
+
+        let mut observed = engine
+            .observe(ObserveQuery::new(
+                "SELECT json_extract(value, '$.value') FROM lix_key_value WHERE key = ?1",
+                vec![Value::Text(key.to_string())],
+            ))
+            .expect("observe should succeed");
+
+        let initial = observed.next().await.unwrap().unwrap();
+        assert_eq!(
+            initial.rows.rows,
+            vec![vec![Value::Text("ok-0".to_string())]]
+        );
+
+        let failing_next = observed.next();
+        engine
+            .execute(
+                "UPDATE lix_key_value SET value = ?2 WHERE key = ?1",
+                &[Value::Text(key.to_string()), Value::Text("{".to_string())],
+            )
+            .await
+            .expect("malformed update should still commit");
+
+        let query_error = failing_next
+            .await
+            .expect_err("observe follow-up should surface malformed json");
+        assert!(
+            query_error.description.contains("malformed")
+                || query_error.description.contains("json")
+                || query_error.description.contains("parse")
+        );
+
+        let recovered_next = observed.next();
+        engine
+            .execute(
+                "UPDATE lix_key_value SET value = ?2 WHERE key = ?1",
+                &[
+                    Value::Text(key.to_string()),
+                    Value::Text(r#"{"value":"ok-1"}"#.to_string()),
+                ],
+            )
+            .await
+            .expect("recovery update should succeed");
+
+        let recovered = tokio::time::timeout(Duration::from_secs(2), recovered_next)
+            .await
+            .expect("observe recovery should not time out")
+            .expect("observe recovery should succeed")
+            .expect("observe recovery event should exist");
+        assert_eq!(
+            recovered.rows.rows,
+            vec![vec![Value::Text("ok-1".to_string())]]
+        );
+    }
+);
+
+simulation_test!(
     observe_skips_unrelated_commits_until_result_changes,
     simulations = [sqlite, postgres],
     |sim| async move {

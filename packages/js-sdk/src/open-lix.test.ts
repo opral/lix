@@ -127,13 +127,10 @@ test("openLix executes SQL against default in-memory sqlite backend", async () =
 	await lix.close();
 });
 
-test("openLix disallows querying internal tables", async () => {
+test("openLix allows querying internal tables for debugging", async () => {
 	const lix = await createInitializedLix();
-	await expect(
-		lix.execute("SELECT * FROM lix_internal_state_vtable", []),
-	).rejects.toThrow(
-		/LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED|lix_internal_\*|not allowed/i,
-	);
+	const result = await lix.execute("SELECT * FROM lix_internal_state_vtable", []);
+	expect(statementRows(result).length).toBeGreaterThan(0);
 	await lix.close();
 });
 
@@ -155,23 +152,21 @@ test("createVersion + switchVersion use the JS API surface", async () => {
 	await lix.close();
 });
 
-test("createVersion forwards inheritsFromVersionId and hidden options", async () => {
+test("createVersion forwards hidden option", async () => {
 	const lix = await createInitializedLix();
 
 	const created = await lix.createVersion({
 		id: "branch-options",
 		name: "Branch Options",
-		inheritsFromVersionId: "global",
 		hidden: true,
 	});
 	expect(created).toEqual({
 		id: "branch-options",
 		name: "Branch Options",
-		inheritsFromVersionId: "global",
 	});
 
 	const row = await lix.execute(
-		"SELECT id, name, inherits_from_version_id, hidden \
+		"SELECT id, name, hidden \
      FROM lix_version \
      WHERE id = ? \
      LIMIT 1",
@@ -181,8 +176,7 @@ test("createVersion forwards inheritsFromVersionId and hidden options", async ()
 	expect(rowValues.length).toBe(1);
 	expect(rowValues[0]?.[0]).toBe("branch-options");
 	expect(rowValues[0]?.[1]).toBe("Branch Options");
-	expect(rowValues[0]?.[2]).toBe("global");
-	expect(rowValues[0]?.[3]).toBe("true");
+	expect(rowValues[0]?.[2]).toBe("true");
 
 	await lix.close();
 });
@@ -507,7 +501,6 @@ test("observe emits initial and follow-up query results", async () => {
 	expect(initial).toBeDefined();
 	expect(initial!.sequence).toBe(0);
 	expect(initial!.rows.rows).toEqual([]);
-	expect(initial!.stateCommitSequence).toBeNull();
 
 	const nextPromise = events.next();
 	await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
@@ -518,7 +511,6 @@ test("observe emits initial and follow-up query results", async () => {
 	const followUp = await nextPromise;
 	expect(followUp).toBeDefined();
 	expect(followUp!.sequence).toBe(1);
-	expect(followUp!.stateCommitSequence).not.toBeNull();
 	expect(followUp!.rows.rows.length).toBe(1);
 
 	events.close();
@@ -692,20 +684,28 @@ test("observe stream remains usable after query error", async () => {
 	expect(initial!.rows.rows.length).toBe(1);
 	expect(initial!.rows.rows[0]![0]).toBe("ok-0");
 
-	const failingNext = events.next();
+	const failingNext = events.next().then(
+		(value) => ({ ok: true as const, value }),
+		(error) => ({ ok: false as const, error }),
+	);
 	await lix.execute("UPDATE lix_key_value SET value = ?2 WHERE key = ?1", [
 		key,
 		"{",
 	]);
 
-	await expect(failingNext).rejects.toThrow(/malformed|json|parse/i);
+	const failingResult = await failingNext;
+	expect(failingResult.ok).toBe(false);
+	if (failingResult.ok) {
+		throw new Error("observe query unexpectedly succeeded");
+	}
+	expect(String(failingResult.error)).toMatch(/malformed|json|parse/i);
 
-	const recoveredNext = events.next();
 	await lix.execute("UPDATE lix_key_value SET value = ?2 WHERE key = ?1", [
 		key,
 		'{"value":"ok-1"}',
 	]);
 
+	const recoveredNext = events.next();
 	const recovered = await withTimeout(recoveredNext, 1500);
 	expect(recovered).not.toBe(TIMEOUT);
 	if (recovered === TIMEOUT || recovered === undefined) {

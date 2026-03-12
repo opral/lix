@@ -1,6 +1,7 @@
 import init, {
 	initLix as initLixWasm,
 	openLix as openLixWasm,
+	type JsonValue,
 	Value,
 	resolveEngineWasmModuleOrPath,
 } from "./engine-wasm/index.js";
@@ -32,14 +33,12 @@ export { Value } from "./engine-wasm/index.js";
 export type CreateVersionOptions = {
 	id?: string;
 	name?: string;
-	inheritsFromVersionId?: string;
 	hidden?: boolean;
 };
 
 export type CreateVersionResult = {
 	id: string;
 	name: string;
-	inheritsFromVersionId: string;
 };
 
 export type InstallPluginOptions = {
@@ -72,7 +71,6 @@ export type SqlTransaction = {
 export type ObserveEvent = {
 	sequence: number;
 	rows: LixRuntimeQueryResult;
-	stateCommitSequence: number | null;
 };
 
 export type ObserveEvents = {
@@ -391,12 +389,10 @@ export async function openLix(
 				const event = next as {
 					sequence: number;
 					rows: LixCanonicalQueryResult;
-					stateCommitSequence: number | null;
 				};
 				return {
 					sequence: event.sequence,
 					rows: decodeCanonicalQueryResult(event.rows),
-					stateCommitSequence: event.stateCommitSequence,
 				};
 			},
 			close,
@@ -416,29 +412,13 @@ export async function openLix(
 		}
 		const id = (raw as { id?: unknown }).id;
 		const name = (raw as { name?: unknown }).name;
-		const inheritsFromVersionId =
-			(
-				raw as {
-					inheritsFromVersionId?: unknown;
-					inherits_from_version_id?: unknown;
-				}
-			).inheritsFromVersionId ??
-			(raw as { inherits_from_version_id?: unknown }).inherits_from_version_id;
 		if (typeof id !== "string" || id.length === 0) {
 			throw new Error("createVersion() result is missing string id");
 		}
 		if (typeof name !== "string" || name.length === 0) {
 			throw new Error("createVersion() result is missing string name");
 		}
-		if (
-			typeof inheritsFromVersionId !== "string" ||
-			inheritsFromVersionId.length === 0
-		) {
-			throw new Error(
-				"createVersion() result is missing string inheritsFromVersionId",
-			);
-		}
-		return { id, name, inheritsFromVersionId };
+		return { id, name };
 	};
 
 	const switchVersion = async (versionId: string): Promise<void> => {
@@ -740,6 +720,8 @@ function decodeCanonicalValue(
 			return value.value;
 		case "text":
 			return value.value;
+		case "json":
+			return value.value;
 		case "blob":
 			return Value.from(value).asBlob() ?? new Uint8Array();
 	}
@@ -798,6 +780,9 @@ function encodeRuntimeValue(
 	}
 	if (value instanceof ArrayBuffer) {
 		return Value.blob(new Uint8Array(value)).toJSON();
+	}
+	if (isJsonRuntimeValue(value)) {
+		return { kind: "json", value };
 	}
 	throw new TypeError(
 		`${context} must be a runtime scalar value or Uint8Array`,
@@ -906,8 +891,38 @@ function isCanonicalLixValue(value: unknown): value is LixCanonicalValue {
 	if (kind === "text") {
 		return typeof (value as { value?: unknown }).value === "string";
 	}
+	if (kind === "json") {
+		return isJsonRuntimeValue((value as { value?: unknown }).value);
+	}
 	if (kind === "blob") {
 		return typeof (value as { base64?: unknown }).base64 === "string";
 	}
 	return false;
+}
+
+function isJsonRuntimeValue(value: unknown): value is JsonValue {
+	if (
+		value === null ||
+		typeof value === "boolean" ||
+		typeof value === "string"
+	) {
+		return true;
+	}
+	if (typeof value === "number") {
+		return Number.isFinite(value);
+	}
+	if (Array.isArray(value)) {
+		return value.every((entry) => isJsonRuntimeValue(entry));
+	}
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	if (
+		value instanceof Uint8Array ||
+		value instanceof ArrayBuffer ||
+		ArrayBuffer.isView(value)
+	) {
+		return false;
+	}
+	return Object.values(value).every((entry) => isJsonRuntimeValue(entry));
 }

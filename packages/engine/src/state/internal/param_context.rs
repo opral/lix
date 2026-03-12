@@ -56,15 +56,6 @@ pub(crate) fn extract_string_column_values_from_expr(
     extract_column_values_from_expr(expr, is_target_column, params, resolve_string_scalar)
 }
 
-#[cfg(test)]
-pub(crate) fn extract_bool_column_values_from_expr(
-    expr: &Expr,
-    is_target_column: fn(&Expr) -> bool,
-    params: &[EngineValue],
-) -> Option<Vec<bool>> {
-    extract_column_values_from_expr(expr, is_target_column, params, resolve_bool_scalar)
-}
-
 pub(crate) fn match_bool_column_equality(
     expr: &Expr,
     is_target_column: fn(&Expr) -> bool,

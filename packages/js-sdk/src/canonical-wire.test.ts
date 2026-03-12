@@ -1,6 +1,8 @@
 import { expect, test } from "vitest";
 import init, {
+	initLix as initLixWasm,
 	openLix as openLixWasm,
+	type JsonValue,
 	resolveEngineWasmModuleOrPath,
 	Value,
 } from "./engine-wasm/index.js";
@@ -14,6 +16,7 @@ type CanonicalValue =
 	| { kind: "int"; value: number }
 	| { kind: "float"; value: number }
 	| { kind: "text"; value: string }
+	| { kind: "json"; value: JsonValue }
 	| { kind: "blob"; base64: string };
 
 const DISALLOWED_NON_CANONICAL_KINDS = new Set([
@@ -32,7 +35,9 @@ function assertCanonicalValue(value: unknown): asserts value is CanonicalValue {
 	const kind = (value as { kind?: unknown }).kind;
 	expect(typeof kind).toBe("string");
 	expect(DISALLOWED_NON_CANONICAL_KINDS.has(String(kind))).toBe(false);
-	expect(["null", "bool", "int", "float", "text", "blob"]).toContain(kind);
+	expect(["null", "bool", "int", "float", "text", "json", "blob"]).toContain(
+		kind,
+	);
 }
 
 function decodeCanonicalToRuntime(value: CanonicalValue): LixRuntimeValue {
@@ -43,6 +48,7 @@ function decodeCanonicalToRuntime(value: CanonicalValue): LixRuntimeValue {
 		case "int":
 		case "float":
 		case "text":
+		case "json":
 			return value.value;
 		case "blob":
 			return Value.from(value).asBlob() ?? new Uint8Array();
@@ -64,10 +70,46 @@ function encodeRuntimeToCanonical(value: LixRuntimeValue): CanonicalValue {
 	if (typeof value === "string") {
 		return { kind: "text", value };
 	}
+	if (isJsonRuntimeValue(value)) {
+		return { kind: "json", value };
+	}
 	if (value instanceof Uint8Array) {
 		return Value.blob(value).toJSON() as CanonicalValue;
 	}
 	throw new Error(`unsupported runtime value: ${String(value)}`);
+}
+
+function isJsonRuntimeValue(value: unknown): value is JsonValue {
+	if (
+		value === null ||
+		typeof value === "boolean" ||
+		typeof value === "string"
+	) {
+		return true;
+	}
+	if (typeof value === "number") {
+		return Number.isFinite(value);
+	}
+	if (Array.isArray(value)) {
+		return value.every((entry) => isJsonRuntimeValue(entry));
+	}
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	if (
+		value instanceof Uint8Array ||
+		value instanceof ArrayBuffer ||
+		ArrayBuffer.isView(value)
+	) {
+		return false;
+	}
+	return Object.values(value).every((entry) => isJsonRuntimeValue(entry));
+}
+
+function firstStatementRows(result: {
+	statements: Array<{ rows: unknown[][] }>;
+}): unknown[][] {
+	return result.statements[0]?.rows ?? [];
 }
 
 async function createCanonicalBoundaryLix() {
@@ -120,7 +162,9 @@ async function createCanonicalBoundaryLix() {
 		},
 	};
 
-	const lix = await openLixWasm(backend as any, createNodeWasmRuntime());
+	const wasmRuntime = createNodeWasmRuntime();
+	await initLixWasm(backend as any, wasmRuntime, undefined);
+	const lix = await openLixWasm(backend as any, wasmRuntime);
 	return { lix, runtimeBackend };
 }
 
@@ -131,8 +175,8 @@ test("execute emits canonical wire value kinds only", async () => {
 			"SELECT 1 AS i, 1.5 AS f, 'abc' AS t, X'0102' AS b, NULL AS n",
 			[],
 			undefined,
-		)) as { rows: unknown[][] };
-		const row = result.rows[0]!;
+		)) as { statements: Array<{ rows: unknown[][] }> };
+		const row = firstStatementRows(result)[0]!;
 		expect(row).toHaveLength(5);
 		for (const cell of row) {
 			assertCanonicalValue(cell);
@@ -161,8 +205,8 @@ test("beginTransaction.execute emits canonical wire value kinds only", async () 
 			const result = (await tx.execute(
 				"SELECT 2 AS i, 'x' AS t",
 				[],
-			)) as { rows: unknown[][] };
-			const row = result.rows[0]!;
+			)) as { statements: Array<{ rows: unknown[][] }> };
+			const row = firstStatementRows(result)[0]!;
 			for (const cell of row) {
 				assertCanonicalValue(cell);
 			}
