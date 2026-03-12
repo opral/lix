@@ -5,8 +5,6 @@ mod boot;
 mod cel;
 mod deterministic_mode;
 mod engine;
-mod error;
-mod error_classification;
 mod errors;
 mod filesystem;
 mod functions;
@@ -35,8 +33,7 @@ pub use engine::{
     boot, init_lix, BootAccount, BootArgs, BootKeyValue, Engine, EngineTransaction,
     EngineTransactionFuture, ExecuteOptions, InitLixArgs, InitLixResult,
 };
-pub use error::LixError;
-pub use errors::ErrorCode;
+pub use errors::{ErrorCode, LixError};
 pub use observe::{observe_owned, ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
 pub use state::checkpoint::CreateCheckpointResult;
 pub use state::commit::{

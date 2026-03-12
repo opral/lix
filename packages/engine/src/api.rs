@@ -6,7 +6,6 @@ use crate::errors;
 use crate::sql::execution::execute;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path;
-use crate::sql::execution::{runtime_post_commit, runtime_sql_effects};
 use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
 use crate::state::materialization::{
     MaterializationApplyReport, MaterializationPlan, MaterializationReport, MaterializationRequest,
@@ -216,44 +215,69 @@ impl Engine {
             self.set_active_version_id(version_id.clone());
         }
 
-        let cache_targets = shared_path::derive_cache_targets(
+        let _file_cache_refresh_targets = shared_path::derive_cache_targets(
             &prepared.plan,
             active_effects,
             effects_are_authoritative,
             execution.postprocess_file_cache_targets.clone(),
+        )
+        .file_cache_refresh_targets;
+
+        let filesystem_payload_domain_changes = self
+            .collect_live_filesystem_payload_domain_changes(
+                &prepared.intent.pending_file_writes,
+                &prepared.intent.pending_file_delete_targets,
+                writer_key,
+            )
+            .await?;
+        let filesystem_payload_domain_changes =
+            crate::engine::dedupe_filesystem_payload_domain_changes(
+                &filesystem_payload_domain_changes,
+            );
+        let payload_domain_changes_to_persist =
+            if shared_path::sql2_filesystem_payload_changes_already_committed(&prepared) {
+                Vec::new()
+            } else if execution.plugin_changes_committed {
+                crate::engine::dedupe_filesystem_payload_domain_changes(
+                    &filesystem_payload_domain_changes,
+                )
+            } else {
+                filesystem_payload_domain_changes.clone()
+            };
+        let should_run_binary_gc = crate::engine::should_run_binary_cas_gc(
+            &prepared.plan.preprocess.mutations,
+            &filesystem_payload_domain_changes,
         );
 
-        runtime_sql_effects::apply_sql_backed_effects(
-            self,
-            &prepared.plan.preprocess.mutations,
-            &prepared.intent.pending_file_writes,
-            &prepared.intent.pending_file_delete_targets,
-            execution.plugin_changes_committed,
-            shared_path::sql2_filesystem_payload_changes_already_committed(&prepared),
-            writer_key,
-        )
-        .await?;
+        if !shared_path::sql2_filesystem_payload_changes_already_committed(&prepared) {
+            self.persist_pending_file_data_updates(&prepared.intent.pending_file_writes)
+                .await?;
+        }
+        if !payload_domain_changes_to_persist.is_empty() {
+            self.persist_filesystem_payload_domain_changes(&payload_domain_changes_to_persist)
+                .await?;
+        }
+        if should_run_binary_gc {
+            self.garbage_collect_unreachable_binary_cas().await?;
+        }
 
         let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
         state_commit_stream_changes.extend(execution.state_commit_stream_changes);
         let should_emit_observe_tick = !state_commit_stream_changes.is_empty();
 
-        runtime_post_commit::apply_runtime_post_commit_effects(
-            self,
-            cache_targets.file_cache_refresh_targets,
-            if effects_are_authoritative {
-                false
-            } else {
-                prepared
-                    .plan
-                    .requirements
-                    .should_invalidate_installed_plugins_cache
-            },
-            should_emit_observe_tick,
-            options.writer_key.as_deref(),
-            state_commit_stream_changes,
-        )
-        .await?;
+        if !effects_are_authoritative
+            && prepared
+                .plan
+                .requirements
+                .should_invalidate_installed_plugins_cache
+        {
+            self.invalidate_installed_plugins_cache()?;
+        }
+        if should_emit_observe_tick {
+            self.append_observe_tick(options.writer_key.as_deref())
+                .await?;
+        }
+        self.emit_state_commit_stream_changes(state_commit_stream_changes);
 
         Ok(ExecuteResult {
             statements: vec![execution.public_result],

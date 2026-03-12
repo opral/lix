@@ -1,6 +1,6 @@
 use serde_json::Value as JsonValue;
 
-use crate::error_classification::is_missing_relation_error;
+use crate::errors::classification::is_missing_relation_error;
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
 use crate::key_value::{

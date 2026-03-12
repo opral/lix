@@ -277,7 +277,8 @@ pub(crate) async fn normalize_sql_execution_error_with_backend(
     error: LixError,
     statements: &[Statement],
 ) -> LixError {
-    crate::error_classification::normalize_sql_error_with_backend(backend, error, statements).await
+    crate::errors::classification::normalize_sql_error_with_backend(backend, error, statements)
+        .await
 }
 
 #[cfg(test)]
