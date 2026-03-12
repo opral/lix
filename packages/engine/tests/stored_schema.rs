@@ -103,6 +103,37 @@ simulation_test!(
 );
 
 simulation_test!(
+    stored_schema_refreshes_public_surface_dispatch_after_public_insert,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_stored_schema_by_version (value, lixcol_version_id) VALUES (\
+                 lix_json('{\"x-lix-key\":\"dispatch_refresh_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}'),\
+                 'global'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let result = engine
+            .execute("SELECT COUNT(*) FROM dispatch_refresh_schema", &[])
+            .await
+            .expect("new public surface should dispatch through public lowering");
+
+        assert_eq!(result.statements[0].rows, vec![vec![Value::Integer(0)]]);
+    }
+);
+
+simulation_test!(
     stored_schema_requires_foreign_key_targets_are_unique_or_primary,
     |sim| async move {
         let engine = sim

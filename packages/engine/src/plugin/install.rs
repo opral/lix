@@ -67,6 +67,7 @@ impl Engine {
         if active_version_id != starting_active_version_id {
             self.set_active_version_id(active_version_id);
         }
+        self.refresh_public_surface_registry().await?;
         self.invalidate_installed_plugins_cache()?;
         self.emit_state_commit_stream_changes(pending_state_commit_stream_changes);
         Ok(())
@@ -83,6 +84,8 @@ async fn install_plugin_in_transaction(
     pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
 ) -> Result<(), LixError> {
     let mut pending_public_append_session = None;
+    let mut public_surface_registry = engine.public_surface_registry();
+    let mut public_surface_registry_dirty = false;
     for schema in &parsed.schemas {
         engine
             .execute_with_options_in_transaction(
@@ -91,6 +94,8 @@ async fn install_plugin_in_transaction(
                 &[Value::Text(schema.normalized_schema_json.clone())],
                 options,
                 false,
+                &mut public_surface_registry,
+                &mut public_surface_registry_dirty,
                 active_version_id,
                 None,
                 false,
@@ -113,6 +118,8 @@ async fn install_plugin_in_transaction(
             &[Value::Text(archive_id.clone())],
             options,
             false,
+            &mut public_surface_registry,
+            &mut public_surface_registry_dirty,
             active_version_id,
             None,
             false,
@@ -134,6 +141,8 @@ async fn install_plugin_in_transaction(
             ],
             options,
             false,
+            &mut public_surface_registry,
+            &mut public_surface_registry_dirty,
             active_version_id,
             None,
             false,

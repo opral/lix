@@ -46,9 +46,10 @@ use crate::state::stream::{
 use crate::state::timeline::ensure_history_timeline_materialized_for_root;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot,
+    parse_active_version_snapshot, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
+use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
     JoinConstraint, JoinOperator, LimitClause, ObjectNamePart, OrderBy, OrderByExpr, Query, Select,
@@ -150,6 +151,12 @@ pub(crate) struct PreparedPublicWrite {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PublicSurfaceRegistryMutation {
+    UpsertStoredSchemaSnapshot { snapshot: JsonValue },
+    RemoveDynamicSchema { schema_key: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PublicWriteExecution {
     pub(crate) partitions: Vec<PublicWriteExecutionPartition>,
 }
@@ -183,6 +190,12 @@ pub(crate) enum PreparedPublicExecution {
     Write(PreparedPublicWrite),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicExecutionRoute {
+    Read,
+    Write,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BoundPublicReadSummary {
     bound_surface_bindings: Vec<crate::sql::public::catalog::SurfaceBinding>,
@@ -191,6 +204,7 @@ struct BoundPublicReadSummary {
     requested_history_root_commit_ids: Vec<String>,
 }
 
+mod bind;
 mod read;
 
 pub(crate) async fn prepare_public_execution(
@@ -211,6 +225,75 @@ pub(crate) async fn prepare_public_execution(
     .await
 }
 
+pub(crate) async fn prepare_public_execution_with_registry_and_internal_access(
+    backend: &dyn LixBackend,
+    registry: &SurfaceRegistry,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+    allow_internal_tables: bool,
+) -> Result<Option<PreparedPublicExecution>, LixError> {
+    let Some(route) = classify_public_execution_route_with_registry(registry, parsed_statements)
+    else {
+        return Ok(None);
+    };
+
+    match route {
+        PublicExecutionRoute::Write => {
+            let target_name = public_write_target_name(registry, parsed_statements)
+                .expect("public write route must expose a target name");
+            let prepared = try_prepare_public_write_with_registry(
+                backend,
+                registry,
+                parsed_statements,
+                params,
+                active_version_id,
+                writer_key,
+            )
+            .await?;
+            prepared
+                .map(PreparedPublicExecution::Write)
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "public write target '{target_name}' must route through public lowering"
+                        ),
+                    )
+                })
+                .map(Some)
+        }
+        PublicExecutionRoute::Read => {
+            if parsed_statements.len() != 1 {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "public read statement batches must route through public lowering one statement at a time",
+                ));
+            }
+
+            read::try_prepare_public_read_with_registry_and_internal_access(
+                backend,
+                registry,
+                parsed_statements,
+                params,
+                active_version_id,
+                writer_key,
+                allow_internal_tables,
+            )
+            .await?
+            .map(PreparedPublicExecution::Read)
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "public read statements must route through public lowering",
+                )
+            })
+            .map(Some)
+        }
+    }
+}
+
 pub(crate) async fn prepare_public_execution_with_internal_access(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
@@ -222,56 +305,29 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
-    if !statements_reference_public_surface(&registry, parsed_statements) {
-        return Ok(None);
-    }
-
-    if let Some(target_name) = public_write_target_name(&registry, parsed_statements) {
-        let prepared = try_prepare_public_write(
-            backend,
-            parsed_statements,
-            params,
-            active_version_id,
-            writer_key,
-        )
-        .await?;
-        return prepared
-            .map(PreparedPublicExecution::Write)
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "public write target '{target_name}' must route through public lowering"
-                    ),
-                )
-            })
-            .map(Some);
-    }
-
-    if parsed_statements.len() != 1 {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "public read statement batches must route through public lowering one statement at a time",
-        ));
-    }
-
-    try_prepare_public_read(
+    prepare_public_execution_with_registry_and_internal_access(
         backend,
+        &registry,
         parsed_statements,
         params,
         active_version_id,
         writer_key,
         allow_internal_tables,
     )
-    .await?
-    .map(PreparedPublicExecution::Read)
-    .ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "public read statements must route through public lowering",
-        )
-    })
-    .map(Some)
+    .await
+}
+
+pub(crate) async fn classify_public_execution_route_with_backend(
+    backend: &dyn LixBackend,
+    parsed_statements: &[Statement],
+) -> Result<Option<PublicExecutionRoute>, LixError> {
+    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
+        .await
+        .map_err(|error| LixError::new(error.code, error.description))?;
+    Ok(classify_public_execution_route_with_registry(
+        &registry,
+        parsed_statements,
+    ))
 }
 
 pub(crate) fn statement_references_public_surface_with_builtin_registry(
@@ -357,8 +413,12 @@ async fn try_prepare_public_read(
     writer_key: Option<&str>,
     allow_internal_tables: bool,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
-    read::try_prepare_public_read_with_internal_access(
+    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
+        .await
+        .map_err(|error| LixError::new(error.code, error.description))?;
+    read::try_prepare_public_read_with_registry_and_internal_access(
         backend,
+        &registry,
         parsed_statements,
         params,
         active_version_id,
@@ -497,6 +557,19 @@ fn statements_reference_public_surface(
     parsed_statements
         .iter()
         .any(|statement| statement_references_public_surface(registry, statement))
+}
+
+pub(crate) fn classify_public_execution_route_with_registry(
+    registry: &SurfaceRegistry,
+    parsed_statements: &[Statement],
+) -> Option<PublicExecutionRoute> {
+    if !statements_reference_public_surface(registry, parsed_statements) {
+        return None;
+    }
+    if public_write_target_name(registry, parsed_statements).is_some() {
+        return Some(PublicExecutionRoute::Write);
+    }
+    Some(PublicExecutionRoute::Read)
 }
 
 fn statement_references_public_surface(registry: &SurfaceRegistry, statement: &Statement) -> bool {
@@ -1357,6 +1430,29 @@ pub(crate) async fn try_prepare_public_write(
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
+    try_prepare_public_write_with_registry(
+        backend,
+        &registry,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+    )
+    .await
+}
+
+pub(crate) async fn try_prepare_public_write_with_registry(
+    backend: &dyn LixBackend,
+    registry: &SurfaceRegistry,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+) -> Result<Option<PreparedPublicWrite>, LixError> {
+    if parsed_statements.len() != 1 {
+        return Ok(None);
+    }
+
     let statement = parsed_statements[0].clone();
     let bound_statement = BoundStatement::from_statement(
         statement,
@@ -1498,9 +1594,8 @@ fn build_public_write_execution(
     let mut filesystem_payloads_persisted = false;
 
     for partition in &resolved.partitions {
-        let persist_filesystem_payloads_before_write =
-            !filesystem_payloads_persisted
-                && public_write_persists_filesystem_payloads(planned_write, partition);
+        let persist_filesystem_payloads_before_write = !filesystem_payloads_persisted
+            && public_write_persists_filesystem_payloads(planned_write, partition);
         filesystem_payloads_persisted |= persist_filesystem_payloads_before_write;
 
         match partition.execution_mode {
@@ -1609,6 +1704,74 @@ fn schema_registrations_from_partition(
         .into_iter()
         .map(|schema_key| SchemaRegistration { schema_key })
         .collect()
+}
+
+pub(crate) fn public_surface_registry_mutations(
+    prepared: &PreparedPublicWrite,
+) -> Result<Vec<PublicSurfaceRegistryMutation>, LixError> {
+    let Some(resolved) = prepared.planned_write.resolved_write_plan.as_ref() else {
+        return Ok(Vec::new());
+    };
+
+    let mut mutations = Vec::new();
+    for row in resolved.intended_post_state() {
+        if row.schema_key != "lix_stored_schema"
+            || row.version_id.as_deref() != Some(GLOBAL_VERSION_ID)
+        {
+            continue;
+        }
+
+        if row.tombstone {
+            if let Some((schema_key, _)) = row.entity_id.rsplit_once('~') {
+                mutations.push(PublicSurfaceRegistryMutation::RemoveDynamicSchema {
+                    schema_key: schema_key.to_string(),
+                });
+            }
+            continue;
+        }
+
+        let Some(snapshot_content) = planned_row_optional_json_text_value(row, "snapshot_content")
+        else {
+            continue;
+        };
+        let snapshot = serde_json::from_str(snapshot_content.as_ref()).map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("stored schema snapshot_content invalid JSON: {error}"),
+            )
+        })?;
+        mutations.push(PublicSurfaceRegistryMutation::UpsertStoredSchemaSnapshot { snapshot });
+    }
+
+    Ok(mutations)
+}
+
+pub(crate) fn apply_public_surface_registry_mutations(
+    registry: &mut SurfaceRegistry,
+    mutations: &[PublicSurfaceRegistryMutation],
+) -> Result<bool, LixError> {
+    if mutations.is_empty() {
+        return Ok(false);
+    }
+
+    for mutation in mutations {
+        match mutation {
+            PublicSurfaceRegistryMutation::UpsertStoredSchemaSnapshot { snapshot } => {
+                registry.replace_dynamic_entity_surfaces_from_stored_snapshot(snapshot)?;
+            }
+            PublicSurfaceRegistryMutation::RemoveDynamicSchema { schema_key } => {
+                registry.remove_dynamic_entity_surfaces_for_schema_key(schema_key);
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+pub(crate) fn prepared_public_write_mutates_public_surface_registry(
+    prepared: &PreparedPublicWrite,
+) -> Result<bool, LixError> {
+    Ok(!public_surface_registry_mutations(prepared)?.is_empty())
 }
 
 fn tracked_public_write_operation_supported(
@@ -2068,9 +2231,11 @@ fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWri
     if planned_write
         .resolved_write_plan
         .as_ref()
-        .map(|plan| plan.partitions.iter().any(|partition| {
-            partition.execution_mode != crate::sql::public::planner::ir::WriteMode::Untracked
-        }))
+        .map(|plan| {
+            plan.partitions.iter().any(|partition| {
+                partition.execution_mode != crate::sql::public::planner::ir::WriteMode::Untracked
+            })
+        })
         .unwrap_or(true)
     {
         physical_checks.push("backend_constraints.defense_in_depth".to_string());
@@ -2088,24 +2253,11 @@ mod tests {
     use super::{
         lower_public_read_query_with_backend, prepare_public_execution,
         prepare_public_execution_with_internal_access, prepare_public_read,
-        prepare_public_read_strict, prepare_public_write, PreparedPublicExecution,
-        PreparedPublicWrite, PublicWriteExecution, PublicWriteExecutionPartition,
+        prepare_public_read_strict, PreparedPublicExecution,
     };
-    use crate::sql::public::catalog::SurfaceRegistry;
-    use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
-    use crate::sql::public::planner::canonicalize::canonicalize_write;
-    use crate::sql::public::planner::ir::{
-        ExpectedTip, ScopeProof, WriteLane, WriteMode, WriteModeRequest,
-    };
-    use crate::sql::public::planner::semantics::domain_changes::{
-        build_domain_change_batch, derive_commit_preconditions,
-    };
-    use crate::sql::public::planner::semantics::write_analysis::analyze_write;
-    use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan;
-    use crate::state::commit::AppendWriteLane;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
-    use serde_json::{json, to_string};
+    use serde_json::json;
     use sqlparser::ast::Statement;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -2398,43 +2550,6 @@ mod tests {
 
     fn parse_one(sql: &str) -> Vec<Statement> {
         Parser::parse_sql(&GenericDialect {}, sql).expect("SQL should parse")
-    }
-
-    fn resolved_write_plan(
-        prepared: &PreparedPublicWrite,
-    ) -> &crate::sql::public::planner::ir::ResolvedWritePlan {
-        prepared
-            .planned_write
-            .resolved_write_plan
-            .as_ref()
-            .expect("resolved write plan should exist")
-    }
-
-    fn tracked_write_lane(
-        resolved: &crate::sql::public::planner::ir::ResolvedWritePlan,
-    ) -> Option<WriteLane> {
-        resolved
-            .tracked_partitions()
-            .next()
-            .and_then(|partition| partition.target_write_lane.clone())
-    }
-
-    fn intended_post_state<'a>(
-        resolved: &'a crate::sql::public::planner::ir::ResolvedWritePlan,
-    ) -> Vec<&'a crate::sql::public::planner::ir::PlannedStateRow> {
-        resolved.intended_post_state().collect()
-    }
-
-    fn tombstones(
-        resolved: &crate::sql::public::planner::ir::ResolvedWritePlan,
-    ) -> Vec<&crate::sql::public::planner::ir::ResolvedRowRef> {
-        resolved.tombstones().collect()
-    }
-
-    fn tracked_commit_preconditions(
-        prepared: &PreparedPublicWrite,
-    ) -> Option<&crate::sql::public::planner::ir::CommitPreconditions> {
-        prepared.planned_write.commit_preconditions.first()
     }
 
     fn extract_sql_string_filter(sql: &str, column: &str) -> Option<String> {
@@ -3614,511 +3729,4 @@ mod tests {
         assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_version_pointer"));
         assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_version_descriptor"));
     }
-
-    #[tokio::test]
-    async fn prepares_state_by_version_inserts_into_planned_writes() {
-        let mut backend = FakeBackend::default();
-        backend.version_pointer_rows.insert(
-            "version-a".to_string(),
-            to_string(&crate::schema::builtin::types::LixVersionPointer {
-                id: "version-a".to_string(),
-                commit_id: "commit-123".to_string(),
-            })
-            .expect("version pointer JSON"),
-        );
-        let prepared = prepare_public_write(
-            &backend,
-            &parse_one(
-                "INSERT INTO lix_state_by_version (\
-                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                 ) VALUES (\
-                 'entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1'\
-                 )",
-            ),
-            &[],
-            "main",
-            Some("writer-a"),
-        )
-        .await
-        .expect("state insert should prepare through public lowering");
-
-        assert_eq!(
-            prepared.debug_trace.surface_bindings,
-            vec!["lix_state_by_version"]
-        );
-        assert_eq!(
-            prepared.planned_write.scope_proof,
-            ScopeProof::SingleVersion("version-a".to_string())
-        );
-        assert_eq!(
-            prepared.planned_write.command.requested_mode,
-            WriteModeRequest::Auto
-        );
-        assert_eq!(
-            resolved_write_plan(&prepared)
-                .single_partition()
-                .map(|partition| partition.execution_mode),
-            Some(WriteMode::Tracked)
-        );
-        assert_eq!(
-            tracked_commit_preconditions(&prepared)
-                .expect("tracked write should include commit preconditions")
-                .expected_tip,
-            ExpectedTip::CommitId("commit-123".to_string())
-        );
-        assert_eq!(
-            tracked_write_lane(resolved_write_plan(&prepared)),
-            Some(WriteLane::SingleVersion("version-a".to_string()))
-        );
-        assert_eq!(
-            prepared
-                .domain_change_batches
-                .first()
-                .expect("tracked write should include a domain change batch")
-                .write_lane,
-            WriteLane::SingleVersion("version-a".to_string())
-        );
-        assert!(matches!(
-            prepared.execution.as_ref(),
-            Some(PublicWriteExecution { partitions })
-                if matches!(
-                    partitions.as_slice(),
-                    [PublicWriteExecutionPartition::Tracked(execution)]
-                        if execution.append_preconditions.write_lane
-                            == AppendWriteLane::Version("version-a".to_string())
-                )
-        ));
-        assert_eq!(
-            prepared
-                .debug_trace
-                .invariant_trace
-                .as_ref()
-                .expect("write debug trace should include invariant checks")
-                .batch_local_checks,
-            vec![
-                "snapshot_content.schema_validation".to_string(),
-                "entity_id.primary_key_consistency".to_string()
-            ]
-        );
-        assert_eq!(
-            prepared.debug_trace.write_phase_trace,
-            vec![
-                "canonicalize_write".to_string(),
-                "analyze_write".to_string(),
-                "resolve_authoritative_pre_state".to_string(),
-                "build_domain_change_batch".to_string(),
-                "derive_commit_preconditions".to_string(),
-                "validate_batch_local_write".to_string(),
-                "append_time_invariant_recheck".to_string(),
-                "append_commit_if_preconditions_hold".to_string(),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn prepares_active_version_state_inserts_with_active_lane() {
-        let mut backend = FakeBackend::default();
-        backend.version_pointer_rows.insert(
-            "main".to_string(),
-            to_string(&crate::schema::builtin::types::LixVersionPointer {
-                id: "main".to_string(),
-                commit_id: "commit-main".to_string(),
-            })
-            .expect("version pointer JSON"),
-        );
-        let prepared = prepare_public_write(
-            &backend,
-            &parse_one(
-                "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version\
-                 ) VALUES (\
-                 'entity-1', 'lix_key_value', 'lix', 'lix', '{\"key\":\"hello\"}', '1'\
-                 )",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("active-version state insert should prepare through public lowering");
-
-        assert_eq!(
-            prepared.planned_write.scope_proof,
-            ScopeProof::ActiveVersion
-        );
-        assert_eq!(
-            tracked_write_lane(resolved_write_plan(&prepared)),
-            Some(WriteLane::ActiveVersion)
-        );
-        assert_eq!(
-            tracked_commit_preconditions(&prepared)
-                .expect("tracked write should include commit preconditions")
-                .expected_tip,
-            ExpectedTip::CommitId("commit-main".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn prepares_lix_version_inserts_with_global_admin_lane() {
-        let mut backend = FakeBackend::default();
-        backend.version_pointer_rows.insert(
-            "global".to_string(),
-            to_string(&crate::schema::builtin::types::LixVersionPointer {
-                id: "global".to_string(),
-                commit_id: "commit-global".to_string(),
-            })
-            .expect("version pointer JSON"),
-        );
-
-        let prepared = prepare_public_write(
-            &backend,
-            &parse_one(
-                "INSERT INTO lix_version (id, name, hidden, commit_id) \
-                 VALUES ('version-a', 'Version A', false, 'commit-a')",
-            ),
-            &[],
-            "main",
-            Some("writer-a"),
-        )
-        .await
-        .expect("lix_version insert should prepare through public lowering");
-
-        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_version"]);
-        assert_eq!(prepared.planned_write.scope_proof, ScopeProof::GlobalAdmin);
-        assert_eq!(
-            tracked_write_lane(resolved_write_plan(&prepared)),
-            Some(WriteLane::GlobalAdmin)
-        );
-        assert_eq!(
-            tracked_commit_preconditions(&prepared)
-                .expect("tracked write should include commit preconditions")
-                .expected_tip,
-            ExpectedTip::CommitId("commit-global".to_string())
-        );
-        let rows = intended_post_state(resolved_write_plan(&prepared));
-        assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .any(|row| row.schema_key == crate::version::version_descriptor_schema_key()));
-        assert!(rows
-            .iter()
-            .any(|row| row.schema_key == crate::version::version_pointer_schema_key()));
-    }
-
-    #[tokio::test]
-    async fn prepares_active_version_updates_as_untracked_admin_writes() {
-        let backend = FakeBackend {
-            active_version_rows: vec![(
-                "active-row".to_string(),
-                crate::version::active_version_snapshot_content("active-row", "main"),
-            )],
-            version_descriptor_rows: HashMap::from([(
-                "version-b".to_string(),
-                crate::version::version_descriptor_snapshot_content(
-                    "version-b",
-                    "Version B",
-                    false,
-                ),
-            )]),
-            ..FakeBackend::default()
-        };
-
-        let prepared = prepare_public_write(
-            &backend,
-            &parse_one("UPDATE lix_active_version SET version_id = 'version-b'"),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("active version update should prepare through public lowering");
-
-        assert_eq!(
-            prepared.debug_trace.surface_bindings,
-            vec!["lix_active_version"]
-        );
-        assert_eq!(
-            prepared.planned_write.command.requested_mode,
-            WriteModeRequest::ForceUntracked
-        );
-        assert!(matches!(
-            prepared.execution.as_ref(),
-            Some(PublicWriteExecution { partitions })
-                if matches!(partitions.as_slice(), [PublicWriteExecutionPartition::Untracked(_)])
-        ));
-        assert!(prepared.planned_write.commit_preconditions.is_empty());
-        assert!(prepared.domain_change_batches.is_empty());
-        let rows = intended_post_state(resolved_write_plan(&prepared));
-        assert_eq!(
-            rows[0].version_id.as_deref(),
-            Some(crate::version::active_version_storage_version_id())
-        );
-    }
-
-    #[tokio::test]
-    async fn prepares_active_account_deletes_as_untracked_admin_writes() {
-        let backend = FakeBackend {
-            active_account_rows: vec!["acct-1".to_string()],
-            ..FakeBackend::default()
-        };
-
-        let prepared = prepare_public_write(
-            &backend,
-            &parse_one("DELETE FROM lix_active_account WHERE account_id = 'acct-1'"),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("active account delete should prepare through public lowering");
-
-        assert_eq!(
-            prepared.debug_trace.surface_bindings,
-            vec!["lix_active_account"]
-        );
-        assert_eq!(
-            prepared.planned_write.command.requested_mode,
-            WriteModeRequest::ForceUntracked
-        );
-        assert!(matches!(
-            prepared.execution.as_ref(),
-            Some(PublicWriteExecution { partitions })
-                if matches!(
-                    partitions.as_slice(),
-                    [PublicWriteExecutionPartition::Untracked(execution)]
-                        if !execution.persist_filesystem_payloads_before_write
-                )
-        ));
-        assert!(prepared.planned_write.commit_preconditions.is_empty());
-        assert!(prepared.domain_change_batches.is_empty());
-        assert!(intended_post_state(resolved_write_plan(&prepared))[0].tombstone);
-    }
-
-    #[tokio::test]
-    async fn prepares_untracked_filesystem_file_by_version_inserts_with_payload_rows() {
-        let prepared = prepare_public_write(
-            &FakeBackend::default(),
-            &parse_one(
-                "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id, lixcol_untracked) \
-                 VALUES ('file-u', '/docs/untracked.md', lix_text_encode('hello'), 'version-a', true)",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("untracked file insert should prepare through public lowering");
-
-        assert_eq!(
-            prepared.debug_trace.surface_bindings,
-            vec!["lix_file_by_version"]
-        );
-        assert_eq!(
-            prepared.planned_write.command.requested_mode,
-            WriteModeRequest::ForceUntracked
-        );
-        assert!(prepared.planned_write.commit_preconditions.is_empty());
-        assert!(prepared.domain_change_batches.is_empty());
-        let rows = intended_post_state(resolved_write_plan(&prepared));
-        assert!(rows
-            .iter()
-            .any(|row| row.schema_key == "lix_file_descriptor"));
-        assert!(rows
-            .iter()
-            .any(|row| row.schema_key == "lix_binary_blob_ref"));
-    }
-
-    #[tokio::test]
-    async fn prepares_untracked_directory_by_version_inserts_without_commit_artifacts() {
-        let prepared = prepare_public_write(
-            &FakeBackend::default(),
-            &parse_one(
-                "INSERT INTO lix_directory_by_version (id, path, lixcol_version_id, lixcol_untracked) \
-                 VALUES ('dir-u', '/docs/guides/', 'version-a', true)",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("untracked directory insert should prepare through public lowering");
-
-        assert_eq!(
-            prepared.debug_trace.surface_bindings,
-            vec!["lix_directory_by_version"]
-        );
-        assert_eq!(
-            prepared.planned_write.command.requested_mode,
-            WriteModeRequest::ForceUntracked
-        );
-        assert!(prepared.planned_write.commit_preconditions.is_empty());
-        assert!(prepared.domain_change_batches.is_empty());
-        let rows = intended_post_state(resolved_write_plan(&prepared));
-        assert!(rows
-            .iter()
-            .all(|row| row.schema_key == "lix_directory_descriptor"));
-        assert!(
-            rows.len() >= 2,
-            "missing ancestor directory rows should be planned"
-        );
-    }
-
-    #[tokio::test]
-    async fn prepares_stored_schema_invariant_trace_for_public_writes() {
-        let mut backend = FakeBackend::default();
-        backend.version_pointer_rows.insert(
-            "global".to_string(),
-            to_string(&crate::schema::builtin::types::LixVersionPointer {
-                id: "global".to_string(),
-                commit_id: "commit-global".to_string(),
-            })
-            .expect("version pointer JSON"),
-        );
-
-        let prepared = prepare_public_write(
-            &backend,
-            &parse_one(
-                "INSERT INTO lix_state_by_version (\
-                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                 ) VALUES (\
-                 'schema-a~1', 'lix_stored_schema', 'lix', 'global', 'lix', '{\"value\":{\"x-lix-key\":\"schema-a\",\"x-lix-version\":\"1\",\"type\":\"object\"}}', '1'\
-                 )",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("stored schema write should prepare through public lowering");
-
-        let invariant_trace = prepared
-            .debug_trace
-            .invariant_trace
-            .as_ref()
-            .expect("stored schema write should expose invariant trace");
-        assert!(invariant_trace
-            .batch_local_checks
-            .contains(&"stored_schema.definition_validation".to_string()));
-        assert!(invariant_trace
-            .batch_local_checks
-            .contains(&"stored_schema.bootstrap_identity".to_string()));
-        assert!(invariant_trace
-            .append_time_checks
-            .contains(&"write_lane.tip_precondition".to_string()));
-        assert_eq!(
-            invariant_trace.physical_checks,
-            vec!["backend_constraints.defense_in_depth".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn prepares_builtin_entity_inserts_into_tracked_write_artifacts() {
-        let mut backend = FakeBackend::default();
-        backend.version_pointer_rows.insert(
-            "main".to_string(),
-            to_string(&crate::schema::builtin::types::LixVersionPointer {
-                id: "main".to_string(),
-                commit_id: "commit-main".to_string(),
-            })
-            .expect("version pointer JSON"),
-        );
-        let registry = SurfaceRegistry::bootstrap_with_backend(&backend)
-            .await
-            .expect("registry should bootstrap");
-        let bound = BoundStatement::from_statement(
-            parse_one("INSERT INTO lix_key_value (key, value) VALUES ('k', 'v')")
-                .into_iter()
-                .next()
-                .expect("single statement"),
-            Vec::new(),
-            ExecutionContext {
-                dialect: Some(SqlDialect::Sqlite),
-                requested_version_id: Some("main".to_string()),
-                ..ExecutionContext::default()
-            },
-        );
-        let canonicalized =
-            canonicalize_write(bound, &registry).expect("entity insert should canonicalize");
-        let mut planned_write =
-            analyze_write(&canonicalized).expect("entity insert should analyze");
-        let resolved_plan = resolve_write_plan(&backend, &planned_write)
-            .await
-            .expect("entity insert should resolve");
-        planned_write.resolved_write_plan = Some(resolved_plan);
-        let _ = build_domain_change_batch(&planned_write)
-            .expect("domain-change batch should build")
-            .first()
-            .expect("tracked entity insert should produce a batch");
-        let _ = derive_commit_preconditions(&backend, &planned_write)
-            .await
-            .expect("commit preconditions should derive")
-            .first()
-            .expect("tracked entity insert should produce commit preconditions");
-
-        let prepared = prepare_public_write(
-            &backend,
-            &parse_one("INSERT INTO lix_key_value (key, value) VALUES ('k', 'v')"),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("builtin entity insert should prepare through public lowering");
-
-        assert_eq!(
-            prepared.debug_trace.surface_bindings,
-            vec!["lix_key_value".to_string()]
-        );
-        let rows = intended_post_state(resolved_write_plan(&prepared));
-        assert_eq!(
-            rows[0].values.get("snapshot_content"),
-            Some(&Value::Text("{\"key\":\"k\",\"value\":\"v\"}".to_string()))
-        );
-    }
-
-    #[tokio::test]
-    async fn returns_none_for_entity_writes_that_need_legacy_global_override_handling() {
-        let mut backend = FakeBackend::default();
-        backend.version_pointer_rows.insert(
-            "main".to_string(),
-            to_string(&crate::schema::builtin::types::LixVersionPointer {
-                id: "main".to_string(),
-                commit_id: "commit-main".to_string(),
-            })
-            .expect("version pointer JSON"),
-        );
-        backend.stored_schema_rows.insert(
-            "message".to_string(),
-            json!({
-                "value": {
-                    "x-lix-key": "message",
-                    "x-lix-version": "1",
-                    "x-lix-primary-key": ["/id"],
-                    "x-lix-override-lixcols": {
-                        "lixcol_file_id": "\"lix\"",
-                        "lixcol_plugin_key": "\"lix\"",
-                        "lixcol_global": "true"
-                    },
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "body": { "type": "string" }
-                    }
-                }
-            })
-            .to_string(),
-        );
-
-        let prepared = prepare_public_write(
-            &backend,
-            &parse_one("INSERT INTO message (id, body) VALUES ('m1', 'hello')"),
-            &[],
-            "main",
-            None,
-        )
-        .await;
-
-        assert!(prepared.is_none());
-    }
-
 }

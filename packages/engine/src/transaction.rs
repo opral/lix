@@ -17,9 +17,11 @@ impl Engine {
             engine: self,
             transaction: Some(transaction),
             options,
+            public_surface_registry: self.public_surface_registry(),
             active_version_id: self.require_active_version_id()?,
             active_version_changed: false,
             installed_plugins_cache_invalidation_pending: false,
+            public_surface_registry_dirty: false,
             pending_state_commit_stream_changes: Vec::new(),
             pending_public_append_session: None,
         })
@@ -94,6 +96,8 @@ impl EngineTransaction<'_> {
                     params,
                     &self.options,
                     allow_internal_tables,
+                    &mut self.public_surface_registry,
+                    &mut self.public_surface_registry_dirty,
                     &mut self.active_version_id,
                     &mut self.pending_state_commit_stream_changes,
                     &mut self.pending_public_append_session,
@@ -108,6 +112,8 @@ impl EngineTransaction<'_> {
                     params,
                     &self.options,
                     allow_internal_tables,
+                    &mut self.public_surface_registry,
+                    &mut self.public_surface_registry_dirty,
                     &mut self.active_version_id,
                     None,
                     false,
@@ -149,6 +155,9 @@ impl EngineTransaction<'_> {
         }
         if self.installed_plugins_cache_invalidation_pending {
             self.engine.invalidate_installed_plugins_cache()?;
+        }
+        if self.public_surface_registry_dirty {
+            self.engine.refresh_public_surface_registry().await?;
         }
         self.engine.emit_state_commit_stream_changes(std::mem::take(
             &mut self.pending_state_commit_stream_changes,

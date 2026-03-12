@@ -2,6 +2,7 @@ use crate::cel::CelEvaluator;
 use crate::deterministic_mode::DeterministicSettings;
 use crate::plugin::types::InstalledPlugin;
 use crate::sql::execution::transaction_session::PublicSqlSessionState;
+use crate::sql::public::catalog::SurfaceRegistry;
 use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
@@ -45,6 +46,7 @@ pub struct Engine {
     deterministic_boot_pending: AtomicBool,
     init_state: AtomicU8,
     active_version_id: RwLock<Option<String>>,
+    public_surface_registry: RwLock<SurfaceRegistry>,
     access_to_internal: bool,
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
     plugin_component_cache: Mutex<BTreeMap<String, crate::plugin::runtime::CachedPluginComponent>>,
@@ -60,9 +62,11 @@ pub struct EngineTransaction<'a> {
     pub(crate) engine: &'a Engine,
     pub(crate) transaction: Option<Box<dyn LixTransaction + 'a>>,
     pub(crate) options: ExecuteOptions,
+    pub(crate) public_surface_registry: SurfaceRegistry,
     pub(crate) active_version_id: String,
     pub(crate) active_version_changed: bool,
     pub(crate) installed_plugins_cache_invalidation_pending: bool,
+    pub(crate) public_surface_registry_dirty: bool,
     pub(crate) pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
     pub(crate) pending_public_append_session:
         Option<crate::sql::execution::shared_path::PendingPublicAppendSession>,
@@ -136,6 +140,23 @@ impl Engine {
             return;
         }
         *guard = Some(version_id);
+    }
+
+    pub(crate) fn public_surface_registry(&self) -> SurfaceRegistry {
+        self.public_surface_registry
+            .read()
+            .expect("public surface registry lock poisoned")
+            .clone()
+    }
+
+    pub(crate) async fn refresh_public_surface_registry(&self) -> Result<(), LixError> {
+        let registry = SurfaceRegistry::bootstrap_with_backend(self.backend.as_ref()).await?;
+        let mut guard = self
+            .public_surface_registry
+            .write()
+            .expect("public surface registry lock poisoned");
+        *guard = registry;
+        Ok(())
     }
 
     pub(crate) fn try_mark_init_in_progress(&self) -> Result<(), LixError> {
@@ -321,6 +342,7 @@ impl Engine {
             deterministic_boot_pending: AtomicBool::new(deterministic_boot_pending),
             init_state: AtomicU8::new(INIT_STATE_NOT_STARTED),
             active_version_id: RwLock::new(None),
+            public_surface_registry: RwLock::new(SurfaceRegistry::with_builtin_surfaces()),
             access_to_internal: args.access_to_internal,
             installed_plugins_cache: RwLock::new(None),
             plugin_component_cache: Mutex::new(BTreeMap::new()),
@@ -519,7 +541,6 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use sqlparser::ast::{Expr, Statement};
-    use std::future::Future;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, RwLock};
     struct TestBackend {
@@ -535,32 +556,17 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct PlainReadBackend {
+        executed_sql: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
     struct EmptySnapshotReader;
 
     struct NoopWasmComponentInstance;
 
     fn active_version_snapshot_json(version_id: &str) -> String {
         serde_json::json!({ "id": "main", "version_id": version_id }).to_string()
-    }
-
-    fn run_async_with_large_stack<F, Fut>(name: &str, test_fn: F)
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + 'static,
-    {
-        std::thread::Builder::new()
-            .name(name.to_string())
-            .stack_size(32 * 1024 * 1024)
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to build tokio runtime");
-                runtime.block_on(test_fn());
-            })
-            .expect("failed to spawn async test thread")
-            .join()
-            .expect("async test thread panicked");
     }
 
     #[async_trait(?Send)]
@@ -641,6 +647,46 @@ mod tests {
         async fn rollback(self: Box<Self>) -> Result<(), LixError> {
             self.rollback_called.store(true, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LixBackend for PlainReadBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            self.executed_sql
+                .lock()
+                .expect("executed_sql lock")
+                .push(sql.to_string());
+            if sql.contains("lix_deterministic_mode")
+                || sql.contains("lix_internal_state_untracked")
+                || sql.contains("lix_internal_stored_schema_bootstrap")
+            {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("plain backend read should not execute preparation SQL: {sql}"),
+                ));
+            }
+            if sql.trim() == "SELECT 1 + 1" {
+                return Ok(QueryResult {
+                    rows: vec![vec![Value::Integer(2)]],
+                    columns: vec!["?column?".to_string()],
+                });
+            }
+            Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("unexpected SQL in PlainReadBackend: {sql}"),
+            ))
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "plain backend read should not begin a transaction",
+            ))
         }
     }
 
@@ -737,34 +783,47 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn unknown_read_query_returns_unknown_table_error() {
-        run_async_with_large_stack(
-            "engine::tests::unknown_read_query_returns_unknown_table_error",
-            || async {
-                let commit_called = Arc::new(AtomicBool::new(false));
-                let rollback_called = Arc::new(AtomicBool::new(false));
-                let engine = boot(BootArgs::new(
-                    Box::new(TestBackend {
-                        commit_called,
-                        rollback_called,
-                        active_version_snapshot: Arc::new(RwLock::new(
-                            active_version_snapshot_json("global"),
-                        )),
-                        restored_active_version_snapshot: active_version_snapshot_json("global"),
-                    }),
-                    Arc::new(NoopWasmRuntime),
-                ));
-                engine.set_active_version_id("version-test".to_string());
+    #[tokio::test]
+    async fn unknown_read_query_returns_unknown_table_error() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                commit_called,
+                rollback_called,
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
+        engine.set_active_version_id("version-test".to_string());
 
-                let error = engine
-                    .execute("SELECT * FROM unknown_table", &[])
-                    .await
-                    .expect_err("unknown relation query should fail");
+        let error = engine
+            .execute("SELECT * FROM unknown_table", &[])
+            .await
+            .expect_err("unknown relation query should fail");
 
-                assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
-            },
-        );
+        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
+    }
+
+    #[tokio::test]
+    async fn plain_backend_read_bypasses_public_preparation() {
+        let backend = PlainReadBackend::default();
+        let executed_sql = Arc::clone(&backend.executed_sql);
+        let engine = boot(BootArgs::new(Box::new(backend), Arc::new(NoopWasmRuntime)));
+        engine.set_active_version_id("version-test".to_string());
+
+        let result = engine
+            .execute("SELECT 1 + 1", &[])
+            .await
+            .expect("plain backend read should succeed");
+
+        assert_eq!(result.statements[0].rows, vec![vec![Value::Integer(2)]]);
+        let executed = executed_sql.lock().expect("executed_sql lock");
+        assert_eq!(executed.len(), 1);
+        assert_eq!(executed[0], "SELECT 1 + 1");
     }
 
     #[test]
