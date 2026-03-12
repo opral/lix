@@ -1091,6 +1091,90 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_update_partitions_tracked_and_untracked_targets,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        engine
+            .execute(
+                "UPDATE lix_active_version SET version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        insert_state_row(
+            &engine,
+            "mixed-tracked",
+            "version-a",
+            "{\"value\":\"tracked-before\"}",
+            false,
+        )
+        .await;
+        insert_state_row(
+            &engine,
+            "mixed-untracked",
+            "version-a",
+            "{\"value\":\"untracked-before\"}",
+            true,
+        )
+        .await;
+
+        let selector_rows = engine
+            .execute(
+                "SELECT entity_id, file_id, plugin_key, schema_version, global, untracked \
+                 FROM lix_state \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND file_id = 'test-file' \
+                 ORDER BY entity_id ASC",
+                &[],
+            )
+            .await
+            .expect("mixed selector rows should be queryable before update");
+
+        sim.assert_deterministic_normalized(selector_rows.statements[0].rows.clone());
+        assert_eq!(selector_rows.statements[0].rows.len(), 2);
+
+        engine
+            .execute(
+                "UPDATE lix_state \
+                 SET snapshot_content = '{\"value\":\"after\"}' \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND file_id = 'test-file'",
+                &[],
+            )
+            .await
+            .expect("mixed tracked/untracked update should succeed");
+
+        let rows = engine
+            .execute(
+                "SELECT entity_id, snapshot_content, untracked \
+                 FROM lix_state \
+                 WHERE entity_id IN ('mixed-tracked', 'mixed-untracked') \
+                 ORDER BY entity_id ASC",
+                &[],
+            )
+            .await
+            .expect("updated mixed rows should be queryable");
+
+        sim.assert_deterministic_normalized(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_text(&rows.statements[0].rows[0][0], "mixed-tracked");
+        assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"after\"}");
+        assert_boolean_like(&rows.statements[0].rows[0][2], false);
+        assert_text(&rows.statements[0].rows[1][0], "mixed-untracked");
+        assert_text(&rows.statements[0].rows[1][1], "{\"value\":\"after\"}");
+        assert_boolean_like(&rows.statements[0].rows[1][2], true);
+    }
+);
+
+simulation_test!(
     lix_state_update_rejects_explicit_version_id_assignment,
     |sim| async move {
         let engine = sim

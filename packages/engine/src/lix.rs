@@ -3,9 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::{
-    observe_owned, BootKeyValue, CreateCheckpointResult, CreateVersionOptions, CreateVersionResult,
-    Engine, EngineConfig, ExecuteOptions, ExecuteResult, LixBackend, LixError, ObserveEventsOwned,
-    ObserveQuery, SnapshotChunkWriter, Value, WasmRuntime,
+    boot::EngineConfig, observe::observe_owned, BootKeyValue, CreateCheckpointResult,
+    CreateVersionOptions, CreateVersionResult, Engine, ExecuteOptions, ExecuteResult, LixBackend,
+    LixError, ObserveEventsOwned, ObserveQuery, SnapshotChunkWriter, Value, WasmRuntime,
 };
 
 pub struct LixConfig {
@@ -48,6 +48,9 @@ pub struct Lix {
 }
 
 impl Lix {
+    // `Lix` is intentionally just a thin SDK-facing wrapper over `Engine`.
+    // New behavior, APIs, and engine-level tests should be added to `Engine` first,
+    // with `Lix` only forwarding or adapting ownership for SDK consumers.
     pub async fn open(config: LixConfig) -> Result<Self, LixError> {
         let engine = Engine::open(config.into_engine_config()).await?;
         Ok(Self {
@@ -56,15 +59,12 @@ impl Lix {
     }
 
     pub async fn init(config: LixConfig) -> Result<InitResult, LixError> {
-        let result = Engine::open_or_init(config.into_engine_config()).await?;
-        Ok(InitResult {
-            initialized: result.initialized,
-        })
+        let initialized = Engine::open_or_init(config.into_engine_config()).await?;
+        Ok(InitResult { initialized })
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
-        self.execute_with_options(sql, params, ExecuteOptions::default())
-            .await
+        self.engine.execute(sql, params).await
     }
 
     pub async fn execute_with_options(

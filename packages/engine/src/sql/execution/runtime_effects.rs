@@ -271,9 +271,11 @@ impl Engine {
             build_filesystem_payload_domain_changes_insert(&deduped_changes, untracked);
         let mut transaction = self.backend.begin_transaction().await?;
         let mut active_version_id = self.require_active_version_id()?;
+        let mut public_surface_registry = self.public_surface_registry();
+        let mut public_surface_registry_dirty = false;
         let previous_active_version_id = active_version_id.clone();
         let mut pending_state_commit_stream_changes = Vec::new();
-        let mut pending_sql2_append_session = None;
+        let mut pending_public_append_session = None;
         let result = self
             .execute_with_options_in_transaction(
                 transaction.as_mut(),
@@ -281,11 +283,13 @@ impl Engine {
                 &params,
                 &ExecuteOptions::default(),
                 true,
+                &mut public_surface_registry,
+                &mut public_surface_registry_dirty,
                 &mut active_version_id,
                 None,
                 true,
                 &mut pending_state_commit_stream_changes,
-                &mut pending_sql2_append_session,
+                &mut pending_public_append_session,
             )
             .await;
         match result {
@@ -332,13 +336,14 @@ impl Engine {
                 &active_version_id,
                 None,
                 true,
+                None,
                 shared_path::PreparationPolicy {
                     skip_side_effect_collection: true,
                 },
             )
             .await?
         };
-        match shared_path::maybe_execute_sql2_write_with_transaction(
+        match shared_path::maybe_execute_public_write_with_transaction(
             self,
             transaction,
             &prepared,

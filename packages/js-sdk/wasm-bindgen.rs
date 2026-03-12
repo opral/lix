@@ -3,6 +3,7 @@ mod wasm {
     use async_trait::async_trait;
     use futures_util::future::{AbortHandle, Abortable};
     use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
+    use lix_engine::wire::{WireQueryResult, WireValue};
     use lix_engine::{
         BootKeyValue, CreateCheckpointResult, CreateVersionOptions, CreateVersionResult,
         ExecuteOptions, ExecuteResult as EngineExecuteResult, InitResult as EngineInitResult,
@@ -10,7 +11,6 @@ mod wasm {
         ObserveEvent as EngineObserveEvent, ObserveEventsOwned as EngineObserveEvents,
         ObserveQuery as EngineObserveQuery, QueryResult as EngineQueryResult, SnapshotChunkWriter,
         SqlDialect, Value as EngineValue, WasmComponentInstance, WasmLimits, WasmRuntime,
-        WireQueryResult, WireValue,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;

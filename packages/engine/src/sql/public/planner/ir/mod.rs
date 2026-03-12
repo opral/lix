@@ -1,8 +1,12 @@
 use crate::sql::public::catalog::{
     DefaultScopeSemantics, SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceVariant,
 };
-use crate::sql::public::core::contracts::ExecutionContext;
+use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
 use crate::Value;
+use sqlparser::ast::{
+    Expr, Join, LimitClause, OrderBy, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
+    TableFactor, TableWithJoins, With,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +254,117 @@ pub(crate) struct ReadCommand {
     pub(crate) requested_commit_mapping: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NormalizedPublicReadQuery {
+    pub(crate) source_alias: Option<TableAlias>,
+    pub(crate) projection: Vec<SelectItem>,
+    pub(crate) selection: Option<Expr>,
+    pub(crate) selection_predicates: Vec<Expr>,
+    pub(crate) order_by: Option<OrderBy>,
+    pub(crate) limit_clause: Option<LimitClause>,
+}
+
+impl NormalizedPublicReadQuery {
+    pub(crate) fn uses_wildcard_projection(&self) -> bool {
+        self.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+            )
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StructuredPublicRead {
+    pub(crate) bound_statement: BoundStatement,
+    pub(crate) surface_binding: SurfaceBinding,
+    pub(crate) read_command: ReadCommand,
+    pub(crate) query: NormalizedPublicReadQuery,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BroadPublicReadStatement {
+    Query(BroadPublicReadQuery),
+    Explain {
+        original: Statement,
+        statement: Box<BroadPublicReadStatement>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BroadPublicReadQuery {
+    pub(crate) original: Query,
+    pub(crate) with: Option<BroadPublicReadWith>,
+    pub(crate) body: BroadPublicReadSetExpr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BroadPublicReadWith {
+    pub(crate) original: With,
+    pub(crate) cte_tables: Vec<BroadPublicReadQuery>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BroadPublicReadSetExpr {
+    Select(BroadPublicReadSelect),
+    Query(Box<BroadPublicReadQuery>),
+    SetOperation {
+        original: SetExpr,
+        left: Box<BroadPublicReadSetExpr>,
+        right: Box<BroadPublicReadSetExpr>,
+    },
+    Table {
+        original: SetExpr,
+        relation: BroadPublicReadRelation,
+    },
+    Other(SetExpr),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BroadPublicReadSelect {
+    pub(crate) original: Select,
+    pub(crate) from: Vec<BroadPublicReadTableWithJoins>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BroadPublicReadTableWithJoins {
+    pub(crate) original: TableWithJoins,
+    pub(crate) relation: BroadPublicReadTableFactor,
+    pub(crate) joins: Vec<BroadPublicReadJoin>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BroadPublicReadJoin {
+    pub(crate) original: Join,
+    pub(crate) relation: BroadPublicReadTableFactor,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BroadPublicReadTableFactor {
+    Table {
+        original: TableFactor,
+        relation: BroadPublicReadRelation,
+    },
+    Derived {
+        original: TableFactor,
+        subquery: Box<BroadPublicReadQuery>,
+    },
+    NestedJoin {
+        original: TableFactor,
+        table_with_joins: Box<BroadPublicReadTableWithJoins>,
+    },
+    Other(TableFactor),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BroadPublicReadRelation {
+    Public(SurfaceBinding),
+    Internal(String),
+    External(String),
+    Cte(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteOperationKind {
     Insert,
@@ -291,7 +406,7 @@ pub(crate) struct InsertOnConflict {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct WriteSelector {
-    pub(crate) residual_predicates: Vec<String>,
+    pub(crate) residual_predicates: Vec<Expr>,
     pub(crate) exact_filters: BTreeMap<String, Value>,
     pub(crate) exact_only: bool,
 }
@@ -385,13 +500,18 @@ pub(crate) struct RowLineage {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ResolvedWritePlan {
+pub(crate) struct ResolvedWritePartition {
     pub(crate) execution_mode: WriteMode,
     pub(crate) authoritative_pre_state: Vec<ResolvedRowRef>,
     pub(crate) intended_post_state: Vec<PlannedStateRow>,
     pub(crate) tombstones: Vec<ResolvedRowRef>,
     pub(crate) lineage: Vec<RowLineage>,
     pub(crate) target_write_lane: Option<WriteLane>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResolvedWritePlan {
+    pub(crate) partitions: Vec<ResolvedWritePartition>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -402,26 +522,85 @@ pub(crate) struct PlannedWrite {
     pub(crate) target_set_proof: Option<TargetSetProof>,
     pub(crate) state_source: StateSourceKind,
     pub(crate) resolved_write_plan: Option<ResolvedWritePlan>,
-    pub(crate) commit_preconditions: Option<CommitPreconditions>,
+    pub(crate) commit_preconditions: Vec<CommitPreconditions>,
     pub(crate) residual_execution_predicates: Vec<String>,
     pub(crate) backend_rejections: Vec<String>,
 }
 
 impl PlannedWrite {
     pub(crate) fn requires_single_write_lane(&self) -> bool {
-        self.resolved_write_plan
-            .as_ref()
-            .map(|plan| plan.execution_mode == WriteMode::Tracked)
-            .unwrap_or_else(|| {
-                !matches!(
-                    self.command.requested_mode,
-                    WriteModeRequest::ForceUntracked
-                )
-            })
+        if let Some(plan) = self.resolved_write_plan.as_ref() {
+            plan.partitions
+                .iter()
+                .any(|partition| partition.execution_mode == WriteMode::Tracked)
+        } else {
+            !matches!(
+                self.command.requested_mode,
+                WriteModeRequest::ForceUntracked
+            )
+        }
     }
 
     pub(crate) fn target_is_writable(&self) -> bool {
         self.command.target.capability == SurfaceCapability::ReadWrite
+    }
+}
+
+impl ResolvedWritePlan {
+    pub(crate) fn from_partition(partition: ResolvedWritePartition) -> Self {
+        Self {
+            partitions: vec![partition],
+        }
+    }
+
+    pub(crate) fn from_partitions(partitions: Vec<ResolvedWritePartition>) -> Self {
+        Self { partitions }
+    }
+
+    pub(crate) fn authoritative_pre_state(&self) -> impl Iterator<Item = &ResolvedRowRef> {
+        self.partitions
+            .iter()
+            .flat_map(|partition| partition.authoritative_pre_state.iter())
+    }
+
+    pub(crate) fn intended_post_state(&self) -> impl Iterator<Item = &PlannedStateRow> {
+        self.partitions
+            .iter()
+            .flat_map(|partition| partition.intended_post_state.iter())
+    }
+
+    pub(crate) fn tombstones(&self) -> impl Iterator<Item = &ResolvedRowRef> {
+        self.partitions
+            .iter()
+            .flat_map(|partition| partition.tombstones.iter())
+    }
+
+    pub(crate) fn lineage(&self) -> impl Iterator<Item = &RowLineage> {
+        self.partitions
+            .iter()
+            .flat_map(|partition| partition.lineage.iter())
+    }
+
+    pub(crate) fn tracked_partitions(&self) -> impl Iterator<Item = &ResolvedWritePartition> {
+        self.partitions
+            .iter()
+            .filter(|partition| partition.execution_mode == WriteMode::Tracked)
+    }
+
+    pub(crate) fn untracked_partitions(&self) -> impl Iterator<Item = &ResolvedWritePartition> {
+        self.partitions
+            .iter()
+            .filter(|partition| partition.execution_mode == WriteMode::Untracked)
+    }
+
+    pub(crate) fn single_partition(&self) -> Option<&ResolvedWritePartition> {
+        (self.partitions.len() == 1).then(|| &self.partitions[0])
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.partitions
+            .iter()
+            .all(|partition| partition.intended_post_state.is_empty())
     }
 }
 

@@ -367,6 +367,55 @@ simulation_test!(lix_version_update_supports_placeholders, |sim| async move {
     assert_text(&row[2], "commit-ph2");
 });
 
+simulation_test!(
+    lix_version_update_supports_or_selector,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_version (id, name, hidden, commit_id) VALUES \
+                 ('version-or-a', 'Version OR A', false, 'commit-or-a'), \
+                 ('version-or-b', 'Version OR B', false, 'commit-or-b')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "UPDATE lix_version \
+                 SET hidden = true \
+                 WHERE id = 'version-or-a' OR id = 'version-or-b'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let result = engine
+            .execute(
+                "SELECT id, hidden \
+                 FROM lix_version \
+                 WHERE id IN ('version-or-a', 'version-or-b') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.statements[0].rows.len(), 2);
+        assert_text(&result.statements[0].rows[0][0], "version-or-a");
+        assert_bool(&result.statements[0].rows[0][1], true);
+        assert_text(&result.statements[0].rows[1][0], "version-or-b");
+        assert_bool(&result.statements[0].rows[1][1], true);
+    }
+);
+
 simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)
@@ -455,6 +504,49 @@ simulation_test!(lix_version_delete_supports_placeholders, |sim| async move {
 
     assert_eq!(result.statements[0].rows.len(), 0);
 });
+
+simulation_test!(
+    lix_version_delete_supports_or_selector,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_version (id, name, hidden, commit_id) VALUES \
+                 ('version-del-a', 'Version Del A', false, 'commit-del-a'), \
+                 ('version-del-b', 'Version Del B', false, 'commit-del-b')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "DELETE FROM lix_version \
+                 WHERE id = 'version-del-a' OR id = 'version-del-b'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let result = engine
+            .execute(
+                "SELECT id \
+                 FROM lix_version \
+                 WHERE id IN ('version-del-a', 'version-del-b')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.statements[0].rows.len(), 0);
+    }
+);
 
 simulation_test!(
     lix_version_direct_mutation_does_not_duplicate_entries,

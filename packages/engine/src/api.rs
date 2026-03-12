@@ -3,16 +3,25 @@ use crate::engine::{
     ExecuteOptions,
 };
 use crate::errors;
+use crate::sql::ast::utils::bind_sql;
+use crate::sql::ast::walk::object_name_matches;
+use crate::sql::common::ast::lower_statement;
 use crate::sql::execution::execute;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path;
+use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
+use crate::sql::execution::transaction_session::execute_public_sql;
+use crate::sql::public::runtime::classify_public_execution_route_with_registry;
+use crate::state::internal::inline_functions::inline_lix_functions_with_provider;
 use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
+use crate::state::internal::statement_references_internal_state_vtable;
 use crate::state::materialization::{
     MaterializationApplyReport, MaterializationPlan, MaterializationReport, MaterializationRequest,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{ExecuteResult, LixError, LixTransaction, QueryResult, Value};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Expr, Function, Statement, Visit, Visitor};
+use std::ops::ControlFlow;
 
 impl Engine {
     #[doc(hidden)]
@@ -21,6 +30,7 @@ impl Engine {
             return Err(errors::not_initialized_error());
         }
         self.load_and_cache_active_version().await?;
+        self.refresh_public_surface_registry().await?;
         Ok(())
     }
 
@@ -98,7 +108,16 @@ impl Engine {
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
-        self.execute_impl_sql(sql, params, options, false).await
+        let mut state = self.public_sql_state.lock().await;
+        execute_public_sql(
+            self,
+            &mut state,
+            &self.public_sql_transaction_open,
+            sql,
+            params,
+            options,
+        )
+        .await
     }
 
     pub(crate) async fn execute_internal(
@@ -156,6 +175,12 @@ impl Engine {
             self.require_active_version_id()?
         };
         let writer_key = options.writer_key.as_deref();
+        if should_use_plain_backend_read_route(&self.public_surface_registry(), &parsed_statements)?
+        {
+            return self
+                .execute_plain_backend_read(sql, params, &parsed_statements)
+                .await;
+        }
         let prepared = shared_path::prepare_execution_with_backend(
             self,
             self.backend.as_ref(),
@@ -164,14 +189,17 @@ impl Engine {
             &active_version_id,
             writer_key,
             allow_internal_sql,
+            None,
             shared_path::PreparationPolicy {
                 skip_side_effect_collection: false,
             },
         )
         .await?;
+        let public_surface_registry_dirty =
+            prepared_execution_mutates_public_surface_registry(&prepared)?;
 
         let execution =
-            match shared_path::maybe_execute_sql2_write_with_backend(self, &prepared, writer_key)
+            match shared_path::maybe_execute_public_write_with_backend(self, &prepared, writer_key)
                 .await
             {
                 Ok(Some(execution)) => execution,
@@ -236,7 +264,7 @@ impl Engine {
                 &filesystem_payload_domain_changes,
             );
         let payload_domain_changes_to_persist =
-            if shared_path::sql2_filesystem_payload_changes_already_committed(&prepared) {
+            if shared_path::public_write_filesystem_payload_changes_already_committed(&prepared) {
                 Vec::new()
             } else if execution.plugin_changes_committed {
                 crate::engine::dedupe_filesystem_payload_domain_changes(
@@ -250,7 +278,7 @@ impl Engine {
             &filesystem_payload_domain_changes,
         );
 
-        if !shared_path::sql2_filesystem_payload_changes_already_committed(&prepared) {
+        if !shared_path::public_write_filesystem_payload_changes_already_committed(&prepared) {
             self.persist_pending_file_data_updates(&prepared.intent.pending_file_writes)
                 .await?;
         }
@@ -278,6 +306,9 @@ impl Engine {
             self.append_observe_tick(options.writer_key.as_deref())
                 .await?;
         }
+        if public_surface_registry_dirty {
+            self.refresh_public_surface_registry().await?;
+        }
         self.emit_state_commit_stream_changes(state_commit_stream_changes);
 
         Ok(ExecuteResult {
@@ -285,7 +316,53 @@ impl Engine {
         })
     }
 
+    async fn execute_plain_backend_read(
+        &self,
+        _sql: &str,
+        params: &[Value],
+        parsed_statements: &[Statement],
+    ) -> Result<ExecuteResult, LixError> {
+        let uses_runtime_functions =
+            plain_backend_read_uses_runtime_functions(&parsed_statements[0]);
+        let (statement, settings, sequence_start, functions) = if uses_runtime_functions {
+            let (settings, sequence_start, functions) = self
+                .prepare_runtime_functions_with_backend(self.backend.as_ref())
+                .await?;
+            let mut provider = functions.clone();
+            (
+                inline_lix_functions_with_provider(parsed_statements[0].clone(), &mut provider),
+                Some(settings),
+                Some(sequence_start),
+                Some(functions),
+            )
+        } else {
+            (parsed_statements[0].clone(), None, None, None)
+        };
+        let lowered = lower_statement(statement, self.backend.dialect())?;
+        let bound = bind_sql(&lowered.to_string(), params, self.backend.dialect())?;
+        match self.backend.execute(&bound.sql, &bound.params).await {
+            Ok(result) => {
+                if let (Some(settings), Some(sequence_start), Some(functions)) =
+                    (settings, sequence_start, functions.as_ref())
+                {
+                    execute::persist_runtime_sequence(self, settings, sequence_start, functions)
+                        .await?;
+                }
+                Ok(ExecuteResult {
+                    statements: vec![result],
+                })
+            }
+            Err(error) => Err(normalize_sql_execution_error_with_backend(
+                self.backend.as_ref(),
+                error,
+                parsed_statements,
+            )
+            .await),
+        }
+    }
+
     pub async fn create_checkpoint(&self) -> Result<crate::CreateCheckpointResult, LixError> {
+        self.ensure_no_open_public_sql_transaction("create_checkpoint")?;
         crate::state::checkpoint::create_checkpoint(self).await
     }
 
@@ -293,10 +370,12 @@ impl Engine {
         &self,
         options: crate::CreateVersionOptions,
     ) -> Result<crate::CreateVersionResult, LixError> {
+        self.ensure_no_open_public_sql_transaction("create_version")?;
         crate::version::create_version(self, options).await
     }
 
     pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
+        self.ensure_no_open_public_sql_transaction("switch_version")?;
         crate::version::switch_version(self, version_id).await
     }
 
@@ -305,6 +384,7 @@ impl Engine {
         &self,
         writer: &mut dyn crate::SnapshotChunkWriter,
     ) -> Result<(), LixError> {
+        self.ensure_no_open_public_sql_transaction("export_snapshot")?;
         self.backend.export_snapshot(writer).await
     }
 
@@ -314,6 +394,7 @@ impl Engine {
     ) -> Result<(), LixError> {
         self.backend.restore_from_snapshot(reader).await?;
         self.load_and_cache_active_version().await?;
+        self.refresh_public_surface_registry().await?;
         self.invalidate_installed_plugins_cache()?;
         Ok(())
     }
@@ -362,4 +443,53 @@ fn contains_transaction_control_statement(statements: &[Statement]) -> bool {
                 | Statement::Rollback { .. }
         )
     })
+}
+
+fn should_use_plain_backend_read_route(
+    registry: &crate::sql::public::catalog::SurfaceRegistry,
+    parsed_statements: &[Statement],
+) -> Result<bool, LixError> {
+    if parsed_statements.len() != 1 {
+        return Ok(false);
+    }
+    if !matches!(
+        parsed_statements[0],
+        Statement::Query(_) | Statement::Explain { .. }
+    ) {
+        return Ok(false);
+    }
+    if statement_references_internal_state_vtable(&parsed_statements[0]) {
+        return Ok(false);
+    }
+
+    Ok(classify_public_execution_route_with_registry(registry, parsed_statements).is_none())
+}
+
+fn plain_backend_read_uses_runtime_functions(statement: &Statement) -> bool {
+    struct Collector {
+        matched: bool,
+    }
+
+    impl Visitor for Collector {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            match expr {
+                Expr::Function(function) if is_runtime_function(function) => {
+                    self.matched = true;
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+
+    let mut collector = Collector { matched: false };
+    let _ = statement.visit(&mut collector);
+    collector.matched
+}
+
+fn is_runtime_function(function: &Function) -> bool {
+    object_name_matches(&function.name, "lix_uuid_v7")
+        || object_name_matches(&function.name, "lix_timestamp")
 }

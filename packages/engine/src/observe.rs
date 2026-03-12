@@ -5,7 +5,8 @@ use crate::sql::execution::dependency_spec::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
 };
 use crate::state::stream::StateCommitStream;
-use crate::{LixError, QueryResult, Value, WireValue};
+use crate::wire::WireValue;
+use crate::{LixError, QueryResult, Value};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::Statement;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -554,6 +555,7 @@ async fn execute_observe_query(
 
 impl Engine {
     pub fn observe(&self, query: ObserveQuery) -> Result<ObserveEvents<'_>, LixError> {
+        self.ensure_no_open_public_sql_transaction("observe")?;
         let state = build_observe_state(self, query)?;
         Ok(ObserveEvents {
             engine: self,
@@ -562,10 +564,11 @@ impl Engine {
     }
 }
 
-pub fn observe_owned(
+pub(crate) fn observe_owned(
     engine: Arc<Engine>,
     query: ObserveQuery,
 ) -> Result<ObserveEventsOwned, LixError> {
+    engine.ensure_no_open_public_sql_transaction("observe")?;
     let state = build_observe_state(engine.as_ref(), query)?;
     Ok(ObserveEventsOwned { engine, state })
 }

@@ -27,7 +27,7 @@ macro_rules! simulation_test {
                     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
                     let thread = std::thread::Builder::new()
                         .name(format!("{}_{}", stringify!($name), simulation_name))
-                        .stack_size(8 * 1024 * 1024)
+                        .stack_size(32 * 1024 * 1024)
                         .spawn(move || {
                             let run_result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
