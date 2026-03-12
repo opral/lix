@@ -48,6 +48,9 @@ pub struct Lix {
 }
 
 impl Lix {
+    // `Lix` is intentionally just a thin SDK-facing wrapper over `Engine`.
+    // New behavior, APIs, and engine-level tests should be added to `Engine` first,
+    // with `Lix` only forwarding or adapting ownership for SDK consumers.
     pub async fn open(config: LixConfig) -> Result<Self, LixError> {
         let engine = Engine::open(config.into_engine_config()).await?;
         Ok(Self {
@@ -61,8 +64,7 @@ impl Lix {
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
-        self.execute_with_options(sql, params, ExecuteOptions::default())
-            .await
+        self.engine.execute(sql, params).await
     }
 
     pub async fn execute_with_options(

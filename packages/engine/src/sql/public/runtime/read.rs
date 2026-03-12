@@ -1,4 +1,58 @@
 use super::*;
+use crate::SqlDialect;
+use sqlparser::ast::{Expr, Value as SqlValue, VisitMut, VisitorMut};
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::ops::ControlFlow;
+
+pub(super) async fn execute_selector_read_strict(
+    backend: &dyn LixBackend,
+    surface_binding: &SurfaceBinding,
+    selector_column: &str,
+    residual_predicates: &[Expr],
+    schema_key_hint: Option<&str>,
+    params: &[Value],
+) -> Result<QueryResult, LixError> {
+    let (compiled_predicates, selector_params) = compile_selector_predicates(
+        residual_predicates,
+        params,
+        backend.dialect(),
+    )?;
+    let schema_set = selector_schema_set(surface_binding, schema_key_hint)?;
+    let (effective_state_request, effective_state_plan) =
+        build_effective_state_for_selector_read(
+            surface_binding,
+            selector_column,
+            &compiled_predicates,
+            schema_set,
+        )
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "selector read does not support surface '{}'",
+                    surface_binding.descriptor.public_name
+                ),
+            )
+        })?;
+    let lowered = lower_selector_read_for_execution(
+        surface_binding,
+        selector_column,
+        &compiled_predicates,
+        &effective_state_request,
+        &effective_state_plan,
+    )?
+    .ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "selector read could not lower structured selector query",
+        )
+    })?;
+    for schema_key in &effective_state_request.schema_set {
+        crate::schema::registry::register_schema(backend, schema_key).await?;
+    }
+    execute_lowered_selector_read(backend, lowered, &selector_params).await
+}
 
 pub(super) async fn lower_public_read_query_with_sql2_backend(
     backend: &dyn LixBackend,
@@ -347,4 +401,130 @@ pub(super) async fn prepare_sql2_read_strict(
         writer_key,
     )
     .await
+}
+
+async fn execute_lowered_selector_read(
+    backend: &dyn LixBackend,
+    lowered: LoweredReadProgram,
+    params: &[Value],
+) -> Result<QueryResult, LixError> {
+    let mut query_result = QueryResult {
+        rows: Vec::new(),
+        columns: Vec::new(),
+    };
+    for mut statement in lowered.statements {
+        statement = lower_statement(statement, backend.dialect())?;
+        query_result = backend.execute(&statement.to_string(), params).await?;
+    }
+
+    Ok(query_result)
+}
+
+fn compile_selector_predicates(
+    residual_predicates: &[Expr],
+    params: &[Value],
+    dialect: SqlDialect,
+) -> Result<(Vec<Expr>, Vec<Value>), LixError> {
+    let mut source_to_dense = HashMap::new();
+    let mut used_source_indices = Vec::new();
+    let mut state = crate::sql::common::placeholders::PlaceholderState::new();
+    let mut compiled = Vec::with_capacity(residual_predicates.len());
+
+    for predicate in residual_predicates {
+        let mut predicate = predicate.clone();
+        let mut projector = SelectorPlaceholderProjector {
+            params_len: params.len(),
+            dialect,
+            state: &mut state,
+            source_to_dense: &mut source_to_dense,
+            used_source_indices: &mut used_source_indices,
+        };
+        if let ControlFlow::Break(error) = (&mut predicate).visit(&mut projector) {
+            return Err(error);
+        }
+        compiled.push(predicate);
+    }
+
+    let selector_params = used_source_indices
+        .into_iter()
+        .map(|source_index| params[source_index].clone())
+        .collect();
+    Ok((compiled, selector_params))
+}
+
+struct SelectorPlaceholderProjector<'a> {
+    params_len: usize,
+    dialect: SqlDialect,
+    state: &'a mut crate::sql::common::placeholders::PlaceholderState,
+    source_to_dense: &'a mut HashMap<usize, usize>,
+    used_source_indices: &'a mut Vec<usize>,
+}
+
+impl VisitorMut for SelectorPlaceholderProjector<'_> {
+    type Break = LixError;
+
+    fn pre_visit_value(&mut self, value: &mut SqlValue) -> ControlFlow<Self::Break> {
+        let SqlValue::Placeholder(token) = value else {
+            return ControlFlow::Continue(());
+        };
+        let source_index = match crate::sql::common::placeholders::resolve_placeholder_index(
+            token,
+            self.params_len,
+            self.state,
+        ) {
+            Ok(index) => index,
+            Err(error) => return ControlFlow::Break(error),
+        };
+        let dense_index = dense_index_for_source(
+            source_index,
+            self.source_to_dense,
+            self.used_source_indices,
+        );
+        *value = SqlValue::Placeholder(placeholder_for_dialect(self.dialect, dense_index + 1));
+        ControlFlow::Continue(())
+    }
+}
+
+fn dense_index_for_source(
+    source_index: usize,
+    source_to_dense: &mut HashMap<usize, usize>,
+    used_source_indices: &mut Vec<usize>,
+) -> usize {
+    if let Some(existing) = source_to_dense.get(&source_index) {
+        return *existing;
+    }
+    let dense_index = used_source_indices.len();
+    used_source_indices.push(source_index);
+    source_to_dense.insert(source_index, dense_index);
+    dense_index
+}
+
+fn placeholder_for_dialect(dialect: SqlDialect, dense_index_1_based: usize) -> String {
+    match dialect {
+        SqlDialect::Sqlite => format!("?{dense_index_1_based}"),
+        SqlDialect::Postgres => format!("${dense_index_1_based}"),
+    }
+}
+
+fn selector_schema_set(
+    surface_binding: &SurfaceBinding,
+    schema_key_hint: Option<&str>,
+) -> Result<BTreeSet<String>, LixError> {
+    let mut schema_set = BTreeSet::new();
+    if let Some(schema_key) = schema_key_hint {
+        schema_set.insert(schema_key.to_string());
+    }
+    if let Some(schema_key) = surface_binding.implicit_overrides.fixed_schema_key.clone() {
+        schema_set.insert(schema_key);
+    }
+    if schema_set.is_empty() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "selector read requires a concrete schema set for '{}'",
+                surface_binding.descriptor.public_name
+            ),
+        ));
+    }
+    Ok(schema_set)
 }

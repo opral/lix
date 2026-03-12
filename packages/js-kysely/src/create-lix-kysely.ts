@@ -14,6 +14,7 @@ import type { LixDatabaseSchema } from "./schema.js";
 type LixQueryResult = {
 	rows?: unknown;
 	columns?: unknown;
+	statements?: unknown;
 };
 
 export type LixExecuteOptions = {
@@ -28,27 +29,11 @@ type LixExecuteLike = {
 	): Promise<LixQueryResult>;
 };
 
-type LixSqlTransactionLike = {
-	execute(
-		sql: string,
-		params?: ReadonlyArray<unknown>,
-	): Promise<LixQueryResult>;
-	commit(): Promise<void>;
-	rollback(): Promise<void>;
-};
-
-type LixBeginTransactionLike = {
-	beginTransaction(options?: LixExecuteOptions): Promise<LixSqlTransactionLike>;
-};
-
 type LixDbLike = {
 	db: unknown;
 };
 
-type LixLike =
-	| LixExecuteLike
-	| LixDbLike
-	| (LixExecuteLike & LixBeginTransactionLike);
+type LixLike = LixExecuteLike | LixDbLike;
 export type CreateLixKyselyOptions = {
 	writerKey?: string | null;
 };
@@ -69,9 +54,11 @@ class LixConnection implements DatabaseConnection {
 	}
 
 	async executeQuery<R>(compiledQuery: CompiledQuery): Promise<QueryResult<R>> {
-		const raw = await this.#executeSql(
-			compiledQuery.sql,
-			compiledQuery.parameters,
+		const raw = normalizeLixQueryResult(
+			await this.#executeSql(
+				compiledQuery.sql,
+				compiledQuery.parameters,
+			),
 		);
 		const decodedRows = decodeRows(raw.rows);
 		const columnNames =
@@ -111,7 +98,7 @@ class LixConnection implements DatabaseConnection {
 	}
 
 	async readIntegerResult(sql: string): Promise<bigint | undefined> {
-		const raw = await this.#executeSql(sql, undefined);
+		const raw = normalizeLixQueryResult(await this.#executeSql(sql, undefined));
 		const rows = decodeRows(raw.rows);
 		if (!rows[0] || rows[0].length === 0) {
 			return undefined;
@@ -156,15 +143,14 @@ class LixConnection implements DatabaseConnection {
 }
 
 class LixDriver implements Driver {
-	readonly #lix: LixExecuteLike & LixBeginTransactionLike;
+	readonly #lix: LixExecuteLike;
 	readonly #connection: LixConnection;
 	readonly #options?: LixExecuteOptions;
-	#activeTransaction?: LixSqlTransactionLike;
+	#transactionSlotHeld = false;
+	#transactionActive = false;
+	#waiters: Array<() => void> = [];
 
-	constructor(
-		lix: LixExecuteLike & LixBeginTransactionLike,
-		options?: LixExecuteOptions,
-	) {
+	constructor(lix: LixExecuteLike, options?: LixExecuteOptions) {
 		this.#lix = lix;
 		this.#options = options;
 		this.#connection = new LixConnection((sql, params) =>
@@ -179,63 +165,67 @@ class LixDriver implements Driver {
 	}
 
 	async beginTransaction(): Promise<void> {
-		this.#activeTransaction = await this.#lix.beginTransaction(this.#options);
+		await this.#acquireTransactionSlot();
+		try {
+			await this.#executeSql("BEGIN", undefined);
+			this.#transactionActive = true;
+		} catch (error) {
+			this.#releaseTransactionSlot();
+			throw error;
+		}
 	}
 
 	async commitTransaction(): Promise<void> {
-		if (this.#activeTransaction) {
-			try {
-				await this.#activeTransaction.commit();
-			} finally {
-				this.#activeTransaction = undefined;
-			}
-			return;
+		if (!this.#transactionActive) {
+			throw new Error("commitTransaction called without active transaction");
 		}
-		throw new Error("commitTransaction called without active transaction");
+		try {
+			await this.#executeSql("COMMIT", undefined);
+		} finally {
+			this.#transactionActive = false;
+			this.#releaseTransactionSlot();
+		}
 	}
 
 	async rollbackTransaction(): Promise<void> {
-		if (this.#activeTransaction) {
-			try {
-				await this.#activeTransaction.rollback();
-			} finally {
-				this.#activeTransaction = undefined;
-			}
-			return;
+		if (!this.#transactionActive) {
+			throw new Error("rollbackTransaction called without active transaction");
 		}
-		throw new Error("rollbackTransaction called without active transaction");
+		try {
+			await this.#executeSql("ROLLBACK", undefined);
+		} finally {
+			this.#transactionActive = false;
+			this.#releaseTransactionSlot();
+		}
 	}
 
 	async savepoint(
 		_connection: DatabaseConnection,
-		savepointName: string,
+		_savepointName: string,
 		_compileQuery: QueryCompiler["compileQuery"],
 	): Promise<void> {
-		await this.#executeSql(
-			`SAVEPOINT ${quoteIdentifier(savepointName)}`,
-			undefined,
+		throw new Error(
+			"Nested transactions are not supported by createLixKysely() yet",
 		);
 	}
 
 	async rollbackToSavepoint(
 		_connection: DatabaseConnection,
-		savepointName: string,
+		_savepointName: string,
 		_compileQuery: QueryCompiler["compileQuery"],
 	): Promise<void> {
-		await this.#executeSql(
-			`ROLLBACK TO SAVEPOINT ${quoteIdentifier(savepointName)}`,
-			undefined,
+		throw new Error(
+			"Nested transactions are not supported by createLixKysely() yet",
 		);
 	}
 
 	async releaseSavepoint(
 		_connection: DatabaseConnection,
-		savepointName: string,
+		_savepointName: string,
 		_compileQuery: QueryCompiler["compileQuery"],
 	): Promise<void> {
-		await this.#executeSql(
-			`RELEASE SAVEPOINT ${quoteIdentifier(savepointName)}`,
-			undefined,
+		throw new Error(
+			"Nested transactions are not supported by createLixKysely() yet",
 		);
 	}
 
@@ -247,10 +237,32 @@ class LixDriver implements Driver {
 		sql: string,
 		params?: ReadonlyArray<unknown>,
 	): Promise<LixQueryResult> {
-		if (this.#activeTransaction) {
-			return this.#activeTransaction.execute(sql, params ?? []);
-		}
 		return this.#lix.execute(sql, params, this.#options);
+	}
+
+	async #acquireTransactionSlot(): Promise<void> {
+		while (this.#transactionSlotHeld) {
+			await new Promise<void>((resolve) => this.#waiters.push(resolve));
+		}
+		this.#transactionSlotHeld = true;
+	}
+
+	#releaseTransactionSlot(): void {
+		this.#transactionSlotHeld = false;
+		const waiter = this.#waiters.shift();
+		if (waiter) {
+			waiter();
+		}
+	}
+}
+
+class LixQueryCompiler extends SqliteQueryCompiler {
+	protected override getLeftIdentifierWrapper(): string {
+		return "";
+	}
+
+	protected override getRightIdentifierWrapper(): string {
+		return "";
 	}
 }
 
@@ -275,11 +287,6 @@ export function createLixKysely(
 			"createLixKysely requires either lix.execute(sql, params) or lix.db",
 		);
 	}
-	if (!isLixBeginTransactionLike(lix)) {
-		throw new TypeError(
-			"createLixKysely requires lix.beginTransaction(options); raw SQL transaction fallback is not supported",
-		);
-	}
 
 	const entry = cache.get(lix as object);
 	const cached = entry?.get(cacheKey);
@@ -291,7 +298,7 @@ export function createLixKysely(
 		createAdapter: () => new SqliteAdapter(),
 		createDriver: () => new LixDriver(lix, { writerKey }),
 		createIntrospector: (db: Kysely<any>) => new SqliteIntrospector(db),
-		createQueryCompiler: () => new SqliteQueryCompiler(),
+		createQueryCompiler: () => new LixQueryCompiler(),
 	};
 
 	const db = new Kysely<LixDatabaseSchema>({ dialect });
@@ -308,18 +315,6 @@ function isLixExecuteLike(value: unknown): value is LixExecuteLike {
 		return false;
 	}
 	return typeof (value as { execute?: unknown }).execute === "function";
-}
-
-function isLixBeginTransactionLike(
-	value: unknown,
-): value is LixExecuteLike & LixBeginTransactionLike {
-	if (!isLixExecuteLike(value)) {
-		return false;
-	}
-	return (
-		typeof (value as { beginTransaction?: unknown }).beginTransaction ===
-		"function"
-	);
 }
 
 function normalizeWriterKey(value: unknown): string | null | undefined {
@@ -366,6 +361,23 @@ function decodeRows(rawRows: unknown): unknown[][] {
 		}
 		return [...row];
 	});
+}
+
+function normalizeLixQueryResult(raw: LixQueryResult): {
+	rows?: unknown;
+	columns?: unknown;
+} {
+	if (Array.isArray(raw.statements)) {
+		const [statement] = raw.statements;
+		if (statement && typeof statement === "object") {
+			const candidate = statement as { rows?: unknown; columns?: unknown };
+			return {
+				rows: candidate.rows,
+				columns: candidate.columns,
+			};
+		}
+	}
+	return raw;
 }
 
 function decodeColumnNames(rawColumns: unknown): string[] | undefined {
@@ -507,8 +519,4 @@ function identifierName(node: unknown): string | undefined {
 	}
 	const name = (node as Record<string, unknown>).name;
 	return typeof name === "string" ? name : undefined;
-}
-
-function quoteIdentifier(value: string): string {
-	return `"${value.replaceAll('"', '""')}"`;
 }

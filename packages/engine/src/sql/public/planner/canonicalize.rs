@@ -774,7 +774,7 @@ fn write_selector(
     );
 
     Ok(WriteSelector {
-        residual_predicates: vec![expr.to_string()],
+        residual_predicates: vec![expr.clone()],
         exact_filters,
         exact_only,
     })

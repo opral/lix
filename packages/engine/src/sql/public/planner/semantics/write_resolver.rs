@@ -13,12 +13,9 @@ use crate::filesystem::path::{
 };
 use crate::schema::builtin::builtin_schema_definition;
 use crate::schema::defaults::apply_schema_defaults_with_system_functions;
-use crate::schema::registry::register_schema_sql_statements;
 use crate::schema::{SchemaProvider, SqlStoredSchemaProvider};
-use crate::sql::ast::utils::bind_sql;
 use crate::sql::common::ast::{lower_statement, parse_sql_statements};
-use crate::sql::public::catalog::{SurfaceFamily, SurfaceRegistry};
-use crate::sql::public::planner::backend::lowerer::rewrite_supported_public_read_surfaces_in_statement_with_registry;
+use crate::sql::public::catalog::SurfaceFamily;
 use crate::sql::public::planner::ir::{
     InsertOnConflictAction, MutationPayload, PlannedStateRow, PlannedWrite, ResolvedRowRef,
     ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, TargetSetProof, WriteLane, WriteMode,
@@ -28,9 +25,8 @@ use crate::sql::public::planner::semantics::effective_state_resolver::{
     resolve_exact_effective_state_row, ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
     OverlayLane,
 };
-use crate::sql::public::runtime::prepare_sql2_read_strict;
+use crate::sql::public::runtime::execute_selector_read_strict;
 use crate::sql::storage::sql_text::escape_sql_string;
-use crate::state::internal::rewrite_internal_state_query_read_with_backend;
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
     active_version_schema_version, active_version_snapshot_content,
@@ -43,7 +39,7 @@ use crate::version::{
 };
 use crate::{LixBackend, Value};
 use serde_json::{json, Map as JsonMap, Number as JsonNumber, Value as JsonValue};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{BinaryOperator, Expr};
 use std::collections::BTreeMap;
 
 const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
@@ -3464,6 +3460,7 @@ async fn resolve_target_entity_rows(
     let entity_ids = query_entity_ids_for_selector(
         backend,
         planned_write,
+        Some(&entity_schema.schema_key),
         "lixcol_entity_id",
         "sql2 entity selector resolver expected lixcol_entity_id text rows",
     )
@@ -3494,116 +3491,20 @@ async fn resolve_target_entity_rows(
 async fn query_entity_ids_for_selector(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    schema_key_hint: Option<&str>,
     selector_column: &str,
     error_message: &str,
 ) -> Result<Vec<String>, WriteResolveError> {
-    let predicate_sql = planned_write
-        .command
-        .selector
-        .residual_predicates
-        .join(" AND ");
-    let sql = if predicate_sql.is_empty() {
-        format!(
-            "SELECT {selector_column} FROM {}",
-            planned_write.command.target.descriptor.public_name,
-        )
-    } else {
-        format!(
-            "SELECT {selector_column} FROM {} WHERE {}",
-            planned_write.command.target.descriptor.public_name, predicate_sql
-        )
-    };
-    let bound_selector = bind_sql(
-        &sql,
-        &planned_write.command.bound_parameters,
-        backend.dialect(),
-    )
-    .map_err(write_resolve_backend_error)?;
-    let statements =
-        parse_sql_statements(&bound_selector.sql).map_err(|error| WriteResolveError {
-            message: error.description,
-        })?;
-    let active_version_id = planned_write
-        .command
-        .execution_context
-        .requested_version_id
-        .as_deref()
-        .unwrap_or(GLOBAL_VERSION_ID);
-    let prepared = prepare_sql2_read_strict(
+    let query_result = execute_selector_read_strict(
         backend,
-        &statements,
-        &bound_selector.params,
-        active_version_id,
-        planned_write
-            .command
-            .execution_context
-            .writer_key
-            .as_deref(),
+        &planned_write.command.target,
+        selector_column,
+        &planned_write.command.selector.residual_predicates,
+        schema_key_hint,
+        &planned_write.command.bound_parameters,
     )
     .await
-    .map_err(write_resolve_backend_error)?
-    .ok_or_else(|| WriteResolveError {
-        message: "sql2 entity selector resolver could not prepare selector read".to_string(),
-    })?;
-    let lowered = prepared.lowered_read.ok_or_else(|| WriteResolveError {
-        message: "sql2 entity selector resolver could not lower selector read".to_string(),
-    })?;
-    let mut lowered_statements = lowered.statements;
-    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
-        .await
-        .map_err(write_resolve_backend_error)?;
-    let mut schema_keys = prepared
-        .dependency_spec
-        .as_ref()
-        .map(|spec| spec.schema_keys.iter().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-    if let Some(schema_key) = prepared.canonicalized.as_ref().and_then(|canonicalized| {
-        canonicalized
-            .surface_binding
-            .implicit_overrides
-            .fixed_schema_key
-            .clone()
-    }) {
-        if !schema_keys.iter().any(|existing| existing == &schema_key) {
-            schema_keys.push(schema_key);
-        }
-    }
-    for schema_key in &schema_keys {
-        for statement in register_schema_sql_statements(schema_key, backend.dialect()) {
-            backend
-                .execute(&statement, &[])
-                .await
-                .map_err(write_resolve_backend_error)?;
-        }
-    }
-    for statement in &mut lowered_statements {
-        *statement = lower_statement(statement.clone(), backend.dialect())
-            .map_err(write_resolve_backend_error)?;
-        rewrite_supported_public_read_surfaces_in_statement_with_registry(statement, &registry)
-            .map_err(write_resolve_backend_error)?;
-        *statement = lower_statement(statement.clone(), backend.dialect())
-            .map_err(write_resolve_backend_error)?;
-        if let Statement::Query(query) = statement {
-            let rewritten =
-                rewrite_internal_state_query_read_with_backend(backend, (**query).clone(), &[])
-                    .await
-                    .map_err(write_resolve_backend_error)?;
-            *statement = Statement::Query(Box::new(rewritten));
-            *statement = lower_statement(statement.clone(), backend.dialect())
-                .map_err(write_resolve_backend_error)?;
-        }
-    }
-
-    let mut query_result = crate::QueryResult {
-        rows: Vec::new(),
-        columns: Vec::new(),
-    };
-    for statement in lowered_statements {
-        query_result = backend
-            .execute(&statement.to_string(), &bound_selector.params)
-            .await
-            .map_err(write_resolve_backend_error)?;
-    }
+    .map_err(write_resolve_backend_error)?;
 
     let mut entity_ids = Vec::new();
     for row in query_result.rows {
@@ -3619,6 +3520,18 @@ async fn query_entity_ids_for_selector(
     Ok(entity_ids)
 }
 
+fn expr_contains_boolean_or(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            *op == BinaryOperator::Or
+                || expr_contains_boolean_or(left)
+                || expr_contains_boolean_or(right)
+        }
+        Expr::Nested(inner) => expr_contains_boolean_or(inner),
+        _ => false,
+    }
+}
+
 async fn resolve_target_state_rows(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
@@ -3630,6 +3543,7 @@ async fn resolve_target_state_rows(
     let entity_ids = query_entity_ids_for_selector(
         backend,
         planned_write,
+        Some(&schema_key),
         "entity_id",
         "sql2 state selector resolver expected entity_id text rows",
     )
@@ -3675,7 +3589,7 @@ fn supports_selector_driven_state_resolution(planned_write: &PlannedWrite) -> bo
         .selector
         .residual_predicates
         .iter()
-        .all(|predicate| !predicate.to_ascii_uppercase().contains(" OR "))
+        .all(|predicate| !expr_contains_boolean_or(predicate))
 }
 
 fn merged_entity_update_values(
