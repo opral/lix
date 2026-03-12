@@ -73,8 +73,13 @@ pub(crate) async fn derive_commit_preconditions(
         let mut executor = backend;
         let current_tip =
             current_tip_for_write_lane(&mut executor, &write_lane, planned_write).await?;
-        let idempotency_key =
-            build_idempotency_key(planned_write, partition, partition_index, &write_lane, &current_tip)?;
+        let idempotency_key = build_idempotency_key(
+            planned_write,
+            partition,
+            partition_index,
+            &write_lane,
+            &current_tip,
+        )?;
         preconditions.push(CommitPreconditions {
             write_lane,
             expected_tip: ExpectedTip::CommitId(current_tip),
@@ -127,7 +132,8 @@ fn build_domain_change_batch_for_partition(
             },
             metadata: serialized_value(&row.values, "metadata"),
             version_id: row.version_id.clone().ok_or_else(|| DomainChangeError {
-                message: "public domain-change derivation requires a concrete version_id".to_string(),
+                message: "public domain-change derivation requires a concrete version_id"
+                    .to_string(),
             })?,
             writer_key,
         });
@@ -173,23 +179,24 @@ async fn current_tip_for_write_lane(
                     ),
                 })
         }
-        WriteLane::SingleVersion(version_id) => {
-            load_committed_version_tip_commit_id(executor, version_id)
-                .await
-                .map_err(domain_change_backend_error)?
-                .ok_or_else(|| DomainChangeError {
-                    message: format!(
-                        "public commit precondition derivation could not find a version tip for '{}'",
-                        version_id
-                    ),
-                })
-        }
+        WriteLane::SingleVersion(version_id) => load_committed_version_tip_commit_id(
+            executor, version_id,
+        )
+        .await
+        .map_err(domain_change_backend_error)?
+        .ok_or_else(|| DomainChangeError {
+            message: format!(
+                "public commit precondition derivation could not find a version tip for '{}'",
+                version_id
+            ),
+        }),
         WriteLane::GlobalAdmin => load_committed_global_tip_commit_id(executor)
             .await
             .map_err(domain_change_backend_error)?
             .ok_or_else(|| DomainChangeError {
-                message: "public commit precondition derivation could not find the global admin tip"
-                    .to_string(),
+                message:
+                    "public commit precondition derivation could not find the global admin tip"
+                        .to_string(),
             }),
     }
 }

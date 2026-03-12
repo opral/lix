@@ -531,9 +531,9 @@ pub(crate) struct PlannedWrite {
 impl PlannedWrite {
     pub(crate) fn requires_single_write_lane(&self) -> bool {
         if let Some(plan) = self.resolved_write_plan.as_ref() {
-            plan.partitions.iter().any(|partition| {
-                partition.execution_mode == WriteMode::Tracked
-            })
+            plan.partitions
+                .iter()
+                .any(|partition| partition.execution_mode == WriteMode::Tracked)
         } else {
             !matches!(
                 self.command.requested_mode,
