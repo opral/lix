@@ -367,6 +367,9 @@ mod tests {
         ))
         .expect("write analysis should succeed");
 
-        assert_eq!(planned.scope_proof, ScopeProof::FiniteVersionSet(BTreeSet::new()));
+        assert_eq!(
+            planned.scope_proof,
+            ScopeProof::FiniteVersionSet(BTreeSet::new())
+        );
     }
 }
