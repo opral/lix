@@ -183,20 +183,13 @@ export type LixObserveEvents = {
         #[wasm_bindgen(js_name = createVersion)]
         pub async fn create_version(&self, args: JsValue) -> Result<JsValue, JsValue> {
             let options = parse_create_version_options(args).map_err(js_error)?;
-            let result = self
-                .lix
-                .create_version(options)
-                .await
-                .map_err(js_error)?;
+            let result = self.lix.create_version(options).await.map_err(js_error)?;
             Ok(create_version_result_to_js(result).into())
         }
 
         #[wasm_bindgen(js_name = switchVersion)]
         pub async fn switch_version(&self, version_id: String) -> Result<(), JsValue> {
-            self.lix
-                .switch_version(version_id)
-                .await
-                .map_err(js_error)
+            self.lix.switch_version(version_id).await.map_err(js_error)
         }
 
         #[wasm_bindgen(js_name = exportSnapshot)]
