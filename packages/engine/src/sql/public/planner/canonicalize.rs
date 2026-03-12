@@ -208,10 +208,7 @@ fn canonicalize_insert_write(
         _ => None,
     };
     let requested_mode = write_mode_request_for_insert_payloads(&surface_binding, &payloads)?;
-    let payload = match payloads.as_slice() {
-        [payload] => MutationPayload::FullSnapshot(payload.clone()),
-        _ => MutationPayload::BulkFullSnapshot(payloads),
-    };
+    let payload = MutationPayload::InsertRows(payloads);
 
     Ok(CanonicalizedWrite {
         bound_statement: bound_statement.clone(),
@@ -280,7 +277,7 @@ fn canonicalize_update_write(
             operation_kind: WriteOperationKind::Update,
             target: surface_binding.clone(),
             selector,
-            payload: MutationPayload::Patch(payload),
+            payload: MutationPayload::UpdatePatch(payload),
             on_conflict: None,
             requested_mode,
             bound_parameters: bound_statement.bound_parameters.clone(),
@@ -1761,8 +1758,11 @@ mod tests {
             canonicalized.write_command.requested_mode,
             WriteModeRequest::Auto
         );
-        let MutationPayload::FullSnapshot(payload) = &canonicalized.write_command.payload else {
-            panic!("expected full snapshot payload");
+        let MutationPayload::InsertRows(rows) = &canonicalized.write_command.payload else {
+            panic!("expected insert rows payload");
+        };
+        let [payload] = rows.as_slice() else {
+            panic!("expected exactly one insert row");
         };
         assert_eq!(
             payload.get("entity_id"),
@@ -1771,6 +1771,30 @@ mod tests {
         assert_eq!(
             payload.get("version_id"),
             Some(&Value::Text("version-a".to_string()))
+        );
+    }
+
+    #[test]
+    fn canonicalizes_multi_row_filesystem_insert_into_insert_rows() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let canonicalized = canonicalize_write(
+            bound_statement(
+                "INSERT INTO lix_file (id, path, data) VALUES \
+                 ('file-1', '/a.txt', X'01'), \
+                 ('file-2', '/b.txt', X'02')",
+            ),
+            &registry,
+        )
+        .expect("multi-row filesystem insert should canonicalize");
+
+        let MutationPayload::InsertRows(rows) = &canonicalized.write_command.payload else {
+            panic!("expected insert rows payload");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("id"), Some(&Value::Text("file-1".to_string())));
+        assert_eq!(
+            rows[1].get("path"),
+            Some(&Value::Text("/b.txt".to_string()))
         );
     }
 
@@ -1797,9 +1821,9 @@ mod tests {
         assert!(
             matches!(
                 canonicalized.write_command.payload,
-                MutationPayload::FullSnapshot(_)
+                MutationPayload::InsertRows(_)
             ),
-            "expected full snapshot payload, got: {:?}",
+            "expected insert rows payload, got: {:?}",
             canonicalized.write_command.payload
         );
     }

@@ -1,8 +1,9 @@
 use crate::app::AppContext;
 use crate::error::CliError;
-use lix_rs_sdk::{init_lix, open_lix, Lix, OpenLixConfig, SqliteBackend};
+use lix_rs_sdk::{Lix, LixConfig, SqliteBackend, WasmtimeRuntime};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub fn resolve_db_path(context: &AppContext) -> Result<PathBuf, CliError> {
     if let Some(path) = &context.lix_path {
@@ -50,12 +51,9 @@ pub fn open_lix_at(path: &Path) -> Result<Lix, CliError> {
         ))
     })?;
 
-    let config = OpenLixConfig {
-        backend: Some(Box::new(backend)),
-        ..Default::default()
-    };
+    let config = LixConfig::new(Box::new(backend), default_wasm_runtime()?);
 
-    pollster::block_on(open_lix(config)).map_err(|err| {
+    pollster::block_on(Lix::open(config)).map_err(|err| {
         CliError::msg(format!(
             "failed to open lix database at {}: {}",
             path.display(),
@@ -80,11 +78,8 @@ pub fn init_lix_at(path: &Path) -> Result<bool, CliError> {
             err
         ))
     })?;
-    let init_config = OpenLixConfig {
-        backend: Some(Box::new(init_backend)),
-        ..Default::default()
-    };
-    let result = pollster::block_on(init_lix(init_config)).map_err(|err| {
+    let init_config = LixConfig::new(Box::new(init_backend), default_wasm_runtime()?);
+    let result = pollster::block_on(Lix::init(init_config)).map_err(|err| {
         CliError::msg(format!(
             "failed to initialize lix database at {}: {}",
             path.display(),
@@ -111,4 +106,10 @@ fn find_lix_files(cwd: &Path) -> Result<Vec<PathBuf>, CliError> {
     }
     files.sort();
     Ok(files)
+}
+
+fn default_wasm_runtime() -> Result<Arc<WasmtimeRuntime>, CliError> {
+    WasmtimeRuntime::new()
+        .map(Arc::new)
+        .map_err(|err| CliError::msg(format!("failed to initialize wasmtime runtime: {err}")))
 }

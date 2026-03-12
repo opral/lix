@@ -44,7 +44,7 @@ use crate::version::{
 use crate::{LixBackend, Value};
 use serde_json::{json, Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use sqlparser::ast::Statement;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
 const FILESYSTEM_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
@@ -104,35 +104,53 @@ async fn resolve_state_insert_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let entity_id = resolved_entity_id(planned_write)?;
-    let schema_key = resolved_schema_key(planned_write)?;
-    let version_id = resolved_version_id(planned_write)?;
-    let row = PlannedStateRow {
-        entity_id: entity_id.clone(),
-        schema_key,
-        version_id,
-        values: payload_map(planned_write)?,
-        tombstone: false,
-    };
+    let mut intended_post_state = Vec::new();
+    let mut lineage = Vec::new();
 
-    if insert_on_conflict_action(planned_write) == Some(InsertOnConflictAction::DoNothing)
-        && state_insert_conflicts_with_existing_row(backend, &row).await?
-    {
-        return Ok(noop_resolved_write_plan(
-            default_execution_mode_for_request(planned_write.command.requested_mode),
-        ));
+    for payload in insert_payload_rows(planned_write)? {
+        let entity_id = payload
+            .get("entity_id")
+            .and_then(text_from_value)
+            .or_else(|| {
+                if insert_payload_rows_count(planned_write) == Some(1) {
+                    resolved_entity_id(planned_write).ok()
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| WriteResolveError {
+                message: "sql2 day-1 write resolver requires an exact entity target".to_string(),
+            })?;
+        let schema_key = resolved_schema_key(planned_write)?;
+        let version_id = resolved_version_id(planned_write)?;
+        let row = PlannedStateRow {
+            entity_id: entity_id.clone(),
+            schema_key,
+            version_id,
+            values: payload,
+            tombstone: false,
+        };
+
+        if insert_on_conflict_action(planned_write) == Some(InsertOnConflictAction::DoNothing)
+            && state_insert_conflicts_with_existing_row(backend, &row).await?
+        {
+            continue;
+        }
+
+        lineage.push(RowLineage {
+            entity_id,
+            source_change_id: None,
+            source_commit_id: None,
+        });
+        intended_post_state.push(row);
     }
 
     Ok(ResolvedWritePlan {
         execution_mode: default_execution_mode_for_request(planned_write.command.requested_mode),
         authoritative_pre_state: Vec::new(),
-        intended_post_state: vec![row],
+        intended_post_state,
         tombstones: Vec::new(),
-        lineage: vec![RowLineage {
-            entity_id,
-            source_change_id: None,
-            source_commit_id: None,
-        }],
+        lineage,
         target_write_lane: None,
     })
 }
@@ -557,50 +575,76 @@ async fn resolve_directory_insert_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let MutationPayload::FullSnapshot(payload) = &planned_write.command.payload else {
-        return Err(WriteResolveError {
-            message: "sql2 filesystem directory insert requires a full snapshot payload"
-                .to_string(),
-        });
-    };
     let version_id = resolved_filesystem_version_id(backend, planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
-
-    let computed =
-        resolve_directory_insert_target(backend, planned_write, payload, &version_id, lookup_scope)
-            .await?;
     let mut intended_post_state = Vec::new();
     let mut lineage = Vec::new();
+    let mut seen_directory_paths = BTreeSet::new();
+    let mut seen_directory_ids = BTreeMap::<String, String>::new();
 
-    for ancestor in &computed.ancestor_rows {
+    for payload in insert_payload_rows(planned_write)? {
+        let computed = resolve_directory_insert_target(
+            backend,
+            planned_write,
+            &payload,
+            &version_id,
+            lookup_scope,
+        )
+        .await?;
+
+        for ancestor in &computed.ancestor_rows {
+            if seen_directory_paths.insert(ancestor.path.clone()) {
+                seen_directory_ids.insert(ancestor.id.clone(), ancestor.path.clone());
+                intended_post_state.push(directory_descriptor_row(
+                    &ancestor.id,
+                    ancestor.parent_id.as_deref(),
+                    &ancestor.name,
+                    ancestor.hidden,
+                    &ancestor.version_id,
+                    ancestor.metadata.as_deref(),
+                ));
+                lineage.push(RowLineage {
+                    entity_id: ancestor.id.clone(),
+                    source_change_id: None,
+                    source_commit_id: None,
+                });
+            }
+        }
+
+        let normalized_path = computed.path.clone();
+        if seen_directory_paths.contains(&normalized_path) {
+            return Err(WriteResolveError {
+                message: format!(
+                    "Unique constraint violation: directory path '{}' already exists in version '{}'",
+                    normalized_path, version_id
+                ),
+            });
+        }
+        if let Some(existing_path) = seen_directory_ids.get(&computed.id) {
+            return Err(WriteResolveError {
+                message: format!(
+                    "Unique constraint violation: directory id '{}' already used for path '{}'",
+                    computed.id, existing_path
+                ),
+            });
+        }
+        seen_directory_paths.insert(normalized_path);
+        seen_directory_ids.insert(computed.id.clone(), computed.path.clone());
+
         intended_post_state.push(directory_descriptor_row(
-            &ancestor.id,
-            ancestor.parent_id.as_deref(),
-            &ancestor.name,
-            ancestor.hidden,
-            &ancestor.version_id,
-            ancestor.metadata.as_deref(),
+            &computed.id,
+            computed.parent_id.as_deref(),
+            &computed.name,
+            computed.hidden,
+            &version_id,
+            computed.metadata.as_deref(),
         ));
         lineage.push(RowLineage {
-            entity_id: ancestor.id.clone(),
+            entity_id: computed.id.clone(),
             source_change_id: None,
             source_commit_id: None,
         });
     }
-
-    intended_post_state.push(directory_descriptor_row(
-        &computed.id,
-        computed.parent_id.as_deref(),
-        &computed.name,
-        computed.hidden,
-        &version_id,
-        computed.metadata.as_deref(),
-    ));
-    lineage.push(RowLineage {
-        entity_id: computed.id.clone(),
-        source_change_id: None,
-        source_commit_id: None,
-    });
 
     Ok(ResolvedWritePlan {
         execution_mode: default_execution_mode_for_request(planned_write.command.requested_mode),
@@ -653,7 +697,7 @@ async fn resolve_existing_directory_write(
 
     match planned_write.command.operation_kind {
         WriteOperationKind::Update => {
-            let MutationPayload::Patch(payload) = &planned_write.command.payload else {
+            let MutationPayload::UpdatePatch(payload) = &planned_write.command.payload else {
                 return Err(WriteResolveError {
                     message: "sql2 filesystem directory update requires a patch payload"
                         .to_string(),
@@ -819,54 +863,92 @@ async fn resolve_file_insert_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let MutationPayload::FullSnapshot(payload) = &planned_write.command.payload else {
-        return Err(WriteResolveError {
-            message: "sql2 filesystem file insert requires a full snapshot payload".to_string(),
-        });
-    };
     let version_id = resolved_filesystem_version_id(backend, planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
-    let computed =
-        resolve_file_insert_target(backend, planned_write, payload, &version_id, lookup_scope)
-            .await?;
-    let payload_bytes = payload_binary_value(payload, "data")?;
 
     let mut intended_post_state = Vec::new();
     let mut lineage = Vec::new();
+    let mut seen_directory_paths = BTreeSet::new();
+    let mut seen_file_paths = BTreeMap::<String, String>::new();
+    let mut seen_file_ids = BTreeMap::<String, String>::new();
 
-    for ancestor in &computed.ancestor_rows {
-        intended_post_state.push(directory_descriptor_row(
-            &ancestor.id,
-            ancestor.parent_id.as_deref(),
-            &ancestor.name,
-            ancestor.hidden,
-            &ancestor.version_id,
-            ancestor.metadata.as_deref(),
+    for payload in insert_payload_rows(planned_write)? {
+        let computed =
+            resolve_file_insert_target(backend, planned_write, &payload, &version_id, lookup_scope)
+                .await?;
+        let payload_bytes = payload_binary_value(&payload, "data")?;
+        let normalized_path =
+            payload_text_required(&payload, "path", "sql2 filesystem file insert")?;
+        let normalized_path = parse_file_path(&normalized_path)
+            .map_err(write_resolve_backend_error)?
+            .normalized_path;
+        let colliding_directory_path = format!("{}/", normalized_path.trim_end_matches('/'));
+        if seen_directory_paths.contains(&colliding_directory_path) {
+            return Err(WriteResolveError {
+                message: format!(
+                    "File path collides with directory path introduced earlier in statement: {colliding_directory_path}"
+                ),
+            });
+        }
+
+        for ancestor in &computed.ancestor_rows {
+            if seen_directory_paths.insert(ancestor.path.clone()) {
+                intended_post_state.push(directory_descriptor_row(
+                    &ancestor.id,
+                    ancestor.parent_id.as_deref(),
+                    &ancestor.name,
+                    ancestor.hidden,
+                    &ancestor.version_id,
+                    ancestor.metadata.as_deref(),
+                ));
+                lineage.push(RowLineage {
+                    entity_id: ancestor.id.clone(),
+                    source_change_id: None,
+                    source_commit_id: None,
+                });
+            }
+        }
+
+        if let Some(existing_id) = seen_file_paths.get(&normalized_path) {
+            return Err(WriteResolveError {
+                message: format!(
+                    "Unique constraint violation: file path '{}' already used by '{}' in this statement",
+                    normalized_path, existing_id
+                ),
+            });
+        }
+        if let Some(existing_path) = seen_file_ids.get(&computed.id) {
+            return Err(WriteResolveError {
+                message: format!(
+                    "Unique constraint violation: file id '{}' already used for path '{}' in this statement",
+                    computed.id, existing_path
+                ),
+            });
+        }
+        seen_file_paths.insert(normalized_path, computed.id.clone());
+        seen_file_ids.insert(
+            computed.id.clone(),
+            payload_text_required(&payload, "path", "sql2 filesystem file insert")?,
+        );
+
+        intended_post_state.push(file_descriptor_row(
+            &computed.id,
+            computed.directory_id.as_deref(),
+            &computed.name,
+            computed.extension.as_deref(),
+            computed.hidden,
+            &version_id,
+            computed.metadata.as_deref(),
         ));
         lineage.push(RowLineage {
-            entity_id: ancestor.id.clone(),
+            entity_id: computed.id.clone(),
             source_change_id: None,
             source_commit_id: None,
         });
-    }
 
-    intended_post_state.push(file_descriptor_row(
-        &computed.id,
-        computed.directory_id.as_deref(),
-        &computed.name,
-        computed.extension.as_deref(),
-        computed.hidden,
-        &version_id,
-        computed.metadata.as_deref(),
-    ));
-    lineage.push(RowLineage {
-        entity_id: computed.id.clone(),
-        source_change_id: None,
-        source_commit_id: None,
-    });
-
-    if let Some(bytes) = payload_bytes {
-        intended_post_state.push(binary_blob_ref_row(&computed.id, &version_id, &bytes)?);
+        if let Some(bytes) = payload_bytes {
+            intended_post_state.push(binary_blob_ref_row(&computed.id, &version_id, &bytes)?);
+        }
     }
 
     Ok(ResolvedWritePlan {
@@ -926,7 +1008,7 @@ async fn resolve_existing_file_write(
 
     match planned_write.command.operation_kind {
         WriteOperationKind::Update => {
-            let MutationPayload::Patch(payload) = &planned_write.command.payload else {
+            let MutationPayload::UpdatePatch(payload) = &planned_write.command.payload else {
                 return Err(WriteResolveError {
                     message: "sql2 filesystem file update requires a patch payload".to_string(),
                 });
@@ -1356,6 +1438,7 @@ struct ResolvedDirectoryInsertTarget {
     id: String,
     parent_id: Option<String>,
     name: String,
+    path: String,
     hidden: bool,
     metadata: Option<String>,
     ancestor_rows: Vec<DirectoryFilesystemRow>,
@@ -1486,6 +1569,7 @@ async fn resolve_directory_insert_target(
         id,
         parent_id,
         name,
+        path: normalized_path,
         hidden,
         metadata,
         ancestor_rows,
@@ -2295,7 +2379,7 @@ async fn resolve_active_version_update_write_plan(
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     ensure_exact_or_unfiltered_selector(planned_write)?;
-    let MutationPayload::Patch(payload) = &planned_write.command.payload else {
+    let MutationPayload::UpdatePatch(payload) = &planned_write.command.payload else {
         return Err(WriteResolveError {
             message: "sql2 active-version update resolver requires a patch payload".to_string(),
         });
@@ -2380,11 +2464,7 @@ async fn resolve_active_version_update_write_plan(
 fn resolve_active_account_insert_write_plan(
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let MutationPayload::FullSnapshot(payload) = &planned_write.command.payload else {
-        return Err(WriteResolveError {
-            message: "sql2 active-account insert resolver requires a full payload".to_string(),
-        });
-    };
+    let payload = exactly_one_insert_row(planned_write, "sql2 active-account insert resolver")?;
     if payload.keys().any(|key| key != "account_id") {
         return Err(WriteResolveError {
             message: "sql2 active-account insert only supports the account_id column".to_string(),
@@ -2653,6 +2733,7 @@ async fn resolve_version_insert_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
+    ensure_single_insert_row(planned_write, "sql2 version insert resolver")?;
     let version_id = version_admin_id_from_payload(planned_write)?;
     let name = version_admin_required_text(planned_write, "name")?;
     let commit_id = version_admin_required_text(planned_write, "commit_id")?;
@@ -2710,7 +2791,7 @@ async fn resolve_existing_version_write(
 
     match planned_write.command.operation_kind {
         WriteOperationKind::Update => {
-            let MutationPayload::Patch(payload) = &planned_write.command.payload else {
+            let MutationPayload::UpdatePatch(payload) = &planned_write.command.payload else {
                 return Err(WriteResolveError {
                     message: "sql2 version update resolver requires a patch payload".to_string(),
                 });
@@ -2911,13 +2992,13 @@ fn version_admin_required_text(
 fn version_admin_hidden_from_payload(
     planned_write: &PlannedWrite,
 ) -> Result<bool, WriteResolveError> {
-    let (MutationPayload::FullSnapshot(payload) | MutationPayload::Patch(payload)) =
-        &planned_write.command.payload
-    else {
-        return Ok(false);
+    let payload = match &planned_write.command.payload {
+        MutationPayload::InsertRows(rows) => rows.first(),
+        MutationPayload::UpdatePatch(payload) => Some(payload),
+        MutationPayload::Tombstone => None,
     };
     Ok(payload
-        .get("hidden")
+        .and_then(|payload| payload.get("hidden"))
         .and_then(value_as_bool)
         .unwrap_or(false))
 }
@@ -3012,7 +3093,7 @@ fn merged_update_values(
     current_values: &BTreeMap<String, Value>,
     planned_write: &PlannedWrite,
 ) -> Result<BTreeMap<String, Value>, WriteResolveError> {
-    let MutationPayload::Patch(payload) = &planned_write.command.payload else {
+    let MutationPayload::UpdatePatch(payload) = &planned_write.command.payload else {
         return Err(WriteResolveError {
             message: "sql2 update resolver requires a patch payload".to_string(),
         });
@@ -3337,7 +3418,7 @@ fn build_entity_insert_rows(
     entity_schema: &EntityWriteSchema,
 ) -> Result<Vec<PlannedStateRow>, WriteResolveError> {
     let version_id = resolved_version_id(planned_write)?;
-    let payloads = payload_maps(planned_write)?;
+    let payloads = insert_payload_rows(planned_write)?;
     let mut rows = Vec::with_capacity(payloads.len());
     for payload in payloads {
         let snapshot = snapshot_from_entity_payload(&payload, entity_schema)?;
@@ -3683,7 +3764,7 @@ fn merged_entity_update_values(
     entity_schema: &EntityWriteSchema,
     current_row: &ExactEffectiveStateRow,
 ) -> Result<BTreeMap<String, Value>, WriteResolveError> {
-    let MutationPayload::Patch(payload) = &planned_write.command.payload else {
+    let MutationPayload::UpdatePatch(payload) = &planned_write.command.payload else {
         return Err(WriteResolveError {
             message: "sql2 entity update resolver requires a patch payload".to_string(),
         });
@@ -4236,47 +4317,79 @@ fn write_resolve_to_lix_error(error: WriteResolveError) -> crate::LixError {
 
 fn payload_map(planned_write: &PlannedWrite) -> Result<BTreeMap<String, Value>, WriteResolveError> {
     match &planned_write.command.payload {
-        MutationPayload::FullSnapshot(payload) | MutationPayload::Patch(payload) => {
-            Ok(payload.clone())
+        MutationPayload::InsertRows(rows) => match rows.as_slice() {
+            [payload] => Ok(payload.clone()),
+            _ => Err(WriteResolveError {
+                message: "sql2 resolver expected a single-row payload".to_string(),
+            }),
+        },
+        MutationPayload::UpdatePatch(payload) => Ok(payload.clone()),
+        MutationPayload::Tombstone => Ok(Default::default()),
+    }
+}
+
+fn insert_payload_rows(
+    planned_write: &PlannedWrite,
+) -> Result<Vec<BTreeMap<String, Value>>, WriteResolveError> {
+    match &planned_write.command.payload {
+        MutationPayload::InsertRows(rows) => Ok(rows.clone()),
+        MutationPayload::UpdatePatch(_) | MutationPayload::Tombstone => Err(WriteResolveError {
+            message: "sql2 resolver expected insert payload rows".to_string(),
+        }),
+    }
+}
+
+fn insert_payload_rows_count(planned_write: &PlannedWrite) -> Option<usize> {
+    match &planned_write.command.payload {
+        MutationPayload::InsertRows(rows) => Some(rows.len()),
+        _ => None,
+    }
+}
+
+fn ensure_single_insert_row(
+    planned_write: &PlannedWrite,
+    context: &str,
+) -> Result<(), WriteResolveError> {
+    if insert_payload_rows_count(planned_write) == Some(1) {
+        return Ok(());
+    }
+    Err(WriteResolveError {
+        message: format!("{context} accepts exactly one row"),
+    })
+}
+
+fn exactly_one_insert_row(
+    planned_write: &PlannedWrite,
+    context: &str,
+) -> Result<BTreeMap<String, Value>, WriteResolveError> {
+    ensure_single_insert_row(planned_write, context)?;
+    match &planned_write.command.payload {
+        MutationPayload::InsertRows(rows) => {
+            rows.first().cloned().ok_or_else(|| WriteResolveError {
+                message: "sql2 resolver expected a single-row payload".to_string(),
+            })
         }
-        MutationPayload::BulkFullSnapshot(_) => Err(WriteResolveError {
+        _ => Err(WriteResolveError {
             message: "sql2 resolver expected a single-row payload".to_string(),
         }),
-        MutationPayload::Tombstone => Ok(Default::default()),
     }
 }
 
 fn payload_text_value(planned_write: &PlannedWrite, key: &str) -> Option<String> {
     match &planned_write.command.payload {
-        MutationPayload::FullSnapshot(payload) | MutationPayload::Patch(payload) => {
-            match payload.get(key) {
+        MutationPayload::InsertRows(rows) => {
+            let mut values = rows.iter().filter_map(|payload| match payload.get(key) {
                 Some(Value::Text(value)) => Some(value.clone()),
                 _ => None,
-            }
-        }
-        MutationPayload::BulkFullSnapshot(payloads) => {
-            let mut values = payloads
-                .iter()
-                .filter_map(|payload| match payload.get(key) {
-                    Some(Value::Text(value)) => Some(value.clone()),
-                    _ => None,
-                });
+            });
             let first = values.next()?;
             values.all(|candidate| candidate == first).then_some(first)
         }
+        MutationPayload::UpdatePatch(payload) => match payload.get(key) {
+            Some(Value::Text(value)) => Some(value.clone()),
+            _ => None,
+        },
         MutationPayload::Tombstone => None,
-    }
-}
-
-fn payload_maps(
-    planned_write: &PlannedWrite,
-) -> Result<Vec<BTreeMap<String, Value>>, WriteResolveError> {
-    match &planned_write.command.payload {
-        MutationPayload::FullSnapshot(payload) => Ok(vec![payload.clone()]),
-        MutationPayload::BulkFullSnapshot(payloads) => Ok(payloads.clone()),
-        MutationPayload::Patch(_) | MutationPayload::Tombstone => Err(WriteResolveError {
-            message: "sql2 resolver expected insert payload rows".to_string(),
-        }),
     }
 }
 
