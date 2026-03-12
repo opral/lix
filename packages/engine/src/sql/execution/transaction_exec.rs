@@ -5,6 +5,11 @@ use crate::engine::{
 use crate::sql::execution::execute;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path;
+use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
+use crate::sql::public::catalog::SurfaceRegistry;
+use crate::sql::public::runtime::{
+    apply_public_surface_registry_mutations, public_surface_registry_mutations,
+};
 use crate::{
     ExecuteOptions, LixError, LixTransaction, QueryResult, StateCommitStreamChange, Value,
 };
@@ -17,6 +22,8 @@ impl Engine {
         params: &[Value],
         options: &ExecuteOptions,
         allow_internal_tables: bool,
+        public_surface_registry: &mut SurfaceRegistry,
+        public_surface_registry_dirty: &mut bool,
         active_version_id: &mut String,
         deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
         skip_side_effect_collection: bool,
@@ -44,6 +51,7 @@ impl Engine {
                 active_version_id.as_str(),
                 writer_key,
                 allow_internal_tables,
+                Some(public_surface_registry),
                 shared_path::PreparationPolicy {
                     skip_side_effect_collection,
                 },
@@ -114,6 +122,17 @@ impl Engine {
             )
         {
             *pending_public_append_session = None;
+        }
+
+        if let Some(public_write) = prepared.public_write.as_ref() {
+            let mutations = public_surface_registry_mutations(public_write)?;
+            if apply_public_surface_registry_mutations(public_surface_registry, &mutations)? {
+                *public_surface_registry_dirty = true;
+            }
+        } else if prepared_execution_mutates_public_surface_registry(&prepared)? {
+            let backend = TransactionBackendAdapter::new(transaction);
+            *public_surface_registry = SurfaceRegistry::bootstrap_with_backend(&backend).await?;
+            *public_surface_registry_dirty = true;
         }
 
         let active_effects = execution

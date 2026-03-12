@@ -27,7 +27,8 @@ impl Engine {
             self.rebuild_internal_last_checkpoint().await?;
             self.seed_boot_key_values().await?;
             self.seed_boot_account().await?;
-            self.load_and_cache_active_version().await
+            self.load_and_cache_active_version().await?;
+            self.refresh_public_surface_registry().await
         }
         .await;
 
@@ -54,6 +55,7 @@ impl Engine {
             Ok(()) => Ok(true),
             Err(error) if error.code == crate::errors::ErrorCode::AlreadyInitialized.as_str() => {
                 self.load_and_cache_active_version().await?;
+                self.refresh_public_surface_registry().await?;
                 Ok(false)
             }
             Err(error) => Err(error),

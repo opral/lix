@@ -6,7 +6,9 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::registry::register_schema_sql_statements;
 use crate::sql::public::runtime::{
     finalize_public_write_execution, prepare_public_execution_with_internal_access,
-    PreparedPublicExecution, PreparedPublicWrite, PublicWriteExecutionPartition,
+    prepare_public_execution_with_registry_and_internal_access,
+    prepared_public_write_mutates_public_surface_registry, PreparedPublicExecution,
+    PreparedPublicWrite, PublicWriteExecutionPartition,
 };
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{
@@ -57,6 +59,37 @@ pub(crate) struct PreparedExecutionContext {
     pub(crate) functions: SharedFunctionProvider<RuntimeFunctionProvider>,
     pub(crate) plan: ExecutionPlan,
     pub(crate) public_write: Option<PreparedPublicWrite>,
+}
+
+pub(crate) fn prepared_execution_mutates_public_surface_registry(
+    prepared: &PreparedExecutionContext,
+) -> Result<bool, LixError> {
+    if prepared.public_write.is_some() {
+        return prepared
+            .public_write
+            .as_ref()
+            .map(prepared_public_write_mutates_public_surface_registry)
+            .transpose()
+            .map(|value| value.unwrap_or(false));
+    }
+
+    if prepared.plan.preprocess.mutations.iter().any(|row| {
+        row.schema_key == STORED_SCHEMA_KEY && row.version_id == GLOBAL_VERSION_ID && !row.untracked
+    }) {
+        return Ok(true);
+    }
+
+    let dirty = match prepared.plan.preprocess.internal_state.as_ref() {
+        Some(crate::state::internal::InternalStatePlan {
+            postprocess: Some(crate::state::internal::PostprocessPlan::VtableUpdate(plan)),
+        }) => plan.schema_key == STORED_SCHEMA_KEY,
+        Some(crate::state::internal::InternalStatePlan {
+            postprocess: Some(crate::state::internal::PostprocessPlan::VtableDelete(plan)),
+        }) => plan.schema_key == STORED_SCHEMA_KEY,
+        _ => false,
+    };
+
+    Ok(dirty)
 }
 
 pub(crate) struct CacheTargets {
@@ -126,6 +159,7 @@ pub(crate) async fn prepare_execution_with_backend(
     active_version_id: &str,
     writer_key: Option<&str>,
     allow_internal_tables: bool,
+    public_surface_registry_override: Option<&crate::sql::public::catalog::SurfaceRegistry>,
     policy: PreparationPolicy,
 ) -> Result<PreparedExecutionContext, LixError> {
     let (settings, sequence_start, functions) = engine
@@ -155,15 +189,31 @@ pub(crate) async fn prepare_execution_with_backend(
             ),
         })?;
 
-    let public_execution = prepare_public_execution_with_internal_access(
-        backend,
-        &statements,
-        params,
-        active_version_id,
-        writer_key,
-        allow_internal_tables,
-    )
-    .await
+    let public_execution = match public_surface_registry_override {
+        Some(registry) => {
+            prepare_public_execution_with_registry_and_internal_access(
+                backend,
+                registry,
+                &statements,
+                params,
+                active_version_id,
+                writer_key,
+                allow_internal_tables,
+            )
+            .await
+        }
+        None => {
+            prepare_public_execution_with_internal_access(
+                backend,
+                &statements,
+                params,
+                active_version_id,
+                writer_key,
+                allow_internal_tables,
+            )
+            .await
+        }
+    }
     .map_err(|error| LixError {
         code: error.code,
         description: format!(
@@ -736,10 +786,7 @@ fn merge_public_write_execution_outcome(
     );
 }
 
-fn merge_plan_effects_override(
-    existing: &mut Option<PlanEffects>,
-    next: Option<PlanEffects>,
-) {
+fn merge_plan_effects_override(existing: &mut Option<PlanEffects>, next: Option<PlanEffects>) {
     match (existing, next) {
         (_, None) => {}
         (slot @ None, Some(next)) => {
@@ -749,7 +796,9 @@ fn merge_plan_effects_override(
             current
                 .state_commit_stream_changes
                 .extend(next.state_commit_stream_changes);
-            current.file_cache_refresh_targets.extend(next.file_cache_refresh_targets);
+            current
+                .file_cache_refresh_targets
+                .extend(next.file_cache_refresh_targets);
             if next.next_active_version_id.is_some() {
                 current.next_active_version_id = next.next_active_version_id;
             }
@@ -1460,20 +1509,10 @@ async fn apply_public_version_last_checkpoint_side_effects(
 
     match public_write.planned_write.command.operation_kind {
         crate::sql::public::planner::ir::WriteOperationKind::Insert => {
-            upsert_last_checkpoint_rows(
-                transaction,
-                &version_checkpoint_rows(batch),
-                true,
-            )
-            .await
+            upsert_last_checkpoint_rows(transaction, &version_checkpoint_rows(batch), true).await
         }
         crate::sql::public::planner::ir::WriteOperationKind::Update => {
-            upsert_last_checkpoint_rows(
-                transaction,
-                &version_checkpoint_rows(batch),
-                false,
-            )
-            .await
+            upsert_last_checkpoint_rows(transaction, &version_checkpoint_rows(batch), false).await
         }
         crate::sql::public::planner::ir::WriteOperationKind::Delete => {
             let version_ids = batch

@@ -1,5 +1,5 @@
+use super::bind::bind_public_query;
 use super::*;
-use crate::sql::ast::utils::bind_sql;
 use crate::sql::public::planner::canonicalize::canonicalize_read;
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint,
@@ -33,11 +33,7 @@ pub(super) async fn execute_public_read_query_strict(
     for schema_key in &required_schema_keys {
         crate::schema::registry::register_schema(backend, schema_key).await?;
     }
-    let bound = bind_sql(
-        &Statement::Query(Box::new(lowered.query)).to_string(),
-        params,
-        backend.dialect(),
-    )?;
+    let bound = bind_public_query(lowered.query, params, backend.dialect())?;
     backend.execute(&bound.sql, &bound.params).await
 }
 
@@ -83,7 +79,11 @@ async fn lower_nested_public_read_subqueries_in_query(
         ))
         .await?;
     }
-    if let Some(quantity) = query.fetch.as_mut().and_then(|fetch| fetch.quantity.as_mut()) {
+    if let Some(quantity) = query
+        .fetch
+        .as_mut()
+        .and_then(|fetch| fetch.quantity.as_mut())
+    {
         Box::pin(lower_nested_public_read_subqueries_in_expr(
             backend,
             quantity,
@@ -823,8 +823,9 @@ async fn lower_public_read_query_with_details(
     }
     let active_version_id = load_active_version_id_for_public_read(backend).await?;
     let parsed = vec![Statement::Query(Box::new(query.clone()))];
-    let prepared = try_prepare_public_read_with_internal_access(
+    let prepared = try_prepare_public_read_with_registry_and_internal_access(
         backend,
+        &registry,
         &parsed,
         params,
         &active_version_id,
@@ -964,8 +965,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
         derive_dependency_spec_from_structured_public_read(&structured_read),
     );
     if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::State {
-        if let Some(error) = unknown_public_state_schema_error(registry, dependency_spec.as_ref())
-        {
+        if let Some(error) = unknown_public_state_schema_error(registry, dependency_spec.as_ref()) {
             return Err(error);
         }
     }
@@ -1046,8 +1046,12 @@ pub(super) async fn try_prepare_public_read(
     active_version_id: &str,
     writer_key: Option<&str>,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
-    try_prepare_public_read_with_internal_access(
+    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
+        .await
+        .map_err(|error| LixError::new(error.code, error.description))?;
+    try_prepare_public_read_with_registry_and_internal_access(
         backend,
+        &registry,
         parsed_statements,
         params,
         active_version_id,
@@ -1057,8 +1061,30 @@ pub(super) async fn try_prepare_public_read(
     .await
 }
 
-pub(super) async fn try_prepare_public_read_with_internal_access(
+pub(super) async fn try_prepare_public_read_with_registry_and_internal_access(
     backend: &dyn LixBackend,
+    registry: &SurfaceRegistry,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+    allow_internal_tables: bool,
+) -> Result<Option<PreparedPublicRead>, LixError> {
+    try_prepare_public_read_with_internal_access(
+        backend,
+        registry,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+        allow_internal_tables,
+    )
+    .await
+}
+
+async fn try_prepare_public_read_with_internal_access(
+    backend: &dyn LixBackend,
+    registry: &SurfaceRegistry,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
@@ -1068,9 +1094,6 @@ pub(super) async fn try_prepare_public_read_with_internal_access(
     if parsed_statements.len() != 1 {
         return Ok(None);
     }
-    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
-        .await
-        .map_err(|error| LixError::new(error.code, error.description))?;
     if let Some(error) = public_read_preflight_error(&registry, &parsed_statements[0]) {
         return Err(error);
     }

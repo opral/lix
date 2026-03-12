@@ -99,6 +99,94 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
     }
 }
 
+fn tx_dynamic_schema_snapshot_sql() -> String {
+    serde_json::json!({
+        "value": {
+            "x-lix-key": "lix_tx_dynamic_schema",
+            "x-lix-version": "1",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-override-lixcols": {
+                "lixcol_file_id": "\"lix\"",
+                "lixcol_plugin_key": "\"lix\""
+            },
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "name": { "type": "string" }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }
+    })
+    .to_string()
+    .replace('\'', "''")
+}
+
+fn insert_tx_dynamic_schema_sql() -> String {
+    let stored_schema_snapshot = tx_dynamic_schema_snapshot_sql();
+    format!(
+        "INSERT INTO lix_state_by_version (\
+         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+         ) VALUES (\
+         'lix_tx_dynamic_schema~1', 'lix_stored_schema', 'lix', 'global', 'lix', '{stored_schema_snapshot}', '1'\
+         )"
+    )
+}
+
+fn insert_tx_dynamic_schema_row_sql(version_id: &str) -> String {
+    format!(
+        "INSERT INTO lix_state_by_version (\
+         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+         ) VALUES (\
+         'row-1', 'lix_tx_dynamic_schema', 'lix', '{version_id}', 'lix', '{{\"id\":\"row-1\",\"name\":\"hello\"}}', '1'\
+         )"
+    )
+}
+
+fn delete_tx_dynamic_schema_sql() -> &'static str {
+    "DELETE FROM lix_state_by_version \
+     WHERE entity_id = 'lix_tx_dynamic_schema~1' \
+       AND schema_key = 'lix_stored_schema' \
+       AND file_id = 'lix' \
+       AND version_id = 'global'"
+}
+
+async fn assert_tx_dynamic_schema_row_visible(engine: &support::simulation_test::SimulationEngine) {
+    let result = engine
+        .execute(
+            "SELECT name \
+             FROM lix_tx_dynamic_schema \
+             WHERE id = 'row-1'",
+            &[],
+        )
+        .await
+        .expect("dynamic surface query should succeed");
+    assert_eq!(result.statements[0].rows.len(), 1);
+    assert_eq!(
+        result.statements[0].rows[0][0],
+        Value::Text("hello".to_string())
+    );
+}
+
+async fn assert_tx_dynamic_schema_unknown_table(
+    engine: &support::simulation_test::SimulationEngine,
+) {
+    let error = engine
+        .execute(
+            "SELECT name \
+             FROM lix_tx_dynamic_schema \
+             WHERE id = 'row-1'",
+            &[],
+        )
+        .await
+        .expect_err("dynamic surface should no longer be queryable");
+    assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
+    assert!(
+        error.description.contains("lix_tx_dynamic_schema"),
+        "unexpected error: {error:?}"
+    );
+}
+
 simulation_test!(
     transaction_path_applies_insert_validation,
     simulations = [sqlite, postgres],
@@ -222,52 +310,13 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         let active_version_id = active_version_id(&engine).await;
-        let stored_schema_snapshot = serde_json::json!({
-            "value": {
-                "x-lix-key": "lix_tx_dynamic_schema",
-                "x-lix-version": "1",
-                "x-lix-primary-key": ["/id"],
-                "x-lix-override-lixcols": {
-                    "lixcol_file_id": "\"lix\"",
-                    "lixcol_plugin_key": "\"lix\""
-                },
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "name": { "type": "string" }
-                },
-                "required": ["id"],
-                "additionalProperties": false
-            }
-        })
-        .to_string()
-        .replace('\'', "''");
-
         let active_version_id_for_tx = active_version_id.clone();
         engine
             .transaction(ExecuteOptions::default(), |tx| {
                 Box::pin(async move {
+                    tx.execute(&insert_tx_dynamic_schema_sql(), &[]).await?;
                     tx.execute(
-                        &format!(
-                            "INSERT INTO lix_state_by_version (\
-                             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                             ) VALUES (\
-                             'lix_tx_dynamic_schema~1', 'lix_stored_schema', 'lix', 'global', 'lix', '{stored_schema_snapshot}', '1'\
-                             )"
-                        ),
-                        &[],
-                    )
-                    .await?;
-
-                    tx.execute(
-                        &format!(
-                            "INSERT INTO lix_state_by_version (\
-                             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                             ) VALUES (\
-                             'row-1', 'lix_tx_dynamic_schema', 'lix', '{}', 'lix', '{{\"id\":\"row-1\",\"name\":\"hello\"}}', '1'\
-                             )",
-                            active_version_id_for_tx
-                        ),
+                        &insert_tx_dynamic_schema_row_sql(&active_version_id_for_tx),
                         &[],
                     )
                     .await?;
@@ -275,8 +324,8 @@ simulation_test!(
                     let in_transaction = tx
                         .execute(
                             "SELECT name \
-                             FROM lix_tx_dynamic_schema \
-                             WHERE id = 'row-1'",
+                         FROM lix_tx_dynamic_schema \
+                         WHERE id = 'row-1'",
                             &[],
                         )
                         .await?;
@@ -292,22 +341,104 @@ simulation_test!(
             .await
             .unwrap();
 
-        let post_commit = engine
-            .execute(
-                &format!(
-                    "SELECT name \
-                     FROM lix_tx_dynamic_schema \
-                     WHERE id = 'row-1'"
-                ),
-                &[],
-            )
+        assert_tx_dynamic_schema_row_visible(&engine).await;
+    }
+);
+
+simulation_test!(
+    public_sql_transaction_path_stored_schema_write_updates_bootstrap_for_followup_dynamic_surface_use,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                access_to_internal: false,
+                ..Default::default()
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let active_version_id = active_version_id(&engine).await;
+        engine.execute("BEGIN;", &[]).await.unwrap();
+        engine.execute(&insert_tx_dynamic_schema_sql(), &[]).await.unwrap();
+        engine
+            .execute(&insert_tx_dynamic_schema_row_sql(&active_version_id), &[])
             .await
             .unwrap();
-        assert_eq!(post_commit.statements[0].rows.len(), 1);
-        assert_eq!(
-            post_commit.statements[0].rows[0][0],
-            Value::Text("hello".to_string())
-        );
+        assert_tx_dynamic_schema_row_visible(&engine).await;
+        engine.execute("COMMIT;", &[]).await.unwrap();
+
+        assert_tx_dynamic_schema_row_visible(&engine).await;
+    }
+);
+
+simulation_test!(
+    transaction_path_stored_schema_tombstone_removes_followup_dynamic_surface_dispatch,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let active_version_id = active_version_id(&engine).await;
+        engine
+            .execute(&insert_tx_dynamic_schema_sql(), &[])
+            .await
+            .unwrap();
+        engine
+            .execute(&insert_tx_dynamic_schema_row_sql(&active_version_id), &[])
+            .await
+            .unwrap();
+        assert_tx_dynamic_schema_row_visible(&engine).await;
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(delete_tx_dynamic_schema_sql(), &[]).await?;
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .unwrap();
+
+        assert_tx_dynamic_schema_unknown_table(&engine).await;
+    }
+);
+
+simulation_test!(
+    public_sql_transaction_path_stored_schema_tombstone_removes_followup_dynamic_surface_dispatch,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                access_to_internal: false,
+                ..Default::default()
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let active_version_id = active_version_id(&engine).await;
+        engine
+            .execute(&insert_tx_dynamic_schema_sql(), &[])
+            .await
+            .unwrap();
+        engine
+            .execute(&insert_tx_dynamic_schema_row_sql(&active_version_id), &[])
+            .await
+            .unwrap();
+        assert_tx_dynamic_schema_row_visible(&engine).await;
+
+        engine.execute("BEGIN;", &[]).await.unwrap();
+        engine
+            .execute(delete_tx_dynamic_schema_sql(), &[])
+            .await
+            .unwrap();
+        engine.execute("COMMIT;", &[]).await.unwrap();
+
+        assert_tx_dynamic_schema_unknown_table(&engine).await;
     }
 );
 

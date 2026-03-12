@@ -6,6 +6,7 @@ use sqlparser::ast::Statement;
 use crate::engine::reject_internal_table_writes;
 use crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use crate::sql::execution::parse::parse_sql;
+use crate::sql::public::catalog::SurfaceRegistry;
 use crate::state::stream::StateCommitStreamChange;
 use crate::{
     errors, Engine, ExecuteOptions, ExecuteResult, LixBackend, LixError, LixTransaction,
@@ -57,9 +58,11 @@ struct SessionTransaction {
     _backend: Arc<dyn LixBackend + Send + Sync>,
     transaction: Option<Box<dyn LixTransaction + 'static>>,
     options: ExecuteOptions,
+    public_surface_registry: SurfaceRegistry,
     active_version_id: String,
     active_version_changed: bool,
     installed_plugins_cache_invalidation_pending: bool,
+    public_surface_registry_dirty: bool,
     pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
     pending_public_append_session:
         Option<crate::sql::execution::shared_path::PendingPublicAppendSession>,
@@ -97,6 +100,9 @@ impl SessionTransaction {
         }
         if self.installed_plugins_cache_invalidation_pending {
             engine.invalidate_installed_plugins_cache()?;
+        }
+        if self.public_surface_registry_dirty {
+            engine.refresh_public_surface_registry().await?;
         }
         engine.emit_state_commit_stream_changes(self.pending_state_commit_stream_changes);
         Ok(())
@@ -145,9 +151,11 @@ async fn execute_transaction_control(
                 _backend: backend,
                 transaction: Some(transaction),
                 options,
+                public_surface_registry: engine.public_surface_registry(),
                 active_version_id,
                 active_version_changed: false,
                 installed_plugins_cache_invalidation_pending: false,
+                public_surface_registry_dirty: false,
                 pending_state_commit_stream_changes: Vec::new(),
                 pending_public_append_session: None,
             });
@@ -199,6 +207,8 @@ async fn execute_in_active_transaction(
                 params,
                 &session_transaction.options,
                 false,
+                &mut session_transaction.public_surface_registry,
+                &mut session_transaction.public_surface_registry_dirty,
                 &mut session_transaction.active_version_id,
                 &mut session_transaction.pending_state_commit_stream_changes,
                 &mut session_transaction.pending_public_append_session,
@@ -212,6 +222,8 @@ async fn execute_in_active_transaction(
                 params,
                 &session_transaction.options,
                 false,
+                &mut session_transaction.public_surface_registry,
+                &mut session_transaction.public_surface_registry_dirty,
                 &mut session_transaction.active_version_id,
                 None,
                 false,

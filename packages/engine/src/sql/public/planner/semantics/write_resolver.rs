@@ -14,13 +14,12 @@ use crate::filesystem::path::{
 use crate::schema::builtin::builtin_schema_definition;
 use crate::schema::defaults::apply_schema_defaults_with_system_functions;
 use crate::schema::{SchemaProvider, SqlStoredSchemaProvider};
-use crate::sql::ast::utils::bind_statement_ast;
 use crate::sql::common::ast::{lower_statement, parse_sql_statements};
 use crate::sql::public::catalog::SurfaceFamily;
 use crate::sql::public::planner::ir::{
     InsertOnConflictAction, MutationPayload, PlannedStateRow, PlannedWrite, ResolvedRowRef,
-    ResolvedWritePartition, ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof,
-    TargetSetProof, WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
+    ResolvedWritePartition, ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, TargetSetProof,
+    WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
 };
 use crate::sql::public::planner::semantics::effective_state_resolver::{
     resolve_exact_effective_state_row, ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
@@ -43,8 +42,8 @@ use serde_json::{json, Map as JsonMap, Number as JsonNumber, Value as JsonValue}
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     BinaryOperator, Expr, GroupByExpr, Ident, ObjectName, ObjectNamePart, Query, Select,
-    SelectFlavor, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
-    Value as SqlValue, ValueWithSpan,
+    SelectFlavor, SelectItem, SetExpr, TableFactor, TableWithJoins, Value as SqlValue,
+    ValueWithSpan,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -254,7 +253,11 @@ fn state_selector_targets_single_effective_row(planned_write: &PlannedWrite) -> 
 }
 
 fn state_selector_exposes_version_id(planned_write: &PlannedWrite) -> bool {
-    planned_write.command.target.implicit_overrides.expose_version_id
+    planned_write
+        .command
+        .target
+        .implicit_overrides
+        .expose_version_id
 }
 
 async fn resolve_existing_state_write_exact(
@@ -338,9 +341,7 @@ fn resolve_existing_state_write_from_rows(
                     source_commit_id: None,
                 });
             }
-            Ok(partitions.into_resolved_write_plan(
-                planned_write.command.requested_mode,
-            ))
+            Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
         WriteOperationKind::Delete => {
             for current_row in current_rows {
@@ -376,9 +377,7 @@ fn resolve_existing_state_write_from_rows(
                     source_commit_id: None,
                 });
             }
-            Ok(partitions.into_resolved_write_plan(
-                planned_write.command.requested_mode,
-            ))
+            Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
         WriteOperationKind::Insert => Err(WriteResolveError {
             message: "public existing-row resolver does not handle inserts".to_string(),
@@ -436,9 +435,7 @@ async fn resolve_existing_entity_write(
                     source_commit_id: None,
                 });
             }
-            Ok(partitions.into_resolved_write_plan(
-                planned_write.command.requested_mode,
-            ))
+            Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
         WriteOperationKind::Delete => {
             for current_row in current_rows {
@@ -474,9 +471,7 @@ async fn resolve_existing_entity_write(
                     source_commit_id: None,
                 });
             }
-            Ok(partitions.into_resolved_write_plan(
-                planned_write.command.requested_mode,
-            ))
+            Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
         WriteOperationKind::Insert => Err(WriteResolveError {
             message: "public entity existing-row resolver does not handle inserts".to_string(),
@@ -533,8 +528,7 @@ async fn resolve_entity_insert_write_plan(
                     row_execution_mode,
                     &current_row,
                 )?;
-                let partition =
-                    partitions.partition_mut(row_execution_mode, target_write_lane);
+                let partition = partitions.partition_mut(row_execution_mode, target_write_lane);
                 partition.authoritative_pre_state.push(row_ref.clone());
                 partition.lineage.push(RowLineage {
                     entity_id: row_ref.entity_id,
@@ -559,9 +553,7 @@ async fn resolve_entity_insert_write_plan(
         partition.intended_post_state.push(row);
     }
 
-    Ok(partitions.into_resolved_write_plan(
-        planned_write.command.requested_mode,
-    ))
+    Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
 }
 
 async fn resolve_filesystem_write(
@@ -673,8 +665,7 @@ async fn resolve_directory_insert_write_plan(
         batch.register_directory_target(computed)?;
     }
     let (intended_post_state, lineage) =
-        finalize_pending_directory_insert_batch(backend, &batch, &version_id, lookup_scope)
-            .await?;
+        finalize_pending_directory_insert_batch(backend, &batch, &version_id, lookup_scope).await?;
 
     Ok(single_partition_write_plan(
         default_execution_mode_for_request(planned_write.command.requested_mode),
@@ -779,20 +770,19 @@ async fn resolve_existing_directory_write(
                 });
             }
 
-            Ok(partitions.into_resolved_write_plan(
-                planned_write.command.requested_mode,
-            ))
+            Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
         WriteOperationKind::Delete => {
             let mut descendant_directories = BTreeMap::new();
             let mut descendant_files = BTreeMap::new();
             for current_row in current_rows {
-                for row in load_directory_rows_under_path(backend, &version_id, &current_row.path)
-                    .await?
+                for row in
+                    load_directory_rows_under_path(backend, &version_id, &current_row.path).await?
                 {
                     descendant_directories.entry(row.id.clone()).or_insert(row);
                 }
-                for row in load_file_rows_under_path(backend, &version_id, &current_row.path).await?
+                for row in
+                    load_file_rows_under_path(backend, &version_id, &current_row.path).await?
                 {
                     descendant_files.entry(row.id.clone()).or_insert(row);
                 }
@@ -821,14 +811,16 @@ async fn resolve_existing_directory_write(
                 )?;
                 let partition = partitions.partition_mut(execution_mode, target_write_lane);
                 partition.authoritative_pre_state.push(row_ref.clone());
-                partition.intended_post_state.push(directory_descriptor_tombstone_row(
-                    &row.id,
-                    row.parent_id.as_deref(),
-                    &row.name,
-                    row.hidden,
-                    &version_id,
-                    row.metadata.as_deref(),
-                ));
+                partition
+                    .intended_post_state
+                    .push(directory_descriptor_tombstone_row(
+                        &row.id,
+                        row.parent_id.as_deref(),
+                        &row.name,
+                        row.hidden,
+                        &version_id,
+                        row.metadata.as_deref(),
+                    ));
                 partition.tombstones.push(row_ref);
                 partition.lineage.push(RowLineage {
                     entity_id: row.id.clone(),
@@ -866,15 +858,17 @@ async fn resolve_existing_directory_write(
                 let partition = partitions.partition_mut(execution_mode, target_write_lane);
                 partition.authoritative_pre_state.push(file_ref.clone());
                 partition.authoritative_pre_state.push(blob_ref.clone());
-                partition.intended_post_state.push(file_descriptor_tombstone_row(
-                    &row.id,
-                    row.directory_id.as_deref(),
-                    &row.name,
-                    row.extension.as_deref(),
-                    row.hidden,
-                    &version_id,
-                    row.metadata.as_deref(),
-                ));
+                partition
+                    .intended_post_state
+                    .push(file_descriptor_tombstone_row(
+                        &row.id,
+                        row.directory_id.as_deref(),
+                        &row.name,
+                        row.extension.as_deref(),
+                        row.hidden,
+                        &version_id,
+                        row.metadata.as_deref(),
+                    ));
                 partition
                     .intended_post_state
                     .push(binary_blob_ref_tombstone_row(&row.id, &version_id));
@@ -887,9 +881,7 @@ async fn resolve_existing_directory_write(
                 });
             }
 
-            Ok(partitions.into_resolved_write_plan(
-                planned_write.command.requested_mode,
-            ))
+            Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
         WriteOperationKind::Insert => Err(WriteResolveError {
             message: "public filesystem directory existing-row resolver does not handle inserts"
@@ -1050,9 +1042,7 @@ async fn resolve_existing_file_write(
                 }
             }
 
-            Ok(partitions.into_resolved_write_plan(
-                planned_write.command.requested_mode,
-            ))
+            Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
         WriteOperationKind::Delete => {
             let mut partitions = ResolvedWritePlanBuilder::default();
@@ -1086,15 +1076,17 @@ async fn resolve_existing_file_write(
                 let partition = partitions.partition_mut(execution_mode, target_write_lane);
                 partition.authoritative_pre_state.push(row_ref.clone());
                 partition.authoritative_pre_state.push(blob_ref.clone());
-                partition.intended_post_state.push(file_descriptor_tombstone_row(
-                    &current_row.id,
-                    current_row.directory_id.as_deref(),
-                    &current_row.name,
-                    current_row.extension.as_deref(),
-                    current_row.hidden,
-                    &version_id,
-                    current_row.metadata.as_deref(),
-                ));
+                partition
+                    .intended_post_state
+                    .push(file_descriptor_tombstone_row(
+                        &current_row.id,
+                        current_row.directory_id.as_deref(),
+                        &current_row.name,
+                        current_row.extension.as_deref(),
+                        current_row.hidden,
+                        &version_id,
+                        current_row.metadata.as_deref(),
+                    ));
                 partition
                     .intended_post_state
                     .push(binary_blob_ref_tombstone_row(&current_row.id, &version_id));
@@ -1106,9 +1098,7 @@ async fn resolve_existing_file_write(
                     source_commit_id: None,
                 });
             }
-            Ok(partitions.into_resolved_write_plan(
-                planned_write.command.requested_mode,
-            ))
+            Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
         WriteOperationKind::Insert => Err(WriteResolveError {
             message: "public filesystem existing-row resolver does not handle inserts".to_string(),
@@ -1153,9 +1143,9 @@ impl PendingFilesystemInsertBatch {
     }
 
     fn pending_directory_path_by_id(&self, directory_id: &str) -> Option<String> {
-        self.directories_by_path
-            .values()
-            .find_map(|pending| (pending.target.id == directory_id).then(|| pending.target.path.clone()))
+        self.directories_by_path.values().find_map(|pending| {
+            (pending.target.id == directory_id).then(|| pending.target.path.clone())
+        })
     }
 
     fn pending_file_id_by_path(&self, path: &str) -> Option<String> {
@@ -1241,7 +1231,10 @@ impl PendingFilesystemInsertBatch {
         data: Option<Vec<u8>>,
     ) -> Result<(), WriteResolveError> {
         let directory_collision_path = format!("{}/", target.path.trim_end_matches('/'));
-        if self.directories_by_path.contains_key(&directory_collision_path) {
+        if self
+            .directories_by_path
+            .contains_key(&directory_collision_path)
+        {
             return Err(WriteResolveError {
                 message: format!(
                     "File path collides with directory path already inserted in this statement: {}",
@@ -1394,7 +1387,10 @@ async fn ensure_parent_directories_for_insert_batch(
     paths.push(directory_path.to_string());
 
     for candidate_path in paths {
-        if batch.pending_directory_id_by_path(&candidate_path).is_some() {
+        if batch
+            .pending_directory_id_by_path(&candidate_path)
+            .is_some()
+        {
             continue;
         }
         if lookup_directory_id_by_path(backend, version_id, &candidate_path, lookup_scope)
@@ -1467,7 +1463,10 @@ async fn ensure_no_directory_at_file_path_in_insert_batch(
     batch: &PendingFilesystemInsertBatch,
 ) -> Result<(), WriteResolveError> {
     let directory_path = format!("{}/", file_path.trim_end_matches('/'));
-    if batch.pending_directory_id_by_path(&directory_path).is_some() {
+    if batch
+        .pending_directory_id_by_path(&directory_path)
+        .is_some()
+    {
         return Err(WriteResolveError {
             message: format!("File path collides with existing directory path: {directory_path}"),
         });
@@ -1486,21 +1485,24 @@ async fn finalize_pending_directory_insert_batch(
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<(Vec<PlannedStateRow>, Vec<RowLineage>), WriteResolveError> {
     let mut pending_directories: Vec<_> = batch.directories_by_path.values().cloned().collect();
-    pending_directories.sort_by_key(|pending| pending_directory_insert_sort_key(&pending.target.path));
+    pending_directories
+        .sort_by_key(|pending| pending_directory_insert_sort_key(&pending.target.path));
 
     let mut intended_post_state = Vec::new();
     let mut lineage = Vec::new();
 
     for pending in pending_directories {
         let parent_id = match pending.target.parent_path.as_deref() {
-            Some(parent_path) => lookup_directory_id_by_path_in_insert_batch(
-                backend,
-                version_id,
-                parent_path,
-                lookup_scope,
-                batch,
-            )
-            .await?,
+            Some(parent_path) => {
+                lookup_directory_id_by_path_in_insert_batch(
+                    backend,
+                    version_id,
+                    parent_path,
+                    lookup_scope,
+                    batch,
+                )
+                .await?
+            }
             None => None,
         };
         intended_post_state.push(directory_descriptor_row(
@@ -1534,14 +1536,16 @@ async fn finalize_pending_file_insert_batch(
 
     for pending in pending_files {
         let directory_id = match pending.target.directory_path.as_deref() {
-            Some(directory_path) => lookup_directory_id_by_path_in_insert_batch(
-                backend,
-                version_id,
-                directory_path,
-                lookup_scope,
-                batch,
-            )
-            .await?,
+            Some(directory_path) => {
+                lookup_directory_id_by_path_in_insert_batch(
+                    backend,
+                    version_id,
+                    directory_path,
+                    lookup_scope,
+                    batch,
+                )
+                .await?
+            }
             None => None,
         };
         intended_post_state.push(file_descriptor_row(
@@ -1833,27 +1837,24 @@ async fn resolve_directory_insert_target(
             directory_name_from_path(&normalized_path).ok_or_else(|| WriteResolveError {
                 message: "Directory name must be provided".to_string(),
             })?;
-        let derived_parent_path =
-            ensure_parent_directories_for_insert_batch(
+        let derived_parent_path = ensure_parent_directories_for_insert_batch(
+            backend,
+            version_id,
+            parent_directory_path(&normalized_path).as_deref(),
+            lookup_scope,
+            batch,
+        )
+        .await?;
+        let derived_parent_id = match derived_parent_path.as_deref() {
+            Some(parent_path) => lookup_directory_id_by_path_in_insert_batch(
                 backend,
                 version_id,
-                parent_directory_path(&normalized_path).as_deref(),
+                parent_path,
                 lookup_scope,
                 batch,
             )
-            .await?;
-        let derived_parent_id = match derived_parent_path.as_deref() {
-            Some(parent_path) => {
-                lookup_directory_id_by_path_in_insert_batch(
-                    backend,
-                    version_id,
-                    parent_path,
-                    lookup_scope,
-                    batch,
-                )
-                    .await?
-                    .or_else(|| Some(auto_directory_id(version_id, parent_path)))
-            }
+            .await?
+            .or_else(|| Some(auto_directory_id(version_id, parent_path))),
             None => None,
         };
 
@@ -1884,24 +1885,26 @@ async fn resolve_directory_insert_target(
         })?;
         let name = normalize_path_segment(&raw_name).map_err(write_resolve_backend_error)?;
         let parent_path = match explicit_parent_id.as_deref() {
-            Some(parent_id) => {
-                lookup_directory_path_by_id_in_insert_batch(
-                    backend,
-                    version_id,
-                    parent_id,
-                    lookup_scope,
-                    batch,
-                )
-                    .await?
-                    .ok_or_else(|| WriteResolveError {
-                        message: format!("Parent directory does not exist for id {parent_id}"),
-                    })?
-            }
+            Some(parent_id) => lookup_directory_path_by_id_in_insert_batch(
+                backend,
+                version_id,
+                parent_id,
+                lookup_scope,
+                batch,
+            )
+            .await?
+            .ok_or_else(|| WriteResolveError {
+                message: format!("Parent directory does not exist for id {parent_id}"),
+            })?,
             None => "/".to_string(),
         };
         let computed_path = compose_directory_path(parent_path.as_str(), &name)
             .map_err(write_resolve_backend_error)?;
-        (explicit_parent_id.as_deref().map(|_| parent_path), name, computed_path)
+        (
+            explicit_parent_id.as_deref().map(|_| parent_path),
+            name,
+            computed_path,
+        )
     };
 
     if let Some(existing_id) = batch.pending_directory_id_by_path(&normalized_path) {
@@ -2073,7 +2076,8 @@ async fn resolve_directory_update_targets_batch(
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<Vec<DirectoryFilesystemRow>, WriteResolveError> {
     if let Some(raw_path) = payload.get("path").and_then(text_from_value) {
-        let normalized_path = normalize_directory_path(&raw_path).map_err(write_resolve_backend_error)?;
+        let normalized_path =
+            normalize_directory_path(&raw_path).map_err(write_resolve_backend_error)?;
         return Err(WriteResolveError {
             message: format!(
                 "Unique constraint violation: directory path '{}' would be assigned to multiple rows",
@@ -2094,7 +2098,9 @@ async fn resolve_directory_update_targets_batch(
             });
         }
         let name = match payload.get("name").and_then(text_from_value) {
-            Some(raw_name) => normalize_path_segment(&raw_name).map_err(write_resolve_backend_error)?,
+            Some(raw_name) => {
+                normalize_path_segment(&raw_name).map_err(write_resolve_backend_error)?
+            }
             None => row.name.clone(),
         };
         let hidden = payload
@@ -2126,7 +2132,8 @@ async fn resolve_directory_update_targets_batch(
         if proposed_by_id.contains_key(parent_id) {
             continue;
         }
-        assert_no_directory_cycle(backend, version_id, &proposal.id, parent_id, lookup_scope).await?;
+        assert_no_directory_cycle(backend, version_id, &proposal.id, parent_id, lookup_scope)
+            .await?;
         let parent_path = lookup_directory_path_by_id(backend, version_id, parent_id, lookup_scope)
             .await?
             .ok_or_else(|| WriteResolveError {
@@ -2239,12 +2246,14 @@ fn resolve_proposed_directory_path(
         .get(directory_id)
         .expect("proposed directory update should exist");
     let parent_path = match proposal.parent_id.as_deref() {
-        Some(parent_id) if proposed_by_id.contains_key(parent_id) => resolve_proposed_directory_path(
-            parent_id,
-            proposed_by_id,
-            external_parent_paths,
-            resolved_paths,
-        )?,
+        Some(parent_id) if proposed_by_id.contains_key(parent_id) => {
+            resolve_proposed_directory_path(
+                parent_id,
+                proposed_by_id,
+                external_parent_paths,
+                resolved_paths,
+            )?
+        }
         Some(parent_id) => external_parent_paths
             .get(parent_id)
             .cloned()
@@ -2274,8 +2283,8 @@ async fn load_target_directory_rows_for_selector(
     .await?;
     let mut rows = Vec::new();
     for directory_id in directory_ids {
-        if let Some(row) = load_directory_row_by_id(backend, version_id, &directory_id, lookup_scope)
-            .await?
+        if let Some(row) =
+            load_directory_row_by_id(backend, version_id, &directory_id, lookup_scope).await?
         {
             rows.push(row);
         }
@@ -2947,7 +2956,8 @@ async fn resolve_active_version_update_write_plan(
     }
     if payload.keys().any(|key| key != "version_id") {
         return Err(WriteResolveError {
-            message: "public active-version update only supports version_id assignments".to_string(),
+            message: "public active-version update only supports version_id assignments"
+                .to_string(),
         });
     }
     let next_version_id =
@@ -3528,18 +3538,24 @@ fn version_admin_tombstone_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
 fn version_admin_id_from_payload_map(
     payload: &BTreeMap<String, Value>,
 ) -> Result<String, WriteResolveError> {
-    payload.get("id").and_then(text_from_value).ok_or_else(|| WriteResolveError {
-        message: "public version insert requires column 'id'".to_string(),
-    })
+    payload
+        .get("id")
+        .and_then(text_from_value)
+        .ok_or_else(|| WriteResolveError {
+            message: "public version insert requires column 'id'".to_string(),
+        })
 }
 
 fn version_admin_required_text_from_payload_map(
     payload: &BTreeMap<String, Value>,
     key: &str,
 ) -> Result<String, WriteResolveError> {
-    let value = payload.get(key).and_then(text_from_value).ok_or_else(|| WriteResolveError {
-        message: format!("public version insert requires column '{key}'"),
-    })?;
+    let value = payload
+        .get(key)
+        .and_then(text_from_value)
+        .ok_or_else(|| WriteResolveError {
+            message: format!("public version insert requires column '{key}'"),
+        })?;
     if value.is_empty() {
         return Err(WriteResolveError {
             message: format!("public version insert cannot set empty {key}"),
@@ -4041,8 +4057,9 @@ fn reject_unsupported_entity_overrides(
         == Some(true)
     {
         return Err(WriteResolveError {
-            message: "public entity live slice does not yet support lixcol_untracked write overrides"
-                .to_string(),
+            message:
+                "public entity live slice does not yet support lixcol_untracked write overrides"
+                    .to_string(),
         });
     }
     Ok(())
@@ -4177,7 +4194,8 @@ async fn resolve_target_entity_rows(
     let selector_rows = query_entity_selector_rows(backend, planned_write).await?;
     let mut rows = Vec::new();
     for selector_row in selector_rows {
-        let version_id = selector_row_version_id(planned_write, selector_row.version_id.as_deref())?;
+        let version_id =
+            selector_row_version_id(planned_write, selector_row.version_id.as_deref())?;
         let exact_filters =
             entity_state_exact_filters(planned_write, entity_schema, &selector_row.entity_id)?;
         let Some(current_row) = resolve_exact_effective_state_row(
@@ -4243,7 +4261,10 @@ async fn query_entity_selector_rows(
                 })
                 .transpose()?,
         };
-        if !selector_rows.iter().any(|existing| existing == &selector_row) {
+        if !selector_rows
+            .iter()
+            .any(|existing| existing == &selector_row)
+        {
             selector_rows.push(selector_row);
         }
     }
@@ -4297,12 +4318,7 @@ async fn query_state_selector_rows(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<Vec<StateSelectorRow>, WriteResolveError> {
-    let mut selector_columns = vec![
-        "entity_id",
-        "file_id",
-        "plugin_key",
-        "schema_version",
-    ];
+    let mut selector_columns = vec!["entity_id", "file_id", "plugin_key", "schema_version"];
     let version_index = if state_selector_exposes_version_id(planned_write) {
         selector_columns.push(public_selector_version_column(planned_write));
         Some(selector_columns.len() - 1)
@@ -4339,14 +4355,21 @@ async fn query_state_selector_rows(
                     )
                 })
                 .transpose()?,
-            global: required_bool_value_index(&row, 4 + version_index.is_some() as usize, "global")?,
+            global: required_bool_value_index(
+                &row,
+                4 + version_index.is_some() as usize,
+                "global",
+            )?,
             untracked: required_bool_value_index(
                 &row,
                 5 + version_index.is_some() as usize,
                 "untracked",
             )?,
         };
-        if !selector_rows.iter().any(|existing| existing == &selector_row) {
+        if !selector_rows
+            .iter()
+            .any(|existing| existing == &selector_row)
+        {
             selector_rows.push(selector_row);
         }
     }
@@ -4383,7 +4406,10 @@ fn exact_selector_predicates(planned_write: &PlannedWrite) -> Option<Vec<Expr>> 
     Some(predicates)
 }
 
-fn public_selector_column_name(planned_write: &PlannedWrite, canonical_column: &str) -> Option<String> {
+fn public_selector_column_name(
+    planned_write: &PlannedWrite,
+    canonical_column: &str,
+) -> Option<String> {
     match planned_write.command.target.descriptor.surface_family {
         SurfaceFamily::State => match canonical_column {
             "entity_id" => Some("entity_id".to_string()),
@@ -4441,18 +4467,20 @@ fn engine_value_to_sql_expr(value: &Value) -> Expr {
     match value {
         Value::Null => Expr::Value(ValueWithSpan::from(SqlValue::Null)),
         Value::Boolean(value) => Expr::Value(ValueWithSpan::from(SqlValue::Boolean(*value))),
-        Value::Text(value) => {
-            Expr::Value(ValueWithSpan::from(SqlValue::SingleQuotedString(value.clone())))
-        }
+        Value::Text(value) => Expr::Value(ValueWithSpan::from(SqlValue::SingleQuotedString(
+            value.clone(),
+        ))),
         Value::Json(value) => Expr::Value(ValueWithSpan::from(SqlValue::SingleQuotedString(
             value.to_string(),
         ))),
-        Value::Integer(value) => {
-            Expr::Value(ValueWithSpan::from(SqlValue::Number(value.to_string(), false)))
-        }
-        Value::Real(value) => {
-            Expr::Value(ValueWithSpan::from(SqlValue::Number(value.to_string(), false)))
-        }
+        Value::Integer(value) => Expr::Value(ValueWithSpan::from(SqlValue::Number(
+            value.to_string(),
+            false,
+        ))),
+        Value::Real(value) => Expr::Value(ValueWithSpan::from(SqlValue::Number(
+            value.to_string(),
+            false,
+        ))),
         Value::Blob(value) => Expr::Value(ValueWithSpan::from(
             SqlValue::SingleQuotedByteStringLiteral(String::from_utf8_lossy(value).to_string()),
         )),
@@ -4488,9 +4516,7 @@ fn build_public_selector_query(
             into: None,
             from: vec![TableWithJoins {
                 relation: TableFactor::Table {
-                    name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
-                        surface_name,
-                    ))]),
+                    name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(surface_name))]),
                     alias: None,
                     args: None,
                     with_hints: vec![],
@@ -4534,16 +4560,7 @@ async fn execute_public_selector_query_strict(
     planned_write: &PlannedWrite,
     query: Query,
 ) -> Result<QueryResult, LixError> {
-    let mut statement = Statement::Query(Box::new(query));
-    let rebound_params = bind_statement_ast(
-        &mut statement,
-        &planned_write.command.bound_parameters,
-        backend.dialect(),
-    )?;
-    let Statement::Query(query) = statement else {
-        unreachable!("selector query binding should preserve statement kind");
-    };
-    execute_public_read_query_strict(backend, *query, &rebound_params).await
+    execute_public_read_query_strict(backend, query, &planned_write.command.bound_parameters).await
 }
 
 async fn resolve_target_state_rows(
@@ -4554,7 +4571,8 @@ async fn resolve_target_state_rows(
     let selector_rows = query_state_selector_rows(backend, planned_write).await?;
     let mut rows = Vec::new();
     for selector_row in selector_rows {
-        let version_id = selector_row_version_id(planned_write, selector_row.version_id.as_deref())?;
+        let version_id =
+            selector_row_version_id(planned_write, selector_row.version_id.as_deref())?;
         let exact_filters = state_selector_exact_filters(planned_write, &selector_row);
         let Some(current_row) = resolve_exact_effective_state_row(
             backend,
@@ -4632,8 +4650,9 @@ fn merged_entity_update_values(
             .any(|path| path.len() == 1 && path[0] == *key)
         {
             return Err(WriteResolveError {
-                message: "public entity live slice does not yet support primary-key property updates"
-                    .to_string(),
+                message:
+                    "public entity live slice does not yet support primary-key property updates"
+                        .to_string(),
             });
         }
         if entity_schema
@@ -4699,8 +4718,7 @@ fn apply_entity_state_column_update(
     value: &Value,
 ) -> Result<bool, WriteResolveError> {
     match key {
-        "entity_id" | "schema_key" | "file_id" | "version_id" | "plugin_key"
-        | "schema_version" => {
+        "entity_id" | "schema_key" | "file_id" | "version_id" | "plugin_key" | "schema_version" => {
             let Some(text) = text_from_value(value) else {
                 return Err(WriteResolveError {
                     message: format!("public entity resolver expected text {key}, got {value:?}"),
@@ -4773,11 +4791,11 @@ fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, W
         ScopeProof::FiniteVersionSet(version_ids) if version_ids.len() == 1 => {
             Ok(version_ids.iter().next().cloned())
         }
-        ScopeProof::FiniteVersionSet(version_ids) if version_ids.is_empty() => Err(
-            WriteResolveError {
+        ScopeProof::FiniteVersionSet(version_ids) if version_ids.is_empty() => {
+            Err(WriteResolveError {
                 message: "public write resolver requires a concrete version_id".to_string(),
-            },
-        ),
+            })
+        }
         ScopeProof::FiniteVersionSet(_) => Err(WriteResolveError {
             message: "public write resolver cannot resolve multi-version writes".to_string(),
         }),
@@ -4966,7 +4984,9 @@ fn parse_snapshot_object(
     };
     let JsonValue::Object(object) =
         serde_json::from_str::<JsonValue>(&snapshot_text).map_err(|error| WriteResolveError {
-            message: format!("public entity resolver could not parse snapshot_content JSON: {error}"),
+            message: format!(
+                "public entity resolver could not parse snapshot_content JSON: {error}"
+            ),
         })?
     else {
         return Err(WriteResolveError {
@@ -4997,8 +5017,9 @@ fn derive_entity_id_from_snapshot(
             });
         }
         let value = json_pointer_get(&snapshot, path).ok_or_else(|| WriteResolveError {
-            message: "public entity resolver could not derive entity_id from the primary-key fields"
-                .to_string(),
+            message:
+                "public entity resolver could not derive entity_id from the primary-key fields"
+                    .to_string(),
         })?;
         parts.push(entity_id_component_from_json_value(value)?);
     }
@@ -5304,833 +5325,4 @@ fn lower_internal_sql_for_backend(
     let lowered =
         lower_statement(statement, backend.dialect()).map_err(write_resolve_backend_error)?;
     Ok(lowered.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::resolve_write_plan;
-    use crate::sql::public::catalog::SurfaceRegistry;
-    use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
-    use crate::sql::public::core::parser::parse_sql_script;
-    use crate::sql::public::planner::canonicalize::canonicalize_write;
-    use crate::sql::public::planner::ir::{WriteLane, WriteMode};
-    use crate::sql::public::planner::semantics::write_analysis::analyze_write;
-    use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
-    use async_trait::async_trait;
-
-    #[derive(Default)]
-    struct FakeBackend {
-        change_rows: Vec<Vec<Value>>,
-        untracked_rows: Vec<Vec<Value>>,
-        version_descriptor_rows: Vec<Vec<Value>>,
-        version_pointer_rows: Vec<Vec<Value>>,
-    }
-
-    #[async_trait(?Send)]
-    impl LixBackend for FakeBackend {
-        fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
-        }
-
-        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("FROM lix_internal_change c")
-                && sql.contains("c.schema_key = 'lix_version_descriptor'")
-            {
-                return Ok(QueryResult {
-                    rows: self.version_descriptor_rows.clone(),
-                    columns: vec!["snapshot_content".to_string(), "change_id".to_string()],
-                });
-            }
-            if sql.contains("FROM lix_internal_change c")
-                && sql.contains("c.schema_key = 'lix_version_pointer'")
-                && !sql.contains("SELECT c.id, c.entity_id, c.schema_key, c.schema_version")
-            {
-                return Ok(QueryResult {
-                    rows: self.version_pointer_rows.clone(),
-                    columns: vec!["snapshot_content".to_string(), "change_id".to_string()],
-                });
-            }
-            if sql.contains("SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at")
-                && sql.contains("FROM lix_internal_change c")
-            {
-                return Ok(QueryResult {
-                    rows: self.change_rows.clone(),
-                    columns: vec![
-                        "id".to_string(),
-                        "entity_id".to_string(),
-                        "schema_key".to_string(),
-                        "schema_version".to_string(),
-                        "file_id".to_string(),
-                        "plugin_key".to_string(),
-                        "snapshot_content".to_string(),
-                        "metadata".to_string(),
-                        "created_at".to_string(),
-                    ],
-                });
-            }
-            if sql.contains("FROM lix_internal_state_untracked") {
-                return Ok(QueryResult {
-                    rows: self.untracked_rows.clone(),
-                    columns: vec![
-                        "entity_id".to_string(),
-                        "schema_key".to_string(),
-                        "schema_version".to_string(),
-                        "file_id".to_string(),
-                        "version_id".to_string(),
-                        "plugin_key".to_string(),
-                        "snapshot_content".to_string(),
-                        "metadata".to_string(),
-                    ],
-                });
-            }
-
-            Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            })
-        }
-
-        async fn begin_transaction(&self) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
-            Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "transactions are not needed in this test backend".to_string(),
-            })
-        }
-    }
-
-    fn build_committed_state_change_rows(
-        entity_id: &str,
-        version_id: &str,
-        file_id: &str,
-        plugin_key: &str,
-        snapshot_content: &str,
-        metadata: Option<&str>,
-        change_id: &str,
-        commit_id: &str,
-    ) -> Vec<Vec<Value>> {
-        let commit_snapshot = serde_json::json!({
-            "id": commit_id,
-            "change_set_id": format!("change-set-{commit_id}"),
-            "change_ids": [change_id],
-            "author_account_ids": [],
-            "parent_commit_ids": [],
-            "meta_change_ids": []
-        })
-        .to_string();
-        let pointer_snapshot = serde_json::json!({
-            "id": version_id,
-            "commit_id": commit_id
-        })
-        .to_string();
-        vec![
-            vec![
-                Value::Text(change_id.to_string()),
-                Value::Text(entity_id.to_string()),
-                Value::Text("lix_key_value".to_string()),
-                Value::Text("1".to_string()),
-                Value::Text(file_id.to_string()),
-                Value::Text(plugin_key.to_string()),
-                Value::Text(snapshot_content.to_string()),
-                metadata
-                    .map(|value| Value::Text(value.to_string()))
-                    .unwrap_or(Value::Null),
-                Value::Text("2026-03-06T18:00:00Z".to_string()),
-            ],
-            vec![
-                Value::Text(format!("commit-change-{commit_id}")),
-                Value::Text(commit_id.to_string()),
-                Value::Text("lix_commit".to_string()),
-                Value::Text("1".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text(commit_snapshot),
-                Value::Null,
-                Value::Text("2026-03-06T18:00:01Z".to_string()),
-            ],
-            vec![
-                Value::Text(format!("pointer-change-{version_id}")),
-                Value::Text(version_id.to_string()),
-                Value::Text("lix_version_pointer".to_string()),
-                Value::Text("1".to_string()),
-                Value::Text(crate::version::version_pointer_file_id().to_string()),
-                Value::Text(crate::version::version_pointer_plugin_key().to_string()),
-                Value::Text(pointer_snapshot),
-                Value::Null,
-                Value::Text("2026-03-06T18:00:02Z".to_string()),
-            ],
-        ]
-    }
-
-    fn build_untracked_state_rows(
-        entity_id: &str,
-        version_id: &str,
-        file_id: &str,
-        plugin_key: &str,
-        snapshot_content: &str,
-        metadata: Option<&str>,
-    ) -> Vec<Vec<Value>> {
-        vec![vec![
-            Value::Text(entity_id.to_string()),
-            Value::Text("lix_key_value".to_string()),
-            Value::Text("1".to_string()),
-            Value::Text(file_id.to_string()),
-            Value::Text(version_id.to_string()),
-            Value::Text(plugin_key.to_string()),
-            Value::Text(snapshot_content.to_string()),
-            metadata
-                .map(|value| Value::Text(value.to_string()))
-                .unwrap_or(Value::Null),
-        ]]
-    }
-
-    fn planned_write(
-        sql: &str,
-        requested_version_id: &str,
-    ) -> crate::sql::public::planner::ir::PlannedWrite {
-        planned_write_with_params(sql, &[], requested_version_id)
-    }
-
-    fn planned_write_with_params(
-        sql: &str,
-        params: &[Value],
-        requested_version_id: &str,
-    ) -> crate::sql::public::planner::ir::PlannedWrite {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
-        let mut statements = parse_sql_script(sql).expect("SQL should parse");
-        let statement = statements.pop().expect("single statement");
-        let bound = BoundStatement::from_statement(
-            statement,
-            params.to_vec(),
-            ExecutionContext {
-                requested_version_id: Some(requested_version_id.to_string()),
-                ..ExecutionContext::default()
-            },
-        );
-        let canonicalized =
-            canonicalize_write(bound, &registry).expect("write should canonicalize");
-        analyze_write(&canonicalized).expect("write analysis should succeed")
-    }
-
-    fn tracked_write_lane(
-        resolved: &crate::sql::public::planner::ir::ResolvedWritePlan,
-    ) -> Option<WriteLane> {
-        resolved
-            .tracked_partitions()
-            .next()
-            .and_then(|partition| partition.target_write_lane.clone())
-    }
-
-    fn single_execution_mode(
-        resolved: &crate::sql::public::planner::ir::ResolvedWritePlan,
-    ) -> Option<WriteMode> {
-        resolved.single_partition().map(|partition| partition.execution_mode)
-    }
-
-    fn intended_post_state<'a>(
-        resolved: &'a crate::sql::public::planner::ir::ResolvedWritePlan,
-    ) -> Vec<&'a crate::sql::public::planner::ir::PlannedStateRow> {
-        resolved.intended_post_state().collect()
-    }
-
-    fn authoritative_pre_state<'a>(
-        resolved: &'a crate::sql::public::planner::ir::ResolvedWritePlan,
-    ) -> Vec<&'a crate::sql::public::planner::ir::ResolvedRowRef> {
-        resolved.authoritative_pre_state().collect()
-    }
-
-    fn tombstones<'a>(
-        resolved: &'a crate::sql::public::planner::ir::ResolvedWritePlan,
-    ) -> Vec<&'a crate::sql::public::planner::ir::ResolvedRowRef> {
-        resolved.tombstones().collect()
-    }
-
-    #[tokio::test]
-    async fn resolves_active_version_insert_with_active_lane() {
-        let backend = FakeBackend::default();
-        let resolved = resolve_write_plan(
-            &backend,
-            &planned_write(
-                "INSERT INTO lix_state (entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version) \
-                 VALUES ('entity-1', 'lix_key_value', 'lix', 'lix', '{\"key\":\"hello\"}', '1')",
-                "main",
-            ),
-        )
-        .await
-        .expect("write should resolve");
-
-        let rows = intended_post_state(&resolved);
-        assert_eq!(rows[0].version_id.as_deref(), Some("main"));
-        assert_eq!(tracked_write_lane(&resolved), Some(WriteLane::ActiveVersion));
-    }
-
-    #[tokio::test]
-    async fn resolves_explicit_version_insert_with_single_version_lane() {
-        let backend = FakeBackend::default();
-        let resolved = resolve_write_plan(
-            &backend,
-            &planned_write(
-                "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
-                 VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')",
-                "main",
-            ),
-        )
-        .await
-        .expect("write should resolve");
-
-        let rows = intended_post_state(&resolved);
-        assert_eq!(
-            tracked_write_lane(&resolved),
-            Some(WriteLane::SingleVersion("version-a".to_string()))
-        );
-        assert_eq!(rows[0].version_id.as_deref(), Some("version-a"));
-    }
-
-    #[tokio::test]
-    async fn resolves_lix_version_insert_with_global_admin_lane() {
-        let backend = FakeBackend::default();
-        let resolved = resolve_write_plan(
-            &backend,
-            &planned_write(
-                "INSERT INTO lix_version (id, name, hidden, commit_id) \
-                 VALUES ('version-a', 'Version A', false, 'commit-a')",
-                "main",
-            ),
-        )
-        .await
-        .expect("version write should resolve");
-
-        let rows = intended_post_state(&resolved);
-        assert_eq!(tracked_write_lane(&resolved), Some(WriteLane::GlobalAdmin));
-        assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .any(|row| row.schema_key == crate::version::version_descriptor_schema_key()));
-        assert!(rows
-            .iter()
-            .any(|row| row.schema_key == crate::version::version_pointer_schema_key()));
-    }
-
-    #[tokio::test]
-    async fn resolves_update_from_authoritative_pre_state() {
-        let backend = FakeBackend {
-            change_rows: build_committed_state_change_rows(
-                "entity-1",
-                "version-a",
-                "lix",
-                "lix",
-                "{\"value\":\"before\"}",
-                Some("{\"m\":1}"),
-                "change-1",
-                "commit-1",
-            ),
-            ..FakeBackend::default()
-        };
-        let resolved = resolve_write_plan(
-            &backend,
-            &planned_write(
-                "UPDATE lix_state_by_version \
-                 SET snapshot_content = '{\"value\":\"after\"}' \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND entity_id = 'entity-1' \
-                   AND version_id = 'version-a'",
-                "main",
-            ),
-        )
-        .await
-        .expect("write should resolve");
-
-        let authoritative = authoritative_pre_state(&resolved);
-        let rows = intended_post_state(&resolved);
-        assert_eq!(authoritative.len(), 1);
-        assert_eq!(
-            rows[0]
-                .values
-                .get("file_id")
-                .and_then(super::text_from_value)
-                .as_deref(),
-            Some("lix")
-        );
-        assert_eq!(
-            rows[0]
-                .values
-                .get("snapshot_content")
-                .and_then(super::text_from_value)
-                .as_deref(),
-            Some("{\"value\":\"after\"}")
-        );
-    }
-
-    #[tokio::test]
-    async fn resolves_delete_from_authoritative_pre_state() {
-        let backend = FakeBackend {
-            change_rows: build_committed_state_change_rows(
-                "entity-1",
-                "version-a",
-                "lix",
-                "lix",
-                "{\"value\":\"before\"}",
-                None,
-                "change-1",
-                "commit-1",
-            ),
-            ..FakeBackend::default()
-        };
-        let resolved = resolve_write_plan(
-            &backend,
-            &planned_write(
-                "DELETE FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND entity_id = 'entity-1' \
-                   AND version_id = 'version-a'",
-                "main",
-            ),
-        )
-        .await
-        .expect("write should resolve");
-
-        assert_eq!(authoritative_pre_state(&resolved).len(), 1);
-        assert_eq!(tombstones(&resolved).len(), 1);
-        assert!(intended_post_state(&resolved)[0].tombstone);
-    }
-
-    #[tokio::test]
-    async fn leaves_noop_update_with_no_rows_to_append() {
-        let backend = FakeBackend::default();
-        let resolved = resolve_write_plan(
-            &backend,
-            &planned_write(
-                "UPDATE lix_state_by_version \
-                 SET snapshot_content = '{\"value\":\"after\"}' \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND entity_id = 'entity-missing' \
-                   AND version_id = 'version-a'",
-                "main",
-            ),
-        )
-        .await
-        .expect("missing rows should resolve as a no-op");
-
-        assert_eq!(
-            tracked_write_lane(&resolved),
-            Some(WriteLane::SingleVersion("version-a".into()))
-        );
-        assert!(authoritative_pre_state(&resolved).is_empty());
-        assert!(intended_post_state(&resolved).is_empty());
-    }
-
-    #[tokio::test]
-    async fn rejects_update_that_changes_identity_columns() {
-        let backend = FakeBackend {
-            change_rows: build_committed_state_change_rows(
-                "entity-1",
-                "version-a",
-                "lix",
-                "lix",
-                "{\"value\":\"before\"}",
-                None,
-                "change-1",
-                "commit-1",
-            ),
-            ..FakeBackend::default()
-        };
-        let error = resolve_write_plan(
-            &backend,
-            &planned_write(
-                "UPDATE lix_state_by_version \
-                 SET file_id = 'other-file' \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND entity_id = 'entity-1' \
-                   AND version_id = 'version-a'",
-                "main",
-            ),
-        )
-        .await
-        .expect_err("identity-changing update should stay off the public live slice");
-
-        assert!(error
-            .message
-            .contains("does not support changing 'file_id'"));
-    }
-
-    #[tokio::test]
-    async fn exact_file_filter_prevents_mismatched_updates() {
-        let backend = FakeBackend {
-            change_rows: build_committed_state_change_rows(
-                "entity-1",
-                "version-a",
-                "lix",
-                "lix",
-                "{\"value\":\"before\"}",
-                None,
-                "change-1",
-                "commit-1",
-            ),
-            ..FakeBackend::default()
-        };
-        let resolved = resolve_write_plan(
-            &backend,
-            &planned_write(
-                "UPDATE lix_state_by_version \
-                 SET snapshot_content = '{\"value\":\"after\"}' \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND entity_id = 'entity-1' \
-                   AND file_id = 'other-file' \
-                   AND version_id = 'version-a'",
-                "main",
-            ),
-        )
-        .await
-        .expect("mismatched exact filters should resolve as a no-op");
-
-        assert!(intended_post_state(&resolved).is_empty());
-    }
-
-    #[tokio::test]
-    async fn resolves_state_update_against_explicit_untracked_winner() {
-        let backend = FakeBackend {
-            untracked_rows: build_untracked_state_rows(
-                "entity-1",
-                "version-a",
-                "lix",
-                "lix",
-                "{\"value\":\"before\"}",
-                None,
-            ),
-            ..FakeBackend::default()
-        };
-        let resolved = resolve_write_plan(
-            &backend,
-            &planned_write(
-                "UPDATE lix_state \
-                 SET snapshot_content = '{\"value\":\"after\"}' \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND entity_id = 'entity-1' \
-                   AND file_id = 'lix' \
-                   AND untracked = true",
-                "version-a",
-            ),
-        )
-        .await
-        .expect("explicit untracked winner should resolve");
-
-        let rows = intended_post_state(&resolved);
-        assert_eq!(single_execution_mode(&resolved), Some(WriteMode::Untracked));
-        assert_eq!(tracked_write_lane(&resolved), None);
-        assert_eq!(
-            rows[0]
-                .values
-                .get("snapshot_content")
-                .and_then(super::text_from_value)
-                .as_deref(),
-            Some("{\"value\":\"after\"}")
-        );
-    }
-
-    #[tokio::test]
-    async fn resolves_state_update_against_visible_untracked_winner_without_selector_hint() {
-        let backend = FakeBackend {
-            change_rows: build_committed_state_change_rows(
-                "entity-1",
-                "version-a",
-                "lix",
-                "lix",
-                "{\"value\":\"tracked-before\"}",
-                None,
-                "change-1",
-                "commit-1",
-            ),
-            untracked_rows: build_untracked_state_rows(
-                "entity-1",
-                "version-a",
-                "lix",
-                "lix",
-                "{\"value\":\"untracked-before\"}",
-                None,
-            ),
-            ..FakeBackend::default()
-        };
-        let resolved = resolve_write_plan(
-            &backend,
-            &planned_write(
-                "UPDATE lix_state \
-                 SET snapshot_content = '{\"value\":\"after\"}' \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND entity_id = 'entity-1' \
-                   AND file_id = 'lix'",
-                "version-a",
-            ),
-        )
-        .await
-        .expect("visible untracked winner should resolve");
-
-        let rows = intended_post_state(&resolved);
-        assert_eq!(single_execution_mode(&resolved), Some(WriteMode::Untracked));
-        assert_eq!(tracked_write_lane(&resolved), None);
-        assert_eq!(
-            rows[0]
-                .values
-                .get("snapshot_content")
-                .and_then(super::text_from_value)
-                .as_deref(),
-            Some("{\"value\":\"after\"}")
-        );
-    }
-
-    #[tokio::test]
-    async fn resolves_directory_delete_cascade_from_authoritative_pre_state() {
-        #[derive(Default)]
-        struct FilesystemDeleteBackend;
-
-        #[async_trait(?Send)]
-        impl LixBackend for FilesystemDeleteBackend {
-            fn dialect(&self) -> SqlDialect {
-                SqlDialect::Sqlite
-            }
-
-            async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-                let sql_lower = sql.to_ascii_lowercase();
-
-                if sql_lower.contains("id = 'dir-root'") {
-                    return Ok(QueryResult {
-                        rows: vec![vec![
-                            Value::Text("dir-root".to_string()),
-                            Value::Null,
-                            Value::Text("root".to_string()),
-                            Value::Text("/root/".to_string()),
-                            Value::Boolean(false),
-                            Value::Text("version-a".to_string()),
-                            Value::Boolean(false),
-                            Value::Null,
-                            Value::Text("change-dir-root".to_string()),
-                        ]],
-                        columns: vec![
-                            "id".to_string(),
-                            "parent_id".to_string(),
-                            "name".to_string(),
-                            "path".to_string(),
-                            "hidden".to_string(),
-                            "lixcol_version_id".to_string(),
-                            "lixcol_untracked".to_string(),
-                            "lixcol_metadata".to_string(),
-                            "lixcol_change_id".to_string(),
-                        ],
-                    });
-                }
-
-                if sql_lower.contains("substr(path, 1, 6) = '/root/'") {
-                    if sql_lower.contains("parent_id") {
-                        return Ok(QueryResult {
-                            rows: vec![
-                                vec![
-                                    Value::Text("dir-root".to_string()),
-                                    Value::Null,
-                                    Value::Text("root".to_string()),
-                                    Value::Text("/root/".to_string()),
-                                    Value::Boolean(false),
-                                    Value::Text("version-a".to_string()),
-                                    Value::Boolean(false),
-                                    Value::Null,
-                                    Value::Text("change-dir-root".to_string()),
-                                ],
-                                vec![
-                                    Value::Text("dir-child".to_string()),
-                                    Value::Text("dir-root".to_string()),
-                                    Value::Text("child".to_string()),
-                                    Value::Text("/root/child/".to_string()),
-                                    Value::Boolean(false),
-                                    Value::Text("version-a".to_string()),
-                                    Value::Boolean(false),
-                                    Value::Null,
-                                    Value::Text("change-dir-child".to_string()),
-                                ],
-                            ],
-                            columns: vec![
-                                "id".to_string(),
-                                "parent_id".to_string(),
-                                "name".to_string(),
-                                "path".to_string(),
-                                "hidden".to_string(),
-                                "lixcol_version_id".to_string(),
-                                "lixcol_untracked".to_string(),
-                                "lixcol_metadata".to_string(),
-                                "lixcol_change_id".to_string(),
-                            ],
-                        });
-                    }
-
-                    if sql_lower.contains("directory_id") {
-                        return Ok(QueryResult {
-                            rows: vec![vec![
-                                Value::Text("file-1".to_string()),
-                                Value::Text("dir-child".to_string()),
-                                Value::Text("note".to_string()),
-                                Value::Text("txt".to_string()),
-                                Value::Text("/root/child/note.txt".to_string()),
-                                Value::Boolean(false),
-                                Value::Text("version-a".to_string()),
-                                Value::Boolean(false),
-                                Value::Null,
-                                Value::Text("change-file-1".to_string()),
-                            ]],
-                            columns: vec![
-                                "id".to_string(),
-                                "directory_id".to_string(),
-                                "name".to_string(),
-                                "extension".to_string(),
-                                "path".to_string(),
-                                "hidden".to_string(),
-                                "lixcol_version_id".to_string(),
-                                "lixcol_untracked".to_string(),
-                                "metadata".to_string(),
-                                "lixcol_change_id".to_string(),
-                            ],
-                        });
-                    }
-                }
-
-                if sql.contains(
-                    "SELECT id, parent_id, name, path, hidden, lixcol_version_id, lixcol_untracked, lixcol_metadata, lixcol_change_id",
-                ) {
-                    let rows = if sql_lower.contains("id = 'dir-root'") {
-                        vec![vec![
-                            Value::Text("dir-root".to_string()),
-                            Value::Null,
-                            Value::Text("root".to_string()),
-                            Value::Text("/root/".to_string()),
-                            Value::Boolean(false),
-                            Value::Text("version-a".to_string()),
-                            Value::Boolean(false),
-                            Value::Null,
-                            Value::Text("change-dir-root".to_string()),
-                        ]]
-                    } else if sql_lower.contains("substr(path, 1, 6) = '/root/'") {
-                        vec![
-                            vec![
-                                Value::Text("dir-root".to_string()),
-                                Value::Null,
-                                Value::Text("root".to_string()),
-                                Value::Text("/root/".to_string()),
-                                Value::Boolean(false),
-                                Value::Text("version-a".to_string()),
-                                Value::Boolean(false),
-                                Value::Null,
-                                Value::Text("change-dir-root".to_string()),
-                            ],
-                            vec![
-                                Value::Text("dir-child".to_string()),
-                                Value::Text("dir-root".to_string()),
-                                Value::Text("child".to_string()),
-                                Value::Text("/root/child/".to_string()),
-                                Value::Boolean(false),
-                                Value::Text("version-a".to_string()),
-                                Value::Boolean(false),
-                                Value::Null,
-                                Value::Text("change-dir-child".to_string()),
-                            ],
-                        ]
-                    } else {
-                        Vec::new()
-                    };
-                    return Ok(QueryResult {
-                        rows,
-                        columns: vec![
-                            "id".to_string(),
-                            "parent_id".to_string(),
-                            "name".to_string(),
-                            "path".to_string(),
-                            "hidden".to_string(),
-                            "lixcol_version_id".to_string(),
-                            "lixcol_untracked".to_string(),
-                            "lixcol_metadata".to_string(),
-                            "lixcol_change_id".to_string(),
-                        ],
-                    });
-                }
-
-                if sql.contains(
-                    "SELECT id, directory_id, name, extension, path, hidden, lixcol_version_id, lixcol_untracked, metadata, lixcol_change_id",
-                ) {
-                    let rows = if sql_lower.contains("substr(path, 1, 6) = '/root/'") {
-                        vec![vec![
-                            Value::Text("file-1".to_string()),
-                            Value::Text("dir-child".to_string()),
-                            Value::Text("note".to_string()),
-                            Value::Text("txt".to_string()),
-                            Value::Text("/root/child/note.txt".to_string()),
-                            Value::Boolean(false),
-                            Value::Text("version-a".to_string()),
-                            Value::Boolean(false),
-                            Value::Null,
-                            Value::Text("change-file-1".to_string()),
-                        ]]
-                    } else {
-                        Vec::new()
-                    };
-                    return Ok(QueryResult {
-                        rows,
-                        columns: vec![
-                            "id".to_string(),
-                            "directory_id".to_string(),
-                            "name".to_string(),
-                            "extension".to_string(),
-                            "path".to_string(),
-                            "hidden".to_string(),
-                            "lixcol_version_id".to_string(),
-                            "lixcol_untracked".to_string(),
-                            "metadata".to_string(),
-                            "lixcol_change_id".to_string(),
-                        ],
-                    });
-                }
-
-                Ok(QueryResult {
-                    rows: Vec::new(),
-                    columns: Vec::new(),
-                })
-            }
-
-            async fn begin_transaction(
-                &self,
-            ) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
-                Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "transactions are not needed in this test backend".to_string(),
-                })
-            }
-        }
-
-        let backend = FilesystemDeleteBackend;
-        let resolved = resolve_write_plan(
-            &backend,
-            &planned_write(
-                "DELETE FROM lix_directory_by_version \
-                 WHERE id = 'dir-root' \
-                   AND lixcol_version_id = 'version-a'",
-                "main",
-            ),
-        )
-        .await
-        .expect("directory delete should resolve through public lowering");
-
-        let authoritative = authoritative_pre_state(&resolved);
-        let rows = intended_post_state(&resolved);
-        let deleted = tombstones(&resolved);
-        assert_eq!(
-            tracked_write_lane(&resolved),
-            Some(WriteLane::SingleVersion("version-a".into()))
-        );
-        assert!(authoritative.len() >= 4);
-        assert!(rows.len() >= 4);
-        assert!(deleted.len() >= 4);
-        assert!(rows.iter().all(|row| row.tombstone));
-        assert!(rows
-            .iter()
-            .any(|row| row.schema_key == "lix_directory_descriptor"));
-        assert!(rows
-            .iter()
-            .any(|row| row.schema_key == "lix_file_descriptor"));
-        assert!(rows
-            .iter()
-            .any(|row| row.schema_key == "lix_binary_blob_ref"));
-    }
 }

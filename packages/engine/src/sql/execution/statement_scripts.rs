@@ -34,9 +34,11 @@ impl Engine {
     ) -> Result<ExecuteResult, LixError> {
         let mut transaction = self.backend.begin_transaction().await?;
         let mut active_version_id = self.require_active_version_id()?;
+        let mut public_surface_registry = self.public_surface_registry();
         let starting_active_version_id = active_version_id.clone();
         let mut pending_state_commit_stream_changes = Vec::new();
         let mut pending_public_append_session = None;
+        let mut public_surface_registry_dirty = false;
         let installed_plugins_cache_invalidation_pending =
             should_invalidate_installed_plugins_cache_for_statements(&statements);
         let result = self
@@ -46,6 +48,8 @@ impl Engine {
                 params,
                 options,
                 allow_internal_tables,
+                &mut public_surface_registry,
+                &mut public_surface_registry_dirty,
                 &mut active_version_id,
                 &mut pending_state_commit_stream_changes,
                 &mut pending_public_append_session,
@@ -73,6 +77,9 @@ impl Engine {
         if installed_plugins_cache_invalidation_pending {
             self.invalidate_installed_plugins_cache()?;
         }
+        if public_surface_registry_dirty {
+            self.refresh_public_surface_registry().await?;
+        }
         self.emit_state_commit_stream_changes(pending_state_commit_stream_changes);
         Ok(result)
     }
@@ -84,6 +91,8 @@ impl Engine {
         params: &[Value],
         options: &ExecuteOptions,
         allow_internal_tables: bool,
+        public_surface_registry: &mut crate::sql::public::catalog::SurfaceRegistry,
+        public_surface_registry_dirty: &mut bool,
         active_version_id: &mut String,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
         pending_public_append_session: &mut Option<
@@ -130,6 +139,8 @@ impl Engine {
                     &statement_params,
                     options,
                     allow_internal_tables,
+                    public_surface_registry,
+                    public_surface_registry_dirty,
                     active_version_id,
                     deferred_side_effects.as_mut(),
                     true,
@@ -144,6 +155,8 @@ impl Engine {
                     &statement_params,
                     options,
                     allow_internal_tables,
+                    public_surface_registry,
+                    public_surface_registry_dirty,
                     active_version_id,
                     None,
                     false,

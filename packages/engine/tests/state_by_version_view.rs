@@ -861,6 +861,126 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_by_version_update_missing_rows_is_noop,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        insert_state_row(
+            &engine,
+            "entity-existing-noop",
+            "version-a",
+            "{\"value\":\"before\"}",
+        )
+        .await;
+        let idempotency_before = engine
+            .execute("SELECT COUNT(*) FROM lix_internal_commit_idempotency", &[])
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "UPDATE lix_state_by_version \
+                 SET snapshot_content = '{\"value\":\"after\"}' \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-missing-noop' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .expect("missing explicit-version rows should resolve as a no-op");
+
+        let rows = engine
+            .execute(
+                "SELECT entity_id, snapshot_content \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND version_id = 'version-a' \
+                 ORDER BY entity_id",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "entity-existing-noop");
+        assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"before\"}");
+
+        let idempotency = engine
+            .execute("SELECT COUNT(*) FROM lix_internal_commit_idempotency", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            idempotency.statements[0].rows[0][0],
+            idempotency_before.statements[0].rows[0][0]
+        );
+    }
+);
+
+simulation_test!(
+    lix_state_by_version_update_rejects_identity_column_mutation,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        insert_state_row(
+            &engine,
+            "entity-upd-identity",
+            "version-a",
+            "{\"value\":\"before\"}",
+        )
+        .await;
+
+        let err = engine
+            .execute(
+                "UPDATE lix_state_by_version \
+                 SET file_id = 'other-file' \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-upd-identity' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .expect_err("identity column mutation should fail");
+
+        assert!(
+            err.description
+                .contains("does not support changing 'file_id'"),
+            "unexpected error: {}",
+            err.description
+        );
+
+        let rows = engine
+            .execute(
+                "SELECT file_id, snapshot_content \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-upd-identity' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "test-file");
+        assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"before\"}");
+    }
+);
+
+simulation_test!(
     lix_state_by_version_update_records_append_idempotency,
     |sim| async move {
         let engine = sim
@@ -980,10 +1100,20 @@ simulation_test!(
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
         insert_version(&engine, "version-b").await;
-        insert_state_row(&engine, "entity-upd-multi", "version-a", "{\"value\":\"before-a\"}")
-            .await;
-        insert_state_row(&engine, "entity-upd-multi", "version-b", "{\"value\":\"before-b\"}")
-            .await;
+        insert_state_row(
+            &engine,
+            "entity-upd-multi",
+            "version-a",
+            "{\"value\":\"before-a\"}",
+        )
+        .await;
+        insert_state_row(
+            &engine,
+            "entity-upd-multi",
+            "version-b",
+            "{\"value\":\"before-b\"}",
+        )
+        .await;
 
         engine
             .execute(
@@ -1356,10 +1486,20 @@ simulation_test!(
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
         insert_version(&engine, "version-b").await;
-        insert_state_row(&engine, "entity-del-multi", "version-a", "{\"value\":\"before-a\"}")
-            .await;
-        insert_state_row(&engine, "entity-del-multi", "version-b", "{\"value\":\"before-b\"}")
-            .await;
+        insert_state_row(
+            &engine,
+            "entity-del-multi",
+            "version-a",
+            "{\"value\":\"before-a\"}",
+        )
+        .await;
+        insert_state_row(
+            &engine,
+            "entity-del-multi",
+            "version-b",
+            "{\"value\":\"before-b\"}",
+        )
+        .await;
 
         engine
             .execute(

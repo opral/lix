@@ -97,15 +97,6 @@ pub(crate) fn bind_sql(
     bind_sql_with_state(sql, params, dialect, PlaceholderState::new())
 }
 
-pub(crate) fn bind_statement_ast(
-    statement: &mut Statement,
-    params: &[Value],
-    dialect: SqlDialect,
-) -> Result<Vec<Value>, LixError> {
-    bind_statement_ast_with_state(statement, params, dialect, PlaceholderState::new())
-        .map(|(_, bound_params)| bound_params)
-}
-
 pub(crate) fn bind_sql_with_state(
     sql: &str,
     params: &[Value],
@@ -150,33 +141,6 @@ pub(crate) fn bind_sql_with_state_and_appended_params(
         params: bound_params,
         state,
     })
-}
-
-pub(crate) fn bind_statement_ast_with_state(
-    statement: &mut Statement,
-    params: &[Value],
-    dialect: SqlDialect,
-    mut state: PlaceholderState,
-) -> Result<(PlaceholderState, Vec<Value>), LixError> {
-    let mut used_source_indices = Vec::new();
-    let mut source_to_dense: HashMap<usize, usize> = HashMap::new();
-    let mut visitor = PlaceholderBinder {
-        params_len: params.len(),
-        dialect,
-        state: &mut state,
-        source_to_dense: &mut source_to_dense,
-        used_source_indices: &mut used_source_indices,
-    };
-    if let ControlFlow::Break(error) = statement.visit(&mut visitor) {
-        return Err(error);
-    }
-
-    let bound_params = used_source_indices
-        .into_iter()
-        .map(|source_index| params[source_index].clone())
-        .collect();
-
-    Ok((state, bound_params))
 }
 
 #[cfg(test)]
