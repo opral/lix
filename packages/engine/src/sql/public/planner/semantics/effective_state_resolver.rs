@@ -1,5 +1,5 @@
 use crate::sql::common::dependency_spec::DependencySpec;
-use crate::sql::public::catalog::{SurfaceFamily, SurfaceVariant};
+use crate::sql::public::catalog::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
 use crate::sql::public::planner::canonicalize::CanonicalizedRead;
 use crate::sql::public::planner::ir::{CanonicalStateScan, ReadPlan, VersionScope};
 use crate::state::commit::{
@@ -115,6 +115,46 @@ pub(crate) fn build_effective_state(
     Some((request, plan))
 }
 
+pub(crate) fn build_effective_state_for_selector_read(
+    surface_binding: &SurfaceBinding,
+    selector_column: &str,
+    residual_predicates: &[Expr],
+    schema_set: BTreeSet<String>,
+) -> Option<(EffectiveStateRequest, EffectiveStatePlan)> {
+    let scan = CanonicalStateScan::from_surface_binding(surface_binding.clone())?;
+    let request = EffectiveStateRequest {
+        schema_set,
+        version_scope: scan.version_scope,
+        include_global_overlay: true,
+        include_untracked_overlay: true,
+        include_tombstones: scan.include_tombstones,
+        predicate_classes: predicate_classes_from_predicates(residual_predicates),
+        required_columns: required_columns_for_selector_read(
+            surface_binding,
+            selector_column,
+            residual_predicates,
+            &scan,
+        ),
+    };
+    let all_predicates = predicate_sql_strings(residual_predicates);
+    let pushdown_safe_predicates =
+        pushdown_safe_predicates_from_predicates(surface_binding, residual_predicates);
+    let plan = EffectiveStatePlan {
+        state_source: StateSourceAuthority::AuthoritativeCommitted,
+        overlay_lanes: overlay_lanes_for_request(&request),
+        pushdown_safe_predicates: pushdown_safe_predicates.clone(),
+        residual_predicates: all_predicates
+            .into_iter()
+            .filter(|predicate| {
+                !pushdown_safe_predicates
+                    .iter()
+                    .any(|candidate| candidate == predicate)
+            })
+            .collect(),
+    };
+    Some((request, plan))
+}
+
 fn canonical_state_scan(read_plan: &ReadPlan) -> Option<&CanonicalStateScan> {
     match read_plan {
         ReadPlan::Scan(scan) => Some(scan),
@@ -180,6 +220,31 @@ fn predicate_classes_for_read(canonicalized: &CanonicalizedRead) -> Vec<String> 
     collector.classes.into_iter().collect()
 }
 
+fn predicate_classes_from_predicates(predicates: &[Expr]) -> Vec<String> {
+    struct Collector {
+        classes: BTreeSet<String>,
+    }
+
+    impl Visitor for Collector {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if let Some(column) = filter_column_name(expr) {
+                self.classes.insert(format!("column:{column}"));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut collector = Collector {
+        classes: BTreeSet::new(),
+    };
+    for predicate in predicates {
+        let _ = predicate.visit(&mut collector);
+    }
+    collector.classes.into_iter().collect()
+}
+
 fn required_columns_for_read(
     canonicalized: &CanonicalizedRead,
     scan: &CanonicalStateScan,
@@ -204,6 +269,28 @@ fn required_columns_for_read(
         required.insert("version_id".to_string());
     }
 
+    required.into_iter().collect()
+}
+
+fn required_columns_for_selector_read(
+    surface_binding: &SurfaceBinding,
+    selector_column: &str,
+    residual_predicates: &[Expr],
+    scan: &CanonicalStateScan,
+) -> Vec<String> {
+    let mut required = BTreeSet::new();
+    required.insert(selector_column.to_string());
+    for predicate in residual_predicates {
+        collect_columns_from_expr(predicate, &mut required);
+    }
+    if required.is_empty() {
+        required.extend(surface_binding.exposed_columns.iter().cloned());
+    }
+    required.insert("entity_id".to_string());
+    required.insert("schema_key".to_string());
+    if scan.expose_version_id || scan.version_scope != VersionScope::ActiveVersion {
+        required.insert("version_id".to_string());
+    }
     required.into_iter().collect()
 }
 
@@ -684,6 +771,10 @@ fn read_predicates(canonicalized: &CanonicalizedRead) -> Vec<String> {
         .collect()
 }
 
+fn predicate_sql_strings(predicates: &[Expr]) -> Vec<String> {
+    predicates.iter().map(ToString::to_string).collect()
+}
+
 fn pushdown_safe_predicates(canonicalized: &CanonicalizedRead) -> Vec<String> {
     let family = canonicalized.surface_binding.descriptor.surface_family;
     let variant = canonicalized.surface_binding.descriptor.surface_variant;
@@ -704,6 +795,25 @@ fn pushdown_safe_predicates(canonicalized: &CanonicalizedRead) -> Vec<String> {
     };
     split_conjunctive_predicates(selection)
         .into_iter()
+        .filter(|predicate| state_predicate_is_pushdown_safe(predicate, variant))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn pushdown_safe_predicates_from_predicates(
+    surface_binding: &SurfaceBinding,
+    predicates: &[Expr],
+) -> Vec<String> {
+    let family = surface_binding.descriptor.surface_family;
+    let variant = surface_binding.descriptor.surface_variant;
+    let state_backed_history_entity =
+        family == SurfaceFamily::Entity && variant == SurfaceVariant::History;
+    if family != SurfaceFamily::State && !state_backed_history_entity {
+        return Vec::new();
+    }
+
+    predicates
+        .iter()
         .filter(|predicate| state_predicate_is_pushdown_safe(predicate, variant))
         .map(ToString::to_string)
         .collect()

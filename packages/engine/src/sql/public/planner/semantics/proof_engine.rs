@@ -47,7 +47,9 @@ pub(crate) fn prove_write(canonicalized: &CanonicalizedWrite) -> Result<PlannedW
             .write_command
             .selector
             .residual_predicates
-            .clone(),
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         backend_rejections: Vec::new(),
     })
 }

@@ -1,12 +1,14 @@
 use crate::cel::CelEvaluator;
 use crate::deterministic_mode::DeterministicSettings;
 use crate::plugin::types::InstalledPlugin;
+use crate::sql::execution::transaction_session::PublicSqlSessionState;
 use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
 use crate::state::validation::SchemaCache;
 use crate::WasmRuntime;
 use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
+use futures_util::lock::Mutex as AsyncMutex;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,7 +35,7 @@ pub struct ExecuteOptions {
 }
 
 pub struct Engine {
-    pub(crate) backend: Box<dyn LixBackend + Send + Sync>,
+    pub(crate) backend: Arc<dyn LixBackend + Send + Sync>,
     wasm_runtime: Arc<dyn WasmRuntime>,
     pub(crate) cel_evaluator: CelEvaluator,
     pub(crate) schema_cache: SchemaCache,
@@ -47,6 +49,8 @@ pub struct Engine {
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
     plugin_component_cache: Mutex<BTreeMap<String, crate::plugin::runtime::CachedPluginComponent>>,
     state_commit_stream_bus: Arc<StateCommitStreamBus>,
+    pub(crate) public_sql_state: AsyncMutex<PublicSqlSessionState>,
+    pub(crate) public_sql_transaction_open: AtomicBool,
     pub(crate) observe_shared_sources:
         Mutex<BTreeMap<String, Arc<Mutex<crate::observe::SharedObserveSource>>>>,
 }
@@ -79,6 +83,18 @@ impl Engine {
 
     pub(crate) fn access_to_internal(&self) -> bool {
         self.access_to_internal
+    }
+
+    pub(crate) fn ensure_no_open_public_sql_transaction(
+        &self,
+        operation: &str,
+    ) -> Result<(), LixError> {
+        if self.public_sql_transaction_open.load(Ordering::SeqCst) {
+            return Err(crate::errors::operation_blocked_by_active_transaction_error(
+                operation,
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn wasm_runtime_ref(&self) -> &dyn WasmRuntime {
@@ -297,7 +313,7 @@ impl Engine {
     ) -> Self {
         let deterministic_boot_pending = boot_deterministic_settings.is_some();
         Self {
-            backend: args.backend,
+            backend: Arc::from(args.backend),
             wasm_runtime: args.wasm_runtime,
             cel_evaluator: CelEvaluator::new(),
             schema_cache: SchemaCache::new(),
@@ -311,6 +327,8 @@ impl Engine {
             installed_plugins_cache: RwLock::new(None),
             plugin_component_cache: Mutex::new(BTreeMap::new()),
             state_commit_stream_bus: Arc::new(StateCommitStreamBus::default()),
+            public_sql_state: AsyncMutex::new(PublicSqlSessionState::default()),
+            public_sql_transaction_open: AtomicBool::new(false),
             observe_shared_sources: Mutex::new(BTreeMap::new()),
         }
     }

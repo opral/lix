@@ -11,6 +11,7 @@ impl Engine {
         &self,
         options: ExecuteOptions,
     ) -> Result<EngineTransaction<'_>, LixError> {
+        self.ensure_no_open_public_sql_transaction("begin_transaction")?;
         let transaction = self.backend.begin_transaction().await?;
         Ok(EngineTransaction {
             engine: self,

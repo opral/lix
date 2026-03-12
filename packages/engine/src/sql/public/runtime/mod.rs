@@ -12,12 +12,12 @@ use crate::sql::execution::contracts::result_contract::ResultContract;
 use crate::sql::execution::intent::authoritative_pending_file_write_targets;
 use crate::sql::public::backend::PushdownDecision;
 use crate::sql::public::catalog::{
-    SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
+    SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
 use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
 use crate::sql::public::planner::backend::lowerer::{
-    lower_read_for_execution, rewrite_supported_public_read_surfaces_in_statement_with_registry,
-    LoweredReadProgram,
+    lower_read_for_execution, lower_selector_read_for_execution,
+    rewrite_supported_public_read_surfaces_in_statement_with_registry, LoweredReadProgram,
 };
 use crate::sql::public::planner::canonicalize::{
     canonicalize_read, canonicalize_write, CanonicalizedRead, CanonicalizedWrite,
@@ -34,7 +34,8 @@ use crate::sql::public::planner::semantics::domain_changes::{
     build_domain_change_batch, derive_commit_preconditions, DomainChangeBatch,
 };
 use crate::sql::public::planner::semantics::effective_state_resolver::{
-    build_effective_state, EffectiveStatePlan, EffectiveStateRequest,
+    build_effective_state, build_effective_state_for_selector_read, EffectiveStatePlan,
+    EffectiveStateRequest,
 };
 use crate::sql::public::planner::semantics::proof_engine::prove_write;
 use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan;
@@ -51,7 +52,7 @@ use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot,
 };
-use crate::{LixBackend, LixError, Value};
+use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
     JoinConstraint, JoinOperator, LimitClause, ObjectNamePart, OrderBy, OrderByExpr, Query, Select,
@@ -446,6 +447,25 @@ pub(crate) async fn prepare_sql2_read_strict(
         params,
         active_version_id,
         writer_key,
+    )
+    .await
+}
+
+pub(crate) async fn execute_selector_read_strict(
+    backend: &dyn LixBackend,
+    surface_binding: &SurfaceBinding,
+    selector_column: &str,
+    residual_predicates: &[Expr],
+    schema_key_hint: Option<&str>,
+    params: &[Value],
+) -> Result<QueryResult, LixError> {
+    read::execute_selector_read_strict(
+        backend,
+        surface_binding,
+        selector_column,
+        residual_predicates,
+        schema_key_hint,
+        params,
     )
     .await
 }

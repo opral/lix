@@ -3,6 +3,7 @@ use crate::sql::public::catalog::{
 };
 use crate::sql::public::core::contracts::ExecutionContext;
 use crate::Value;
+use sqlparser::ast::Expr;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,7 +293,7 @@ pub(crate) struct InsertOnConflict {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct WriteSelector {
-    pub(crate) residual_predicates: Vec<String>,
+    pub(crate) residual_predicates: Vec<Expr>,
     pub(crate) exact_filters: BTreeMap<String, Value>,
     pub(crate) exact_only: bool,
 }

@@ -27,6 +27,7 @@ use crate::version::{
     version_pointer_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::LixError;
+use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
     JoinConstraint, JoinOperator, LimitClause, OrderBy, OrderByExpr, Query, Select, SelectItem,
@@ -128,6 +129,69 @@ pub(crate) fn lower_read_for_execution(
     }
 }
 
+pub(crate) fn lower_selector_read_for_execution(
+    surface_binding: &SurfaceBinding,
+    selector_column: &str,
+    residual_predicates: &[Expr],
+    effective_state_request: &EffectiveStateRequest,
+    effective_state_plan: &EffectiveStatePlan,
+) -> Result<Option<LoweredReadProgram>, LixError> {
+    let pushdown_predicates = effective_state_plan.pushdown_safe_predicates.clone();
+    let mut residual_predicates = residual_predicates.to_vec();
+    for predicate in &mut residual_predicates {
+        rewrite_nested_filesystem_surfaces_in_expr(predicate)?;
+    }
+    let residual_selection =
+        selector_residual_selection(&residual_predicates, effective_state_plan);
+    let pushdown_decision = build_pushdown_decision(effective_state_plan);
+
+    match surface_binding.descriptor.surface_family {
+        SurfaceFamily::State => {
+            if let Some(error) = state_read_exposed_column_error(surface_binding, effective_state_request)
+            {
+                return Err(error);
+            }
+            let Some(source_query) = build_state_source_query(
+                surface_binding,
+                effective_state_request,
+                &pushdown_predicates,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(LoweredReadProgram {
+                statements: vec![build_selector_query_statement(
+                    surface_binding,
+                    selector_column,
+                    source_query,
+                    residual_selection,
+                )],
+                pushdown_decision,
+            }))
+        }
+        SurfaceFamily::Entity => {
+            let Some(source_query) = build_entity_source_query(
+                surface_binding,
+                effective_state_request,
+                &pushdown_predicates,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(LoweredReadProgram {
+                statements: vec![build_selector_query_statement(
+                    surface_binding,
+                    selector_column,
+                    source_query,
+                    residual_selection,
+                )],
+                pushdown_decision,
+            }))
+        }
+        SurfaceFamily::Filesystem | SurfaceFamily::Admin | SurfaceFamily::Change => Ok(None),
+    }
+}
+
 fn lower_state_read_for_execution(
     canonicalized: &CanonicalizedRead,
     effective_state_request: &EffectiveStateRequest,
@@ -173,6 +237,62 @@ fn lower_state_read_for_execution(
     select.selection = residual_selection;
 
     Ok(Some(Statement::Query(query)))
+}
+
+fn build_selector_query_statement(
+    surface_binding: &SurfaceBinding,
+    selector_column: &str,
+    source_query: Query,
+    selection: Option<Expr>,
+) -> Statement {
+    Statement::Query(Box::new(Query {
+        with: None,
+        body: Box::new(SetExpr::Select(Box::new(Select {
+            select_token: AttachedToken::empty(),
+            distinct: None,
+            top: None,
+            top_before_distinct: false,
+            projection: vec![SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(
+                selector_column,
+            )))],
+            exclude: None,
+            into: None,
+            from: vec![TableWithJoins {
+                relation: TableFactor::Derived {
+                    lateral: false,
+                    subquery: Box::new(source_query),
+                    alias: Some(TableAlias {
+                        explicit: false,
+                        name: Ident::new(&surface_binding.descriptor.public_name),
+                        columns: Vec::new(),
+                    }),
+                },
+                joins: Vec::new(),
+            }],
+            lateral_views: Vec::new(),
+            prewhere: None,
+            selection,
+            group_by: GroupByExpr::Expressions(Vec::new(), Vec::new()),
+            cluster_by: Vec::new(),
+            distribute_by: Vec::new(),
+            sort_by: Vec::new(),
+            having: None,
+            named_window: Vec::new(),
+            qualify: None,
+            window_before_qualify: false,
+            value_table_mode: None,
+            connect_by: None,
+            flavor: sqlparser::ast::SelectFlavor::Standard,
+        }))),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    }))
 }
 
 fn state_read_exposed_column_error(
@@ -2296,6 +2416,25 @@ fn build_pushdown_decision(effective_state_plan: &EffectiveStatePlan) -> Pushdow
             .collect(),
         residual_predicates: effective_state_plan.residual_predicates.clone(),
     }
+}
+
+fn selector_residual_selection(
+    residual_predicates: &[Expr],
+    effective_state_plan: &EffectiveStatePlan,
+) -> Option<Expr> {
+    combine_conjunctive_predicates(
+        residual_predicates
+            .iter()
+            .filter(|predicate| {
+                let predicate_sql = predicate.to_string();
+                !effective_state_plan
+                    .pushdown_safe_predicates
+                    .iter()
+                    .any(|candidate| candidate == &predicate_sql)
+            })
+            .cloned()
+            .collect(),
+    )
 }
 
 fn change_pushdown_decision(canonicalized: &CanonicalizedRead) -> PushdownDecision {

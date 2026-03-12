@@ -6,6 +6,7 @@ use crate::errors;
 use crate::sql::execution::execute;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path;
+use crate::sql::execution::transaction_session::execute_public_sql;
 use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
 use crate::state::materialization::{
     MaterializationApplyReport, MaterializationPlan, MaterializationReport, MaterializationRequest,
@@ -98,7 +99,16 @@ impl Engine {
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
-        self.execute_impl_sql(sql, params, options, false).await
+        let mut state = self.public_sql_state.lock().await;
+        execute_public_sql(
+            self,
+            &mut state,
+            &self.public_sql_transaction_open,
+            sql,
+            params,
+            options,
+        )
+        .await
     }
 
     pub(crate) async fn execute_internal(
@@ -286,6 +296,7 @@ impl Engine {
     }
 
     pub async fn create_checkpoint(&self) -> Result<crate::CreateCheckpointResult, LixError> {
+        self.ensure_no_open_public_sql_transaction("create_checkpoint")?;
         crate::state::checkpoint::create_checkpoint(self).await
     }
 
@@ -293,10 +304,12 @@ impl Engine {
         &self,
         options: crate::CreateVersionOptions,
     ) -> Result<crate::CreateVersionResult, LixError> {
+        self.ensure_no_open_public_sql_transaction("create_version")?;
         crate::version::create_version(self, options).await
     }
 
     pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
+        self.ensure_no_open_public_sql_transaction("switch_version")?;
         crate::version::switch_version(self, version_id).await
     }
 
@@ -305,6 +318,7 @@ impl Engine {
         &self,
         writer: &mut dyn crate::SnapshotChunkWriter,
     ) -> Result<(), LixError> {
+        self.ensure_no_open_public_sql_transaction("export_snapshot")?;
         self.backend.export_snapshot(writer).await
     }
 

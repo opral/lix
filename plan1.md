@@ -375,6 +375,199 @@ Tasks:
 - Shared contract test matrix.
 - Reduced engine crate-root public exports.
 
+## Plan: Separate Execute Transaction Control
+
+### Objective
+
+Add support for transaction control across separate `execute()` calls so this flow works on one `Lix` / `Engine` instance:
+
+- `execute("BEGIN;")`
+- `execute("INSERT ...")`
+- `execute("INSERT ...")`
+- `execute("COMMIT;")`
+
+The goal is to make transaction scope session-like instead of single-call-only, while keeping the current explicit transaction-script path (`BEGIN; ... COMMIT;` in one call) working.
+
+### Important Architecture Note
+
+The current Kysely environment driver in `packages/sdk` already emits raw transaction SQL:
+
+- `begin`
+- `commit`
+- `rollback`
+- nested `savepoint` / `release savepoint` / `rollback to savepoint`
+
+That code lives in `packages/sdk/src/database/sqlite/environment-dialect.ts`.
+
+However, that driver currently talks to the TypeScript engine through `lix_execute_sync` in `packages/sdk/src/engine/functions/register-builtins.ts`, not directly to the Rust engine.
+
+That means there are two distinct integration options:
+
+1. Implement the feature in the Rust engine and also move JS Kysely to a Rust-backed execution path.
+2. Implement the same feature in the TypeScript engine if the immediate goal is to fix the current `packages/sdk` Kysely path.
+
+If the goal is specifically the newer Rust-backed JS SDK, the Rust engine plan below is the right one. If the goal is the current `packages/sdk` Kysely runtime, the same semantics must also exist in the TypeScript engine or the driver must be rewired.
+
+### Current Confirmed Behavior
+
+The current Rust engine behavior is now covered by tests:
+
+- separate `BEGIN` is rejected
+- separate `COMMIT` is rejected
+- writes between them commit independently
+- single-call `BEGIN; ... COMMIT;` scripts still work
+
+### Scope Decision
+
+First pass should support top-level transaction control only:
+
+- `BEGIN`
+- `COMMIT`
+- `ROLLBACK`
+
+Do not make nested transactions part of the first implementation.
+
+For nested Kysely transactions:
+
+- either explicitly reject them in the driver for now
+- or add `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT` in a follow-up
+
+### Phase 1: Introduce Session Transaction State In The Rust Engine
+
+Add engine-owned state for one active session transaction per `Engine` / `Lix` instance.
+
+That state should hold:
+
+- the backend transaction object
+- current active version id
+- starting active version id
+- pending state commit stream changes
+- pending SQL2 append session
+- plugin cache invalidation flag
+- any other commit-finalization state currently tracked by `EngineTransaction`
+
+This should be stored in a synchronization primitive so separate async `execute()` calls can reuse the same open transaction safely.
+
+### Phase 2: Serialize Public Execute Operations Per Engine Session
+
+Separate-call transaction control only works predictably if execution on a single session is ordered.
+
+Add a session operation lock / queue so:
+
+- `BEGIN`
+- statements inside the open transaction
+- `COMMIT` or `ROLLBACK`
+
+are processed in a deterministic order for one `Engine` / `Lix` instance.
+
+This aligns with session/connection semantics and matches what the JS wrapper already approximates with its operation queue.
+
+### Phase 3: Route Transaction Control Statements In `execute_impl_sql`
+
+Update `packages/engine/src/api.rs` so public `execute()`:
+
+1. detects single-statement `BEGIN` / `COMMIT` / `ROLLBACK`
+2. routes them to the session transaction manager instead of rejecting them
+3. routes normal statements through the active session transaction when one exists
+4. preserves the current one-call `BEGIN; ... COMMIT;` script behavior when no session transaction is open
+
+Rules to enforce:
+
+- `BEGIN` when no session transaction is open: open one
+- `BEGIN` when one is already open: reject as nested transaction
+- `COMMIT` / `ROLLBACK` with no open session transaction: reject
+- transaction control inside a session script: reject unless explicitly supported later
+
+### Phase 4: Reuse Existing In-Transaction Execution Helpers
+
+Do not create a second execution path.
+
+Reuse:
+
+- `execute_with_options_in_transaction`
+- `execute_statement_script_with_options_in_transaction`
+- existing runtime side-effect flushing
+- existing active-version tracking
+
+The main refactor here is to extract commit/rollback finalization logic currently duplicated across:
+
+- `EngineTransaction::commit`
+- `execute_statement_script_with_options`
+
+into shared helpers used by:
+
+- explicit transaction API
+- one-call transaction scripts
+- new session transaction control
+
+### Phase 5: Define Behavior For Other Public `Lix` Methods During An Open SQL Transaction
+
+Methods like these currently manage their own transactions internally:
+
+- `create_version`
+- `switch_version`
+- `create_checkpoint`
+- `install_plugin`
+
+First pass should not silently nest them inside an open SQL session transaction.
+
+Recommended rule:
+
+- if a session transaction is open, these methods return a clear error like "not supported while an explicit SQL transaction is open"
+
+That avoids accidental nested transaction behavior while keeping the first implementation small and predictable.
+
+### Phase 6: Kysely Integration Decision
+
+For the current `packages/sdk` Kysely path:
+
+- top-level transactions should work once the underlying engine used by `lix_execute_sync` supports separate-call transaction control
+- nested transactions still need a decision
+
+Recommended first-pass Kysely behavior:
+
+- allow top-level `db.transaction().execute(...)`
+- explicitly reject nested transactions in the driver until savepoints are supported end to end
+
+If moving Kysely onto the Rust-backed JS SDK instead:
+
+- create a driver/connection that maps `CompiledQuery.raw("begin")`, `commit`, and `rollback` to `lix.execute(...)`
+- reuse the same session transaction semantics there
+
+### Phase 7: Tests
+
+Rust engine tests:
+
+- `BEGIN` + writes + `COMMIT` persists changes
+- `BEGIN` + writes + `ROLLBACK` discards changes
+- `BEGIN` twice is rejected
+- `COMMIT` / `ROLLBACK` without `BEGIN` is rejected
+- one-call `BEGIN; ... COMMIT;` remains working
+- open session transaction blocks or serializes concurrent execute calls predictably
+
+Rust SDK tests:
+
+- same top-level transaction behavior through `Lix`
+
+JS SDK tests:
+
+- same top-level transaction behavior through `openLix()`
+
+Kysely integration tests:
+
+- `db.transaction().execute(...)` commits on success
+- `db.transaction().execute(...)` rolls back on thrown error
+- nested transactions either work with savepoints or fail with an explicit not-supported error
+
+### Recommended Implementation Order
+
+1. Implement session transaction state and routing in the Rust engine.
+2. Extract shared transaction-finalization helpers.
+3. Add engine tests for separate-call `BEGIN` / `COMMIT` / `ROLLBACK`.
+4. Decide and enforce first-pass behavior for nested transactions.
+5. Wire the chosen JS Kysely path to the new semantics.
+6. Add integration tests at the Kysely layer.
+
 ## Progress Log
 
 - 2026-03-12: Created `plan1.md` with initial implementation plan and checkpoint log section.
@@ -384,3 +577,4 @@ Tasks:
 - 2026-03-12: Verified the new contract with `cargo test -p lix_rs_sdk`, `cargo test -p lix_engine --test transaction_execution`, `pnpm --filter @lix-js/sdk typecheck`, and `pnpm --filter @lix-js/sdk test`.
 - 2026-03-12: Pruned the engine crate root to remove unused SDK-facing exports (`EngineConfig`, `OpenOrInitResult`, `EngineTransactionFuture`, `observe_owned`, commit-generation exports, root `Wire*`, and root `ErrorCode`), moved JS to `lix_engine::wire`, and removed dead transaction-handle plumbing plus the unused `Engine::init` path.
 - 2026-03-12: Re-verified the narrower engine surface with `cargo test -p lix_engine --tests --no-run`, `cargo test -p lix_engine --test transaction_execution`, `cargo test -p lix_rs_sdk`, and `pnpm --filter @lix-js/sdk test`. `cargo bench -p lix_engine --no-run` still fails because several bench files use a stale `ExecuteResult.rows` shape unrelated to this API-pruning pass.
+- 2026-03-12: Added contract tests in engine, rs-sdk, and js-sdk showing that separate `execute("BEGIN;") ... execute("COMMIT;")` calls do not form a transaction: `BEGIN` and `COMMIT` are rejected, and intermediate writes commit independently.
