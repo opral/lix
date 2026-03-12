@@ -4,12 +4,13 @@ mod wasm {
     use futures_util::future::{AbortHandle, Abortable};
     use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
-        observe_owned, BootKeyValue, CreateCheckpointResult, CreateVersionOptions,
-        CreateVersionResult, EngineConfig, ExecuteOptions, ExecuteResult as EngineExecuteResult,
-        LixBackend, LixError, LixTransaction, ObserveEvent as EngineObserveEvent,
-        ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
-        QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect, Value as EngineValue,
-        WasmComponentInstance, WasmLimits, WasmRuntime, WireQueryResult, WireValue,
+        BootKeyValue, CreateCheckpointResult, CreateVersionOptions, CreateVersionResult,
+        ExecuteOptions, ExecuteResult as EngineExecuteResult, InitResult as EngineInitResult,
+        Lix as CoreLix, LixBackend, LixConfig, LixError, LixTransaction,
+        ObserveEvent as EngineObserveEvent, ObserveEventsOwned as EngineObserveEvents,
+        ObserveQuery as EngineObserveQuery, QueryResult as EngineQueryResult, SnapshotChunkWriter,
+        SqlDialect, Value as EngineValue, WasmComponentInstance, WasmLimits, WasmRuntime,
+        WireQueryResult, WireValue,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -133,14 +134,7 @@ export type LixObserveEvents = {
 
     #[wasm_bindgen]
     pub struct Lix {
-        engine: Arc<lix_engine::Engine>,
-    }
-
-    #[wasm_bindgen(js_name = SqlTransaction)]
-    pub struct JsSqlTransaction {
-        engine: Arc<lix_engine::Engine>,
-        handle: u64,
-        closed: AtomicBool,
+        lix: Arc<CoreLix>,
     }
 
     #[wasm_bindgen(js_name = ObserveEvents)]
@@ -166,42 +160,23 @@ export type LixObserveEvents = {
             }
             let execute_options = parse_execute_options(options, "execute").map_err(js_error)?;
             let result = self
-                .engine
+                .lix
                 .execute_with_options(&sql, &values, execute_options)
                 .await
                 .map_err(js_error)?;
             execute_result_to_js(result).map_err(js_error)
         }
 
-        #[wasm_bindgen(js_name = beginTransaction)]
-        pub async fn begin_transaction(
-            &self,
-            options: Option<JsValue>,
-        ) -> Result<JsSqlTransaction, JsValue> {
-            let execute_options =
-                parse_execute_options(options, "beginTransaction").map_err(js_error)?;
-            let handle = self
-                .engine
-                .begin_transaction_handle_with_options(execute_options)
-                .await
-                .map_err(js_error)?;
-            Ok(JsSqlTransaction {
-                engine: Arc::clone(&self.engine),
-                handle,
-                closed: AtomicBool::new(false),
-            })
-        }
-
         #[wasm_bindgen(js_name = installPlugin)]
         pub async fn install_plugin(&self, archive_bytes: Uint8Array) -> Result<(), JsValue> {
             let mut bytes = vec![0u8; archive_bytes.length() as usize];
             archive_bytes.copy_to(&mut bytes);
-            self.engine.install_plugin(&bytes).await.map_err(js_error)
+            self.lix.install_plugin(&bytes).await.map_err(js_error)
         }
 
         #[wasm_bindgen(js_name = createCheckpoint)]
         pub async fn create_checkpoint(&self) -> Result<JsValue, JsValue> {
-            let result = self.engine.create_checkpoint().await.map_err(js_error)?;
+            let result = self.lix.create_checkpoint().await.map_err(js_error)?;
             Ok(create_checkpoint_result_to_js(result).into())
         }
 
@@ -209,7 +184,7 @@ export type LixObserveEvents = {
         pub async fn create_version(&self, args: JsValue) -> Result<JsValue, JsValue> {
             let options = parse_create_version_options(args).map_err(js_error)?;
             let result = self
-                .engine
+                .lix
                 .create_version(options)
                 .await
                 .map_err(js_error)?;
@@ -218,7 +193,7 @@ export type LixObserveEvents = {
 
         #[wasm_bindgen(js_name = switchVersion)]
         pub async fn switch_version(&self, version_id: String) -> Result<(), JsValue> {
-            self.engine
+            self.lix
                 .switch_version(version_id)
                 .await
                 .map_err(js_error)
@@ -226,18 +201,14 @@ export type LixObserveEvents = {
 
         #[wasm_bindgen(js_name = exportSnapshot)]
         pub async fn export_snapshot(&self) -> Result<Uint8Array, JsValue> {
-            let mut writer = VecSnapshotWriter::default();
-            self.engine
-                .export_snapshot(&mut writer)
-                .await
-                .map_err(js_error)?;
-            Ok(Uint8Array::from(writer.bytes.as_slice()))
+            let bytes = self.lix.export_snapshot().await.map_err(js_error)?;
+            Ok(Uint8Array::from(bytes.as_slice()))
         }
 
         #[wasm_bindgen(js_name = observe)]
         pub fn observe(&self, query: JsValue) -> Result<JsObserveEvents, JsValue> {
             let query = parse_observe_query(query).map_err(js_error)?;
-            let events = observe_owned(Arc::clone(&self.engine), query).map_err(js_error)?;
+            let events = self.lix.observe(query).map_err(js_error)?;
             Ok(JsObserveEvents {
                 inner: std::sync::Mutex::new(Some(events)),
                 in_flight_next_abort: std::sync::Mutex::new(None),
@@ -368,86 +339,15 @@ export type LixObserveEvents = {
         }
     }
 
-    #[wasm_bindgen(js_class = SqlTransaction)]
-    impl JsSqlTransaction {
-        #[wasm_bindgen(js_name = execute)]
-        pub async fn execute(&self, sql: String, params: JsValue) -> Result<JsValue, JsValue> {
-            if self.closed.load(Ordering::SeqCst) {
-                return Err(js_error(LixError {
-                    code: "LIX_ERROR_JS_SDK".to_string(),
-                    description: "transaction is already closed".to_string(),
-                }));
-            }
-            let params = Array::from(&params);
-            let mut values = Vec::new();
-            for value in params.iter() {
-                values.push(value_from_js(value).map_err(js_error)?);
-            }
-            let result = self
-                .engine
-                .execute_in_transaction_handle(self.handle, &sql, &values)
-                .await
-                .map_err(js_error)?;
-            execute_result_to_js(result).map_err(js_error)
-        }
-
-        #[wasm_bindgen(js_name = commit)]
-        pub async fn commit(&self) -> Result<(), JsValue> {
-            if self.closed.swap(true, Ordering::SeqCst) {
-                return Ok(());
-            }
-            self.engine
-                .commit_transaction_handle(self.handle)
-                .await
-                .map_err(js_error)?;
-            Ok(())
-        }
-
-        #[wasm_bindgen(js_name = rollback)]
-        pub async fn rollback(&self) -> Result<(), JsValue> {
-            if self.closed.swap(true, Ordering::SeqCst) {
-                return Ok(());
-            }
-            self.engine
-                .rollback_transaction_handle(self.handle)
-                .await
-                .map_err(js_error)?;
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct VecSnapshotWriter {
-        bytes: Vec<u8>,
-    }
-
-    #[async_trait(?Send)]
-    impl SnapshotChunkWriter for VecSnapshotWriter {
-        async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), LixError> {
-            self.bytes.extend_from_slice(chunk);
-            Ok(())
-        }
-    }
-
     #[wasm_bindgen(js_name = openLix)]
     pub async fn open_lix(
         backend: JsLixBackend,
         wasm_runtime: JsLixWasmRuntime,
     ) -> Result<Lix, JsValue> {
-        let backend = Box::new(JsBackend {
-            backend: backend.into(),
-        });
-        let engine = lix_engine::Engine::open(EngineConfig::new(
-            backend,
-            Arc::new(JsHostWasmRuntime {
-                runtime: wasm_runtime.into(),
-            }) as Arc<dyn WasmRuntime>,
-        ))
-        .await
-        .map_err(js_error)?;
-        Ok(Lix {
-            engine: Arc::new(engine),
-        })
+        let lix = CoreLix::open(build_lix_config(backend, wasm_runtime, Vec::new()))
+            .await
+            .map_err(js_error)?;
+        Ok(Lix { lix: Arc::new(lix) })
     }
 
     #[wasm_bindgen(js_name = initLix)]
@@ -456,32 +356,31 @@ export type LixObserveEvents = {
         wasm_runtime: JsLixWasmRuntime,
         boot_key_values: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
-        let backend = Box::new(JsBackend {
-            backend: backend.into(),
-        });
-        let mut config = EngineConfig::new(
-            backend,
+        let mut key_values = Vec::new();
+        if let Some(raw_key_values) = boot_key_values {
+            key_values = parse_boot_key_values(raw_key_values).map_err(js_error)?;
+        }
+        let result = CoreLix::init(build_lix_config(backend, wasm_runtime, key_values))
+            .await
+            .map_err(js_error)?;
+        init_result_to_js(result).map_err(js_error)
+    }
+
+    fn build_lix_config(
+        backend: JsLixBackend,
+        wasm_runtime: JsLixWasmRuntime,
+        key_values: Vec<BootKeyValue>,
+    ) -> LixConfig {
+        let mut config = LixConfig::new(
+            Box::new(JsBackend {
+                backend: backend.into(),
+            }),
             Arc::new(JsHostWasmRuntime {
                 runtime: wasm_runtime.into(),
             }) as Arc<dyn WasmRuntime>,
         );
-        if let Some(raw_key_values) = boot_key_values {
-            config.key_values = parse_boot_key_values(raw_key_values).map_err(js_error)?;
-        }
-        let initialized = lix_engine::Engine::open_or_init(config)
-            .await
-            .map_err(js_error)?
-            .initialized;
-
-        let object = Object::new();
-        Reflect::set(
-            &object,
-            &JsValue::from_str("initialized"),
-            &JsValue::from_bool(initialized),
-        )
-        .map_err(js_to_lix_error)
-        .map_err(js_error)?;
-        Ok(object.into())
+        config.key_values = key_values;
+        config
     }
 
     fn parse_boot_key_values(input: JsValue) -> Result<Vec<BootKeyValue>, LixError> {
@@ -655,6 +554,17 @@ export type LixObserveEvents = {
             &JsValue::from_str(&result.change_set_id),
         );
         object
+    }
+
+    fn init_result_to_js(result: EngineInitResult) -> Result<JsValue, LixError> {
+        let object = Object::new();
+        Reflect::set(
+            &object,
+            &JsValue::from_str("initialized"),
+            &JsValue::from_bool(result.initialized),
+        )
+        .map_err(js_to_lix_error)?;
+        Ok(object.into())
     }
 
     fn create_version_result_to_js(result: CreateVersionResult) -> Object {

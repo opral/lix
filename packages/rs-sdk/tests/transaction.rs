@@ -1,4 +1,7 @@
-use lix_rs_sdk::{open_lix, OpenLixConfig, Value};
+use lix_rs_sdk::{Lix, LixConfig, SqliteBackend, Value, WasmtimeRuntime};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn run_async_with_large_stack<F, Fut>(build_future: F)
 where
@@ -21,34 +24,30 @@ where
 }
 
 #[test]
-fn begin_transaction_commit_persists_changes() {
+fn execute_begin_commit_script_persists_changes() {
     run_async_with_large_stack(|| async {
-        let lix = open_lix(OpenLixConfig::default())
-            .await
-            .expect("open_lix should succeed");
+        let path = temp_sqlite_path("tx-script");
+        let lix = create_initialized_lix(&path).await;
 
-        let mut tx = lix
-            .begin_transaction()
-            .await
-            .expect("begin_transaction should succeed");
-        tx.execute(
-            "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?)",
+        lix.execute(
+            "BEGIN; \
+             INSERT INTO lix_file (id, path, data) VALUES (?1, ?2, ?3); \
+             COMMIT;",
             &[
-                Value::Text("tx-commit".to_string()),
-                Value::Text("/tx-commit.txt".to_string()),
+                Value::Text("tx-script-commit".to_string()),
+                Value::Text("/tx-script-commit.txt".to_string()),
                 Value::Blob(vec![1, 2, 3]),
             ],
         )
         .await
-        .expect("insert in transaction should succeed");
-        tx.commit().await.expect("commit should succeed");
+        .expect("BEGIN/COMMIT script should succeed");
 
         let result = lix
             .execute(
                 "SELECT COUNT(*) FROM lix_file WHERE id = ? AND path = ?",
                 &[
-                    Value::Text("tx-commit".to_string()),
-                    Value::Text("/tx-commit.txt".to_string()),
+                    Value::Text("tx-script-commit".to_string()),
+                    Value::Text("/tx-script-commit.txt".to_string()),
                 ],
             )
             .await
@@ -56,41 +55,59 @@ fn begin_transaction_commit_persists_changes() {
 
         assert_eq!(result.statements[0].rows.len(), 1);
         assert_eq!(result.statements[0].rows[0][0], Value::Integer(1));
+
+        cleanup_sqlite_path(&path);
     });
 }
 
 #[test]
-fn begin_transaction_rollback_discards_changes() {
+fn execute_rejects_standalone_transaction_control() {
     run_async_with_large_stack(|| async {
-        let lix = open_lix(OpenLixConfig::default())
-            .await
-            .expect("open_lix should succeed");
+        let path = temp_sqlite_path("tx-denied");
+        let lix = create_initialized_lix(&path).await;
 
-        let mut tx = lix
-            .begin_transaction()
+        let error = lix
+            .execute("ROLLBACK;", &[])
             .await
-            .expect("begin_transaction should succeed");
-        tx.execute(
-            "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?)",
-            &[
-                Value::Text("tx-rollback".to_string()),
-                Value::Text("/tx-rollback.txt".to_string()),
-                Value::Blob(vec![9, 9, 9]),
-            ],
-        )
-        .await
-        .expect("insert in transaction should succeed");
-        tx.rollback().await.expect("rollback should succeed");
+            .expect_err("standalone transaction control should be rejected");
 
-        let result = lix
-            .execute(
-                "SELECT COUNT(*) FROM lix_file WHERE id = ?",
-                &[Value::Text("tx-rollback".to_string())],
-            )
-            .await
-            .expect("verification query should succeed");
+        assert_eq!(error.code, "LIX_ERROR_TRANSACTION_CONTROL_STATEMENT_DENIED");
 
-        assert_eq!(result.statements[0].rows.len(), 1);
-        assert_eq!(result.statements[0].rows[0][0], Value::Integer(0));
+        cleanup_sqlite_path(&path);
     });
+}
+
+async fn create_initialized_lix(path: &PathBuf) -> Lix {
+    let init_result = Lix::init(LixConfig::new(
+        Box::new(SqliteBackend::from_path(path).expect("sqlite backend should open")),
+        Arc::new(WasmtimeRuntime::new().expect("wasmtime runtime should initialize")),
+    ))
+    .await
+    .expect("Lix::init should succeed");
+    assert!(init_result.initialized);
+
+    Lix::open(LixConfig::new(
+        Box::new(SqliteBackend::from_path(path).expect("sqlite backend should reopen")),
+        Arc::new(WasmtimeRuntime::new().expect("wasmtime runtime should initialize")),
+    ))
+    .await
+    .expect("Lix::open should succeed after Lix::init")
+}
+
+fn temp_sqlite_path(label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "lix-rs-sdk-{label}-{}-{nanos}.sqlite",
+        std::process::id()
+    ))
+}
+
+fn cleanup_sqlite_path(path: &PathBuf) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
+    let _ = std::fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
+    let _ = std::fs::remove_file(PathBuf::from(format!("{}-journal", path.display())));
 }

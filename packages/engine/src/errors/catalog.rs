@@ -201,14 +201,14 @@ pub(crate) fn vtable_schema_key_required_error() -> LixError {
 pub(crate) fn transaction_control_statement_denied_error() -> LixError {
     build_error(
         ErrorCode::TransactionControlStatementDenied,
-        "Use transaction APIs instead: beginTransaction() or transaction().",
+        "Standalone transaction control is not allowed here. Wrap the full script in one execute() call, for example: BEGIN; ... COMMIT;.",
     )
 }
 
 pub(crate) fn transaction_handle_not_found_error() -> LixError {
     build_error(
         ErrorCode::TransactionHandleNotFound,
-        "The transaction handle is invalid or already closed. Open a new transaction with beginTransaction().",
+        "The transaction handle is invalid or already closed.",
     )
 }
 
