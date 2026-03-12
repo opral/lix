@@ -658,10 +658,3 @@ fn table_factor_references_column_name(
         _ => false,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sqlparser::dialect::GenericDialect;
-    use sqlparser::parser::Parser;
-}

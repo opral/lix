@@ -1,5 +1,6 @@
 import type {
 	ExecuteResult as LixCanonicalExecuteResult,
+	JsonValue,
 	LixValue as LixCanonicalValue,
 	QueryResult as LixCanonicalQueryResult,
 } from "./engine-wasm/index.js";
@@ -10,7 +11,7 @@ export type {
 	LixCanonicalQueryResult,
 };
 
-export type LixRuntimeValue = null | boolean | number | string | Uint8Array;
+export type LixRuntimeValue = JsonValue | Uint8Array;
 
 export type LixRuntimeQueryResult = {
 	rows: LixRuntimeValue[][];

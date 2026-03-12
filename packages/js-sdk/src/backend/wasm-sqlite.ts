@@ -50,10 +50,27 @@ async function createInMemoryDatabase(): Promise<SqliteWasmDatabase> {
 export async function createWasmSqliteBackend(): Promise<LixBackend> {
 	const db = await createInMemoryDatabase();
 	let backendClosed = false;
+	let operationQueue: Promise<void> = Promise.resolve();
 
 	const ensureBackendOpen = (): void => {
 		if (backendClosed) {
 			throw new Error("sqlite backend is closed");
+		}
+	};
+
+	const runSerialized = async <T>(
+		operation: () => T | Promise<T>,
+	): Promise<T> => {
+		const previous = operationQueue;
+		let releaseCurrent: (() => void) | undefined;
+		operationQueue = new Promise<void>((resolve) => {
+			releaseCurrent = resolve;
+		});
+		await previous;
+		try {
+			return await operation();
+		} finally {
+			releaseCurrent?.();
 		}
 	};
 
@@ -98,23 +115,29 @@ export async function createWasmSqliteBackend(): Promise<LixBackend> {
 				if (transactionClosed) {
 					throw new Error("transaction is already closed");
 				}
-				ensureBackendOpen();
-				return runQuery(sql, params);
+				return runSerialized(() => {
+					ensureBackendOpen();
+					return runQuery(sql, params);
+				});
 			},
 			async commit(): Promise<void> {
 				if (transactionClosed) {
 					return;
 				}
-				ensureBackendOpen();
-				runQuery("COMMIT", []);
+				await runSerialized(() => {
+					ensureBackendOpen();
+					runQuery("COMMIT", []);
+				});
 				transactionClosed = true;
 			},
 			async rollback(): Promise<void> {
 				if (transactionClosed) {
 					return;
 				}
-				ensureBackendOpen();
-				runQuery("ROLLBACK", []);
+				await runSerialized(() => {
+					ensureBackendOpen();
+					runQuery("ROLLBACK", []);
+				});
 				transactionClosed = true;
 			},
 		};
@@ -126,23 +149,32 @@ export async function createWasmSqliteBackend(): Promise<LixBackend> {
 			sql: string,
 			params: ReadonlyArray<LixRuntimeValue>,
 		): Promise<LixRuntimeQueryResult> {
-			return runQuery(sql, params);
+			return runSerialized(() => runQuery(sql, params));
 		},
 		async beginTransaction(): Promise<LixTransaction> {
-			ensureBackendOpen();
-			runQuery("BEGIN", []);
-			return createTransaction();
+			return runSerialized(() => {
+				ensureBackendOpen();
+				runQuery("BEGIN", []);
+				return createTransaction();
+			});
 		},
 		async exportSnapshot(): Promise<Uint8Array> {
-			ensureBackendOpen();
-			return db.sqlite3.capi.sqlite3_js_db_export(db, "main");
+			return runSerialized(() => {
+				ensureBackendOpen();
+				return db.sqlite3.capi.sqlite3_js_db_export(db, "main");
+			});
 		},
 		async close(): Promise<void> {
 			if (backendClosed) {
 				return;
 			}
-			backendClosed = true;
-			db.close();
+			await runSerialized(() => {
+				if (backendClosed) {
+					return;
+				}
+				backendClosed = true;
+				db.close();
+			});
 		},
 	};
 }

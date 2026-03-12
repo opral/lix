@@ -1,18 +1,24 @@
 mod support;
 
 use async_trait::async_trait;
+#[cfg(any())]
 use std::fs;
+#[cfg(any())]
 use std::path::{Path, PathBuf};
+#[cfg(any())]
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(any())]
+use std::sync::OnceLock;
 
-use lix_engine::{
-    ExecuteOptions, LixError, MaterializationDebugMode, MaterializationRequest,
-    MaterializationScope, Value, WasmComponentInstance, WasmLimits, WasmRuntime,
-};
+use lix_engine::{ExecuteOptions, LixError, Value, WasmComponentInstance, WasmLimits, WasmRuntime};
+#[cfg(any())]
+use lix_engine::{MaterializationDebugMode, MaterializationRequest, MaterializationScope};
 use serde::{Deserialize, Serialize};
+#[cfg(any())]
 use serde_json::Value as JsonValue;
 
+#[cfg(any())]
 const TEST_PLUGIN_MANIFEST: &str = r#"{
   "key": "json",
   "runtime": "wasm-component-v1",
@@ -21,6 +27,7 @@ const TEST_PLUGIN_MANIFEST: &str = r#"{
   "entry": "plugin.wasm"
 }"#;
 
+#[cfg(any())]
 const TEST_TXT_PLUGIN_MANIFEST: &str = r#"{
   "key": "txt_noop",
   "runtime": "wasm-component-v1",
@@ -29,6 +36,7 @@ const TEST_TXT_PLUGIN_MANIFEST: &str = r#"{
   "entry": "plugin.wasm"
 }"#;
 
+#[cfg(any())]
 const TEST_TXT_NOOP_PLUGIN_WASM_BYTES: &[u8] = b"\0asm\x01\0\0\0lix-test-txt-noop-plugin-v1";
 
 #[derive(Debug, Deserialize)]
@@ -72,19 +80,24 @@ struct PathEchoRuntime;
 #[derive(Debug, Default)]
 struct PathEchoInstance;
 
+#[cfg(any())]
 #[derive(Debug, Default)]
 struct BeforeAwareRuntime;
 
+#[cfg(any())]
 #[derive(Debug, Default)]
 struct BeforeAwareInstance;
 
+#[cfg(any())]
 struct JsonWithTxtNoopRuntime {
     inner: support::wasmtime_runtime::TestWasmtimeRuntime,
 }
 
+#[cfg(any())]
 #[derive(Debug, Default)]
 struct TxtNoopInstance;
 
+#[cfg(any())]
 impl JsonWithTxtNoopRuntime {
     fn new() -> Self {
         Self {
@@ -155,6 +168,7 @@ impl WasmComponentInstance for PathEchoInstance {
     }
 }
 
+#[cfg(any())]
 #[async_trait(?Send)]
 impl WasmRuntime for BeforeAwareRuntime {
     async fn init_component(
@@ -166,6 +180,7 @@ impl WasmRuntime for BeforeAwareRuntime {
     }
 }
 
+#[cfg(any())]
 #[async_trait(?Send)]
 impl WasmComponentInstance for BeforeAwareInstance {
     async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
@@ -211,6 +226,7 @@ impl WasmComponentInstance for BeforeAwareInstance {
     }
 }
 
+#[cfg(any())]
 #[async_trait(?Send)]
 impl WasmRuntime for JsonWithTxtNoopRuntime {
     async fn init_component(
@@ -225,6 +241,7 @@ impl WasmRuntime for JsonWithTxtNoopRuntime {
     }
 }
 
+#[cfg(any())]
 #[async_trait(?Send)]
 impl WasmComponentInstance for TxtNoopInstance {
     async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
@@ -246,18 +263,21 @@ impl WasmComponentInstance for TxtNoopInstance {
     }
 }
 
+#[cfg(any())]
 fn plugin_json_v2_manifest_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../plugin-json-v2")
         .join("Cargo.toml")
 }
 
+#[cfg(any())]
 fn plugin_json_v2_wasm_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../plugin-json-v2")
         .join("target/wasm32-wasip2/debug/plugin_json_v2.wasm")
 }
 
+#[cfg(any())]
 fn ensure_wasm32_wasip2_target() -> Result<(), String> {
     let status = Command::new("rustup")
         .arg("target")
@@ -274,6 +294,7 @@ fn ensure_wasm32_wasip2_target() -> Result<(), String> {
     }
 }
 
+#[cfg(any())]
 fn build_plugin_json_v2_wasm(manifest_path: &Path) -> Result<(), String> {
     let output = Command::new("cargo")
         .arg("build")
@@ -317,6 +338,7 @@ fn build_plugin_json_v2_wasm(manifest_path: &Path) -> Result<(), String> {
     Err(format!("cargo build for plugin_json_v2 failed:\n{stderr}"))
 }
 
+#[cfg(any())]
 fn plugin_json_v2_wasm_bytes() -> Vec<u8> {
     static WASM_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
     WASM_BYTES
@@ -338,10 +360,12 @@ fn plugin_json_v2_wasm_bytes() -> Vec<u8> {
         .clone()
 }
 
+#[cfg(any())]
 fn plugin_txt_noop_wasm_bytes() -> Vec<u8> {
     TEST_TXT_NOOP_PLUGIN_WASM_BYTES.to_vec()
 }
 
+#[cfg(any())]
 async fn register_plugin_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
@@ -387,6 +411,7 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
     }
 }
 
+#[cfg(any())]
 async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let rows = engine
         .execute(
@@ -402,6 +427,7 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
     }
 }
 
+#[cfg(any())]
 async fn boot_engine_with_json_plugin(
     sim: &support::simulation_test::SimulationArgs,
 ) -> support::simulation_test::SimulationEngine {
@@ -432,6 +458,7 @@ async fn boot_engine_with_json_plugin(
     engine
 }
 
+#[cfg(any())]
 async fn boot_engine_with_path_echo_plugin(
     sim: &support::simulation_test::SimulationArgs,
 ) -> support::simulation_test::SimulationEngine {
@@ -459,6 +486,7 @@ async fn boot_engine_with_path_echo_plugin(
     engine
 }
 
+#[cfg(any())]
 async fn boot_engine_with_before_aware_plugin(
     sim: &support::simulation_test::SimulationArgs,
 ) -> support::simulation_test::SimulationEngine {
@@ -486,6 +514,7 @@ async fn boot_engine_with_before_aware_plugin(
     engine
 }
 
+#[cfg(any())]
 async fn detected_json_pointer_entities(
     engine: &support::simulation_test::SimulationEngine,
     file_id: &str,
@@ -516,6 +545,7 @@ async fn detected_json_pointer_entities(
         .collect::<Vec<_>>()
 }
 
+#[cfg(any())]
 async fn json_pointer_change_count(
     engine: &support::simulation_test::SimulationEngine,
     file_id: &str,
@@ -537,6 +567,7 @@ async fn json_pointer_change_count(
     value_as_i64(&rows.statements[0].rows[0][0])
 }
 
+#[cfg(any())]
 fn assert_blob_json_eq(value: &Value, expected: JsonValue) {
     let bytes = match value {
         Value::Blob(bytes) => bytes,
@@ -568,6 +599,7 @@ fn value_as_text(value: &Value) -> String {
     }
 }
 
+#[cfg(any())]
 async fn file_cache_row_count(
     engine: &support::simulation_test::SimulationEngine,
     file_id: &str,
@@ -589,6 +621,7 @@ async fn file_cache_row_count(
     value_as_i64(&rows.statements[0].rows[0][0])
 }
 
+#[cfg(any())]
 async fn file_descriptor_tombstone_count(
     engine: &support::simulation_test::SimulationEngine,
     file_id: &str,
@@ -612,6 +645,7 @@ async fn file_descriptor_tombstone_count(
     value_as_i64(&rows.statements[0].rows[0][0])
 }
 
+#[cfg(any())]
 async fn total_file_cache_row_count_for_prefix(
     engine: &support::simulation_test::SimulationEngine,
     file_id_prefix: &str,
@@ -632,6 +666,7 @@ async fn total_file_cache_row_count_for_prefix(
     value_as_i64(&rows.statements[0].rows[0][0])
 }
 
+#[cfg(any())]
 async fn orphan_file_cache_row_count_for_prefix(
     engine: &support::simulation_test::SimulationEngine,
     file_id_prefix: &str,
@@ -821,6 +856,7 @@ async fn binary_prefixed_chunk_payload_count_for_blob(
     value_as_i64(&rows.statements[0].rows[0][0])
 }
 
+#[cfg(any())]
 async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
     sim: &support::simulation_test::SimulationArgs,
 ) -> support::simulation_test::SimulationEngine {

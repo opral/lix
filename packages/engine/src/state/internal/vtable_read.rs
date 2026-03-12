@@ -24,7 +24,6 @@ pub fn rewrite_query(query: Query, params: &[LixValue]) -> Result<Option<Query>,
     normalize_query_placeholders(&mut query, &mut PlaceholderOrdinalState::new())?;
 
     let schema_keys = extract_schema_keys_from_query(&query, params).unwrap_or_default();
-
     let mut changed = false;
     let mut new_query = query.clone();
     rewrite_query_inner(&mut new_query, &schema_keys, params, &mut changed, None)?;
@@ -158,26 +157,30 @@ fn rewrite_set_expr(
             set_quantifier,
             left,
             right,
-        } => SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left: Box::new(rewrite_set_expr(
+        } => {
+            let left = Box::new(rewrite_set_expr(
                 *left,
                 schema_keys,
                 pushdown_predicate,
                 params,
                 changed,
                 available_schema_keys,
-            )?),
-            right: Box::new(rewrite_set_expr(
+            )?);
+            let right = Box::new(rewrite_set_expr(
                 *right,
                 schema_keys,
                 pushdown_predicate,
                 params,
                 changed,
                 available_schema_keys,
-            )?),
-        },
+            )?);
+            SetExpr::SetOperation {
+                op,
+                set_quantifier,
+                left,
+                right,
+            }
+        }
         other => other,
     })
 }

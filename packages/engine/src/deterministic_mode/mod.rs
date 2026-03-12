@@ -1,7 +1,6 @@
 use serde_json::Value as JsonValue;
 
 use crate::errors::classification::is_missing_relation_error;
-use crate::functions::SystemFunctionProvider;
 use crate::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
 use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
@@ -200,26 +199,41 @@ async fn load_key_value_payload(
     backend: &dyn LixBackend,
     entity_id: &str,
 ) -> Result<Option<JsonValue>, LixError> {
-    let sql = format!(
-        "SELECT snapshot_content \
-         FROM lix_internal_state_vtable \
-         WHERE schema_key = '{schema_key}' \
-           AND entity_id = '{entity_id}' \
-           AND version_id = '{version_id}' \
-           AND snapshot_content IS NOT NULL \
-         LIMIT 1",
-        schema_key = escape_sql_string(key_value_schema_key()),
-        entity_id = escape_sql_string(entity_id),
-        version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
+    let untracked_payload = load_first_payload_from_table(
+        backend,
+        "lix_internal_state_untracked",
+        &format!(
+            "schema_key = '{schema_key}' \
+             AND entity_id = '{entity_id}' \
+             AND version_id = '{version_id}' \
+             AND snapshot_content IS NOT NULL",
+            schema_key = escape_sql_string(key_value_schema_key()),
+            entity_id = escape_sql_string(entity_id),
+            version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
+        ),
+    )
+    .await?;
+    if untracked_payload.is_some() {
+        return Ok(untracked_payload);
+    }
+
+    let table_name = format!(
+        "lix_internal_state_materialized_v1_{}",
+        key_value_schema_key()
     );
-    let statements = parse_sql_statements(&sql)?;
-    let mut provider = SystemFunctionProvider;
-    let rewritten =
-        preprocess_statements_with_provider(statements, &[], &mut provider, backend.dialect())?;
-    let result = backend
-        .execute(&rewritten.sql, rewritten.single_statement_params()?)
-        .await?;
-    parse_first_payload(result.rows.first())
+    load_first_payload_from_table(
+        backend,
+        &table_name,
+        &format!(
+            "entity_id = '{entity_id}' \
+             AND version_id = '{version_id}' \
+             AND snapshot_content IS NOT NULL \
+             AND is_tombstone = 0",
+            entity_id = escape_sql_string(entity_id),
+            version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
+        ),
+    )
+    .await
 }
 
 async fn load_sequence_highest_from_committed_state(
@@ -284,6 +298,25 @@ async fn load_sequence_highest_from_table(
         .filter_map(|row| parse_first_payload(Some(row)).ok().flatten())
         .filter_map(|value| parse_integer_value(&value))
         .max())
+}
+
+async fn load_first_payload_from_table(
+    backend: &dyn LixBackend,
+    table_name: &str,
+    where_clause: &str,
+) -> Result<Option<JsonValue>, LixError> {
+    let sql = format!(
+        "SELECT snapshot_content \
+         FROM {table_name} \
+         WHERE {where_clause} \
+         LIMIT 1",
+    );
+    let result = match backend.execute(&sql, &[]).await {
+        Ok(result) => result,
+        Err(err) if is_missing_relation_error(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    parse_first_payload(result.rows.first())
 }
 
 fn parse_integer_value(value: &JsonValue) -> Option<i64> {

@@ -2,7 +2,22 @@ export { default } from "./wasm/lix_engine_wasm_bindgen.js";
 export * from "./wasm/lix_engine_wasm_bindgen.js";
 import type { InitInput } from "./wasm/lix_engine_wasm_bindgen.js";
 
-export type ValueKind = "null" | "bool" | "int" | "float" | "text" | "blob";
+export type JsonValue =
+	| null
+	| boolean
+	| number
+	| string
+	| JsonValue[]
+	| { [key: string]: JsonValue };
+
+export type ValueKind =
+	| "null"
+	| "bool"
+	| "int"
+	| "float"
+	| "text"
+	| "json"
+	| "blob";
 
 export type LixValue =
 	| { kind: "null"; value: null }
@@ -10,16 +25,17 @@ export type LixValue =
 	| { kind: "int"; value: number }
 	| { kind: "float"; value: number }
 	| { kind: "text"; value: string }
+	| { kind: "json"; value: JsonValue }
 	| { kind: "blob"; base64: string };
 
 export class Value {
 	kind: ValueKind;
-	value: null | boolean | number | string | undefined;
+	value: null | boolean | number | string | JsonValue | undefined;
 	base64: string | undefined;
 
 	constructor(
 		kind: ValueKind,
-		value: null | boolean | number | string | undefined,
+		value: null | boolean | number | string | JsonValue | undefined,
 		base64?: string,
 	) {
 		this.kind = kind;
@@ -53,6 +69,10 @@ export class Value {
 		return new Value("text", value);
 	}
 
+	static json(value: JsonValue): Value {
+		return new Value("json", value);
+	}
+
 	static blob(value: Uint8Array): Value {
 		return new Value("blob", undefined, bytesToBase64(value));
 	}
@@ -71,6 +91,8 @@ export class Value {
 					return Value.real(raw.value);
 				case "text":
 					return Value.text(raw.value);
+				case "json":
+					return Value.json(raw.value);
 				case "blob":
 					return new Value("blob", undefined, raw.base64);
 			}
@@ -88,6 +110,7 @@ export class Value {
 				new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength),
 			);
 		}
+		if (isJsonValue(raw)) return Value.json(raw);
 		throw new TypeError(
 			"Value.from() requires a canonical LixValue or scalar primitive",
 		);
@@ -113,6 +136,10 @@ export class Value {
 		return this.kind === "text" ? (this.value as string) : undefined;
 	}
 
+	asJson(): JsonValue | undefined {
+		return this.kind === "json" ? (this.value as JsonValue) : undefined;
+	}
+
 	asBlob(): Uint8Array | undefined {
 		return this.kind === "blob" && this.base64 !== undefined
 			? base64ToBytes(this.base64)
@@ -131,6 +158,8 @@ export class Value {
 				return { kind: "float", value: this.asReal() ?? 0 };
 			case "text":
 				return { kind: "text", value: this.asText() ?? "" };
+			case "json":
+				return { kind: "json", value: this.asJson() ?? null };
 			case "blob":
 				return { kind: "blob", base64: this.base64 ?? "" };
 		}
@@ -170,10 +199,33 @@ function isLixValue(value: unknown): value is LixValue {
 	if (kind === "text") {
 		return typeof (value as { value?: unknown }).value === "string";
 	}
+	if (kind === "json") {
+		return isJsonValue((value as { value?: unknown }).value);
+	}
 	if (kind === "blob") {
 		return typeof (value as { base64?: unknown }).base64 === "string";
 	}
 	return false;
+}
+
+function isJsonValue(value: unknown): value is JsonValue {
+	if (
+		value === null ||
+		typeof value === "boolean" ||
+		typeof value === "string"
+	) {
+		return true;
+	}
+	if (typeof value === "number") {
+		return Number.isFinite(value);
+	}
+	if (Array.isArray(value)) {
+		return value.every((item) => isJsonValue(item));
+	}
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	return Object.values(value).every((entry) => isJsonValue(entry));
 }
 
 function bytesToBase64(bytes: Uint8Array): string {

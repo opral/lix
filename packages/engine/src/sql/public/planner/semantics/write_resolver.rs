@@ -15,6 +15,7 @@ use crate::schema::builtin::builtin_schema_definition;
 use crate::schema::defaults::apply_schema_defaults_with_system_functions;
 use crate::schema::registry::register_schema_sql_statements;
 use crate::schema::{SchemaProvider, SqlStoredSchemaProvider};
+use crate::sql::ast::utils::bind_sql;
 use crate::sql::common::ast::{lower_statement, parse_sql_statements};
 use crate::sql::public::catalog::{SurfaceFamily, SurfaceRegistry};
 use crate::sql::public::planner::backend::lowerer::rewrite_supported_public_read_surfaces_in_statement_with_registry;
@@ -3512,9 +3513,16 @@ async fn query_entity_ids_for_selector(
             planned_write.command.target.descriptor.public_name, predicate_sql
         )
     };
-    let statements = parse_sql_statements(&sql).map_err(|error| WriteResolveError {
-        message: error.description,
-    })?;
+    let bound_selector = bind_sql(
+        &sql,
+        &planned_write.command.bound_parameters,
+        backend.dialect(),
+    )
+    .map_err(write_resolve_backend_error)?;
+    let statements =
+        parse_sql_statements(&bound_selector.sql).map_err(|error| WriteResolveError {
+            message: error.description,
+        })?;
     let active_version_id = planned_write
         .command
         .execution_context
@@ -3524,7 +3532,7 @@ async fn query_entity_ids_for_selector(
     let prepared = prepare_sql2_read_strict(
         backend,
         &statements,
-        &planned_write.command.bound_parameters,
+        &bound_selector.params,
         active_version_id,
         planned_write
             .command
@@ -3592,10 +3600,7 @@ async fn query_entity_ids_for_selector(
     };
     for statement in lowered_statements {
         query_result = backend
-            .execute(
-                &statement.to_string(),
-                &planned_write.command.bound_parameters,
-            )
+            .execute(&statement.to_string(), &bound_selector.params)
             .await
             .map_err(write_resolve_backend_error)?;
     }
@@ -4325,6 +4330,8 @@ mod tests {
         untracked_rows: Vec<Vec<Value>>,
         version_descriptor_rows: Vec<Vec<Value>>,
         version_pointer_rows: Vec<Vec<Value>>,
+        selector_rows: Vec<Vec<Value>>,
+        expected_selector_params: Option<Vec<Value>>,
     }
 
     #[async_trait(?Send)]
@@ -4333,7 +4340,16 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+        async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+            if sql.contains("SELECT lixcol_entity_id") && sql.contains("WHERE key = ?1") {
+                if let Some(expected) = &self.expected_selector_params {
+                    assert_eq!(params, expected.as_slice());
+                }
+                return Ok(QueryResult {
+                    rows: self.selector_rows.clone(),
+                    columns: vec!["lixcol_entity_id".to_string()],
+                });
+            }
             if sql.contains("FROM lix_internal_change c")
                 && sql.contains("c.schema_key = 'lix_version_descriptor'")
             {
@@ -4496,12 +4512,20 @@ mod tests {
         sql: &str,
         requested_version_id: &str,
     ) -> crate::sql::public::planner::ir::PlannedWrite {
+        planned_write_with_params(sql, &[], requested_version_id)
+    }
+
+    fn planned_write_with_params(
+        sql: &str,
+        params: &[Value],
+        requested_version_id: &str,
+    ) -> crate::sql::public::planner::ir::PlannedWrite {
         let registry = SurfaceRegistry::with_builtin_surfaces();
         let mut statements = parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
         let bound = BoundStatement::from_statement(
             statement,
-            Vec::new(),
+            params.to_vec(),
             ExecutionContext {
                 requested_version_id: Some(requested_version_id.to_string()),
                 ..ExecutionContext::default()
@@ -4842,6 +4866,46 @@ mod tests {
                 .and_then(super::text_from_value)
                 .as_deref(),
             Some("{\"value\":\"after\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn trims_selector_bindings_for_public_update_placeholders() {
+        let backend = FakeBackend {
+            untracked_rows: build_untracked_state_rows(
+                "placeholder-key",
+                "version-a",
+                "lix",
+                "lix",
+                "{\"key\":\"placeholder-key\",\"value\":\"before\"}",
+                None,
+            ),
+            selector_rows: vec![vec![Value::Text("placeholder-key".to_string())]],
+            expected_selector_params: Some(vec![Value::Text("placeholder-key".to_string())]),
+            ..FakeBackend::default()
+        };
+        let resolved = resolve_write_plan(
+            &backend,
+            &planned_write_with_params(
+                "UPDATE lix_key_value SET value = ?2 WHERE key = ?1",
+                &[
+                    Value::Text("placeholder-key".to_string()),
+                    Value::Text("after".to_string()),
+                ],
+                "version-a",
+            ),
+        )
+        .await
+        .expect("placeholder update should resolve");
+
+        assert_eq!(resolved.execution_mode, WriteMode::Untracked);
+        assert_eq!(
+            resolved.intended_post_state[0]
+                .values
+                .get("snapshot_content")
+                .and_then(super::text_from_value)
+                .as_deref(),
+            Some("{\"key\":\"placeholder-key\",\"value\":\"after\"}")
         );
     }
 

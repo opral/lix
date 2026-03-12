@@ -11,8 +11,6 @@ use std::ops::ControlFlow;
 
 use crate::errors;
 use crate::functions::LixFunctionProvider;
-#[cfg(test)]
-use crate::state::commit::bind_statement_batch_for_dialect as bind_shared_statement_batch_for_dialect;
 use crate::state::commit::{
     build_statement_batch_from_generate_commit_result, load_commit_active_accounts,
     load_version_info_for_versions, CommitQueryExecutor, StatementBatch,
@@ -27,8 +25,6 @@ use crate::state::internal::{
     SchemaRegistration, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
 };
 use crate::version::GLOBAL_VERSION_ID;
-#[cfg(test)]
-use crate::SqlDialect;
 use crate::Value as EngineValue;
 use crate::{LixBackend, LixError, QueryResult};
 
@@ -101,15 +97,6 @@ pub enum DeleteRewrite {
 pub struct VtableDeleteRewrite {
     pub statement: Statement,
     pub plan: VtableDeletePlan,
-}
-
-#[cfg(test)]
-pub fn rewrite_insert(
-    insert: sqlparser::ast::Insert,
-    params: &[EngineValue],
-    functions: &mut dyn LixFunctionProvider,
-) -> Result<Option<VtableWriteRewrite>, LixError> {
-    rewrite_insert_with_writer_key(insert, params, None, functions)
 }
 
 pub fn rewrite_insert_with_writer_key(
@@ -1340,15 +1327,6 @@ fn build_untracked_insert(
     ))
 }
 
-#[cfg(test)]
-fn bind_statement_batch_for_dialect(
-    batch: StatementBatch,
-    dialect: SqlDialect,
-) -> Result<Vec<crate::sql::execution::contracts::prepared_statement::PreparedStatement>, LixError>
-{
-    bind_shared_statement_batch_for_dialect(batch, dialect)
-}
-
 fn filter_update_assignments(assignments: Vec<Assignment>) -> Vec<Assignment> {
     assignments
         .into_iter()
@@ -1536,21 +1514,6 @@ fn lix_timestamp_expr() -> Expr {
         over: None,
         within_group: Vec::new(),
     })
-}
-
-#[cfg(test)]
-fn build_statements_from_generate_commit_result(
-    commit_result: crate::state::commit::GenerateCommitResult,
-    functions: &mut dyn LixFunctionProvider,
-    placeholder_offset: usize,
-    dialect: SqlDialect,
-) -> Result<StatementBatch, LixError> {
-    build_statement_batch_from_generate_commit_result(
-        commit_result,
-        functions,
-        placeholder_offset,
-        dialect,
-    )
 }
 
 fn table_with_joins_for(table: &str) -> TableWithJoins {
