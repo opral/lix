@@ -29,11 +29,6 @@ pub struct EngineConfig {
     pub access_to_internal: bool,
 }
 
-pub struct OpenOrInitResult {
-    pub engine: Engine,
-    pub initialized: bool,
-}
-
 impl EngineConfig {
     pub fn new(
         backend: Box<dyn LixBackend + Send + Sync>,
@@ -50,25 +45,16 @@ impl EngineConfig {
 }
 
 impl Engine {
-    pub async fn open(config: EngineConfig) -> Result<Self, LixError> {
+    pub(crate) async fn open(config: EngineConfig) -> Result<Self, LixError> {
         let engine = boot(config);
         engine.open_existing().await?;
         Ok(engine)
     }
 
-    pub async fn init(config: EngineConfig) -> Result<Self, LixError> {
-        let engine = boot(config);
-        engine.initialize().await?;
-        Ok(engine)
-    }
-
-    pub async fn open_or_init(config: EngineConfig) -> Result<OpenOrInitResult, LixError> {
+    pub(crate) async fn open_or_init(config: EngineConfig) -> Result<bool, LixError> {
         let engine = boot(config);
         let initialized = engine.initialize_if_needed().await?;
-        Ok(OpenOrInitResult {
-            engine,
-            initialized,
-        })
+        Ok(initialized)
     }
 }
 
@@ -76,7 +62,7 @@ impl Engine {
 pub type BootArgs = EngineConfig;
 
 #[doc(hidden)]
-pub fn boot(args: EngineConfig) -> Engine {
+pub fn boot(args: BootArgs) -> Engine {
     let boot_deterministic_settings = infer_boot_deterministic_settings(&args.key_values);
     Engine::from_boot_args(args, boot_deterministic_settings)
 }

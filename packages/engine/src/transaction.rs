@@ -1,11 +1,10 @@
-use crate::engine::{
-    reject_internal_table_writes, Engine, EngineTransaction, EngineTransactionFuture,
-    ExecuteOptions,
-};
+use crate::engine::{reject_internal_table_writes, Engine, EngineTransaction, ExecuteOptions};
 use crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use crate::sql::execution::parse::parse_sql;
 use crate::{ExecuteResult, LixError, Value};
 use futures_util::FutureExt;
+use std::future::Future;
+use std::pin::Pin;
 
 impl Engine {
     pub async fn begin_transaction_with_options(
@@ -27,7 +26,9 @@ impl Engine {
 
     pub async fn transaction<T, F>(&self, options: ExecuteOptions, f: F) -> Result<T, LixError>
     where
-        F: for<'tx> FnOnce(&'tx mut EngineTransaction<'_>) -> EngineTransactionFuture<'tx, T>,
+        F: for<'tx> FnOnce(
+            &'tx mut EngineTransaction<'_>,
+        ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
         let mut transaction = self.begin_transaction_with_options(options).await?;
         match std::panic::AssertUnwindSafe(f(&mut transaction))
@@ -47,41 +48,6 @@ impl Engine {
                 std::panic::resume_unwind(payload);
             }
         }
-    }
-
-    pub async fn begin_transaction_handle_with_options(
-        &self,
-        options: ExecuteOptions,
-    ) -> Result<u64, LixError> {
-        let transaction = self.begin_transaction_with_options(options).await?;
-        let handle = self.next_transaction_handle();
-        let transaction = unsafe {
-            std::mem::transmute::<EngineTransaction<'_>, EngineTransaction<'static>>(transaction)
-        };
-        self.put_transaction_handle(handle, transaction)?;
-        Ok(handle)
-    }
-
-    pub async fn execute_in_transaction_handle(
-        &self,
-        handle: u64,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<ExecuteResult, LixError> {
-        let mut transaction = self.take_transaction_handle(handle)?;
-        let result = transaction.execute(sql, params).await;
-        self.put_transaction_handle(handle, transaction)?;
-        result
-    }
-
-    pub async fn commit_transaction_handle(&self, handle: u64) -> Result<(), LixError> {
-        let transaction = self.take_transaction_handle(handle)?;
-        transaction.commit().await
-    }
-
-    pub async fn rollback_transaction_handle(&self, handle: u64) -> Result<(), LixError> {
-        let transaction = self.take_transaction_handle(handle)?;
-        transaction.rollback().await
     }
 }
 

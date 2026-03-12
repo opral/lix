@@ -2,7 +2,7 @@ use crate::sql::public::catalog::builtin_public_surface_names;
 use crate::LixError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ErrorCode {
+pub(crate) enum ErrorCode {
     AlreadyInitialized,
     NotInitialized,
     TableNotFound,
@@ -13,9 +13,7 @@ pub enum ErrorCode {
     ReadOnlyViewWriteDenied,
     VtableSchemaKeyRequired,
     TransactionControlStatementDenied,
-    TransactionHandleNotFound,
     FileDataExpectsBytes,
-    FileDataUnavailable,
     UnexpectedStatementCount,
 }
 
@@ -34,13 +32,12 @@ impl ErrorCode {
             Self::TransactionControlStatementDenied => {
                 "LIX_ERROR_TRANSACTION_CONTROL_STATEMENT_DENIED"
             }
-            Self::TransactionHandleNotFound => "LIX_ERROR_TRANSACTION_HANDLE_NOT_FOUND",
             Self::FileDataExpectsBytes => "LIX_ERROR_FILE_DATA_EXPECTS_BYTES",
-            Self::FileDataUnavailable => "LIX_ERROR_FILE_DATA_UNAVAILABLE",
             Self::UnexpectedStatementCount => "LIX_ERROR_UNEXPECTED_STATEMENT_COUNT",
         }
     }
 
+    #[cfg(test)]
     pub const fn all() -> &'static [Self] {
         &[
             Self::AlreadyInitialized,
@@ -53,9 +50,7 @@ impl ErrorCode {
             Self::ReadOnlyViewWriteDenied,
             Self::VtableSchemaKeyRequired,
             Self::TransactionControlStatementDenied,
-            Self::TransactionHandleNotFound,
             Self::FileDataExpectsBytes,
-            Self::FileDataUnavailable,
             Self::UnexpectedStatementCount,
         ]
     }
@@ -205,13 +200,6 @@ pub(crate) fn transaction_control_statement_denied_error() -> LixError {
     )
 }
 
-pub(crate) fn transaction_handle_not_found_error() -> LixError {
-    build_error(
-        ErrorCode::TransactionHandleNotFound,
-        "The transaction handle is invalid or already closed.",
-    )
-}
-
 pub(crate) fn file_data_expects_bytes_error() -> LixError {
     build_error(
         ErrorCode::FileDataExpectsBytes,
@@ -237,8 +225,8 @@ mod tests {
         internal_table_access_denied_error, mixed_public_internal_query_error,
         not_initialized_error, read_only_view_write_error, schema_not_registered_error,
         sql_unknown_column_error, sql_unknown_table_error, table_not_found_read_error,
-        transaction_control_statement_denied_error, transaction_handle_not_found_error,
-        unexpected_statement_count_error, vtable_schema_key_required_error, ErrorCode,
+        transaction_control_statement_denied_error, unexpected_statement_count_error,
+        vtable_schema_key_required_error, ErrorCode,
     };
     use std::collections::HashSet;
 
@@ -306,12 +294,6 @@ mod tests {
         assert_eq!(
             transaction_control_denied.code,
             "LIX_ERROR_TRANSACTION_CONTROL_STATEMENT_DENIED"
-        );
-
-        let transaction_handle_not_found = transaction_handle_not_found_error();
-        assert_eq!(
-            transaction_handle_not_found.code,
-            "LIX_ERROR_TRANSACTION_HANDLE_NOT_FOUND"
         );
 
         let file_data_expects_bytes = file_data_expects_bytes_error();
