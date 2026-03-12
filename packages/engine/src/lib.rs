@@ -32,18 +32,11 @@ pub use backend::LixTransaction;
 pub use backend::SqlDialect;
 #[doc(hidden)]
 pub use engine::{boot, BootArgs};
-pub use engine::{
-    BootAccount, BootKeyValue, Engine, EngineConfig, EngineTransaction, EngineTransactionFuture,
-    ExecuteOptions, OpenOrInitResult,
-};
-pub use errors::{ErrorCode, LixError};
+pub use engine::{BootAccount, BootKeyValue, Engine, EngineTransaction, ExecuteOptions};
+pub use errors::LixError;
 pub use lix::{InitResult, Lix, LixConfig};
-pub use observe::{observe_owned, ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
+pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
 pub use state::checkpoint::CreateCheckpointResult;
-pub use state::commit::{
-    generate_commit, ChangeRow, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
-    MaterializedStateRow, VersionInfo, VersionSnapshot,
-};
 pub use state::materialization::{
     apply_materialization_plan, materialization_plan, materialize, LatestVisibleWinnerDebugRow,
     MaterializationApplyReport, MaterializationDebugMode, MaterializationDebugTrace,
@@ -60,4 +53,3 @@ pub use state::stream::{
 pub use types::{ExecuteResult, QueryResult, Value};
 pub use version::{CreateVersionOptions, CreateVersionResult};
 pub use wasm_runtime::{NoopWasmRuntime, WasmComponentInstance, WasmLimits, WasmRuntime};
-pub use wire::{WireQueryResult, WireValue};

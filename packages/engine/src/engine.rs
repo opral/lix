@@ -10,10 +10,8 @@ use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::marker::PhantomData;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -21,7 +19,7 @@ use std::sync::RwLock;
 use crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange;
 use crate::sql::execution::contracts::planned_statement::MutationRow;
 
-pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue, EngineConfig, OpenOrInitResult};
+pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -33,8 +31,6 @@ pub(crate) const INIT_STATE_COMPLETED: u8 = 2;
 pub struct ExecuteOptions {
     pub writer_key: Option<String>,
 }
-
-pub type EngineTransactionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, LixError>> + 'a>>;
 
 pub struct Engine {
     pub(crate) backend: Box<dyn LixBackend + Send + Sync>,
@@ -53,8 +49,6 @@ pub struct Engine {
     state_commit_stream_bus: Arc<StateCommitStreamBus>,
     pub(crate) observe_shared_sources:
         Mutex<BTreeMap<String, Arc<Mutex<crate::observe::SharedObserveSource>>>>,
-    active_transactions: Mutex<BTreeMap<u64, EngineTransaction<'static>>>,
-    next_transaction_handle_id: AtomicU64,
 }
 
 #[must_use = "EngineTransaction must be committed or rolled back"]
@@ -172,37 +166,6 @@ impl Engine {
             description: "plugin component cache lock poisoned".to_string(),
         })?;
         component_guard.clear();
-        Ok(())
-    }
-
-    pub(crate) fn next_transaction_handle(&self) -> u64 {
-        self.next_transaction_handle_id
-            .fetch_add(1, Ordering::Relaxed)
-    }
-
-    pub(crate) fn take_transaction_handle(
-        &self,
-        handle: u64,
-    ) -> Result<EngineTransaction<'static>, LixError> {
-        let mut guard = self.active_transactions.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction registry lock poisoned".to_string(),
-        })?;
-        guard
-            .remove(&handle)
-            .ok_or_else(crate::errors::transaction_handle_not_found_error)
-    }
-
-    pub(crate) fn put_transaction_handle(
-        &self,
-        handle: u64,
-        transaction: EngineTransaction<'static>,
-    ) -> Result<(), LixError> {
-        let mut guard = self.active_transactions.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction registry lock poisoned".to_string(),
-        })?;
-        guard.insert(handle, transaction);
         Ok(())
     }
 }
@@ -349,8 +312,6 @@ impl Engine {
             plugin_component_cache: Mutex::new(BTreeMap::new()),
             state_commit_stream_bus: Arc::new(StateCommitStreamBus::default()),
             observe_shared_sources: Mutex::new(BTreeMap::new()),
-            active_transactions: Mutex::new(BTreeMap::new()),
-            next_transaction_handle_id: AtomicU64::new(1),
         }
     }
 }
