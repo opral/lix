@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 
-use crate::error_classification::is_missing_relation_error;
+use crate::errors::classification::is_missing_relation_error;
 use crate::schema::builtin::types::LixVersionPointer;
 use crate::state::materialization::{
     materialization_plan, MaterializationDebugMode, MaterializationRequest, MaterializationScope,

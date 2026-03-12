@@ -12,8 +12,6 @@ pub(crate) mod plan;
 pub(crate) mod preprocess;
 pub(crate) mod runtime_effects;
 pub(crate) mod runtime_functions;
-pub(crate) mod runtime_post_commit;
-pub(crate) mod runtime_sql_effects;
 pub(crate) mod shared_path;
 pub(crate) mod statement_scripts;
 pub(crate) mod transaction_exec;
