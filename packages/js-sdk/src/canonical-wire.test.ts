@@ -197,35 +197,6 @@ test("execute emits canonical wire value kinds only", async () => {
 	}
 });
 
-test("beginTransaction.execute emits canonical wire value kinds only", async () => {
-	const { lix, runtimeBackend } = await createCanonicalBoundaryLix();
-	try {
-		const tx = await lix.beginTransaction(undefined);
-		try {
-			const result = (await tx.execute(
-				"SELECT 2 AS i, 'x' AS t",
-				[],
-			)) as { statements: Array<{ rows: unknown[][] }> };
-			const row = firstStatementRows(result)[0]!;
-			for (const cell of row) {
-				assertCanonicalValue(cell);
-			}
-			expect((row[0] as CanonicalValue).kind).toBe("int");
-			expect((row[1] as CanonicalValue).kind).toBe("text");
-		} finally {
-			await tx.rollback();
-		}
-	} finally {
-		try {
-			lix.free();
-		} finally {
-			if (typeof runtimeBackend.close === "function") {
-				await runtimeBackend.close();
-			}
-		}
-	}
-});
-
 test("observe emits canonical wire value kinds only", async () => {
 	const { lix, runtimeBackend } = await createCanonicalBoundaryLix();
 	try {

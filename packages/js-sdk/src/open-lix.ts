@@ -59,15 +59,6 @@ export type ExecuteOptions = {
 	writerKey?: string | null;
 };
 
-export type SqlTransaction = {
-	execute(
-		sql: string,
-		params?: ReadonlyArray<LixRuntimeValue>,
-	): Promise<LixRuntimeExecuteResult>;
-	commit(): Promise<void>;
-	rollback(): Promise<void>;
-};
-
 export type ObserveEvent = {
 	sequence: number;
 	rows: LixRuntimeQueryResult;
@@ -95,12 +86,6 @@ export type Lix = {
 		params?: ReadonlyArray<LixRuntimeValue>,
 		options?: ExecuteOptions,
 	): Promise<LixRuntimeExecuteResult>;
-	beginTransaction(options?: ExecuteOptions): Promise<SqlTransaction>;
-	transaction<T>(
-		options: ExecuteOptions,
-		f: (tx: SqlTransaction) => Promise<T>,
-	): Promise<T>;
-	transaction<T>(f: (tx: SqlTransaction) => Promise<T>): Promise<T>;
 	observe(query: ObserveQuery): ObserveEvents;
 	createVersion(args?: CreateVersionOptions): Promise<CreateVersionResult>;
 	createCheckpoint(): Promise<CreateCheckpointResult>;
@@ -167,10 +152,7 @@ export async function openLix(
 	const openObserveHandles = new Set<{
 		close?: () => void;
 	}>();
-	const openSqlTransactions = new Set<{
-		forceRollback: () => Promise<void>;
-	}>();
-	let transactionQueue: Promise<void> = Promise.resolve();
+	let operationQueue: Promise<void> = Promise.resolve();
 
 	const ensureOpen = (methodName: string): void => {
 		if (closed || closing) {
@@ -189,13 +171,13 @@ export async function openLix(
 			normalizeExecuteOptions(options, "execute"),
 		);
 
-	const acquireTransactionSlot = async (): Promise<() => void> => {
-		const previous = transactionQueue;
+	const acquireOperationSlot = async (): Promise<() => void> => {
+		const previous = operationQueue;
 		let releaseCurrent: (() => void) | undefined;
 		const current = new Promise<void>((resolve) => {
 			releaseCurrent = resolve;
 		});
-		transactionQueue = previous.then(() => current);
+		operationQueue = previous.then(() => current);
 		await previous;
 		return () => {
 			releaseCurrent?.();
@@ -203,7 +185,7 @@ export async function openLix(
 	};
 
 	const runQueued = async <T>(operation: () => Promise<T>): Promise<T> => {
-		const release = await acquireTransactionSlot();
+		const release = await acquireOperationSlot();
 		try {
 			return await operation();
 		} finally {
@@ -220,137 +202,6 @@ export async function openLix(
 		const result = await runQueued(() => runExecute(sql, params, options));
 		return decodeCanonicalExecuteResult(result);
 	};
-
-	const beginTransaction = async (
-		options?: ExecuteOptions,
-	): Promise<SqlTransaction> => {
-		ensureOpen("beginTransaction");
-		const releaseSlot = await acquireTransactionSlot();
-		const transactionOptions = normalizeExecuteOptions(
-			options,
-			"beginTransaction",
-		);
-		let transactionClosed = false;
-		if (typeof (wasmLix as any).beginTransaction !== "function") {
-			releaseSlot();
-			throw new Error("beginTransaction is not available in this wasm build");
-		}
-
-		let wasmTransaction: any;
-		try {
-			wasmTransaction = await (wasmLix as any).beginTransaction(
-				transactionOptions,
-			);
-		} catch (error) {
-			releaseSlot();
-			throw error;
-		}
-		if (!wasmTransaction || typeof wasmTransaction.execute !== "function") {
-			releaseSlot();
-			throw new Error(
-				"beginTransaction() returned an invalid transaction object",
-			);
-		}
-
-		const tx = {
-			execute: async (
-				sql: string,
-				params: ReadonlyArray<LixRuntimeValue> = [],
-			): Promise<LixRuntimeExecuteResult> => {
-				if (transactionClosed) {
-					throw new Error("transaction is closed; execute() is unavailable");
-				}
-				if (closing || closed) {
-					throw new Error(
-						"lix is closed; transaction.execute() is unavailable",
-					);
-				}
-				const result = await wasmTransaction.execute(
-					sql,
-					params.map((param: LixRuntimeValue) =>
-						encodeRuntimeSqlParam(param, "transaction.execute"),
-					),
-				);
-				return decodeCanonicalExecuteResult(
-					result as LixCanonicalExecuteResult,
-				);
-			},
-			commit: async (): Promise<void> => {
-				if (transactionClosed) {
-					return;
-				}
-				try {
-					await wasmTransaction.commit();
-				} finally {
-					transactionClosed = true;
-					openSqlTransactions.delete(txHandle);
-					releaseSlot();
-				}
-			},
-			rollback: async (): Promise<void> => {
-				if (transactionClosed) {
-					return;
-				}
-				try {
-					await wasmTransaction.rollback();
-				} finally {
-					transactionClosed = true;
-					openSqlTransactions.delete(txHandle);
-					releaseSlot();
-				}
-			},
-		} satisfies SqlTransaction;
-
-		const txHandle = {
-			forceRollback: async (): Promise<void> => {
-				if (transactionClosed) {
-					return;
-				}
-				try {
-					await wasmTransaction.rollback();
-				} finally {
-					transactionClosed = true;
-					releaseSlot();
-				}
-			},
-		};
-		openSqlTransactions.add(txHandle);
-		return tx;
-	};
-
-	async function transaction<T>(
-		options: ExecuteOptions,
-		f: (tx: SqlTransaction) => Promise<T>,
-	): Promise<T>;
-	async function transaction<T>(
-		f: (tx: SqlTransaction) => Promise<T>,
-	): Promise<T>;
-	async function transaction<T>(
-		first: ExecuteOptions | ((tx: SqlTransaction) => Promise<T>),
-		second?: (tx: SqlTransaction) => Promise<T>,
-	): Promise<T> {
-		ensureOpen("transaction");
-		const options = typeof first === "function" ? undefined : first;
-		const callback = (typeof first === "function" ? first : second) as
-			| ((tx: SqlTransaction) => Promise<T>)
-			| undefined;
-		if (typeof callback !== "function") {
-			throw new Error("transaction requires an async callback");
-		}
-		const tx = await beginTransaction(options);
-		try {
-			const value = await callback(tx);
-			await tx.commit();
-			return value;
-		} catch (error) {
-			try {
-				await tx.rollback();
-			} catch {
-				// ignore rollback errors; original error is more relevant to caller
-			}
-			throw error;
-		}
-	}
 
 	const observe = (query: ObserveQuery): ObserveEvents => {
 		ensureOpen("observe");
@@ -507,15 +358,6 @@ export async function openLix(
 		}
 		openObserveHandles.clear();
 
-		for (const tx of [...openSqlTransactions]) {
-			try {
-				await tx.forceRollback();
-			} catch {
-				// ignore rollback failures while shutting down
-			}
-		}
-		openSqlTransactions.clear();
-
 		let firstError: unknown;
 		try {
 			try {
@@ -549,8 +391,6 @@ export async function openLix(
 
 	return {
 		execute,
-		beginTransaction,
-		transaction,
 		observe,
 		createVersion,
 		createCheckpoint,
@@ -613,7 +453,7 @@ function isNodeRuntime(): boolean {
 
 function normalizeExecuteOptions(
 	options: ExecuteOptions | undefined,
-	methodName: "execute" | "beginTransaction",
+	methodName: "execute",
 ): ExecuteOptions | undefined {
 	if (options === undefined) {
 		return undefined;

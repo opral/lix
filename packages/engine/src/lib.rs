@@ -10,6 +10,7 @@ mod filesystem;
 mod functions;
 mod init;
 mod key_value;
+mod lix;
 mod observe;
 mod plugin;
 mod schema;
@@ -36,6 +37,7 @@ pub use engine::{
     ExecuteOptions, OpenOrInitResult,
 };
 pub use errors::{ErrorCode, LixError};
+pub use lix::{InitResult, Lix, LixConfig};
 pub use observe::{observe_owned, ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
 pub use state::checkpoint::CreateCheckpointResult;
 pub use state::commit::{
