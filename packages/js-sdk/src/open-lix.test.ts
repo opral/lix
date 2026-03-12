@@ -242,12 +242,71 @@ test("execute accepts explicit BEGIN/COMMIT wrappers", async () => {
 	await lix.close();
 });
 
-test("execute rejects standalone transaction control", async () => {
+test("execute rejects unsupported transaction control variants", async () => {
 	const lix = await createInitializedLix();
 
-	await expect(lix.execute("ROLLBACK;", [])).rejects.toThrow(
-		/BEGIN; .* COMMIT|transaction control/i,
+	await expect(lix.execute("BEGIN IMMEDIATE;", [])).rejects.toThrow(
+		/plain BEGIN|transaction control|not supported/i,
 	);
+
+	await lix.close();
+});
+
+test("separate BEGIN and COMMIT execute calls form a transaction", async () => {
+	const lix = await createInitializedLix();
+
+	await lix.execute("BEGIN;", []);
+
+	await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
+		"tx-separate-begin-a",
+		"a",
+	]);
+	await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
+		"tx-separate-begin-b",
+		"b",
+	]);
+
+	await lix.execute("COMMIT;", []);
+
+	const result = await lix.execute(
+		"SELECT key, value FROM lix_key_value WHERE key IN (?1, ?2) ORDER BY key",
+		["tx-separate-begin-a", "tx-separate-begin-b"],
+	);
+	expect(statementRows(result)).toEqual([
+		["tx-separate-begin-a", "a"],
+		["tx-separate-begin-b", "b"],
+	]);
+
+	await lix.close();
+});
+
+test("separate BEGIN and ROLLBACK execute calls discard changes", async () => {
+	const lix = await createInitializedLix();
+
+	await lix.execute("BEGIN;", []);
+	await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
+		"tx-separate-rollback",
+		"discard-me",
+	]);
+	await lix.execute("ROLLBACK;", []);
+
+	const result = await lix.execute(
+		"SELECT COUNT(*) FROM lix_key_value WHERE key = ?1",
+		["tx-separate-rollback"],
+	);
+	expect(statementRows(result)).toEqual([[0]]);
+
+	await lix.close();
+});
+
+test("non-execute methods fail while a SQL transaction is open", async () => {
+	const lix = await createInitializedLix();
+
+	await lix.execute("BEGIN;", []);
+	await expect(lix.createVersion()).rejects.toThrow(
+		/unavailable while a SQL transaction is open|transaction/i,
+	);
+	await lix.execute("ROLLBACK;", []);
 
 	await lix.close();
 });

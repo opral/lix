@@ -13,10 +13,9 @@ use crate::sql::public::catalog::{
     SurfaceVariant,
 };
 use crate::sql::public::core::parser::parse_sql_script;
-use crate::sql::public::planner::canonicalize::CanonicalizedRead;
 use crate::sql::public::planner::ir::{
     CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan, CanonicalStateScan,
-    CanonicalWorkingChangesScan, FilesystemKind, ReadPlan, VersionScope,
+    CanonicalWorkingChangesScan, FilesystemKind, ReadPlan, StructuredPublicRead, VersionScope,
 };
 use crate::sql::public::planner::semantics::effective_state_resolver::{
     EffectiveStatePlan, EffectiveStateRequest,
@@ -27,10 +26,11 @@ use crate::version::{
     version_pointer_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::LixError;
+use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
-    JoinConstraint, JoinOperator, LimitClause, OrderBy, OrderByExpr, Query, Select, SelectItem,
-    SetExpr, Statement, TableAlias, TableFactor, TableWithJoins,
+    JoinConstraint, JoinOperator, LimitClause, OrderBy, OrderByExpr, OrderByKind, Query, Select,
+    SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins,
 };
 use std::collections::BTreeSet;
 
@@ -40,27 +40,41 @@ pub(crate) struct LoweredReadProgram {
     pub(crate) pushdown_decision: PushdownDecision,
 }
 
-mod expand;
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BroadPublicRelationSummary {
+    pub(crate) public_relations: BTreeSet<String>,
+    pub(crate) internal_relations: BTreeSet<String>,
+    pub(crate) external_relations: BTreeSet<String>,
+}
+
+mod broad;
 
 pub(crate) fn rewrite_supported_public_read_surfaces_in_statement(
     statement: &mut Statement,
 ) -> Result<(), LixError> {
-    expand::rewrite_supported_public_read_surfaces_in_statement(statement)
+    broad::rewrite_supported_public_read_surfaces_in_statement(statement)
 }
 
 pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry(
     statement: &mut Statement,
     registry: &SurfaceRegistry,
 ) -> Result<(), LixError> {
-    expand::rewrite_supported_public_read_surfaces_in_statement_with_registry(statement, registry)
+    broad::rewrite_supported_public_read_surfaces_in_statement_with_registry(statement, registry)
+}
+
+pub(crate) fn summarize_bound_public_read_statement_with_registry(
+    statement: &Statement,
+    registry: &SurfaceRegistry,
+) -> Result<Option<BroadPublicRelationSummary>, LixError> {
+    broad::summarize_bound_public_read_statement_with_registry(statement, registry)
 }
 
 pub(crate) fn lower_read_for_execution(
-    canonicalized: &CanonicalizedRead,
+    structured_read: &StructuredPublicRead,
     effective_state_request: Option<&EffectiveStateRequest>,
     effective_state_plan: Option<&EffectiveStatePlan>,
 ) -> Result<Option<LoweredReadProgram>, LixError> {
-    match canonicalized.surface_binding.descriptor.surface_family {
+    match structured_read.surface_binding.descriptor.surface_family {
         SurfaceFamily::State => {
             let Some(effective_state_request) = effective_state_request else {
                 return Ok(None);
@@ -69,7 +83,7 @@ pub(crate) fn lower_read_for_execution(
                 return Ok(None);
             };
             lower_state_read_for_execution(
-                canonicalized,
+                structured_read,
                 effective_state_request,
                 effective_state_plan,
             )
@@ -88,7 +102,7 @@ pub(crate) fn lower_read_for_execution(
                 return Ok(None);
             };
             lower_entity_read_for_execution(
-                canonicalized,
+                structured_read,
                 effective_state_request,
                 effective_state_plan,
             )
@@ -99,29 +113,32 @@ pub(crate) fn lower_read_for_execution(
                 })
             })
         }
-        SurfaceFamily::Change => lower_change_read_for_execution(canonicalized).map(|statement| {
-            let pushdown_decision =
-                if canonical_working_changes_scan(&canonicalized.read_command.root).is_some() {
-                    working_changes_pushdown_decision(canonicalized)
-                } else {
-                    change_pushdown_decision(canonicalized)
-                };
-            statement.map(|statement| LoweredReadProgram {
-                statements: vec![statement],
-                pushdown_decision,
+        SurfaceFamily::Change => {
+            lower_change_read_for_execution(structured_read).map(|statement| {
+                let pushdown_decision =
+                    if canonical_working_changes_scan(&structured_read.read_command.root).is_some()
+                    {
+                        working_changes_pushdown_decision(structured_read)
+                    } else {
+                        change_pushdown_decision(structured_read)
+                    };
+                statement.map(|statement| LoweredReadProgram {
+                    statements: vec![statement],
+                    pushdown_decision,
+                })
             })
-        }),
-        SurfaceFamily::Admin => lower_admin_read_for_execution(canonicalized).map(|statement| {
+        }
+        SurfaceFamily::Admin => lower_admin_read_for_execution(structured_read).map(|statement| {
             statement.map(|statement| LoweredReadProgram {
                 statements: vec![statement],
-                pushdown_decision: admin_pushdown_decision(canonicalized),
+                pushdown_decision: admin_pushdown_decision(structured_read),
             })
         }),
         SurfaceFamily::Filesystem => {
-            lower_filesystem_read_for_execution(canonicalized).map(|statement| {
+            lower_filesystem_read_for_execution(structured_read).map(|statement| {
                 statement.map(|statement| LoweredReadProgram {
                     statements: vec![statement],
-                    pushdown_decision: filesystem_pushdown_decision(canonicalized),
+                    pushdown_decision: filesystem_pushdown_decision(structured_read),
                 })
             })
         }
@@ -129,7 +146,7 @@ pub(crate) fn lower_read_for_execution(
 }
 
 fn lower_state_read_for_execution(
-    canonicalized: &CanonicalizedRead,
+    canonicalized: &StructuredPublicRead,
     effective_state_request: &EffectiveStateRequest,
     effective_state_plan: &EffectiveStatePlan,
 ) -> Result<Option<Statement>, LixError> {
@@ -139,17 +156,10 @@ fn lower_state_read_for_execution(
         return Err(error);
     }
 
-    let Statement::Query(mut query) = canonicalized.bound_statement.statement.clone() else {
-        return Ok(None);
-    };
-    rewrite_nested_filesystem_surfaces_in_query(query.as_mut(), true)?;
-    let select = select_mut(query.as_mut())?;
-    let TableFactor::Table { alias, .. } = &mut select.from[0].relation else {
-        return Ok(None);
-    };
-
-    let (pushdown_predicates, residual_selection) =
-        split_state_selection_for_pushdown(select.selection.as_ref(), effective_state_plan);
+    let (pushdown_predicates, residual_selection) = split_state_selection_for_pushdown(
+        canonicalized.query.selection.as_ref(),
+        effective_state_plan,
+    );
     let Some(derived_query) = build_state_source_query(
         &canonicalized.surface_binding,
         effective_state_request,
@@ -158,21 +168,76 @@ fn lower_state_read_for_execution(
     else {
         return Ok(None);
     };
-    let derived_alias = alias.clone().or_else(|| {
+    let query = build_lowered_read_query(canonicalized, derived_query, residual_selection)?;
+    Ok(Some(Statement::Query(Box::new(query))))
+}
+
+fn build_lowered_read_query(
+    structured_read: &StructuredPublicRead,
+    source_query: Query,
+    selection: Option<Expr>,
+) -> Result<Query, LixError> {
+    let mut projection = structured_read.query.projection.clone();
+    rewrite_nested_filesystem_surfaces_in_select_items(&mut projection)?;
+
+    let mut selection = selection;
+    if let Some(selection) = &mut selection {
+        rewrite_nested_filesystem_surfaces_in_expr(selection)?;
+    }
+
+    let mut order_by = structured_read.query.order_by.clone();
+    rewrite_nested_filesystem_surfaces_in_order_by(order_by.as_mut())?;
+
+    let derived_alias = structured_read.query.source_alias.clone().or_else(|| {
         Some(TableAlias {
             explicit: false,
-            name: Ident::new(&canonicalized.surface_binding.descriptor.public_name),
+            name: Ident::new(&structured_read.surface_binding.descriptor.public_name),
             columns: Vec::new(),
         })
     });
-    select.from[0].relation = TableFactor::Derived {
-        lateral: false,
-        subquery: Box::new(derived_query),
-        alias: derived_alias,
-    };
-    select.selection = residual_selection;
 
-    Ok(Some(Statement::Query(query)))
+    Ok(Query {
+        with: None,
+        body: Box::new(SetExpr::Select(Box::new(Select {
+            select_token: AttachedToken::empty(),
+            distinct: None,
+            top: None,
+            top_before_distinct: false,
+            projection,
+            exclude: None,
+            into: None,
+            from: vec![TableWithJoins {
+                relation: TableFactor::Derived {
+                    lateral: false,
+                    subquery: Box::new(source_query),
+                    alias: derived_alias,
+                },
+                joins: Vec::new(),
+            }],
+            lateral_views: Vec::new(),
+            prewhere: None,
+            selection,
+            group_by: GroupByExpr::Expressions(Vec::new(), Vec::new()),
+            cluster_by: Vec::new(),
+            distribute_by: Vec::new(),
+            sort_by: Vec::new(),
+            having: None,
+            named_window: Vec::new(),
+            qualify: None,
+            window_before_qualify: false,
+            value_table_mode: None,
+            connect_by: None,
+            flavor: sqlparser::ast::SelectFlavor::Standard,
+        }))),
+        order_by,
+        limit_clause: structured_read.query.limit_clause.clone(),
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    })
 }
 
 fn state_read_exposed_column_error(
@@ -220,25 +285,18 @@ fn state_read_exposed_column_error(
 }
 
 fn lower_entity_read_for_execution(
-    canonicalized: &CanonicalizedRead,
+    canonicalized: &StructuredPublicRead,
     effective_state_request: &EffectiveStateRequest,
     effective_state_plan: &EffectiveStatePlan,
 ) -> Result<Option<Statement>, LixError> {
-    if query_uses_wildcard_projection(&canonicalized.bound_statement.statement) {
+    if canonicalized.query.uses_wildcard_projection() {
         return Ok(None);
     }
 
-    let Statement::Query(mut query) = canonicalized.bound_statement.statement.clone() else {
-        return Ok(None);
-    };
-    rewrite_nested_filesystem_surfaces_in_query(query.as_mut(), true)?;
-    let select = select_mut(query.as_mut())?;
-    let TableFactor::Table { alias, .. } = &mut select.from[0].relation else {
-        return Ok(None);
-    };
-
-    let (pushdown_predicates, residual_selection) =
-        split_state_selection_for_pushdown(select.selection.as_ref(), effective_state_plan);
+    let (pushdown_predicates, residual_selection) = split_state_selection_for_pushdown(
+        canonicalized.query.selection.as_ref(),
+        effective_state_plan,
+    );
     let Some(derived_query) = build_entity_source_query(
         &canonicalized.surface_binding,
         effective_state_request,
@@ -247,83 +305,36 @@ fn lower_entity_read_for_execution(
     else {
         return Ok(None);
     };
-    let derived_alias = alias.clone().or_else(|| {
-        Some(TableAlias {
-            explicit: false,
-            name: Ident::new(&canonicalized.surface_binding.descriptor.public_name),
-            columns: Vec::new(),
-        })
-    });
-    select.from[0].relation = TableFactor::Derived {
-        lateral: false,
-        subquery: Box::new(derived_query),
-        alias: derived_alias,
-    };
-    select.selection = residual_selection;
-
-    Ok(Some(Statement::Query(query)))
+    let query = build_lowered_read_query(canonicalized, derived_query, residual_selection)?;
+    Ok(Some(Statement::Query(Box::new(query))))
 }
 
 fn lower_change_read_for_execution(
-    canonicalized: &CanonicalizedRead,
+    canonicalized: &StructuredPublicRead,
 ) -> Result<Option<Statement>, LixError> {
     if canonical_working_changes_scan(&canonicalized.read_command.root).is_some() {
         return lower_working_changes_read_for_execution(canonicalized);
     }
 
-    let Statement::Query(mut query) = canonicalized.bound_statement.statement.clone() else {
-        return Ok(None);
-    };
-    rewrite_nested_filesystem_surfaces_in_query(query.as_mut(), true)?;
-    let select = select_mut(query.as_mut())?;
-    let TableFactor::Table { alias, .. } = &mut select.from[0].relation else {
-        return Ok(None);
-    };
-
     let derived_query = build_change_source_query()?;
-    let derived_alias = alias.clone().or_else(|| {
-        Some(TableAlias {
-            explicit: false,
-            name: Ident::new(&canonicalized.surface_binding.descriptor.public_name),
-            columns: Vec::new(),
-        })
-    });
-    select.from[0].relation = TableFactor::Derived {
-        lateral: false,
-        subquery: Box::new(derived_query),
-        alias: derived_alias,
-    };
-
-    Ok(Some(Statement::Query(query)))
+    let query = build_lowered_read_query(
+        canonicalized,
+        derived_query,
+        canonicalized.query.selection.clone(),
+    )?;
+    Ok(Some(Statement::Query(Box::new(query))))
 }
 
 fn lower_working_changes_read_for_execution(
-    canonicalized: &CanonicalizedRead,
+    canonicalized: &StructuredPublicRead,
 ) -> Result<Option<Statement>, LixError> {
-    let Statement::Query(mut query) = canonicalized.bound_statement.statement.clone() else {
-        return Ok(None);
-    };
-    rewrite_nested_filesystem_surfaces_in_query(query.as_mut(), true)?;
-    let select = select_mut(query.as_mut())?;
-    let TableFactor::Table { alias, .. } = &mut select.from[0].relation else {
-        return Ok(None);
-    };
-
     let derived_query = build_working_changes_source_query()?;
-    let derived_alias = alias.clone().or_else(|| {
-        Some(TableAlias {
-            explicit: false,
-            name: Ident::new(&canonicalized.surface_binding.descriptor.public_name),
-            columns: Vec::new(),
-        })
-    });
-    select.from[0].relation = TableFactor::Derived {
-        lateral: false,
-        subquery: Box::new(derived_query),
-        alias: derived_alias,
-    };
-
-    Ok(Some(Statement::Query(query)))
+    let query = build_lowered_read_query(
+        canonicalized,
+        derived_query,
+        canonicalized.query.selection.clone(),
+    )?;
+    Ok(Some(Statement::Query(Box::new(query))))
 }
 
 fn rewrite_nested_filesystem_surfaces_in_query(
@@ -366,6 +377,35 @@ fn rewrite_nested_filesystem_surfaces_in_select(
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+fn rewrite_nested_filesystem_surfaces_in_select_items(
+    projection: &mut [SelectItem],
+) -> Result<(), LixError> {
+    for item in projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                rewrite_nested_filesystem_surfaces_in_expr(expr)?;
+            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {}
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_nested_filesystem_surfaces_in_order_by(
+    order_by: Option<&mut OrderBy>,
+) -> Result<(), LixError> {
+    let Some(order_by) = order_by else {
+        return Ok(());
+    };
+    let OrderByKind::Expressions(ordering) = &mut order_by.kind else {
+        return Ok(());
+    };
+    for item in ordering {
+        rewrite_nested_filesystem_surfaces_in_expr(&mut item.expr)?;
     }
     Ok(())
 }
@@ -626,62 +666,38 @@ fn is_filesystem_public_surface_name(name: &str) -> bool {
 }
 
 fn lower_admin_read_for_execution(
-    canonicalized: &CanonicalizedRead,
+    canonicalized: &StructuredPublicRead,
 ) -> Result<Option<Statement>, LixError> {
     let Some(admin_scan) = canonical_admin_scan(&canonicalized.read_command.root) else {
         return Ok(None);
     };
 
-    let Statement::Query(mut query) = canonicalized.bound_statement.statement.clone() else {
-        return Ok(None);
-    };
-    rewrite_nested_filesystem_surfaces_in_query(query.as_mut(), true)?;
-    let select = select_mut(query.as_mut())?;
-    let TableFactor::Table { alias, .. } = &mut select.from[0].relation else {
-        return Ok(None);
-    };
-
     let derived_query = build_admin_source_query(admin_scan.kind)?;
-    let derived_alias = alias.clone().or_else(|| {
-        Some(TableAlias {
-            explicit: false,
-            name: Ident::new(&canonicalized.surface_binding.descriptor.public_name),
-            columns: Vec::new(),
-        })
-    });
-    select.from[0].relation = TableFactor::Derived {
-        lateral: false,
-        subquery: Box::new(derived_query),
-        alias: derived_alias,
-    };
-
-    Ok(Some(Statement::Query(query)))
+    let query = build_lowered_read_query(
+        canonicalized,
+        derived_query,
+        canonicalized.query.selection.clone(),
+    )?;
+    Ok(Some(Statement::Query(Box::new(query))))
 }
 
 fn lower_filesystem_read_for_execution(
-    canonicalized: &CanonicalizedRead,
+    canonicalized: &StructuredPublicRead,
 ) -> Result<Option<Statement>, LixError> {
     let Some(filesystem_scan) = canonical_filesystem_scan(&canonicalized.read_command.root) else {
         return Ok(None);
     };
 
-    let Statement::Query(mut query) = canonicalized.bound_statement.statement.clone() else {
-        return Ok(None);
-    };
-    rewrite_nested_filesystem_surfaces_in_query(query.as_mut(), true)?;
-    let select = select_mut(query.as_mut())?;
-    let allow_unqualified = select.from.len() == 1 && select.from[0].joins.is_empty();
-    let TableFactor::Table { alias, .. } = &mut select.from[0].relation else {
-        return Ok(None);
-    };
-    let relation_name = alias
+    let relation_name = canonicalized
+        .query
+        .source_alias
         .as_ref()
         .map(|value| value.name.value.clone())
         .unwrap_or_else(|| canonicalized.surface_binding.descriptor.public_name.clone());
     let history_pushdown_predicates = collect_filesystem_history_pushdown_predicates(
-        select.selection.as_ref(),
+        canonicalized.query.selection.as_ref(),
         &relation_name,
-        allow_unqualified,
+        true,
     );
 
     let derived_query = match (filesystem_scan.kind, filesystem_scan.version_scope) {
@@ -737,21 +753,12 @@ fn lower_filesystem_read_for_execution(
         }
         _ => return Ok(None),
     };
-
-    let derived_alias = alias.clone().or_else(|| {
-        Some(TableAlias {
-            explicit: false,
-            name: Ident::new(&canonicalized.surface_binding.descriptor.public_name),
-            columns: Vec::new(),
-        })
-    });
-    select.from[0].relation = TableFactor::Derived {
-        lateral: false,
-        subquery: Box::new(derived_query),
-        alias: derived_alias,
-    };
-
-    Ok(Some(Statement::Query(query)))
+    let query = build_lowered_read_query(
+        canonicalized,
+        derived_query,
+        canonicalized.query.selection.clone(),
+    )?;
+    Ok(Some(Statement::Query(Box::new(query))))
 }
 
 fn build_state_source_query(
@@ -2298,7 +2305,7 @@ fn build_pushdown_decision(effective_state_plan: &EffectiveStatePlan) -> Pushdow
     }
 }
 
-fn change_pushdown_decision(canonicalized: &CanonicalizedRead) -> PushdownDecision {
+fn change_pushdown_decision(canonicalized: &StructuredPublicRead) -> PushdownDecision {
     let residual_predicates = read_predicates_from_query(canonicalized);
     PushdownDecision {
         accepted_predicates: Vec::new(),
@@ -2314,7 +2321,7 @@ fn change_pushdown_decision(canonicalized: &CanonicalizedRead) -> PushdownDecisi
     }
 }
 
-fn working_changes_pushdown_decision(canonicalized: &CanonicalizedRead) -> PushdownDecision {
+fn working_changes_pushdown_decision(canonicalized: &StructuredPublicRead) -> PushdownDecision {
     let residual_predicates = read_predicates_from_query(canonicalized);
     PushdownDecision {
         accepted_predicates: Vec::new(),
@@ -2330,7 +2337,7 @@ fn working_changes_pushdown_decision(canonicalized: &CanonicalizedRead) -> Pushd
     }
 }
 
-fn admin_pushdown_decision(canonicalized: &CanonicalizedRead) -> PushdownDecision {
+fn admin_pushdown_decision(canonicalized: &StructuredPublicRead) -> PushdownDecision {
     let residual_predicates = read_predicates_from_query(canonicalized);
     PushdownDecision {
         accepted_predicates: Vec::new(),
@@ -2348,7 +2355,7 @@ fn admin_pushdown_decision(canonicalized: &CanonicalizedRead) -> PushdownDecisio
     }
 }
 
-fn filesystem_pushdown_decision(canonicalized: &CanonicalizedRead) -> PushdownDecision {
+fn filesystem_pushdown_decision(canonicalized: &StructuredPublicRead) -> PushdownDecision {
     let residual_predicates = read_predicates_from_query(canonicalized);
     PushdownDecision {
         accepted_predicates: Vec::new(),
@@ -2423,18 +2430,12 @@ fn combine_conjunctive_predicates(predicates: Vec<Expr>) -> Option<Expr> {
     }))
 }
 
-fn read_predicates_from_query(canonicalized: &CanonicalizedRead) -> Vec<String> {
-    let Statement::Query(query) = &canonicalized.bound_statement.statement else {
-        return Vec::new();
-    };
-    let Some(select) = select_ref(query.as_ref()) else {
-        return Vec::new();
-    };
-    let Some(selection) = &select.selection else {
-        return Vec::new();
-    };
-
-    split_conjunctive_predicates(selection)
+fn read_predicates_from_query(canonicalized: &StructuredPublicRead) -> Vec<String> {
+    canonicalized
+        .query
+        .selection_predicates
+        .iter()
+        .cloned()
         .into_iter()
         .map(|predicate| predicate.to_string())
         .collect()
@@ -2460,42 +2461,6 @@ fn parse_single_query(sql: &str) -> Result<Query, LixError> {
     Ok(*query)
 }
 
-fn query_uses_wildcard_projection(statement: &Statement) -> bool {
-    let Statement::Query(query) = statement else {
-        return false;
-    };
-    let Some(select) = select_query(query.as_ref()) else {
-        return false;
-    };
-    select.projection.iter().any(|item| {
-        matches!(
-            item,
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
-        )
-    })
-}
-
-fn select_query(query: &Query) -> Option<&Select> {
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
-    };
-    Some(select.as_ref())
-}
-
-fn select_ref(query: &Query) -> Option<&Select> {
-    select_query(query)
-}
-
-fn select_mut(query: &mut Query) -> Result<&mut Select, LixError> {
-    let SetExpr::Select(select) = query.body.as_mut() else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "sql2 live read lowering requires a SELECT query".to_string(),
-        });
-    };
-    Ok(select.as_mut())
-}
-
 fn render_identifier(value: &str) -> String {
     Ident::new(value).to_string()
 }
@@ -2513,7 +2478,7 @@ mod tests {
     use crate::sql::public::catalog::SurfaceRegistry;
     use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql::public::planner::canonicalize::canonicalize_read;
-    use crate::sql::public::planner::semantics::dependency_spec::derive_dependency_spec_from_canonicalized_read;
+    use crate::sql::public::planner::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
     use crate::sql::public::planner::semantics::effective_state_resolver::build_effective_state;
     use crate::{SqlDialect, Value};
 
@@ -2526,11 +2491,13 @@ mod tests {
             Vec::<Value>::new(),
             ExecutionContext::with_dialect(SqlDialect::Sqlite),
         );
-        let canonicalized = canonicalize_read(bound, registry).expect("query should canonicalize");
-        let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
-        let effective_state = build_effective_state(&canonicalized, dependency_spec.as_ref());
+        let structured_read = canonicalize_read(bound, registry)
+            .expect("query should canonicalize")
+            .into_structured_read();
+        let dependency_spec = derive_dependency_spec_from_structured_public_read(&structured_read);
+        let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
         lower_read_for_execution(
-            &canonicalized,
+            &structured_read,
             effective_state.as_ref().map(|(request, _)| request),
             effective_state.as_ref().map(|(_, plan)| plan),
         )

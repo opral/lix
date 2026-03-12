@@ -101,6 +101,51 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
     assert_eq!(after_delete.statements[0].rows.len(), 0);
 });
 
+simulation_test!(
+    key_value_update_with_sparse_placeholders_routes_through_public_lowering,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('placeholder-key', 'before')",
+                &[],
+            )
+            .await
+            .expect("seed insert should succeed");
+
+        engine
+            .execute(
+                "UPDATE lix_key_value SET value = ?2 WHERE key = ?1",
+                &[
+                    Value::Text("placeholder-key".to_string()),
+                    Value::Text("after".to_string()),
+                ],
+            )
+            .await
+            .expect("sparse placeholder update should succeed");
+
+        let updated = engine
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'placeholder-key'",
+                &[],
+            )
+            .await
+            .expect("verification query should succeed");
+
+        sim.assert_deterministic(updated.statements[0].rows.clone());
+        assert_eq!(
+            updated.statements[0].rows,
+            vec![vec![Value::Text("after".to_string())]]
+        );
+    }
+);
+
 simulation_test!(key_value_allows_arbitrary_json_values, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)

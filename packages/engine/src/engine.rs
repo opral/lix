@@ -1,19 +1,20 @@
 use crate::cel::CelEvaluator;
 use crate::deterministic_mode::DeterministicSettings;
 use crate::plugin::types::InstalledPlugin;
+use crate::sql::execution::transaction_session::PublicSqlSessionState;
+use crate::sql::public::catalog::SurfaceRegistry;
 use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
 use crate::state::validation::SchemaCache;
 use crate::WasmRuntime;
 use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
+use futures_util::lock::Mutex as AsyncMutex;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::marker::PhantomData;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -21,7 +22,7 @@ use std::sync::RwLock;
 use crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange;
 use crate::sql::execution::contracts::planned_statement::MutationRow;
 
-pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue, EngineConfig, OpenOrInitResult};
+pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -34,10 +35,8 @@ pub struct ExecuteOptions {
     pub writer_key: Option<String>,
 }
 
-pub type EngineTransactionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, LixError>> + 'a>>;
-
 pub struct Engine {
-    pub(crate) backend: Box<dyn LixBackend + Send + Sync>,
+    pub(crate) backend: Arc<dyn LixBackend + Send + Sync>,
     wasm_runtime: Arc<dyn WasmRuntime>,
     pub(crate) cel_evaluator: CelEvaluator,
     pub(crate) schema_cache: SchemaCache,
@@ -47,14 +46,15 @@ pub struct Engine {
     deterministic_boot_pending: AtomicBool,
     init_state: AtomicU8,
     active_version_id: RwLock<Option<String>>,
+    public_surface_registry: RwLock<SurfaceRegistry>,
     access_to_internal: bool,
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
     plugin_component_cache: Mutex<BTreeMap<String, crate::plugin::runtime::CachedPluginComponent>>,
     state_commit_stream_bus: Arc<StateCommitStreamBus>,
+    pub(crate) public_sql_state: AsyncMutex<PublicSqlSessionState>,
+    pub(crate) public_sql_transaction_open: AtomicBool,
     pub(crate) observe_shared_sources:
         Mutex<BTreeMap<String, Arc<Mutex<crate::observe::SharedObserveSource>>>>,
-    active_transactions: Mutex<BTreeMap<u64, EngineTransaction<'static>>>,
-    next_transaction_handle_id: AtomicU64,
 }
 
 #[must_use = "EngineTransaction must be committed or rolled back"]
@@ -62,12 +62,14 @@ pub struct EngineTransaction<'a> {
     pub(crate) engine: &'a Engine,
     pub(crate) transaction: Option<Box<dyn LixTransaction + 'a>>,
     pub(crate) options: ExecuteOptions,
+    pub(crate) public_surface_registry: SurfaceRegistry,
     pub(crate) active_version_id: String,
     pub(crate) active_version_changed: bool,
     pub(crate) installed_plugins_cache_invalidation_pending: bool,
+    pub(crate) public_surface_registry_dirty: bool,
     pub(crate) pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
-    pub(crate) pending_sql2_append_session:
-        Option<crate::sql::execution::shared_path::PendingSql2AppendSession>,
+    pub(crate) pending_public_append_session:
+        Option<crate::sql::execution::shared_path::PendingPublicAppendSession>,
 }
 
 impl Engine {
@@ -85,6 +87,16 @@ impl Engine {
 
     pub(crate) fn access_to_internal(&self) -> bool {
         self.access_to_internal
+    }
+
+    pub(crate) fn ensure_no_open_public_sql_transaction(
+        &self,
+        operation: &str,
+    ) -> Result<(), LixError> {
+        if self.public_sql_transaction_open.load(Ordering::SeqCst) {
+            return Err(crate::errors::operation_blocked_by_active_transaction_error(operation));
+        }
+        Ok(())
     }
 
     pub(crate) fn wasm_runtime_ref(&self) -> &dyn WasmRuntime {
@@ -130,6 +142,23 @@ impl Engine {
         *guard = Some(version_id);
     }
 
+    pub(crate) fn public_surface_registry(&self) -> SurfaceRegistry {
+        self.public_surface_registry
+            .read()
+            .expect("public surface registry lock poisoned")
+            .clone()
+    }
+
+    pub(crate) async fn refresh_public_surface_registry(&self) -> Result<(), LixError> {
+        let registry = SurfaceRegistry::bootstrap_with_backend(self.backend.as_ref()).await?;
+        let mut guard = self
+            .public_surface_registry
+            .write()
+            .expect("public surface registry lock poisoned");
+        *guard = registry;
+        Ok(())
+    }
+
     pub(crate) fn try_mark_init_in_progress(&self) -> Result<(), LixError> {
         self.init_state
             .compare_exchange(
@@ -172,37 +201,6 @@ impl Engine {
             description: "plugin component cache lock poisoned".to_string(),
         })?;
         component_guard.clear();
-        Ok(())
-    }
-
-    pub(crate) fn next_transaction_handle(&self) -> u64 {
-        self.next_transaction_handle_id
-            .fetch_add(1, Ordering::Relaxed)
-    }
-
-    pub(crate) fn take_transaction_handle(
-        &self,
-        handle: u64,
-    ) -> Result<EngineTransaction<'static>, LixError> {
-        let mut guard = self.active_transactions.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction registry lock poisoned".to_string(),
-        })?;
-        guard
-            .remove(&handle)
-            .ok_or_else(crate::errors::transaction_handle_not_found_error)
-    }
-
-    pub(crate) fn put_transaction_handle(
-        &self,
-        handle: u64,
-        transaction: EngineTransaction<'static>,
-    ) -> Result<(), LixError> {
-        let mut guard = self.active_transactions.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction registry lock poisoned".to_string(),
-        })?;
-        guard.insert(handle, transaction);
         Ok(())
     }
 }
@@ -334,7 +332,7 @@ impl Engine {
     ) -> Self {
         let deterministic_boot_pending = boot_deterministic_settings.is_some();
         Self {
-            backend: args.backend,
+            backend: Arc::from(args.backend),
             wasm_runtime: args.wasm_runtime,
             cel_evaluator: CelEvaluator::new(),
             schema_cache: SchemaCache::new(),
@@ -344,13 +342,14 @@ impl Engine {
             deterministic_boot_pending: AtomicBool::new(deterministic_boot_pending),
             init_state: AtomicU8::new(INIT_STATE_NOT_STARTED),
             active_version_id: RwLock::new(None),
+            public_surface_registry: RwLock::new(SurfaceRegistry::with_builtin_surfaces()),
             access_to_internal: args.access_to_internal,
             installed_plugins_cache: RwLock::new(None),
             plugin_component_cache: Mutex::new(BTreeMap::new()),
             state_commit_stream_bus: Arc::new(StateCommitStreamBus::default()),
+            public_sql_state: AsyncMutex::new(PublicSqlSessionState::default()),
+            public_sql_transaction_open: AtomicBool::new(false),
             observe_shared_sources: Mutex::new(BTreeMap::new()),
-            active_transactions: Mutex::new(BTreeMap::new()),
-            next_transaction_handle_id: AtomicU64::new(1),
         }
     }
 }
@@ -557,6 +556,11 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct PlainReadBackend {
+        executed_sql: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
     struct EmptySnapshotReader;
 
     struct NoopWasmComponentInstance;
@@ -643,6 +647,46 @@ mod tests {
         async fn rollback(self: Box<Self>) -> Result<(), LixError> {
             self.rollback_called.store(true, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LixBackend for PlainReadBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            self.executed_sql
+                .lock()
+                .expect("executed_sql lock")
+                .push(sql.to_string());
+            if sql.contains("lix_deterministic_mode")
+                || sql.contains("lix_internal_state_untracked")
+                || sql.contains("lix_internal_stored_schema_bootstrap")
+            {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("plain backend read should not execute preparation SQL: {sql}"),
+                ));
+            }
+            if sql.trim() == "SELECT 1 + 1" {
+                return Ok(QueryResult {
+                    rows: vec![vec![Value::Integer(2)]],
+                    columns: vec!["?column?".to_string()],
+                });
+            }
+            Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("unexpected SQL in PlainReadBackend: {sql}"),
+            ))
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "plain backend read should not begin a transaction",
+            ))
         }
     }
 
@@ -762,6 +806,24 @@ mod tests {
             .expect_err("unknown relation query should fail");
 
         assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
+    }
+
+    #[tokio::test]
+    async fn plain_backend_read_bypasses_public_preparation() {
+        let backend = PlainReadBackend::default();
+        let executed_sql = Arc::clone(&backend.executed_sql);
+        let engine = boot(BootArgs::new(Box::new(backend), Arc::new(NoopWasmRuntime)));
+        engine.set_active_version_id("version-test".to_string());
+
+        let result = engine
+            .execute("SELECT 1 + 1", &[])
+            .await
+            .expect("plain backend read should succeed");
+
+        assert_eq!(result.statements[0].rows, vec![vec![Value::Integer(2)]]);
+        let executed = executed_sql.lock().expect("executed_sql lock");
+        assert_eq!(executed.len(), 1);
+        assert_eq!(executed[0], "SELECT 1 + 1");
     }
 
     #[test]

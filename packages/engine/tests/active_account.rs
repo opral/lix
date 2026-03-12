@@ -130,3 +130,33 @@ simulation_test!(
         assert!(rows.is_empty());
     }
 );
+
+simulation_test!(
+    active_account_view_delete_supports_or_selector,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(Some(SimulationBootArgs {
+                active_account: Some(BootAccount {
+                    id: "acct-delete-or".to_string(),
+                    name: "Delete Me".to_string(),
+                }),
+                ..SimulationBootArgs::default()
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "DELETE FROM lix_active_account \
+                 WHERE account_id = 'acct-delete-or' OR account_id = 'missing-account'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = read_active_account_rows(&engine).await;
+        assert!(rows.is_empty());
+    }
+);

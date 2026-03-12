@@ -273,6 +273,62 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_entity_view_update_supports_non_identity_state_columns,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_key_value (\
+                 key, value, lixcol_file_id, lixcol_plugin_key, lixcol_schema_version\
+                 ) VALUES (\
+                 'key-state-update', 'value-before', 'lix', 'lix', '1'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "UPDATE lix_key_value \
+                 SET value = 'value-after', \
+                     lixcol_plugin_key = 'custom_plugin', \
+                     lixcol_metadata = '{\"source\":\"update\"}' \
+                 WHERE key = 'key-state-update'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let updated = engine
+            .execute(
+                "SELECT snapshot_content, plugin_key, metadata \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = 'key-state-update' \
+                   AND snapshot_content IS NOT NULL",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(updated.statements[0].rows.clone());
+        assert_eq!(updated.statements[0].rows.len(), 1);
+        assert_eq!(
+            snapshot_field(&updated.statements[0].rows[0][0], "value"),
+            "value-after".to_string()
+        );
+        assert_text(&updated.statements[0].rows[0][1], "custom_plugin");
+        assert_text(&updated.statements[0].rows[0][2], "{\"source\":\"update\"}");
+    }
+);
+
+simulation_test!(
     lix_entity_view_insert_on_conflict_do_update_is_supported,
     |sim| async move {
         let engine = sim

@@ -1,7 +1,8 @@
 use crate::sql::common::dependency_spec::DependencySpec;
-use crate::sql::public::catalog::{SurfaceFamily, SurfaceVariant};
-use crate::sql::public::planner::canonicalize::CanonicalizedRead;
-use crate::sql::public::planner::ir::{CanonicalStateScan, ReadPlan, VersionScope};
+use crate::sql::public::catalog::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
+use crate::sql::public::planner::ir::{
+    CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
+};
 use crate::state::commit::{
     load_exact_committed_state_row, CommitQueryExecutor, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
@@ -9,7 +10,7 @@ use crate::state::commit::{
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::{
-    BinaryOperator, Expr, OrderByKind, Query, SelectItem, Statement, UnaryOperator, Visit, Visitor,
+    BinaryOperator, Expr, OrderBy, OrderByKind, SelectItem, UnaryOperator, Visit, Visitor,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
@@ -84,21 +85,21 @@ pub(crate) struct ExactEffectiveStateRow {
 }
 
 pub(crate) fn build_effective_state(
-    canonicalized: &CanonicalizedRead,
+    structured_read: &StructuredPublicRead,
     dependency_spec: Option<&DependencySpec>,
 ) -> Option<(EffectiveStateRequest, EffectiveStatePlan)> {
-    let scan = canonical_state_scan(&canonicalized.read_command.root)?;
+    let scan = canonical_state_scan(&structured_read.read_command.root)?;
     let request = EffectiveStateRequest {
-        schema_set: schema_set_for_read(canonicalized, dependency_spec),
+        schema_set: schema_set_for_read(structured_read, dependency_spec),
         version_scope: scan.version_scope,
         include_global_overlay: true,
         include_untracked_overlay: true,
         include_tombstones: scan.include_tombstones,
-        predicate_classes: predicate_classes_for_read(canonicalized),
-        required_columns: required_columns_for_read(canonicalized, scan),
+        predicate_classes: predicate_classes_for_read(structured_read),
+        required_columns: required_columns_for_read(structured_read, scan),
     };
-    let all_predicates = read_predicates(canonicalized);
-    let pushdown_safe_predicates = pushdown_safe_predicates(canonicalized);
+    let all_predicates = read_predicates(structured_read);
+    let pushdown_safe_predicates = pushdown_safe_predicates(structured_read);
     let plan = EffectiveStatePlan {
         state_source: StateSourceAuthority::AuthoritativeCommitted,
         overlay_lanes: overlay_lanes_for_request(&request),
@@ -130,11 +131,11 @@ fn canonical_state_scan(read_plan: &ReadPlan) -> Option<&CanonicalStateScan> {
 }
 
 fn schema_set_for_read(
-    canonicalized: &CanonicalizedRead,
+    structured_read: &StructuredPublicRead,
     dependency_spec: Option<&DependencySpec>,
 ) -> BTreeSet<String> {
     let mut schema_set = BTreeSet::new();
-    if let Some(schema_key) = canonicalized
+    if let Some(schema_key) = structured_read
         .surface_binding
         .implicit_overrides
         .fixed_schema_key
@@ -153,11 +154,7 @@ fn schema_set_for_read(
     schema_set
 }
 
-fn predicate_classes_for_read(canonicalized: &CanonicalizedRead) -> Vec<String> {
-    let Statement::Query(query) = &canonicalized.bound_statement.statement else {
-        return Vec::new();
-    };
-
+fn predicate_classes_for_read(structured_read: &StructuredPublicRead) -> Vec<String> {
     struct Collector {
         classes: BTreeSet<String>,
     }
@@ -176,25 +173,53 @@ fn predicate_classes_for_read(canonicalized: &CanonicalizedRead) -> Vec<String> 
     let mut collector = Collector {
         classes: BTreeSet::new(),
     };
-    let _ = query.visit(&mut collector);
+    for predicate in &structured_read.query.selection_predicates {
+        let _ = predicate.visit(&mut collector);
+    }
+    collector.classes.into_iter().collect()
+}
+
+fn predicate_classes_from_predicates(predicates: &[Expr]) -> Vec<String> {
+    struct Collector {
+        classes: BTreeSet<String>,
+    }
+
+    impl Visitor for Collector {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if let Some(column) = filter_column_name(expr) {
+                self.classes.insert(format!("column:{column}"));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut collector = Collector {
+        classes: BTreeSet::new(),
+    };
+    for predicate in predicates {
+        let _ = predicate.visit(&mut collector);
+    }
     collector.classes.into_iter().collect()
 }
 
 fn required_columns_for_read(
-    canonicalized: &CanonicalizedRead,
+    structured_read: &StructuredPublicRead,
     scan: &CanonicalStateScan,
 ) -> Vec<String> {
-    let Statement::Query(query) = &canonicalized.bound_statement.statement else {
-        return scan.binding.exposed_columns.clone();
-    };
     let mut required = BTreeSet::new();
 
     if let Some(entity_projection) = &scan.entity_projection {
         required.extend(entity_projection.visible_columns.iter().cloned());
     }
 
-    collect_projection_columns(query, &mut required);
-    collect_expression_columns(query, &mut required);
+    collect_projection_columns(&structured_read.query.projection, &mut required);
+    collect_expression_columns(
+        structured_read.query.selection.as_ref(),
+        structured_read.query.order_by.as_ref(),
+        &mut required,
+    );
     if required.is_empty() {
         required.extend(scan.binding.exposed_columns.iter().cloned());
     }
@@ -207,11 +232,8 @@ fn required_columns_for_read(
     required.into_iter().collect()
 }
 
-fn collect_projection_columns(query: &Query, required: &mut BTreeSet<String>) {
-    let Some(select) = select_query(query) else {
-        return;
-    };
-    let wildcard_projection = select.projection.iter().any(|item| {
+fn collect_projection_columns(projection: &[SelectItem], required: &mut BTreeSet<String>) {
+    let wildcard_projection = projection.iter().any(|item| {
         matches!(
             item,
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
@@ -221,7 +243,7 @@ fn collect_projection_columns(query: &Query, required: &mut BTreeSet<String>) {
         return;
     }
 
-    for item in &select.projection {
+    for item in projection {
         match item {
             SelectItem::UnnamedExpr(expr) => collect_columns_from_expr(expr, required),
             SelectItem::ExprWithAlias { expr, .. } => collect_columns_from_expr(expr, required),
@@ -230,14 +252,15 @@ fn collect_projection_columns(query: &Query, required: &mut BTreeSet<String>) {
     }
 }
 
-fn collect_expression_columns(query: &Query, required: &mut BTreeSet<String>) {
-    let Some(select) = select_query(query) else {
-        return;
-    };
-    if let Some(selection) = &select.selection {
+fn collect_expression_columns(
+    selection: Option<&Expr>,
+    order_by: Option<&OrderBy>,
+    required: &mut BTreeSet<String>,
+) {
+    if let Some(selection) = selection {
         collect_columns_from_expr(selection, required);
     }
-    if let Some(order_by) = &query.order_by {
+    if let Some(order_by) = order_by {
         let OrderByKind::Expressions(ordering) = &order_by.kind else {
             return;
         };
@@ -245,13 +268,6 @@ fn collect_expression_columns(query: &Query, required: &mut BTreeSet<String>) {
             collect_columns_from_expr(&item.expr, required);
         }
     }
-}
-
-fn select_query(query: &Query) -> Option<&sqlparser::ast::Select> {
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
-    };
-    Some(select)
 }
 
 fn collect_columns_from_expr(expr: &Expr, required: &mut BTreeSet<String>) {
@@ -667,67 +683,54 @@ fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn read_predicates(canonicalized: &CanonicalizedRead) -> Vec<String> {
-    let Statement::Query(query) = &canonicalized.bound_statement.statement else {
-        return Vec::new();
-    };
-    let Some(select) = select_query(query) else {
-        return Vec::new();
-    };
-    let Some(selection) = &select.selection else {
-        return Vec::new();
-    };
-
-    split_conjunctive_predicates(selection)
-        .into_iter()
+fn read_predicates(structured_read: &StructuredPublicRead) -> Vec<String> {
+    structured_read
+        .query
+        .selection_predicates
+        .iter()
         .map(ToString::to_string)
         .collect()
 }
 
-fn pushdown_safe_predicates(canonicalized: &CanonicalizedRead) -> Vec<String> {
-    let family = canonicalized.surface_binding.descriptor.surface_family;
-    let variant = canonicalized.surface_binding.descriptor.surface_variant;
+fn predicate_sql_strings(predicates: &[Expr]) -> Vec<String> {
+    predicates.iter().map(ToString::to_string).collect()
+}
+
+fn pushdown_safe_predicates(structured_read: &StructuredPublicRead) -> Vec<String> {
+    let family = structured_read.surface_binding.descriptor.surface_family;
+    let variant = structured_read.surface_binding.descriptor.surface_variant;
     let state_backed_history_entity =
         family == SurfaceFamily::Entity && variant == SurfaceVariant::History;
     if family != SurfaceFamily::State && !state_backed_history_entity {
         return Vec::new();
     }
 
-    let Statement::Query(query) = &canonicalized.bound_statement.statement else {
-        return Vec::new();
-    };
-    let Some(select) = select_query(query) else {
-        return Vec::new();
-    };
-    let Some(selection) = &select.selection else {
-        return Vec::new();
-    };
-    split_conjunctive_predicates(selection)
-        .into_iter()
+    structured_read
+        .query
+        .selection_predicates
+        .iter()
         .filter(|predicate| state_predicate_is_pushdown_safe(predicate, variant))
         .map(ToString::to_string)
         .collect()
 }
 
-fn split_conjunctive_predicates(expr: &Expr) -> Vec<&Expr> {
-    let mut predicates = Vec::new();
-    collect_conjunctive_predicates(expr, &mut predicates);
-    predicates
-}
-
-fn collect_conjunctive_predicates<'a>(expr: &'a Expr, predicates: &mut Vec<&'a Expr>) {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            collect_conjunctive_predicates(left, predicates);
-            collect_conjunctive_predicates(right, predicates);
-        }
-        Expr::Nested(inner) => collect_conjunctive_predicates(inner, predicates),
-        _ => predicates.push(expr),
+fn pushdown_safe_predicates_from_predicates(
+    surface_binding: &SurfaceBinding,
+    predicates: &[Expr],
+) -> Vec<String> {
+    let family = surface_binding.descriptor.surface_family;
+    let variant = surface_binding.descriptor.surface_variant;
+    let state_backed_history_entity =
+        family == SurfaceFamily::Entity && variant == SurfaceVariant::History;
+    if family != SurfaceFamily::State && !state_backed_history_entity {
+        return Vec::new();
     }
+
+    predicates
+        .iter()
+        .filter(|predicate| state_predicate_is_pushdown_safe(predicate, variant))
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn state_predicate_is_pushdown_safe(expr: &Expr, variant: SurfaceVariant) -> bool {
@@ -800,14 +803,15 @@ mod tests {
     use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql::public::core::parser::parse_sql_script;
     use crate::sql::public::planner::canonicalize::canonicalize_read;
-    use crate::sql::public::planner::semantics::dependency_spec::derive_dependency_spec_from_canonicalized_read;
+    use crate::sql::public::planner::ir::StructuredPublicRead;
+    use crate::sql::public::planner::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
     use crate::{SqlDialect, Value};
 
-    fn canonicalized_read(
+    fn structured_read(
         registry: &SurfaceRegistry,
         sql: &str,
         params: Vec<Value>,
-    ) -> crate::sql::public::planner::canonicalize::CanonicalizedRead {
+    ) -> StructuredPublicRead {
         let mut statements = parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
         let bound = BoundStatement::from_statement(
@@ -815,21 +819,23 @@ mod tests {
             params,
             ExecutionContext::with_dialect(SqlDialect::Sqlite),
         );
-        canonicalize_read(bound, registry).expect("query should canonicalize")
+        canonicalize_read(bound, registry)
+            .expect("query should canonicalize")
+            .into_structured_read()
     }
 
     #[test]
     fn builds_effective_state_request_for_entity_surface() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
-        let canonicalized = canonicalized_read(
+        let structured_read = structured_read(
             &registry,
             "SELECT key, value FROM lix_key_value WHERE key = 'hello'",
             Vec::new(),
         );
-        let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized)
+        let dependency_spec = derive_dependency_spec_from_structured_public_read(&structured_read)
             .expect("dependency spec");
 
-        let (request, plan) = build_effective_state(&canonicalized, Some(&dependency_spec))
+        let (request, plan) = build_effective_state(&structured_read, Some(&dependency_spec))
             .expect("effective-state plan should build");
 
         assert_eq!(
@@ -858,15 +864,15 @@ mod tests {
     #[test]
     fn history_surfaces_include_tombstones_and_version_columns() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
-        let canonicalized = canonicalized_read(
+        let structured_read = structured_read(
             &registry,
             "SELECT entity_id, version_id FROM lix_state_history WHERE schema_key = 'message'",
             Vec::new(),
         );
-        let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized)
+        let dependency_spec = derive_dependency_spec_from_structured_public_read(&structured_read)
             .expect("dependency spec");
 
-        let (request, _plan) = build_effective_state(&canonicalized, Some(&dependency_spec))
+        let (request, _plan) = build_effective_state(&structured_read, Some(&dependency_spec))
             .expect("effective-state plan should build");
 
         assert!(request.include_tombstones);
@@ -879,14 +885,14 @@ mod tests {
     #[test]
     fn extracts_exact_state_pushdown_predicates_from_top_level_conjunctions() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
-        let canonicalized = canonicalized_read(
+        let structured_read = structured_read(
             &registry,
             "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value' AND file_id = 'lix'",
             Vec::new(),
         );
 
-        let (_request, plan) =
-            build_effective_state(&canonicalized, None).expect("effective-state plan should build");
+        let (_request, plan) = build_effective_state(&structured_read, None)
+            .expect("effective-state plan should build");
 
         assert_eq!(
             plan.pushdown_safe_predicates,

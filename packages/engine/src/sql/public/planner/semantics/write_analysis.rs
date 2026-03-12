@@ -1,4 +1,3 @@
-use crate::sql::common::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::public::catalog::SurfaceOverrideValue;
 use crate::sql::public::planner::canonicalize::CanonicalizedWrite;
 use crate::sql::public::planner::ir::{
@@ -7,28 +6,29 @@ use crate::sql::public::planner::ir::{
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::Value;
-use sqlparser::ast::{BinaryOperator, Expr, Statement, Value as SqlValue};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProofError {
+pub(crate) struct WriteAnalysisError {
     pub(crate) message: String,
 }
 
-pub(crate) fn prove_write(canonicalized: &CanonicalizedWrite) -> Result<PlannedWrite, ProofError> {
-    let scope_proof = prove_scope(canonicalized)?;
+pub(crate) fn analyze_write(
+    canonicalized: &CanonicalizedWrite,
+) -> Result<PlannedWrite, WriteAnalysisError> {
+    let scope_proof = analyze_write_scope(canonicalized)?;
     if !matches!(
         canonicalized.write_command.requested_mode,
         WriteModeRequest::ForceUntracked
     ) && matches!(scope_proof, ScopeProof::Unknown | ScopeProof::Unbounded)
     {
-        return Err(ProofError {
-            message: "tracked sql2 writes require a bounded scope proof".to_string(),
+        return Err(WriteAnalysisError {
+            message: "tracked public writes require a bounded scope analysis".to_string(),
         });
     }
 
-    let schema_proof = prove_schema(canonicalized);
-    let target_set_proof = prove_target_set(canonicalized);
+    let schema_proof = derive_write_schema_facts(canonicalized);
+    let target_set_proof = derive_write_target_facts(canonicalized);
 
     Ok(PlannedWrite {
         command: canonicalized.write_command.clone(),
@@ -42,17 +42,21 @@ pub(crate) fn prove_write(canonicalized: &CanonicalizedWrite) -> Result<PlannedW
             }
         },
         resolved_write_plan: None,
-        commit_preconditions: None,
+        commit_preconditions: Vec::new(),
         residual_execution_predicates: canonicalized
             .write_command
             .selector
             .residual_predicates
-            .clone(),
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         backend_rejections: Vec::new(),
     })
 }
 
-fn prove_scope(canonicalized: &CanonicalizedWrite) -> Result<ScopeProof, ProofError> {
+fn analyze_write_scope(
+    canonicalized: &CanonicalizedWrite,
+) -> Result<ScopeProof, WriteAnalysisError> {
     if let Some(version_id) = forced_write_version_id(canonicalized) {
         return Ok(ScopeProof::SingleVersion(version_id));
     }
@@ -71,15 +75,7 @@ fn prove_scope(canonicalized: &CanonicalizedWrite) -> Result<ScopeProof, ProofEr
             }
         }
         crate::sql::public::catalog::DefaultScopeSemantics::ExplicitVersion => {
-            let Some(version_id) = write_text_value(canonicalized, "version_id") else {
-                return Err(ProofError {
-                    message: format!(
-                        "sql2 write proof requires version_id for '{}'",
-                        canonicalized.surface_binding.descriptor.public_name
-                    ),
-                });
-            };
-            Ok(ScopeProof::SingleVersion(version_id))
+            Ok(write_scope_for_explicit_version_surface(canonicalized))
         }
         crate::sql::public::catalog::DefaultScopeSemantics::History => Ok(ScopeProof::Unbounded),
         crate::sql::public::catalog::DefaultScopeSemantics::GlobalAdmin => {
@@ -89,6 +85,12 @@ fn prove_scope(canonicalized: &CanonicalizedWrite) -> Result<ScopeProof, ProofEr
             Ok(ScopeProof::Unknown)
         }
     }
+}
+
+fn write_scope_for_explicit_version_surface(canonicalized: &CanonicalizedWrite) -> ScopeProof {
+    write_text_value(canonicalized, "version_id")
+        .map(ScopeProof::SingleVersion)
+        .unwrap_or_else(|| ScopeProof::FiniteVersionSet(BTreeSet::new()))
 }
 
 fn forced_write_version_id(canonicalized: &CanonicalizedWrite) -> Option<String> {
@@ -119,7 +121,7 @@ fn surface_forces_global_scope(canonicalized: &CanonicalizedWrite) -> bool {
         })
 }
 
-fn prove_schema(canonicalized: &CanonicalizedWrite) -> SchemaProof {
+fn derive_write_schema_facts(canonicalized: &CanonicalizedWrite) -> SchemaProof {
     if let Some(schema_key) = filesystem_write_schema_key(canonicalized) {
         return SchemaProof::Exact(BTreeSet::from([schema_key.to_string()]));
     }
@@ -139,7 +141,7 @@ fn prove_schema(canonicalized: &CanonicalizedWrite) -> SchemaProof {
     }
 }
 
-fn prove_target_set(canonicalized: &CanonicalizedWrite) -> Option<TargetSetProof> {
+fn derive_write_target_facts(canonicalized: &CanonicalizedWrite) -> Option<TargetSetProof> {
     let target_key = match canonicalized
         .surface_binding
         .descriptor
@@ -172,11 +174,11 @@ fn filesystem_write_schema_key(canonicalized: &CanonicalizedWrite) -> Option<&'s
 }
 
 fn write_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<String> {
-    payload_text_value(canonicalized, key).or_else(|| selection_text_value(canonicalized, key))
+    payload_text_value(canonicalized, key).or_else(|| selector_text_value(canonicalized, key))
 }
 
 fn write_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<bool> {
-    payload_bool_value(canonicalized, key).or_else(|| selection_bool_value(canonicalized, key))
+    payload_bool_value(canonicalized, key).or_else(|| selector_bool_value(canonicalized, key))
 }
 
 fn payload_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<String> {
@@ -229,26 +231,15 @@ fn bool_value_from_payload(
     }
 }
 
-fn selection_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<String> {
-    if let Some(Value::Text(value)) = canonicalized.write_command.selector.exact_filters.get(key) {
-        return Some(value.clone());
-    }
-
-    let selection = match &canonicalized.bound_statement.statement {
-        Statement::Update(update) => update.selection.as_ref(),
-        Statement::Delete(delete) => delete.selection.as_ref(),
+fn selector_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<String> {
+    match canonicalized.write_command.selector.exact_filters.get(key) {
+        Some(Value::Text(value)) => Some(value.clone()),
+        Some(Value::Integer(value)) => Some(value.to_string()),
         _ => None,
-    }?;
-    let mut placeholder_state = PlaceholderState::new();
-    extract_string_equality(
-        selection,
-        key,
-        &canonicalized.bound_statement.bound_parameters,
-        &mut placeholder_state,
-    )
+    }
 }
 
-fn selection_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<bool> {
+fn selector_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<bool> {
     match canonicalized.write_command.selector.exact_filters.get(key) {
         Some(Value::Boolean(value)) => return Some(*value),
         Some(Value::Integer(value)) => return Some(*value != 0),
@@ -265,78 +256,9 @@ fn selection_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option
     None
 }
 
-fn extract_string_equality(
-    expr: &Expr,
-    key: &str,
-    params: &[Value],
-    placeholder_state: &mut PlaceholderState,
-) -> Option<String> {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => extract_string_equality(left, key, params, placeholder_state)
-            .or_else(|| extract_string_equality(right, key, params, placeholder_state)),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => {
-            if expr_references_column(left, key) {
-                expr_to_string_value(right, params, placeholder_state)
-            } else if expr_references_column(right, key) {
-                expr_to_string_value(left, params, placeholder_state)
-            } else {
-                None
-            }
-        }
-        Expr::Nested(inner) => extract_string_equality(inner, key, params, placeholder_state),
-        _ => None,
-    }
-}
-
-fn expr_references_column(expr: &Expr, key: &str) -> bool {
-    match expr {
-        Expr::Identifier(identifier) => identifier.value.eq_ignore_ascii_case(key),
-        Expr::CompoundIdentifier(parts) => parts
-            .last()
-            .is_some_and(|identifier| identifier.value.eq_ignore_ascii_case(key)),
-        Expr::Nested(inner) => expr_references_column(inner, key),
-        _ => false,
-    }
-}
-
-fn expr_to_string_value(
-    expr: &Expr,
-    params: &[Value],
-    placeholder_state: &mut PlaceholderState,
-) -> Option<String> {
-    match expr {
-        Expr::Value(value) => match &value.value {
-            SqlValue::SingleQuotedString(value)
-            | SqlValue::DoubleQuotedString(value)
-            | SqlValue::TripleSingleQuotedString(value)
-            | SqlValue::TripleDoubleQuotedString(value) => Some(value.clone()),
-            SqlValue::Placeholder(token) => {
-                let index =
-                    resolve_placeholder_index(token, params.len(), placeholder_state).ok()?;
-                match params.get(index) {
-                    Some(Value::Text(value)) => Some(value.clone()),
-                    Some(Value::Integer(value)) => Some(value.to_string()),
-                    _ => None,
-                }
-            }
-            _ => None,
-        },
-        Expr::Nested(inner) => expr_to_string_value(inner, params, placeholder_state),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::prove_write;
+    use super::analyze_write;
     use crate::sql::public::catalog::SurfaceRegistry;
     use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql::public::core::parser::parse_sql_script;
@@ -363,13 +285,13 @@ mod tests {
     }
 
     #[test]
-    fn proves_active_scope_for_lix_state_insert() {
-        let planned = prove_write(&canonicalized_write(
+    fn analyzes_active_scope_for_lix_state_insert() {
+        let planned = analyze_write(&canonicalized_write(
             "INSERT INTO lix_state (entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version) \
              VALUES ('entity-1', 'lix_key_value', 'lix', 'lix', '{\"key\":\"hello\"}', '1')",
             "main",
         ))
-        .expect("proofs should succeed");
+        .expect("write analysis should succeed");
 
         assert_eq!(planned.scope_proof, ScopeProof::ActiveVersion);
         assert_eq!(
@@ -385,13 +307,13 @@ mod tests {
     }
 
     #[test]
-    fn proves_single_version_scope_for_lix_state_by_version_insert() {
-        let planned = prove_write(&canonicalized_write(
+    fn analyzes_single_version_scope_for_lix_state_by_version_insert() {
+        let planned = analyze_write(&canonicalized_write(
             "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
              VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')",
             "main",
         ))
-        .expect("proofs should succeed");
+        .expect("write analysis should succeed");
 
         assert_eq!(
             planned.scope_proof,
@@ -400,8 +322,8 @@ mod tests {
     }
 
     #[test]
-    fn proves_scope_and_target_from_lix_state_by_version_update_predicate() {
-        let planned = prove_write(&canonicalized_write(
+    fn analyzes_scope_and_target_from_lix_state_by_version_update_predicate() {
+        let planned = analyze_write(&canonicalized_write(
             "UPDATE lix_state_by_version \
              SET snapshot_content = '{\"value\":\"after\"}' \
              WHERE schema_key = 'lix_key_value' \
@@ -409,7 +331,7 @@ mod tests {
                AND version_id = 'version-a'",
             "main",
         ))
-        .expect("proofs should succeed");
+        .expect("write analysis should succeed");
 
         assert_eq!(
             planned.scope_proof,
@@ -424,6 +346,24 @@ mod tests {
             Some(TargetSetProof::Exact(BTreeSet::from([
                 "entity-1".to_string()
             ])))
+        );
+    }
+
+    #[test]
+    fn explicit_version_surfaces_keep_bounded_scope_without_exact_version_literal() {
+        let planned = analyze_write(&canonicalized_write(
+            "UPDATE lix_state_by_version \
+             SET snapshot_content = '{\"value\":\"after\"}' \
+             WHERE schema_key = 'lix_key_value' \
+               AND entity_id = 'entity-1' \
+               AND version_id IN ('version-a', 'version-b')",
+            "main",
+        ))
+        .expect("write analysis should succeed");
+
+        assert_eq!(
+            planned.scope_proof,
+            ScopeProof::FiniteVersionSet(BTreeSet::new())
         );
     }
 }

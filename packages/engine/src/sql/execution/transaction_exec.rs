@@ -5,6 +5,11 @@ use crate::engine::{
 use crate::sql::execution::execute;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path;
+use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
+use crate::sql::public::catalog::SurfaceRegistry;
+use crate::sql::public::runtime::{
+    apply_public_surface_registry_mutations, public_surface_registry_mutations,
+};
 use crate::{
     ExecuteOptions, LixError, LixTransaction, QueryResult, StateCommitStreamChange, Value,
 };
@@ -17,11 +22,13 @@ impl Engine {
         params: &[Value],
         options: &ExecuteOptions,
         allow_internal_tables: bool,
+        public_surface_registry: &mut SurfaceRegistry,
+        public_surface_registry_dirty: &mut bool,
         active_version_id: &mut String,
         deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
         skip_side_effect_collection: bool,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
-        pending_sql2_append_session: &mut Option<shared_path::PendingSql2AppendSession>,
+        pending_public_append_session: &mut Option<shared_path::PendingPublicAppendSession>,
     ) -> Result<QueryResult, LixError> {
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         if parsed_statements.len() != 1 {
@@ -44,6 +51,7 @@ impl Engine {
                 active_version_id.as_str(),
                 writer_key,
                 allow_internal_tables,
+                Some(public_surface_registry),
                 shared_path::PreparationPolicy {
                     skip_side_effect_collection,
                 },
@@ -58,12 +66,12 @@ impl Engine {
             })?
         };
 
-        let execution = match shared_path::maybe_execute_sql2_write_with_transaction(
+        let execution = match shared_path::maybe_execute_public_write_with_transaction(
             self,
             transaction,
             &prepared,
             writer_key,
-            Some(pending_sql2_append_session),
+            Some(pending_public_append_session),
         )
         .await
         {
@@ -100,7 +108,7 @@ impl Engine {
                 return Err(LixError {
                     code: error.code,
                     description: format!(
-                        "transaction sql2 write execution failed: {}",
+                        "transaction public write execution failed: {}",
                         error.description
                     ),
                 })
@@ -113,7 +121,18 @@ impl Engine {
                 sqlparser::ast::Statement::Query(_) | sqlparser::ast::Statement::Explain { .. }
             )
         {
-            *pending_sql2_append_session = None;
+            *pending_public_append_session = None;
+        }
+
+        if let Some(public_write) = prepared.public_write.as_ref() {
+            let mutations = public_surface_registry_mutations(public_write)?;
+            if apply_public_surface_registry_mutations(public_surface_registry, &mutations)? {
+                *public_surface_registry_dirty = true;
+            }
+        } else if prepared_execution_mutates_public_surface_registry(&prepared)? {
+            let backend = TransactionBackendAdapter::new(transaction);
+            *public_surface_registry = SurfaceRegistry::bootstrap_with_backend(&backend).await?;
+            *public_surface_registry_dirty = true;
         }
 
         let active_effects = execution
@@ -137,7 +156,7 @@ impl Engine {
                 .extend(prepared.intent.pending_file_writes.clone());
         } else {
             let filesystem_payload_changes_already_committed =
-                shared_path::sql2_filesystem_payload_changes_already_committed(&prepared);
+                shared_path::public_write_filesystem_payload_changes_already_committed(&prepared);
             if !filesystem_payload_changes_already_committed {
                 self.persist_pending_file_data_updates_in_transaction(
                     transaction,
@@ -152,7 +171,7 @@ impl Engine {
                     ),
                 })?;
             }
-            // Live sql2 filesystem writes already commit descriptor and payload domain changes
+            // Live public filesystem writes already commit descriptor and payload domain changes
             // through the append boundary. Re-deriving payload effects from pre-commit state
             // inside the same transaction can observe incomplete runtime state and abort the
             // transaction on Postgres.

@@ -1,5 +1,6 @@
 use crate::cel::CelEvaluator;
 use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
+use crate::schema::schema_from_stored_snapshot;
 use crate::schema::SqlStoredSchemaProvider;
 use crate::{LixBackend, LixError};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -249,6 +250,37 @@ impl SurfaceRegistry {
             self.insert_descriptor(descriptor);
         }
         self.epoch
+    }
+
+    pub(crate) fn remove_dynamic_entity_surfaces_for_schema_key(&mut self, schema_key: &str) {
+        let dynamic_descriptor_names = self
+            .descriptors
+            .iter()
+            .filter_map(|(name, descriptor)| {
+                (descriptor.catalog_source == CatalogSource::Dynamic
+                    && descriptor.implicit_overrides.fixed_schema_key.as_deref()
+                        == Some(schema_key))
+                .then_some(name.clone())
+            })
+            .collect::<Vec<_>>();
+        if dynamic_descriptor_names.is_empty() {
+            return;
+        }
+        self.epoch.bump();
+        for name in dynamic_descriptor_names {
+            self.descriptors.remove(&name);
+        }
+    }
+
+    pub(crate) fn replace_dynamic_entity_surfaces_from_stored_snapshot(
+        &mut self,
+        snapshot: &JsonValue,
+    ) -> Result<(), LixError> {
+        let (key, schema) = schema_from_stored_snapshot(snapshot)?;
+        self.remove_dynamic_entity_surfaces_for_schema_key(&key.schema_key);
+        let spec = entity_surface_spec_from_schema(&schema)?;
+        self.register_dynamic_entity_surfaces(spec);
+        Ok(())
     }
 
     fn insert_descriptor(&mut self, descriptor: SurfaceDescriptor) {

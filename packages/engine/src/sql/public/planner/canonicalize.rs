@@ -4,8 +4,9 @@ use crate::sql::public::core::contracts::{BoundStatement, StatementKind};
 use crate::sql::public::planner::ir::{
     CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan,
     CanonicalWorkingChangesScan, InsertOnConflict, InsertOnConflictAction, MutationPayload,
-    PredicateSpec, ProjectionExpr, ReadCommand, ReadContract, ReadPlan, SortKey, WriteCommand,
-    WriteModeRequest, WriteOperationKind, WriteSelector,
+    NormalizedPublicReadQuery, PredicateSpec, ProjectionExpr, ReadCommand, ReadContract, ReadPlan,
+    SortKey, StructuredPublicRead, WriteCommand, WriteModeRequest, WriteOperationKind,
+    WriteSelector,
 };
 use crate::Value;
 use sqlparser::ast::{
@@ -34,6 +35,27 @@ pub(crate) struct CanonicalizedRead {
     pub(crate) bound_statement: BoundStatement,
     pub(crate) surface_binding: SurfaceBinding,
     pub(crate) read_command: ReadCommand,
+    pub(crate) query: NormalizedPublicReadQuery,
+}
+
+impl CanonicalizedRead {
+    pub(crate) fn structured_read(&self) -> StructuredPublicRead {
+        StructuredPublicRead {
+            bound_statement: self.bound_statement.clone(),
+            surface_binding: self.surface_binding.clone(),
+            read_command: self.read_command.clone(),
+            query: self.query.clone(),
+        }
+    }
+
+    pub(crate) fn into_structured_read(self) -> StructuredPublicRead {
+        StructuredPublicRead {
+            bound_statement: self.bound_statement,
+            surface_binding: self.surface_binding,
+            read_command: self.read_command,
+            query: self.query,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,6 +83,7 @@ pub(crate) fn canonicalize_read(
 
     let select = extract_supported_select(query)?;
     let surface_binding = bind_single_surface(select, registry)?;
+    let query_model = normalized_public_read_query(query, select)?;
     let mut root = if surface_binding.resolution_capabilities.canonical_state_scan {
         let scan =
             CanonicalStateScan::from_surface_binding(surface_binding.clone()).ok_or_else(|| {
@@ -162,6 +185,7 @@ pub(crate) fn canonicalize_read(
             contract: ReadContract::CommittedAtStart,
             requested_commit_mapping: None,
         },
+        query: query_model,
     })
 }
 
@@ -771,7 +795,7 @@ fn write_selector(
     );
 
     Ok(WriteSelector {
-        residual_predicates: vec![expr.to_string()],
+        residual_predicates: vec![expr.clone()],
         exact_filters,
         exact_only,
     })
@@ -1489,6 +1513,30 @@ fn projection_expressions(
     Ok(Some(expressions))
 }
 
+fn normalized_public_read_query(
+    query: &Query,
+    select: &Select,
+) -> Result<NormalizedPublicReadQuery, CanonicalizeError> {
+    let TableFactor::Table { alias, .. } = &select.from[0].relation else {
+        return Err(CanonicalizeError::unsupported(
+            "sql2 day-1 canonicalizer only supports direct table references",
+        ));
+    };
+
+    Ok(NormalizedPublicReadQuery {
+        source_alias: alias.clone(),
+        projection: select.projection.clone(),
+        selection: select.selection.clone(),
+        selection_predicates: select
+            .selection
+            .as_ref()
+            .map(split_conjunctive_predicates)
+            .unwrap_or_default(),
+        order_by: query.order_by.clone(),
+        limit_clause: query.limit_clause.clone(),
+    })
+}
+
 fn sort_keys(order_by: Option<&OrderBy>) -> Result<Option<Vec<SortKey>>, CanonicalizeError> {
     let Some(order_by) = order_by else {
         return Ok(None);
@@ -1541,6 +1589,27 @@ fn limit_values(
         LimitClause::OffsetCommaLimit { offset, limit } => {
             Ok(Some((Some(expr_to_u64(limit)?), expr_to_u64(offset)?)))
         }
+    }
+}
+
+fn split_conjunctive_predicates(expr: &Expr) -> Vec<Expr> {
+    let mut predicates = Vec::new();
+    collect_conjunctive_predicates(expr, &mut predicates);
+    predicates
+}
+
+fn collect_conjunctive_predicates(expr: &Expr, predicates: &mut Vec<Expr>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_conjunctive_predicates(left, predicates);
+            collect_conjunctive_predicates(right, predicates);
+        }
+        Expr::Nested(inner) => collect_conjunctive_predicates(inner, predicates),
+        _ => predicates.push(expr.clone()),
     }
 }
 
@@ -1616,6 +1685,27 @@ mod tests {
             canonicalized.read_command.contract,
             ReadContract::CommittedAtStart
         );
+        assert!(canonicalized.query.source_alias.is_none());
+        assert_eq!(canonicalized.query.projection.len(), 2);
+        assert_eq!(
+            canonicalized
+                .query
+                .selection
+                .as_ref()
+                .map(ToString::to_string),
+            Some("version_id = 'v1'".to_string())
+        );
+        assert_eq!(
+            canonicalized
+                .query
+                .selection_predicates
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["version_id = 'v1'".to_string()]
+        );
+        assert!(canonicalized.query.order_by.is_some());
+        assert!(canonicalized.query.limit_clause.is_some());
 
         let ReadPlan::Limit {
             input,

@@ -2095,6 +2095,95 @@ simulation_test!(filesystem_views_generate_default_ids, |sim| async move {
 });
 
 simulation_test!(
+    filesystem_multi_row_insert_reuses_shared_ancestor_directory,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES \
+                 ('multi-row-a', '/docs/a.md', X'41'), \
+                 ('multi-row-b', '/docs/b.md', X'42')",
+                &[],
+            )
+            .await
+            .expect("multi-row file insert should succeed");
+
+        let directory_rows = engine
+            .execute(
+                "SELECT id, path FROM lix_directory WHERE path = '/docs/'",
+                &[],
+            )
+            .await
+            .expect("directory verification query should succeed");
+        assert_eq!(directory_rows.statements[0].rows.len(), 1);
+        assert_text(&directory_rows.statements[0].rows[0][1], "/docs/");
+
+        let file_rows = engine
+            .execute(
+                "SELECT id, path FROM lix_file \
+                 WHERE id IN ('multi-row-a', 'multi-row-b') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("file verification query should succeed");
+        assert_eq!(file_rows.statements[0].rows.len(), 2);
+        assert_text(&file_rows.statements[0].rows[0][0], "multi-row-a");
+        assert_text(&file_rows.statements[0].rows[1][0], "multi-row-b");
+    }
+);
+
+simulation_test!(
+    filesystem_multi_row_directory_insert_promotes_explicit_ancestor_row,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path, parent_id, name, hidden) VALUES \
+                 ('child-guides', '/docs/guides/', NULL, 'guides', false), \
+                 ('parent-docs', '/docs/', NULL, 'docs', true)",
+                &[],
+            )
+            .await
+            .expect("multi-row directory insert should succeed");
+
+        let parent_rows = engine
+            .execute(
+                "SELECT id, hidden FROM lix_directory WHERE path = '/docs/'",
+                &[],
+            )
+            .await
+            .expect("parent verification query should succeed");
+        assert_eq!(parent_rows.statements[0].rows.len(), 1);
+        assert_text(&parent_rows.statements[0].rows[0][0], "parent-docs");
+        assert_boolean_like(&parent_rows.statements[0].rows[0][1], true);
+
+        let child_rows = engine
+            .execute(
+                "SELECT id, parent_id FROM lix_directory WHERE path = '/docs/guides/'",
+                &[],
+            )
+            .await
+            .expect("child verification query should succeed");
+        assert_eq!(child_rows.statements[0].rows.len(), 1);
+        assert_text(&child_rows.statements[0].rows[0][0], "child-guides");
+        assert_text(&child_rows.statements[0].rows[0][1], "parent-docs");
+    }
+);
+
+simulation_test!(
     filesystem_file_auto_id_insert_persists_data,
     |sim| async move {
         let engine = sim
@@ -2233,6 +2322,172 @@ simulation_test!(directory_duplicate_paths_are_rejected, |sim| async move {
         err.description
     );
 });
+
+simulation_test!(
+    directory_update_hidden_supports_or_selector,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path, parent_id, name) VALUES \
+                 ('dir-or-update-a', '/dir-or-update-a/', NULL, 'dir-or-update-a'), \
+                 ('dir-or-update-b', '/dir-or-update-b/', NULL, 'dir-or-update-b')",
+                &[],
+            )
+            .await
+            .expect("multi-row seed directory insert should succeed");
+
+        engine
+            .execute(
+                "UPDATE lix_directory \
+                 SET hidden = true \
+                 WHERE id = 'dir-or-update-a' OR path = '/dir-or-update-b/'",
+                &[],
+            )
+            .await
+            .expect("OR-selector directory update should succeed");
+
+        let rows = engine
+            .execute(
+                "SELECT id, hidden \
+                 FROM lix_directory \
+                 WHERE id IN ('dir-or-update-a', 'dir-or-update-b') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("verification query should succeed");
+
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_text(&rows.statements[0].rows[0][0], "dir-or-update-a");
+        assert_boolean_like(&rows.statements[0].rows[0][1], true);
+        assert_text(&rows.statements[0].rows[1][0], "dir-or-update-b");
+        assert_boolean_like(&rows.statements[0].rows[1][1], true);
+    }
+);
+
+simulation_test!(
+    directory_delete_supports_or_selector,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path, parent_id, name) VALUES \
+                 ('dir-or-delete-a', '/dir-or-delete-a/', NULL, 'dir-or-delete-a'), \
+                 ('dir-or-delete-b', '/dir-or-delete-b/', NULL, 'dir-or-delete-b')",
+                &[],
+            )
+            .await
+            .expect("multi-row seed directory insert should succeed");
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES \
+                 ('file-or-delete-a-child', '/dir-or-delete-a/note.md', X'41'), \
+                 ('file-or-delete-b-child', '/dir-or-delete-b/note.md', X'42')",
+                &[],
+            )
+            .await
+            .expect("multi-row seed child file insert should succeed");
+
+        engine
+            .execute(
+                "DELETE FROM lix_directory \
+                 WHERE id = 'dir-or-delete-a' OR path = '/dir-or-delete-b/'",
+                &[],
+            )
+            .await
+            .expect("OR-selector directory delete should succeed");
+
+        let directory_rows = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_directory \
+                 WHERE id IN ('dir-or-delete-a', 'dir-or-delete-b')",
+                &[],
+            )
+            .await
+            .expect("directory count query should succeed");
+        assert_eq!(directory_rows.statements[0].rows.len(), 1);
+        assert_integer(&directory_rows.statements[0].rows[0][0], 0);
+
+        let file_rows = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_file \
+                 WHERE id IN ('file-or-delete-a-child', 'file-or-delete-b-child')",
+                &[],
+            )
+            .await
+            .expect("file count query should succeed");
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
+        assert_integer(&file_rows.statements[0].rows[0][0], 0);
+    }
+);
+
+simulation_test!(
+    directory_batch_rename_updates_descendant_paths_from_renamed_parents,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path, parent_id, name) VALUES \
+                 ('dir-batch-parent', '/docs/', NULL, 'docs'), \
+                 ('dir-batch-child', '/docs/guides/', 'dir-batch-parent', 'guides')",
+                &[],
+            )
+            .await
+            .expect("seed directory insert should succeed");
+
+        engine
+            .execute(
+                "UPDATE lix_directory \
+                 SET name = 'renamed' \
+                 WHERE id = 'dir-batch-parent' OR id = 'dir-batch-child'",
+                &[],
+            )
+            .await
+            .expect("batch directory rename should succeed");
+
+        let rows = engine
+            .execute(
+                "SELECT id, path, parent_id \
+                 FROM lix_directory \
+                 WHERE id IN ('dir-batch-parent', 'dir-batch-child') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("verification query should succeed");
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_text(&rows.statements[0].rows[0][0], "dir-batch-child");
+        assert_text(&rows.statements[0].rows[0][1], "/renamed/renamed/");
+        assert_text(&rows.statements[0].rows[0][2], "dir-batch-parent");
+        assert_text(&rows.statements[0].rows[1][0], "dir-batch-parent");
+        assert_text(&rows.statements[0].rows[1][1], "/renamed/");
+        match &rows.statements[0].rows[1][2] {
+            Value::Null => {}
+            other => panic!("expected root parent_id to remain NULL, got {other:?}"),
+        }
+    }
+);
 
 simulation_test!(
     directory_duplicate_global_path_is_rejected_in_child_version,
@@ -2568,6 +2823,136 @@ simulation_test!(
             .expect("new path count query should succeed");
         assert_eq!(new_rows.statements[0].rows.len(), 1);
         assert_integer(&new_rows.statements[0].rows[0][0], 1);
+    }
+);
+
+simulation_test!(
+    file_update_hidden_supports_or_selector,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES \
+                 ('file-or-update-a', '/or-update-a.md', X'41'), \
+                 ('file-or-update-b', '/or-update-b.md', X'42')",
+                &[],
+            )
+            .await
+            .expect("multi-row seed insert should succeed");
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET hidden = true \
+                 WHERE id = 'file-or-update-a' OR path = '/or-update-b.md'",
+                &[],
+            )
+            .await
+            .expect("OR-selector update should succeed");
+
+        let rows = engine
+            .execute(
+                "SELECT id, hidden \
+                 FROM lix_file \
+                 WHERE id IN ('file-or-update-a', 'file-or-update-b') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("verification query should succeed");
+
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_text(&rows.statements[0].rows[0][0], "file-or-update-a");
+        assert_boolean_like(&rows.statements[0].rows[0][1], true);
+        assert_text(&rows.statements[0].rows[1][0], "file-or-update-b");
+        assert_boolean_like(&rows.statements[0].rows[1][1], true);
+    }
+);
+
+simulation_test!(
+    file_delete_supports_or_selector,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES \
+                 ('file-or-delete-a', '/or-delete-a.md', X'41'), \
+                 ('file-or-delete-b', '/or-delete-b.md', X'42')",
+                &[],
+            )
+            .await
+            .expect("multi-row seed insert should succeed");
+
+        engine
+            .execute(
+                "DELETE FROM lix_file \
+                 WHERE id = 'file-or-delete-a' OR path = '/or-delete-b.md'",
+                &[],
+            )
+            .await
+            .expect("OR-selector delete should succeed");
+
+        let rows = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_file \
+                 WHERE id IN ('file-or-delete-a', 'file-or-delete-b')",
+                &[],
+            )
+            .await
+            .expect("count query should succeed");
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_integer(&rows.statements[0].rows[0][0], 0);
+    }
+);
+
+simulation_test!(
+    file_multi_row_path_update_reports_unique_constraint,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES \
+                 ('file-batch-path-a', '/batch-path-a.md', X'41'), \
+                 ('file-batch-path-b', '/batch-path-b.md', X'42')",
+                &[],
+            )
+            .await
+            .expect("seed file insert should succeed");
+
+        let error = engine
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/same-batch-path.md' \
+                 WHERE id = 'file-batch-path-a' OR id = 'file-batch-path-b'",
+                &[],
+            )
+            .await
+            .expect_err("multi-row file path update should fail");
+        assert!(
+            error.description.contains("Unique constraint violation")
+                && !error.description.contains("does not yet support"),
+            "unexpected error: {}",
+            error.description
+        );
     }
 );
 
@@ -3177,7 +3562,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    tracked_directory_delete_rejects_untracked_descendant_winner,
+    tracked_directory_delete_partitions_tracked_and_untracked_descendants,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
@@ -3201,20 +3586,31 @@ simulation_test!(
             .await
             .expect("untracked child file insert should succeed");
 
-        let error = engine
+        engine
             .execute(
                 "DELETE FROM lix_directory WHERE id = 'dir-tracked-mixed'",
                 &[],
             )
             .await
-            .expect_err("tracked delete should reject mixed tracked/untracked cascade");
-        assert!(
-            error
-                .description
-                .contains("untracked winners in the cascade"),
-            "unexpected error: {}",
-            error.description
-        );
+            .expect("tracked delete should partition mixed tracked/untracked cascade");
+
+        let directory_rows = engine
+            .execute(
+                "SELECT id FROM lix_directory WHERE id = 'dir-tracked-mixed'",
+                &[],
+            )
+            .await
+            .expect("tracked root directory should be queryable after delete");
+        assert!(directory_rows.statements[0].rows.is_empty());
+
+        let file_rows = engine
+            .execute(
+                "SELECT id FROM lix_file WHERE id = 'file-untracked-mixed'",
+                &[],
+            )
+            .await
+            .expect("untracked descendant file should be queryable after delete");
+        assert!(file_rows.statements[0].rows.is_empty());
     }
 );
 

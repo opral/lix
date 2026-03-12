@@ -3,7 +3,8 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFuncti
 use crate::sql::common::ast::parse_sql_statements;
 use crate::sql::execution::contracts::planned_statement::PlannedStatementSet;
 use crate::sql::public::runtime::{
-    statement_references_public_sql2_surface, statement_references_public_sql2_surface_with_backend,
+    statement_references_public_surface_with_backend,
+    statement_references_public_surface_with_builtin_registry,
 };
 use crate::state::internal::{
     prepare_statements_sync_to_plan, prepare_statements_with_backend_to_plan,
@@ -91,11 +92,11 @@ where
 fn reject_public_surface_statements(statements: &[Statement]) -> Result<(), LixError> {
     if statements
         .iter()
-        .any(statement_references_public_sql2_surface)
+        .any(statement_references_public_surface_with_builtin_registry)
     {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "public surface statements must route through sql2",
+            "public surface statements must route through public lowering",
         ));
     }
     Ok(())
@@ -106,10 +107,10 @@ async fn reject_public_surface_statements_with_backend(
     statements: &[Statement],
 ) -> Result<(), LixError> {
     for statement in statements {
-        if statement_references_public_sql2_surface_with_backend(backend, statement).await {
+        if statement_references_public_surface_with_backend(backend, statement).await {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "public surface statements must route through sql2",
+                "public surface statements must route through public lowering",
             ));
         }
     }

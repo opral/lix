@@ -5,7 +5,7 @@ use sqlparser::ast::{
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::ast::utils::{bind_sql, parse_sql_statements};
 use crate::sql::ast::walk::object_name_matches;
-use crate::sql::public::runtime::lower_public_read_query_with_sql2_backend;
+use crate::sql::public::runtime::lower_public_read_query_with_backend;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) async fn materialize_vtable_insert_select_sources(
@@ -31,14 +31,17 @@ pub(crate) async fn materialize_vtable_insert_select_sources(
                 continue;
             };
             let source_query = (**source).clone();
-            let rewritten_source = Box::pin(lower_public_read_query_with_sql2_backend(
+            let rewritten_source = Box::pin(lower_public_read_query_with_backend(
                 backend,
                 source_query,
                 params,
             ))
             .await?;
+            for schema_key in &rewritten_source.required_schema_keys {
+                crate::schema::registry::register_schema(backend, schema_key).await?;
+            }
             let lowered_source = lower_statement(
-                Statement::Query(Box::new(rewritten_source)),
+                Statement::Query(Box::new(rewritten_source.query)),
                 backend.dialect(),
             )?;
             let select_sql = lowered_source.to_string();

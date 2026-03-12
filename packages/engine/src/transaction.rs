@@ -1,33 +1,37 @@
-use crate::engine::{
-    reject_internal_table_writes, Engine, EngineTransaction, EngineTransactionFuture,
-    ExecuteOptions,
-};
+use crate::engine::{reject_internal_table_writes, Engine, EngineTransaction, ExecuteOptions};
 use crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use crate::sql::execution::parse::parse_sql;
 use crate::{ExecuteResult, LixError, Value};
 use futures_util::FutureExt;
+use std::future::Future;
+use std::pin::Pin;
 
 impl Engine {
     pub async fn begin_transaction_with_options(
         &self,
         options: ExecuteOptions,
     ) -> Result<EngineTransaction<'_>, LixError> {
+        self.ensure_no_open_public_sql_transaction("begin_transaction")?;
         let transaction = self.backend.begin_transaction().await?;
         Ok(EngineTransaction {
             engine: self,
             transaction: Some(transaction),
             options,
+            public_surface_registry: self.public_surface_registry(),
             active_version_id: self.require_active_version_id()?,
             active_version_changed: false,
             installed_plugins_cache_invalidation_pending: false,
+            public_surface_registry_dirty: false,
             pending_state_commit_stream_changes: Vec::new(),
-            pending_sql2_append_session: None,
+            pending_public_append_session: None,
         })
     }
 
     pub async fn transaction<T, F>(&self, options: ExecuteOptions, f: F) -> Result<T, LixError>
     where
-        F: for<'tx> FnOnce(&'tx mut EngineTransaction<'_>) -> EngineTransactionFuture<'tx, T>,
+        F: for<'tx> FnOnce(
+            &'tx mut EngineTransaction<'_>,
+        ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
         let mut transaction = self.begin_transaction_with_options(options).await?;
         match std::panic::AssertUnwindSafe(f(&mut transaction))
@@ -47,41 +51,6 @@ impl Engine {
                 std::panic::resume_unwind(payload);
             }
         }
-    }
-
-    pub async fn begin_transaction_handle_with_options(
-        &self,
-        options: ExecuteOptions,
-    ) -> Result<u64, LixError> {
-        let transaction = self.begin_transaction_with_options(options).await?;
-        let handle = self.next_transaction_handle();
-        let transaction = unsafe {
-            std::mem::transmute::<EngineTransaction<'_>, EngineTransaction<'static>>(transaction)
-        };
-        self.put_transaction_handle(handle, transaction)?;
-        Ok(handle)
-    }
-
-    pub async fn execute_in_transaction_handle(
-        &self,
-        handle: u64,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<ExecuteResult, LixError> {
-        let mut transaction = self.take_transaction_handle(handle)?;
-        let result = transaction.execute(sql, params).await;
-        self.put_transaction_handle(handle, transaction)?;
-        result
-    }
-
-    pub async fn commit_transaction_handle(&self, handle: u64) -> Result<(), LixError> {
-        let transaction = self.take_transaction_handle(handle)?;
-        transaction.commit().await
-    }
-
-    pub async fn rollback_transaction_handle(&self, handle: u64) -> Result<(), LixError> {
-        let transaction = self.take_transaction_handle(handle)?;
-        transaction.rollback().await
     }
 }
 
@@ -127,9 +96,11 @@ impl EngineTransaction<'_> {
                     params,
                     &self.options,
                     allow_internal_tables,
+                    &mut self.public_surface_registry,
+                    &mut self.public_surface_registry_dirty,
                     &mut self.active_version_id,
                     &mut self.pending_state_commit_stream_changes,
-                    &mut self.pending_sql2_append_session,
+                    &mut self.pending_public_append_session,
                 )
                 .await?
         } else {
@@ -141,11 +112,13 @@ impl EngineTransaction<'_> {
                     params,
                     &self.options,
                     allow_internal_tables,
+                    &mut self.public_surface_registry,
+                    &mut self.public_surface_registry_dirty,
                     &mut self.active_version_id,
                     None,
                     false,
                     &mut self.pending_state_commit_stream_changes,
-                    &mut self.pending_sql2_append_session,
+                    &mut self.pending_public_append_session,
                 )
                 .await?;
             ExecuteResult {
@@ -182,6 +155,9 @@ impl EngineTransaction<'_> {
         }
         if self.installed_plugins_cache_invalidation_pending {
             self.engine.invalidate_installed_plugins_cache()?;
+        }
+        if self.public_surface_registry_dirty {
+            self.engine.refresh_public_surface_registry().await?;
         }
         self.engine.emit_state_commit_stream_changes(std::mem::take(
             &mut self.pending_state_commit_stream_changes,

@@ -10,7 +10,7 @@ use crate::plugin::types::{InstalledPlugin, PluginContentType};
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::preprocess::preprocess_sql_to_plan as preprocess_sql;
-use crate::sql::public::runtime::lower_public_read_query_with_sql2_backend;
+use crate::sql::public::runtime::lower_public_read_query_with_backend;
 use crate::state::materialization::{
     MaterializationPlan, MaterializationWrite, MaterializationWriteOp,
 };
@@ -597,7 +597,7 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
            AND root_commit_id = $3 \
            AND depth >= (SELECT raw_depth FROM target_commit_depth) \
          ORDER BY entity_id ASC, depth ASC";
-    let rows = execute_read_query_with_public_sql2_lowering(backend, sql, &params).await?;
+    let rows = execute_read_query_with_public_lowering(backend, sql, &params).await?;
 
     let mut changes = Vec::new();
     let mut previous_entity_id: Option<String> = None;
@@ -620,14 +620,16 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
     Ok(changes)
 }
 
-async fn execute_read_query_with_public_sql2_lowering(
+async fn execute_read_query_with_public_lowering(
     backend: &dyn LixBackend,
     sql: &str,
     params: &[Value],
 ) -> Result<crate::QueryResult, LixError> {
     let mut statements = parse_sql(sql).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("plugin runtime: failed to parse query for sql2 lowering: {error:?}"),
+        description: format!(
+            "plugin runtime: failed to parse query for public lowering: {error:?}"
+        ),
     })?;
     if statements.len() != 1 {
         return Err(LixError {
@@ -638,12 +640,17 @@ async fn execute_read_query_with_public_sql2_lowering(
     let Statement::Query(query) = statements.remove(0) else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "plugin runtime: expected a SELECT query for sql2 lowering".to_string(),
+            description: "plugin runtime: expected a SELECT query for public lowering".to_string(),
         });
     };
-    let lowered_query = lower_public_read_query_with_sql2_backend(backend, *query, params).await?;
-    let lowered_statement =
-        lower_statement(Statement::Query(Box::new(lowered_query)), backend.dialect())?;
+    let lowered_query = lower_public_read_query_with_backend(backend, *query, params).await?;
+    for schema_key in &lowered_query.required_schema_keys {
+        crate::schema::registry::register_schema(backend, schema_key).await?;
+    }
+    let lowered_statement = lower_statement(
+        Statement::Query(Box::new(lowered_query.query)),
+        backend.dialect(),
+    )?;
     backend
         .execute(&lowered_statement.to_string(), params)
         .await
