@@ -181,33 +181,26 @@ fn write_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<boo
 
 fn payload_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<String> {
     match &canonicalized.write_command.payload {
-        MutationPayload::FullSnapshot(payload) | MutationPayload::Patch(payload) => {
-            match payload.get(key) {
+        MutationPayload::InsertRows(rows) => {
+            let mut values = rows.iter().filter_map(|payload| match payload.get(key) {
                 Some(Value::Text(value)) => Some(value.clone()),
                 _ => None,
-            }
-        }
-        MutationPayload::BulkFullSnapshot(payloads) => {
-            let mut values = payloads
-                .iter()
-                .filter_map(|payload| match payload.get(key) {
-                    Some(Value::Text(value)) => Some(value.clone()),
-                    _ => None,
-                });
+            });
             let first = values.next()?;
             values.all(|candidate| candidate == first).then_some(first)
         }
+        MutationPayload::UpdatePatch(payload) => match payload.get(key) {
+            Some(Value::Text(value)) => Some(value.clone()),
+            _ => None,
+        },
         MutationPayload::Tombstone => None,
     }
 }
 
 fn payload_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<bool> {
     match &canonicalized.write_command.payload {
-        MutationPayload::FullSnapshot(payload) | MutationPayload::Patch(payload) => {
-            bool_value_from_payload(payload, key)
-        }
-        MutationPayload::BulkFullSnapshot(payloads) => {
-            let mut values = payloads
+        MutationPayload::InsertRows(rows) => {
+            let mut values = rows
                 .iter()
                 .map(|payload| bool_value_from_payload(payload, key));
             let first = values.next()??;
@@ -215,6 +208,7 @@ fn payload_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<b
                 .all(|candidate| candidate == Some(first))
                 .then_some(first)
         }
+        MutationPayload::UpdatePatch(payload) => bool_value_from_payload(payload, key),
         MutationPayload::Tombstone => None,
     }
 }

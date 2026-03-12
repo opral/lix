@@ -601,6 +601,56 @@ simulation_test!(
 );
 
 simulation_test!(
+    transaction_script_path_handles_parameterized_multi_row_lix_file_insert,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "BEGIN; \
+                 INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?), (?, ?, ?); \
+                 COMMIT;",
+                &[
+                    Value::Text("tx-script-batch-1".to_string()),
+                    Value::Text("/batch-1.md".to_string()),
+                    Value::Blob(b"batch-1".to_vec()),
+                    Value::Text("tx-script-batch-2".to_string()),
+                    Value::Text("/batch-2.md".to_string()),
+                    Value::Blob(b"batch-2".to_vec()),
+                ],
+            )
+            .await
+            .expect(
+                "BEGIN/COMMIT transaction script with parameterized multi-row insert should execute successfully",
+            );
+
+        let inserted = engine
+            .execute(
+                "SELECT id, path, data FROM lix_file WHERE id IN ('tx-script-batch-1', 'tx-script-batch-2') ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(inserted.statements[0].rows.len(), 2);
+        assert_eq!(
+            inserted.statements[0].rows[0][0],
+            Value::Text("tx-script-batch-1".to_string())
+        );
+        assert_eq!(
+            inserted.statements[0].rows[1][1],
+            Value::Text("/batch-2.md".to_string())
+        );
+        assert_blob_text(&inserted.statements[0].rows[0][2], "batch-1");
+        assert_blob_text(&inserted.statements[0].rows[1][2], "batch-2");
+    }
+);
+
+simulation_test!(
     transaction_script_path_handles_single_parameterized_lix_file_update,
     simulations = [sqlite, postgres],
     |sim| async move {

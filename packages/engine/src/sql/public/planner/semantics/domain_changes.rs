@@ -217,16 +217,12 @@ fn build_idempotency_key(
 
 fn summarize_mutation_payload(payload: &MutationPayload) -> JsonValue {
     match payload {
-        MutationPayload::FullSnapshot(values) => json!({
-            "kind": "full_snapshot",
-            "values": summarize_value_map(values),
-        }),
-        MutationPayload::BulkFullSnapshot(rows) => json!({
-            "kind": "bulk_full_snapshot",
+        MutationPayload::InsertRows(rows) => json!({
+            "kind": "insert_rows",
             "rows": rows.iter().map(summarize_value_map).collect::<Vec<_>>(),
         }),
-        MutationPayload::Patch(values) => json!({
-            "kind": "patch",
+        MutationPayload::UpdatePatch(values) => json!({
+            "kind": "update_patch",
             "values": summarize_value_map(values),
         }),
         MutationPayload::Tombstone => json!({
@@ -328,8 +324,7 @@ fn serialized_value(
 
 fn command_writer_key(planned_write: &PlannedWrite) -> Option<String> {
     match &planned_write.command.payload {
-        crate::sql::public::planner::ir::MutationPayload::FullSnapshot(payload)
-        | crate::sql::public::planner::ir::MutationPayload::Patch(payload) => {
+        crate::sql::public::planner::ir::MutationPayload::UpdatePatch(payload) => {
             if !payload.contains_key("writer_key") {
                 return planned_write.command.execution_context.writer_key.clone();
             }
@@ -340,7 +335,7 @@ fn command_writer_key(planned_write: &PlannedWrite) -> Option<String> {
                 _ => None,
             }
         }
-        crate::sql::public::planner::ir::MutationPayload::BulkFullSnapshot(payloads) => {
+        crate::sql::public::planner::ir::MutationPayload::InsertRows(payloads) => {
             payloads.first().and_then(|payload| {
                 if !payload.contains_key("writer_key") {
                     return planned_write.command.execution_context.writer_key.clone();
