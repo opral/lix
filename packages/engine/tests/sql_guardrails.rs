@@ -67,7 +67,7 @@ fn guardrail_engine_runtime_section_excludes_legacy_sql_pipeline_imports() {
 }
 
 #[test]
-fn guardrail_sql_runtime_forbids_legacy_sql2_imports() {
+fn guardrail_sql_runtime_forbids_legacy_public_lowering_imports() {
     let shared_path_source = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql/execution/shared_path.rs"),
     )
@@ -77,12 +77,12 @@ fn guardrail_sql_runtime_forbids_legacy_sql2_imports() {
         "shared_path must not depend on removed engine::sql2 bridge paths"
     );
     assert!(
-        shared_path_source.contains("prepare_sql2_public_execution"),
-        "shared_path must route public batches through the single sql2 public-preparation entrypoint"
+        shared_path_source.contains("prepare_public_execution_with_internal_access"),
+        "shared_path must route public batches through the single public-lowering preparation entrypoint"
     );
     assert!(
         !shared_path_source.contains("prepare_sql2_read"),
-        "shared_path must not reintroduce direct public-read bridge probing once sql2 owns dispatch"
+        "shared_path must not reintroduce direct public-read bridge probing once public lowering owns dispatch"
     );
 }
 
@@ -158,12 +158,12 @@ fn guardrail_duplicate_public_surface_registry_is_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
         !root.join("src/lix_table_registry.rs").exists(),
-        "duplicate public surface registry must stay removed once sql2/catalog owns diagnostics"
+        "duplicate public surface registry must stay removed once public lowering/catalog owns diagnostics"
     );
 }
 
 #[test]
-fn guardrail_sql2_stays_isolated_from_legacy_rewrite_followup_and_classifier_modules() {
+fn guardrail_public_lowering_stays_isolated_from_legacy_rewrite_followup_and_classifier_modules() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql/public");
     let mut files = Vec::new();
     collect_rust_sources(&root, &mut files);
@@ -181,7 +181,7 @@ fn guardrail_sql2_stays_isolated_from_legacy_rewrite_followup_and_classifier_mod
         ] {
             assert!(
                 !source.contains(forbidden),
-                "sql2 must not depend on legacy rewrite/followup/classifier/planning code: {}",
+                "public lowering must not depend on legacy rewrite/followup/classifier/planning code: {}",
                 file.display()
             );
         }
@@ -225,7 +225,7 @@ fn guardrail_legacy_filesystem_select_rewrite_is_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
         !root.join("src/filesystem/select_rewrite.rs").exists(),
-        "legacy filesystem select rewrite must stay removed once sql2 owns filesystem reads"
+        "legacy filesystem select rewrite must stay removed once public lowering owns filesystem reads"
     );
 
     let filesystem_mod_source =
@@ -292,7 +292,7 @@ fn guardrail_legacy_filesystem_mutation_rewrite_is_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
         !root.join("src/filesystem/mutation_rewrite.rs").exists(),
-        "legacy filesystem mutation rewrite must stay removed once sql2 owns filesystem writes"
+        "legacy filesystem mutation rewrite must stay removed once public lowering owns filesystem writes"
     );
 
     let filesystem_mod_source =

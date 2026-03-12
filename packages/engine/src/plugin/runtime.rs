@@ -647,8 +647,10 @@ async fn execute_read_query_with_public_lowering(
     for schema_key in &lowered_query.required_schema_keys {
         crate::schema::registry::register_schema(backend, schema_key).await?;
     }
-    let lowered_statement =
-        lower_statement(Statement::Query(Box::new(lowered_query.query)), backend.dialect())?;
+    let lowered_statement = lower_statement(
+        Statement::Query(Box::new(lowered_query.query)),
+        backend.dialect(),
+    )?;
     backend
         .execute(&lowered_statement.to_string(), params)
         .await

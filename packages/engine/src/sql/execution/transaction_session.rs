@@ -39,8 +39,15 @@ pub(crate) async fn execute_public_sql(
         if contains_any_transaction_control_statement(&parsed_statements) {
             return Err(errors::transaction_control_statement_denied_error());
         }
-        return execute_in_active_transaction(state, engine, parsed_statements, sql, params, options)
-            .await;
+        return execute_in_active_transaction(
+            state,
+            engine,
+            parsed_statements,
+            sql,
+            params,
+            options,
+        )
+        .await;
     }
 
     engine.execute_impl_sql(sql, params, options, false).await
@@ -130,10 +137,9 @@ async fn execute_transaction_control(
                 // SAFETY: the transaction may borrow from the backend allocation.
                 // Keeping an `Arc` clone in `SessionTransaction` keeps that allocation
                 // alive for at least as long as the transaction object.
-                std::mem::transmute::<
-                    Box<dyn LixTransaction + '_>,
-                    Box<dyn LixTransaction + 'static>,
-                >(transaction)
+                std::mem::transmute::<Box<dyn LixTransaction + '_>, Box<dyn LixTransaction + 'static>>(
+                    transaction,
+                )
             };
             state.session_transaction = Some(SessionTransaction {
                 _backend: backend,

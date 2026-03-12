@@ -41,9 +41,7 @@ impl ErrorCode {
             Self::OperationBlockedByActiveTransaction => {
                 "LIX_ERROR_OPERATION_BLOCKED_BY_ACTIVE_TRANSACTION"
             }
-            Self::TransactionWriterKeyConflict => {
-                "LIX_ERROR_TRANSACTION_WRITER_KEY_CONFLICT"
-            }
+            Self::TransactionWriterKeyConflict => "LIX_ERROR_TRANSACTION_WRITER_KEY_CONFLICT",
             Self::FileDataExpectsBytes => "LIX_ERROR_FILE_DATA_EXPECTS_BYTES",
             Self::UnexpectedStatementCount => "LIX_ERROR_UNEXPECTED_STATEMENT_COUNT",
         }

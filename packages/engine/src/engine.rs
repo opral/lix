@@ -90,9 +90,7 @@ impl Engine {
         operation: &str,
     ) -> Result<(), LixError> {
         if self.public_sql_transaction_open.load(Ordering::SeqCst) {
-            return Err(crate::errors::operation_blocked_by_active_transaction_error(
-                operation,
-            ));
+            return Err(crate::errors::operation_blocked_by_active_transaction_error(operation));
         }
         Ok(())
     }
@@ -521,6 +519,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use sqlparser::ast::{Expr, Statement};
+    use std::future::Future;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, RwLock};
     struct TestBackend {
@@ -542,6 +541,26 @@ mod tests {
 
     fn active_version_snapshot_json(version_id: &str) -> String {
         serde_json::json!({ "id": "main", "version_id": version_id }).to_string()
+    }
+
+    fn run_async_with_large_stack<F, Fut>(name: &str, test_fn: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build tokio runtime");
+                runtime.block_on(test_fn());
+            })
+            .expect("failed to spawn async test thread")
+            .join()
+            .expect("async test thread panicked");
     }
 
     #[async_trait(?Send)]
@@ -718,29 +737,34 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn unknown_read_query_returns_unknown_table_error() {
-        let commit_called = Arc::new(AtomicBool::new(false));
-        let rollback_called = Arc::new(AtomicBool::new(false));
-        let engine = boot(BootArgs::new(
-            Box::new(TestBackend {
-                commit_called,
-                rollback_called,
-                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
-                    "global",
-                ))),
-                restored_active_version_snapshot: active_version_snapshot_json("global"),
-            }),
-            Arc::new(NoopWasmRuntime),
-        ));
-        engine.set_active_version_id("version-test".to_string());
+    #[test]
+    fn unknown_read_query_returns_unknown_table_error() {
+        run_async_with_large_stack(
+            "engine::tests::unknown_read_query_returns_unknown_table_error",
+            || async {
+                let commit_called = Arc::new(AtomicBool::new(false));
+                let rollback_called = Arc::new(AtomicBool::new(false));
+                let engine = boot(BootArgs::new(
+                    Box::new(TestBackend {
+                        commit_called,
+                        rollback_called,
+                        active_version_snapshot: Arc::new(RwLock::new(
+                            active_version_snapshot_json("global"),
+                        )),
+                        restored_active_version_snapshot: active_version_snapshot_json("global"),
+                    }),
+                    Arc::new(NoopWasmRuntime),
+                ));
+                engine.set_active_version_id("version-test".to_string());
 
-        let error = engine
-            .execute("SELECT * FROM unknown_table", &[])
-            .await
-            .expect_err("unknown relation query should fail");
+                let error = engine
+                    .execute("SELECT * FROM unknown_table", &[])
+                    .await
+                    .expect_err("unknown relation query should fail");
 
-        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
+                assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
+            },
+        );
     }
 
     #[test]

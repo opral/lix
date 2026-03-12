@@ -1004,17 +1004,16 @@ async fn active_version_id_from_lix_active_version_update(
         query_sql.push_str(&selection.to_string());
     }
     let bound = bind_sql_with_state(&query_sql, params, backend.dialect(), placeholder_state)?;
-    let rows =
-        execute_public_prefetch_query(backend, &bound.sql, &bound.params, GLOBAL_VERSION_ID)
-            .await
-            .map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "active version update prefetch failed for '{}': {}",
-                    bound.sql, error.description
-                ),
-            })?
-            .rows;
+    let rows = execute_public_prefetch_query(backend, &bound.sql, &bound.params, GLOBAL_VERSION_ID)
+        .await
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "active version update prefetch failed for '{}': {}",
+                bound.sql, error.description
+            ),
+        })?
+        .rows;
     if rows.is_empty() {
         return Ok(None);
     }
