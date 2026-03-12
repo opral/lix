@@ -1,4 +1,4 @@
-use super::{
+use crate::engine::{
     collapse_pending_file_writes_for_transaction, dedupe_filesystem_payload_domain_changes,
     should_run_binary_cas_gc, CollectedExecutionSideEffects, DeferredTransactionSideEffects,
     Engine, TransactionBackendAdapter,
@@ -136,7 +136,7 @@ impl Engine {
         ) {
             crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
                 backend,
-                self.wasm_runtime.as_ref(),
+                self.wasm_runtime_ref(),
             )
             .await?;
         }
@@ -504,29 +504,6 @@ impl Engine {
         transaction: &mut dyn LixTransaction,
     ) -> Result<(), LixError> {
         garbage_collect_unreachable_binary_cas_in_transaction(transaction).await
-    }
-
-    pub(crate) fn require_active_version_id(&self) -> Result<String, LixError> {
-        let guard = self.active_version_id.read().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "active version cache lock poisoned".to_string(),
-        })?;
-        guard
-            .clone()
-            .ok_or_else(crate::errors::not_initialized_error)
-    }
-
-    pub(crate) fn clear_active_version_id(&self) {
-        let mut guard = self.active_version_id.write().unwrap();
-        *guard = None;
-    }
-
-    pub(crate) fn set_active_version_id(&self, version_id: String) {
-        let mut guard = self.active_version_id.write().unwrap();
-        if guard.as_ref() == Some(&version_id) {
-            return;
-        }
-        *guard = Some(version_id);
     }
 }
 

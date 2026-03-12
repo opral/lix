@@ -1,7 +1,13 @@
-use super::*;
+use crate::engine::{
+    dedupe_filesystem_payload_domain_changes, normalize_sql_execution_error_with_backend,
+    should_run_binary_cas_gc, DeferredTransactionSideEffects, Engine, TransactionBackendAdapter,
+};
 use crate::sql::execution::execute;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path;
+use crate::{
+    ExecuteOptions, LixError, LixTransaction, QueryResult, StateCommitStreamChange, Value,
+};
 
 impl Engine {
     pub(crate) async fn execute_with_options_in_transaction(

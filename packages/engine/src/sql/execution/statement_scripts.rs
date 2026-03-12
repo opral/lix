@@ -1,10 +1,11 @@
 use crate::engine::{
-    CollectedExecutionSideEffects, DeferredTransactionSideEffects, Engine, ExecuteOptions,
-    StateCommitStreamChange, TransactionBackendAdapter,
+    CollectedExecutionSideEffects, DeferredTransactionSideEffects, Engine,
+    TransactionBackendAdapter,
 };
 use crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use crate::state::internal::script::prepare_statement_script_sql_statements;
-use crate::{ExecuteResult, LixError, LixTransaction, Value};
+use crate::state::stream::StateCommitStreamChange;
+use crate::{ExecuteOptions, ExecuteResult, LixError, LixTransaction, Value};
 use sqlparser::ast::Statement;
 
 impl Engine {

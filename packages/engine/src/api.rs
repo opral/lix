@@ -1,11 +1,19 @@
-use super::*;
+use crate::engine::{
+    normalize_sql_execution_error_with_backend, reject_internal_table_writes, Engine,
+    ExecuteOptions,
+};
 use crate::errors;
-use crate::runtime_post_commit;
-use crate::runtime_sql_effects;
 use crate::sql::execution::execute;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path;
+use crate::sql::execution::{runtime_post_commit, runtime_sql_effects};
 use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
+use crate::state::materialization::{
+    MaterializationApplyReport, MaterializationPlan, MaterializationReport, MaterializationRequest,
+};
+use crate::version::GLOBAL_VERSION_ID;
+use crate::{ExecuteResult, LixError, LixTransaction, QueryResult, Value};
+use sqlparser::ast::Statement;
 
 impl Engine {
     pub async fn open(&self) -> Result<(), LixError> {
@@ -14,14 +22,6 @@ impl Engine {
         }
         self.load_and_cache_active_version().await?;
         Ok(())
-    }
-
-    pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
-        self.wasm_runtime.clone()
-    }
-
-    pub fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {
-        self.state_commit_stream_bus.subscribe(filter)
     }
 
     pub(crate) async fn execute_backend_sql(
@@ -87,24 +87,6 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
-        self.state_commit_stream_bus.emit(changes);
-    }
-
-    pub(crate) fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
-        let mut guard = self.installed_plugins_cache.write().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "installed plugin cache lock poisoned".to_string(),
-        })?;
-        *guard = None;
-        let mut component_guard = self.plugin_component_cache.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "plugin component cache lock poisoned".to_string(),
-        })?;
-        component_guard.clear();
-        Ok(())
-    }
-
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.execute_with_options(sql, params, ExecuteOptions::default())
             .await
@@ -135,7 +117,7 @@ impl Engine {
         options: ExecuteOptions,
         allow_internal_tables: bool,
     ) -> Result<ExecuteResult, LixError> {
-        let allow_internal_sql = allow_internal_tables || self.access_to_internal;
+        let allow_internal_sql = allow_internal_tables || self.access_to_internal();
 
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         if !allow_internal_sql {
@@ -337,7 +319,7 @@ impl Engine {
 
         crate::plugin::runtime::materialize_file_data_with_plugins(
             self.backend.as_ref(),
-            self.wasm_runtime.as_ref(),
+            self.wasm_runtime_ref(),
             &plan,
         )
         .await?;

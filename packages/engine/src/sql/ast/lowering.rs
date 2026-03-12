@@ -1,8 +1,3 @@
-#[path = "lower_json_fn.rs"]
-mod lower_json_fn;
-#[path = "lower_logical_fn.rs"]
-mod lower_logical_fn;
-
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{Expr, Statement};
@@ -11,11 +6,11 @@ use sqlparser::ast::{VisitMut, VisitorMut};
 use crate::backend::SqlDialect;
 use crate::LixError;
 
-use self::lower_json_fn::{
+use super::lower_json_fn::{
     lower_lix_empty_blob, lower_lix_json, lower_lix_json_extract, lower_lix_text_decode,
     lower_lix_text_encode,
 };
-use self::lower_logical_fn::{
+use super::lower_logical_fn::{
     parse_lix_empty_blob, parse_lix_json, parse_lix_json_extract, parse_lix_text_decode,
     parse_lix_text_encode,
 };
