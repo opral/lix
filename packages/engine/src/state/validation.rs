@@ -173,7 +173,7 @@ async fn validate_sql2_write(
     let mut schema_provider = OverlaySchemaProvider::from_backend(backend);
 
     if planned_write.command.operation_kind == WriteOperationKind::Update {
-        for row in &resolved.intended_post_state {
+        for row in resolved.intended_post_state() {
             if row.tombstone {
                 continue;
             }
@@ -181,7 +181,7 @@ async fn validate_sql2_write(
         }
     }
 
-    for row in &resolved.intended_post_state {
+    for row in resolved.intended_post_state() {
         validate_sql2_planned_row(
             backend,
             &mut schema_provider,

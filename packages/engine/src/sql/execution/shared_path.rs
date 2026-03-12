@@ -6,7 +6,7 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::registry::register_schema_sql_statements;
 use crate::sql::public::runtime::{
     finalize_public_write_execution, prepare_public_execution_with_internal_access,
-    PreparedPublicExecution, PreparedPublicWrite, PublicWriteExecution,
+    PreparedPublicExecution, PreparedPublicWrite, PublicWriteExecutionPartition,
 };
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{
@@ -227,11 +227,24 @@ pub(crate) async fn prepare_execution_with_backend(
             &statements,
             public_write
                 .as_ref()
-                .and_then(|prepared| match prepared.execution.as_ref() {
-                    Some(PublicWriteExecution::Tracked(execution)) => {
-                        Some(execution.schema_registrations.clone())
-                    }
-                    _ => None,
+                .map(|prepared| {
+                    prepared
+                        .execution
+                        .as_ref()
+                        .map(|execution| {
+                            execution
+                                .partitions
+                                .iter()
+                                .filter_map(|partition| match partition {
+                                    PublicWriteExecutionPartition::Tracked(execution) => {
+                                        Some(execution.schema_registrations.clone())
+                                    }
+                                    PublicWriteExecutionPartition::Untracked(_) => None,
+                                })
+                                .flatten()
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
                 })
                 .unwrap_or_default(),
         )
@@ -250,10 +263,10 @@ pub(crate) async fn prepare_execution_with_backend(
             writer_key,
         )
         .await
-            .map_err(LixError::from)
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
+        .map_err(LixError::from)
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
                 "prepare_execution_with_backend plan building failed: {}",
                 error.description
             ),
@@ -288,11 +301,7 @@ pub(crate) async fn prepare_execution_with_backend(
         })?;
     }
     if let Some(public_write) = public_write.as_ref() {
-        validate_sql2_batch_local_write(
-            backend,
-            &engine.schema_cache,
-            &public_write.planned_write,
-        )
+        validate_sql2_batch_local_write(backend, &engine.schema_cache, &public_write.planned_write)
             .await
             .map_err(|error| LixError {
                 code: error.code,
@@ -489,23 +498,55 @@ pub(crate) async fn maybe_execute_public_write_with_transaction(
         return Ok(None);
     };
 
-    if let PublicWriteExecution::Untracked(execution) = execution {
-        if let Some(session_slot) = pending_append_session.as_mut() {
-            **session_slot = None;
+    let mut combined_outcome = None;
+    for partition in &execution.partitions {
+        let outcome = match partition {
+            PublicWriteExecutionPartition::Untracked(execution) => {
+                if let Some(session_slot) = pending_append_session.as_mut() {
+                    **session_slot = None;
+                }
+                execute_public_untracked_write_with_transaction(
+                    engine,
+                    transaction,
+                    execution,
+                    prepared,
+                )
+                .await?
+            }
+            PublicWriteExecutionPartition::Tracked(execution) => {
+                execute_public_tracked_write_with_transaction(
+                    engine,
+                    transaction,
+                    execution,
+                    public_write,
+                    prepared,
+                    writer_key,
+                    pending_append_session.as_deref_mut(),
+                )
+                .await?
+            }
+        };
+
+        if let Some(outcome) = outcome {
+            merge_public_write_execution_outcome(&mut combined_outcome, outcome);
         }
-        return execute_public_untracked_write_with_transaction(
-            engine,
-            transaction,
-            execution,
-            prepared,
-        )
-        .await;
     }
 
-    let PublicWriteExecution::Tracked(execution) = execution else {
-        return Ok(None);
-    };
-    if execution.filesystem_payload_changes_committed_by_write {
+    Ok(Some(
+        combined_outcome.unwrap_or_else(empty_public_write_execution_outcome),
+    ))
+}
+
+async fn execute_public_tracked_write_with_transaction(
+    engine: &Engine,
+    transaction: &mut dyn LixTransaction,
+    execution: &crate::sql::public::runtime::TrackedWriteExecution,
+    public_write: &PreparedPublicWrite,
+    prepared: &PreparedExecutionContext,
+    writer_key: Option<&str>,
+    mut pending_append_session: Option<&mut Option<PendingPublicAppendSession>>,
+) -> Result<Option<SqlExecutionOutcome>, LixError> {
+    if execution.persist_filesystem_payloads_before_write {
         engine
             .persist_pending_file_data_updates_in_transaction(
                 transaction,
@@ -539,22 +580,12 @@ pub(crate) async fn maybe_execute_public_write_with_transaction(
     }
 
     if execution.domain_change_batch.changes.is_empty() {
-        return Ok(Some(SqlExecutionOutcome {
-            public_result: QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            },
-            postprocess_file_cache_targets: BTreeSet::new(),
-            plugin_changes_committed: false,
-            plan_effects_override: Some(PlanEffects::default()),
-            state_commit_stream_changes: Vec::new(),
-        }));
+        return Ok(Some(empty_public_write_execution_outcome()));
     }
 
     let mut append_functions = prepared.functions.clone();
     let timestamp = append_functions.timestamp();
     if let Some(session_slot) = pending_append_session.as_mut() {
-        let session_slot = &mut **session_slot;
         let can_merge = session_slot.as_ref().is_some_and(|session| {
             pending_session_matches_append(session, &execution.append_preconditions)
         });
@@ -617,22 +648,25 @@ pub(crate) async fn maybe_execute_public_write_with_transaction(
             })?;
     }
     if matches!(append_result.disposition, AppendCommitDisposition::Applied) {
-        apply_public_version_last_checkpoint_side_effects(transaction, public_write)
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "public tracked write version checkpoint side effects failed: {}",
-                    error.description
-                ),
-            })?;
+        apply_public_version_last_checkpoint_side_effects(
+            transaction,
+            public_write,
+            &execution.domain_change_batch,
+        )
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "public tracked write version checkpoint side effects failed: {}",
+                error.description
+            ),
+        })?;
     }
 
     let plugin_changes_committed =
         matches!(append_result.disposition, AppendCommitDisposition::Applied);
     if let Some(session_slot) = pending_append_session.as_mut() {
-        let session_slot = &mut **session_slot;
-        *session_slot = if plugin_changes_committed {
+        **session_slot = if plugin_changes_committed {
             if let Some(commit_result) = append_result.commit_result.as_ref() {
                 Some(
                     build_pending_public_append_session(
@@ -666,6 +700,61 @@ pub(crate) async fn maybe_execute_public_write_with_transaction(
         plan_effects_override: Some(plan_effects_override),
         state_commit_stream_changes: Vec::new(),
     }))
+}
+
+fn empty_public_write_execution_outcome() -> SqlExecutionOutcome {
+    SqlExecutionOutcome {
+        public_result: QueryResult {
+            rows: Vec::new(),
+            columns: Vec::new(),
+        },
+        postprocess_file_cache_targets: BTreeSet::new(),
+        plugin_changes_committed: false,
+        plan_effects_override: Some(PlanEffects::default()),
+        state_commit_stream_changes: Vec::new(),
+    }
+}
+
+fn merge_public_write_execution_outcome(
+    combined: &mut Option<SqlExecutionOutcome>,
+    outcome: SqlExecutionOutcome,
+) {
+    let Some(existing) = combined.as_mut() else {
+        *combined = Some(outcome);
+        return;
+    };
+    existing
+        .postprocess_file_cache_targets
+        .extend(outcome.postprocess_file_cache_targets);
+    existing.plugin_changes_committed |= outcome.plugin_changes_committed;
+    existing
+        .state_commit_stream_changes
+        .extend(outcome.state_commit_stream_changes);
+    merge_plan_effects_override(
+        &mut existing.plan_effects_override,
+        outcome.plan_effects_override,
+    );
+}
+
+fn merge_plan_effects_override(
+    existing: &mut Option<PlanEffects>,
+    next: Option<PlanEffects>,
+) {
+    match (existing, next) {
+        (_, None) => {}
+        (slot @ None, Some(next)) => {
+            *slot = Some(next);
+        }
+        (Some(current), Some(next)) => {
+            current
+                .state_commit_stream_changes
+                .extend(next.state_commit_stream_changes);
+            current.file_cache_refresh_targets.extend(next.file_cache_refresh_targets);
+            if next.next_active_version_id.is_some() {
+                current.next_active_version_id = next.next_active_version_id;
+            }
+        }
+    }
 }
 
 fn pending_session_matches_append(
@@ -1128,11 +1217,15 @@ pub(crate) fn public_write_filesystem_payload_changes_already_committed(
     let Some(public_write) = prepared.public_write.as_ref() else {
         return false;
     };
-    matches!(
-        public_write.execution.as_ref(),
-        Some(PublicWriteExecution::Tracked(execution))
-            if execution.filesystem_payload_changes_committed_by_write
-    )
+    public_write.execution.as_ref().is_some_and(|execution| {
+        execution.partitions.iter().any(|partition| {
+            matches!(
+                partition,
+                PublicWriteExecutionPartition::Tracked(execution)
+                    if execution.filesystem_payload_changes_committed_by_write
+            )
+        })
+    })
 }
 
 async fn apply_public_untracked_rows(
@@ -1352,6 +1445,7 @@ async fn mirror_public_stored_schema_bootstrap_rows(
 async fn apply_public_version_last_checkpoint_side_effects(
     transaction: &mut dyn LixTransaction,
     public_write: &PreparedPublicWrite,
+    batch: &crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch,
 ) -> Result<(), LixError> {
     if public_write
         .planned_write
@@ -1364,15 +1458,11 @@ async fn apply_public_version_last_checkpoint_side_effects(
         return Ok(());
     }
 
-    let Some(resolved) = public_write.planned_write.resolved_write_plan.as_ref() else {
-        return Ok(());
-    };
-
     match public_write.planned_write.command.operation_kind {
         crate::sql::public::planner::ir::WriteOperationKind::Insert => {
             upsert_last_checkpoint_rows(
                 transaction,
-                &version_checkpoint_rows(&resolved.intended_post_state),
+                &version_checkpoint_rows(batch),
                 true,
             )
             .await
@@ -1380,16 +1470,16 @@ async fn apply_public_version_last_checkpoint_side_effects(
         crate::sql::public::planner::ir::WriteOperationKind::Update => {
             upsert_last_checkpoint_rows(
                 transaction,
-                &version_checkpoint_rows(&resolved.intended_post_state),
+                &version_checkpoint_rows(batch),
                 false,
             )
             .await
         }
         crate::sql::public::planner::ir::WriteOperationKind::Delete => {
-            let version_ids = resolved
-                .authoritative_pre_state
+            let version_ids = batch
+                .changes
                 .iter()
-                .map(|row| row.entity_id.clone())
+                .map(|change| change.entity_id.clone())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -1399,21 +1489,23 @@ async fn apply_public_version_last_checkpoint_side_effects(
 }
 
 fn version_checkpoint_rows(
-    rows: &[crate::sql::public::planner::ir::PlannedStateRow],
+    batch: &crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch,
 ) -> Vec<(String, String)> {
-    rows.iter()
-        .filter(|row| row.schema_key == crate::version::version_pointer_schema_key())
-        .filter_map(|row| {
-            planned_row_optional_json_text_value(row, "snapshot_content")
-                .and_then(|snapshot| {
-                    serde_json::from_str::<serde_json::Value>(snapshot.as_ref()).ok()
-                })
-                .and_then(|snapshot| {
-                    snapshot
-                        .get("commit_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|commit_id| (row.entity_id.clone(), commit_id.to_string()))
-                })
+    batch
+        .changes
+        .iter()
+        .filter(|change| change.schema_key == crate::version::version_pointer_schema_key())
+        .filter_map(|change| {
+            change.snapshot_content.as_deref().and_then(|snapshot| {
+                serde_json::from_str::<serde_json::Value>(snapshot)
+                    .ok()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .get("commit_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|commit_id| (change.entity_id.clone(), commit_id.to_string()))
+                    })
+            })
         })
         .collect()
 }

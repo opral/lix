@@ -276,6 +276,34 @@ simulation_test!(
 );
 
 simulation_test!(
+    active_version_view_update_supports_or_selector,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+        insert_version(&engine, "version-or-target").await;
+
+        let (active_id, _) = read_active_version_view_row(&engine).await;
+
+        engine
+            .execute(
+                "UPDATE lix_active_version \
+                 SET version_id = 'version-or-target' \
+                 WHERE id = $1 OR version_id = 'missing-version'",
+                &[Value::Text(active_id)],
+            )
+            .await
+            .unwrap();
+
+        let (_, version_id) = read_active_version_view_row(&engine).await;
+        assert_eq!(version_id, "version-or-target");
+    }
+);
+
+simulation_test!(
     active_version_can_be_switched_via_vtable_update,
     |sim| async move {
         let engine = sim

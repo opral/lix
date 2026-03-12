@@ -1,51 +1,49 @@
 use crate::sql::common::dependency_spec::{DependencyPrecision, DependencySpec};
 use crate::sql::common::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::public::catalog::{SurfaceBinding, SurfaceFamily};
-use crate::sql::public::planner::canonicalize::CanonicalizedRead;
 use crate::sql::public::planner::ir::{
     CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan,
-    CanonicalWorkingChangesScan, FilesystemKind, ReadPlan, VersionScope,
+    CanonicalWorkingChangesScan, FilesystemKind, ReadPlan, StructuredPublicRead, VersionScope,
 };
 use crate::Value;
 use sqlparser::ast::{
-    BinaryOperator, Expr, Query, Statement, TableFactor, UnaryOperator, Value as SqlValue, Visit,
-    Visitor,
+    BinaryOperator, Expr, OrderByKind, SelectItem, UnaryOperator, Value as SqlValue, Visit, Visitor,
 };
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
-pub(crate) fn derive_dependency_spec_from_canonicalized_read(
-    canonicalized: &CanonicalizedRead,
+pub(crate) fn derive_dependency_spec_from_structured_public_read(
+    structured_read: &StructuredPublicRead,
 ) -> Option<DependencySpec> {
-    let Statement::Query(query) = &canonicalized.bound_statement.statement else {
-        return None;
-    };
-    if let Some(change_scan) = canonical_change_scan(&canonicalized.read_command.root) {
+    if let Some(change_scan) = canonical_change_scan(&structured_read.read_command.root) {
         return Some(dependency_spec_for_change_scan(&change_scan.binding));
     }
-    if canonical_working_changes_scan(&canonicalized.read_command.root).is_some() {
+    if canonical_working_changes_scan(&structured_read.read_command.root).is_some() {
         return Some(dependency_spec_for_working_changes_scan());
     }
-    if let Some(filesystem_scan) = canonical_filesystem_scan(&canonicalized.read_command.root) {
+    if let Some(filesystem_scan) = canonical_filesystem_scan(&structured_read.read_command.root) {
         return Some(dependency_spec_for_filesystem_scan(
             filesystem_scan.kind,
-            &canonicalized.surface_binding,
+            &structured_read.surface_binding,
         ));
     }
-    if let Some(admin_scan) = canonical_admin_scan(&canonicalized.read_command.root) {
+    if let Some(admin_scan) = canonical_admin_scan(&structured_read.read_command.root) {
         return Some(dependency_spec_for_admin_scan(admin_scan.kind));
     }
-    let Some(scan) = canonical_state_scan(&canonicalized.read_command.root) else {
+    let Some(scan) = canonical_state_scan(&structured_read.read_command.root) else {
         return None;
     };
+    if query_contains_expression_subqueries(&structured_read.query) {
+        return None;
+    }
 
-    let relation_name = canonicalized
+    let relation_name = structured_read
         .surface_binding
         .descriptor
         .public_name
         .to_ascii_lowercase();
     let mut pinned_schema_keys = BTreeSet::new();
-    if let Some(schema_key) = canonicalized
+    if let Some(schema_key) = structured_read
         .surface_binding
         .implicit_overrides
         .fixed_schema_key
@@ -54,29 +52,29 @@ pub(crate) fn derive_dependency_spec_from_canonicalized_read(
         pinned_schema_keys.insert(schema_key);
     }
 
-    let mut collector = DependencyCollector {
-        params: &canonicalized.bound_statement.bound_parameters,
-        placeholder_state: PlaceholderState::new(),
-        relation_name: relation_name.clone(),
-        pinned_schema_keys: pinned_schema_keys.clone(),
-        spec: DependencySpec {
-            relations: [relation_name].into_iter().collect(),
-            schema_keys: pinned_schema_keys,
-            ..DependencySpec::default()
-        },
-        query_count: 0,
-        has_cte: false,
-        has_derived_tables: false,
-        has_expression_subqueries: false,
+    let mut spec = DependencySpec {
+        relations: [relation_name].into_iter().collect(),
+        schema_keys: pinned_schema_keys.clone(),
+        ..DependencySpec::default()
     };
-    if let ControlFlow::Break(()) = query.visit(&mut collector) {
-        return None;
-    }
-    if !collector.is_safe_day_one_shape() {
-        return None;
+    let mut placeholder_state = PlaceholderState::new();
+    for predicate in &structured_read.query.selection_predicates {
+        if expr_is_non_representable_for_commit_filter(predicate) {
+            spec.precision = DependencyPrecision::Conservative;
+            spec.schema_keys = pinned_schema_keys.clone();
+            spec.entity_ids.clear();
+            spec.file_ids.clear();
+            spec.version_ids.clear();
+            break;
+        }
+        collect_literal_filters_from_expr(
+            predicate,
+            &structured_read.bound_statement.bound_parameters,
+            &mut placeholder_state,
+            &mut spec,
+        );
     }
 
-    let mut spec = collector.spec;
     if state_like_surface_depends_on_active_version(&scan.binding, scan.version_scope) {
         spec.depends_on_active_version = true;
         spec.schema_keys.insert("lix_active_version".to_string());
@@ -86,6 +84,66 @@ pub(crate) fn derive_dependency_spec_from_canonicalized_read(
     }
 
     Some(spec)
+}
+
+fn query_contains_expression_subqueries(
+    query: &crate::sql::public::planner::ir::NormalizedPublicReadQuery,
+) -> bool {
+    query
+        .selection_predicates
+        .iter()
+        .any(expr_contains_expression_subquery)
+        || query
+            .projection
+            .iter()
+            .any(select_item_contains_expression_subquery)
+        || query
+            .order_by
+            .as_ref()
+            .is_some_and(order_by_contains_expression_subquery)
+}
+
+fn order_by_contains_expression_subquery(order_by: &sqlparser::ast::OrderBy) -> bool {
+    let OrderByKind::Expressions(expressions) = &order_by.kind else {
+        return false;
+    };
+    expressions
+        .iter()
+        .any(|expression| expr_contains_expression_subquery(&expression.expr))
+}
+
+fn select_item_contains_expression_subquery(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            expr_contains_expression_subquery(expr)
+        }
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => false,
+    }
+}
+
+fn expr_contains_expression_subquery(expr: &Expr) -> bool {
+    struct Collector {
+        found: bool,
+    }
+
+    impl Visitor for Collector {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if matches!(
+                expr,
+                Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. }
+            ) {
+                self.found = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut collector = Collector { found: false };
+    let _ = expr.visit(&mut collector);
+    collector.found
 }
 
 pub(crate) fn derive_dependency_spec_from_bound_public_surface_bindings(
@@ -350,102 +408,6 @@ fn canonical_change_scan(
     }
 }
 
-struct DependencyCollector<'a> {
-    params: &'a [Value],
-    placeholder_state: PlaceholderState,
-    relation_name: String,
-    pinned_schema_keys: BTreeSet<String>,
-    spec: DependencySpec,
-    query_count: usize,
-    has_cte: bool,
-    has_derived_tables: bool,
-    has_expression_subqueries: bool,
-}
-
-impl DependencyCollector<'_> {
-    fn is_safe_day_one_shape(&self) -> bool {
-        self.query_count == 1
-            && !self.has_cte
-            && !self.has_derived_tables
-            && !self.has_expression_subqueries
-            && self.spec.relations.len() == 1
-            && self.spec.relations.contains(&self.relation_name)
-    }
-
-    fn mark_conservative(&mut self) {
-        self.spec.precision = DependencyPrecision::Conservative;
-        self.spec.schema_keys = self.pinned_schema_keys.clone();
-        self.spec.entity_ids.clear();
-        self.spec.file_ids.clear();
-        self.spec.version_ids.clear();
-    }
-}
-
-impl Visitor for DependencyCollector<'_> {
-    type Break = ();
-
-    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
-        self.query_count += 1;
-        if query.with.is_some() {
-            self.has_cte = true;
-        }
-        ControlFlow::Continue(())
-    }
-
-    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<Self::Break> {
-        match table_factor {
-            TableFactor::Table { name, .. } => {
-                if let Some(identifier) = name
-                    .0
-                    .last()
-                    .and_then(sqlparser::ast::ObjectNamePart::as_ident)
-                {
-                    self.spec
-                        .relations
-                        .insert(identifier.value.to_ascii_lowercase());
-                }
-            }
-            TableFactor::Derived { .. } => {
-                self.has_derived_tables = true;
-            }
-            _ => {}
-        }
-        ControlFlow::Continue(())
-    }
-
-    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
-        match expr {
-            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
-                self.has_expression_subqueries = true;
-            }
-            _ => {}
-        }
-
-        if self.spec.precision == DependencyPrecision::Conservative {
-            return ControlFlow::Continue(());
-        }
-        if expr_is_non_representable_for_commit_filter(expr) {
-            self.mark_conservative();
-            return ControlFlow::Continue(());
-        }
-
-        let mut local_state = self.placeholder_state;
-        collect_literal_filters_from_expr(expr, self.params, &mut local_state, &mut self.spec);
-        ControlFlow::Continue(())
-    }
-
-    fn pre_visit_value(&mut self, value: &SqlValue) -> ControlFlow<Self::Break> {
-        let SqlValue::Placeholder(token) = value else {
-            return ControlFlow::Continue(());
-        };
-        if resolve_placeholder_index(token, self.params.len(), &mut self.placeholder_state).is_err()
-        {
-            self.mark_conservative();
-        }
-        ControlFlow::Continue(())
-    }
-}
-
 fn expr_is_non_representable_for_commit_filter(expr: &Expr) -> bool {
     match expr {
         Expr::BinaryOp { left, op, right } => {
@@ -613,19 +575,20 @@ fn add_filter_literal(column: FilterColumn, value: String, spec: &mut Dependency
 
 #[cfg(test)]
 mod tests {
-    use super::derive_dependency_spec_from_canonicalized_read;
+    use super::derive_dependency_spec_from_structured_public_read;
     use crate::sql::common::dependency_spec::DependencyPrecision;
     use crate::sql::public::catalog::SurfaceRegistry;
     use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql::public::core::parser::parse_sql_script;
     use crate::sql::public::planner::canonicalize::canonicalize_read;
+    use crate::sql::public::planner::ir::StructuredPublicRead;
     use crate::{SqlDialect, Value};
 
-    fn canonicalized_read(
+    fn structured_read(
         registry: &SurfaceRegistry,
         sql: &str,
         params: Vec<Value>,
-    ) -> crate::sql::public::planner::canonicalize::CanonicalizedRead {
+    ) -> StructuredPublicRead {
         let mut statements = parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
         let bound = BoundStatement::from_statement(
@@ -633,19 +596,21 @@ mod tests {
             params,
             ExecutionContext::with_dialect(SqlDialect::Sqlite),
         );
-        canonicalize_read(bound, registry).expect("query should canonicalize")
+        canonicalize_read(bound, registry)
+            .expect("query should canonicalize")
+            .into_structured_read()
     }
 
     #[test]
     fn derives_fixed_schema_dependency_for_entity_surface() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
-        let canonicalized = canonicalized_read(
+        let structured_read = structured_read(
             &registry,
             "SELECT key, value FROM lix_key_value WHERE key = 'hello'",
             Vec::new(),
         );
 
-        let spec = derive_dependency_spec_from_canonicalized_read(&canonicalized)
+        let spec = derive_dependency_spec_from_structured_public_read(&structured_read)
             .expect("entity read should derive dependency spec");
 
         assert_eq!(spec.precision, DependencyPrecision::Precise);
@@ -662,7 +627,7 @@ mod tests {
     #[test]
     fn derives_version_filter_from_placeholder_on_explicit_version_surface() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
-        let canonicalized = canonicalized_read(
+        let structured_read = structured_read(
             &registry,
             "SELECT entity_id FROM lix_state_by_version WHERE version_id = ? AND schema_key = ?",
             vec![
@@ -671,7 +636,7 @@ mod tests {
             ],
         );
 
-        let spec = derive_dependency_spec_from_canonicalized_read(&canonicalized)
+        let spec = derive_dependency_spec_from_structured_public_read(&structured_read)
             .expect("explicit version read should derive dependency spec");
 
         assert_eq!(spec.precision, DependencyPrecision::Precise);
@@ -689,13 +654,13 @@ mod tests {
     #[test]
     fn marks_non_representable_filter_shapes_as_conservative() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
-        let canonicalized = canonicalized_read(
+        let structured_read = structured_read(
             &registry,
             "SELECT entity_id FROM lix_state WHERE schema_key = 'a' OR entity_id = 'b'",
             Vec::new(),
         );
 
-        let spec = derive_dependency_spec_from_canonicalized_read(&canonicalized)
+        let spec = derive_dependency_spec_from_structured_public_read(&structured_read)
             .expect("state read should derive dependency spec");
 
         assert_eq!(spec.precision, DependencyPrecision::Conservative);

@@ -1,6 +1,6 @@
 use crate::sql::public::planner::ir::{
     CommitPreconditions, ExpectedTip, IdempotencyKey, MutationPayload, PlannedStateRow,
-    PlannedWrite, WriteLane, WriteMode,
+    PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode,
 };
 use crate::state::commit::{
     load_committed_global_tip_commit_id, load_committed_version_tip_commit_id, ProposedDomainChange,
@@ -29,30 +29,81 @@ pub(crate) struct DomainChangeError {
 
 pub(crate) fn build_domain_change_batch(
     planned_write: &PlannedWrite,
-) -> Result<Option<DomainChangeBatch>, DomainChangeError> {
+) -> Result<Vec<DomainChangeBatch>, DomainChangeError> {
     let resolved = planned_write
         .resolved_write_plan
         .as_ref()
         .ok_or_else(|| DomainChangeError {
-            message: "sql2 domain-change derivation requires a resolved write plan".to_string(),
+            message: "public domain-change derivation requires a resolved write plan".to_string(),
         })?;
-    if resolved.execution_mode != WriteMode::Tracked {
-        return Ok(None);
+    resolved
+        .partitions
+        .iter()
+        .filter(|partition| partition.execution_mode == WriteMode::Tracked)
+        .map(|partition| build_domain_change_batch_for_partition(planned_write, partition))
+        .collect()
+}
+
+pub(crate) async fn derive_commit_preconditions(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+) -> Result<Vec<CommitPreconditions>, DomainChangeError> {
+    let resolved = planned_write
+        .resolved_write_plan
+        .as_ref()
+        .ok_or_else(|| DomainChangeError {
+            message: "public commit precondition derivation requires a resolved write plan"
+                .to_string(),
+        })?;
+    let mut preconditions = Vec::new();
+    for (partition_index, partition) in resolved
+        .partitions
+        .iter()
+        .enumerate()
+        .filter(|(_, partition)| partition.execution_mode == WriteMode::Tracked)
+    {
+        let write_lane = partition
+            .target_write_lane
+            .clone()
+            .ok_or_else(|| DomainChangeError {
+                message:
+                    "public commit precondition derivation requires exactly one tracked write lane"
+                        .to_string(),
+            })?;
+        let mut executor = backend;
+        let current_tip =
+            current_tip_for_write_lane(&mut executor, &write_lane, planned_write).await?;
+        let idempotency_key =
+            build_idempotency_key(planned_write, partition, partition_index, &write_lane, &current_tip)?;
+        preconditions.push(CommitPreconditions {
+            write_lane,
+            expected_tip: ExpectedTip::CommitId(current_tip),
+            idempotency_key,
+        });
     }
-    if resolved.intended_post_state.is_empty() {
-        return Ok(None);
+    Ok(preconditions)
+}
+
+fn build_domain_change_batch_for_partition(
+    planned_write: &PlannedWrite,
+    partition: &ResolvedWritePartition,
+) -> Result<DomainChangeBatch, DomainChangeError> {
+    if partition.intended_post_state.is_empty() {
+        return Err(DomainChangeError {
+            message: "public domain-change derivation requires tracked rows".to_string(),
+        });
     }
-    let write_lane = resolved
+    let write_lane = partition
         .target_write_lane
         .clone()
         .ok_or_else(|| DomainChangeError {
-            message: "sql2 domain-change derivation requires exactly one tracked write lane"
+            message: "public domain-change derivation requires exactly one tracked write lane"
                 .to_string(),
         })?;
 
     let mut changes = Vec::new();
     let mut semantic_effects = Vec::new();
-    for row in &resolved.intended_post_state {
+    for row in &partition.intended_post_state {
         let version_descriptor = row
             .version_id
             .clone()
@@ -76,7 +127,7 @@ pub(crate) fn build_domain_change_batch(
             },
             metadata: serialized_value(&row.values, "metadata"),
             version_id: row.version_id.clone().ok_or_else(|| DomainChangeError {
-                message: "sql2 domain-change derivation requires a concrete version_id".to_string(),
+                message: "public domain-change derivation requires a concrete version_id".to_string(),
             })?,
             writer_key,
         });
@@ -89,47 +140,12 @@ pub(crate) fn build_domain_change_batch(
         });
     }
 
-    Ok(Some(DomainChangeBatch {
+    Ok(DomainChangeBatch {
         changes,
         write_lane,
         writer_key: planned_write.command.execution_context.writer_key.clone(),
         semantic_effects,
-    }))
-}
-
-pub(crate) async fn derive_commit_preconditions(
-    backend: &dyn LixBackend,
-    planned_write: &PlannedWrite,
-) -> Result<Option<CommitPreconditions>, DomainChangeError> {
-    let resolved = planned_write
-        .resolved_write_plan
-        .as_ref()
-        .ok_or_else(|| DomainChangeError {
-            message: "sql2 commit precondition derivation requires a resolved write plan"
-                .to_string(),
-        })?;
-    if resolved.execution_mode != WriteMode::Tracked {
-        return Ok(None);
-    }
-    if resolved.intended_post_state.is_empty() {
-        return Ok(None);
-    }
-    let write_lane = resolved
-        .target_write_lane
-        .clone()
-        .ok_or_else(|| DomainChangeError {
-            message: "sql2 commit precondition derivation requires exactly one tracked write lane"
-                .to_string(),
-        })?;
-    let mut executor = backend;
-    let current_tip = current_tip_for_write_lane(&mut executor, &write_lane, planned_write).await?;
-    let idempotency_key = build_idempotency_key(planned_write, &write_lane, &current_tip)?;
-
-    Ok(Some(CommitPreconditions {
-        write_lane,
-        expected_tip: ExpectedTip::CommitId(current_tip),
-        idempotency_key,
-    }))
+    })
 }
 
 async fn current_tip_for_write_lane(
@@ -145,14 +161,14 @@ async fn current_tip_for_write_lane(
             .requested_version_id
             .clone()
             .ok_or_else(|| DomainChangeError {
-                message: "sql2 commit precondition derivation requires requested_version_id for ActiveVersion writes".to_string(),
+                message: "public commit precondition derivation requires requested_version_id for ActiveVersion writes".to_string(),
             })?;
             load_committed_version_tip_commit_id(executor, &version_id)
                 .await
                 .map_err(domain_change_backend_error)?
                 .ok_or_else(|| DomainChangeError {
                     message: format!(
-                        "sql2 commit precondition derivation could not find a version tip for '{}'",
+                        "public commit precondition derivation could not find a version tip for '{}'",
                         version_id
                     ),
                 })
@@ -163,7 +179,7 @@ async fn current_tip_for_write_lane(
                 .map_err(domain_change_backend_error)?
                 .ok_or_else(|| DomainChangeError {
                     message: format!(
-                        "sql2 commit precondition derivation could not find a version tip for '{}'",
+                        "public commit precondition derivation could not find a version tip for '{}'",
                         version_id
                     ),
                 })
@@ -172,7 +188,7 @@ async fn current_tip_for_write_lane(
             .await
             .map_err(domain_change_backend_error)?
             .ok_or_else(|| DomainChangeError {
-                message: "sql2 commit precondition derivation could not find the global admin tip"
+                message: "public commit precondition derivation could not find the global admin tip"
                     .to_string(),
             }),
     }
@@ -180,26 +196,23 @@ async fn current_tip_for_write_lane(
 
 fn build_idempotency_key(
     planned_write: &PlannedWrite,
+    partition: &ResolvedWritePartition,
+    partition_index: usize,
     write_lane: &WriteLane,
     current_tip: &str,
 ) -> Result<IdempotencyKey, DomainChangeError> {
-    let resolved = planned_write
-        .resolved_write_plan
-        .as_ref()
-        .ok_or_else(|| DomainChangeError {
-            message: "sql2 idempotency-key derivation requires a resolved write plan".to_string(),
-        })?;
     let summarized = json!({
         "surface": planned_write.command.target.descriptor.public_name,
         "operation": format!("{:?}", planned_write.command.operation_kind),
+        "partition_index": partition_index,
         "lane": format!("{:?}", write_lane),
         "tip": current_tip,
         "writer_key": planned_write.command.execution_context.writer_key,
         "payload": summarize_mutation_payload(&planned_write.command.payload),
-        "resolved_rows": summarize_planned_rows(&resolved.intended_post_state),
+        "resolved_rows": summarize_planned_rows(&partition.intended_post_state),
     });
     let summarized_bytes = serde_json::to_vec(&summarized).map_err(|error| DomainChangeError {
-        message: format!("sql2 idempotency-key serialization failed: {error}"),
+        message: format!("public idempotency-key serialization failed: {error}"),
     })?;
     let fingerprint = crate::plugin::runtime::binary_blob_hash_hex(&summarized_bytes);
 
@@ -207,6 +220,7 @@ fn build_idempotency_key(
         json!({
             "surface": planned_write.command.target.descriptor.public_name,
             "operation": format!("{:?}", planned_write.command.operation_kind),
+            "partition_index": partition_index,
             "lane": format!("{:?}", write_lane),
             "tip": current_tip,
             "fingerprint": fingerprint,
@@ -366,7 +380,7 @@ mod tests {
     use crate::sql::public::core::parser::parse_sql_script;
     use crate::sql::public::planner::canonicalize::canonicalize_write;
     use crate::sql::public::planner::ir::{ExpectedTip, WriteLane};
-    use crate::sql::public::planner::semantics::proof_engine::prove_write;
+    use crate::sql::public::planner::semantics::write_analysis::analyze_write;
     use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
@@ -448,7 +462,8 @@ mod tests {
         );
         let canonicalized =
             canonicalize_write(bound, &registry).expect("write should canonicalize");
-        let mut planned_write = prove_write(&canonicalized).expect("proofs should succeed");
+        let mut planned_write =
+            analyze_write(&canonicalized).expect("write analysis should succeed");
         let resolved_write_plan = resolve_write_plan(&FakeBackend::default(), &planned_write)
             .await
             .expect("write should resolve");
@@ -472,20 +487,22 @@ mod tests {
         )
         .await;
 
-        let batch = build_domain_change_batch(&planned_write)
+        let batches = build_domain_change_batch(&planned_write)
             .expect("domain changes should derive")
+            .into_iter()
+            .next()
             .expect("tracked writes should produce a batch");
 
         assert_eq!(
-            batch.write_lane,
+            batches.write_lane,
             WriteLane::SingleVersion("version-a".to_string())
         );
-        assert_eq!(batch.changes.len(), 1);
-        assert_eq!(batch.semantic_effects.len(), 1);
-        assert_eq!(batch.writer_key.as_deref(), Some("writer-a"));
-        assert_eq!(batch.changes[0].schema_version.as_deref(), Some("1"));
-        assert_eq!(batch.changes[0].file_id.as_deref(), Some("lix"));
-        assert_eq!(batch.changes[0].plugin_key.as_deref(), Some("lix"));
+        assert_eq!(batches.changes.len(), 1);
+        assert_eq!(batches.semantic_effects.len(), 1);
+        assert_eq!(batches.writer_key.as_deref(), Some("writer-a"));
+        assert_eq!(batches.changes[0].schema_version.as_deref(), Some("1"));
+        assert_eq!(batches.changes[0].file_id.as_deref(), Some("lix"));
+        assert_eq!(batches.changes[0].plugin_key.as_deref(), Some("lix"));
     }
 
     #[tokio::test]
@@ -504,6 +521,8 @@ mod tests {
         let preconditions = derive_commit_preconditions(&backend, &planned_write)
             .await
             .expect("preconditions should derive")
+            .into_iter()
+            .next()
             .expect("tracked writes should require commit preconditions");
 
         assert_eq!(
@@ -541,6 +560,8 @@ mod tests {
         let preconditions = derive_commit_preconditions(&backend, &planned_write)
             .await
             .expect("preconditions should derive")
+            .into_iter()
+            .next()
             .expect("tracked writes should require commit preconditions");
 
         assert!(

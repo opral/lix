@@ -97,9 +97,9 @@ impl Engine {
                 }
             },
             Err(error) => {
-                    return Err(LixError {
-                        code: error.code,
-                        description: format!(
+                return Err(LixError {
+                    code: error.code,
+                    description: format!(
                         "transaction public write execution failed: {}",
                         error.description
                     ),
