@@ -181,7 +181,7 @@ impl Engine {
         .await?;
 
         let execution =
-            match shared_path::maybe_execute_sql2_write_with_backend(self, &prepared, writer_key)
+            match shared_path::maybe_execute_public_write_with_backend(self, &prepared, writer_key)
                 .await
             {
                 Ok(Some(execution)) => execution,
@@ -246,7 +246,7 @@ impl Engine {
                 &filesystem_payload_domain_changes,
             );
         let payload_domain_changes_to_persist =
-            if shared_path::sql2_filesystem_payload_changes_already_committed(&prepared) {
+            if shared_path::public_write_filesystem_payload_changes_already_committed(&prepared) {
                 Vec::new()
             } else if execution.plugin_changes_committed {
                 crate::engine::dedupe_filesystem_payload_domain_changes(
@@ -260,7 +260,7 @@ impl Engine {
             &filesystem_payload_domain_changes,
         );
 
-        if !shared_path::sql2_filesystem_payload_changes_already_committed(&prepared) {
+        if !shared_path::public_write_filesystem_payload_changes_already_committed(&prepared) {
             self.persist_pending_file_data_updates(&prepared.intent.pending_file_writes)
                 .await?;
         }

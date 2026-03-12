@@ -64,8 +64,8 @@ pub struct EngineTransaction<'a> {
     pub(crate) active_version_changed: bool,
     pub(crate) installed_plugins_cache_invalidation_pending: bool,
     pub(crate) pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
-    pub(crate) pending_sql2_append_session:
-        Option<crate::sql::execution::shared_path::PendingSql2AppendSession>,
+    pub(crate) pending_public_append_session:
+        Option<crate::sql::execution::shared_path::PendingPublicAppendSession>,
 }
 
 impl Engine {

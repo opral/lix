@@ -82,7 +82,7 @@ async fn install_plugin_in_transaction(
     active_version_id: &mut String,
     pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
 ) -> Result<(), LixError> {
-    let mut pending_sql2_append_session = None;
+    let mut pending_public_append_session = None;
     for schema in &parsed.schemas {
         engine
             .execute_with_options_in_transaction(
@@ -95,7 +95,7 @@ async fn install_plugin_in_transaction(
                 None,
                 false,
                 pending_state_commit_stream_changes,
-                &mut pending_sql2_append_session,
+                &mut pending_public_append_session,
             )
             .await?;
     }
@@ -117,7 +117,7 @@ async fn install_plugin_in_transaction(
             None,
             false,
             pending_state_commit_stream_changes,
-            &mut pending_sql2_append_session,
+            &mut pending_public_append_session,
         )
         .await?;
 
@@ -138,7 +138,7 @@ async fn install_plugin_in_transaction(
             None,
             false,
             pending_state_commit_stream_changes,
-            &mut pending_sql2_append_session,
+            &mut pending_public_append_session,
         )
         .await?;
 
