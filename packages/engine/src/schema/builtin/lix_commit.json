@@ -19,8 +19,7 @@
         "properties": [
           "/id"
         ]
-      },
-      "mode": "materialized"
+      }
     }
   ],
   "type": "object",

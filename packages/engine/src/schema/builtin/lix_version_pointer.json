@@ -14,8 +14,7 @@
         "properties": [
           "/id"
         ]
-      },
-      "mode": "materialized"
+      }
     }
   ],
   "x-lix-override-lixcols": {
