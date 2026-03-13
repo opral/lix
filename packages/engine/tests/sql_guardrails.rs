@@ -487,9 +487,20 @@ fn guardrail_state_assignment_semantics_stay_out_of_write_resolver() {
     let write_resolver =
         fs::read_to_string(root.join("src/sql/public/planner/semantics/write_resolver.rs"))
             .expect("write_resolver.rs should be readable");
+    let state_backed_writes = fs::read_to_string(
+        root.join("src/sql/public/planner/semantics/write_resolver/state_backed_writes.rs"),
+    )
+    .expect("state_backed_writes.rs should be readable");
     let state_assignments =
         fs::read_to_string(root.join("src/sql/public/planner/semantics/state_assignments.rs"))
             .expect("state_assignments.rs should be readable");
+
+    for required_dispatch in ["resolve_state_write(", "resolve_entity_write("] {
+        assert!(
+            write_resolver.contains(required_dispatch),
+            "write_resolver should delegate state-backed coordination through {required_dispatch}"
+        );
+    }
 
     for required_use in [
         "assignments_from_payload(",
@@ -500,8 +511,8 @@ fn guardrail_state_assignment_semantics_stay_out_of_write_resolver() {
         "ensure_identity_columns_preserved(",
     ] {
         assert!(
-            write_resolver.contains(required_use),
-            "write_resolver should delegate shared state semantics through {required_use}"
+            state_backed_writes.contains(required_use),
+            "state_backed_writes.rs should delegate shared state semantics through {required_use}"
         );
     }
 
@@ -518,6 +529,10 @@ fn guardrail_state_assignment_semantics_stay_out_of_write_resolver() {
             "write_resolver must not redefine shared state assignment helper {extracted_definition}"
         );
         assert!(
+            !state_backed_writes.contains(extracted_definition),
+            "state_backed_writes.rs must not redefine shared state assignment helper {extracted_definition}"
+        );
+        assert!(
             state_assignments.contains(extracted_definition),
             "state_assignments.rs should own extracted helper {extracted_definition}"
         );
@@ -530,6 +545,14 @@ fn guardrail_exact_row_targeting_stays_shared_between_read_and_write() {
     let write_resolver =
         fs::read_to_string(root.join("src/sql/public/planner/semantics/write_resolver.rs"))
             .expect("write_resolver.rs should be readable");
+    let state_backed_writes = fs::read_to_string(
+        root.join("src/sql/public/planner/semantics/write_resolver/state_backed_writes.rs"),
+    )
+    .expect("state_backed_writes.rs should be readable");
+    let selector_queries = fs::read_to_string(
+        root.join("src/sql/public/planner/semantics/write_resolver/selector_queries.rs"),
+    )
+    .expect("selector_queries.rs should be readable");
     let effective_state_resolver = fs::read_to_string(
         root.join("src/sql/public/planner/semantics/effective_state_resolver.rs"),
     )
@@ -537,16 +560,28 @@ fn guardrail_exact_row_targeting_stays_shared_between_read_and_write() {
     let ir_mod = fs::read_to_string(root.join("src/sql/public/planner/ir/mod.rs"))
         .expect("planner ir mod should be readable");
 
+    for required_dispatch in ["resolve_state_write(", "resolve_entity_write("] {
+        assert!(
+            write_resolver.contains(required_dispatch),
+            "write_resolver should delegate state-backed exact-row coordination through {required_dispatch}"
+        );
+    }
+
     for required in [
         "CanonicalStateRowKey",
-        "CanonicalStateSelector",
         "resolve_exact_effective_state_row(",
         "ExactEffectiveStateRowRequest {",
         "targets_single_effective_row(",
     ] {
         assert!(
-            write_resolver.contains(required),
-            "write_resolver must share canonical exact-row targeting through {required}"
+            state_backed_writes.contains(required),
+            "state_backed_writes.rs must share canonical exact-row targeting through {required}"
+        );
+    }
+    for required in ["CanonicalStateSelector", "canonical_state_selector("] {
+        assert!(
+            selector_queries.contains(required),
+            "selector_queries.rs must own shared selector-query construction through {required}"
         );
     }
 
