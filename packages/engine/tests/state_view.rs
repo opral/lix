@@ -1071,7 +1071,7 @@ simulation_test!(
         let tracked = engine
             .execute(
                 "SELECT snapshot_content \
-                 FROM lix_internal_state_materialized_v1_test_state_schema \
+                 FROM lix_internal_live_v1_test_state_schema \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'effective-entity-u' \
                    AND file_id = 'test-file' \

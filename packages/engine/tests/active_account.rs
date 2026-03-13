@@ -89,7 +89,7 @@ simulation_test!(
         let stored = engine
             .execute(
                 "SELECT entity_id, snapshot_content \
-             FROM lix_internal_state_untracked \
+             FROM lix_internal_live_untracked_v1 \
              WHERE schema_key = 'lix_active_account' \
                AND file_id = 'lix' \
                AND version_id = 'global'",

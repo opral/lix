@@ -3,14 +3,14 @@ use std::collections::BTreeSet;
 use crate::schema::registry::register_schema;
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::materialization::types::{
-    MaterializationApplyReport, MaterializationPlan, MaterializationScope, MaterializationWriteOp,
+    LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildScope, LiveStateWriteOp,
 };
 use crate::{LixBackend, LixError, Value};
 
-pub(crate) async fn apply_materialization_plan_internal(
+pub(crate) async fn apply_live_state_rebuild_plan_internal(
     backend: &dyn LixBackend,
-    plan: &MaterializationPlan,
-) -> Result<MaterializationApplyReport, LixError> {
+    plan: &LiveStateRebuildPlan,
+) -> Result<LiveStateApplyReport, LixError> {
     let mut tables_touched = BTreeSet::new();
 
     let mut schema_keys = BTreeSet::new();
@@ -22,12 +22,12 @@ pub(crate) async fn apply_materialization_plan_internal(
         clear_scope_rows(backend, &schema_keys, &plan.scope, &mut tables_touched).await?;
 
     for write in &plan.writes {
-        let table_name = materialized_table_name(&write.schema_key);
+        let table_name = live_state_table_name(&write.schema_key);
         tables_touched.insert(table_name.clone());
 
         let is_tombstone = match write.op {
-            MaterializationWriteOp::Upsert => 0,
-            MaterializationWriteOp::Tombstone => 1,
+            LiveStateWriteOp::Upsert => 0,
+            LiveStateWriteOp::Tombstone => 1,
         };
         let snapshot_sql = write
             .snapshot_content
@@ -76,7 +76,7 @@ pub(crate) async fn apply_materialization_plan_internal(
         backend.execute(&sql, &[]).await?;
     }
 
-    Ok(MaterializationApplyReport {
+    Ok(LiveStateApplyReport {
         run_id: plan.run_id.clone(),
         rows_written: plan.writes.len(),
         rows_deleted,
@@ -87,7 +87,7 @@ pub(crate) async fn apply_materialization_plan_internal(
 async fn clear_scope_rows(
     backend: &dyn LixBackend,
     schema_keys: &BTreeSet<String>,
-    scope: &MaterializationScope,
+    scope: &LiveStateRebuildScope,
     tables_touched: &mut BTreeSet<String>,
 ) -> Result<usize, LixError> {
     if schema_keys.is_empty() {
@@ -95,15 +95,15 @@ async fn clear_scope_rows(
     }
 
     let version_filter = match scope {
-        MaterializationScope::Full => None,
-        MaterializationScope::Versions(versions) if versions.is_empty() => return Ok(0),
-        MaterializationScope::Versions(versions) => Some(in_clause_values(versions)),
+        LiveStateRebuildScope::Full => None,
+        LiveStateRebuildScope::Versions(versions) if versions.is_empty() => return Ok(0),
+        LiveStateRebuildScope::Versions(versions) => Some(in_clause_values(versions)),
     };
     let mut rows_deleted = 0usize;
 
     for schema_key in schema_keys {
         register_schema(backend, schema_key).await?;
-        let table_name = materialized_table_name(schema_key);
+        let table_name = live_state_table_name(schema_key);
         tables_touched.insert(table_name.clone());
 
         let (count_sql, delete_sql) = if let Some(in_list) = version_filter.as_ref() {
@@ -174,8 +174,8 @@ fn in_clause_values(values: &BTreeSet<String>) -> String {
         .join(", ")
 }
 
-fn materialized_table_name(schema_key: &str) -> String {
-    format!("lix_internal_state_materialized_v1_{}", schema_key)
+fn live_state_table_name(schema_key: &str) -> String {
+    format!("lix_internal_live_v1_{}", schema_key)
 }
 
 fn quote_ident(value: &str) -> String {

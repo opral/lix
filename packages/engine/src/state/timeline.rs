@@ -84,7 +84,7 @@ fn build_phase1_source_query_sql(
                entity_id AS id, \
                {change_set_id_sql} AS change_set_id, \
                version_id AS lixcol_version_id \
-             FROM lix_internal_state_materialized_v1_lix_commit \
+             FROM lix_internal_live_v1_lix_commit \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
@@ -98,7 +98,7 @@ fn build_phase1_source_query_sql(
                {cse_schema_key_sql} AS schema_key, \
                {cse_file_id_sql} AS file_id, \
                version_id AS lixcol_version_id \
-             FROM lix_internal_state_materialized_v1_lix_change_set_element \
+             FROM lix_internal_live_v1_lix_change_set_element \
              WHERE schema_key = 'lix_change_set_element' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \

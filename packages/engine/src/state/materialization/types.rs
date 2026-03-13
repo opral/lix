@@ -1,49 +1,49 @@
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum MaterializationScope {
+pub enum LiveStateRebuildScope {
     Full,
     Versions(BTreeSet<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum MaterializationDebugMode {
+pub enum LiveStateRebuildDebugMode {
     Off,
     Summary,
     Full,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MaterializationRequest {
-    pub scope: MaterializationScope,
-    pub debug: MaterializationDebugMode,
+pub struct LiveStateRebuildRequest {
+    pub scope: LiveStateRebuildScope,
+    pub debug: LiveStateRebuildDebugMode,
     pub debug_row_limit: usize,
 }
 
-impl Default for MaterializationRequest {
+impl Default for LiveStateRebuildRequest {
     fn default() -> Self {
         Self {
-            scope: MaterializationScope::Full,
-            debug: MaterializationDebugMode::Summary,
+            scope: LiveStateRebuildScope::Full,
+            debug: LiveStateRebuildDebugMode::Summary,
             debug_row_limit: 1_000,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum MaterializationWriteOp {
+pub enum LiveStateWriteOp {
     Upsert,
     Tombstone,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MaterializationWrite {
+pub struct LiveStateWrite {
     pub schema_key: String,
     pub entity_id: String,
     pub file_id: String,
     pub version_id: String,
     pub global: bool,
-    pub op: MaterializationWriteOp,
+    pub op: LiveStateWriteOp,
     pub snapshot_content: Option<String>,
     pub metadata: Option<String>,
     pub schema_version: String,
@@ -61,7 +61,7 @@ pub struct StageStat {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MaterializationWarning {
+pub struct LiveStateRebuildWarning {
     pub code: String,
     pub message: String,
 }
@@ -114,7 +114,7 @@ pub struct ScopeWinnerDebugRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MaterializationDebugTrace {
+pub struct LiveStateRebuildDebugTrace {
     pub tips_by_version: Vec<VersionPointerDebugRow>,
     pub traversed_commits: Vec<TraversedCommitDebugRow>,
     pub traversed_edges: Vec<TraversedEdgeDebugRow>,
@@ -124,17 +124,17 @@ pub struct MaterializationDebugTrace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MaterializationPlan {
+pub struct LiveStateRebuildPlan {
     pub run_id: String,
-    pub scope: MaterializationScope,
+    pub scope: LiveStateRebuildScope,
     pub stats: Vec<StageStat>,
-    pub writes: Vec<MaterializationWrite>,
-    pub warnings: Vec<MaterializationWarning>,
-    pub debug: Option<MaterializationDebugTrace>,
+    pub writes: Vec<LiveStateWrite>,
+    pub warnings: Vec<LiveStateRebuildWarning>,
+    pub debug: Option<LiveStateRebuildDebugTrace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MaterializationApplyReport {
+pub struct LiveStateApplyReport {
     pub run_id: String,
     pub rows_written: usize,
     pub rows_deleted: usize,
@@ -142,7 +142,7 @@ pub struct MaterializationApplyReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MaterializationReport {
-    pub plan: MaterializationPlan,
-    pub apply: MaterializationApplyReport,
+pub struct LiveStateRebuildReport {
+    pub plan: LiveStateRebuildPlan,
+    pub apply: LiveStateApplyReport,
 }

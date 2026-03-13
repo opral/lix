@@ -120,7 +120,7 @@ simulation_test!(internal_table_read_is_allowed, |sim| async move {
     engine.initialize().await.expect("init should succeed");
 
     engine
-        .execute("SELECT COUNT(*) FROM lix_internal_state_untracked", &[])
+        .execute("SELECT COUNT(*) FROM lix_internal_live_untracked_v1", &[])
         .await
         .expect("internal table read should be allowed");
 });
@@ -138,7 +138,7 @@ simulation_test!(
 
         let error = engine
             .execute(
-                "UPDATE lix_internal_state_untracked SET snapshot_content = '{}' WHERE 1 = 0",
+                "UPDATE lix_internal_live_untracked_v1 SET snapshot_content = '{}' WHERE 1 = 0",
                 &[],
             )
             .await
@@ -168,7 +168,7 @@ simulation_test!(
             .expect("begin transaction should succeed");
         let error = tx
             .execute(
-                "UPDATE lix_internal_state_untracked SET snapshot_content = '{}' WHERE 1 = 0",
+                "UPDATE lix_internal_live_untracked_v1 SET snapshot_content = '{}' WHERE 1 = 0",
                 &[],
             )
             .await

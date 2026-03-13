@@ -928,7 +928,7 @@ struct OverlayWriteState {
 
 const ACTIVE_VERSION_VIEW: &str = "lix_active_version";
 const INTERNAL_STATE_VTABLE: &str = "lix_internal_state_vtable";
-const INTERNAL_STATE_UNTRACKED: &str = "lix_internal_state_untracked";
+const INTERNAL_STATE_UNTRACKED: &str = "lix_internal_live_untracked_v1";
 
 fn apply_statement_writes_to_overlay(
     statement_writes: &[PendingFileWrite],

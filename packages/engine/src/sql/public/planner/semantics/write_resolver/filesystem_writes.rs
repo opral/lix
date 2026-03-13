@@ -90,7 +90,7 @@ async fn load_active_filesystem_version_id(
     let result = backend
         .execute(
             "SELECT snapshot_content \
-             FROM lix_internal_state_untracked \
+             FROM lix_internal_live_untracked_v1 \
              WHERE schema_key = $1 \
                AND file_id = $2 \
                AND version_id = $3 \

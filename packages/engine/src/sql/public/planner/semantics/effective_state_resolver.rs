@@ -462,7 +462,7 @@ async fn load_exact_untracked_state_row(
         "SELECT \
              entity_id, schema_key, schema_version, file_id, version_id, plugin_key, \
              snapshot_content, metadata \
-         FROM lix_internal_state_untracked \
+         FROM lix_internal_live_untracked_v1 \
          WHERE {predicates} \
          LIMIT 2",
         predicates = predicates.join(" AND "),

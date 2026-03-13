@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 
 use lix_engine::{ExecuteOptions, LixError, Value, WasmComponentInstance, WasmLimits, WasmRuntime};
 #[cfg(any())]
-use lix_engine::{MaterializationDebugMode, MaterializationRequest, MaterializationScope};
+use lix_engine::{LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope};
 use serde::{Deserialize, Serialize};
 #[cfg(any())]
 use serde_json::Value as JsonValue;
@@ -640,7 +640,7 @@ async fn file_descriptor_tombstone_count(
         .execute(
             &format!(
                 "SELECT COUNT(*) \
-                 FROM lix_internal_state_materialized_v1_lix_file_descriptor \
+                 FROM lix_internal_live_v1_lix_file_descriptor \
                  WHERE entity_id = '{}' \
                    AND version_id = '{}' \
                    AND is_tombstone = 1",
@@ -1306,9 +1306,9 @@ mod legacy_plugin_and_cache_tests {
             .expect("insert plugin state should succeed");
 
             engine
-                .materialize(&MaterializationRequest {
-                    scope: MaterializationScope::Full,
-                    debug: MaterializationDebugMode::Off,
+                .rebuild_live_state(&LiveStateRebuildRequest {
+                    scope: LiveStateRebuildScope::Full,
+                    debug: LiveStateRebuildDebugMode::Off,
                     debug_row_limit: 1,
                 })
                 .await

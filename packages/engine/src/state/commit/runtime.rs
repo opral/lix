@@ -23,10 +23,10 @@ use crate::{LixError, SqlDialect, Value as EngineValue};
 use super::state_source::CommitQueryExecutor;
 use super::types::{DomainChangeInput, GenerateCommitResult, MaterializedStateRow};
 
-const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
+const UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
 const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
 const CHANGE_TABLE: &str = "lix_internal_change";
-const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
+const LIVE_STATE_PREFIX: &str = "lix_internal_live_v1_";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
@@ -187,11 +187,11 @@ pub(crate) fn build_statement_batch_from_generate_commit_result(
         ]);
     }
 
-    for row in &commit_result.materialized_state {
+    for row in &commit_result.live_state_rows {
         let entry = materialized_by_schema
             .entry(row.schema_key.clone())
             .or_default();
-        entry.push(materialized_row_values_parameterized(
+        entry.push(live_state_row_values_parameterized(
             row,
             &mut next_placeholder,
             &mut statement_params,
@@ -242,7 +242,7 @@ pub(crate) fn build_statement_batch_from_generate_commit_result(
     }
 
     for (schema_key, rows) in materialized_by_schema {
-        let table_name = format!("{MATERIALIZED_PREFIX}{schema_key}");
+        let table_name = format!("{LIVE_STATE_PREFIX}{schema_key}");
         push_chunked_insert_statements(
             &mut statements,
             &table_name,
@@ -263,7 +263,7 @@ pub(crate) fn build_statement_batch_from_generate_commit_result(
                 Ident::new("updated_at"),
             ],
             rows,
-            Some(build_materialized_on_conflict()),
+            Some(build_live_state_on_conflict()),
             max_rows_per_insert_for_dialect(dialect, MATERIALIZED_INSERT_PARAM_COLUMNS),
         );
     }
@@ -272,7 +272,7 @@ pub(crate) fn build_statement_batch_from_generate_commit_result(
         &mut statements,
         &mut statement_params,
         &mut next_placeholder,
-        &commit_result.materialized_state,
+        &commit_result.live_state_rows,
     )?;
 
     Ok(StatementBatch {
@@ -331,9 +331,9 @@ fn append_commit_ancestry_statements(
     statements: &mut Vec<Statement>,
     params: &mut Vec<EngineValue>,
     next_placeholder: &mut usize,
-    materialized_state: &[MaterializedStateRow],
+    live_state_rows: &[MaterializedStateRow],
 ) -> Result<(), LixError> {
-    let commit_parents = collect_commit_parent_map_for_ancestry(materialized_state)?;
+    let commit_parents = collect_commit_parent_map_for_ancestry(live_state_rows)?;
     for (commit_id, parent_ids) in commit_parents {
         let commit_placeholder = *next_placeholder;
         *next_placeholder += 1;
@@ -382,16 +382,16 @@ fn append_commit_ancestry_statements(
 }
 
 fn collect_commit_parent_map_for_ancestry(
-    materialized_state: &[MaterializedStateRow],
+    live_state_rows: &[MaterializedStateRow],
 ) -> Result<BTreeMap<String, BTreeSet<String>>, LixError> {
     let mut out = BTreeMap::<String, BTreeSet<String>>::new();
-    for row in materialized_state {
+    for row in live_state_rows {
         if row.schema_key == COMMIT_SCHEMA_KEY && row.lixcol_version_id == GLOBAL_VERSION_ID {
             out.entry(row.entity_id.clone()).or_default();
         }
     }
 
-    for row in materialized_state {
+    for row in live_state_rows {
         if row.schema_key != COMMIT_EDGE_SCHEMA_KEY || row.lixcol_version_id != GLOBAL_VERSION_ID {
             continue;
         }
@@ -468,7 +468,7 @@ fn optional_text_param_expr(
     }
 }
 
-fn materialized_row_values_parameterized(
+fn live_state_row_values_parameterized(
     row: &MaterializedStateRow,
     next_placeholder: &mut usize,
     params: &mut Vec<EngineValue>,
@@ -552,7 +552,7 @@ fn build_snapshot_on_conflict() -> OnInsert {
     })
 }
 
-fn build_materialized_on_conflict() -> OnInsert {
+fn build_live_state_on_conflict() -> OnInsert {
     OnInsert::OnConflict(OnConflict {
         conflict_target: Some(ConflictTarget::Columns(vec![
             Ident::new("entity_id"),

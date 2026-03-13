@@ -45,7 +45,7 @@ use sqlparser::ast::Statement;
 
 const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
 const STORED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_stored_schema_bootstrap";
-const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
+const UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
 const GLOBAL_VERSION_ID: &str = "global";
 
 pub(crate) struct PreparationPolicy {
@@ -823,7 +823,7 @@ async fn build_pending_public_append_session(
     commit_result: &GenerateCommitResult,
 ) -> Result<PendingPublicAppendSession, LixError> {
     let commit_row = commit_result
-        .materialized_state
+        .live_state_rows
         .iter()
         .find(|row| row.schema_key == "lix_commit")
         .ok_or_else(|| {
@@ -1026,7 +1026,7 @@ fn rewrite_generated_commit_result_for_pending_session(
     timestamp: &str,
 ) -> Result<GenerateCommitResult, LixError> {
     let temporary_commit_id = generated
-        .materialized_state
+        .live_state_rows
         .iter()
         .find(|row| row.schema_key == "lix_commit")
         .map(|row| row.entity_id.clone())
@@ -1037,7 +1037,7 @@ fn rewrite_generated_commit_result_for_pending_session(
             )
         })?;
     let temporary_change_set_id = generated
-        .materialized_state
+        .live_state_rows
         .iter()
         .find(|row| row.schema_key == "lix_change_set")
         .map(|row| row.entity_id.clone())
@@ -1049,8 +1049,8 @@ fn rewrite_generated_commit_result_for_pending_session(
         })?;
     let version_pointer_entity_id = pending_session_version_pointer_entity_id(&session.lane);
 
-    let mut materialized_state = Vec::new();
-    for mut row in generated.materialized_state {
+    let mut live_state_rows = Vec::new();
+    for mut row in generated.live_state_rows {
         if is_pending_commit_meta_row(
             &row,
             &temporary_commit_id,
@@ -1078,10 +1078,10 @@ fn rewrite_generated_commit_result_for_pending_session(
                 row.lixcol_commit_id = session.commit_id.clone();
             }
         }
-        materialized_state.push(row);
+        live_state_rows.push(row);
     }
 
-    materialized_state.push(MaterializedStateRow {
+    live_state_rows.push(MaterializedStateRow {
         id: session.commit_materialized_change_id.clone(),
         entity_id: session.commit_id.clone(),
         schema_key: "lix_commit".to_string(),
@@ -1102,7 +1102,7 @@ fn rewrite_generated_commit_result_for_pending_session(
             .into_iter()
             .take(domain_change_count)
             .collect(),
-        materialized_state,
+        live_state_rows,
     })
 }
 
@@ -1431,7 +1431,7 @@ async fn mirror_public_stored_schema_bootstrap_rows(
     transaction: &mut dyn LixTransaction,
     commit_result: &crate::state::commit::GenerateCommitResult,
 ) -> Result<(), LixError> {
-    for row in &commit_result.materialized_state {
+    for row in &commit_result.live_state_rows {
         if row.schema_key != STORED_SCHEMA_KEY || row.lixcol_version_id != GLOBAL_VERSION_ID {
             continue;
         }

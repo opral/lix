@@ -12,7 +12,7 @@ impl Engine {
             .backend
             .execute(
                 "SELECT snapshot_content \
-                 FROM lix_internal_state_materialized_v1_lix_version_pointer \
+                 FROM lix_internal_live_v1_lix_version_pointer \
                  WHERE schema_key = $1 \
                    AND entity_id = $2 \
                    AND file_id = $3 \
@@ -46,7 +46,7 @@ impl Engine {
             .backend
             .execute(
                 "SELECT 1 \
-                 FROM lix_internal_state_materialized_v1_lix_commit \
+                 FROM lix_internal_live_v1_lix_commit \
                  WHERE schema_key = 'lix_commit' \
                    AND version_id = 'global' \
                    AND is_tombstone = 0 \
@@ -90,7 +90,7 @@ impl Engine {
             .backend
             .execute(
                 "SELECT snapshot_content \
-                 FROM lix_internal_state_untracked \
+                 FROM lix_internal_live_untracked_v1 \
                  WHERE schema_key = $1 \
                    AND file_id = $2 \
                    AND version_id = $3 \

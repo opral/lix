@@ -375,7 +375,7 @@ impl Engine {
             .backend
             .execute(
                 "SELECT COUNT(*) \
-                 FROM lix_internal_state_materialized_v1_lix_commit \
+                 FROM lix_internal_live_v1_lix_commit \
                  WHERE schema_key = 'lix_commit' \
                    AND version_id = 'global' \
                    AND is_tombstone = 0 \
@@ -393,7 +393,7 @@ impl Engine {
                 "WITH RECURSIVE \
                    commits AS ( \
                      SELECT entity_id AS commit_id \
-                     FROM lix_internal_state_materialized_v1_lix_commit \
+                     FROM lix_internal_live_v1_lix_commit \
                      WHERE schema_key = 'lix_commit' \
                        AND version_id = 'global' \
                        AND is_tombstone = 0 \
@@ -403,7 +403,7 @@ impl Engine {
                      SELECT \
                        lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
                        lix_json_extract(snapshot_content, 'child_id') AS child_id \
-                     FROM lix_internal_state_materialized_v1_lix_commit_edge \
+                     FROM lix_internal_live_v1_lix_commit_edge \
                      WHERE schema_key = 'lix_commit_edge' \
                        AND version_id = 'global' \
                        AND is_tombstone = 0 \
@@ -521,10 +521,7 @@ impl Engine {
         entity_id: &str,
         name: &str,
     ) -> Result<(), LixError> {
-        let table = format!(
-            "lix_internal_state_materialized_v1_{}",
-            version_descriptor_schema_key()
-        );
+        let table = format!("lix_internal_live_v1_{}", version_descriptor_schema_key());
         let check_sql = format!(
             "SELECT 1 \
              FROM {table} \
@@ -574,10 +571,7 @@ impl Engine {
         &self,
         name: &str,
     ) -> Result<Option<String>, LixError> {
-        let table = format!(
-            "lix_internal_state_materialized_v1_{}",
-            version_descriptor_schema_key()
-        );
+        let table = format!("lix_internal_live_v1_{}", version_descriptor_schema_key());
         let sql = format!(
             "SELECT entity_id, snapshot_content \
              FROM {table} \
@@ -636,10 +630,7 @@ impl Engine {
     ) -> Result<(), LixError> {
         let snapshot_content = version_pointer_snapshot_content(entity_id, commit_id);
         let change_id = format!("seed~{}~{}", version_pointer_schema_key(), entity_id);
-        let table = format!(
-            "lix_internal_state_materialized_v1_{}",
-            version_pointer_schema_key()
-        );
+        let table = format!("lix_internal_live_v1_{}", version_pointer_schema_key());
         let check_sql = format!(
             "SELECT 1 \
              FROM {table} \
@@ -1047,7 +1038,7 @@ impl Engine {
     ) -> Result<(), LixError> {
         let check_sql = format!(
             "SELECT 1 \
-             FROM lix_internal_state_untracked \
+             FROM lix_internal_live_untracked_v1 \
              WHERE schema_key = '{schema_key}' \
                AND file_id = '{file_id}' \
                AND version_id = '{storage_version_id}' \
@@ -1065,7 +1056,7 @@ impl Engine {
         let entity_id = self.generate_runtime_uuid().await?;
         let snapshot_content = active_version_snapshot_content(&entity_id, version_id);
         let insert_sql = format!(
-            "INSERT INTO lix_internal_state_untracked (\
+            "INSERT INTO lix_internal_live_untracked_v1 (\
              entity_id, schema_key, file_id, version_id, global, plugin_key, snapshot_content, schema_version, created_at, updated_at\
              ) VALUES (\
              '{entity_id}', '{schema_key}', '{file_id}', '{storage_version_id}', true, '{plugin_key}', '{snapshot_content}', '{schema_version}', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z'\

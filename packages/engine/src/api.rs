@@ -16,7 +16,7 @@ use crate::state::internal::inline_functions::inline_lix_functions_with_provider
 use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
 use crate::state::internal::statement_references_internal_state_vtable;
 use crate::state::materialization::{
-    MaterializationApplyReport, MaterializationPlan, MaterializationReport, MaterializationRequest,
+    LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{ExecuteResult, LixError, LixTransaction, QueryResult, Value};
@@ -399,29 +399,33 @@ impl Engine {
         Ok(())
     }
 
-    pub async fn materialization_plan(
+    pub async fn live_state_rebuild_plan(
         &self,
-        req: &MaterializationRequest,
-    ) -> Result<MaterializationPlan, LixError> {
-        crate::state::materialization::materialization_plan(self.backend.as_ref(), req).await
+        req: &LiveStateRebuildRequest,
+    ) -> Result<LiveStateRebuildPlan, LixError> {
+        crate::state::materialization::live_state_rebuild_plan(self.backend.as_ref(), req).await
     }
 
-    pub async fn apply_materialization_plan(
+    pub async fn apply_live_state_rebuild_plan(
         &self,
-        plan: &MaterializationPlan,
-    ) -> Result<MaterializationApplyReport, LixError> {
-        crate::state::materialization::apply_materialization_plan(self.backend.as_ref(), plan).await
+        plan: &LiveStateRebuildPlan,
+    ) -> Result<LiveStateApplyReport, LixError> {
+        crate::state::materialization::apply_live_state_rebuild_plan(self.backend.as_ref(), plan)
+            .await
     }
 
-    pub async fn materialize(
+    pub async fn rebuild_live_state(
         &self,
-        req: &MaterializationRequest,
-    ) -> Result<MaterializationReport, LixError> {
+        req: &LiveStateRebuildRequest,
+    ) -> Result<LiveStateRebuildReport, LixError> {
         let plan =
-            crate::state::materialization::materialization_plan(self.backend.as_ref(), req).await?;
-        let apply =
-            crate::state::materialization::apply_materialization_plan(self.backend.as_ref(), &plan)
+            crate::state::materialization::live_state_rebuild_plan(self.backend.as_ref(), req)
                 .await?;
+        let apply = crate::state::materialization::apply_live_state_rebuild_plan(
+            self.backend.as_ref(),
+            &plan,
+        )
+        .await?;
 
         crate::plugin::runtime::materialize_file_data_with_plugins(
             self.backend.as_ref(),
@@ -430,7 +434,7 @@ impl Engine {
         )
         .await?;
 
-        Ok(MaterializationReport { plan, apply })
+        Ok(LiveStateRebuildReport { plan, apply })
     }
 }
 

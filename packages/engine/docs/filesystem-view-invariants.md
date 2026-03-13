@@ -16,7 +16,7 @@ When these drifted, writes appeared to succeed while read paths disagreed.
 
 For tracked file payload pointers, the authoritative state is:
 
-- `lix_internal_state_materialized_v1_lix_binary_blob_ref`
+- `lix_internal_live_v1_lix_binary_blob_ref`
 
 Everything else is derived:
 

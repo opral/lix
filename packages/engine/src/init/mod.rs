@@ -60,7 +60,7 @@ const INIT_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_stored_schema_bootstrap_live_vfe \
      ON lix_internal_stored_schema_bootstrap (version_id, file_id, entity_id) \
      WHERE is_tombstone = 0 AND snapshot_content IS NOT NULL",
-    "CREATE TABLE IF NOT EXISTS lix_internal_state_materialized_v1_lix_stored_schema (\
+    "CREATE TABLE IF NOT EXISTS lix_internal_live_v1_lix_stored_schema (\
      entity_id TEXT NOT NULL,\
      schema_key TEXT NOT NULL,\
      schema_version TEXT NOT NULL,\
@@ -77,23 +77,23 @@ const INIT_STATEMENTS: &[&str] = &[
      updated_at TEXT NOT NULL,\
      PRIMARY KEY (entity_id, file_id, version_id)\
      )",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_version_id \
-     ON lix_internal_state_materialized_v1_lix_stored_schema (version_id)",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_global_version \
-     ON lix_internal_state_materialized_v1_lix_stored_schema (global, version_id)",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_vfe \
-     ON lix_internal_state_materialized_v1_lix_stored_schema (version_id, file_id, entity_id)",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_ve \
-     ON lix_internal_state_materialized_v1_lix_stored_schema (version_id, entity_id)",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_fv \
-     ON lix_internal_state_materialized_v1_lix_stored_schema (file_id, version_id)",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_live_vfe \
-     ON lix_internal_state_materialized_v1_lix_stored_schema (version_id, file_id, entity_id) \
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_v1_lix_stored_schema_version_id \
+     ON lix_internal_live_v1_lix_stored_schema (version_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_v1_lix_stored_schema_global_version \
+     ON lix_internal_live_v1_lix_stored_schema (global, version_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_v1_lix_stored_schema_vfe \
+     ON lix_internal_live_v1_lix_stored_schema (version_id, file_id, entity_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_v1_lix_stored_schema_ve \
+     ON lix_internal_live_v1_lix_stored_schema (version_id, entity_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_v1_lix_stored_schema_fv \
+     ON lix_internal_live_v1_lix_stored_schema (file_id, version_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_v1_lix_stored_schema_live_vfe \
+     ON lix_internal_live_v1_lix_stored_schema (version_id, file_id, entity_id) \
      WHERE is_tombstone = 0 AND snapshot_content IS NOT NULL",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_tomb_vfe \
-     ON lix_internal_state_materialized_v1_lix_stored_schema (version_id, file_id, entity_id) \
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_v1_lix_stored_schema_tomb_vfe \
+     ON lix_internal_live_v1_lix_stored_schema (version_id, file_id, entity_id) \
      WHERE is_tombstone = 1 AND snapshot_content IS NULL",
-    "CREATE TABLE IF NOT EXISTS lix_internal_state_untracked (\
+    "CREATE TABLE IF NOT EXISTS lix_internal_live_untracked_v1 (\
      entity_id TEXT NOT NULL,\
      schema_key TEXT NOT NULL,\
      file_id TEXT NOT NULL,\
@@ -108,12 +108,12 @@ const INIT_STATEMENTS: &[&str] = &[
      updated_at TEXT NOT NULL,\
      PRIMARY KEY (entity_id, schema_key, file_id, version_id)\
      )",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_untracked_version_id \
-     ON lix_internal_state_untracked (version_id)",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_untracked_global_version \
-     ON lix_internal_state_untracked (global, version_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_untracked_v1_version_id \
+     ON lix_internal_live_untracked_v1 (version_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_untracked_v1_global_version \
+     ON lix_internal_live_untracked_v1 (global, version_id)",
     "CREATE INDEX IF NOT EXISTS ix_unt_v_f_s_e \
-     ON lix_internal_state_untracked (version_id, file_id, schema_key, entity_id)",
+     ON lix_internal_live_untracked_v1 (version_id, file_id, schema_key, entity_id)",
     "CREATE TABLE IF NOT EXISTS lix_internal_file_data_cache (\
      file_id TEXT NOT NULL,\
      version_id TEXT NOT NULL,\
@@ -265,7 +265,7 @@ async fn ensure_stored_schema_bootstrap_seeded(backend: &dyn LixBackend) -> Resu
              entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
              ) \
              SELECT m.entity_id, m.schema_key, m.schema_version, m.file_id, m.version_id, m.global, m.plugin_key, m.snapshot_content, m.change_id, m.metadata, m.writer_key, m.is_tombstone, m.created_at, m.updated_at \
-             FROM lix_internal_state_materialized_v1_lix_stored_schema m \
+             FROM lix_internal_live_v1_lix_stored_schema m \
              WHERE NOT EXISTS (\
                SELECT 1 \
                FROM lix_internal_stored_schema_bootstrap b \
@@ -332,7 +332,7 @@ async fn ensure_state_untracked_writer_key_column(
 ) -> Result<(), LixError> {
     ensure_column_exists(
         backend,
-        "lix_internal_state_untracked",
+        "lix_internal_live_untracked_v1",
         "writer_key",
         "TEXT",
     )
