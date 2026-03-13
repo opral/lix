@@ -17,11 +17,11 @@ use crate::version::DEFAULT_ACTIVE_VERSION_NAME;
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
     active_version_schema_version, active_version_snapshot_content,
-    active_version_storage_version_id, version_descriptor_file_id, version_descriptor_plugin_key,
-    version_descriptor_schema_key, version_descriptor_schema_version,
-    version_descriptor_snapshot_content, version_descriptor_storage_version_id,
-    version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key,
-    version_pointer_schema_version, version_pointer_snapshot_content,
+    active_version_storage_version_id, parse_active_version_snapshot, version_descriptor_file_id,
+    version_descriptor_plugin_key, version_descriptor_schema_key,
+    version_descriptor_schema_version, version_descriptor_snapshot_content,
+    version_descriptor_storage_version_id, version_pointer_file_id, version_pointer_plugin_key,
+    version_pointer_schema_key, version_pointer_schema_version, version_pointer_snapshot_content,
     version_pointer_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixError, Value};
@@ -87,11 +87,12 @@ impl Engine {
 
     pub(crate) async fn seed_boot_key_values(&self) -> Result<(), LixError> {
         for key_value in self.boot_key_values() {
-            let version_id = key_value
-                .version_id
-                .as_deref()
-                .unwrap_or(KEY_VALUE_GLOBAL_VERSION);
-            let untracked = key_value.untracked.unwrap_or(true);
+            let version_id = if key_value.lixcol_global.unwrap_or(false) {
+                KEY_VALUE_GLOBAL_VERSION.to_string()
+            } else {
+                self.load_boot_active_version_id().await?
+            };
+            let untracked = key_value.lixcol_untracked.unwrap_or(true);
             let snapshot_content = serde_json::json!({
                 "key": key_value.key,
                 "value": key_value.value,
@@ -106,7 +107,7 @@ impl Engine {
                     Value::Text(key_value.key.clone()),
                     Value::Text(key_value_schema_key().to_string()),
                     Value::Text(key_value_file_id().to_string()),
-                    Value::Text(version_id.to_string()),
+                    Value::Text(version_id),
                     Value::Text(key_value_plugin_key().to_string()),
                     Value::Text(snapshot_content),
                     Value::Text(key_value_schema_version().to_string()),
@@ -118,6 +119,49 @@ impl Engine {
         }
 
         Ok(())
+    }
+
+    async fn load_boot_active_version_id(&self) -> Result<String, LixError> {
+        let result = self
+            .backend
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_internal_live_untracked_v1 \
+                 WHERE schema_key = $1 \
+                   AND file_id = $2 \
+                   AND version_id = $3 \
+                   AND snapshot_content IS NOT NULL \
+                 ORDER BY updated_at DESC \
+                 LIMIT 1",
+                &[
+                    Value::Text(active_version_schema_key().to_string()),
+                    Value::Text(active_version_file_id().to_string()),
+                    Value::Text(active_version_storage_version_id().to_string()),
+                ],
+            )
+            .await?;
+
+        let row = result.rows.first().ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "boot key-value seeding requires an active version".to_string(),
+        })?;
+        let snapshot_content = row.first().ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "active version query row is missing snapshot_content".to_string(),
+        })?;
+        let snapshot_content = match snapshot_content {
+            Value::Text(value) => value.as_str(),
+            other => {
+                return Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
+                        "active version snapshot_content must be text, got {other:?}"
+                    ),
+                })
+            }
+        };
+
+        parse_active_version_snapshot(snapshot_content)
     }
 
     pub(crate) async fn seed_global_system_directories(&self) -> Result<(), LixError> {

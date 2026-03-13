@@ -155,8 +155,8 @@ fn build_fixture_with_trace(
     boot_args.key_values.push(BootKeyValue {
         key: "lix_deterministic_mode".to_string(),
         value: json!({ "enabled": true }),
-        version_id: Some("global".to_string()),
-        untracked: None,
+        lixcol_global: Some(true),
+        lixcol_untracked: None,
     });
 
     let engine = boot(boot_args);
