@@ -119,7 +119,12 @@
         },
         "x-lix-override-lixcols": {
           "type": "object",
-          "description": "Default metadata column values (such as lixcol_file_id). Does not affect JSON property defaults.",
+          "description": "Default metadata column values (such as lixcol_file_id). Does not affect JSON property defaults. lixcol_version_id is intentionally unsupported.",
+          "propertyNames": {
+            "not": {
+              "const": "lixcol_version_id"
+            }
+          },
           "additionalProperties": {
             "type": "string",
             "format": "cel"

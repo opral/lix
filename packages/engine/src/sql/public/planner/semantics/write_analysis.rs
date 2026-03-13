@@ -94,20 +94,13 @@ fn write_scope_for_explicit_version_surface(canonicalized: &CanonicalizedWrite) 
 }
 
 fn forced_write_version_id(canonicalized: &CanonicalizedWrite) -> Option<String> {
-    canonicalized
-        .surface_binding
-        .implicit_overrides
-        .fixed_version_id
-        .clone()
-        .or_else(|| {
-            if surface_forces_global_scope(canonicalized)
-                || write_bool_value(canonicalized, "global") == Some(true)
-            {
-                Some(GLOBAL_VERSION_ID.to_string())
-            } else {
-                None
-            }
-        })
+    if surface_forces_global_scope(canonicalized)
+        || write_bool_value(canonicalized, "global") == Some(true)
+    {
+        Some(GLOBAL_VERSION_ID.to_string())
+    } else {
+        None
+    }
 }
 
 fn surface_forces_global_scope(canonicalized: &CanonicalizedWrite) -> bool {

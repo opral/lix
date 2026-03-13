@@ -642,6 +642,15 @@ async fn load_entity_schema(
         .get("x-lix-override-lixcols")
         .and_then(JsonValue::as_object)
     {
+        if overrides.contains_key("lixcol_version_id") {
+            return Err(crate::LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "schema '{}' uses removed x-lix-override-lixcols.lixcol_version_id support; use lixcol_global for global write scope",
+                    schema_key
+                ),
+            });
+        }
         for (raw_key, expr) in overrides {
             let Some(expr) = expr.as_str() else {
                 continue;
@@ -767,7 +776,6 @@ fn entity_state_column_name(column: &str) -> Option<&'static str> {
         "lixcol_entity_id" => Some("entity_id"),
         "lixcol_schema_key" => Some("schema_key"),
         "lixcol_file_id" => Some("file_id"),
-        "lixcol_version_id" => Some("version_id"),
         "lixcol_plugin_key" => Some("plugin_key"),
         "lixcol_schema_version" => Some("schema_version"),
         "lixcol_global" => Some("global"),

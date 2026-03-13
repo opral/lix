@@ -685,7 +685,6 @@ mod tests {
             schema_key: "lix_key_value".to_string(),
             visible_columns: vec!["key".to_string(), "value".to_string()],
             column_types: BTreeMap::new(),
-            fixed_version_id: None,
             predicate_overrides: Vec::new(),
         });
 

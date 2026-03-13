@@ -861,7 +861,7 @@ fn x_lix_override_lixcols_accepts_valid_cel_expression() {
         "x-lix-version": "1",
         "x-lix-override-lixcols": {
             "lixcol_file_id": "'lix'",
-            "lixcol_version_id": "lix_timestamp()"
+            "lixcol_global": "true"
         },
         "properties": {
             "id": { "type": "string" }
@@ -892,6 +892,31 @@ fn x_lix_override_lixcols_accepts_cel_literals() {
     });
 
     assert!(validate_lix_schema_definition(&schema).is_ok());
+}
+
+#[test]
+fn x_lix_override_lixcols_rejects_lixcol_version_id() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "mock",
+        "x-lix-version": "1",
+        "x-lix-override-lixcols": {
+            "lixcol_version_id": "\"global\""
+        },
+        "properties": {
+            "id": { "type": "string" }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    });
+
+    let err = validate_lix_schema_definition(&schema)
+        .expect_err("lixcol_version_id override should be rejected");
+    assert!(
+        err.description.contains("lixcol_version_id")
+            && err.description.contains("x-lix-override-lixcols"),
+        "unexpected error: {err:?}"
+    );
 }
 
 #[test]
