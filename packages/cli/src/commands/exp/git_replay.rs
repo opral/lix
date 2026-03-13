@@ -1,6 +1,7 @@
 use crate::cli::exp::ExpGitReplayArgs;
+use crate::db;
 use crate::error::CliError;
-use lix_rs_sdk::{open_lix, BootKeyValueConfig, Lix, OpenLixConfig, SqliteBackend, Value};
+use lix_rs_sdk::{BootKeyValue, Lix, LixConfig, SqliteBackend, Value, WasmtimeRuntime};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -8,6 +9,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 const NULL_OID: &str = "0000000000000000000000000000000000000000";
 const PROGRESS_EVERY: usize = 10;
@@ -160,6 +162,8 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
 }
 
 fn open_lix_at_path(path: &Path) -> Result<Lix, CliError> {
+    db::init_lix_at(path)?;
+
     let backend = SqliteBackend::from_path(path).map_err(|err| {
         CliError::msg(format!(
             "failed to open sqlite backend at {}: {}",
@@ -168,18 +172,18 @@ fn open_lix_at_path(path: &Path) -> Result<Lix, CliError> {
         ))
     })?;
 
-    let config = OpenLixConfig {
-        backend: Some(Box::new(backend)),
-        key_values: vec![BootKeyValueConfig {
+    let config = LixConfig {
+        backend: Box::new(backend),
+        wasm_runtime: default_wasm_runtime()?,
+        key_values: vec![BootKeyValue {
             key: "lix_deterministic_mode".to_string(),
             value: json!({ "enabled": true }),
             version_id: Some("global".to_string()),
             untracked: None,
         }],
-        ..Default::default()
     };
 
-    pollster::block_on(open_lix(config)).map_err(|err| {
+    pollster::block_on(Lix::open(config)).map_err(|err| {
         CliError::msg(format!(
             "failed to open lix database at {}: {}",
             path.display(),
@@ -193,29 +197,51 @@ fn execute_statements_as_transaction(
     statements: &[SqlStatement],
     commit_sha: &str,
 ) -> Result<(), CliError> {
-    let mut tx = pollster::block_on(lix.begin_transaction()).map_err(|err| {
-        CliError::msg(format!(
-            "failed at commit {commit_sha} while opening replay transaction: {err}"
-        ))
-    })?;
+    let script = build_transaction_script(statements);
+    let params = statements
+        .iter()
+        .flat_map(|statement| statement.params.iter().cloned())
+        .collect::<Vec<_>>();
 
-    for statement in statements {
-        if let Err(error) = pollster::block_on(tx.execute(&statement.sql, &statement.params)) {
-            let _ = pollster::block_on(tx.rollback());
-            let sql_preview = statement.sql.chars().take(160).collect::<String>();
-            return Err(CliError::msg(format!(
-                "failed at commit {commit_sha} while executing replay SQL '{sql_preview}': {error}"
-            )));
-        }
-    }
-
-    pollster::block_on(tx.commit()).map_err(|error| {
+    pollster::block_on(lix.execute(&script, &params)).map_err(|error| {
+        let sql_preview = script.chars().take(160).collect::<String>();
         CliError::msg(format!(
-            "failed at commit {commit_sha} while committing replay transaction: {error}"
+            "failed at commit {commit_sha} while executing replay SQL '{sql_preview}': {error}"
         ))
     })?;
 
     Ok(())
+}
+
+fn build_transaction_script(statements: &[SqlStatement]) -> String {
+    let mut script = String::from("BEGIN;");
+    let mut next_param_index = 1usize;
+
+    for statement in statements {
+        script.push(' ');
+        script.push_str(&number_sql_parameters(
+            &statement.sql,
+            &mut next_param_index,
+        ));
+        script.push(';');
+    }
+
+    script.push_str(" COMMIT;");
+    script
+}
+
+fn number_sql_parameters(sql: &str, next_param_index: &mut usize) -> String {
+    let mut numbered = String::with_capacity(sql.len() + 16);
+    for ch in sql.chars() {
+        if ch == '?' {
+            numbered.push('?');
+            numbered.push_str(&next_param_index.to_string());
+            *next_param_index += 1;
+        } else {
+            numbered.push(ch);
+        }
+    }
+    numbered
 }
 
 fn list_linear_commits(
@@ -940,6 +966,12 @@ fn run_git_bytes(
         status,
         stderr
     )))
+}
+
+fn default_wasm_runtime() -> Result<Arc<WasmtimeRuntime>, CliError> {
+    WasmtimeRuntime::new()
+        .map(Arc::new)
+        .map_err(|err| CliError::msg(format!("failed to initialize wasmtime runtime: {err}")))
 }
 
 fn prepare_output_path(path: &Path) -> Result<(), CliError> {
