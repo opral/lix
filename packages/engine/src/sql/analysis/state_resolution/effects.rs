@@ -74,7 +74,7 @@ pub(crate) fn active_version_from_update_validations(
     for plan in plans.iter().rev() {
         if !plan
             .table
-            .eq_ignore_ascii_case("lix_internal_state_untracked")
+            .eq_ignore_ascii_case("lix_internal_live_untracked_v1")
         {
             continue;
         }

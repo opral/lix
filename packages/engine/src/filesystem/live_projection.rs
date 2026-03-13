@@ -63,7 +63,7 @@ pub(crate) fn build_filesystem_file_projection_sql(
              SELECT \
                entity_id AS commit_id, \
                lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id \
-             FROM lix_internal_state_materialized_v1_lix_commit \
+             FROM lix_internal_live_v1_lix_commit \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
@@ -73,7 +73,7 @@ pub(crate) fn build_filesystem_file_projection_sql(
              SELECT \
                lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
                lix_json_extract(snapshot_content, 'change_id') AS change_id \
-             FROM lix_internal_state_materialized_v1_lix_change_set_element \
+             FROM lix_internal_live_v1_lix_change_set_element \
              WHERE schema_key = 'lix_change_set_element' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
@@ -308,7 +308,7 @@ pub(crate) fn build_filesystem_directory_projection_sql(
              SELECT \
                entity_id AS commit_id, \
                lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id \
-             FROM lix_internal_state_materialized_v1_lix_commit \
+             FROM lix_internal_live_v1_lix_commit \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
@@ -318,7 +318,7 @@ pub(crate) fn build_filesystem_directory_projection_sql(
              SELECT \
                lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
                lix_json_extract(snapshot_content, 'change_id') AS change_id \
-             FROM lix_internal_state_materialized_v1_lix_change_set_element \
+             FROM lix_internal_live_v1_lix_change_set_element \
              WHERE schema_key = 'lix_change_set_element' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
@@ -829,7 +829,7 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
             "target_versions AS ( \
                SELECT DISTINCT \
                  lix_json_extract(snapshot_content, 'version_id') AS version_id \
-               FROM lix_internal_state_untracked \
+               FROM lix_internal_live_untracked_v1 \
                WHERE schema_key = '{schema_key}' \
                  AND file_id = '{file_id}' \
                  AND version_id = '{storage_version_id}' \
@@ -843,8 +843,7 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
             let union_rows = schema_keys
                 .iter()
                 .flat_map(|schema_key| {
-                    let quoted =
-                        quote_ident(&format!("lix_internal_state_materialized_v1_{schema_key}"));
+                    let quoted = quote_ident(&format!("lix_internal_live_v1_{schema_key}"));
                     [
                         format!(
                             "SELECT DISTINCT version_id \
@@ -855,7 +854,7 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
                         ),
                         format!(
                             "SELECT DISTINCT version_id \
-                             FROM lix_internal_state_untracked \
+                             FROM lix_internal_live_untracked_v1 \
                              WHERE schema_key = '{schema_key}' \
                                AND version_id <> '{global_version}'",
                             schema_key = escape_sql_string(schema_key),
@@ -874,7 +873,7 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
                    SELECT '{global_version}' AS version_id \
                    UNION \
                    SELECT DISTINCT entity_id AS version_id \
-                   FROM lix_internal_state_materialized_v1_lix_version_descriptor \
+                   FROM lix_internal_live_v1_lix_version_descriptor \
                    WHERE schema_key = '{version_descriptor_schema_key}' \
                      AND version_id = '{global_version}' \
                      AND is_tombstone = 0 \
@@ -893,7 +892,7 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
 }
 
 fn effective_state_candidates_sql(schema_key: &str) -> String {
-    let table_name = quote_ident(&format!("lix_internal_state_materialized_v1_{schema_key}"));
+    let table_name = quote_ident(&format!("lix_internal_live_v1_{schema_key}"));
     let schema_filter = format!("u.schema_key = '{}'", escape_sql_string(schema_key));
     format!(
         "SELECT \
@@ -962,7 +961,7 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            u.writer_key AS writer_key, \
            u.metadata AS metadata, \
            1 AS precedence \
-         FROM lix_internal_state_untracked u \
+         FROM lix_internal_live_untracked_v1 u \
          JOIN target_versions tv \
            ON tv.version_id = u.version_id \
          WHERE {schema_filter} \
@@ -984,7 +983,7 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            u.writer_key AS writer_key, \
            u.metadata AS metadata, \
            3 AS precedence \
-         FROM lix_internal_state_untracked u \
+         FROM lix_internal_live_untracked_v1 u \
          JOIN target_versions tv \
            ON tv.version_id <> '{global_version}' \
           AND u.version_id = '{global_version}' \
@@ -1004,13 +1003,13 @@ fn active_version_commit_id_sql() -> String {
     format!(
         "(\
          SELECT lix_json_extract(vp.snapshot_content, 'commit_id') \
-         FROM lix_internal_state_materialized_v1_lix_version_pointer vp \
+         FROM lix_internal_live_v1_lix_version_pointer vp \
          WHERE vp.schema_key = 'lix_version_pointer' \
            AND vp.version_id = '{global_version}' \
            AND vp.snapshot_content IS NOT NULL \
            AND vp.entity_id = (\
                SELECT lix_json_extract(snapshot_content, 'version_id') \
-               FROM lix_internal_state_untracked \
+               FROM lix_internal_live_untracked_v1 \
                WHERE schema_key = '{schema_key}' \
                  AND file_id = '{file_id}' \
                  AND version_id = '{storage_version_id}' \
@@ -1037,7 +1036,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
             "active_version_rows AS ( \
                SELECT DISTINCT \
                  lix_json_extract(snapshot_content, 'version_id') AS version_id \
-               FROM lix_internal_state_untracked \
+               FROM lix_internal_live_untracked_v1 \
                WHERE schema_key = '{active_schema_key}' \
                  AND file_id = '{active_file_id}' \
                  AND version_id = '{active_storage_version_id}' \
@@ -1056,7 +1055,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
            SELECT DISTINCT \
              lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
              vp.entity_id AS root_version_id \
-           FROM lix_internal_state_materialized_v1_lix_version_pointer vp \
+           FROM lix_internal_live_v1_lix_version_pointer vp \
            JOIN active_version_rows av \
              ON av.version_id = vp.entity_id \
            WHERE vp.schema_key = 'lix_version_pointer' \
@@ -1067,7 +1066,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
            SELECT DISTINCT \
              lix_json_extract(vd.snapshot_content, 'commit_id') AS root_commit_id, \
              vd.entity_id AS root_version_id \
-           FROM lix_internal_state_materialized_v1_lix_version_descriptor vd \
+           FROM lix_internal_live_v1_lix_version_descriptor vd \
            JOIN active_version_rows av \
              ON av.version_id = vd.entity_id \
            WHERE vd.schema_key = '{version_descriptor_schema_key}' \
@@ -1084,7 +1083,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
            SELECT DISTINCT \
              lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
              vp.entity_id AS root_version_id \
-           FROM lix_internal_state_materialized_v1_lix_version_pointer vp \
+           FROM lix_internal_live_v1_lix_version_pointer vp \
            WHERE vp.schema_key = 'lix_version_pointer' \
              AND vp.version_id = '{global_version}' \
              AND vp.is_tombstone = 0 \
@@ -1093,7 +1092,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
            SELECT DISTINCT \
              lix_json_extract(vd.snapshot_content, 'commit_id') AS root_commit_id, \
              vd.entity_id AS root_version_id \
-           FROM lix_internal_state_materialized_v1_lix_version_descriptor vd \
+           FROM lix_internal_live_v1_lix_version_descriptor vd \
            WHERE vd.schema_key = '{version_descriptor_schema_key}' \
              AND vd.version_id = '{global_version}' \
              AND vd.is_tombstone = 0 \
@@ -1111,7 +1110,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
              SELECT DISTINCT \
                c.entity_id AS commit_id, \
                COALESCE(d.root_version_id, c.version_id) AS root_version_id \
-             FROM lix_internal_state_materialized_v1_lix_commit c \
+             FROM lix_internal_live_v1_lix_commit c \
              LEFT JOIN default_root_commits d \
                ON d.root_commit_id = c.entity_id \
              WHERE c.schema_key = 'lix_commit' \
@@ -1139,7 +1138,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
                rc.root_commit_id AS root_commit_id, \
                rc.root_version_id AS root_version_id, \
                rc.commit_depth AS commit_depth \
-             FROM lix_internal_state_materialized_v1_lix_commit c \
+             FROM lix_internal_live_v1_lix_commit c \
              JOIN reachable_commits_from_requested rc \
                ON rc.commit_id = c.entity_id \
              WHERE c.schema_key = 'lix_commit' \
@@ -1158,7 +1157,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
                cc.root_commit_id AS root_commit_id, \
                cc.root_version_id AS root_version_id, \
                cc.commit_depth AS commit_depth \
-             FROM lix_internal_state_materialized_v1_lix_change_set_element cse \
+             FROM lix_internal_live_v1_lix_change_set_element cse \
              JOIN commit_changesets cc \
                ON lix_json_extract(cse.snapshot_content, 'change_set_id') = cc.change_set_id \
              WHERE cse.schema_key = 'lix_change_set_element' \

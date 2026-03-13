@@ -38,12 +38,12 @@ pub use lix::{InitResult, Lix, LixConfig};
 pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
 pub use state::checkpoint::CreateCheckpointResult;
 pub use state::materialization::{
-    apply_materialization_plan, materialization_plan, materialize, LatestVisibleWinnerDebugRow,
-    MaterializationApplyReport, MaterializationDebugMode, MaterializationDebugTrace,
-    MaterializationPlan, MaterializationReport, MaterializationRequest, MaterializationScope,
-    MaterializationWarning, MaterializationWrite, MaterializationWriteOp, ScopeWinnerDebugRow,
-    StageStat, TraversedCommitDebugRow, TraversedEdgeDebugRow, VersionAncestryDebugRow,
-    VersionPointerDebugRow,
+    apply_live_state_rebuild_plan, live_state_rebuild_plan, rebuild_live_state,
+    LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
+    LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
+    LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning, LiveStateWrite,
+    LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
+    TraversedEdgeDebugRow, VersionAncestryDebugRow, VersionPointerDebugRow,
 };
 pub use state::snapshot::{SnapshotChunkReader, SnapshotChunkWriter};
 pub use state::stream::{

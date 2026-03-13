@@ -405,7 +405,7 @@ async fn load_active_version_admin_rows(
 ) -> Result<Vec<ActiveVersionAdminRow>, crate::LixError> {
     let sql = format!(
         "SELECT entity_id, snapshot_content \
-         FROM lix_internal_state_untracked \
+         FROM lix_internal_live_untracked_v1 \
          WHERE schema_key = '{schema_key}' \
            AND file_id = '{file_id}' \
            AND version_id = '{storage_version_id}' \
@@ -482,7 +482,7 @@ async fn load_active_account_admin_rows(
 ) -> Result<Vec<ActiveAccountAdminRow>, crate::LixError> {
     let sql = format!(
         "SELECT entity_id, snapshot_content \
-         FROM lix_internal_state_untracked \
+         FROM lix_internal_live_untracked_v1 \
          WHERE schema_key = '{schema_key}' \
            AND file_id = '{file_id}' \
            AND version_id = '{storage_version_id}' \
@@ -738,7 +738,7 @@ async fn load_version_admin_row(
 ) -> Result<Option<VersionAdminRow>, crate::LixError> {
     let descriptor_sql = format!(
         "SELECT snapshot_content, change_id \
-         FROM lix_internal_state_materialized_v1_lix_version_descriptor \
+         FROM lix_internal_live_v1_lix_version_descriptor \
          WHERE schema_key = '{schema_key}' \
            AND entity_id = '{entity_id}' \
            AND file_id = '{file_id}' \
@@ -759,7 +759,7 @@ async fn load_version_admin_row(
     };
     let pointer_sql = format!(
         "SELECT snapshot_content, change_id \
-         FROM lix_internal_state_materialized_v1_lix_version_pointer \
+         FROM lix_internal_live_v1_lix_version_pointer \
          WHERE schema_key = '{schema_key}' \
            AND entity_id = '{entity_id}' \
            AND file_id = '{file_id}' \

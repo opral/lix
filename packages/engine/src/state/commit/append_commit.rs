@@ -550,7 +550,7 @@ mod tests {
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             self.executed_sql.push(sql.to_string());
 
-            if sql.contains("FROM lix_internal_state_materialized_v1_lix_version_pointer")
+            if sql.contains("FROM lix_internal_live_v1_lix_version_pointer")
                 && sql.contains("entity_id = 'global'")
             {
                 let rows = self

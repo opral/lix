@@ -3,8 +3,8 @@ mod support;
 use std::collections::BTreeSet;
 
 use lix_engine::{
-    MaterializationDebugMode, MaterializationPlan, MaterializationRequest, MaterializationScope,
-    MaterializationWrite, MaterializationWriteOp, Value,
+    LiveStateRebuildDebugMode, LiveStateRebuildPlan, LiveStateRebuildRequest,
+    LiveStateRebuildScope, LiveStateWrite, LiveStateWriteOp, Value,
 };
 
 fn scrub_timestamp_fields(value: &mut serde_json::Value) {
@@ -92,9 +92,9 @@ simulation_test!(
             .unwrap();
 
         let plan = engine
-            .materialization_plan(&MaterializationRequest {
-                scope: MaterializationScope::Full,
-                debug: MaterializationDebugMode::Full,
+            .live_state_rebuild_plan(&LiveStateRebuildRequest {
+                scope: LiveStateRebuildScope::Full,
+                debug: LiveStateRebuildDebugMode::Full,
                 debug_row_limit: 256,
             })
             .await
@@ -152,29 +152,32 @@ simulation_test!(
                 .unwrap();
 
         let plan = engine
-            .materialization_plan(&MaterializationRequest {
-                scope: MaterializationScope::Full,
-                debug: MaterializationDebugMode::Summary,
+            .live_state_rebuild_plan(&LiveStateRebuildRequest {
+                scope: LiveStateRebuildScope::Full,
+                debug: LiveStateRebuildDebugMode::Summary,
                 debug_row_limit: 128,
             })
             .await
             .unwrap();
 
-        let first_report = engine.apply_materialization_plan(&plan).await.unwrap();
+        let first_report = engine.apply_live_state_rebuild_plan(&plan).await.unwrap();
 
         assert_eq!(first_report.rows_written, plan.writes.len());
         assert!(first_report.rows_written > 0);
         sim.assert_deterministic(first_report.rows_written as i64);
 
         let next_plan = engine
-            .materialization_plan(&MaterializationRequest {
-                scope: MaterializationScope::Full,
-                debug: MaterializationDebugMode::Summary,
+            .live_state_rebuild_plan(&LiveStateRebuildRequest {
+                scope: LiveStateRebuildScope::Full,
+                debug: LiveStateRebuildDebugMode::Summary,
                 debug_row_limit: 128,
             })
             .await
             .unwrap();
-        let report = engine.apply_materialization_plan(&next_plan).await.unwrap();
+        let report = engine
+            .apply_live_state_rebuild_plan(&next_plan)
+            .await
+            .unwrap();
         assert!(report.rows_deleted > 0);
         assert!(report.rows_written > 0);
         sim.assert_deterministic(vec![report.rows_written as i64, report.rows_deleted as i64]);
@@ -224,17 +227,17 @@ simulation_test!(
         let main_version_id = main_version_id(&engine).await;
 
         let scoped_versions = BTreeSet::from([main_version_id.clone()]);
-        let seed_plan = MaterializationPlan {
+        let seed_plan = LiveStateRebuildPlan {
             run_id: "seed".to_string(),
-            scope: MaterializationScope::Versions(scoped_versions.clone()),
+            scope: LiveStateRebuildScope::Versions(scoped_versions.clone()),
             stats: Vec::new(),
-            writes: vec![MaterializationWrite {
+            writes: vec![LiveStateWrite {
                 schema_key: "materialization_test_schema".to_string(),
                 entity_id: "entity-old".to_string(),
                 file_id: "file-1".to_string(),
                 version_id: main_version_id.clone(),
                 global: false,
-                op: MaterializationWriteOp::Upsert,
+                op: LiveStateWriteOp::Upsert,
                 snapshot_content: Some("{\"value\":\"old\"}".to_string()),
                 metadata: None,
                 schema_version: "1".to_string(),
@@ -246,19 +249,22 @@ simulation_test!(
             warnings: Vec::new(),
             debug: None,
         };
-        engine.apply_materialization_plan(&seed_plan).await.unwrap();
+        engine
+            .apply_live_state_rebuild_plan(&seed_plan)
+            .await
+            .unwrap();
 
-        let full_plan = MaterializationPlan {
+        let full_plan = LiveStateRebuildPlan {
             run_id: "full".to_string(),
-            scope: MaterializationScope::Full,
+            scope: LiveStateRebuildScope::Full,
             stats: Vec::new(),
-            writes: vec![MaterializationWrite {
+            writes: vec![LiveStateWrite {
                 schema_key: "materialization_test_schema".to_string(),
                 entity_id: "entity-new".to_string(),
                 file_id: "file-1".to_string(),
                 version_id: main_version_id.clone(),
                 global: false,
-                op: MaterializationWriteOp::Upsert,
+                op: LiveStateWriteOp::Upsert,
                 snapshot_content: Some("{\"value\":\"new\"}".to_string()),
                 metadata: None,
                 schema_version: "1".to_string(),
@@ -270,7 +276,10 @@ simulation_test!(
             warnings: Vec::new(),
             debug: None,
         };
-        let report = engine.apply_materialization_plan(&full_plan).await.unwrap();
+        let report = engine
+            .apply_live_state_rebuild_plan(&full_plan)
+            .await
+            .unwrap();
 
         assert!(report.rows_deleted > 0);
         assert_eq!(report.rows_written, 1);
@@ -279,7 +288,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT entity_id, snapshot_content \
-                 FROM lix_internal_state_materialized_v1_materialization_test_schema \
+                 FROM lix_internal_live_v1_materialization_test_schema \
                  ORDER BY entity_id",
                 &[],
             )

@@ -31,8 +31,8 @@ flowchart TB
   end
 
   subgraph S5["Physical SQL Tables"]
-    U["lix_internal_state_untracked"]
-    M["lix_internal_state_materialized_v1_<schema_key>"]
+    U["lix_internal_live_untracked_v1"]
+    M["lix_internal_live_v1_<schema_key>"]
     CH["lix_internal_change"]
     SN["lix_internal_snapshot"]
     TL["lix_internal_entity_state_timeline_breakpoint\n+ lix_internal_timeline_status"]
@@ -74,7 +74,7 @@ Short answer: mostly yes, with one important correction.
   - vtable reads go to `untracked + materialized` state tables.
 - On writes, tracked mutations generate both:
   - change log rows (`lix_internal_change` + `lix_internal_snapshot`), and
-  - materialized state rows (`lix_internal_state_materialized_v1_*`).
+  - materialized state rows (`lix_internal_live_v1_*`).
 
 So a more accurate model is:
 
@@ -113,8 +113,8 @@ Entity view names are derived from schema keys (`lix_<schema>`, suffix `_by_vers
 There is one registered vtable surface (`InternalStateVtable`) with read and write capability.
 
 - Read lowering expands vtable references into a derived `UNION ALL` query across:
-  - `lix_internal_state_untracked`
-  - `lix_internal_state_materialized_v1_<schema_key>`
+  - `lix_internal_live_untracked_v1`
+  - `lix_internal_live_v1_<schema_key>`
 - Rows are ranked so untracked rows take precedence.
 
 ### 3.5 Write path: canonicalization + tracked/untracked split
@@ -124,13 +124,13 @@ Mutation flow (backend path):
 1. Statement canonical rewrite loop (filesystem/entity/state/by_version/vtable).
    - `lix_state` mutation rewrites first normalize to a `lix_state_by_version` form with active `version_id`.
 2. `vtable_write` split:
-   - untracked rows -> `lix_internal_state_untracked` upsert
+   - untracked rows -> `lix_internal_live_untracked_v1` upsert
    - tracked rows -> domain changes -> `generate_commit(...)`
 3. `generate_commit` emits commit metadata and domain materialization.
 4. `commit_runtime` converts commit result into SQL inserts for:
    - `lix_internal_snapshot`
    - `lix_internal_change`
-   - `lix_internal_state_materialized_v1_<schema_key>`
+   - `lix_internal_live_v1_<schema_key>`
 5. UPDATE/DELETE rely on postprocess followups to generate commit rows from RETURNING results.
 
 ### 3.6 `lix_change` is read-only and sourced from change/snapshot tables
@@ -146,8 +146,8 @@ and write attempts are rejected.
 
 Core persisted state/change layer:
 
-- `lix_internal_state_untracked`
-- `lix_internal_state_materialized_v1_<schema_key>` (dynamic per schema, created by `schema_registry`)
+- `lix_internal_live_untracked_v1`
+- `lix_internal_live_v1_<schema_key>` (dynamic per schema, created by `schema_registry`)
 - `lix_internal_change`
 - `lix_internal_snapshot`
 - `lix_internal_commit_ancestry`

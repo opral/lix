@@ -201,7 +201,7 @@ async fn load_key_value_payload(
 ) -> Result<Option<JsonValue>, LixError> {
     let untracked_payload = load_first_payload_from_table(
         backend,
-        "lix_internal_state_untracked",
+        "lix_internal_live_untracked_v1",
         &format!(
             "schema_key = '{schema_key}' \
              AND entity_id = '{entity_id}' \
@@ -217,10 +217,7 @@ async fn load_key_value_payload(
         return Ok(untracked_payload);
     }
 
-    let table_name = format!(
-        "lix_internal_state_materialized_v1_{}",
-        key_value_schema_key()
-    );
+    let table_name = format!("lix_internal_live_v1_{}", key_value_schema_key());
     load_first_payload_from_table(
         backend,
         &table_name,
@@ -239,10 +236,7 @@ async fn load_key_value_payload(
 async fn load_sequence_highest_from_committed_state(
     backend: &dyn LixBackend,
 ) -> Result<Option<i64>, LixError> {
-    let table_name = format!(
-        "lix_internal_state_materialized_v1_{}",
-        key_value_schema_key()
-    );
+    let table_name = format!("lix_internal_live_v1_{}", key_value_schema_key());
     load_sequence_highest_from_table(
         backend,
         &table_name,
@@ -263,7 +257,7 @@ async fn load_sequence_highest_from_untracked_state(
 ) -> Result<Option<i64>, LixError> {
     load_sequence_highest_from_table(
         backend,
-        "lix_internal_state_untracked",
+        "lix_internal_live_untracked_v1",
         &format!(
             "schema_key = '{schema_key}' \
              AND entity_id = '{entity_id}' \

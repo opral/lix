@@ -29,10 +29,10 @@ use crate::Value as EngineValue;
 use crate::{LixBackend, LixError, QueryResult};
 
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
-const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
+const UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
 const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
 const CHANGE_TABLE: &str = "lix_internal_change";
-const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
+const LIVE_STATE_PREFIX: &str = "lix_internal_live_v1_";
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "entity_id",
     "file_id",
@@ -450,7 +450,7 @@ pub fn rewrite_update(
 
     if let Some(validation) = build_update_validation_plan(
         &new_update,
-        Some(format!("{}{}", MATERIALIZED_PREFIX, schema_key)),
+        Some(format!("{}{}", LIVE_STATE_PREFIX, schema_key)),
         params,
     )? {
         validations.push(validation);
@@ -565,7 +565,7 @@ pub fn rewrite_delete_with_options(
     };
 
     let tracked_selection = if effective_scope_without_untracked_predicate {
-        let materialized_table_ref = format!("{}{}", MATERIALIZED_PREFIX, schema_key);
+        let materialized_table_ref = format!("{}{}", LIVE_STATE_PREFIX, schema_key);
         let default_entity_sql = materialized_column_sql(&materialized_table_ref, "entity_id");
         let default_file_sql = materialized_column_sql(&materialized_table_ref, "file_id");
         let default_version_sql = materialized_column_sql(&materialized_table_ref, "version_id");
@@ -586,7 +586,7 @@ pub fn rewrite_delete_with_options(
 
     let update = Update {
         update_token: AttachedToken::empty(),
-        table: table_with_joins_for(&format!("{}{}", MATERIALIZED_PREFIX, schema_key)),
+        table: table_with_joins_for(&format!("{}{}", LIVE_STATE_PREFIX, schema_key)),
         assignments: vec![
             Assignment {
                 target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
@@ -698,7 +698,7 @@ fn build_untracked_on_conflict() -> OnInsert {
     })
 }
 
-fn build_materialized_on_conflict() -> OnInsert {
+fn build_live_state_on_conflict() -> OnInsert {
     OnInsert::OnConflict(OnConflict {
         conflict_target: Some(ConflictTarget::Columns(vec![
             Ident::new("entity_id"),
@@ -1029,7 +1029,7 @@ fn rewrite_tracked_rows(
     }
 
     for (schema_key, rows) in materialized_by_schema {
-        let table_name = format!("{}{}", MATERIALIZED_PREFIX, schema_key);
+        let table_name = format!("{}{}", LIVE_STATE_PREFIX, schema_key);
         statements.push(make_insert_statement(
             &table_name,
             vec![
@@ -1049,7 +1049,7 @@ fn rewrite_tracked_rows(
                 Ident::new("updated_at"),
             ],
             rows,
-            Some(build_materialized_on_conflict()),
+            Some(build_live_state_on_conflict()),
         ));
     }
 
@@ -1176,7 +1176,7 @@ async fn rewrite_tracked_rows_with_backend(
         || functions.uuid_v7(),
     )?;
 
-    for row in &commit_result.materialized_state {
+    for row in &commit_result.live_state_rows {
         ensure_registration(registrations, &row.schema_key);
     }
 
@@ -1847,7 +1847,7 @@ fn replace_table_with_untracked(table: &mut TableWithJoins) {
 
 fn replace_table_with_materialized(table: &mut TableWithJoins, schema_key: &str) {
     if let TableFactor::Table { name, .. } = &mut table.relation {
-        let table_name = format!("{}{}", MATERIALIZED_PREFIX, schema_key);
+        let table_name = format!("{}{}", LIVE_STATE_PREFIX, schema_key);
         *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(table_name))]);
     }
 }

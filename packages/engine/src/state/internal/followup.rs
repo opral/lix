@@ -34,8 +34,8 @@ use crate::state::internal::{
 };
 use crate::LixBackend;
 
-const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
-const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
+const LIVE_STATE_PREFIX: &str = "lix_internal_live_v1_";
+const UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "entity_id",
     "file_id",
@@ -490,9 +490,9 @@ async fn load_effective_scope_delete_rows(
         return Ok(Vec::new());
     };
 
-    let schema_table = quote_ident(&format!("{MATERIALIZED_PREFIX}{}", plan.schema_key));
+    let schema_table = quote_ident(&format!("{LIVE_STATE_PREFIX}{}", plan.schema_key));
     let descriptor_table = quote_ident(&format!(
-        "{MATERIALIZED_PREFIX}{}",
+        "{LIVE_STATE_PREFIX}{}",
         version_descriptor_schema_key()
     ));
     let sql = format!(

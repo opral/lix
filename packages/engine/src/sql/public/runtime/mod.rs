@@ -1065,7 +1065,7 @@ async fn load_active_version_id_for_public_read(
     let result = backend
         .execute(
             "SELECT snapshot_content \
-             FROM lix_internal_state_untracked \
+             FROM lix_internal_live_untracked_v1 \
              WHERE schema_key = $1 \
                AND file_id = $2 \
                AND version_id = $3 \
@@ -2320,7 +2320,7 @@ mod tests {
                     },
                 });
             }
-            if sql.contains("FROM lix_internal_state_untracked")
+            if sql.contains("FROM lix_internal_live_untracked_v1")
                 && sql.contains("schema_key = 'lix_active_version'")
             {
                 let rows = self
@@ -2338,7 +2338,7 @@ mod tests {
                     columns: vec!["entity_id".to_string(), "snapshot_content".to_string()],
                 });
             }
-            if sql.contains("FROM lix_internal_state_untracked")
+            if sql.contains("FROM lix_internal_live_untracked_v1")
                 && sql.contains("schema_key = 'lix_active_account'")
             {
                 let rows = self
@@ -2358,7 +2358,7 @@ mod tests {
                     columns: vec!["entity_id".to_string(), "snapshot_content".to_string()],
                 });
             }
-            if sql.contains("FROM lix_internal_state_untracked") {
+            if sql.contains("FROM lix_internal_live_untracked_v1") {
                 return Ok(QueryResult {
                     rows: self.untracked_rows.clone(),
                     columns: vec![
@@ -2395,7 +2395,7 @@ mod tests {
                     columns: vec!["snapshot_content".to_string(), "change_id".to_string()],
                 });
             }
-            if sql.contains("FROM lix_internal_state_materialized_v1_lix_version_descriptor") {
+            if sql.contains("FROM lix_internal_live_v1_lix_version_descriptor") {
                 let rows = self
                     .version_descriptor_rows
                     .iter()
@@ -2453,7 +2453,7 @@ mod tests {
                     },
                 });
             }
-            if sql.contains("FROM lix_internal_state_materialized_v1_lix_version_pointer") {
+            if sql.contains("FROM lix_internal_live_v1_lix_version_pointer") {
                 let rows = self
                     .version_pointer_rows
                     .iter()
@@ -2481,7 +2481,7 @@ mod tests {
                     },
                 });
             }
-            if sql.contains("FROM lix_internal_state_materialized_v1_lix_version_pointer")
+            if sql.contains("FROM lix_internal_live_v1_lix_version_pointer")
                 && sql.contains("entity_id = 'global'")
             {
                 let rows = self
@@ -2696,7 +2696,7 @@ mod tests {
             .first()
             .expect("live public entity read should lower");
         assert!(lowered_sql.contains("FROM (SELECT"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
         assert_eq!(
             extract_sql_string_filter(lowered_sql, "file_id").as_deref(),
             Some("lix")
@@ -2755,7 +2755,7 @@ mod tests {
             .first()
             .expect("stored-schema entity read should lower");
         assert!(lowered_sql.contains("FROM (SELECT"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_message"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_message"));
     }
 
     #[tokio::test]
@@ -2790,7 +2790,7 @@ mod tests {
             lowered.required_schema_keys,
             ["message".to_string()].into_iter().collect()
         );
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_message"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_message"));
         assert!(!lowered_sql.contains("FROM message"));
     }
 
@@ -2832,7 +2832,7 @@ mod tests {
             .lowered_sql
             .first()
             .expect("entity by-version read should lower");
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
         assert!(lowered_sql.contains("version_id AS lixcol_version_id"));
     }
 
@@ -2876,7 +2876,7 @@ mod tests {
             .lowered_sql
             .first()
             .expect("entity history read should lower");
-        assert!(lowered_sql.contains("FROM lix_internal_state_materialized_v1_lix_commit"));
+        assert!(lowered_sql.contains("FROM lix_internal_live_v1_lix_commit"));
         assert!(lowered_sql.contains("c.id = 'commit-active-root'"));
         assert!(lowered_sql.contains("commit_id AS lixcol_commit_id"));
         assert!(lowered_sql.contains("depth AS lixcol_depth"));
@@ -3023,8 +3023,8 @@ mod tests {
             .lowered_sql
             .first()
             .expect("filesystem read should lower");
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_file_descriptor"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_directory_descriptor"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_file_descriptor"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_directory_descriptor"));
         assert!(lowered_sql.contains("lix_internal_binary_blob_store"));
         assert!(!lowered_sql.contains("FROM lix_file_by_version"));
     }
@@ -3069,7 +3069,7 @@ mod tests {
             .first()
             .expect("filesystem by-version read should lower");
         assert!(lowered_sql.contains("all_target_versions AS"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_directory_descriptor"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_directory_descriptor"));
         assert!(!lowered_sql.contains("FROM lix_directory_by_version"));
     }
 
@@ -3246,7 +3246,7 @@ mod tests {
             .first()
             .expect("explain state read should lower");
         assert!(lowered_sql.starts_with("EXPLAIN SELECT"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
     }
 
     #[tokio::test]
@@ -3361,7 +3361,7 @@ mod tests {
             .expect("surface-expanded read should lower");
         assert!(!lowered_sql.contains("FROM lix_state "));
         assert!(!lowered_sql.contains("JOIN lix_state_by_version"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
         assert!(lowered_sql.contains("all_target_versions AS"));
     }
 
@@ -3394,7 +3394,7 @@ mod tests {
             .first()
             .expect("group-by/having read should lower");
         assert!(!lowered_sql.contains("FROM lix_state"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
         assert!(lowered_sql.contains("GROUP BY"));
         assert!(lowered_sql.contains("HAVING"));
     }
@@ -3464,8 +3464,8 @@ mod tests {
             .lowered_sql
             .first()
             .expect("joined admin read should lower");
-        assert!(lowered_sql.contains("lix_internal_state_untracked"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_version_descriptor"));
+        assert!(lowered_sql.contains("lix_internal_live_untracked_v1"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
     }
 
     #[tokio::test]
@@ -3498,7 +3498,7 @@ mod tests {
             .first()
             .expect("mixed read should lower");
         assert!(lowered_sql.contains("app_versions"));
-        assert!(lowered_sql.contains("lix_internal_state_untracked"));
+        assert!(lowered_sql.contains("lix_internal_live_untracked_v1"));
     }
 
     #[tokio::test]
@@ -3509,7 +3509,7 @@ mod tests {
             &parse_one(
                 "SELECT av.version_id \
                  FROM lix_active_version av \
-                 JOIN lix_internal_state_untracked u ON u.entity_id = av.id",
+                 JOIN lix_internal_live_untracked_v1 u ON u.entity_id = av.id",
             ),
             &[],
             "main",
@@ -3519,7 +3519,7 @@ mod tests {
         .expect_err("public/internal mixed read should be rejected");
 
         assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
-        assert!(error.description.contains("lix_internal_state_untracked"));
+        assert!(error.description.contains("lix_internal_live_untracked_v1"));
     }
 
     #[tokio::test]
@@ -3530,7 +3530,7 @@ mod tests {
             &parse_one(
                 "SELECT av.version_id \
                  FROM lix_active_version av \
-                 JOIN lix_internal_state_untracked u ON u.entity_id = av.id",
+                 JOIN lix_internal_live_untracked_v1 u ON u.entity_id = av.id",
             ),
             &[],
             "main",
@@ -3551,7 +3551,7 @@ mod tests {
             .lowered_sql
             .first()
             .expect("public/internal mixed read should lower");
-        assert!(lowered_sql.contains("lix_internal_state_untracked"));
+        assert!(lowered_sql.contains("lix_internal_live_untracked_v1"));
     }
 
     #[tokio::test]
@@ -3590,7 +3590,7 @@ mod tests {
             .lowered_sql
             .first()
             .expect("state read should lower");
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
     }
 
     #[tokio::test]
@@ -3626,7 +3626,7 @@ mod tests {
             .lowered_sql
             .first()
             .expect("state-by-version read should lower");
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
         assert!(lowered_sql.contains("all_target_versions AS"));
     }
 
@@ -3662,7 +3662,7 @@ mod tests {
             .lowered_sql
             .first()
             .expect("state-history read should lower");
-        assert!(lowered_sql.contains("FROM lix_internal_state_materialized_v1_lix_commit"));
+        assert!(lowered_sql.contains("FROM lix_internal_live_v1_lix_commit"));
         assert!(lowered_sql.contains("c.id = 'commit-1'"));
     }
 
@@ -3689,7 +3689,7 @@ mod tests {
             .first()
             .expect("nested filesystem subquery should lower");
         assert!(!lowered_sql.contains("FROM lix_file"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_file_descriptor"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_file_descriptor"));
     }
 
     #[tokio::test]
@@ -3726,7 +3726,7 @@ mod tests {
             .expect("nested public-subquery read should lower");
         assert!(!lowered_sql.contains("FROM lix_active_version"));
         assert!(!lowered_sql.contains("FROM lix_version"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_version_pointer"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_version_descriptor"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_pointer"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
     }
 }

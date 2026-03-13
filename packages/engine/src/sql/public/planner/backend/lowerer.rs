@@ -784,7 +784,7 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
             "SELECT \
                 entity_id AS id, \
                 lix_json_extract(snapshot_content, 'version_id') AS version_id \
-             FROM lix_internal_state_untracked \
+             FROM lix_internal_live_untracked_v1 \
              WHERE schema_key = '{schema_key}' \
                AND file_id = '{file_id}' \
                AND version_id = '{storage_version_id}' \
@@ -797,7 +797,7 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
             "SELECT \
                 lix_json_extract(snapshot_content, 'account_id') AS id, \
                 lix_json_extract(snapshot_content, 'account_id') AS account_id \
-             FROM lix_internal_state_untracked \
+             FROM lix_internal_live_untracked_v1 \
              WHERE schema_key = '{schema_key}' \
                AND file_id = '{file_id}' \
                AND version_id = '{storage_version_id}' \
@@ -819,7 +819,7 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
                 lix_json_extract(d.snapshot_content, 'name') AS name, \
                 COALESCE(lix_json_extract(d.snapshot_content, 'hidden'), 'false') AS hidden, \
                 lix_json_extract(t.snapshot_content, 'commit_id') AS commit_id \
-             FROM lix_internal_state_materialized_v1_lix_version_descriptor d \
+             FROM lix_internal_live_v1_lix_version_descriptor d \
              LEFT JOIN ( \
                SELECT entity_id, snapshot_content \
                FROM ( \
@@ -832,7 +832,7 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
                               created_at DESC, \
                               change_id DESC \
                    ) AS rn \
-                 FROM lix_internal_state_materialized_v1_lix_version_pointer \
+                 FROM lix_internal_live_v1_lix_version_pointer \
                  WHERE schema_key = 'lix_version_pointer' \
                    AND is_tombstone = 0 \
                    AND snapshot_content IS NOT NULL \
@@ -955,7 +955,7 @@ fn build_effective_state_source_sql(
              SELECT \
                entity_id AS commit_id, \
                lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id \
-             FROM lix_internal_state_materialized_v1_lix_commit \
+             FROM lix_internal_live_v1_lix_commit \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
@@ -965,7 +965,7 @@ fn build_effective_state_source_sql(
              SELECT \
                lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
                lix_json_extract(snapshot_content, 'change_id') AS change_id \
-             FROM lix_internal_state_materialized_v1_lix_change_set_element \
+             FROM lix_internal_live_v1_lix_change_set_element \
              WHERE schema_key = 'lix_change_set_element' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
@@ -1041,7 +1041,7 @@ fn active_target_versions_cte_sql() -> String {
         "target_versions AS ( \
            SELECT DISTINCT \
              lix_json_extract(snapshot_content, 'version_id') AS version_id \
-           FROM lix_internal_state_untracked \
+           FROM lix_internal_live_untracked_v1 \
            WHERE schema_key = '{schema_key}' \
              AND file_id = '{file_id}' \
              AND version_id = '{storage_version_id}' \
@@ -1077,15 +1077,14 @@ fn explicit_target_versions_cte_sql(
                 "SELECT DISTINCT version_id \
                  FROM {table_name} \
                  WHERE version_id <> '{global_version}'",
-                table_name =
-                    quote_ident(&format!("lix_internal_state_materialized_v1_{schema_key}")),
+                table_name = quote_ident(&format!("lix_internal_live_v1_{schema_key}")),
                 global_version = escape_sql_string(GLOBAL_VERSION_ID),
             )
         })
         .chain(schema_keys.iter().map(|schema_key| {
             format!(
                 "SELECT DISTINCT version_id \
-                 FROM lix_internal_state_untracked \
+                 FROM lix_internal_live_untracked_v1 \
                  WHERE schema_key = '{schema_key}' \
                    AND version_id <> '{global_version}'",
                 schema_key = escape_sql_string(schema_key),
@@ -1117,7 +1116,7 @@ fn explicit_target_versions_cte_sql(
     format!(
         "all_target_versions AS ( \
            SELECT DISTINCT entity_id AS version_id \
-           FROM lix_internal_state_materialized_v1_lix_version_descriptor \
+           FROM lix_internal_live_v1_lix_version_descriptor \
            WHERE {version_descriptor_predicates}\
            {all_target_versions} \
          ), \
@@ -1142,7 +1141,7 @@ fn effective_state_candidate_rows_sql(
         .iter()
         .flat_map(|schema_key| {
             let table_name =
-                quote_ident(&format!("lix_internal_state_materialized_v1_{schema_key}"));
+                quote_ident(&format!("lix_internal_live_v1_{schema_key}"));
             let schema_filter = format!("schema_key = '{}'", escape_sql_string(schema_key));
             [
                 format!(
@@ -1220,7 +1219,7 @@ fn effective_state_candidate_rows_sql(
                        u.writer_key AS writer_key, \
                        u.metadata AS metadata, \
                        1 AS precedence \
-                     FROM lix_internal_state_untracked u \
+                     FROM lix_internal_live_untracked_v1 u \
                      JOIN target_versions tv \
                        ON tv.version_id = u.version_id \
                      WHERE {schema_filter}{untracked_predicates}",
@@ -1246,7 +1245,7 @@ fn effective_state_candidate_rows_sql(
                        u.writer_key AS writer_key, \
                        u.metadata AS metadata, \
                        3 AS precedence \
-                     FROM lix_internal_state_untracked u \
+                     FROM lix_internal_live_untracked_v1 u \
                      JOIN target_versions tv \
                        ON tv.version_id <> '{global_version}' \
                       AND u.version_id = '{global_version}' \
@@ -1283,7 +1282,7 @@ fn build_state_history_source_sql(
             "active_version_rows AS ( \
                SELECT DISTINCT \
                  lix_json_extract(snapshot_content, 'version_id') AS version_id \
-               FROM lix_internal_state_untracked \
+               FROM lix_internal_live_untracked_v1 \
                WHERE schema_key = '{schema_key}' \
                  AND file_id = '{file_id}' \
                  AND version_id = '{storage_version_id}' \
@@ -1302,7 +1301,7 @@ fn build_state_history_source_sql(
                SELECT DISTINCT \
                  lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
                  vp.version_id AS root_version_id \
-               FROM lix_internal_state_materialized_v1_lix_version_pointer vp \
+               FROM lix_internal_live_v1_lix_version_pointer vp \
                JOIN active_version_rows av \
                  ON av.version_id = vp.entity_id \
                WHERE vp.schema_key = '{schema_key}' \
@@ -1321,7 +1320,7 @@ fn build_state_history_source_sql(
                SELECT DISTINCT \
                  lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
                  vp.entity_id AS root_version_id \
-               FROM lix_internal_state_materialized_v1_lix_version_pointer vp \
+               FROM lix_internal_live_v1_lix_version_pointer vp \
                WHERE vp.schema_key = '{schema_key}' \
                  AND vp.file_id = '{file_id}' \
                  AND vp.version_id = '{storage_version_id}' \
@@ -1344,7 +1343,7 @@ fn build_state_history_source_sql(
                lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
                created_at AS created_at, \
                version_id AS lixcol_version_id \
-             FROM lix_internal_state_materialized_v1_lix_commit \
+             FROM lix_internal_live_v1_lix_commit \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
@@ -1771,7 +1770,7 @@ fn build_working_changes_source_query() -> Result<Query, LixError> {
         "WITH \
             active_version AS ( \
                 SELECT lix_json_extract(snapshot_content, 'version_id') AS version_id \
-                FROM lix_internal_state_untracked \
+                FROM lix_internal_live_untracked_v1 \
                 WHERE schema_key = 'lix_active_version' \
                   AND file_id = 'lix' \
                   AND version_id = 'global' \
@@ -1785,7 +1784,7 @@ fn build_working_changes_source_query() -> Result<Query, LixError> {
                     (SELECT version_id FROM active_version) AS checkpoint_version_id, \
                     ( \
                         SELECT lix_json_extract(snapshot_content, 'commit_id') \
-                        FROM lix_internal_state_materialized_v1_lix_version_pointer \
+                        FROM lix_internal_live_v1_lix_version_pointer \
                         WHERE schema_key = 'lix_version_pointer' \
                           AND entity_id = (SELECT version_id FROM active_version) \
                           AND file_id = 'lix' \
@@ -1800,7 +1799,7 @@ fn build_working_changes_source_query() -> Result<Query, LixError> {
                     'global' AS checkpoint_version_id, \
                     ( \
                         SELECT lix_json_extract(snapshot_content, 'commit_id') \
-                        FROM lix_internal_state_materialized_v1_lix_version_pointer \
+                        FROM lix_internal_live_v1_lix_version_pointer \
                         WHERE schema_key = 'lix_version_pointer' \
                           AND entity_id = 'global' \
                           AND file_id = 'lix' \
@@ -1830,7 +1829,7 @@ fn build_working_changes_source_query() -> Result<Query, LixError> {
                     entity_id AS id, \
                     lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
                     created_at \
-                FROM lix_internal_state_untracked \
+                FROM lix_internal_live_untracked_v1 \
                 WHERE schema_key = 'lix_commit' \
                   AND file_id = 'lix' \
                   AND version_id = 'global' \
@@ -1840,7 +1839,7 @@ fn build_working_changes_source_query() -> Result<Query, LixError> {
                     entity_id AS id, \
                     lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
                     created_at \
-                FROM lix_internal_state_materialized_v1_lix_commit \
+                FROM lix_internal_live_v1_lix_commit \
                 WHERE schema_key = 'lix_commit' \
                   AND file_id = 'lix' \
                   AND version_id = 'global' \
@@ -1862,7 +1861,7 @@ fn build_working_changes_source_query() -> Result<Query, LixError> {
                     lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
                     lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
                     lix_json_extract(snapshot_content, 'file_id') AS file_id \
-                FROM lix_internal_state_untracked \
+                FROM lix_internal_live_untracked_v1 \
                 WHERE schema_key = 'lix_change_set_element' \
                   AND file_id = 'lix' \
                   AND version_id = 'global' \
@@ -1874,7 +1873,7 @@ fn build_working_changes_source_query() -> Result<Query, LixError> {
                     lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
                     lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
                     lix_json_extract(snapshot_content, 'file_id') AS file_id \
-                FROM lix_internal_state_materialized_v1_lix_change_set_element \
+                FROM lix_internal_live_v1_lix_change_set_element \
                 WHERE schema_key = 'lix_change_set_element' \
                   AND file_id = 'lix' \
                   AND version_id = 'global' \
@@ -2522,8 +2521,8 @@ mod tests {
         let lowered_sql = lowered.statements[0].to_string();
 
         assert!(lowered_sql.contains("FROM (SELECT"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
-        assert!(lowered_sql.contains("FROM lix_internal_state_untracked"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
+        assert!(lowered_sql.contains("FROM lix_internal_live_untracked_v1"));
         assert!(lowered_sql.contains("file_id = 'lix'"));
         assert!(lowered_sql.contains("plugin_key = 'lix'"));
         assert_eq!(
@@ -2556,8 +2555,8 @@ mod tests {
 
         assert!(!lowered_sql.contains("FROM lix_entity_label"));
         assert!(!lowered_sql.contains("JOIN lix_label"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_entity_label"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_label"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_entity_label"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_label"));
     }
 
     #[test]
@@ -2585,7 +2584,7 @@ mod tests {
 
         assert!(!lowered_sql.contains("FROM lix_state "));
         assert!(!lowered_sql.contains("JOIN lix_state_by_version"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
         assert!(lowered_sql.contains("all_target_versions AS"));
     }
 
@@ -2603,8 +2602,8 @@ mod tests {
         let lowered_sql = statement.to_string();
 
         assert!(lowered_sql.contains("FROM lix_state"));
-        assert!(!lowered_sql.contains("lix_internal_state_materialized_v1_"));
-        assert!(!lowered_sql.contains("FROM lix_internal_state_untracked"));
+        assert!(!lowered_sql.contains("lix_internal_live_v1_"));
+        assert!(!lowered_sql.contains("FROM lix_internal_live_untracked_v1"));
     }
 
     #[test]
@@ -2643,7 +2642,7 @@ mod tests {
         .expect("dynamic entity read should lower");
         let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_message"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_message"));
         assert!(lowered_sql.contains("file_id = 'inlang'"));
         assert!(lowered_sql.contains("plugin_key = 'inlang_sdk'"));
         assert!(lowered_sql.contains("global = true"));
@@ -2668,7 +2667,7 @@ mod tests {
         .expect("state read should lower");
         let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
         assert!(!lowered_sql.contains("FROM lix_state"));
         assert!(!lowered_sql.contains(") WHERE schema_key = 'lix_key_value'"));
         assert_eq!(
@@ -2716,7 +2715,7 @@ mod tests {
             !lowered_sql.contains("FROM lix_file"),
             "lowered sql still contains public lix_file: {lowered_sql}"
         );
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_file_descriptor"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_file_descriptor"));
         assert!(lowered_sql.contains("FROM (WITH active_version AS"));
     }
 
@@ -2731,8 +2730,8 @@ mod tests {
         .expect("filesystem current read should lower");
         let current_sql = current.statements[0].to_string();
 
-        assert!(current_sql.contains("lix_internal_state_materialized_v1_lix_file_descriptor"));
-        assert!(current_sql.contains("lix_internal_state_materialized_v1_lix_directory_descriptor"));
+        assert!(current_sql.contains("lix_internal_live_v1_lix_file_descriptor"));
+        assert!(current_sql.contains("lix_internal_live_v1_lix_directory_descriptor"));
         assert!(current_sql.contains("lix_internal_binary_blob_store"));
         assert!(!current_sql.contains("FROM lix_file_by_version"));
         assert_eq!(
@@ -2748,9 +2747,7 @@ mod tests {
         .expect("filesystem by-version read should lower");
         let by_version_sql = by_version.statements[0].to_string();
 
-        assert!(
-            by_version_sql.contains("lix_internal_state_materialized_v1_lix_directory_descriptor")
-        );
+        assert!(by_version_sql.contains("lix_internal_live_v1_lix_directory_descriptor"));
         assert!(by_version_sql.contains("all_target_versions AS"));
         assert!(!by_version_sql.contains("FROM lix_directory_by_version"));
         assert_eq!(
@@ -2772,7 +2769,7 @@ mod tests {
         .expect("active version read should lower");
         let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered_sql.contains("FROM lix_internal_state_untracked"));
+        assert!(lowered_sql.contains("FROM lix_internal_live_untracked_v1"));
         assert!(lowered_sql.contains("schema_key = 'lix_active_version'"));
         assert!(lowered_sql.contains("file_id = 'lix'"));
         assert!(lowered_sql.contains("version_id = 'global'"));
@@ -2796,7 +2793,7 @@ mod tests {
         .expect("active account read should lower");
         let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered_sql.contains("FROM lix_internal_state_untracked"));
+        assert!(lowered_sql.contains("FROM lix_internal_live_untracked_v1"));
         assert!(lowered_sql.contains("schema_key = 'lix_active_account'"));
         assert!(!lowered_sql.contains("FROM lix_active_account"));
         assert_eq!(
@@ -2819,8 +2816,8 @@ mod tests {
         .expect("version read should lower");
         let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_version_descriptor"));
-        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_version_pointer"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_pointer"));
         assert!(!lowered_sql.contains("FROM lix_version"));
         assert_eq!(
             lowered.pushdown_decision.accepted_predicates,

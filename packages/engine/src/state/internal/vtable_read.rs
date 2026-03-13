@@ -16,8 +16,8 @@ use crate::version::GLOBAL_VERSION_ID;
 use crate::{errors, LixBackend, LixError, Value as LixValue};
 
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
-const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
-const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
+const UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
+const LIVE_STATE_PREFIX: &str = "lix_internal_live_v1_";
 
 pub fn rewrite_query(query: Query, params: &[LixValue]) -> Result<Option<Query>, LixError> {
     let mut query = query;
@@ -355,7 +355,7 @@ fn build_untracked_union_query(
     ));
 
     for key in &effective_schema_keys {
-        let materialized_table = format!("{MATERIALIZED_PREFIX}{key}");
+        let materialized_table = format!("{LIVE_STATE_PREFIX}{key}");
         let materialized_ident = quote_ident(&materialized_table);
         let materialized_where = predicate_sql
             .as_ref()

@@ -15,7 +15,7 @@ const GLOBAL_VERSION: &str = "global";
 const ENGINE_FILE_ID: &str = "lix";
 const ENGINE_PLUGIN_KEY: &str = "lix";
 const BOOTSTRAP_TABLE: &str = "lix_internal_stored_schema_bootstrap";
-const MATERIALIZED_TABLE: &str = "lix_internal_state_materialized_v1_lix_stored_schema";
+const MATERIALIZED_TABLE: &str = "lix_internal_live_v1_lix_stored_schema";
 
 #[derive(Debug, Clone)]
 pub struct StoredSchemaRewrite {

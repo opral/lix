@@ -79,5 +79,5 @@ pub struct MaterializedStateRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateCommitResult {
     pub changes: Vec<ChangeRow>,
-    pub materialized_state: Vec<MaterializedStateRow>,
+    pub live_state_rows: Vec<MaterializedStateRow>,
 }

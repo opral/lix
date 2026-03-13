@@ -316,7 +316,7 @@ mod tests {
         );
 
         let mixed_public_internal =
-            mixed_public_internal_query_error(&["lix_internal_state_untracked".to_string()]);
+            mixed_public_internal_query_error(&["lix_internal_live_untracked_v1".to_string()]);
         assert_eq!(
             mixed_public_internal.code,
             "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED"

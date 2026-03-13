@@ -576,7 +576,7 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("FROM lix_internal_state_untracked")
+            if sql.contains("FROM lix_internal_live_untracked_v1")
                 && sql.contains("SELECT snapshot_content")
             {
                 let snapshot = self
@@ -662,7 +662,7 @@ mod tests {
                 .expect("executed_sql lock")
                 .push(sql.to_string());
             if sql.contains("lix_deterministic_mode")
-                || sql.contains("lix_internal_state_untracked")
+                || sql.contains("lix_internal_live_untracked_v1")
                 || sql.contains("lix_internal_stored_schema_bootstrap")
             {
                 return Err(LixError::new(
@@ -707,7 +707,7 @@ mod tests {
     #[test]
     fn detects_active_version_update_with_single_quoted_schema_key() {
         let where_clause = parse_update_where_clause(&format!(
-            "UPDATE lix_internal_state_untracked SET snapshot_content = 'x' WHERE schema_key = '{}' AND entity_id = 'main'",
+            "UPDATE lix_internal_live_untracked_v1 SET snapshot_content = 'x' WHERE schema_key = '{}' AND entity_id = 'main'",
             active_version_schema_key()
         ));
         let plan = update_validation_plan(where_clause, "v-single");
@@ -719,7 +719,7 @@ mod tests {
     #[test]
     fn detects_active_version_update_with_double_quoted_schema_key() {
         let where_clause = parse_update_where_clause(&format!(
-            "UPDATE lix_internal_state_untracked SET snapshot_content = 'x' WHERE schema_key = \"{}\" AND entity_id = 'main'",
+            "UPDATE lix_internal_live_untracked_v1 SET snapshot_content = 'x' WHERE schema_key = \"{}\" AND entity_id = 'main'",
             active_version_schema_key()
         ));
         let plan = update_validation_plan(where_clause, "v-double");
@@ -731,7 +731,7 @@ mod tests {
     #[test]
     fn ignores_non_active_version_schema_key() {
         let where_clause = parse_update_where_clause(
-            "UPDATE lix_internal_state_untracked SET snapshot_content = 'x' WHERE schema_key = 'other_schema' AND entity_id = 'main'",
+            "UPDATE lix_internal_live_untracked_v1 SET snapshot_content = 'x' WHERE schema_key = 'other_schema' AND entity_id = 'main'",
         );
         let plan = update_validation_plan(where_clause, "v-other");
 
@@ -1128,7 +1128,7 @@ mod tests {
 
     fn update_validation_plan(where_clause: Expr, version_id: &str) -> UpdateValidationPlan {
         UpdateValidationPlan {
-            table: "lix_internal_state_untracked".to_string(),
+            table: "lix_internal_live_untracked_v1".to_string(),
             where_clause: Some(where_clause),
             snapshot_content: Some(json!({
                 "id": "main",

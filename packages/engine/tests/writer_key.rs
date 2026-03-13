@@ -102,7 +102,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT writer_key \
-                     FROM lix_internal_state_materialized_v1_wk_writer_key_schema \
+                     FROM lix_internal_live_v1_wk_writer_key_schema \
                      WHERE entity_id = 'wk-tracked' \
                        AND version_id = '{version_id}' \
                        AND is_tombstone = 0 \
@@ -119,7 +119,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT writer_key \
-                     FROM lix_internal_state_untracked \
+                     FROM lix_internal_live_untracked_v1 \
                      WHERE entity_id = 'wk-untracked' \
                        AND version_id = '{version_id}' \
                      LIMIT 1"
@@ -163,7 +163,9 @@ simulation_test!(
         engine.initialize().await.unwrap();
         engine
             .execute(
-                "SELECT writer_key FROM lix_internal_state_materialized_v1_lix_file_descriptor LIMIT 0", &[])
+                "SELECT writer_key FROM lix_internal_live_v1_lix_file_descriptor LIMIT 0",
+                &[],
+            )
             .await
             .unwrap();
 
@@ -347,7 +349,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT writer_key, is_tombstone \
-                     FROM lix_internal_state_materialized_v1_lix_file_descriptor \
+                     FROM lix_internal_live_v1_lix_file_descriptor \
                      WHERE entity_id = 'wk-clear-delete' \
                        AND version_id = '{version_id}' \
                      LIMIT 1"

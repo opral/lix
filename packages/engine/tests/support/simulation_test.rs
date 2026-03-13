@@ -11,9 +11,9 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use lix_engine::{
-    boot, BootAccount, BootArgs, BootKeyValue, Engine, ExecuteOptions, ExecuteResult, LixBackend,
-    LixError, MaterializationApplyReport, MaterializationDebugMode, MaterializationPlan,
-    MaterializationReport, MaterializationRequest, MaterializationScope, Value, WasmRuntime,
+    boot, BootAccount, BootArgs, BootKeyValue, Engine, ExecuteOptions, ExecuteResult,
+    LiveStateApplyReport, LiveStateRebuildDebugMode, LiveStateRebuildPlan, LiveStateRebuildReport,
+    LiveStateRebuildRequest, LiveStateRebuildScope, LixBackend, LixError, Value, WasmRuntime,
 };
 use tokio::sync::Mutex as TokioMutex;
 use zip::write::SimpleFileOptions;
@@ -109,25 +109,25 @@ impl SimulationEngine {
         self.engine.install_plugin(archive_bytes).await
     }
 
-    pub async fn materialization_plan(
+    pub async fn live_state_rebuild_plan(
         &self,
-        req: &MaterializationRequest,
-    ) -> Result<MaterializationPlan, LixError> {
-        self.engine.materialization_plan(req).await
+        req: &LiveStateRebuildRequest,
+    ) -> Result<LiveStateRebuildPlan, LixError> {
+        self.engine.live_state_rebuild_plan(req).await
     }
 
-    pub async fn apply_materialization_plan(
+    pub async fn apply_live_state_rebuild_plan(
         &self,
-        plan: &MaterializationPlan,
-    ) -> Result<MaterializationApplyReport, LixError> {
-        self.engine.apply_materialization_plan(plan).await
+        plan: &LiveStateRebuildPlan,
+    ) -> Result<LiveStateApplyReport, LixError> {
+        self.engine.apply_live_state_rebuild_plan(plan).await
     }
 
-    pub async fn materialize(
+    pub async fn rebuild_live_state(
         &self,
-        req: &MaterializationRequest,
-    ) -> Result<MaterializationReport, LixError> {
-        self.engine.materialize(req).await
+        req: &LiveStateRebuildRequest,
+    ) -> Result<LiveStateRebuildReport, LixError> {
+        self.engine.rebuild_live_state(req).await
     }
 
     async fn rematerialize_before_read_if_needed(&self) -> Result<(), LixError> {
@@ -146,9 +146,9 @@ impl SimulationEngine {
         }
 
         self.engine
-            .materialize(&MaterializationRequest {
-                scope: MaterializationScope::Full,
-                debug: MaterializationDebugMode::Off,
+            .rebuild_live_state(&LiveStateRebuildRequest {
+                scope: LiveStateRebuildScope::Full,
+                debug: LiveStateRebuildDebugMode::Off,
                 debug_row_limit: 1,
             })
             .await?;

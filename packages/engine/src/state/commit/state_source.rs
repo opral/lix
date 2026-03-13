@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use crate::errors::classification::is_missing_relation_error;
 use crate::schema::builtin::types::LixVersionPointer;
 use crate::state::materialization::{
-    materialization_plan, MaterializationDebugMode, MaterializationRequest, MaterializationScope,
-    MaterializationWrite, MaterializationWriteOp,
+    live_state_rebuild_plan, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
+    LiveStateRebuildScope, LiveStateWrite, LiveStateWriteOp,
 };
 use crate::version::{
     version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key,
@@ -16,7 +16,7 @@ use crate::{LixBackend, LixError, QueryResult, Value};
 
 use super::types::{VersionInfo, VersionSnapshot};
 
-const VERSION_POINTER_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_pointer";
+const VERSION_POINTER_TABLE: &str = "lix_internal_live_v1_lix_version_pointer";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ExactCommittedStateRow {
@@ -275,11 +275,11 @@ pub(crate) async fn load_exact_committed_state_row(
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
     let mut target_versions = BTreeSet::new();
     target_versions.insert(request.version_id.clone());
-    let plan = materialization_plan(
+    let plan = live_state_rebuild_plan(
         backend,
-        &MaterializationRequest {
-            scope: MaterializationScope::Versions(target_versions),
-            debug: MaterializationDebugMode::Off,
+        &LiveStateRebuildRequest {
+            scope: LiveStateRebuildScope::Versions(target_versions),
+            debug: LiveStateRebuildDebugMode::Off,
             debug_row_limit: 0,
         },
     )
@@ -307,7 +307,7 @@ pub(crate) async fn load_exact_committed_state_row(
 }
 
 fn materialized_write_matches_request(
-    row: &MaterializationWrite,
+    row: &LiveStateWrite,
     request: &ExactCommittedStateRowRequest,
 ) -> bool {
     if row.entity_id != request.entity_id
@@ -335,13 +335,13 @@ fn materialized_write_matches_request(
     }
 
     match row.op {
-        MaterializationWriteOp::Upsert => row.snapshot_content.is_some(),
-        MaterializationWriteOp::Tombstone => false,
+        LiveStateWriteOp::Upsert => row.snapshot_content.is_some(),
+        LiveStateWriteOp::Tombstone => false,
     }
 }
 
 fn exact_committed_state_row_from_materialized_write(
-    row: &MaterializationWrite,
+    row: &LiveStateWrite,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
     let Some(snapshot_content) = row.snapshot_content.clone() else {
         return Ok(None);

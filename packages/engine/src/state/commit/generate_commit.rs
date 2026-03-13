@@ -79,7 +79,7 @@ where
         .iter()
         .map(|change| sanitize_domain_change(change))
         .collect();
-    let mut materialized_state: Vec<MaterializedStateRow> = Vec::new();
+    let mut live_state_rows: Vec<MaterializedStateRow> = Vec::new();
 
     let mut domain_by_version: BTreeMap<String, Vec<&DomainChangeInput>> = BTreeMap::new();
     for change in &effective_domain_changes {
@@ -194,7 +194,7 @@ where
             .unwrap_or_else(|| meta.commit_id.clone());
 
         for change in domain_changes {
-            materialized_state.push(MaterializedStateRow {
+            live_state_rows.push(MaterializedStateRow {
                 id: change.id.clone(),
                 entity_id: change.entity_id.clone(),
                 schema_key: change.schema_key.clone(),
@@ -209,7 +209,7 @@ where
                 writer_key: change.writer_key.clone(),
             });
 
-            materialized_state.push(MaterializedStateRow {
+            live_state_rows.push(MaterializedStateRow {
                 id: generate_uuid(),
                 entity_id: format!("{}~{}", meta.change_set_id, change.id),
                 schema_key: CHANGE_SET_ELEMENT_SCHEMA_KEY.to_string(),
@@ -254,7 +254,7 @@ where
 
         for change in domain_changes {
             for account_id in &unique_active_accounts {
-                materialized_state.push(MaterializedStateRow {
+                live_state_rows.push(MaterializedStateRow {
                     id: commit_change_id.clone(),
                     entity_id: format!("{}~{}", change.id, account_id),
                     schema_key: CHANGE_AUTHOR_SCHEMA_KEY.to_string(),
@@ -394,7 +394,7 @@ where
             .get(version_id)
             .cloned()
             .unwrap_or_else(|| generate_uuid());
-        materialized_state.push(MaterializedStateRow {
+        live_state_rows.push(MaterializedStateRow {
             id: change_set_change_id,
             entity_id: meta.change_set_id.clone(),
             schema_key: CHANGE_SET_SCHEMA_KEY.to_string(),
@@ -424,7 +424,7 @@ where
                     version_id
                 ),
             })?;
-        materialized_state.push(MaterializedStateRow {
+        live_state_rows.push(MaterializedStateRow {
             id: generate_uuid(),
             entity_id: meta.commit_id.clone(),
             schema_key: COMMIT_SCHEMA_KEY.to_string(),
@@ -443,7 +443,7 @@ where
             .get(version_id)
             .cloned()
             .unwrap_or_else(|| generate_uuid());
-        materialized_state.push(MaterializedStateRow {
+        live_state_rows.push(MaterializedStateRow {
             id: tip_id,
             entity_id: version_id.clone(),
             schema_key: VERSION_POINTER_SCHEMA_KEY.to_string(),
@@ -471,7 +471,7 @@ where
             .clone()
             .unwrap_or_else(|| meta.commit_id.clone());
         for parent_id in &meta.parent_commit_ids {
-            materialized_state.push(MaterializedStateRow {
+            live_state_rows.push(MaterializedStateRow {
                 id: generate_uuid(),
                 entity_id: format!("{}~{}", parent_id, meta.commit_id),
                 schema_key: COMMIT_EDGE_SCHEMA_KEY.to_string(),
@@ -498,7 +498,7 @@ where
 
     Ok(GenerateCommitResult {
         changes: output_changes,
-        materialized_state,
+        live_state_rows,
     })
 }
 
@@ -728,7 +728,7 @@ mod tests {
         );
 
         let materialized_commit_row = result
-            .materialized_state
+            .live_state_rows
             .iter()
             .find(|row| row.schema_key == "lix_commit")
             .expect("expected materialized commit row");
@@ -737,7 +737,7 @@ mod tests {
                 .unwrap();
         assert_eq!(materialized_commit_snapshot, commit_snapshot);
 
-        let materialized_counts = counts_by_schema(&result.materialized_state);
+        let materialized_counts = counts_by_schema(&result.live_state_rows);
         assert_eq!(materialized_counts.get("lix_key_value"), Some(&1));
         assert_eq!(materialized_counts.get("lix_change_author"), Some(&1));
         assert_eq!(materialized_counts.get("lix_change_set_element"), Some(&1));
@@ -745,10 +745,10 @@ mod tests {
         assert_eq!(materialized_counts.get("lix_commit"), Some(&1));
         assert_eq!(materialized_counts.get("lix_version_pointer"), Some(&1));
         assert_eq!(materialized_counts.get("lix_commit_edge"), Some(&1));
-        assert_eq!(result.materialized_state.len(), 7);
+        assert_eq!(result.live_state_rows.len(), 7);
 
         let domain_materialized = result
-            .materialized_state
+            .live_state_rows
             .iter()
             .find(|row| row.schema_key == "lix_key_value")
             .expect("expected domain materialized row");
@@ -794,7 +794,7 @@ mod tests {
         );
         assert_eq!(
             result
-                .materialized_state
+                .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_author")
                 .count(),
@@ -802,7 +802,7 @@ mod tests {
         );
         assert_eq!(
             result
-                .materialized_state
+                .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_set_element")
                 .count(),
@@ -810,7 +810,7 @@ mod tests {
         );
         assert_eq!(
             result
-                .materialized_state
+                .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_commit_edge")
                 .count(),
@@ -818,13 +818,13 @@ mod tests {
         );
         assert_eq!(
             result
-                .materialized_state
+                .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_set")
                 .count(),
             1
         );
-        assert_eq!(result.materialized_state.len(), 7);
+        assert_eq!(result.live_state_rows.len(), 7);
 
         let commit_row = result
             .changes
@@ -847,7 +847,7 @@ mod tests {
         );
 
         let author_row = result
-            .materialized_state
+            .live_state_rows
             .iter()
             .find(|row| row.schema_key == "lix_change_author")
             .expect("expected change_author row");
@@ -918,7 +918,7 @@ mod tests {
 
         assert_eq!(
             result
-                .materialized_state
+                .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_author")
                 .count(),
@@ -926,13 +926,13 @@ mod tests {
         );
         assert_eq!(
             result
-                .materialized_state
+                .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_set")
                 .count(),
             2
         );
-        assert_eq!(result.materialized_state.len(), 16);
+        assert_eq!(result.live_state_rows.len(), 16);
 
         let commit_rows: Vec<_> = result
             .changes
@@ -954,7 +954,7 @@ mod tests {
         }
 
         let change_author_entities: BTreeSet<String> = result
-            .materialized_state
+            .live_state_rows
             .iter()
             .filter(|row| row.schema_key == "lix_change_author")
             .map(|row| row.entity_id.clone())
@@ -970,7 +970,7 @@ mod tests {
         );
 
         let global_tip = result
-            .materialized_state
+            .live_state_rows
             .iter()
             .find(|row| row.schema_key == "lix_version_pointer" && row.entity_id == "global")
             .expect("global version_pointer should exist");
@@ -982,7 +982,7 @@ mod tests {
             .to_string();
 
         for cse in result
-            .materialized_state
+            .live_state_rows
             .iter()
             .filter(|row| row.schema_key == "lix_change_set_element")
         {
@@ -1036,7 +1036,7 @@ mod tests {
         );
 
         let cse_change_ids = result
-            .materialized_state
+            .live_state_rows
             .iter()
             .filter(|row| row.schema_key == "lix_change_set_element")
             .map(|row| {
@@ -1055,7 +1055,7 @@ mod tests {
         );
 
         let change_author_entities = result
-            .materialized_state
+            .live_state_rows
             .iter()
             .filter(|row| row.schema_key == "lix_change_author")
             .map(|row| row.entity_id.clone())
@@ -1148,14 +1148,14 @@ mod tests {
         .expect("generate_commit should succeed");
 
         let domain_row = result
-            .materialized_state
+            .live_state_rows
             .iter()
             .find(|row| row.schema_key == "mock_schema")
             .expect("expected materialized domain row");
         assert_eq!(domain_row.writer_key.as_deref(), Some("writer:test"));
 
         for row in result
-            .materialized_state
+            .live_state_rows
             .iter()
             .filter(|row| row.schema_key != "mock_schema")
         {

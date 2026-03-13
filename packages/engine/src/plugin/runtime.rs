@@ -11,9 +11,7 @@ use crate::sql::ast::lowering::lower_statement;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::preprocess::preprocess_sql_to_plan as preprocess_sql;
 use crate::sql::public::runtime::lower_public_read_query_with_backend;
-use crate::state::materialization::{
-    MaterializationPlan, MaterializationWrite, MaterializationWriteOp,
-};
+use crate::state::materialization::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::Statement;
@@ -112,7 +110,7 @@ async fn load_or_init_plugin_component(
 pub(crate) async fn materialize_file_data_with_plugins(
     backend: &dyn LixBackend,
     runtime: &dyn WasmRuntime,
-    plan: &MaterializationPlan,
+    plan: &LiveStateRebuildPlan,
 ) -> Result<(), LixError> {
     let installed_plugins = load_installed_plugins(backend).await?;
 
@@ -123,7 +121,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
             continue;
         }
         let key = (write.version_id.clone(), write.entity_id.clone());
-        if write.op == MaterializationWriteOp::Tombstone {
+        if write.op == LiveStateWriteOp::Tombstone {
             tombstoned_files.push((key.1, key.0));
             continue;
         }
@@ -150,7 +148,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
         );
     }
 
-    let mut writes_by_target: BTreeMap<(String, String, String), Vec<&MaterializationWrite>> =
+    let mut writes_by_target: BTreeMap<(String, String, String), Vec<&LiveStateWrite>> =
         BTreeMap::new();
     for write in &plan.writes {
         if write.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY {
@@ -201,7 +199,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
                 entity_id: write.entity_id.clone(),
                 schema_key: write.schema_key.clone(),
                 schema_version: write.schema_version.clone(),
-                snapshot_content: if write.op == MaterializationWriteOp::Tombstone {
+                snapshot_content: if write.op == LiveStateWriteOp::Tombstone {
                     None
                 } else {
                     write.snapshot_content.clone()
@@ -523,7 +521,7 @@ async fn load_missing_file_history_descriptors(
            WHERE history.path IS NOT NULL \
              AND history.lixcol_root_commit_id IN (\
                SELECT entity_id \
-               FROM lix_internal_state_materialized_v1_lix_commit \
+               FROM lix_internal_live_v1_lix_commit \
                WHERE schema_key = 'lix_commit' \
                  AND version_id = 'global' \
                  AND is_tombstone = 0 \

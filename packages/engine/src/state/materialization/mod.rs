@@ -4,34 +4,34 @@ mod plan;
 mod types;
 
 pub use types::{
-    LatestVisibleWinnerDebugRow, MaterializationApplyReport, MaterializationDebugMode,
-    MaterializationDebugTrace, MaterializationPlan, MaterializationReport, MaterializationRequest,
-    MaterializationScope, MaterializationWarning, MaterializationWrite, MaterializationWriteOp,
-    ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow, TraversedEdgeDebugRow,
-    VersionAncestryDebugRow, VersionPointerDebugRow,
+    LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
+    LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
+    LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning, LiveStateWrite,
+    LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
+    TraversedEdgeDebugRow, VersionAncestryDebugRow, VersionPointerDebugRow,
 };
 
 use crate::{LixBackend, LixError};
 
-pub async fn materialization_plan(
+pub async fn live_state_rebuild_plan(
     backend: &dyn LixBackend,
-    req: &MaterializationRequest,
-) -> Result<MaterializationPlan, LixError> {
-    plan::materialization_plan_internal(backend, req).await
+    req: &LiveStateRebuildRequest,
+) -> Result<LiveStateRebuildPlan, LixError> {
+    plan::live_state_rebuild_plan_internal(backend, req).await
 }
 
-pub async fn apply_materialization_plan(
+pub async fn apply_live_state_rebuild_plan(
     backend: &dyn LixBackend,
-    plan: &MaterializationPlan,
-) -> Result<MaterializationApplyReport, LixError> {
-    apply::apply_materialization_plan_internal(backend, plan).await
+    plan: &LiveStateRebuildPlan,
+) -> Result<LiveStateApplyReport, LixError> {
+    apply::apply_live_state_rebuild_plan_internal(backend, plan).await
 }
 
-pub async fn materialize(
+pub async fn rebuild_live_state(
     backend: &dyn LixBackend,
-    req: &MaterializationRequest,
-) -> Result<MaterializationReport, LixError> {
-    let plan = materialization_plan(backend, req).await?;
-    let apply = apply_materialization_plan(backend, &plan).await?;
-    Ok(MaterializationReport { plan, apply })
+    req: &LiveStateRebuildRequest,
+) -> Result<LiveStateRebuildReport, LixError> {
+    let plan = live_state_rebuild_plan(backend, req).await?;
+    let apply = apply_live_state_rebuild_plan(backend, &plan).await?;
+    Ok(LiveStateRebuildReport { plan, apply })
 }

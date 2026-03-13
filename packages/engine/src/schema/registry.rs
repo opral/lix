@@ -8,7 +8,7 @@ pub async fn register_schema(backend: &dyn LixBackend, schema_key: &str) -> Resu
 }
 
 pub fn register_schema_sql(schema_key: &str) -> String {
-    let table_name = format!("lix_internal_state_materialized_v1_{}", schema_key);
+    let table_name = format!("lix_internal_live_v1_{}", schema_key);
     let table_ident = quote_ident(&table_name);
 
     format!(
@@ -34,7 +34,7 @@ pub fn register_schema_sql(schema_key: &str) -> String {
 }
 
 pub fn register_schema_sql_statements(schema_key: &str, dialect: SqlDialect) -> Vec<String> {
-    let table_name = format!("lix_internal_state_materialized_v1_{}", schema_key);
+    let table_name = format!("lix_internal_live_v1_{}", schema_key);
     let table_ident = quote_ident(&table_name);
 
     let mut statements = vec![register_schema_sql(schema_key)];

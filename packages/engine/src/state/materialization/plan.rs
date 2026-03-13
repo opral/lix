@@ -6,11 +6,10 @@ use crate::schema::builtin::types::LixVersionPointer;
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
 use crate::state::materialization::loader::{load_data, ChangeRecord, LoadedData};
 use crate::state::materialization::types::{
-    LatestVisibleWinnerDebugRow, MaterializationDebugMode, MaterializationDebugTrace,
-    MaterializationPlan, MaterializationRequest, MaterializationScope, MaterializationWarning,
-    MaterializationWrite, MaterializationWriteOp, ScopeWinnerDebugRow, StageStat,
-    TraversedCommitDebugRow, TraversedEdgeDebugRow, VersionAncestryDebugRow,
-    VersionPointerDebugRow,
+    LatestVisibleWinnerDebugRow, LiveStateRebuildDebugMode, LiveStateRebuildDebugTrace,
+    LiveStateRebuildPlan, LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning,
+    LiveStateWrite, LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
+    TraversedEdgeDebugRow, VersionAncestryDebugRow, VersionPointerDebugRow,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError};
@@ -59,10 +58,10 @@ struct BuiltinProjectionSchemaMeta {
     plugin_key: String,
 }
 
-pub(crate) async fn materialization_plan_internal(
+pub(crate) async fn live_state_rebuild_plan_internal(
     backend: &dyn LixBackend,
-    req: &MaterializationRequest,
-) -> Result<MaterializationPlan, LixError> {
+    req: &LiveStateRebuildRequest,
+) -> Result<LiveStateRebuildPlan, LixError> {
     let data = load_data(backend).await?;
     let mut stats = Vec::new();
     let mut warnings = Vec::new();
@@ -103,7 +102,7 @@ pub(crate) async fn materialization_plan_internal(
         &final_state,
     );
 
-    Ok(MaterializationPlan {
+    Ok(LiveStateRebuildPlan {
         run_id: format!("materialization::{:?}", req.scope),
         scope: resolved_scope(req, target_versions),
         stats,
@@ -114,12 +113,12 @@ pub(crate) async fn materialization_plan_internal(
 }
 
 fn resolved_scope(
-    req: &MaterializationRequest,
+    req: &LiveStateRebuildRequest,
     target_versions: BTreeSet<String>,
-) -> MaterializationScope {
+) -> LiveStateRebuildScope {
     match &req.scope {
-        MaterializationScope::Full => MaterializationScope::Versions(target_versions),
-        MaterializationScope::Versions(_) => MaterializationScope::Versions(target_versions),
+        LiveStateRebuildScope::Full => LiveStateRebuildScope::Versions(target_versions),
+        LiveStateRebuildScope::Versions(_) => LiveStateRebuildScope::Versions(target_versions),
     }
 }
 
@@ -283,7 +282,7 @@ fn build_latest_visible_state(
     data: &LoadedData,
     commit_graph: &BTreeMap<(String, String), usize>,
     version_pointers: &BTreeMap<String, Vec<String>>,
-    warnings: &mut Vec<MaterializationWarning>,
+    warnings: &mut Vec<LiveStateRebuildWarning>,
     stats: &mut Vec<StageStat>,
 ) -> Vec<VisibleRow> {
     let mut candidates: BTreeMap<(String, String, String, String), Vec<VisibleCandidate>> =
@@ -291,7 +290,7 @@ fn build_latest_visible_state(
 
     for ((version_id, commit_id), depth) in commit_graph {
         let Some(commit) = data.commits.get(commit_id) else {
-            warnings.push(MaterializationWarning {
+            warnings.push(LiveStateRebuildWarning {
                 code: "missing_commit_snapshot".to_string(),
                 message: format!(
                     "commit_graph references commit '{}' for version '{}' but no lix_commit snapshot exists",
@@ -303,7 +302,7 @@ fn build_latest_visible_state(
 
         for change_id in &commit.snapshot.change_ids {
             let Some(change) = data.changes.get(change_id) else {
-                warnings.push(MaterializationWarning {
+                warnings.push(LiveStateRebuildWarning {
                     code: "missing_change".to_string(),
                     message: format!(
                         "lix_commit '{}' references missing change '{}'",
@@ -404,7 +403,7 @@ fn build_global_projection_rows(
     data: &LoadedData,
     commit_graph: &BTreeMap<(String, String), usize>,
     version_pointers: &BTreeMap<String, Vec<String>>,
-    warnings: &mut Vec<MaterializationWarning>,
+    warnings: &mut Vec<LiveStateRebuildWarning>,
 ) -> Vec<VisibleRow> {
     let commit_schema = builtin_projection_schema_meta("lix_commit");
     let version_pointer_schema = builtin_projection_schema_meta("lix_version_pointer");
@@ -423,7 +422,7 @@ fn build_global_projection_rows(
             match serde_json::from_str::<LixVersionPointer>(raw) {
                 Ok(parsed) => Some(parsed),
                 Err(error) => {
-                    warnings.push(MaterializationWarning {
+                    warnings.push(LiveStateRebuildWarning {
                         code: "invalid_version_pointer_snapshot".to_string(),
                         message: format!(
                             "lix_version_pointer change '{}' has invalid snapshot JSON: {}",
@@ -539,7 +538,7 @@ fn build_global_projection_rows(
 
     for (commit_id, depth) in &commit_depths {
         let Some(commit) = data.commits.get(commit_id) else {
-            warnings.push(MaterializationWarning {
+            warnings.push(LiveStateRebuildWarning {
                 code: "missing_commit_snapshot".to_string(),
                 message: format!(
                     "commit_graph references commit '{}' but no lix_commit snapshot exists",
@@ -549,7 +548,7 @@ fn build_global_projection_rows(
             continue;
         };
         let Some(commit_change) = data.changes.get(&commit.id) else {
-            warnings.push(MaterializationWarning {
+            warnings.push(LiveStateRebuildWarning {
                 code: "missing_commit_change".to_string(),
                 message: format!(
                     "lix_commit '{}' references missing change row '{}'",
@@ -595,7 +594,7 @@ fn build_global_projection_rows(
         {
             for change_id in &commit.snapshot.change_ids {
                 let Some(change) = data.changes.get(change_id) else {
-                    warnings.push(MaterializationWarning {
+                    warnings.push(LiveStateRebuildWarning {
                         code: "missing_change".to_string(),
                         message: format!(
                             "lix_commit '{}' references missing change '{}'",
@@ -913,14 +912,14 @@ fn builtin_projection_schema_meta(schema_key: &str) -> BuiltinProjectionSchemaMe
 }
 
 fn resolve_target_versions(
-    req: &MaterializationRequest,
+    req: &LiveStateRebuildRequest,
     version_pointers: &BTreeMap<String, Vec<String>>,
     data: &LoadedData,
     latest_visible_state: &[VisibleRow],
 ) -> BTreeSet<String> {
     match &req.scope {
-        MaterializationScope::Versions(versions) => versions.clone(),
-        MaterializationScope::Full => {
+        LiveStateRebuildScope::Versions(versions) => versions.clone(),
+        LiveStateRebuildScope::Full => {
             let mut versions = BTreeSet::new();
             for version_id in version_pointers.keys() {
                 versions.insert(version_id.clone());
@@ -939,7 +938,7 @@ fn resolve_target_versions(
 fn build_version_ancestry(
     data: &LoadedData,
     target_versions: &BTreeSet<String>,
-    _warnings: &mut Vec<MaterializationWarning>,
+    _warnings: &mut Vec<LiveStateRebuildWarning>,
     stats: &mut Vec<StageStat>,
 ) -> BTreeMap<String, Vec<(String, usize)>> {
     let mut ancestry: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
@@ -1032,15 +1031,15 @@ fn build_final_state(
     rows
 }
 
-fn build_writes(final_state: &[FinalStateRow]) -> Vec<MaterializationWrite> {
+fn build_writes(final_state: &[FinalStateRow]) -> Vec<LiveStateWrite> {
     let mut writes = Vec::new();
     for row in final_state {
         let op = if row.source.snapshot_content.is_some() {
-            MaterializationWriteOp::Upsert
+            LiveStateWriteOp::Upsert
         } else {
-            MaterializationWriteOp::Tombstone
+            LiveStateWriteOp::Tombstone
         };
-        writes.push(MaterializationWrite {
+        writes.push(LiveStateWrite {
             schema_key: row.source.schema_key.clone(),
             entity_id: row.source.entity_id.clone(),
             file_id: row.source.file_id.clone(),
@@ -1070,15 +1069,15 @@ fn build_writes(final_state: &[FinalStateRow]) -> Vec<MaterializationWrite> {
 }
 
 fn build_debug_trace(
-    req: &MaterializationRequest,
+    req: &LiveStateRebuildRequest,
     version_pointers: &BTreeMap<String, Vec<String>>,
     commit_graph: &BTreeMap<(String, String), usize>,
     all_commit_edges: &BTreeSet<(String, String)>,
     version_ancestry: &BTreeMap<String, Vec<(String, usize)>>,
     latest_visible_state: &[VisibleRow],
     final_state: &[FinalStateRow],
-) -> Option<MaterializationDebugTrace> {
-    if matches!(req.debug, MaterializationDebugMode::Off) {
+) -> Option<LiveStateRebuildDebugTrace> {
+    if matches!(req.debug, LiveStateRebuildDebugMode::Off) {
         return None;
     }
 
@@ -1127,7 +1126,7 @@ fn build_debug_trace(
         }
     }
 
-    let latest_visible_winners = if matches!(req.debug, MaterializationDebugMode::Full) {
+    let latest_visible_winners = if matches!(req.debug, LiveStateRebuildDebugMode::Full) {
         latest_visible_state
             .iter()
             .map(|row| LatestVisibleWinnerDebugRow {
@@ -1144,7 +1143,7 @@ fn build_debug_trace(
         Vec::new()
     };
 
-    let scope_winners = if matches!(req.debug, MaterializationDebugMode::Full) {
+    let scope_winners = if matches!(req.debug, LiveStateRebuildDebugMode::Full) {
         final_state
             .iter()
             .map(|row| ScopeWinnerDebugRow {
@@ -1161,7 +1160,7 @@ fn build_debug_trace(
         Vec::new()
     };
 
-    Some(MaterializationDebugTrace {
+    Some(LiveStateRebuildDebugTrace {
         tips_by_version: tips_by_version.into_iter().take(limit).collect(),
         traversed_commits: traversed_commits.into_iter().take(limit).collect(),
         traversed_edges: traversed_edges.into_iter().take(limit).collect(),
