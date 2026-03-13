@@ -32,7 +32,7 @@ pub(crate) fn assignments_from_payload(
     payload: &MutationPayload,
     context: &str,
 ) -> Result<CanonicalStateAssignments, StateAssignmentsError> {
-    let MutationPayload::Patch(columns) = payload else {
+    let MutationPayload::UpdatePatch(columns) = payload else {
         return Err(StateAssignmentsError {
             message: format!("{context} requires a patch payload"),
         });
