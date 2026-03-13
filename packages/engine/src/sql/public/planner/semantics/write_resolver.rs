@@ -686,7 +686,7 @@ async fn resolve_active_version_update_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let MutationPayload::Patch(payload) = &planned_write.command.payload else {
+    let MutationPayload::UpdatePatch(payload) = &planned_write.command.payload else {
         return Err(WriteResolveError {
             message: "public active-version update resolver requires a patch payload".to_string(),
         });
@@ -773,9 +773,15 @@ async fn resolve_active_version_update_write_plan(
 fn resolve_active_account_insert_write_plan(
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let MutationPayload::FullSnapshot(payload) = &planned_write.command.payload else {
+    let MutationPayload::InsertRows(payloads) = &planned_write.command.payload else {
         return Err(WriteResolveError {
             message: "public active-account insert resolver requires a full payload".to_string(),
+        });
+    };
+    let [payload] = payloads.as_slice() else {
+        return Err(WriteResolveError {
+            message: "public active-account insert resolver requires exactly one payload row"
+                .to_string(),
         });
     };
     if payload.keys().any(|key| key != "account_id") {
@@ -1096,7 +1102,7 @@ async fn resolve_existing_version_write(
 
     match planned_write.command.operation_kind {
         WriteOperationKind::Update => {
-            let MutationPayload::Patch(payload) = &planned_write.command.payload else {
+            let MutationPayload::UpdatePatch(payload) = &planned_write.command.payload else {
                 return Err(WriteResolveError {
                     message: "public version update resolver requires a patch payload".to_string(),
                 });
@@ -2510,34 +2516,31 @@ fn write_resolve_to_lix_error(error: WriteResolveError) -> crate::LixError {
 
 fn payload_map(planned_write: &PlannedWrite) -> Result<BTreeMap<String, Value>, WriteResolveError> {
     match &planned_write.command.payload {
-        MutationPayload::FullSnapshot(payload) | MutationPayload::Patch(payload) => {
-            Ok(payload.clone())
-        }
-        MutationPayload::BulkFullSnapshot(_) => Err(WriteResolveError {
-            message: "public resolver expected a single-row payload".to_string(),
-        }),
+        MutationPayload::InsertRows(payloads) => match payloads.as_slice() {
+            [payload] => Ok(payload.clone()),
+            _ => Err(WriteResolveError {
+                message: "public resolver expected a single-row payload".to_string(),
+            }),
+        },
+        MutationPayload::UpdatePatch(payload) => Ok(payload.clone()),
         MutationPayload::Tombstone => Ok(Default::default()),
     }
 }
 
 fn payload_text_value(planned_write: &PlannedWrite, key: &str) -> Option<String> {
     match &planned_write.command.payload {
-        MutationPayload::FullSnapshot(payload) | MutationPayload::Patch(payload) => {
-            match payload.get(key) {
+        MutationPayload::InsertRows(payloads) => {
+            let mut values = payloads.iter().filter_map(|payload| match payload.get(key) {
                 Some(Value::Text(value)) => Some(value.clone()),
                 _ => None,
-            }
-        }
-        MutationPayload::BulkFullSnapshot(payloads) => {
-            let mut values = payloads
-                .iter()
-                .filter_map(|payload| match payload.get(key) {
-                    Some(Value::Text(value)) => Some(value.clone()),
-                    _ => None,
-                });
+            });
             let first = values.next()?;
             values.all(|candidate| candidate == first).then_some(first)
         }
+        MutationPayload::UpdatePatch(payload) => match payload.get(key) {
+            Some(Value::Text(value)) => Some(value.clone()),
+            _ => None,
+        },
         MutationPayload::Tombstone => None,
     }
 }
@@ -2546,9 +2549,8 @@ fn payload_maps(
     planned_write: &PlannedWrite,
 ) -> Result<Vec<BTreeMap<String, Value>>, WriteResolveError> {
     match &planned_write.command.payload {
-        MutationPayload::FullSnapshot(payload) => Ok(vec![payload.clone()]),
-        MutationPayload::BulkFullSnapshot(payloads) => Ok(payloads.clone()),
-        MutationPayload::Patch(_) | MutationPayload::Tombstone => Err(WriteResolveError {
+        MutationPayload::InsertRows(payloads) => Ok(payloads.clone()),
+        MutationPayload::UpdatePatch(_) | MutationPayload::Tombstone => Err(WriteResolveError {
             message: "public resolver expected insert payload rows".to_string(),
         }),
     }
