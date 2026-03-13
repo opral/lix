@@ -1,13 +1,83 @@
 use unicode_normalization::UnicodeNormalization;
 
 use crate::LixError;
+use std::fmt;
+use std::ops::Deref;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedDirectoryPath(String);
+
+impl NormalizedDirectoryPath {
+    pub(crate) fn try_from_path(path: &str) -> Result<Self, LixError> {
+        normalize_directory_path(path).map(Self)
+    }
+
+    pub(crate) fn from_normalized(path: String) -> Self {
+        Self(path)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl Deref for NormalizedDirectoryPath {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for NormalizedDirectoryPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedFilePath(String);
+
+impl NormalizedFilePath {
+    pub(crate) fn from_normalized(path: String) -> Self {
+        Self(path)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl Deref for NormalizedFilePath {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for NormalizedFilePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedFilePath {
-    pub(crate) normalized_path: String,
-    pub(crate) directory_path: Option<String>,
+    pub(crate) normalized_path: NormalizedFilePath,
+    pub(crate) directory_path: Option<NormalizedDirectoryPath>,
     pub(crate) name: String,
     pub(crate) extension: Option<String>,
+}
+
+impl ParsedFilePath {
+    pub(crate) fn try_from_path(path: &str) -> Result<Self, LixError> {
+        parse_file_path(path)
+    }
+
+    pub(crate) fn from_normalized_path(path: String) -> Result<Self, LixError> {
+        parse_file_path(&path)
+    }
 }
 
 pub(crate) fn normalize_path_segment(raw: &str) -> Result<String, LixError> {
@@ -138,7 +208,10 @@ pub(crate) fn parse_file_path(path: &str) -> Result<ParsedFilePath, LixError> {
         description: format!("Invalid file path {path}"),
     })?;
     let directory_path = if segments.len() > 1 {
-        Some(format!("/{}/", segments[..segments.len() - 1].join("/")))
+        Some(NormalizedDirectoryPath::from_normalized(format!(
+            "/{}/",
+            segments[..segments.len() - 1].join("/")
+        )))
     } else {
         None
     };
@@ -159,7 +232,7 @@ pub(crate) fn parse_file_path(path: &str) -> Result<ParsedFilePath, LixError> {
     };
 
     Ok(ParsedFilePath {
-        normalized_path,
+        normalized_path: NormalizedFilePath::from_normalized(normalized_path),
         directory_path,
         name,
         extension,

@@ -622,15 +622,24 @@ fn guardrail_filesystem_path_normalization_stays_in_filesystem_assignments() {
         fs::read_to_string(root.join("src/sql/public/planner/semantics/filesystem_queries.rs"))
             .expect("filesystem_queries.rs should be readable");
 
+    assert!(
+        filesystem_assignments.contains("NormalizedDirectoryPath::try_from_path("),
+        "filesystem_assignments.rs should normalize directory paths at ingress"
+    );
+    assert!(
+        filesystem_assignments.contains("ParsedFilePath::try_from_path("),
+        "filesystem_assignments.rs should parse file paths at ingress"
+    );
+    assert!(
+        filesystem_assignments.contains("normalize_path_segment("),
+        "filesystem_assignments.rs should continue to normalize raw path segments at ingress"
+    );
+
     for helper in [
         "normalize_directory_path(",
         "normalize_path_segment(",
         "parse_file_path(",
     ] {
-        assert!(
-            filesystem_assignments.contains(helper),
-            "filesystem_assignments.rs should own path normalization helper {helper}"
-        );
         for (label, source) in [
             ("write_resolver.rs", &write_resolver),
             ("filesystem_writes.rs", &filesystem_writes),
