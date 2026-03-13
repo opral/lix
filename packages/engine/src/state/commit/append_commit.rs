@@ -216,7 +216,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
     .map_err(backend_error)?;
     let committed_tip = extract_committed_tip_id(&commit_result, &concrete_lane)?;
 
-    let prepared_statements = bind_statement_batch_for_dialect(
+    let prepared_batch = bind_statement_batch_for_dialect(
         build_statement_batch_from_generate_commit_result(
             commit_result.clone(),
             functions,
@@ -228,12 +228,10 @@ pub(crate) async fn append_commit_if_preconditions_hold(
     )
     .map_err(backend_error)?;
 
-    for statement in prepared_statements {
-        transaction
-            .execute(&statement.sql, &statement.params)
-            .await
-            .map_err(backend_error)?;
-    }
+    transaction
+        .execute(&prepared_batch.sql, &prepared_batch.params)
+        .await
+        .map_err(backend_error)?;
     insert_idempotency_row(
         transaction,
         &concrete_lane,
@@ -727,6 +725,20 @@ mod tests {
         assert_eq!(result.disposition, AppendCommitDisposition::Applied);
         assert!(result.commit_result.is_some());
         assert_eq!(checker.calls, 1);
+        let generated_commit_batches = transaction
+            .executed_sql
+            .iter()
+            .filter(|sql| sql.contains("INSERT INTO lix_internal_change "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            generated_commit_batches.len(),
+            1,
+            "generated commit work should execute as one SQL batch"
+        );
+        assert!(
+            generated_commit_batches[0].contains("; INSERT INTO lix_internal_live_v1_"),
+            "generated commit batch should include live-state writes in the same execute call"
+        );
         assert!(
             transaction
                 .executed_sql

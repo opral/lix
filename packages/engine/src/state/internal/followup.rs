@@ -19,9 +19,10 @@ use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value as EngineVa
 
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
-use crate::sql::execution::contracts::prepared_statement::PreparedStatement;
+use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
 use crate::sql::execution::execute_prepared::{
-    execute_prepared_with_backend, execute_prepared_with_transaction,
+    execute_prepared_batch_with_transaction, execute_prepared_with_backend,
+    execute_prepared_with_transaction,
 };
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{
@@ -190,7 +191,7 @@ pub(crate) async fn execute_postprocess_with_transaction(
             .await?
         }
     };
-    execute_prepared_with_transaction(transaction, &followup_statements).await?;
+    execute_prepared_batch_with_transaction(transaction, &followup_statements).await?;
 
     Ok(PostprocessExecutionOutcome {
         internal_result,
@@ -247,7 +248,7 @@ pub(crate) async fn build_update_followup_statements(
     rows: &[Vec<EngineValue>],
     writer_key: Option<&str>,
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
-) -> Result<Vec<PreparedStatement>, LixError> {
+) -> Result<PreparedBatch, LixError> {
     let mut executor = TransactionExecutor { transaction };
     let batch =
         build_update_followup_statement_batch(&mut executor, plan, rows, writer_key, functions)
@@ -262,7 +263,7 @@ pub(crate) async fn build_delete_followup_statements(
     params: &[EngineValue],
     writer_key: Option<&str>,
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
-) -> Result<Vec<PreparedStatement>, LixError> {
+) -> Result<PreparedBatch, LixError> {
     let mut executor = TransactionExecutor { transaction };
     let batch = build_delete_followup_statement_batch(
         &mut executor,
