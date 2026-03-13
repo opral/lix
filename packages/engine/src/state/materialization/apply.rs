@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::schema::registry::register_schema;
+use crate::schema::registry::ensure_schema_live_table;
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::materialization::types::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildScope, LiveStateWriteOp,
@@ -102,7 +102,7 @@ async fn clear_scope_rows(
     let mut rows_deleted = 0usize;
 
     for schema_key in schema_keys {
-        register_schema(backend, schema_key).await?;
+        ensure_schema_live_table(backend, schema_key).await?;
         let table_name = live_state_table_name(schema_key);
         tables_touched.insert(table_name.clone());
 

@@ -18,7 +18,7 @@ Read and write data in a Lix repo safely through the Lix CLI.
   - `data` is bytes; use `lix_text_encode('...')` for text payloads.
 - Entities:
   - Entities are schema-scoped records in `lix_state` / `lix_state_by_version`.
-  - They are keyed by `schema_key` + `entity_id` + `file_id`, with schemas discoverable via `lix_stored_schema`.
+  - They are keyed by `schema_key` + `entity_id` + `file_id`, with schemas discoverable via `lix_registered_schema`.
 - Checkpoints:
   - A checkpoint is a committed history boundary (a saved change set) used to anchor history/diffs.
   - History views (`*_history`) are read-only projections over these committed changes.

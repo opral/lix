@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde_json::Value as JsonValue;
 
 use crate::{
     boot::EngineConfig, observe::observe_owned, BootKeyValue, CreateCheckpointResult,
@@ -97,6 +98,10 @@ impl Lix {
 
     pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
         self.engine.install_plugin(archive_bytes).await
+    }
+
+    pub async fn register_schema(&self, schema: &JsonValue) -> Result<(), LixError> {
+        self.engine.register_schema(schema).await
     }
 
     pub async fn export_snapshot(&self) -> Result<Vec<u8>, LixError> {

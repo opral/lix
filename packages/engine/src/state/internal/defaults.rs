@@ -11,7 +11,7 @@ use crate::sql::ast::walk::object_name_matches;
 use crate::{LixBackend, LixError, Value};
 
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
-const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
+const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 pub(crate) async fn apply_vtable_insert_defaults<P>(
     backend: &dyn LixBackend,
@@ -85,7 +85,7 @@ where
             continue;
         };
 
-        if schema_key == STORED_SCHEMA_KEY {
+        if schema_key == REGISTERED_SCHEMA_KEY {
             let _ = schema_provider.remember_pending_schema_from_snapshot(&snapshot);
             continue;
         }
@@ -226,12 +226,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uses_pending_schema_when_stored_schema_insert_omits_schema_version_column() {
+    async fn uses_pending_schema_when_registered_schema_insert_omits_schema_version_column() {
         let evaluator = CelEvaluator::new();
         let backend = UnexpectedBackendCall;
         let mut statements = parse_sql_statements(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) \
-             VALUES ('lix_stored_schema', '{\"value\":{\"x-lix-key\":\"same_request_cel_default_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"slug\":{\"type\":\"string\",\"x-lix-default\":\"name + ''-slug''\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'); \
+             VALUES ('lix_registered_schema', '{\"value\":{\"x-lix-key\":\"same_request_cel_default_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"slug\":{\"type\":\"string\",\"x-lix-default\":\"name + ''-slug''\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'); \
              INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
              VALUES ('entity-1', 'same_request_cel_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')",
         )

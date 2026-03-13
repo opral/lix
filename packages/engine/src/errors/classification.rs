@@ -345,9 +345,10 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_unknown_column_for_lix_stored_schema_with_column_catalog() {
-        let statements = Parser::parse_sql(&GenericDialect {}, "SELECT id FROM lix_stored_schema")
-            .expect("parse SQL");
+    fn normalizes_unknown_column_for_lix_registered_schema_with_column_catalog() {
+        let statements =
+            Parser::parse_sql(&GenericDialect {}, "SELECT id FROM lix_registered_schema")
+                .expect("parse SQL");
         let error = normalize_sql_error(
             LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -359,7 +360,7 @@ mod tests {
         assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
         assert!(error
             .description
-            .contains("Column `id` does not exist on `lix_stored_schema`."));
+            .contains("Column `id` does not exist on `lix_registered_schema`."));
         assert!(error.description.contains("Available columns: value"));
         assert!(error.description.contains("lixcol_entity_id"));
         assert!(!error.description.contains("Available columns: (unknown)."));

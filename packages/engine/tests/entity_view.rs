@@ -102,7 +102,7 @@ async fn install_global_override_schema(
     });
     let sql = format!(
         "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-         'lix_stored_schema', '{snapshot}'\
+         'lix_registered_schema', '{snapshot}'\
          )",
         snapshot = snapshot.to_string().replace('\'', "''"),
     );
@@ -123,7 +123,7 @@ async fn install_select_override_schema(engine: &support::simulation_test::Simul
     engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema', \
+             'lix_registered_schema', \
              '{\"value\":{\"x-lix-key\":\"lix_select_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"inlang\\\"\",\"lixcol_plugin_key\":\"\\\"inlang_sdk\\\"\",\"lixcol_global\":\"true\",\"lixcol_untracked\":\"true\",\"lixcol_metadata\":\"null\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -134,7 +134,7 @@ async fn install_inherited_override_schema(engine: &support::simulation_test::Si
     engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema', \
+             'lix_registered_schema', \
              '{\"value\":{\"x-lix-key\":\"lix_inherited_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -145,7 +145,7 @@ async fn install_default_values_schema(engine: &support::simulation_test::Simula
     engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema', \
+             'lix_registered_schema', \
              '{\"value\":{\"x-lix-key\":\"lix_default_values_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"\\\"default-id-value\\\"\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -156,7 +156,7 @@ async fn install_delete_subquery_schemas(engine: &support::simulation_test::Simu
     engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema', \
+             'lix_registered_schema', \
              '{\"value\":{\"x-lix-key\":\"lix_delete_message_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"bundle_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"bundle_id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -165,7 +165,7 @@ async fn install_delete_subquery_schemas(engine: &support::simulation_test::Simu
     engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema', \
+             'lix_registered_schema', \
              '{\"value\":{\"x-lix-key\":\"lix_delete_variant_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"message_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"message_id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -565,7 +565,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-                 'lix_stored_schema', \
+                 'lix_registered_schema', \
                  '{\"value\":{\"x-lix-key\":\"lix_patch_validation\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}}'\
                  )", &[])
             .await
@@ -1062,7 +1062,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_stored_schema_by_version (value, lixcol_version_id) VALUES (\
+                "INSERT INTO lix_registered_schema_by_version (value, lixcol_version_id) VALUES (\
                  lix_json('{\"x-lix-key\":\"lix_custom_error_columns\",\"x-lix-version\":\"1\",\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"]}'),\
                  'global'\
                  )", &[])

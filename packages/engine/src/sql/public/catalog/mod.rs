@@ -1,7 +1,7 @@
 use crate::cel::CelEvaluator;
 use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
-use crate::schema::schema_from_stored_snapshot;
-use crate::schema::SqlStoredSchemaProvider;
+use crate::schema::schema_from_registered_snapshot;
+use crate::schema::SqlRegisteredSchemaProvider;
 use crate::{LixBackend, LixError};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sqlparser::ast::{ObjectName, ObjectNamePart};
@@ -167,7 +167,7 @@ impl SurfaceRegistry {
 
     pub(crate) async fn bootstrap_with_backend(backend: &dyn LixBackend) -> Result<Self, LixError> {
         let mut registry = Self::with_builtin_surfaces();
-        let mut provider = SqlStoredSchemaProvider::new(backend);
+        let mut provider = SqlRegisteredSchemaProvider::new(backend);
         for (_, schema) in provider.load_latest_schema_entries().await? {
             let spec = entity_surface_spec_from_schema(&schema)?;
             registry.register_dynamic_entity_surfaces(spec);
@@ -287,7 +287,7 @@ impl SurfaceRegistry {
         &mut self,
         snapshot: &JsonValue,
     ) -> Result<(), LixError> {
-        let (key, schema) = schema_from_stored_snapshot(snapshot)?;
+        let (key, schema) = schema_from_registered_snapshot(snapshot)?;
         self.remove_dynamic_entity_surfaces_for_schema_key(&key.schema_key);
         let spec = entity_surface_spec_from_schema(&schema)?;
         self.register_dynamic_entity_surfaces(spec);
@@ -1238,11 +1238,11 @@ mod tests {
     }
 
     #[test]
-    fn builtin_registry_exposes_stored_schema_by_version_entity_surface() {
+    fn builtin_registry_exposes_registered_schema_by_version_entity_surface() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
         let binding = registry
-            .bind_relation_name("lix_stored_schema_by_version")
-            .expect("stored schema by-version surface should bind");
+            .bind_relation_name("lix_registered_schema_by_version")
+            .expect("registered schema by-version surface should bind");
 
         assert_eq!(binding.descriptor.surface_family, SurfaceFamily::Entity);
         assert_eq!(
@@ -1251,22 +1251,22 @@ mod tests {
         );
         assert_eq!(
             binding.implicit_overrides.fixed_schema_key.as_deref(),
-            Some("lix_stored_schema")
+            Some("lix_registered_schema")
         );
     }
 
     #[test]
-    fn builtin_registry_exposes_stored_schema_default_entity_surface() {
+    fn builtin_registry_exposes_registered_schema_default_entity_surface() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
         let binding = registry
-            .bind_relation_name("lix_stored_schema")
-            .expect("stored schema default surface should bind");
+            .bind_relation_name("lix_registered_schema")
+            .expect("registered schema default surface should bind");
 
         assert_eq!(binding.descriptor.surface_family, SurfaceFamily::Entity);
         assert_eq!(binding.descriptor.surface_variant, SurfaceVariant::Default);
         assert_eq!(
             binding.implicit_overrides.fixed_schema_key.as_deref(),
-            Some("lix_stored_schema")
+            Some("lix_registered_schema")
         );
     }
 
@@ -1428,7 +1428,7 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("FROM lix_internal_stored_schema_bootstrap") {
+            if sql.contains("FROM lix_internal_registered_schema_bootstrap") {
                 let rows = self
                     .schema_rows
                     .values()
@@ -1468,7 +1468,7 @@ mod tests {
             .expect("registry should bootstrap");
         let binding = registry
             .bind_relation_name("message")
-            .expect("dynamic stored schema surface should bind");
+            .expect("dynamic registered schema surface should bind");
 
         assert_eq!(binding.descriptor.surface_family, SurfaceFamily::Entity);
         assert!(binding.catalog_epoch.is_some());

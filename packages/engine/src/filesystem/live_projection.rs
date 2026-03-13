@@ -1,3 +1,4 @@
+use crate::filesystem::path::ParsedFilePath;
 use crate::sql::public::planner::semantics::filesystem_queries::lookup_file_id_by_path;
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::version::{
@@ -5,7 +6,6 @@ use crate::version::{
     version_descriptor_schema_key, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError};
-use crate::filesystem::path::ParsedFilePath;
 
 pub(crate) const LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN: &str = "__lix_blob_hash";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";

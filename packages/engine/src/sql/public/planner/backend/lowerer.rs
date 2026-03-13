@@ -2911,20 +2911,20 @@ mod tests {
     }
 
     #[test]
-    fn lowers_stored_schema_reads_through_entity_surface() {
+    fn lowers_registered_schema_reads_through_entity_surface() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
         let lowered = lowered_program(
             &registry,
-            "SELECT value, lixcol_entity_id FROM lix_stored_schema WHERE lixcol_entity_id = 'x~1'",
+            "SELECT value, lixcol_entity_id FROM lix_registered_schema WHERE lixcol_entity_id = 'x~1'",
         )
-        .expect("stored schema read should lower");
+        .expect("registered schema read should lower");
         let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_stored_schema"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_registered_schema"));
         assert!(lowered_sql.contains("file_id = 'lix'"));
         assert!(lowered_sql.contains("plugin_key = 'lix'"));
         assert!(lowered_sql.contains("global = true"));
-        assert!(!lowered_sql.contains("FROM lix_stored_schema"));
+        assert!(!lowered_sql.contains("FROM lix_registered_schema"));
         assert_eq!(
             lowered.pushdown_decision.residual_predicates,
             vec!["lixcol_entity_id = 'x~1'".to_string()]

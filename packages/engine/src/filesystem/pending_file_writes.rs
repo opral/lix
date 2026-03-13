@@ -1044,7 +1044,7 @@ async fn execute_public_prefetch_query(
             if schema_key == "lix_active_version" {
                 continue;
             }
-            crate::schema::registry::register_schema(backend, schema_key).await?;
+            crate::schema::registry::ensure_schema_live_table(backend, schema_key).await?;
         }
     }
     let lowered = prepared.lowered_read;

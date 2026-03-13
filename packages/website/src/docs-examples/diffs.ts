@@ -5,7 +5,7 @@ export default async function runExample(console: any) {
 
   // Store a test schema for our examples
   await lix.db
-    .insertInto("stored_schema")
+    .insertInto("registered_schema")
     .values({
       value: {
         "x-lix-key": "product",

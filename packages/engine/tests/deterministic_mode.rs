@@ -16,14 +16,14 @@ fn insert_key_value_sql(key: &str, value_json: &str) -> String {
 
 fn register_test_schema_sql() -> &'static str {
     "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-     'lix_stored_schema',\
+     'lix_registered_schema',\
      '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
      )"
 }
 
 fn register_defaults_schema_sql() -> &'static str {
     "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-     'lix_stored_schema',\
+     'lix_registered_schema',\
      '{\"value\":{\"x-lix-key\":\"defaults_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"created_at\":{\"type\":\"string\",\"x-lix-default\":\"lix_timestamp()\"}},\"additionalProperties\":false}}'\
      )"
 }

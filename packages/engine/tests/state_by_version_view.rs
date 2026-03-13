@@ -36,7 +36,7 @@ fn normalize_bool_like_rows(rows: &[Vec<Value>], columns: &[usize]) -> Vec<Vec<V
 }
 
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
-    register_stored_schema_snapshot(
+    register_registered_schema_snapshot(
         engine,
         "{\"value\":{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}",
     )
@@ -44,21 +44,21 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
 }
 
 async fn register_immutable_schema(engine: &support::simulation_test::SimulationEngine) {
-    register_stored_schema_snapshot(
+    register_registered_schema_snapshot(
         engine,
         "{\"value\":{\"x-lix-key\":\"immutable_state_schema\",\"x-lix-version\":\"1\",\"x-lix-immutable\":true,\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}",
     )
     .await;
 }
 
-async fn register_stored_schema_snapshot(
+async fn register_registered_schema_snapshot(
     engine: &support::simulation_test::SimulationEngine,
     snapshot_content: &str,
 ) {
     engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema', $1\
+             'lix_registered_schema', $1\
              )",
             &[Value::Text(snapshot_content.to_string())],
         )
@@ -326,7 +326,9 @@ simulation_test!(
 
         assert_eq!(err.code, "LIX_ERROR_SCHEMA_NOT_REGISTERED");
         assert!(err.description.contains("Schema `markdown_v2_document`"));
-        assert!(err.description.contains("SELECT * FROM lix_stored_schema"));
+        assert!(err
+            .description
+            .contains("SELECT * FROM lix_registered_schema"));
     }
 );
 

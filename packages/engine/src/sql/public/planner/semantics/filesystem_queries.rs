@@ -2,9 +2,7 @@ use crate::filesystem::live_projection::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
     FilesystemProjectionScope,
 };
-use crate::filesystem::path::{
-    compose_directory_path, NormalizedDirectoryPath, ParsedFilePath,
-};
+use crate::filesystem::path::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
 use crate::sql::common::ast::{lower_statement, parse_sql_statements};
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::version::GLOBAL_VERSION_ID;
@@ -90,9 +88,10 @@ pub(crate) async fn ensure_no_file_at_directory_path(
     directory_path: &NormalizedDirectoryPath,
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<(), FilesystemQueryError> {
-    let file_path =
-        ParsedFilePath::from_normalized_path(directory_path.as_str().trim_end_matches('/').to_string())
-            .map_err(filesystem_query_backend_error)?;
+    let file_path = ParsedFilePath::from_normalized_path(
+        directory_path.as_str().trim_end_matches('/').to_string(),
+    )
+    .map_err(filesystem_query_backend_error)?;
     if lookup_file_id_by_path(backend, version_id, &file_path, lookup_scope)
         .await?
         .is_none()
@@ -214,17 +213,12 @@ pub(crate) async fn load_file_row_by_path(
     scope: FilesystemProjectionScope,
 ) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
     let directory_id = match path.directory_path.as_ref() {
-        Some(directory_path) => match lookup_directory_id_by_path(
-            backend,
-            version_id,
-            directory_path,
-            scope,
-        )
-        .await?
-        {
-            Some(directory_id) => Some(directory_id),
-            None => return Ok(None),
-        },
+        Some(directory_path) => {
+            match lookup_directory_id_by_path(backend, version_id, directory_path, scope).await? {
+                Some(directory_id) => Some(directory_id),
+                None => return Ok(None),
+            }
+        }
         None => None,
     };
     let Some(descriptor) = load_file_descriptor_by_path_components(
@@ -696,12 +690,7 @@ async fn load_visible_descriptor_row_for_version(
     base_predicate: &str,
     version_id: &str,
 ) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
-    let sql = visible_descriptor_sql(
-        tracked_table,
-        schema_key,
-        base_predicate,
-        version_id,
-    );
+    let sql = visible_descriptor_sql(tracked_table, schema_key, base_predicate, version_id);
     load_effective_descriptor_row(backend, &sql).await
 }
 

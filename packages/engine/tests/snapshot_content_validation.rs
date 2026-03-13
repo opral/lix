@@ -13,7 +13,7 @@ simulation_test!(allows_valid_snapshot, |sim| async move {
     engine
             .execute(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
+             'lix_registered_schema',\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
              )", &[])
             .await
@@ -54,7 +54,7 @@ simulation_test!(rejects_invalid_snapshot, |sim| async move {
     engine
             .execute(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
+             'lix_registered_schema',\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
              )", &[])
             .await
@@ -77,7 +77,7 @@ simulation_test!(rejects_invalid_snapshot, |sim| async move {
     );
 });
 
-simulation_test!(requires_stored_schema, |sim| async move {
+simulation_test!(requires_registered_schema, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)
         .await
@@ -115,7 +115,7 @@ simulation_test!(
         engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
+             'lix_registered_schema',\
              '{\"value\":{\"x-lix-key\":\"pk_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -150,7 +150,7 @@ simulation_test!(rejects_invalid_update, |sim| async move {
     engine
             .execute(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
+             'lix_registered_schema',\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
              )", &[])
             .await
@@ -191,7 +191,7 @@ simulation_test!(rejects_update_on_immutable_schema, |sim| async move {
     engine
             .execute(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
+             'lix_registered_schema',\
              '{\"value\":{\"x-lix-key\":\"immutable_schema\",\"x-lix-version\":\"1\",\"x-lix-immutable\":true,\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
              )", &[])
             .await
@@ -234,7 +234,7 @@ simulation_test!(
         engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
+             'lix_registered_schema',\
              '{\"value\":{\"x-lix-key\":\"pk_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -278,7 +278,7 @@ simulation_test!(
         engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
+             'lix_registered_schema',\
              '{\"value\":{\"x-lix-key\":\"composite_pk_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\",\"/locale\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"locale\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"locale\",\"name\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -314,7 +314,7 @@ simulation_test!(allows_delete_on_immutable_schema, |sim| async move {
     engine
             .execute(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
+             'lix_registered_schema',\
              '{\"value\":{\"x-lix-key\":\"immutable_schema\",\"x-lix-version\":\"1\",\"x-lix-immutable\":true,\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
              )", &[])
             .await

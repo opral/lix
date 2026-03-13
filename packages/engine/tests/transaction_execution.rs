@@ -123,12 +123,12 @@ fn tx_dynamic_schema_snapshot_sql() -> String {
 }
 
 fn insert_tx_dynamic_schema_sql() -> String {
-    let stored_schema_snapshot = tx_dynamic_schema_snapshot_sql();
+    let registered_schema_snapshot = tx_dynamic_schema_snapshot_sql();
     format!(
         "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
-         'lix_tx_dynamic_schema~1', 'lix_stored_schema', 'lix', 'global', 'lix', '{stored_schema_snapshot}', '1'\
+         'lix_tx_dynamic_schema~1', 'lix_registered_schema', 'lix', 'global', 'lix', '{registered_schema_snapshot}', '1'\
          )"
     )
 }
@@ -146,7 +146,7 @@ fn insert_tx_dynamic_schema_row_sql(version_id: &str) -> String {
 fn delete_tx_dynamic_schema_sql() -> &'static str {
     "DELETE FROM lix_state_by_version \
      WHERE entity_id = 'lix_tx_dynamic_schema~1' \
-       AND schema_key = 'lix_stored_schema' \
+       AND schema_key = 'lix_registered_schema' \
        AND file_id = 'lix' \
        AND version_id = 'global'"
 }
@@ -203,7 +203,7 @@ simulation_test!(
                 Box::pin(async move {
                     tx.execute(
                         "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-                         'lix_stored_schema',\
+                         'lix_registered_schema',\
                          '{\"value\":{\"x-lix-key\":\"tx_validation_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
                          )",
                         &[],
@@ -300,7 +300,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    transaction_path_sql2_stored_schema_write_updates_bootstrap_for_followup_dynamic_surface_use,
+    transaction_path_sql2_registered_schema_write_updates_bootstrap_for_followup_dynamic_surface_use,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -346,7 +346,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    public_sql_transaction_path_stored_schema_write_updates_bootstrap_for_followup_dynamic_surface_use,
+    public_sql_transaction_path_registered_schema_write_updates_bootstrap_for_followup_dynamic_surface_use,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -373,7 +373,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    transaction_path_stored_schema_tombstone_removes_followup_dynamic_surface_dispatch,
+    transaction_path_registered_schema_tombstone_removes_followup_dynamic_surface_dispatch,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -408,7 +408,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    public_sql_transaction_path_stored_schema_tombstone_removes_followup_dynamic_surface_dispatch,
+    public_sql_transaction_path_registered_schema_tombstone_removes_followup_dynamic_surface_dispatch,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
