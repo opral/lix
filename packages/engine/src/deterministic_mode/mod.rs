@@ -118,6 +118,14 @@ impl LixFunctionProvider for RuntimeFunctionProvider {
         self.sequence_start = Some(sequence_start);
         self.next_sequence = sequence_start;
     }
+
+    fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
+        let sequence_start = self.sequence_start?;
+        if !self.settings.enabled || self.next_sequence <= sequence_start {
+            return None;
+        }
+        Some(self.next_sequence - 1)
+    }
 }
 
 fn shuffled_timestamp_millis(counter: i64) -> i64 {
