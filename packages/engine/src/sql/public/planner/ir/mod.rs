@@ -413,6 +413,61 @@ pub(crate) struct WriteSelector {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CanonicalStateSelector {
+    pub(crate) predicates: Vec<Expr>,
+    pub(crate) version_column: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalStateRowKey {
+    pub(crate) entity_id: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
+    pub(crate) schema_version: Option<String>,
+    pub(crate) version_id: Option<String>,
+    pub(crate) global: Option<bool>,
+    pub(crate) untracked: Option<bool>,
+    pub(crate) writer_key: Option<String>,
+}
+
+impl CanonicalStateRowKey {
+    pub(crate) fn targets_single_effective_row(&self, expose_version_id: bool) -> bool {
+        self.file_id.is_some()
+            && self.plugin_key.is_some()
+            && self.schema_version.is_some()
+            && self.global.is_some()
+            && self.untracked.is_some()
+            && (!expose_version_id || self.version_id.is_some())
+    }
+
+    pub(crate) fn committed_exact_filters(&self) -> BTreeMap<String, Value> {
+        let mut filters = BTreeMap::new();
+        filters.insert("entity_id".to_string(), Value::Text(self.entity_id.clone()));
+        if let Some(file_id) = self.file_id.as_ref() {
+            filters.insert("file_id".to_string(), Value::Text(file_id.clone()));
+        }
+        if let Some(plugin_key) = self.plugin_key.as_ref() {
+            filters.insert("plugin_key".to_string(), Value::Text(plugin_key.clone()));
+        }
+        if let Some(schema_version) = self.schema_version.as_ref() {
+            filters.insert(
+                "schema_version".to_string(),
+                Value::Text(schema_version.clone()),
+            );
+        }
+        if let Some(writer_key) = self.writer_key.as_ref() {
+            filters.insert("writer_key".to_string(), Value::Text(writer_key.clone()));
+        }
+        filters
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CanonicalStateAssignments {
+    pub(crate) columns: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WriteCommand {
     pub(crate) operation_kind: WriteOperationKind,
     pub(crate) target: SurfaceBinding,

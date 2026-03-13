@@ -179,17 +179,17 @@ async fn current_tip_for_write_lane(
                     ),
                 })
         }
-        WriteLane::SingleVersion(version_id) => load_committed_version_tip_commit_id(
-            executor, version_id,
-        )
-        .await
-        .map_err(domain_change_backend_error)?
-        .ok_or_else(|| DomainChangeError {
-            message: format!(
+        WriteLane::SingleVersion(version_id) => {
+            load_committed_version_tip_commit_id(executor, version_id)
+                .await
+                .map_err(domain_change_backend_error)?
+                .ok_or_else(|| DomainChangeError {
+                    message: format!(
                 "public commit precondition derivation could not find a version tip for '{}'",
                 version_id
             ),
-        }),
+                })
+        }
         WriteLane::GlobalAdmin => load_committed_global_tip_commit_id(executor)
             .await
             .map_err(domain_change_backend_error)?
