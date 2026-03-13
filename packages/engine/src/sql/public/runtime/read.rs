@@ -1,5 +1,8 @@
 use super::bind::bind_public_query;
 use super::*;
+use crate::sql::public::planner::backend::lowerer::{
+    LoweredReadProgram, LoweredResultColumn, LoweredResultColumns,
+};
 use crate::sql::public::planner::canonicalize::canonicalize_read;
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint,
@@ -12,6 +15,7 @@ use std::collections::BTreeSet;
 pub(crate) struct LoweredPublicReadQuery {
     pub(crate) query: Query,
     pub(crate) required_schema_keys: BTreeSet<String>,
+    pub(crate) result_columns: Option<LoweredResultColumns>,
 }
 
 pub(super) async fn execute_public_read_query_strict(
@@ -34,7 +38,79 @@ pub(super) async fn execute_public_read_query_strict(
         crate::schema::registry::register_schema(backend, schema_key).await?;
     }
     let bound = bind_public_query(lowered.query, params, backend.dialect())?;
-    backend.execute(&bound.sql, &bound.params).await
+    let result = backend.execute(&bound.sql, &bound.params).await?;
+    let Some(result_columns) = lowered.result_columns.as_ref() else {
+        return Ok(result);
+    };
+    Ok(decode_public_read_result(
+        result,
+        &LoweredReadProgram {
+            statements: Vec::new(),
+            pushdown_decision: PushdownDecision::default(),
+            result_columns: result_columns.clone(),
+        },
+    ))
+}
+
+pub(crate) fn decode_public_read_result(
+    mut result: QueryResult,
+    lowered_read: &LoweredReadProgram,
+) -> QueryResult {
+    let column_plan = match &lowered_read.result_columns {
+        LoweredResultColumns::Static(columns) => columns
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(LoweredResultColumn::Untyped))
+            .take(result.columns.len())
+            .collect::<Vec<_>>(),
+        LoweredResultColumns::ByColumnName(columns_by_name) => result
+            .columns
+            .iter()
+            .map(|column| {
+                columns_by_name
+                    .iter()
+                    .find_map(|(candidate, kind)| {
+                        candidate.eq_ignore_ascii_case(column).then_some(*kind)
+                    })
+                    .unwrap_or(LoweredResultColumn::Untyped)
+            })
+            .collect::<Vec<_>>(),
+    };
+
+    if !column_plan
+        .iter()
+        .any(|kind| *kind == LoweredResultColumn::Boolean)
+    {
+        return result;
+    }
+
+    for row in &mut result.rows {
+        for (value, kind) in row.iter_mut().zip(column_plan.iter().copied()) {
+            if kind == LoweredResultColumn::Boolean {
+                if let Some(decoded) = decode_boolean_value(value) {
+                    *value = decoded;
+                }
+            }
+        }
+    }
+
+    result
+}
+
+fn decode_boolean_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Null => Some(Value::Null),
+        Value::Boolean(value) => Some(Value::Boolean(*value)),
+        Value::Integer(0) => Some(Value::Boolean(false)),
+        Value::Integer(1) => Some(Value::Boolean(true)),
+        Value::Text(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" => Some(Value::Boolean(false)),
+            "1" | "true" => Some(Value::Boolean(true)),
+            _ => None,
+        },
+        Value::Real(_) | Value::Json(_) | Value::Blob(_) => None,
+        Value::Integer(_) => None,
+    }
 }
 
 async fn lower_nested_public_read_subqueries_in_query(
@@ -819,6 +895,7 @@ async fn lower_public_read_query_with_details(
         return Ok(LoweredPublicReadQuery {
             query,
             required_schema_keys: BTreeSet::new(),
+            result_columns: None,
         });
     }
     let active_version_id = load_active_version_id_for_public_read(backend).await?;
@@ -847,6 +924,7 @@ async fn lower_public_read_query_with_details(
             return Ok(LoweredPublicReadQuery {
                 query: rewritten,
                 required_schema_keys: BTreeSet::new(),
+                result_columns: None,
             });
         }
         let bound_statement = BoundStatement::from_statement(
@@ -902,6 +980,7 @@ async fn lower_public_read_query_with_details(
         Statement::Query(query) => Ok(LoweredPublicReadQuery {
             query: *query,
             required_schema_keys,
+            result_columns: Some(lowered.result_columns),
         }),
         _ => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -1201,6 +1280,7 @@ async fn prepare_public_read_via_surface_lowering(
         LoweredReadProgram {
             statements: vec![rewritten_statement.clone()],
             pushdown_decision: PushdownDecision::default(),
+            result_columns: LoweredResultColumns::Static(Vec::new()),
         },
         explain_envelope,
     );

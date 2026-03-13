@@ -663,6 +663,7 @@ impl ResolvedWritePlan {
 mod tests {
     use super::{CanonicalStateScan, EntityProjectionSpec, VersionScope};
     use crate::sql::public::catalog::{DynamicEntitySurfaceSpec, SurfaceRegistry};
+    use std::collections::BTreeMap;
 
     #[test]
     fn canonical_state_scan_tracks_explicit_version_visibility() {
@@ -685,6 +686,7 @@ mod tests {
         registry.register_dynamic_entity_surfaces(DynamicEntitySurfaceSpec {
             schema_key: "lix_key_value".to_string(),
             visible_columns: vec!["key".to_string(), "value".to_string()],
+            column_types: BTreeMap::new(),
             fixed_version_id: None,
             predicate_overrides: Vec::new(),
         });

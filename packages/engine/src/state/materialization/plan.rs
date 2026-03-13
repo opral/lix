@@ -405,6 +405,7 @@ fn build_global_projection_rows(
     version_pointers: &BTreeMap<String, Vec<String>>,
     warnings: &mut Vec<LiveStateRebuildWarning>,
 ) -> Vec<VisibleRow> {
+    let version_descriptor_schema = builtin_projection_schema_meta("lix_version_descriptor");
     let commit_schema = builtin_projection_schema_meta("lix_commit");
     let version_pointer_schema = builtin_projection_schema_meta("lix_version_pointer");
     let change_set_element_schema = builtin_projection_schema_meta("lix_change_set_element");
@@ -416,6 +417,43 @@ fn build_global_projection_rows(
 
     let mut candidates: BTreeMap<(String, String, String, String), Vec<ProjectionCandidate>> =
         BTreeMap::new();
+
+    for descriptor in data.version_descriptors.values() {
+        let effective_commit_id = version_pointers
+            .get(&descriptor.entity_id)
+            .and_then(|tips| tips.first())
+            .cloned()
+            .unwrap_or_else(|| GLOBAL_VERSION_ID.to_string());
+        let depth = commit_depths
+            .get(&effective_commit_id)
+            .copied()
+            .unwrap_or(usize::MAX / 4);
+
+        let row = VisibleRow {
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            commit_id: effective_commit_id,
+            change_id: descriptor.id.clone(),
+            entity_id: descriptor.entity_id.clone(),
+            schema_key: version_descriptor_schema.schema_key.clone(),
+            schema_version: descriptor.schema_version.clone(),
+            file_id: descriptor.file_id.clone(),
+            plugin_key: descriptor.plugin_key.clone(),
+            snapshot_content: Some(descriptor.snapshot_content.clone()),
+            metadata: descriptor.metadata.clone(),
+            created_at: descriptor.created_at.clone(),
+            updated_at: descriptor.created_at.clone(),
+        };
+        let key = (
+            row.version_id.clone(),
+            row.entity_id.clone(),
+            row.schema_key.clone(),
+            row.file_id.clone(),
+        );
+        candidates
+            .entry(key)
+            .or_default()
+            .push(ProjectionCandidate { depth, row });
+    }
 
     for change in &latest_pointer_changes {
         let pointer_snapshot = change.snapshot_content.as_ref().and_then(|raw| {
