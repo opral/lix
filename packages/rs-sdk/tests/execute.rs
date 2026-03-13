@@ -1,4 +1,5 @@
-use lix_rs_sdk::{Lix, LixConfig, SqliteBackend, Value, WasmtimeRuntime};
+use lix_rs_sdk::{BootKeyValue, Lix, LixConfig, SqliteBackend, Value, WasmtimeRuntime};
+use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -82,6 +83,65 @@ fn init_lix_initializes_core_tables() {
 
         assert_eq!(result.statements[0].rows.len(), 1);
         assert_eq!(result.statements[0].rows[0][0], Value::Integer(1));
+
+        cleanup_sqlite_path(&path);
+    });
+}
+
+#[test]
+fn init_lix_boot_key_values_default_to_active_version() {
+    run_async_with_large_stack(|| async {
+        let path = temp_sqlite_path("init-boot-key-values");
+        let mut config = LixConfig::new(
+            Box::new(SqliteBackend::from_path(&path).expect("sqlite backend should open")),
+            Arc::new(WasmtimeRuntime::new().expect("wasmtime runtime should initialize")),
+        );
+        config.key_values = vec![BootKeyValue {
+            key: "boot-default-active".to_string(),
+            value: json!("active-value"),
+            lixcol_global: None,
+            lixcol_untracked: Some(false),
+        }];
+
+        let init_result = Lix::init(config).await.expect("Lix::init should succeed");
+        assert!(init_result.initialized);
+
+        let lix = Lix::open(LixConfig::new(
+            Box::new(SqliteBackend::from_path(&path).expect("sqlite backend should reopen")),
+            Arc::new(WasmtimeRuntime::new().expect("wasmtime runtime should initialize")),
+        ))
+        .await
+        .expect("Lix::open should succeed after Lix::init");
+
+        let active_version = lix
+            .execute(
+                "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("active version query should succeed");
+        let Value::Text(active_version_id) = &active_version.statements[0].rows[0][0] else {
+            panic!("expected text active version id");
+        };
+
+        let result = lix
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = ?1 \
+                   AND version_id = ?2 \
+                   AND global = false \
+                   AND snapshot_content IS NOT NULL",
+                &[
+                    Value::Text("boot-default-active".to_string()),
+                    Value::Text(active_version_id.clone()),
+                ],
+            )
+            .await
+            .expect("boot key-value query should succeed");
+
+        assert_eq!(result.statements[0].rows, vec![vec![Value::Integer(1)]]);
 
         cleanup_sqlite_path(&path);
     });

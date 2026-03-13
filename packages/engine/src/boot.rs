@@ -1,6 +1,5 @@
 use crate::deterministic_mode::{parse_deterministic_settings_value, DeterministicSettings};
 use crate::engine::Engine;
-use crate::key_value::KEY_VALUE_GLOBAL_VERSION;
 use crate::{LixBackend, LixError, WasmRuntime};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -11,8 +10,8 @@ const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 pub struct BootKeyValue {
     pub key: String,
     pub value: JsonValue,
-    pub version_id: Option<String>,
-    pub untracked: Option<bool>,
+    pub lixcol_global: Option<bool>,
+    pub lixcol_untracked: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,13 +71,6 @@ pub(crate) fn infer_boot_deterministic_settings(
 ) -> Option<DeterministicSettings> {
     key_values.iter().rev().find_map(|key_value| {
         if key_value.key != DETERMINISTIC_MODE_KEY {
-            return None;
-        }
-        if key_value
-            .version_id
-            .as_deref()
-            .is_some_and(|version| version != KEY_VALUE_GLOBAL_VERSION)
-        {
             return None;
         }
         let settings = parse_deterministic_settings_value(&key_value.value);

@@ -313,8 +313,8 @@ impl SimulationArgs {
             key_values: vec![BootKeyValue {
                 key: "lix_deterministic_mode".to_string(),
                 value: serde_json::json!({ "enabled": true }),
-                version_id: None,
-                untracked: None,
+                lixcol_global: Some(true),
+                lixcol_untracked: None,
             }],
             active_account: None,
             wasm_runtime: default_simulation_wasm_runtime(),
@@ -348,7 +348,7 @@ fn enable_timestamp_shuffle_mode(key_values: &mut Vec<BootKeyValue>) {
     const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
     if let Some(existing) = key_values
         .iter_mut()
-        .find(|entry| entry.key == DETERMINISTIC_MODE_KEY && entry.version_id.is_none())
+        .find(|entry| entry.key == DETERMINISTIC_MODE_KEY && entry.lixcol_global.unwrap_or(false))
     {
         let mut object = existing
             .value
@@ -370,8 +370,8 @@ fn enable_timestamp_shuffle_mode(key_values: &mut Vec<BootKeyValue>) {
             "enabled": true,
             "timestamp_shuffle": true
         }),
-        version_id: None,
-        untracked: None,
+        lixcol_global: Some(true),
+        lixcol_untracked: None,
     });
 }
 
