@@ -2,7 +2,7 @@ use super::*;
 use crate::filesystem::live_projection::FilesystemProjectionScope;
 use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
-    parent_directory_path,
+    parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
 use crate::sql::public::planner::semantics::filesystem_assignments::{
     parse_directory_insert_assignments, parse_directory_update_assignments,
@@ -623,7 +623,13 @@ async fn resolve_parent_directory_target(
     let directory_id = if let Some(last_row) = missing_rows.last() {
         Some(last_row.id.clone())
     } else {
-        lookup_directory_id_by_path(backend, version_id, directory_path, lookup_scope).await?
+        lookup_directory_id_by_path(
+            backend,
+            version_id,
+            &NormalizedDirectoryPath::from_normalized(directory_path.to_string()),
+            lookup_scope,
+        )
+        .await?
     };
     Ok((directory_id, missing_rows))
 }
@@ -642,20 +648,36 @@ async fn resolve_missing_directory_rows(
 
     for candidate_path in paths {
         if let Some(existing_id) =
-            lookup_directory_id_by_path(backend, version_id, &candidate_path, lookup_scope).await?
+            lookup_directory_id_by_path(
+                backend,
+                version_id,
+                &NormalizedDirectoryPath::from_normalized(candidate_path.clone()),
+                lookup_scope,
+            )
+            .await?
         {
             known_ids.insert(candidate_path, existing_id);
             continue;
         }
-        ensure_no_file_at_directory_path(backend, version_id, &candidate_path, lookup_scope)
-            .await?;
+        ensure_no_file_at_directory_path(
+            backend,
+            version_id,
+            &NormalizedDirectoryPath::from_normalized(candidate_path.clone()),
+            lookup_scope,
+        )
+        .await?;
         let parent_id = match parent_directory_path(&candidate_path) {
             Some(parent_path) => {
                 if let Some(parent_id) = known_ids.get(&parent_path).cloned() {
                     Some(parent_id)
                 } else if let Some(existing_parent_id) =
-                    lookup_directory_id_by_path(backend, version_id, &parent_path, lookup_scope)
-                        .await?
+                    lookup_directory_id_by_path(
+                        backend,
+                        version_id,
+                        &NormalizedDirectoryPath::from_normalized(parent_path.clone()),
+                        lookup_scope,
+                    )
+                    .await?
                 {
                     Some(existing_parent_id)
                 } else {
@@ -698,7 +720,7 @@ async fn resolve_file_update_target(
             ensure_no_directory_at_file_path(
                 backend,
                 version_id,
-                &parsed.normalized_path,
+                parsed,
                 lookup_scope,
             )
             .await?;
@@ -715,7 +737,7 @@ async fn resolve_file_update_target(
                 directory_id,
                 parsed.name.clone(),
                 parsed.extension.clone(),
-                parsed.normalized_path.clone(),
+                parsed.normalized_path.as_str().to_string(),
             )
         } else {
             (
@@ -726,8 +748,14 @@ async fn resolve_file_update_target(
             )
         };
 
-    if let Some(existing_id) =
-        lookup_file_id_by_path(backend, version_id, &next_path, lookup_scope).await?
+    if let Some(existing_id) = lookup_file_id_by_path(
+        backend,
+        version_id,
+        &ParsedFilePath::from_normalized_path(next_path.clone())
+            .map_err(write_resolve_backend_error)?,
+        lookup_scope,
+    )
+    .await?
     {
         if existing_id != current_row.id {
             return Err(WriteResolveError {
@@ -782,8 +810,13 @@ async fn resolve_directory_update_target(
         })?;
         let parent_id = match parent_directory_path(normalized_path) {
             Some(parent_path) => {
-                lookup_directory_id_by_path(backend, version_id, &parent_path, lookup_scope)
-                    .await?
+                lookup_directory_id_by_path(
+                    backend,
+                    version_id,
+                    &NormalizedDirectoryPath::from_normalized(parent_path.clone()),
+                    lookup_scope,
+                )
+                .await?
                     .ok_or_else(|| WriteResolveError {
                         message: format!(
                             "Parent directory does not exist for path {}",
@@ -798,7 +831,7 @@ async fn resolve_directory_update_target(
         } else {
             Some(parent_id)
         };
-        (parent_id_opt, name, normalized_path.clone())
+        (parent_id_opt, name, normalized_path.as_str().to_string())
     } else {
         let parent_id = assignments
             .parent_id
@@ -838,8 +871,13 @@ async fn resolve_directory_update_target(
         )
         .await?;
     }
-    if let Some(existing_id) =
-        lookup_directory_id_by_path(backend, version_id, &resolved_path, lookup_scope).await?
+    if let Some(existing_id) = lookup_directory_id_by_path(
+        backend,
+        version_id,
+        &NormalizedDirectoryPath::from_normalized(resolved_path.clone()),
+        lookup_scope,
+    )
+    .await?
     {
         if existing_id != current_row.id {
             return Err(WriteResolveError {
@@ -850,7 +888,13 @@ async fn resolve_directory_update_target(
             });
         }
     }
-    ensure_no_file_at_directory_path(backend, version_id, &resolved_path, lookup_scope).await?;
+    ensure_no_file_at_directory_path(
+        backend,
+        version_id,
+        &NormalizedDirectoryPath::from_normalized(resolved_path.clone()),
+        lookup_scope,
+    )
+    .await?;
 
     Ok(DirectoryFilesystemRow {
         id: current_row.id.clone(),
@@ -957,7 +1001,13 @@ async fn resolve_directory_update_targets_batch(
             &external_parent_paths,
             &mut resolved_paths,
         )?;
-        ensure_no_file_at_directory_path(backend, version_id, &path, lookup_scope).await?;
+        ensure_no_file_at_directory_path(
+            backend,
+            version_id,
+            &NormalizedDirectoryPath::from_normalized(path.clone()),
+            lookup_scope,
+        )
+        .await?;
     }
 
     let mut path_to_id = BTreeMap::<String, String>::new();
@@ -977,7 +1027,13 @@ async fn resolve_directory_update_targets_batch(
             }
         }
         if let Some(existing_id) =
-            lookup_directory_id_by_path(backend, version_id, &path, lookup_scope).await?
+            lookup_directory_id_by_path(
+                backend,
+                version_id,
+                &NormalizedDirectoryPath::from_normalized(path.clone()),
+                lookup_scope,
+            )
+            .await?
         {
             if existing_id == row.id {
                 continue;
@@ -1066,6 +1122,14 @@ async fn load_target_directory_rows_for_selector(
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<Vec<DirectoryFilesystemRow>, WriteResolveError> {
+    if let Some(directory_id) = exact_id_selector_value(planned_write) {
+        return Ok(
+            load_directory_row_by_id(backend, version_id, &directory_id, lookup_scope)
+                .await?
+                .into_iter()
+                .collect(),
+        );
+    }
     let directory_ids = query_text_selector_values_for_write_selector(
         backend,
         planned_write,
@@ -1090,6 +1154,14 @@ async fn load_target_file_rows_for_selector(
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<Vec<FileFilesystemRow>, WriteResolveError> {
+    if let Some(file_id) = exact_id_selector_value(planned_write) {
+        return Ok(
+            load_file_row_by_id(backend, version_id, &file_id, lookup_scope)
+                .await?
+                .into_iter()
+                .collect(),
+        );
+    }
     let file_ids = query_text_selector_values_for_write_selector(
         backend,
         planned_write,
@@ -1104,6 +1176,27 @@ async fn load_target_file_rows_for_selector(
         }
     }
     Ok(rows)
+}
+
+fn exact_id_selector_value(planned_write: &PlannedWrite) -> Option<String> {
+    if !planned_write.command.selector.exact_only {
+        return None;
+    }
+    if !planned_write
+        .command
+        .selector
+        .exact_filters
+        .keys()
+        .all(|key| matches!(key.as_str(), "id" | "version_id" | "lixcol_version_id"))
+    {
+        return None;
+    }
+    planned_write
+        .command
+        .selector
+        .exact_filters
+        .get("id")
+        .and_then(text_from_value)
 }
 
 async fn assert_no_directory_cycle(
