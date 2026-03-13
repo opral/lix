@@ -40,6 +40,8 @@ use crate::sql::execution::intent::{
     ExecutionIntent, IntentCollectionPolicy,
 };
 use crate::sql::execution::plan::build_execution_plan;
+use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
+use crate::state::internal::write_program::WriteProgram;
 use serde_json::{json, Value as JsonValue};
 use sqlparser::ast::Statement;
 
@@ -531,6 +533,25 @@ pub(crate) async fn maybe_execute_public_write_with_backend(
         Some(execution) => execution,
         None => return Ok(None),
     };
+    engine
+        .persist_runtime_sequence_in_transaction(
+            transaction.as_mut(),
+            prepared.settings,
+            prepared.sequence_start,
+            &prepared.functions,
+        )
+        .await?;
+    let should_emit_observe_tick = execution
+        .plan_effects_override
+        .as_ref()
+        .map(|effects| !effects.state_commit_stream_changes.is_empty())
+        .unwrap_or(false)
+        || !execution.state_commit_stream_changes.is_empty();
+    if should_emit_observe_tick {
+        engine
+            .append_observe_tick_in_transaction(transaction.as_mut(), writer_key)
+            .await?;
+    }
     transaction.commit().await?;
     Ok(Some(execution))
 }
@@ -1217,7 +1238,9 @@ async fn execute_generated_commit_result(
         )?,
         transaction.dialect(),
     )?;
-    transaction.execute(&prepared.sql, &prepared.params).await?;
+    let mut program = WriteProgram::new();
+    program.push_batch(prepared);
+    execute_write_program_with_transaction(transaction, program).await?;
     Ok(())
 }
 

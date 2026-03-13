@@ -11,12 +11,16 @@ use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path;
 use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
 use crate::sql::execution::transaction_session::execute_public_sql;
+use crate::sql::execution::write_program_runner::{
+    execute_write_program_with_backend, execute_write_program_with_transaction,
+};
 use crate::sql::public::runtime::{
     classify_public_execution_route_with_registry, decode_public_read_result,
 };
 use crate::state::internal::inline_functions::inline_lix_functions_with_provider;
 use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
 use crate::state::internal::statement_references_internal_state_vtable;
+use crate::state::internal::write_program::WriteProgram;
 use crate::state::materialization::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
 };
@@ -48,26 +52,20 @@ impl Engine {
         &self,
         writer_key: Option<&str>,
     ) -> Result<(), LixError> {
+        let mut program = WriteProgram::new();
         match writer_key {
-            Some(writer_key) => {
-                self.backend
-                    .execute(
-                        "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
-                         VALUES (CURRENT_TIMESTAMP, $1)",
-                        &[Value::Text(writer_key.to_string())],
-                    )
-                    .await?;
-            }
-            None => {
-                self.backend
-                    .execute(
-                        "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
-                         VALUES (CURRENT_TIMESTAMP, NULL)",
-                        &[],
-                    )
-                    .await?;
-            }
+            Some(writer_key) => program.push_statement(
+                "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+                 VALUES (CURRENT_TIMESTAMP, $1)",
+                vec![Value::Text(writer_key.to_string())],
+            ),
+            None => program.push_statement(
+                "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+                 VALUES (CURRENT_TIMESTAMP, NULL)",
+                Vec::new(),
+            ),
         }
+        execute_write_program_with_backend(self.backend.as_ref(), program).await?;
         Ok(())
     }
 
@@ -76,26 +74,20 @@ impl Engine {
         transaction: &mut dyn LixTransaction,
         writer_key: Option<&str>,
     ) -> Result<(), LixError> {
+        let mut program = WriteProgram::new();
         match writer_key {
-            Some(writer_key) => {
-                transaction
-                    .execute(
-                        "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
-                         VALUES (CURRENT_TIMESTAMP, $1)",
-                        &[Value::Text(writer_key.to_string())],
-                    )
-                    .await?;
-            }
-            None => {
-                transaction
-                    .execute(
-                        "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
-                         VALUES (CURRENT_TIMESTAMP, NULL)",
-                        &[],
-                    )
-                    .await?;
-            }
+            Some(writer_key) => program.push_statement(
+                "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+                 VALUES (CURRENT_TIMESTAMP, $1)",
+                vec![Value::Text(writer_key.to_string())],
+            ),
+            None => program.push_statement(
+                "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+                 VALUES (CURRENT_TIMESTAMP, NULL)",
+                Vec::new(),
+            ),
         }
+        execute_write_program_with_transaction(transaction, program).await?;
         Ok(())
     }
 
@@ -183,6 +175,7 @@ impl Engine {
                 .execute_plain_backend_read(sql, params, &parsed_statements)
                 .await;
         }
+        let public_surface_registry = self.public_surface_registry();
         let prepared = shared_path::prepare_execution_with_backend(
             self,
             self.backend.as_ref(),
@@ -191,7 +184,7 @@ impl Engine {
             &active_version_id,
             writer_key,
             allow_internal_sql,
-            None,
+            Some(&public_surface_registry),
             shared_path::PreparationPolicy {
                 skip_side_effect_collection: false,
             },
@@ -200,11 +193,11 @@ impl Engine {
         let public_surface_registry_dirty =
             prepared_execution_mutates_public_surface_registry(&prepared)?;
 
-        let execution =
+        let (execution, write_owned_transaction_committed) =
             match shared_path::maybe_execute_public_write_with_backend(self, &prepared, writer_key)
                 .await
             {
-                Ok(Some(execution)) => execution,
+                Ok(Some(execution)) => (execution, true),
                 Ok(None) => match execute::execute_plan_sql(
                     self,
                     &prepared.plan,
@@ -215,7 +208,7 @@ impl Engine {
                 .await
                 .map_err(LixError::from)
                 {
-                    Ok(execution) => execution,
+                    Ok(execution) => (execution, false),
                     Err(error) => {
                         return Err(normalize_sql_execution_error_with_backend(
                             self.backend.as_ref(),
@@ -228,13 +221,15 @@ impl Engine {
                 Err(error) => return Err(error),
             };
 
-        execute::persist_runtime_sequence(
-            self,
-            prepared.settings,
-            prepared.sequence_start,
-            &prepared.functions,
-        )
-        .await?;
+        if !write_owned_transaction_committed {
+            execute::persist_runtime_sequence(
+                self,
+                prepared.settings,
+                prepared.sequence_start,
+                &prepared.functions,
+            )
+            .await?;
+        }
 
         let active_effects = execution
             .plan_effects_override
@@ -304,7 +299,7 @@ impl Engine {
         {
             self.invalidate_installed_plugins_cache()?;
         }
-        if should_emit_observe_tick {
+        if should_emit_observe_tick && !write_owned_transaction_committed {
             self.append_observe_tick(options.writer_key.as_deref())
                 .await?;
         }

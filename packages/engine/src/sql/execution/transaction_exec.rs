@@ -230,8 +230,8 @@ impl Engine {
                     })?;
             }
         }
-        self.persist_runtime_sequence_with_backend(
-            &TransactionBackendAdapter::new(transaction),
+        self.persist_runtime_sequence_in_transaction(
+            transaction,
             prepared.settings,
             prepared.sequence_start,
             &prepared.functions,

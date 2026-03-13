@@ -3,6 +3,7 @@ use crate::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
 };
 use crate::filesystem::pending_file_writes::PendingFileWrite;
+use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::common::dependency_spec::DependencySpec;
@@ -1705,6 +1706,7 @@ fn schema_registrations_from_partition(
 
     schema_keys
         .into_iter()
+        .filter(|schema_key| builtin_schema_definition(schema_key).is_none())
         .map(|schema_key| SchemaRegistration { schema_key })
         .collect()
 }
