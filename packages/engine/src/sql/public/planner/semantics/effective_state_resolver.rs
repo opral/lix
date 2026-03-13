@@ -1,7 +1,10 @@
 use crate::sql::common::dependency_spec::DependencySpec;
-use crate::sql::public::catalog::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
 use crate::sql::public::planner::ir::{
-    CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
+    CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
+};
+use crate::sql::public::planner::semantics::surface_semantics::{
+    canonical_filter_column_name, effective_state_pushdown_predicates, overlay_lanes,
+    overlay_lanes_for_version, OverlayLane,
 };
 use crate::state::commit::{
     load_exact_committed_state_row, CommitQueryExecutor, ExactCommittedStateRow,
@@ -9,9 +12,7 @@ use crate::state::commit::{
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value};
-use sqlparser::ast::{
-    BinaryOperator, Expr, OrderBy, OrderByKind, SelectItem, UnaryOperator, Visit, Visitor,
-};
+use sqlparser::ast::{Expr, OrderBy, OrderByKind, SelectItem, Visit, Visitor};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
@@ -19,14 +20,6 @@ use std::ops::ControlFlow;
 pub(crate) enum StateSourceAuthority {
     AuthoritativeCommitted,
     Untracked,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OverlayLane {
-    GlobalTracked,
-    LocalTracked,
-    GlobalUntracked,
-    LocalUntracked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,12 +33,12 @@ pub(crate) struct EffectiveStateRequest {
     pub(crate) required_columns: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EffectiveStatePlan {
     pub(crate) state_source: StateSourceAuthority,
     pub(crate) overlay_lanes: Vec<OverlayLane>,
-    pub(crate) pushdown_safe_predicates: Vec<String>,
-    pub(crate) residual_predicates: Vec<String>,
+    pub(crate) pushdown_safe_predicates: Vec<Expr>,
+    pub(crate) residual_predicates: Vec<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +61,7 @@ pub(crate) struct ResolvedStateRows {
 pub(crate) struct ExactEffectiveStateRowRequest {
     pub(crate) schema_key: String,
     pub(crate) version_id: String,
-    pub(crate) exact_filters: BTreeMap<String, Value>,
+    pub(crate) row_key: CanonicalStateRowKey,
     pub(crate) include_global_overlay: bool,
     pub(crate) include_untracked_overlay: bool,
 }
@@ -98,11 +91,15 @@ pub(crate) fn build_effective_state(
         predicate_classes: predicate_classes_for_read(structured_read),
         required_columns: required_columns_for_read(structured_read, scan),
     };
-    let all_predicates = read_predicates(structured_read);
-    let pushdown_safe_predicates = pushdown_safe_predicates(structured_read);
+    let all_predicates = structured_read.query.selection_predicates.clone();
+    let pushdown_safe_predicates =
+        effective_state_pushdown_predicates(&structured_read.surface_binding, &all_predicates);
     let plan = EffectiveStatePlan {
         state_source: StateSourceAuthority::AuthoritativeCommitted,
-        overlay_lanes: overlay_lanes_for_request(&request),
+        overlay_lanes: overlay_lanes(
+            request.include_global_overlay,
+            request.include_untracked_overlay,
+        ),
         pushdown_safe_predicates: pushdown_safe_predicates.clone(),
         residual_predicates: all_predicates
             .into_iter()
@@ -163,7 +160,7 @@ fn predicate_classes_for_read(structured_read: &StructuredPublicRead) -> Vec<Str
         type Break = ();
 
         fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
-            if let Some(column) = filter_column_name(expr) {
+            if let Some(column) = canonical_filter_column_name(expr) {
                 self.classes.insert(format!("column:{column}"));
             }
             ControlFlow::Continue(())
@@ -174,31 +171,6 @@ fn predicate_classes_for_read(structured_read: &StructuredPublicRead) -> Vec<Str
         classes: BTreeSet::new(),
     };
     for predicate in &structured_read.query.selection_predicates {
-        let _ = predicate.visit(&mut collector);
-    }
-    collector.classes.into_iter().collect()
-}
-
-fn predicate_classes_from_predicates(predicates: &[Expr]) -> Vec<String> {
-    struct Collector {
-        classes: BTreeSet<String>,
-    }
-
-    impl Visitor for Collector {
-        type Break = ();
-
-        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
-            if let Some(column) = filter_column_name(expr) {
-                self.classes.insert(format!("column:{column}"));
-            }
-            ControlFlow::Continue(())
-        }
-    }
-
-    let mut collector = Collector {
-        classes: BTreeSet::new(),
-    };
-    for predicate in predicates {
         let _ = predicate.visit(&mut collector);
     }
     collector.classes.into_iter().collect()
@@ -279,7 +251,7 @@ fn collect_columns_from_expr(expr: &Expr, required: &mut BTreeSet<String>) {
         type Break = ();
 
         fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
-            if let Some(column) = filter_column_name(expr) {
+            if let Some(column) = canonical_filter_column_name(expr) {
                 self.required.insert(column.to_string());
             } else if let Expr::Identifier(ident) = expr {
                 self.required.insert(ident.value.clone());
@@ -296,51 +268,12 @@ fn collect_columns_from_expr(expr: &Expr, required: &mut BTreeSet<String>) {
     let _ = expr.visit(&mut collector);
 }
 
-fn filter_column_name(expr: &Expr) -> Option<&'static str> {
-    let column = match expr {
-        Expr::Identifier(identifier) => Some(identifier.value.as_str()),
-        Expr::CompoundIdentifier(identifiers) => identifiers
-            .last()
-            .map(|identifier| identifier.value.as_str()),
-        Expr::Nested(inner) => return filter_column_name(inner),
-        _ => None,
-    }?;
-
-    match column.to_ascii_lowercase().as_str() {
-        "schema_key" => Some("schema_key"),
-        "entity_id" => Some("entity_id"),
-        "file_id" => Some("file_id"),
-        "version_id" | "lixcol_version_id" => Some("version_id"),
-        _ => None,
-    }
-}
-
-fn overlay_lanes_for_request(request: &EffectiveStateRequest) -> Vec<OverlayLane> {
-    let mut lanes = vec![OverlayLane::LocalTracked];
-    if request.include_untracked_overlay {
-        lanes.insert(0, OverlayLane::LocalUntracked);
-    }
-    if request.include_global_overlay {
-        if request.include_untracked_overlay {
-            lanes.push(OverlayLane::GlobalUntracked);
-        }
-        lanes.push(OverlayLane::GlobalTracked);
-    }
-    lanes
-}
-
 pub(crate) async fn resolve_exact_effective_state_row(
     backend: &dyn LixBackend,
     request: &ExactEffectiveStateRowRequest,
 ) -> Result<Option<ExactEffectiveStateRow>, LixError> {
-    let requested_untracked = request
-        .exact_filters
-        .get("untracked")
-        .and_then(bool_from_value);
-    let mut requested_global = request
-        .exact_filters
-        .get("global")
-        .and_then(bool_from_value);
+    let requested_untracked = request.row_key.untracked;
+    let mut requested_global = request.row_key.global;
     if request.version_id == GLOBAL_VERSION_ID {
         if requested_global == Some(false) {
             return Ok(None);
@@ -348,16 +281,11 @@ pub(crate) async fn resolve_exact_effective_state_row(
         requested_global = None;
     }
 
-    let mut lanes = vec![OverlayLane::LocalTracked];
-    if request.include_untracked_overlay {
-        lanes.insert(0, OverlayLane::LocalUntracked);
-    }
-    if request.include_global_overlay && request.version_id != GLOBAL_VERSION_ID {
-        if request.include_untracked_overlay {
-            lanes.push(OverlayLane::GlobalUntracked);
-        }
-        lanes.push(OverlayLane::GlobalTracked);
-    }
+    let lanes = overlay_lanes_for_version(
+        &request.version_id,
+        request.include_global_overlay,
+        request.include_untracked_overlay,
+    );
 
     for lane in lanes {
         if !lane_matches_global_filter(lane, requested_global)
@@ -400,27 +328,13 @@ async fn load_exact_tracked_effective_row(
     internal_version_id: &str,
     overlay_lane: OverlayLane,
 ) -> Result<Option<ExactEffectiveStateRow>, LixError> {
-    let Some(entity_id) = request
-        .exact_filters
-        .get("entity_id")
-        .and_then(text_from_value)
-        .map(ToString::to_string)
-    else {
-        return Ok(None);
-    };
-
-    let mut exact_filters = request.exact_filters.clone();
-    exact_filters.remove("entity_id");
-    exact_filters.remove("global");
-    exact_filters.remove("untracked");
-
     let row = load_exact_committed_state_row(
         backend,
         &ExactCommittedStateRowRequest {
-            entity_id,
+            entity_id: request.row_key.entity_id.clone(),
             schema_key: request.schema_key.clone(),
             version_id: internal_version_id.to_string(),
-            exact_filters,
+            exact_filters: request.row_key.committed_exact_filters(),
         },
     )
     .await?;
@@ -441,7 +355,7 @@ async fn load_exact_untracked_effective_row(
         &ExactUntrackedStateRowRequest {
             schema_key: request.schema_key.clone(),
             version_id: version_id.to_string(),
-            exact_filters: request.exact_filters.clone(),
+            row_key: request.row_key.clone(),
         },
     )
     .await?;
@@ -511,7 +425,7 @@ fn exact_effective_state_row_from_untracked(
 struct ExactUntrackedStateRowRequest {
     schema_key: String,
     version_id: String,
-    exact_filters: BTreeMap<String, Value>,
+    row_key: CanonicalStateRowKey,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -539,15 +453,7 @@ async fn load_exact_untracked_state_row(
         "schema_version",
         "writer_key",
     ] {
-        if let Some(value) = request.exact_filters.get(column) {
-            let Some(value) = text_from_value(value) else {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
-                        "sql2 effective-state resolver requires text-compatible exact filter values for '{column}'"
-                    ),
-                });
-            };
+        if let Some(value) = row_key_text_value(&request.row_key, column) {
             predicates.push(format!("{column} = '{}'", escape_sql_string(value)));
         }
     }
@@ -642,22 +548,13 @@ fn lane_matches_untracked_filter(lane: OverlayLane, requested_untracked: Option<
     }
 }
 
-fn bool_from_value(value: &Value) -> Option<bool> {
-    match value {
-        Value::Boolean(value) => Some(*value),
-        Value::Integer(value) => Some(*value != 0),
-        Value::Text(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" => Some(true),
-            "0" | "false" => Some(false),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn text_from_value(value: &Value) -> Option<&str> {
-    match value {
-        Value::Text(value) => Some(value.as_str()),
+fn row_key_text_value<'a>(row_key: &'a CanonicalStateRowKey, column: &str) -> Option<&'a str> {
+    match column {
+        "entity_id" => Some(row_key.entity_id.as_str()),
+        "file_id" => row_key.file_id.as_deref(),
+        "plugin_key" => row_key.plugin_key.as_deref(),
+        "schema_version" => row_key.schema_version.as_deref(),
+        "writer_key" => row_key.writer_key.as_deref(),
         _ => None,
     }
 }
@@ -681,119 +578,6 @@ fn optional_value(value: &Value) -> Option<Value> {
 
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
-}
-
-fn read_predicates(structured_read: &StructuredPublicRead) -> Vec<String> {
-    structured_read
-        .query
-        .selection_predicates
-        .iter()
-        .map(ToString::to_string)
-        .collect()
-}
-
-fn predicate_sql_strings(predicates: &[Expr]) -> Vec<String> {
-    predicates.iter().map(ToString::to_string).collect()
-}
-
-fn pushdown_safe_predicates(structured_read: &StructuredPublicRead) -> Vec<String> {
-    let family = structured_read.surface_binding.descriptor.surface_family;
-    let variant = structured_read.surface_binding.descriptor.surface_variant;
-    let state_backed_history_entity =
-        family == SurfaceFamily::Entity && variant == SurfaceVariant::History;
-    if family != SurfaceFamily::State && !state_backed_history_entity {
-        return Vec::new();
-    }
-
-    structured_read
-        .query
-        .selection_predicates
-        .iter()
-        .filter(|predicate| state_predicate_is_pushdown_safe(predicate, variant))
-        .map(ToString::to_string)
-        .collect()
-}
-
-fn pushdown_safe_predicates_from_predicates(
-    surface_binding: &SurfaceBinding,
-    predicates: &[Expr],
-) -> Vec<String> {
-    let family = surface_binding.descriptor.surface_family;
-    let variant = surface_binding.descriptor.surface_variant;
-    let state_backed_history_entity =
-        family == SurfaceFamily::Entity && variant == SurfaceVariant::History;
-    if family != SurfaceFamily::State && !state_backed_history_entity {
-        return Vec::new();
-    }
-
-    predicates
-        .iter()
-        .filter(|predicate| state_predicate_is_pushdown_safe(predicate, variant))
-        .map(ToString::to_string)
-        .collect()
-}
-
-fn state_predicate_is_pushdown_safe(expr: &Expr, variant: SurfaceVariant) -> bool {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => state_pushdown_column(left, variant).is_some() && constant_like_expr(right),
-        Expr::InList {
-            expr,
-            list,
-            negated: false,
-        } => state_pushdown_column(expr, variant).is_some() && list.iter().all(constant_like_expr),
-        Expr::Nested(inner) => state_predicate_is_pushdown_safe(inner, variant),
-        _ => false,
-    }
-}
-
-fn state_pushdown_column<'a>(expr: &'a Expr, variant: SurfaceVariant) -> Option<&'a str> {
-    let column = identifier_column_name(expr)?;
-    match variant {
-        SurfaceVariant::Default => match column.to_ascii_lowercase().as_str() {
-            "schema_key" | "entity_id" | "file_id" | "plugin_key" | "schema_version" => {
-                Some(column)
-            }
-            _ => None,
-        },
-        SurfaceVariant::ByVersion => match column.to_ascii_lowercase().as_str() {
-            "schema_key" | "entity_id" | "file_id" | "plugin_key" | "schema_version"
-            | "version_id" | "lixcol_version_id" => Some(column),
-            _ => None,
-        },
-        SurfaceVariant::History => match column.to_ascii_lowercase().as_str() {
-            "root_commit_id" | "lixcol_root_commit_id" => Some(column),
-            _ => None,
-        },
-        SurfaceVariant::Active | SurfaceVariant::WorkingChanges => None,
-    }
-}
-
-fn identifier_column_name(expr: &Expr) -> Option<&str> {
-    match expr {
-        Expr::Identifier(identifier) => Some(identifier.value.as_str()),
-        Expr::CompoundIdentifier(identifiers) => identifiers
-            .last()
-            .map(|identifier| identifier.value.as_str()),
-        Expr::Nested(inner) => identifier_column_name(inner),
-        _ => None,
-    }
-}
-
-fn constant_like_expr(expr: &Expr) -> bool {
-    match expr {
-        Expr::Value(_) => true,
-        Expr::Nested(inner) => constant_like_expr(inner),
-        Expr::UnaryOp {
-            op: UnaryOperator::Plus | UnaryOperator::Minus,
-            expr,
-        } => constant_like_expr(expr),
-        Expr::Cast { expr, .. } => constant_like_expr(expr),
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -858,7 +642,13 @@ mod tests {
                 OverlayLane::GlobalTracked,
             ]
         );
-        assert_eq!(plan.residual_predicates, vec!["key = 'hello'".to_string()]);
+        assert_eq!(
+            plan.residual_predicates
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["key = 'hello'".to_string()]
+        );
     }
 
     #[test]
@@ -895,7 +685,10 @@ mod tests {
             .expect("effective-state plan should build");
 
         assert_eq!(
-            plan.pushdown_safe_predicates,
+            plan.pushdown_safe_predicates
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
             vec![
                 "schema_key = 'lix_key_value'".to_string(),
                 "file_id = 'lix'".to_string()

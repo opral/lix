@@ -2289,19 +2289,27 @@ fn render_override_value(value: &SurfaceOverrideValue) -> String {
 
 fn build_pushdown_decision(effective_state_plan: &EffectiveStatePlan) -> PushdownDecision {
     PushdownDecision {
-        accepted_predicates: effective_state_plan.pushdown_safe_predicates.clone(),
+        accepted_predicates: effective_state_plan
+            .pushdown_safe_predicates
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         rejected_predicates: effective_state_plan
             .residual_predicates
             .iter()
             .map(|predicate| RejectedPredicate {
-                predicate: predicate.clone(),
+                predicate: predicate.to_string(),
                 reason:
                     "day-1 sql2 read lowering keeps this predicate above effective-state resolution"
                         .to_string(),
                 support: PushdownSupport::Unsupported,
             })
             .collect(),
-        residual_predicates: effective_state_plan.residual_predicates.clone(),
+        residual_predicates: effective_state_plan
+            .residual_predicates
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
     }
 }
 
@@ -2377,11 +2385,6 @@ fn split_state_selection_for_pushdown(
     selection: Option<&Expr>,
     effective_state_plan: &EffectiveStatePlan,
 ) -> (Vec<String>, Option<Expr>) {
-    let accepted = effective_state_plan
-        .pushdown_safe_predicates
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
     let Some(selection) = selection else {
         return (Vec::new(), None);
     };
@@ -2389,7 +2392,11 @@ fn split_state_selection_for_pushdown(
     let mut pushdown = Vec::new();
     let mut residual = Vec::new();
     for predicate in split_conjunctive_predicates(selection) {
-        if accepted.contains(&predicate.to_string()) {
+        if effective_state_plan
+            .pushdown_safe_predicates
+            .iter()
+            .any(|accepted| accepted == &predicate)
+        {
             pushdown.push(predicate.to_string());
         } else {
             residual.push(predicate);
