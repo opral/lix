@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "pnpm exec nx run-many --nx-bail --target=build --parallel",
+    "bench:engine:baseline": "node packages/engine/scripts/log-bench-baseline.mjs",
     "postinstall": "command -v cargo >/dev/null 2>&1 && cargo fetch || true",
     "test": "pnpm test:js && pnpm test:rs",
     "test:js": "pnpm exec nx run-many --target=test --parallel",
