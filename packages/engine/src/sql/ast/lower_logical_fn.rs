@@ -25,7 +25,20 @@ pub(crate) struct LixTextCodecCall {
 pub(crate) fn parse_lix_json_extract(
     function: &Function,
 ) -> Result<Option<LixJsonExtractCall>, LixError> {
-    if !function_name_matches(&function.name, "lix_json_extract") {
+    parse_lix_json_extract_named(function, "lix_json_extract")
+}
+
+pub(crate) fn parse_lix_json_extract_boolean(
+    function: &Function,
+) -> Result<Option<LixJsonExtractCall>, LixError> {
+    parse_lix_json_extract_named(function, "lix_json_extract_boolean")
+}
+
+fn parse_lix_json_extract_named(
+    function: &Function,
+    function_name: &str,
+) -> Result<Option<LixJsonExtractCall>, LixError> {
+    if !function_name_matches(&function.name, function_name) {
         return Ok(None);
     }
 
@@ -34,8 +47,7 @@ pub(crate) fn parse_lix_json_extract(
             if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "lix_json_extract() does not support DISTINCT/ALL/clauses"
-                        .to_string(),
+                    description: format!("{function_name}() does not support DISTINCT/ALL/clauses"),
                 });
             }
             &list.args
@@ -43,7 +55,7 @@ pub(crate) fn parse_lix_json_extract(
         _ => {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "lix_json_extract() requires a regular argument list".to_string(),
+                description: format!("{function_name}() requires a regular argument list"),
             })
         }
     };
@@ -51,23 +63,23 @@ pub(crate) fn parse_lix_json_extract(
     if args.len() < 2 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "lix_json_extract() requires at least 2 arguments".to_string(),
+            description: format!("{function_name}() requires at least 2 arguments"),
         });
     }
 
-    let json_expr = function_arg_expr(&args[0], "lix_json_extract()")?;
+    let call_name = format!("{function_name}()");
+    let json_expr = function_arg_expr(&args[0], &call_name)?;
     let mut path = Vec::with_capacity(args.len() - 1);
     for arg in &args[1..] {
-        let expr = function_arg_expr(arg, "lix_json_extract()")?;
+        let expr = function_arg_expr(arg, &call_name)?;
         let key = string_literal(&expr).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "lix_json_extract() path arguments must be single-quoted strings"
-                .to_string(),
+            description: format!("{function_name}() path arguments must be single-quoted strings"),
         })?;
         if key.is_empty() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "lix_json_extract() path segments must not be empty".to_string(),
+                description: format!("{function_name}() path segments must not be empty"),
             });
         }
         path.push(key.to_string());

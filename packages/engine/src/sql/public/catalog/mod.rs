@@ -95,6 +95,15 @@ pub(crate) enum SurfaceOverrideValue {
     String(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SurfaceColumnType {
+    String,
+    Integer,
+    Number,
+    Boolean,
+    Json,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SurfaceOverridePredicate {
     pub(crate) column: String,
@@ -108,6 +117,7 @@ pub(crate) struct SurfaceDescriptor {
     pub(crate) surface_variant: SurfaceVariant,
     pub(crate) visible_columns: Vec<String>,
     pub(crate) hidden_columns: Vec<String>,
+    pub(crate) column_types: BTreeMap<String, SurfaceColumnType>,
     pub(crate) capability: SurfaceCapability,
     pub(crate) default_scope: DefaultScopeSemantics,
     pub(crate) surface_traits: SurfaceTraits,
@@ -121,6 +131,7 @@ pub(crate) struct SurfaceBinding {
     pub(crate) descriptor: SurfaceDescriptor,
     pub(crate) catalog_epoch: Option<CatalogEpoch>,
     pub(crate) exposed_columns: Vec<String>,
+    pub(crate) column_types: BTreeMap<String, SurfaceColumnType>,
     pub(crate) capability: SurfaceCapability,
     pub(crate) default_scope: DefaultScopeSemantics,
     pub(crate) implicit_overrides: SurfaceImplicitOverrides,
@@ -131,6 +142,7 @@ pub(crate) struct SurfaceBinding {
 pub(crate) struct DynamicEntitySurfaceSpec {
     pub(crate) schema_key: String,
     pub(crate) visible_columns: Vec<String>,
+    pub(crate) column_types: BTreeMap<String, SurfaceColumnType>,
     pub(crate) fixed_version_id: Option<String>,
     pub(crate) predicate_overrides: Vec<SurfaceOverridePredicate>,
 }
@@ -178,6 +190,7 @@ impl SurfaceRegistry {
                 CatalogSource::Dynamic => Some(self.epoch),
             },
             exposed_columns: descriptor.visible_columns.clone(),
+            column_types: descriptor.column_types.clone(),
             capability: descriptor.capability,
             default_scope: descriptor.default_scope,
             implicit_overrides: descriptor.implicit_overrides.clone(),
@@ -347,6 +360,7 @@ fn builtin_surface_descriptors() -> Vec<SurfaceDescriptor> {
             surface_variant: SurfaceVariant::History,
             visible_columns: change_columns(),
             hidden_columns: Vec::new(),
+            column_types: change_column_types(),
             capability: SurfaceCapability::ReadOnly,
             default_scope: DefaultScopeSemantics::History,
             surface_traits: SurfaceTraits {
@@ -366,6 +380,7 @@ fn builtin_surface_descriptors() -> Vec<SurfaceDescriptor> {
             surface_variant: SurfaceVariant::WorkingChanges,
             visible_columns: working_changes_columns(),
             hidden_columns: Vec::new(),
+            column_types: working_changes_column_types(),
             capability: SurfaceCapability::ReadOnly,
             default_scope: DefaultScopeSemantics::WorkingChanges,
             surface_traits: SurfaceTraits {
@@ -439,6 +454,7 @@ fn state_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescr
         surface_variant: variant,
         visible_columns,
         hidden_columns,
+        column_types: state_column_types(),
         capability,
         default_scope,
         surface_traits: SurfaceTraits {
@@ -505,6 +521,7 @@ fn filesystem_surface_descriptor(name: &str, variant: SurfaceVariant) -> Surface
         surface_variant: variant,
         visible_columns,
         hidden_columns: Vec::new(),
+        column_types: filesystem_column_types(name),
         capability,
         default_scope,
         surface_traits: SurfaceTraits {
@@ -538,6 +555,7 @@ fn admin_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescr
         surface_variant: variant,
         visible_columns: admin_columns(name),
         hidden_columns: Vec::new(),
+        column_types: admin_column_types(name),
         capability,
         default_scope: DefaultScopeSemantics::GlobalAdmin,
         surface_traits: SurfaceTraits::default(),
@@ -564,6 +582,7 @@ fn entity_descriptors_from_spec(
     let by_version_visible = entity_visible_columns(&spec.visible_columns, true, false);
     let history_visible = entity_visible_columns(&spec.visible_columns, true, true);
     let hidden_columns = entity_hidden_columns();
+    let column_types = entity_column_types(&spec.column_types);
 
     vec![
         SurfaceDescriptor {
@@ -572,6 +591,7 @@ fn entity_descriptors_from_spec(
             surface_variant: SurfaceVariant::Default,
             visible_columns: default_visible,
             hidden_columns: hidden_columns.clone(),
+            column_types: column_types.clone(),
             capability: SurfaceCapability::ReadWrite,
             default_scope: DefaultScopeSemantics::ActiveVersion,
             surface_traits: SurfaceTraits {
@@ -602,6 +622,7 @@ fn entity_descriptors_from_spec(
             surface_variant: SurfaceVariant::ByVersion,
             visible_columns: by_version_visible,
             hidden_columns: hidden_columns.clone(),
+            column_types: column_types.clone(),
             capability: SurfaceCapability::ReadWrite,
             default_scope: DefaultScopeSemantics::ExplicitVersion,
             surface_traits: SurfaceTraits {
@@ -633,6 +654,7 @@ fn entity_descriptors_from_spec(
             surface_variant: SurfaceVariant::History,
             visible_columns: history_visible,
             hidden_columns,
+            column_types,
             capability: SurfaceCapability::ReadOnly,
             default_scope: DefaultScopeSemantics::History,
             surface_traits: SurfaceTraits {
@@ -686,6 +708,19 @@ fn entity_surface_spec_from_schema(
         })
         .unwrap_or_default();
     visible_columns.dedup();
+    let column_types = schema
+        .get("properties")
+        .and_then(JsonValue::as_object)
+        .map(|properties| {
+            properties
+                .iter()
+                .filter(|(key, _)| !key.starts_with("lixcol_"))
+                .filter_map(|(key, property_schema)| {
+                    surface_column_type_from_schema(property_schema).map(|kind| (key.clone(), kind))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
 
     let evaluator = CelEvaluator::new();
     let fixed_version_id =
@@ -695,6 +730,7 @@ fn entity_surface_spec_from_schema(
     Ok(DynamicEntitySurfaceSpec {
         schema_key: schema_key.to_string(),
         visible_columns,
+        column_types,
         fixed_version_id,
         predicate_overrides,
     })
@@ -847,6 +883,13 @@ fn state_by_version_columns() -> Vec<String> {
     columns
 }
 
+fn state_column_types() -> BTreeMap<String, SurfaceColumnType> {
+    BTreeMap::from([
+        ("global".to_string(), SurfaceColumnType::Boolean),
+        ("untracked".to_string(), SurfaceColumnType::Boolean),
+    ])
+}
+
 fn state_history_columns() -> Vec<String> {
     [
         "entity_id",
@@ -885,6 +928,10 @@ fn change_columns() -> Vec<String> {
     .collect()
 }
 
+fn change_column_types() -> BTreeMap<String, SurfaceColumnType> {
+    BTreeMap::new()
+}
+
 fn working_changes_columns() -> Vec<String> {
     [
         "entity_id",
@@ -900,6 +947,10 @@ fn working_changes_columns() -> Vec<String> {
     .into_iter()
     .map(str::to_string)
     .collect()
+}
+
+fn working_changes_column_types() -> BTreeMap<String, SurfaceColumnType> {
+    BTreeMap::from([("lixcol_global".to_string(), SurfaceColumnType::Boolean)])
 }
 
 fn filesystem_file_columns() -> Vec<String> {
@@ -1016,6 +1067,24 @@ fn filesystem_directory_history_columns() -> Vec<String> {
     .collect()
 }
 
+fn filesystem_column_types(name: &str) -> BTreeMap<String, SurfaceColumnType> {
+    match name {
+        "lix_file" | "lix_file_by_version" | "lix_file_history" | "lix_file_history_by_version" => {
+            BTreeMap::from([
+                ("hidden".to_string(), SurfaceColumnType::Boolean),
+                ("lixcol_global".to_string(), SurfaceColumnType::Boolean),
+                ("lixcol_untracked".to_string(), SurfaceColumnType::Boolean),
+            ])
+        }
+        "lix_directory" | "lix_directory_by_version" | "lix_directory_history" => BTreeMap::from([
+            ("hidden".to_string(), SurfaceColumnType::Boolean),
+            ("lixcol_global".to_string(), SurfaceColumnType::Boolean),
+            ("lixcol_untracked".to_string(), SurfaceColumnType::Boolean),
+        ]),
+        _ => BTreeMap::new(),
+    }
+}
+
 fn admin_columns(name: &str) -> Vec<String> {
     match name {
         "lix_active_version" => vec!["id".to_string(), "version_id".to_string()],
@@ -1041,6 +1110,17 @@ fn admin_columns(name: &str) -> Vec<String> {
             "commit_id".to_string(),
         ],
         _ => vec!["id".to_string()],
+    }
+}
+
+fn admin_column_types(name: &str) -> BTreeMap<String, SurfaceColumnType> {
+    match name {
+        "lix_stored_schema" => BTreeMap::from([
+            ("lixcol_global".to_string(), SurfaceColumnType::Boolean),
+            ("lixcol_untracked".to_string(), SurfaceColumnType::Boolean),
+        ]),
+        "lix_version" => BTreeMap::from([("hidden".to_string(), SurfaceColumnType::Boolean)]),
+        _ => BTreeMap::new(),
     }
 }
 
@@ -1081,6 +1161,43 @@ fn entity_hidden_columns() -> Vec<String> {
     .collect()
 }
 
+fn entity_column_types(
+    property_column_types: &BTreeMap<String, SurfaceColumnType>,
+) -> BTreeMap<String, SurfaceColumnType> {
+    let mut column_types = property_column_types.clone();
+    column_types.insert("lixcol_global".to_string(), SurfaceColumnType::Boolean);
+    column_types.insert("lixcol_untracked".to_string(), SurfaceColumnType::Boolean);
+    column_types
+}
+
+fn surface_column_type_from_schema(schema: &JsonValue) -> Option<SurfaceColumnType> {
+    let types = match schema.get("type") {
+        Some(JsonValue::String(kind)) => vec![kind.as_str()],
+        Some(JsonValue::Array(kinds)) => kinds
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .collect::<Vec<_>>(),
+        _ => return None,
+    };
+
+    if types.iter().any(|kind| *kind == "boolean") {
+        return Some(SurfaceColumnType::Boolean);
+    }
+    if types.iter().any(|kind| *kind == "integer") {
+        return Some(SurfaceColumnType::Integer);
+    }
+    if types.iter().any(|kind| *kind == "number") {
+        return Some(SurfaceColumnType::Number);
+    }
+    if types.iter().any(|kind| *kind == "string") {
+        return Some(SurfaceColumnType::String);
+    }
+    if types.iter().any(|kind| matches!(*kind, "object" | "array")) {
+        return Some(SurfaceColumnType::Json);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1093,7 +1210,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     #[test]
     fn binds_builtin_state_surfaces() {
@@ -1122,6 +1239,7 @@ mod tests {
         let epoch = registry.register_dynamic_entity_surfaces(DynamicEntitySurfaceSpec {
             schema_key: "lix_key_value".to_string(),
             visible_columns: vec!["key".to_string(), "value".to_string()],
+            column_types: BTreeMap::new(),
             fixed_version_id: None,
             predicate_overrides: Vec::new(),
         });
