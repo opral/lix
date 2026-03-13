@@ -409,25 +409,78 @@ test("lix_file.data roundtrips as Uint8Array runtime value", async () => {
 	await lix.close();
 });
 
-test("openLix seeds keyValues at startup", async () => {
+test("openLix seeds global keyValues at startup", async () => {
 	const lix = await openLix({
 		keyValues: [
 			{
 				key: "lix_deterministic_mode",
 				value: { enabled: true },
-				lixcol_version_id: "global",
+				lixcol_global: true,
 			},
 		],
 	});
 	const result = await lix.execute(
-		"SELECT value FROM lix_key_value \
-     WHERE key = 'lix_deterministic_mode' LIMIT 1",
+		"SELECT COUNT(*) FROM lix_internal_state_vtable \
+     WHERE schema_key = 'lix_key_value' \
+       AND entity_id = 'lix_deterministic_mode' \
+       AND version_id = 'global' \
+       AND global = true \
+       AND snapshot_content IS NOT NULL",
 		[],
 	);
 	const resultRows = statementRows(result);
 	expect(resultRows.length).toBe(1);
-	expect(resultRows[0]?.[0]).toBe(JSON.stringify({ enabled: true }));
+	expect(resultRows[0]?.[0]).toBe(1);
 	await lix.close();
+});
+
+test("openLix defaults boot keyValues to the active version", async () => {
+	const lix = await openLix({
+		keyValues: [
+			{
+				key: "boot-default-active",
+				value: "active-value",
+			},
+		],
+	});
+	const activeVersion = await lix.execute(
+		"SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
+		[],
+	);
+	const activeVersionRows = statementRows(activeVersion);
+	expect(activeVersionRows.length).toBe(1);
+	const activeVersionId = activeVersionRows[0]?.[0];
+	expect(typeof activeVersionId).toBe("string");
+
+	const result = await lix.execute(
+		"SELECT COUNT(*) FROM lix_internal_state_vtable \
+     WHERE schema_key = 'lix_key_value' \
+       AND entity_id = 'boot-default-active' \
+       AND version_id = ?1 \
+       AND global = false \
+       AND snapshot_content IS NOT NULL",
+		[activeVersionId as string],
+	);
+	const resultRows = statementRows(result);
+	expect(resultRows.length).toBe(1);
+	expect(resultRows[0]?.[0]).toBe(1);
+	await lix.close();
+});
+
+test("initLix rejects legacy boot keyValue version fields", async () => {
+	const backend = await createWasmSqliteBackend();
+	await expect(
+		initLix({
+			backend,
+			keyValues: [
+				{
+					key: "legacy-boot",
+					value: "x",
+					lixcol_version_id: "global",
+				} as any,
+			],
+		}),
+	).rejects.toThrow("lixcol_global");
 });
 
 test("close is idempotent and blocks further API calls", async () => {
