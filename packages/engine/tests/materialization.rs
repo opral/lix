@@ -31,7 +31,7 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
     engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
+             'lix_registered_schema',\
              '{\"value\":{\"x-lix-key\":\"materialization_test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
              )", &[])
         .await

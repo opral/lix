@@ -6,8 +6,8 @@ pub(crate) mod inline_functions;
 pub(crate) mod materialize;
 pub(crate) mod param_context;
 pub(crate) mod postprocess;
+pub(crate) mod registered_schema;
 pub(crate) mod script;
-pub(crate) mod stored_schema;
 pub(crate) mod vtable_read;
 pub(crate) mod vtable_write;
 pub(crate) mod write_program;
@@ -35,8 +35,8 @@ pub(crate) use crate::sql::ast::utils::{
     resolve_expr_cell_with_state, ResolvedCell, RowSourceResolver,
 };
 pub(crate) use crate::sql::ast::walk::object_name_matches;
-pub(crate) type SchemaRegistration =
-    crate::sql::execution::contracts::planned_statement::SchemaRegistration;
+pub(crate) type SchemaLiveTableRequirement =
+    crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
 pub(crate) type MutationOperation =
     crate::sql::execution::contracts::planned_statement::MutationOperation;
 pub(crate) type MutationRow = crate::sql::execution::contracts::planned_statement::MutationRow;
@@ -57,7 +57,7 @@ pub(crate) struct RewriteOutput {
     pub(crate) statements: Vec<Statement>,
     pub(crate) effect_only: bool,
     pub(crate) params: Vec<Value>,
-    pub(crate) registrations: Vec<SchemaRegistration>,
+    pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub(crate) postprocess: Option<PostprocessPlan>,
     pub(crate) mutations: Vec<MutationRow>,
     pub(crate) update_validations: Vec<UpdateValidationPlan>,
@@ -67,7 +67,7 @@ pub(crate) struct RewriteOutput {
 pub(crate) struct PreprocessOutput {
     pub(crate) sql: String,
     pub(crate) prepared_statements: Vec<PreparedStatement>,
-    pub(crate) registrations: Vec<SchemaRegistration>,
+    pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub(crate) internal_state: Option<InternalStatePlan>,
     pub(crate) mutations: Vec<MutationRow>,
     pub(crate) update_validations: Vec<UpdateValidationPlan>,
@@ -77,7 +77,7 @@ pub(crate) struct PreprocessOutput {
 struct StatementRewriteOutput {
     statements: Vec<Statement>,
     params: Vec<Value>,
-    registrations: Vec<SchemaRegistration>,
+    live_table_requirements: Vec<SchemaLiveTableRequirement>,
     internal_state: Option<InternalStatePlan>,
     mutations: Vec<MutationRow>,
     update_validations: Vec<UpdateValidationPlan>,
@@ -94,7 +94,7 @@ impl From<PreprocessOutput> for PlannedStatementSet {
         Self {
             sql: output.sql,
             prepared_statements: output.prepared_statements,
-            registrations: output.registrations,
+            live_table_requirements: output.live_table_requirements,
             internal_state: output.internal_state,
             mutations: output.mutations,
             update_validations: output.update_validations,
@@ -283,7 +283,7 @@ fn passthrough_output(statement: Statement) -> RewriteOutput {
         statements: vec![statement],
         effect_only: false,
         params: Vec::new(),
-        registrations: Vec::new(),
+        live_table_requirements: Vec::new(),
         postprocess: None,
         mutations: Vec::new(),
         update_validations: Vec::new(),
@@ -376,7 +376,7 @@ pub(crate) fn prepare_statements_sync_to_plan<P: LixFunctionProvider>(
     normalize_statement_placeholders_in_batch(&mut statements)?;
 
     let mut rewritten = Vec::with_capacity(statements.len());
-    let mut registrations: Vec<SchemaRegistration> = Vec::new();
+    let mut live_table_requirements: Vec<SchemaLiveTableRequirement> = Vec::new();
     let mut internal_state: Option<InternalStatePlan> = None;
     let mut mutations: Vec<MutationRow> = Vec::new();
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
@@ -395,7 +395,7 @@ pub(crate) fn prepare_statements_sync_to_plan<P: LixFunctionProvider>(
             provider,
             dialect,
             &mut rewritten,
-            &mut registrations,
+            &mut live_table_requirements,
             &mut internal_state,
             &mut mutations,
             &mut update_validations,
@@ -420,7 +420,7 @@ pub(crate) fn prepare_statements_sync_to_plan<P: LixFunctionProvider>(
     Ok(PreprocessOutput {
         sql: normalized_sql,
         prepared_statements,
-        registrations,
+        live_table_requirements,
         internal_state,
         mutations,
         update_validations,
@@ -490,7 +490,7 @@ where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
     let mut rewritten = Vec::with_capacity(statements.len());
-    let mut registrations: Vec<SchemaRegistration> = Vec::new();
+    let mut live_table_requirements: Vec<SchemaLiveTableRequirement> = Vec::new();
     let mut internal_state: Option<InternalStatePlan> = None;
     let mut mutations: Vec<MutationRow> = Vec::new();
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
@@ -523,7 +523,7 @@ where
             provider,
             backend.dialect(),
             &mut rewritten,
-            &mut registrations,
+            &mut live_table_requirements,
             &mut internal_state,
             &mut mutations,
             &mut update_validations,
@@ -548,7 +548,7 @@ where
     Ok(PreprocessOutput {
         sql: normalized_sql,
         prepared_statements,
-        registrations,
+        live_table_requirements,
         internal_state,
         mutations,
         update_validations,
@@ -560,12 +560,12 @@ fn accumulate_rewrite_output<P: LixFunctionProvider>(
     provider: &mut P,
     dialect: SqlDialect,
     rewritten: &mut Vec<RewrittenStatementBinding>,
-    registrations: &mut Vec<SchemaRegistration>,
+    live_table_requirements: &mut Vec<SchemaLiveTableRequirement>,
     internal_state: &mut Option<InternalStatePlan>,
     mutations: &mut Vec<MutationRow>,
     update_validations: &mut Vec<UpdateValidationPlan>,
 ) -> Result<(), LixError> {
-    registrations.extend(output.registrations);
+    live_table_requirements.extend(output.live_table_requirements);
     if let Some(plan) = output.internal_state {
         if internal_state.is_some() {
             return Err(LixError {
@@ -625,7 +625,7 @@ fn from_rewrite_output(output: RewriteOutput) -> StatementRewriteOutput {
     StatementRewriteOutput {
         statements: output.statements,
         params: output.params,
-        registrations: output.registrations,
+        live_table_requirements: output.live_table_requirements,
         internal_state: internal_state_plan_from_postprocess(output.postprocess),
         mutations: output.mutations,
         update_validations: output.update_validations,
@@ -796,7 +796,7 @@ fn empty_rewrite_output() -> RewriteOutput {
         statements: Vec::new(),
         effect_only: false,
         params: Vec::new(),
-        registrations: Vec::new(),
+        live_table_requirements: Vec::new(),
         postprocess: None,
         mutations: Vec::new(),
         update_validations: Vec::new(),

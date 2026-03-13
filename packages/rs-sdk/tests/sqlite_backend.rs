@@ -1,24 +1,24 @@
-use lix_engine::{LixError, SnapshotChunkReader, SnapshotChunkWriter};
+use lix_engine::{ImageChunkReader, ImageChunkWriter, LixError};
 use lix_rs_sdk::{LixBackend, SqliteBackend, Value};
 
-struct VecSnapshotWriter {
+struct VecImageWriter {
     bytes: Vec<u8>,
 }
 
 #[async_trait::async_trait(?Send)]
-impl SnapshotChunkWriter for VecSnapshotWriter {
+impl ImageChunkWriter for VecImageWriter {
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), LixError> {
         self.bytes.extend_from_slice(chunk);
         Ok(())
     }
 }
 
-struct VecSnapshotReader {
+struct VecImageReader {
     bytes: Option<Vec<u8>>,
 }
 
 #[async_trait::async_trait(?Send)]
-impl SnapshotChunkReader for VecSnapshotReader {
+impl ImageChunkReader for VecImageReader {
     async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, LixError> {
         Ok(self.bytes.take())
     }
@@ -98,7 +98,7 @@ async fn sqlite_backend_transaction_rollback_discards_changes() {
 }
 
 #[tokio::test]
-async fn sqlite_backend_export_and_restore_snapshot_roundtrip() {
+async fn sqlite_backend_export_and_restore_image_roundtrip() {
     let backend = SqliteBackend::in_memory().expect("in-memory backend should initialize");
 
     backend
@@ -116,14 +116,14 @@ async fn sqlite_backend_export_and_restore_snapshot_roundtrip() {
         .await
         .expect("seed insert should succeed");
 
-    let mut writer = VecSnapshotWriter { bytes: Vec::new() };
+    let mut writer = VecImageWriter { bytes: Vec::new() };
     backend
-        .export_snapshot(&mut writer)
+        .export_image(&mut writer)
         .await
-        .expect("export_snapshot should succeed");
+        .expect("export_image should succeed");
     assert!(
         !writer.bytes.is_empty(),
-        "export_snapshot should emit sqlite bytes"
+        "export_image should emit sqlite bytes"
     );
 
     backend
@@ -131,13 +131,13 @@ async fn sqlite_backend_export_and_restore_snapshot_roundtrip() {
         .await
         .expect("delete should succeed");
 
-    let mut reader = VecSnapshotReader {
+    let mut reader = VecImageReader {
         bytes: Some(writer.bytes),
     };
     backend
-        .restore_from_snapshot(&mut reader)
+        .restore_from_image(&mut reader)
         .await
-        .expect("restore_from_snapshot should succeed");
+        .expect("restore_from_image should succeed");
 
     let rows = backend
         .execute(

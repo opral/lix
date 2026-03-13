@@ -64,15 +64,15 @@ test("close is idempotent and prevents further queries", async () => {
 	);
 });
 
-test("exportSnapshot returns bytes", async () => {
+test("export_image returns bytes", async () => {
 	const backend = await createBetterSqlite3Backend();
 	await backend.execute("CREATE TABLE t (value INTEGER)", []);
 	await backend.execute("INSERT INTO t (value) VALUES (?)", [42]);
 
-	expect(typeof backend.exportSnapshot).toBe("function");
-	const snapshot = await backend.exportSnapshot!();
-	expect(snapshot).toBeInstanceOf(Uint8Array);
-	expect(snapshot.byteLength).toBeGreaterThan(0);
+	expect(typeof backend.export_image).toBe("function");
+	const image = await backend.export_image!();
+	expect(image).toBeInstanceOf(Uint8Array);
+	expect(image.byteLength).toBeGreaterThan(0);
 	await backend.close?.();
 });
 

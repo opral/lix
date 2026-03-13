@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::{LixError, QueryResult, SnapshotChunkReader, SnapshotChunkWriter, Value};
+use crate::{ImageChunkReader, ImageChunkWriter, LixError, QueryResult, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlDialect {
@@ -25,21 +25,18 @@ pub trait LixBackend: Send + Sync {
     ///
     /// Implementations should write a valid SQLite3 database image (for example `.lix`)
     /// to `writer` in one or more chunks.
-    async fn export_snapshot(&self, _writer: &mut dyn SnapshotChunkWriter) -> Result<(), LixError> {
+    async fn export_image(&self, _writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "export_snapshot is not supported by this backend".to_string(),
+            description: "export_image is not supported by this backend".to_string(),
         })
     }
 
     /// Restores backend state from a SQLite database file payload stream.
-    async fn restore_from_snapshot(
-        &self,
-        _reader: &mut dyn SnapshotChunkReader,
-    ) -> Result<(), LixError> {
+    async fn restore_from_image(&self, _reader: &mut dyn ImageChunkReader) -> Result<(), LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "restore_from_snapshot is not supported by this backend".to_string(),
+            description: "restore_from_image is not supported by this backend".to_string(),
         })
     }
 }

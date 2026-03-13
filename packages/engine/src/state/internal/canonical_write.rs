@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use sqlparser::ast::{Delete, Statement, Update};
 
 use crate::functions::LixFunctionProvider;
-use crate::state::internal::{stored_schema, vtable_write};
+use crate::state::internal::{registered_schema, vtable_write};
 use crate::state::internal::{PostprocessPlan, RewriteOutput};
 use crate::{LixBackend, LixError, Value};
 
@@ -14,7 +14,7 @@ struct StatementContext<'a> {
     writer_key: Option<&'a str>,
     backend: Option<&'a dyn LixBackend>,
     side_effects: Vec<Statement>,
-    registrations: Vec<crate::state::internal::SchemaRegistration>,
+    live_table_requirements: Vec<crate::state::internal::SchemaLiveTableRequirement>,
     generated_params: Vec<Value>,
     mutations: Vec<crate::state::internal::MutationRow>,
     update_validations: Vec<crate::state::internal::UpdateValidationPlan>,
@@ -28,7 +28,7 @@ impl<'a> StatementContext<'a> {
             writer_key,
             backend: None,
             side_effects: Vec::new(),
-            registrations: Vec::new(),
+            live_table_requirements: Vec::new(),
             generated_params: Vec::new(),
             mutations: Vec::new(),
             update_validations: Vec::new(),
@@ -46,7 +46,7 @@ impl<'a> StatementContext<'a> {
             writer_key,
             backend: Some(backend),
             side_effects: Vec::new(),
-            registrations: Vec::new(),
+            live_table_requirements: Vec::new(),
             generated_params: Vec::new(),
             mutations: Vec::new(),
             update_validations: Vec::new(),
@@ -59,7 +59,7 @@ impl<'a> StatementContext<'a> {
             statements,
             effect_only: false,
             params: std::mem::take(&mut self.generated_params),
-            registrations: std::mem::take(&mut self.registrations),
+            live_table_requirements: std::mem::take(&mut self.live_table_requirements),
             postprocess: self.postprocess.take(),
             mutations: std::mem::take(&mut self.mutations),
             update_validations: std::mem::take(&mut self.update_validations),
@@ -86,7 +86,8 @@ fn merge_rewrite_output(base: &mut RewriteOutput, mut next: RewriteOutput) -> Re
     base.statements.extend(next.statements);
     base.effect_only = base.effect_only || next.effect_only;
     base.params.extend(next.params);
-    base.registrations.extend(next.registrations);
+    base.live_table_requirements
+        .extend(next.live_table_requirements);
     base.mutations.extend(next.mutations);
     base.update_validations.extend(next.update_validations);
     Ok(())
@@ -101,7 +102,7 @@ fn rewrite_vtable_update_output(
             statements: vec![rewrite.statement],
             effect_only: false,
             params: Vec::new(),
-            registrations: Vec::new(),
+            live_table_requirements: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),
             update_validations: rewrite.validation.into_iter().collect(),
@@ -113,7 +114,7 @@ fn rewrite_vtable_update_output(
                 statements,
                 effect_only: false,
                 params: Vec::new(),
-                registrations: Vec::new(),
+                live_table_requirements: Vec::new(),
                 postprocess: Some(PostprocessPlan::VtableUpdate(rewrite.plan)),
                 mutations: Vec::new(),
                 update_validations: rewrite.validations,
@@ -126,7 +127,7 @@ fn rewrite_vtable_update_output(
                     statements: vec![Statement::Update(update)],
                     effect_only: false,
                     params: Vec::new(),
-                    registrations: Vec::new(),
+                    live_table_requirements: Vec::new(),
                     postprocess: None,
                     mutations: Vec::new(),
                     update_validations: Vec::new(),
@@ -160,7 +161,7 @@ fn rewrite_vtable_delete_output(
             statements: vec![statement],
             effect_only: false,
             params: Vec::new(),
-            registrations: Vec::new(),
+            live_table_requirements: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),
             update_validations: Vec::new(),
@@ -169,7 +170,7 @@ fn rewrite_vtable_delete_output(
             statements: vec![rewrite.statement],
             effect_only: false,
             params: Vec::new(),
-            registrations: Vec::new(),
+            live_table_requirements: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableDelete(rewrite.plan)),
             mutations: Vec::new(),
             update_validations: Vec::new(),
@@ -181,7 +182,7 @@ fn rewrite_vtable_delete_output(
                     statements: vec![Statement::Delete(delete)],
                     effect_only: false,
                     params: Vec::new(),
-                    registrations: Vec::new(),
+                    live_table_requirements: Vec::new(),
                     postprocess: None,
                     mutations: Vec::new(),
                     update_validations: Vec::new(),
@@ -238,7 +239,7 @@ where
         statements: Vec::new(),
         effect_only: false,
         params: Vec::new(),
-        registrations: Vec::new(),
+        live_table_requirements: Vec::new(),
         postprocess: None,
         mutations: Vec::new(),
         update_validations: Vec::new(),
@@ -300,15 +301,17 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 let mut current_insert = insert;
                 let mut supplemental_statements = Vec::new();
                 if let Some(rewritten) =
-                    stored_schema::rewrite_insert(current_insert.clone(), context.params)?
+                    registered_schema::rewrite_insert(current_insert.clone(), context.params)?
                 {
-                    context.registrations.push(rewritten.registration);
+                    context
+                        .live_table_requirements
+                        .push(rewritten.live_table_requirement);
                     context.mutations.push(rewritten.mutation);
                     supplemental_statements.extend(rewritten.supplemental_statements);
                     let Statement::Insert(insert_statement) = rewritten.statement else {
                         return Err(LixError {
                             code: "LIX_ERROR_UNKNOWN".to_string(),
-                            description: "stored schema rewrite expected insert statement"
+                            description: "registered schema rewrite expected insert statement"
                                 .to_string(),
                         });
                     };
@@ -321,7 +324,9 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                     context.writer_key,
                     functions,
                 )? {
-                    context.registrations.extend(rewritten.registrations);
+                    context
+                        .live_table_requirements
+                        .extend(rewritten.live_table_requirements);
                     context.generated_params.extend(rewritten.params);
                     context.mutations.extend(rewritten.mutations);
                     statements = rewritten.statements;
@@ -358,7 +363,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                     statements: vec![other],
                     effect_only: false,
                     params: Vec::new(),
-                    registrations: Vec::new(),
+                    live_table_requirements: Vec::new(),
                     postprocess: None,
                     mutations: Vec::new(),
                     update_validations: Vec::new(),
@@ -400,15 +405,17 @@ where
                 let mut current_insert = insert;
                 let mut supplemental_statements = Vec::new();
                 if let Some(rewritten) =
-                    stored_schema::rewrite_insert(current_insert.clone(), context.params)?
+                    registered_schema::rewrite_insert(current_insert.clone(), context.params)?
                 {
-                    context.registrations.push(rewritten.registration);
+                    context
+                        .live_table_requirements
+                        .push(rewritten.live_table_requirement);
                     context.mutations.push(rewritten.mutation);
                     supplemental_statements.extend(rewritten.supplemental_statements);
                     let Statement::Insert(insert_statement) = rewritten.statement else {
                         return Err(LixError {
                             code: "LIX_ERROR_UNKNOWN".to_string(),
-                            description: "stored schema rewrite expected insert statement"
+                            description: "registered schema rewrite expected insert statement"
                                 .to_string(),
                         });
                     };
@@ -432,7 +439,9 @@ where
                         error.description
                     ),
                 })? {
-                    context.registrations.extend(rewritten.registrations);
+                    context
+                        .live_table_requirements
+                        .extend(rewritten.live_table_requirements);
                     context.generated_params.extend(rewritten.params);
                     context.mutations.extend(rewritten.mutations);
                     statements = rewritten.statements;
@@ -470,7 +479,7 @@ where
                     statements: vec![other],
                     effect_only: false,
                     params: Vec::new(),
-                    registrations: Vec::new(),
+                    live_table_requirements: Vec::new(),
                     postprocess: context.postprocess.take(),
                     mutations: Vec::new(),
                     update_validations: Vec::new(),

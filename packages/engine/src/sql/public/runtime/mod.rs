@@ -8,7 +8,7 @@ use crate::sql::analysis::state_resolution::canonical::statement_targets_table_n
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::common::dependency_spec::DependencySpec;
 use crate::sql::execution::contracts::effects::PlanEffects;
-use crate::sql::execution::contracts::planned_statement::SchemaRegistration;
+use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::sql::execution::intent::authoritative_pending_file_write_targets;
 use crate::sql::public::backend::PushdownDecision;
 use crate::sql::public::catalog::{
@@ -155,7 +155,7 @@ pub(crate) struct PreparedPublicWrite {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PublicSurfaceRegistryMutation {
-    UpsertStoredSchemaSnapshot { snapshot: JsonValue },
+    UpsertRegisteredSchemaSnapshot { snapshot: JsonValue },
     RemoveDynamicSchema { schema_key: String },
 }
 
@@ -172,7 +172,7 @@ pub(crate) enum PublicWriteExecutionPartition {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TrackedWriteExecution {
-    pub(crate) schema_registrations: Vec<SchemaRegistration>,
+    pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub(crate) domain_change_batch: Option<DomainChangeBatch>,
     pub(crate) lazy_exact_file_metadata_update:
         Option<crate::sql::public::planner::ir::LazyExactFileMetadataUpdate>,
@@ -1629,7 +1629,8 @@ fn build_public_write_execution(
 
                 partitions.push(PublicWriteExecutionPartition::Tracked(
                     TrackedWriteExecution {
-                        schema_registrations: schema_registrations_from_partition(partition),
+                        schema_live_table_requirements:
+                            schema_live_table_requirements_from_partition(partition),
                         append_preconditions: append_commit_preconditions_for_public_write(
                             planned_write,
                             domain_change_batch.as_ref(),
@@ -1700,16 +1701,16 @@ pub(crate) fn finalize_public_write_execution(
     Ok(())
 }
 
-fn schema_registrations_from_partition(
+fn schema_live_table_requirements_from_partition(
     partition: &crate::sql::public::planner::ir::ResolvedWritePartition,
-) -> Vec<SchemaRegistration> {
+) -> Vec<SchemaLiveTableRequirement> {
     let mut schema_keys = BTreeSet::new();
     for row in &partition.intended_post_state {
-        if row.schema_key != "lix_stored_schema" {
+        if row.schema_key != "lix_registered_schema" {
             schema_keys.insert(row.schema_key.clone());
         }
 
-        if row.schema_key != "lix_stored_schema" || row.tombstone {
+        if row.schema_key != "lix_registered_schema" || row.tombstone {
             continue;
         }
 
@@ -1720,7 +1721,7 @@ fn schema_registrations_from_partition(
         let Ok(snapshot) = serde_json::from_str(&snapshot_content) else {
             continue;
         };
-        let Ok((schema_key, _)) = crate::schema::schema_from_stored_snapshot(&snapshot) else {
+        let Ok((schema_key, _)) = crate::schema::schema_from_registered_snapshot(&snapshot) else {
             continue;
         };
         schema_keys.insert(schema_key.schema_key);
@@ -1729,7 +1730,7 @@ fn schema_registrations_from_partition(
     schema_keys
         .into_iter()
         .filter(|schema_key| builtin_schema_definition(schema_key).is_none())
-        .map(|schema_key| SchemaRegistration { schema_key })
+        .map(|schema_key| SchemaLiveTableRequirement { schema_key })
         .collect()
 }
 
@@ -1742,7 +1743,7 @@ pub(crate) fn public_surface_registry_mutations(
 
     let mut mutations = Vec::new();
     for row in resolved.intended_post_state() {
-        if row.schema_key != "lix_stored_schema"
+        if row.schema_key != "lix_registered_schema"
             || row.version_id.as_deref() != Some(GLOBAL_VERSION_ID)
         {
             continue;
@@ -1764,10 +1765,10 @@ pub(crate) fn public_surface_registry_mutations(
         let snapshot = serde_json::from_str(snapshot_content.as_ref()).map_err(|error| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                format!("stored schema snapshot_content invalid JSON: {error}"),
+                format!("registered schema snapshot_content invalid JSON: {error}"),
             )
         })?;
-        mutations.push(PublicSurfaceRegistryMutation::UpsertStoredSchemaSnapshot { snapshot });
+        mutations.push(PublicSurfaceRegistryMutation::UpsertRegisteredSchemaSnapshot { snapshot });
     }
 
     Ok(mutations)
@@ -1783,7 +1784,7 @@ pub(crate) fn apply_public_surface_registry_mutations(
 
     for mutation in mutations {
         match mutation {
-            PublicSurfaceRegistryMutation::UpsertStoredSchemaSnapshot { snapshot } => {
+            PublicSurfaceRegistryMutation::UpsertRegisteredSchemaSnapshot { snapshot } => {
                 registry.replace_dynamic_entity_surfaces_from_stored_snapshot(snapshot)?;
             }
             PublicSurfaceRegistryMutation::RemoveDynamicSchema { schema_key } => {
@@ -2237,8 +2238,8 @@ fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWri
     if let Some(resolved) = planned_write.resolved_write_plan.as_ref() {
         let mut saw_snapshot_validation = false;
         let mut saw_primary_key_consistency = false;
-        let mut saw_stored_schema_definition = false;
-        let mut saw_stored_schema_bootstrap_identity = false;
+        let mut saw_registered_schema_definition = false;
+        let mut saw_registered_schema_bootstrap_identity = false;
 
         for row in resolved.intended_post_state() {
             if row.tombstone {
@@ -2253,14 +2254,14 @@ fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWri
                 batch_local_checks.push("entity_id.primary_key_consistency".to_string());
                 saw_primary_key_consistency = true;
             }
-            if row.schema_key == "lix_stored_schema" {
-                if !saw_stored_schema_definition {
-                    batch_local_checks.push("stored_schema.definition_validation".to_string());
-                    saw_stored_schema_definition = true;
+            if row.schema_key == "lix_registered_schema" {
+                if !saw_registered_schema_definition {
+                    batch_local_checks.push("registered_schema.definition_validation".to_string());
+                    saw_registered_schema_definition = true;
                 }
-                if !saw_stored_schema_bootstrap_identity {
-                    batch_local_checks.push("stored_schema.bootstrap_identity".to_string());
-                    saw_stored_schema_bootstrap_identity = true;
+                if !saw_registered_schema_bootstrap_identity {
+                    batch_local_checks.push("registered_schema.bootstrap_identity".to_string());
+                    saw_registered_schema_bootstrap_identity = true;
                 }
             }
         }
@@ -2303,7 +2304,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeBackend {
-        stored_schema_rows: HashMap<String, String>,
+        registered_schema_rows: HashMap<String, String>,
         version_descriptor_rows: HashMap<String, String>,
         version_pointer_rows: HashMap<String, String>,
         active_version_rows: Vec<(String, String)>,
@@ -2319,9 +2320,9 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("FROM lix_internal_stored_schema_bootstrap") {
+            if sql.contains("FROM lix_internal_registered_schema_bootstrap") {
                 let rows = self
-                    .stored_schema_rows
+                    .registered_schema_rows
                     .iter()
                     .map(|(schema_key, snapshot)| {
                         if sql.contains("SELECT schema_version, snapshot_content") {
@@ -2746,9 +2747,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepares_stored_schema_derived_entity_reads() {
+    async fn prepares_registered_schema_derived_entity_reads() {
         let mut backend = FakeBackend::default();
-        backend.stored_schema_rows.insert(
+        backend.registered_schema_rows.insert(
             "message".to_string(),
             json!({
                 "value": {
@@ -2772,13 +2773,13 @@ mod tests {
             None,
         )
         .await
-        .expect("stored-schema entity read should canonicalize");
+        .expect("registered-schema entity read should canonicalize");
 
         assert_eq!(prepared.debug_trace.surface_bindings, vec!["message"]);
         assert_eq!(
             prepared
                 .structured_read()
-                .expect("stored-schema entity read should use canonicalized path")
+                .expect("registered-schema entity read should use canonicalized path")
                 .surface_binding
                 .implicit_overrides
                 .fixed_schema_key
@@ -2791,7 +2792,7 @@ mod tests {
             .debug_trace
             .lowered_sql
             .first()
-            .expect("stored-schema entity read should lower");
+            .expect("registered-schema entity read should lower");
         assert!(lowered_sql.contains("FROM (SELECT"));
         assert!(lowered_sql.contains("lix_internal_live_v1_message"));
     }
@@ -2799,7 +2800,7 @@ mod tests {
     #[tokio::test]
     async fn lowers_backend_registered_public_queries_with_public_surface_lowering() {
         let mut backend = FakeBackend::default();
-        backend.stored_schema_rows.insert(
+        backend.registered_schema_rows.insert(
             "message".to_string(),
             json!({
                 "value": {
@@ -2821,7 +2822,7 @@ mod tests {
 
         let lowered = lower_public_read_query_with_backend(&backend, *query, &[])
             .await
-            .expect("stored-schema derived public query should lower through backend registry");
+            .expect("registered-schema derived public query should lower through backend registry");
         let lowered_sql = lowered.query.to_string();
 
         assert_eq!(

@@ -461,7 +461,7 @@ simulation_test!(init_seeds_key_value_schema_definition, |sim| async move {
             "SELECT entity_id, snapshot_content \
              FROM lix_internal_state_vtable \
              WHERE entity_id = 'lix_key_value~1' \
-               AND schema_key = 'lix_stored_schema' \
+               AND schema_key = 'lix_registered_schema' \
                AND file_id = 'lix' \
                AND version_id = 'global' \
              LIMIT 1",
@@ -499,7 +499,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
             "SELECT entity_id, snapshot_content \
              FROM lix_internal_state_vtable \
              WHERE entity_id IN (\
-               'lix_stored_schema~1', \
+               'lix_registered_schema~1', \
                'lix_key_value~1', \
                'lix_change~1', \
                'lix_change_author~1', \
@@ -509,7 +509,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
                'lix_change_set_element~1', \
                'lix_commit_edge~1'\
              ) \
-               AND schema_key = 'lix_stored_schema' \
+               AND schema_key = 'lix_registered_schema' \
                AND file_id = 'lix' \
                AND version_id = 'global' \
              ORDER BY entity_id",
@@ -534,7 +534,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
         let parsed: serde_json::Value = serde_json::from_str(&snapshot_content).unwrap();
         let schema = parsed
             .get("value")
-            .expect("stored schema snapshot_content must include value");
+            .expect("registered schema snapshot_content must include value");
         let schema_key = schema
             .get("x-lix-key")
             .and_then(serde_json::Value::as_str)
@@ -566,7 +566,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
             "lix_commit".to_string(),
             "lix_commit_edge".to_string(),
             "lix_key_value".to_string(),
-            "lix_stored_schema".to_string(),
+            "lix_registered_schema".to_string(),
             "lix_version_pointer".to_string(),
         ])
     );

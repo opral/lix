@@ -4,7 +4,7 @@ use super::selector_queries::{
 };
 use super::*;
 use crate::schema::builtin::builtin_schema_definition;
-use crate::schema::{SchemaProvider, SqlStoredSchemaProvider};
+use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
 use crate::sql::public::planner::ir::CanonicalStateAssignments;
 use crate::sql::public::planner::ir::CanonicalStateRowKey;
 use crate::sql::public::planner::semantics::state_assignments::{
@@ -33,7 +33,7 @@ pub(super) async fn resolve_entity_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let mut provider = SqlStoredSchemaProvider::new(backend);
+    let mut provider = SqlRegisteredSchemaProvider::new(backend);
     let entity_schema = load_entity_schema(&mut provider, planned_write)
         .await
         .map_err(write_resolve_backend_error)?;
@@ -642,6 +642,15 @@ async fn load_entity_schema(
         .get("x-lix-override-lixcols")
         .and_then(JsonValue::as_object)
     {
+        if overrides.contains_key("lixcol_version_id") {
+            return Err(crate::LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "schema '{}' uses removed x-lix-override-lixcols.lixcol_version_id support; use lixcol_global for global write scope",
+                    schema_key
+                ),
+            });
+        }
         for (raw_key, expr) in overrides {
             let Some(expr) = expr.as_str() else {
                 continue;
@@ -767,7 +776,6 @@ fn entity_state_column_name(column: &str) -> Option<&'static str> {
         "lixcol_entity_id" => Some("entity_id"),
         "lixcol_schema_key" => Some("schema_key"),
         "lixcol_file_id" => Some("file_id"),
-        "lixcol_version_id" => Some("version_id"),
         "lixcol_plugin_key" => Some("plugin_key"),
         "lixcol_schema_version" => Some("schema_version"),
         "lixcol_global" => Some("global"),

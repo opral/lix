@@ -6,29 +6,29 @@ use sqlparser::ast::{
 
 use crate::state::internal::{
     object_name_matches, MutationOperation, MutationRow, ResolvedCell, RowSourceResolver,
-    SchemaRegistration,
+    SchemaLiveTableRequirement,
 };
 use crate::{LixError, Value as EngineValue};
 
-const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
+const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const GLOBAL_VERSION: &str = "global";
 const ENGINE_FILE_ID: &str = "lix";
 const ENGINE_PLUGIN_KEY: &str = "lix";
-const BOOTSTRAP_TABLE: &str = "lix_internal_stored_schema_bootstrap";
-const MATERIALIZED_TABLE: &str = "lix_internal_live_v1_lix_stored_schema";
+const BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
+const MATERIALIZED_TABLE: &str = "lix_internal_live_v1_lix_registered_schema";
 
 #[derive(Debug, Clone)]
-pub struct StoredSchemaRewrite {
+pub struct RegisteredSchemaRewrite {
     pub statement: Statement,
     pub supplemental_statements: Vec<Statement>,
-    pub registration: SchemaRegistration,
+    pub live_table_requirement: SchemaLiveTableRequirement,
     pub mutation: MutationRow,
 }
 
 pub fn rewrite_insert(
     insert: Insert,
     params: &[EngineValue],
-) -> Result<Option<StoredSchemaRewrite>, LixError> {
+) -> Result<Option<RegisteredSchemaRewrite>, LixError> {
     if !table_object_is_vtable(&insert.table) {
         return Ok(None);
     }
@@ -60,7 +60,7 @@ pub fn rewrite_insert(
 
     if !resolved_rows
         .iter()
-        .all(|row| resolved_value_equals(row.get(schema_key_index), STORED_SCHEMA_KEY))
+        .all(|row| resolved_value_equals(row.get(schema_key_index), REGISTERED_SCHEMA_KEY))
     {
         return Ok(None);
     }
@@ -70,7 +70,7 @@ pub fn rewrite_insert(
         None => {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "stored schema insert requires snapshot_content".to_string(),
+                description: "registered schema insert requires snapshot_content".to_string(),
             })
         }
     };
@@ -78,7 +78,7 @@ pub fn rewrite_insert(
     if rows.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "stored schema insert supports a single row at a time".to_string(),
+            description: "registered schema insert supports a single row at a time".to_string(),
         });
     }
 
@@ -89,7 +89,7 @@ pub fn rewrite_insert(
     for (row_idx, row) in rows.iter().enumerate() {
         let snapshot_expr = row.get(snapshot_index).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "stored schema insert missing snapshot_content value".to_string(),
+            description: "registered schema insert missing snapshot_content value".to_string(),
         })?;
         let literal = snapshot_literal(
             snapshot_expr,
@@ -109,7 +109,7 @@ pub fn rewrite_insert(
             if existing != &derived_id {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "stored schema insert must use a single schema identity"
+                    description: "registered schema insert must use a single schema identity"
                         .to_string(),
                 });
             }
@@ -120,24 +120,24 @@ pub fn rewrite_insert(
 
     let entity_id = entity_id_value.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "stored schema insert requires schema identity".to_string(),
+        description: "registered schema insert requires schema identity".to_string(),
     })?;
     let schema_key_value = schema_key_value.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "stored schema insert requires schema key".to_string(),
+        description: "registered schema insert requires schema key".to_string(),
     })?;
     let schema_version_value = schema_version_value.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "stored schema insert requires schema version".to_string(),
+        description: "registered schema insert requires schema version".to_string(),
     })?;
     let snapshot_literal_value = snapshot_literal_value.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "stored schema insert requires snapshot_content".to_string(),
+        description: "registered schema insert requires snapshot_content".to_string(),
     })?;
     let snapshot_value: JsonValue =
         serde_json::from_str(&snapshot_literal_value).map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("stored schema snapshot_content must be valid JSON: {err}"),
+            description: format!("registered schema snapshot_content must be valid JSON: {err}"),
         })?;
 
     if let Some(entity_index) = find_column_index(&columns, "entity_id") {
@@ -147,7 +147,7 @@ pub fn rewrite_insert(
         {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "stored schema insert entity_id must match schema key + version"
+                description: "registered schema insert entity_id must match schema key + version"
                     .to_string(),
             });
         }
@@ -206,7 +206,7 @@ pub fn rewrite_insert(
         "1970-01-01T00:00:00Z",
     )?;
 
-    // `lix_stored_schema` materialized storage does not expose `untracked`.
+    // `lix_registered_schema` materialized storage does not expose `untracked`.
     drop_column_if_present(&mut columns, &mut rows, "untracked");
 
     source.body = Box::new(sqlparser::ast::SetExpr::Values(sqlparser::ast::Values {
@@ -227,16 +227,16 @@ pub fn rewrite_insert(
         ..rewritten.clone()
     };
 
-    Ok(Some(StoredSchemaRewrite {
+    Ok(Some(RegisteredSchemaRewrite {
         statement: Statement::Insert(rewritten),
         supplemental_statements: vec![Statement::Insert(mirrored)],
-        registration: SchemaRegistration {
+        live_table_requirement: SchemaLiveTableRequirement {
             schema_key: schema_key_value,
         },
         mutation: MutationRow {
             operation: MutationOperation::Insert,
             entity_id,
-            schema_key: STORED_SCHEMA_KEY.to_string(),
+            schema_key: REGISTERED_SCHEMA_KEY.to_string(),
             schema_version: schema_version_value,
             file_id: ENGINE_FILE_ID.to_string(),
             version_id: GLOBAL_VERSION.to_string(),
@@ -359,7 +359,7 @@ fn ensure_literal_column(
         if !ok {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("stored schema insert requires {name} = '{value}'"),
+                description: format!("registered schema insert requires {name} = '{value}'"),
             });
         }
         return Ok(());
@@ -391,7 +391,7 @@ fn snapshot_literal(expr: &Expr, cell: Option<&ResolvedCell>) -> Result<String, 
             ..
         }) => Ok(value.clone()),
         _ => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description:
-                "stored schema insert requires literal snapshot_content (prepared statement support TODO)"
+                "registered schema insert requires literal snapshot_content (prepared statement support TODO)"
                     .to_string(),
         }),
     }
@@ -400,29 +400,29 @@ fn snapshot_literal(expr: &Expr, cell: Option<&ResolvedCell>) -> Result<String, 
 fn parse_schema_identity(snapshot: &str) -> Result<(String, String), LixError> {
     let parsed: JsonValue = serde_json::from_str(snapshot).map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("stored schema snapshot_content must be valid JSON: {err}"),
+        description: format!("registered schema snapshot_content must be valid JSON: {err}"),
     })?;
     let value = parsed.get("value").ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "stored schema snapshot_content must contain value".to_string(),
+        description: "registered schema snapshot_content must contain value".to_string(),
     })?;
     let obj = value.as_object().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "stored schema value must be an object".to_string(),
+        description: "registered schema value must be an object".to_string(),
     })?;
     let schema_key = obj
         .get("x-lix-key")
         .and_then(|v| v.as_str())
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "stored schema value.x-lix-key must be string".to_string(),
+            description: "registered schema value.x-lix-key must be string".to_string(),
         })?;
     let schema_version = obj
         .get("x-lix-version")
         .and_then(|v| v.as_str())
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "stored schema value.x-lix-version must be string".to_string(),
+            description: "registered schema value.x-lix-version must be string".to_string(),
         })?;
 
     // Deliberately keep x-lix-version as a monotonic integer (string) so we can evolve
@@ -436,21 +436,21 @@ fn ensure_monotonic_version(version: &str) -> Result<(), LixError> {
     if version.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "stored schema x-lix-version must be a monotonic integer".to_string(),
+            description: "registered schema x-lix-version must be a monotonic integer".to_string(),
         });
     }
     let mut chars = version.chars();
     let Some(first) = chars.next() else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "stored schema x-lix-version must be a monotonic integer".to_string(),
+            description: "registered schema x-lix-version must be a monotonic integer".to_string(),
         });
     };
     if first == '0' || !first.is_ascii_digit() || !chars.all(|c| c.is_ascii_digit()) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description:
-                "stored schema x-lix-version must be a monotonic integer without leading zeros"
+                "registered schema x-lix-version must be a monotonic integer without leading zeros"
                     .to_string(),
         });
     }

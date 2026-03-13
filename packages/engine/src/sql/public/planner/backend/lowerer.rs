@@ -898,13 +898,6 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
             file_id = escape_sql_string(active_account_file_id()),
             storage_version_id = escape_sql_string(active_account_storage_version_id()),
         ),
-        CanonicalAdminKind::StoredSchema => "SELECT \
-                lix_json_extract(snapshot_content, 'value') AS value, \
-                lix_json_extract(snapshot_content, 'value.x-lix-key') AS lixcol_schema_key, \
-                lix_json_extract(snapshot_content, 'value.x-lix-version') AS lixcol_schema_version \
-             FROM lix_internal_stored_schema_bootstrap \
-             WHERE snapshot_content IS NOT NULL"
-            .to_string(),
         CanonicalAdminKind::Version => format!(
             "SELECT \
                 d.entity_id AS id, \
@@ -2333,29 +2326,14 @@ fn entity_source_predicates(
     surface_binding: &SurfaceBinding,
     schema_key: &str,
 ) -> (String, Vec<String>) {
-    let mut predicates = vec![format!(
+    let predicates = vec![format!(
         "{} = '{}'",
         render_identifier("schema_key"),
         escape_sql_string(schema_key)
     )];
 
     let source_table = match surface_binding.descriptor.surface_variant {
-        SurfaceVariant::Default => {
-            if let Some(version_id) = surface_binding
-                .implicit_overrides
-                .fixed_version_id
-                .as_deref()
-            {
-                predicates.push(format!(
-                    "{} = '{}'",
-                    render_identifier("version_id"),
-                    escape_sql_string(version_id)
-                ));
-                "lix_state_by_version".to_string()
-            } else {
-                "lix_state".to_string()
-            }
-        }
+        SurfaceVariant::Default => "lix_state".to_string(),
         SurfaceVariant::ByVersion => "lix_state_by_version".to_string(),
         SurfaceVariant::History => "lix_state_history".to_string(),
         SurfaceVariant::Active | SurfaceVariant::WorkingChanges => {
@@ -2717,7 +2695,6 @@ mod tests {
                 schema_key: "message".to_string(),
                 visible_columns: vec!["body".to_string(), "id".to_string()],
                 column_types: BTreeMap::new(),
-                fixed_version_id: None,
                 predicate_overrides: vec![
                     crate::sql::public::catalog::SurfaceOverridePredicate {
                         column: "file_id".to_string(),
@@ -2934,24 +2911,23 @@ mod tests {
     }
 
     #[test]
-    fn lowers_stored_schema_reads_through_bootstrap_table() {
+    fn lowers_registered_schema_reads_through_entity_surface() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
         let lowered = lowered_program(
             &registry,
-            "SELECT value, lixcol_schema_key FROM lix_stored_schema WHERE lixcol_schema_key = 'x'",
+            "SELECT value, lixcol_entity_id FROM lix_registered_schema WHERE lixcol_entity_id = 'x~1'",
         )
-        .expect("stored schema read should lower");
+        .expect("registered schema read should lower");
         let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered_sql.contains("FROM lix_internal_stored_schema_bootstrap"));
-        assert!(!lowered_sql.contains("FROM lix_stored_schema"));
-        assert_eq!(
-            lowered.pushdown_decision.accepted_predicates,
-            Vec::<String>::new()
-        );
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_registered_schema"));
+        assert!(lowered_sql.contains("file_id = 'lix'"));
+        assert!(lowered_sql.contains("plugin_key = 'lix'"));
+        assert!(lowered_sql.contains("global = true"));
+        assert!(!lowered_sql.contains("FROM lix_registered_schema"));
         assert_eq!(
             lowered.pushdown_decision.residual_predicates,
-            vec!["lixcol_schema_key = 'x'".to_string()]
+            vec!["lixcol_entity_id = 'x~1'".to_string()]
         );
     }
 

@@ -298,20 +298,20 @@ impl Engine {
         crate::version::switch_version(self, version_id).await
     }
 
-    /// Exports a portable snapshot as SQLite3 file bytes written via chunk stream.
-    pub async fn export_snapshot(
+    /// Exports a portable image as SQLite3 file bytes written via chunk stream.
+    pub async fn export_image(
         &self,
-        writer: &mut dyn crate::SnapshotChunkWriter,
+        writer: &mut dyn crate::ImageChunkWriter,
     ) -> Result<(), LixError> {
-        self.ensure_no_open_public_sql_transaction("export_snapshot")?;
-        self.backend.export_snapshot(writer).await
+        self.ensure_no_open_public_sql_transaction("export_image")?;
+        self.backend.export_image(writer).await
     }
 
-    pub async fn restore_from_snapshot(
+    pub async fn restore_from_image(
         &self,
-        reader: &mut dyn crate::SnapshotChunkReader,
+        reader: &mut dyn crate::ImageChunkReader,
     ) -> Result<(), LixError> {
-        self.backend.restore_from_snapshot(reader).await?;
+        self.backend.restore_from_image(reader).await?;
         self.load_and_cache_active_version().await?;
         self.refresh_public_surface_registry().await?;
         self.invalidate_installed_plugins_cache()?;

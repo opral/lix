@@ -2,13 +2,14 @@ use std::collections::BTreeSet;
 
 use crate::engine::Engine;
 use crate::functions::LixFunctionProvider;
+use crate::schema::registry::ensure_schema_live_table_in_transaction;
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::execute::SqlExecutionOutcome;
 use crate::sql::execution::shared_path::{
     append_commit_error_to_lix_error, apply_public_version_last_checkpoint_side_effects,
     build_pending_public_append_session, empty_public_write_execution_outcome,
     merge_public_domain_change_batch_into_pending_commit,
-    mirror_public_stored_schema_bootstrap_rows, pending_session_matches_append,
+    mirror_public_registered_schema_bootstrap_rows, pending_session_matches_append,
     PendingPublicAppendSession, Sql2AppendInvariantChecker,
 };
 use crate::sql::public::planner::ir::WriteLane;
@@ -44,22 +45,16 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
             })?;
     }
 
-    for registration in &plan.execution.schema_registrations {
-        for statement in crate::schema::registry::register_schema_sql_statements(
-            &registration.schema_key,
-            transaction.dialect(),
-        ) {
-            transaction
-                .execute(&statement, &[])
-                .await
-                .map_err(|error| LixError {
-                    code: error.code,
-                    description: format!(
-                        "public tracked write schema registration failed for '{}': {}",
-                        registration.schema_key, error.description
-                    ),
-                })?;
-        }
+    for requirement in &plan.execution.schema_live_table_requirements {
+        ensure_schema_live_table_in_transaction(transaction, &requirement.schema_key)
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "public tracked write schema live-table ensure failed for '{}': {}",
+                    requirement.schema_key, error.description
+                ),
+            })?;
     }
 
     if plan
@@ -140,12 +135,12 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
     .map_err(append_commit_error_to_lix_error)?;
 
     if let Some(commit_result) = append_result.commit_result.as_ref() {
-        mirror_public_stored_schema_bootstrap_rows(transaction, commit_result)
+        mirror_public_registered_schema_bootstrap_rows(transaction, commit_result)
             .await
             .map_err(|error| LixError {
                 code: error.code,
                 description: format!(
-                    "public tracked write stored-schema bootstrap mirroring failed: {}",
+                    "public tracked write registered-schema bootstrap mirroring failed: {}",
                     error.description
                 ),
             })?;

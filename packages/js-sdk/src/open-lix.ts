@@ -94,7 +94,7 @@ export type Lix = {
 		args: InstallPluginOptions | Uint8Array | ArrayBuffer,
 	): Promise<void>;
 	/** Exports the current database as SQLite file bytes (portable `.lix` artifact). */
-	exportSnapshot(): Promise<Uint8Array>;
+	export_image(): Promise<Uint8Array>;
 	close(): Promise<void>;
 };
 
@@ -329,19 +329,19 @@ export async function openLix(
 		return { id, changeSetId };
 	};
 
-	const exportSnapshot = async (): Promise<Uint8Array> => {
-		ensureOpen("exportSnapshot");
-		if (typeof (wasmLix as any).exportSnapshot !== "function") {
-			throw new Error("exportSnapshot is not available in this wasm build");
+	const export_image = async (): Promise<Uint8Array> => {
+		ensureOpen("export_image");
+		if (typeof (wasmLix as any).export_image !== "function") {
+			throw new Error("export_image is not available in this wasm build");
 		}
-		const output = await (wasmLix as any).exportSnapshot();
+		const output = await (wasmLix as any).export_image();
 		if (output instanceof Uint8Array) {
 			return output;
 		}
 		if (output instanceof ArrayBuffer) {
 			return new Uint8Array(output);
 		}
-		throw new Error("exportSnapshot() must return Uint8Array or ArrayBuffer");
+		throw new Error("export_image() must return Uint8Array or ArrayBuffer");
 	};
 
 	const close = async (): Promise<void> => {
@@ -396,7 +396,7 @@ export async function openLix(
 		createCheckpoint,
 		switchVersion,
 		installPlugin,
-		exportSnapshot,
+		export_image,
 		close,
 	};
 }
@@ -644,7 +644,7 @@ function createCanonicalBackendAdapter(backend: LixBackend): {
 		commit(): Promise<void> | void;
 		rollback(): Promise<void> | void;
 	}>;
-	exportSnapshot?: () =>
+	export_image?: () =>
 		| Promise<Uint8Array | ArrayBuffer>
 		| Uint8Array
 		| ArrayBuffer;
@@ -673,7 +673,7 @@ function createCanonicalBackendAdapter(backend: LixBackend): {
 			commit(): Promise<void> | void;
 			rollback(): Promise<void> | void;
 		}>;
-		exportSnapshot?: () =>
+		export_image?: () =>
 			| Promise<Uint8Array | ArrayBuffer>
 			| Uint8Array
 			| ArrayBuffer;
@@ -700,8 +700,8 @@ function createCanonicalBackendAdapter(backend: LixBackend): {
 		};
 	}
 
-	if (typeof backend.exportSnapshot === "function") {
-		adapted.exportSnapshot = () => backend.exportSnapshot!();
+	if (typeof backend.export_image === "function") {
+		adapted.export_image = () => backend.export_image!();
 	}
 
 	return adapted;

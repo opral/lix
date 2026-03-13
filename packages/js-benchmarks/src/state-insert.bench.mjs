@@ -122,7 +122,7 @@ async function setupOldAdapter() {
 
   await oldExecute(
     lix,
-    "INSERT INTO stored_schema_by_version (value, lixcol_version_id) VALUES (?, ?)",
+    "INSERT INTO registered_schema_by_version (value, lixcol_version_id) VALUES (?, ?)",
     [JSON.stringify(oldSchema), "global"],
   );
 
@@ -167,7 +167,7 @@ async function setupNewAdapter() {
   });
 
   await lix.execute(
-    "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('lix_stored_schema', ?)",
+    "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('lix_registered_schema', ?)",
     [JSON.stringify({ value: newSchema })],
   );
 

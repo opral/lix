@@ -173,10 +173,6 @@ fn dependency_spec_for_admin_scan(kind: CanonicalAdminKind) -> DependencySpec {
             spec.relations.insert("lix_active_account".to_string());
             spec.schema_keys.insert("lix_active_account".to_string());
         }
-        CanonicalAdminKind::StoredSchema => {
-            spec.relations.insert("lix_stored_schema".to_string());
-            spec.schema_keys.insert("lix_stored_schema".to_string());
-        }
         CanonicalAdminKind::Version => {
             spec.relations.insert("lix_version".to_string());
             spec.schema_keys

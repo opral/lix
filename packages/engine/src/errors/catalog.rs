@@ -110,7 +110,7 @@ pub(crate) fn schema_not_registered_error(
     build_error(
         ErrorCode::SchemaNotRegistered,
         &format!(
-            "Schema `{schema_key}` is not registered. Register or install the schema before querying it. {available} Inspect registered schemas via `SELECT * FROM lix_stored_schema`."
+            "Schema `{schema_key}` is not registered. Register or install the schema before querying it. {available} Inspect registered schemas via `SELECT * FROM lix_registered_schema`."
         ),
     )
 }

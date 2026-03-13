@@ -5,7 +5,7 @@ use crate::schema::lix_schema_definition;
 
 pub(crate) mod types;
 
-const LIX_STORED_SCHEMA_KEY: &str = "lix_stored_schema";
+const LIX_REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const LIX_KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const LIX_ACCOUNT_SCHEMA_KEY: &str = "lix_account";
 const LIX_ACTIVE_ACCOUNT_SCHEMA_KEY: &str = "lix_active_account";
@@ -24,7 +24,7 @@ const LIX_FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const LIX_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 
-const LIX_STORED_SCHEMA_JSON: &str = include_str!("lix_stored_schema.json");
+const LIX_REGISTERED_SCHEMA_JSON: &str = include_str!("lix_registered_schema.json");
 const LIX_KEY_VALUE_SCHEMA_JSON: &str = include_str!("lix_key_value.json");
 const LIX_ACCOUNT_SCHEMA_JSON: &str = include_str!("lix_account.json");
 const LIX_ACTIVE_ACCOUNT_SCHEMA_JSON: &str = include_str!("lix_active_account.json");
@@ -43,7 +43,7 @@ const LIX_FILE_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_file_descriptor.
 const LIX_DIRECTORY_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_directory_descriptor.json");
 const LIX_BINARY_BLOB_REF_SCHEMA_JSON: &str = include_str!("lix_binary_blob_ref.json");
 
-static LIX_STORED_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
+static LIX_REGISTERED_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_KEY_VALUE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_ACCOUNT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_ACTIVE_ACCOUNT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
@@ -63,7 +63,7 @@ static LIX_DIRECTORY_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_BINARY_BLOB_REF_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 
 const BUILTIN_SCHEMA_KEYS: &[&str] = &[
-    LIX_STORED_SCHEMA_KEY,
+    LIX_REGISTERED_SCHEMA_KEY,
     LIX_KEY_VALUE_SCHEMA_KEY,
     LIX_ACCOUNT_SCHEMA_KEY,
     LIX_ACTIVE_ACCOUNT_SCHEMA_KEY,
@@ -89,9 +89,9 @@ pub(crate) fn builtin_schema_keys() -> &'static [&'static str] {
 
 pub(crate) fn builtin_schema_definition(schema_key: &str) -> Option<&'static JsonValue> {
     match schema_key {
-        LIX_STORED_SCHEMA_KEY => {
-            Some(LIX_STORED_SCHEMA.get_or_init(|| parse_stored_schema_with_inlined_definition()))
-        }
+        LIX_REGISTERED_SCHEMA_KEY => Some(
+            LIX_REGISTERED_SCHEMA.get_or_init(|| parse_registered_schema_with_inlined_definition()),
+        ),
         LIX_KEY_VALUE_SCHEMA_KEY => {
             Some(LIX_KEY_VALUE_SCHEMA.get_or_init(|| {
                 parse_builtin_schema("lix_key_value.json", LIX_KEY_VALUE_SCHEMA_JSON)
@@ -171,7 +171,7 @@ pub(crate) fn builtin_schema_definition(schema_key: &str) -> Option<&'static Jso
 #[allow(dead_code)]
 pub(crate) fn builtin_schema_json(schema_key: &str) -> Option<&'static str> {
     match schema_key {
-        LIX_STORED_SCHEMA_KEY => Some(LIX_STORED_SCHEMA_JSON),
+        LIX_REGISTERED_SCHEMA_KEY => Some(LIX_REGISTERED_SCHEMA_JSON),
         LIX_KEY_VALUE_SCHEMA_KEY => Some(LIX_KEY_VALUE_SCHEMA_JSON),
         LIX_ACCOUNT_SCHEMA_KEY => Some(LIX_ACCOUNT_SCHEMA_JSON),
         LIX_ACTIVE_ACCOUNT_SCHEMA_KEY => Some(LIX_ACTIVE_ACCOUNT_SCHEMA_JSON),
@@ -203,14 +203,14 @@ fn parse_builtin_schema(file_name: &str, raw_json: &str) -> JsonValue {
     })
 }
 
-fn parse_stored_schema_with_inlined_definition() -> JsonValue {
-    let mut schema = parse_builtin_schema("lix_stored_schema.json", LIX_STORED_SCHEMA_JSON);
+fn parse_registered_schema_with_inlined_definition() -> JsonValue {
+    let mut schema = parse_builtin_schema("lix_registered_schema.json", LIX_REGISTERED_SCHEMA_JSON);
     let value_schema = schema
         .pointer_mut("/properties/value")
-        .expect("lix_stored_schema.json must define /properties/value");
+        .expect("lix_registered_schema.json must define /properties/value");
     let value_schema_object = value_schema
         .as_object_mut()
-        .expect("lix_stored_schema.json /properties/value must be an object");
+        .expect("lix_registered_schema.json /properties/value must be an object");
 
     value_schema_object.insert(
         "allOf".to_string(),
@@ -247,12 +247,13 @@ mod tests {
     }
 
     #[test]
-    fn stored_schema_value_inlines_lix_schema_definition() {
-        let schema = builtin_schema_definition("lix_stored_schema").expect("schema should exist");
+    fn registered_schema_value_inlines_lix_schema_definition() {
+        let schema =
+            builtin_schema_definition("lix_registered_schema").expect("schema should exist");
         let all_of = schema
             .pointer("/properties/value/allOf")
             .and_then(|value| value.as_array())
-            .expect("stored schema value must define allOf array");
+            .expect("registered schema value must define allOf array");
         assert_eq!(all_of.len(), 1);
         assert_eq!(all_of[0], *crate::schema::lix_schema_definition());
     }

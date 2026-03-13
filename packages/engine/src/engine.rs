@@ -577,7 +577,7 @@ mod tests {
     use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
     use crate::version::active_version_schema_key;
     use crate::{
-        LixError, NoopWasmRuntime, QueryResult, SnapshotChunkReader, Value, WasmComponentInstance,
+        ImageChunkReader, LixError, NoopWasmRuntime, QueryResult, Value, WasmComponentInstance,
     };
     use async_trait::async_trait;
     use serde_json::json;
@@ -602,7 +602,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct EmptySnapshotReader;
+    struct EmptyImageReader;
 
     struct NoopWasmComponentInstance;
 
@@ -649,9 +649,9 @@ mod tests {
             }))
         }
 
-        async fn restore_from_snapshot(
+        async fn restore_from_image(
             &self,
-            reader: &mut dyn SnapshotChunkReader,
+            reader: &mut dyn ImageChunkReader,
         ) -> Result<(), LixError> {
             while reader.read_chunk().await?.is_some() {}
             let mut guard = self
@@ -704,7 +704,7 @@ mod tests {
                 .push(sql.to_string());
             if sql.contains("lix_deterministic_mode")
                 || sql.contains("lix_internal_live_untracked_v1")
-                || sql.contains("lix_internal_stored_schema_bootstrap")
+                || sql.contains("lix_internal_registered_schema_bootstrap")
             {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -732,7 +732,7 @@ mod tests {
     }
 
     #[async_trait(?Send)]
-    impl SnapshotChunkReader for EmptySnapshotReader {
+    impl ImageChunkReader for EmptyImageReader {
         async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, LixError> {
             Ok(None)
         }
@@ -981,7 +981,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_from_snapshot_refreshes_active_version_and_plugin_caches() {
+    async fn restore_from_image_refreshes_active_version_and_plugin_caches() {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
         let active_version_snapshot = Arc::new(RwLock::new(active_version_snapshot_json("before")));
@@ -1025,11 +1025,11 @@ mod tests {
             );
         }
 
-        let mut reader = EmptySnapshotReader;
+        let mut reader = EmptyImageReader;
         engine
-            .restore_from_snapshot(&mut reader)
+            .restore_from_image(&mut reader)
             .await
-            .expect("restore_from_snapshot should succeed");
+            .expect("restore_from_image should succeed");
 
         assert_eq!(
             engine

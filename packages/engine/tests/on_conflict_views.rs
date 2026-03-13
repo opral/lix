@@ -28,7 +28,7 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
     engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
+             'lix_registered_schema',\
              '{\"value\":{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -242,7 +242,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    on_conflict_stored_schema_by_version_do_nothing_is_supported,
+    on_conflict_registered_schema_by_version_do_nothing_is_supported,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
@@ -254,7 +254,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_stored_schema_by_version (value, lixcol_version_id) \
+                "INSERT INTO lix_registered_schema_by_version (value, lixcol_version_id) \
                  VALUES (lix_json(?1), 'global') \
                  ON CONFLICT (entity_id, file_id, version_id) DO NOTHING",
                 &[Value::Text(schema_json.to_string())],
@@ -264,7 +264,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_stored_schema_by_version (value, lixcol_version_id) \
+                "INSERT INTO lix_registered_schema_by_version (value, lixcol_version_id) \
                  VALUES (lix_json(?1), 'global') \
                  ON CONFLICT (entity_id, file_id, version_id) DO NOTHING",
                 &[Value::Text(schema_json.to_string())],
@@ -275,7 +275,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT COUNT(*) \
-                 FROM lix_internal_stored_schema_bootstrap \
+                 FROM lix_internal_registered_schema_bootstrap \
                  WHERE entity_id = 'on_conflict_schema~1' \
                    AND file_id = 'lix' \
                    AND version_id = 'global'",

@@ -149,7 +149,6 @@ impl CanonicalWorkingChangesScan {
 pub(crate) enum CanonicalAdminKind {
     ActiveVersion,
     ActiveAccount,
-    StoredSchema,
     Version,
 }
 
@@ -168,7 +167,6 @@ impl CanonicalAdminScan {
         let kind = match binding.descriptor.public_name.as_str() {
             "lix_active_version" => CanonicalAdminKind::ActiveVersion,
             "lix_active_account" => CanonicalAdminKind::ActiveAccount,
-            "lix_stored_schema" => CanonicalAdminKind::StoredSchema,
             "lix_version" => CanonicalAdminKind::Version,
             _ => return None,
         };
@@ -712,7 +710,6 @@ mod tests {
             schema_key: "lix_key_value".to_string(),
             visible_columns: vec!["key".to_string(), "value".to_string()],
             column_types: BTreeMap::new(),
-            fixed_version_id: None,
             predicate_overrides: Vec::new(),
         });
 

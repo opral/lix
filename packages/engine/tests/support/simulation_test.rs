@@ -15,6 +15,7 @@ use lix_engine::{
     LiveStateApplyReport, LiveStateRebuildDebugMode, LiveStateRebuildPlan, LiveStateRebuildReport,
     LiveStateRebuildRequest, LiveStateRebuildScope, LixBackend, LixError, Value, WasmRuntime,
 };
+use serde_json::Value as JsonValue;
 use tokio::sync::Mutex as TokioMutex;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -107,6 +108,10 @@ impl SimulationEngine {
 
     pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
         self.engine.install_plugin(archive_bytes).await
+    }
+
+    pub async fn register_schema(&self, schema: &JsonValue) -> Result<(), LixError> {
+        self.engine.register_schema(schema).await
     }
 
     pub async fn live_state_rebuild_plan(

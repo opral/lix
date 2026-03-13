@@ -9,13 +9,11 @@ use crate::engine::{Engine, ExecuteOptions};
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
 use crate::plugin::types::PluginManifest;
-use crate::schema::{validate_lix_schema_definition, SchemaKey};
+use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 use crate::{LixError, LixTransaction, StateCommitStreamChange, Value};
 
-const INSTALL_STORED_SCHEMA_SQL: &str =
-    "INSERT INTO lix_stored_schema_by_version (value, lixcol_version_id) \
-     VALUES (lix_json(?), 'global') \
-     ON CONFLICT (lixcol_entity_id, lixcol_file_id, lixcol_version_id) DO NOTHING";
+const INSTALL_REGISTERED_SCHEMA_SQL: &str =
+    "INSERT INTO lix_registered_schema (value) VALUES (lix_json(?))";
 
 struct ParsedPluginArchive {
     manifest: PluginManifest,
@@ -90,7 +88,7 @@ async fn install_plugin_in_transaction(
         engine
             .execute_with_options_in_transaction(
                 transaction,
-                INSTALL_STORED_SCHEMA_SQL,
+                INSTALL_REGISTERED_SCHEMA_SQL,
                 &[Value::Text(schema.normalized_schema_json.clone())],
                 options,
                 false,
@@ -195,7 +193,7 @@ fn parse_plugin_archive(archive_bytes: &[u8]) -> Result<ParsedPluginArchive, Lix
                 ),
             })?;
         validate_lix_schema_definition(&schema_json)?;
-        let schema_key = extract_schema_key(&schema_json)?;
+        let schema_key = schema_key_from_definition(&schema_json)?;
         if !seen_schema_keys.insert((
             schema_key.schema_key.clone(),
             schema_key.schema_version.clone(),
@@ -226,31 +224,6 @@ fn parse_plugin_archive(archive_bytes: &[u8]) -> Result<ParsedPluginArchive, Lix
         wasm_bytes,
         schemas,
     })
-}
-
-fn extract_schema_key(schema: &JsonValue) -> Result<SchemaKey, LixError> {
-    let object = schema.as_object().ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "schema definition must be a JSON object".to_string(),
-    })?;
-    let schema_key = object
-        .get("x-lix-key")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "schema definition must include string x-lix-key".to_string(),
-        })?;
-    let schema_version = object
-        .get("x-lix-version")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "schema definition must include string x-lix-version".to_string(),
-        })?;
-    Ok(SchemaKey::new(
-        schema_key.to_string(),
-        schema_version.to_string(),
-    ))
 }
 
 fn read_archive_files(archive_bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, LixError> {

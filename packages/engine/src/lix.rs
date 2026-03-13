@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde_json::Value as JsonValue;
 
 use crate::{
     boot::EngineConfig, observe::observe_owned, BootKeyValue, CreateCheckpointResult,
-    CreateVersionOptions, CreateVersionResult, Engine, ExecuteOptions, ExecuteResult, LixBackend,
-    LixError, ObserveEventsOwned, ObserveQuery, SnapshotChunkWriter, Value, WasmRuntime,
+    CreateVersionOptions, CreateVersionResult, Engine, ExecuteOptions, ExecuteResult,
+    ImageChunkWriter, LixBackend, LixError, ObserveEventsOwned, ObserveQuery, Value, WasmRuntime,
 };
 
 pub struct LixConfig {
@@ -99,20 +100,24 @@ impl Lix {
         self.engine.install_plugin(archive_bytes).await
     }
 
-    pub async fn export_snapshot(&self) -> Result<Vec<u8>, LixError> {
-        let mut writer = VecSnapshotWriter::default();
-        self.engine.export_snapshot(&mut writer).await?;
+    pub async fn register_schema(&self, schema: &JsonValue) -> Result<(), LixError> {
+        self.engine.register_schema(schema).await
+    }
+
+    pub async fn export_image(&self) -> Result<Vec<u8>, LixError> {
+        let mut writer = VecImageWriter::default();
+        self.engine.export_image(&mut writer).await?;
         Ok(writer.bytes)
     }
 }
 
 #[derive(Default)]
-struct VecSnapshotWriter {
+struct VecImageWriter {
     bytes: Vec<u8>,
 }
 
 #[async_trait(?Send)]
-impl SnapshotChunkWriter for VecSnapshotWriter {
+impl ImageChunkWriter for VecImageWriter {
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), LixError> {
         self.bytes.extend_from_slice(chunk);
         Ok(())
