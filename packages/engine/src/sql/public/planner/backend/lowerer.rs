@@ -2326,29 +2326,14 @@ fn entity_source_predicates(
     surface_binding: &SurfaceBinding,
     schema_key: &str,
 ) -> (String, Vec<String>) {
-    let mut predicates = vec![format!(
+    let predicates = vec![format!(
         "{} = '{}'",
         render_identifier("schema_key"),
         escape_sql_string(schema_key)
     )];
 
     let source_table = match surface_binding.descriptor.surface_variant {
-        SurfaceVariant::Default => {
-            if let Some(version_id) = surface_binding
-                .implicit_overrides
-                .fixed_version_id
-                .as_deref()
-            {
-                predicates.push(format!(
-                    "{} = '{}'",
-                    render_identifier("version_id"),
-                    escape_sql_string(version_id)
-                ));
-                "lix_state_by_version".to_string()
-            } else {
-                "lix_state".to_string()
-            }
-        }
+        SurfaceVariant::Default => "lix_state".to_string(),
         SurfaceVariant::ByVersion => "lix_state_by_version".to_string(),
         SurfaceVariant::History => "lix_state_history".to_string(),
         SurfaceVariant::Active | SurfaceVariant::WorkingChanges => {
@@ -2710,7 +2695,6 @@ mod tests {
                 schema_key: "message".to_string(),
                 visible_columns: vec!["body".to_string(), "id".to_string()],
                 column_types: BTreeMap::new(),
-                fixed_version_id: None,
                 predicate_overrides: vec![
                     crate::sql::public::catalog::SurfaceOverridePredicate {
                         column: "file_id".to_string(),

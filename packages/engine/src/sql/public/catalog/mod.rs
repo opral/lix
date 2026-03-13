@@ -83,7 +83,6 @@ pub(crate) struct SurfaceResolutionCapabilities {
 pub(crate) struct SurfaceImplicitOverrides {
     pub(crate) fixed_schema_key: Option<String>,
     pub(crate) expose_version_id: bool,
-    pub(crate) fixed_version_id: Option<String>,
     pub(crate) predicate_overrides: Vec<SurfaceOverridePredicate>,
 }
 
@@ -143,7 +142,6 @@ pub(crate) struct DynamicEntitySurfaceSpec {
     pub(crate) schema_key: String,
     pub(crate) visible_columns: Vec<String>,
     pub(crate) column_types: BTreeMap<String, SurfaceColumnType>,
-    pub(crate) fixed_version_id: Option<String>,
     pub(crate) predicate_overrides: Vec<SurfaceOverridePredicate>,
 }
 
@@ -606,7 +604,6 @@ fn entity_descriptors_from_spec(
             implicit_overrides: SurfaceImplicitOverrides {
                 fixed_schema_key: Some(spec.schema_key.clone()),
                 expose_version_id: false,
-                fixed_version_id: spec.fixed_version_id.clone(),
                 predicate_overrides: entity_override_predicates_for_variant(
                     &spec.predicate_overrides,
                     SurfaceVariant::Default,
@@ -638,7 +635,6 @@ fn entity_descriptors_from_spec(
             implicit_overrides: SurfaceImplicitOverrides {
                 fixed_schema_key: Some(spec.schema_key.clone()),
                 expose_version_id: true,
-                fixed_version_id: spec.fixed_version_id.clone(),
                 predicate_overrides: entity_override_predicates_for_variant(
                     &spec.predicate_overrides,
                     SurfaceVariant::ByVersion,
@@ -670,7 +666,6 @@ fn entity_descriptors_from_spec(
             implicit_overrides: SurfaceImplicitOverrides {
                 fixed_schema_key: Some(spec.schema_key.clone()),
                 expose_version_id: true,
-                fixed_version_id: spec.fixed_version_id.clone(),
                 predicate_overrides: entity_override_predicates_for_variant(
                     &spec.predicate_overrides,
                     SurfaceVariant::History,
@@ -721,15 +716,13 @@ fn entity_surface_spec_from_schema(
         .unwrap_or_default();
 
     let evaluator = CelEvaluator::new();
-    let fixed_version_id =
-        extract_lixcol_string_override(schema, schema_key, "lixcol_version_id", &evaluator)?;
+    reject_removed_lixcol_version_override(schema, schema_key)?;
     let predicate_overrides = collect_override_predicates(schema, schema_key, &evaluator)?;
 
     Ok(DynamicEntitySurfaceSpec {
         schema_key: schema_key.to_string(),
         visible_columns,
         column_types,
-        fixed_version_id,
         predicate_overrides,
     })
 }
@@ -756,6 +749,23 @@ fn raw_lixcol_override_expression<'a>(schema: &'a JsonValue, key: &str) -> Optio
         .and_then(JsonValue::as_str)
 }
 
+fn reject_removed_lixcol_version_override(
+    schema: &JsonValue,
+    schema_key: &str,
+) -> Result<(), LixError> {
+    if raw_lixcol_override_expression(schema, "lixcol_version_id").is_some() {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "schema '{}' uses removed x-lix-override-lixcols.lixcol_version_id support; use lixcol_global for global write scope",
+                schema_key
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 fn evaluate_lixcol_override(
     schema: &JsonValue,
     schema_key: &str,
@@ -779,27 +789,6 @@ fn evaluate_lixcol_override(
                 schema_key, key, error.description
             ),
         })
-}
-
-fn extract_lixcol_string_override(
-    schema: &JsonValue,
-    schema_key: &str,
-    key: &str,
-    evaluator: &CelEvaluator,
-) -> Result<Option<String>, LixError> {
-    let Some(value) = evaluate_lixcol_override(schema, schema_key, key, evaluator)? else {
-        return Ok(None);
-    };
-    match value {
-        JsonValue::String(text) => Ok(Some(text)),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "x-lix-override-lixcols '{}.{}' must evaluate to a string",
-                schema_key, key
-            ),
-        }),
-    }
 }
 
 fn extract_lixcol_scalar_override(
@@ -1220,7 +1209,6 @@ mod tests {
             schema_key: "lix_key_value".to_string(),
             visible_columns: vec!["key".to_string(), "value".to_string()],
             column_types: BTreeMap::new(),
-            fixed_version_id: None,
             predicate_overrides: Vec::new(),
         });
 
@@ -1280,7 +1268,6 @@ mod tests {
             binding.implicit_overrides.fixed_schema_key.as_deref(),
             Some("lix_stored_schema")
         );
-        assert_eq!(binding.implicit_overrides.fixed_version_id.as_deref(), None);
     }
 
     #[test]
@@ -1370,7 +1357,6 @@ mod tests {
             spec.visible_columns,
             vec!["id".to_string(), "message".to_string()]
         );
-        assert_eq!(spec.fixed_version_id, None);
     }
 
     #[test]
@@ -1390,11 +1376,31 @@ mod tests {
         }))
         .expect("schema spec should derive");
 
-        assert_eq!(spec.fixed_version_id, None);
         assert_eq!(spec.predicate_overrides.len(), 3);
         assert!(spec.predicate_overrides.iter().any(|predicate| {
             predicate.column == "global" && predicate.value == SurfaceOverrideValue::Boolean(true)
         }));
+    }
+
+    #[test]
+    fn entity_surface_spec_rejects_removed_lixcol_version_override() {
+        let err = entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "message",
+            "x-lix-version": "1",
+            "x-lix-override-lixcols": {
+                "lixcol_version_id": "\"global\""
+            },
+            "properties": {
+                "id": { "type": "string" }
+            }
+        }))
+        .expect_err("removed lixcol_version_id override should be rejected");
+
+        assert!(
+            err.description
+                .contains("x-lix-override-lixcols.lixcol_version_id"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
