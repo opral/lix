@@ -289,6 +289,10 @@ impl Engine {
 
         let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
         state_commit_stream_changes.extend(execution.state_commit_stream_changes);
+        self.maybe_invalidate_deterministic_settings_cache(
+            &prepared.plan.preprocess.mutations,
+            &state_commit_stream_changes,
+        );
         let should_emit_observe_tick = !state_commit_stream_changes.is_empty();
 
         if !effects_are_authoritative

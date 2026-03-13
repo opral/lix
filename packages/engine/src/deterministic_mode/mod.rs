@@ -27,6 +27,10 @@ pub struct DeterministicSettings {
     pub timestamp_shuffle_enabled: bool,
 }
 
+pub(crate) fn deterministic_mode_key() -> &'static str {
+    DETERMINISTIC_MODE_KEY
+}
+
 impl DeterministicSettings {
     pub fn disabled() -> Self {
         Self {
@@ -149,37 +153,30 @@ pub async fn persist_sequence_highest(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DeterministicRuntimeState {
-    pub settings: DeterministicSettings,
-    pub next_sequence: i64,
-}
-
-pub(crate) async fn load_runtime_state(
+pub(crate) async fn load_runtime_settings(
     backend: &dyn LixBackend,
-) -> Result<DeterministicRuntimeState, LixError> {
-    let values =
-        match load_key_value_payloads(backend, &[DETERMINISTIC_MODE_KEY, SEQUENCE_KEY]).await {
-            Ok(values) => values,
-            Err(err) if is_missing_relation_error(&err) => {
-                return Ok(DeterministicRuntimeState {
-                    settings: DeterministicSettings::disabled(),
-                    next_sequence: 0,
-                })
-            }
-            Err(err) => return Err(err),
-        };
+) -> Result<DeterministicSettings, LixError> {
+    let values = match load_key_value_payloads(backend, &[DETERMINISTIC_MODE_KEY]).await {
+        Ok(values) => values,
+        Err(err) if is_missing_relation_error(&err) => return Ok(DeterministicSettings::disabled()),
+        Err(err) => return Err(err),
+    };
 
-    let settings = values
+    Ok(values
         .get(DETERMINISTIC_MODE_KEY)
         .map(parse_deterministic_settings_value)
-        .unwrap_or_else(DeterministicSettings::disabled);
-    let highest_seen = values.get(SEQUENCE_KEY).and_then(parse_integer_value);
+        .unwrap_or_else(DeterministicSettings::disabled))
+}
 
-    Ok(DeterministicRuntimeState {
-        settings,
-        next_sequence: highest_seen.unwrap_or(-1) + 1,
-    })
+pub(crate) async fn load_runtime_sequence_start(backend: &dyn LixBackend) -> Result<i64, LixError> {
+    let values = match load_key_value_payloads(backend, &[SEQUENCE_KEY]).await {
+        Ok(values) => values,
+        Err(err) if is_missing_relation_error(&err) => return Ok(0),
+        Err(err) => return Err(err),
+    };
+
+    let highest_seen = values.get(SEQUENCE_KEY).and_then(parse_integer_value);
+    Ok(highest_seen.unwrap_or(-1) + 1)
 }
 
 pub(crate) fn build_persist_sequence_highest_batch(
