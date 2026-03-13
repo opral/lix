@@ -10,6 +10,7 @@ pub(crate) mod script;
 pub(crate) mod stored_schema;
 pub(crate) mod vtable_read;
 pub(crate) mod vtable_write;
+pub(crate) mod write_program;
 
 use crate::cel::CelEvaluator;
 use crate::functions::LixFunctionProvider;

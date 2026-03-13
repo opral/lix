@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 
 use crate::functions::LixFunctionProvider;
 use crate::schema::builtin::types::LixVersionPointer;
+use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
+use crate::state::internal::write_program::WriteProgram;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, LixTransaction, QueryResult, Value};
 use async_trait::async_trait;
@@ -181,12 +183,32 @@ pub(crate) async fn append_commit_if_preconditions_hold(
         .iter()
         .map(|change| change.version_id.clone())
         .collect::<BTreeSet<_>>();
+    let lane_version_id = match &concrete_lane {
+        ConcreteWriteLane::Version { version_id } => Some(version_id.clone()),
+        ConcreteWriteLane::GlobalAdmin => None,
+    };
+    let versions_to_load = affected_versions
+        .iter()
+        .filter(|version_id| Some((*version_id).clone()) != lane_version_id)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut versions = {
         let mut executor = TransactionCommitExecutor { transaction };
-        load_version_info_for_versions(&mut executor, &affected_versions)
+        load_version_info_for_versions(&mut executor, &versions_to_load)
             .await
             .map_err(backend_error)?
     };
+    if let Some(version_id) = lane_version_id.as_ref() {
+        versions.insert(
+            version_id.clone(),
+            VersionInfo {
+                parent_commit_ids: current_tip.clone().into_iter().collect(),
+                snapshot: VersionSnapshot {
+                    id: version_id.clone(),
+                },
+            },
+        );
+    }
     if matches!(concrete_lane, ConcreteWriteLane::GlobalAdmin) {
         let global_version = versions
             .entry(GLOBAL_VERSION_ID.to_string())
@@ -228,18 +250,20 @@ pub(crate) async fn append_commit_if_preconditions_hold(
     )
     .map_err(backend_error)?;
 
-    transaction
-        .execute(&prepared_batch.sql, &prepared_batch.params)
+    let mut write_program = WriteProgram::new();
+    write_program.push_batch(prepared_batch);
+    write_program.push_statement(
+        insert_idempotency_row_sql(
+            &concrete_lane,
+            &args.preconditions.idempotency_key,
+            &committed_tip,
+            &args.timestamp,
+        ),
+        Vec::new(),
+    );
+    execute_write_program_with_transaction(transaction, write_program)
         .await
         .map_err(backend_error)?;
-    insert_idempotency_row(
-        transaction,
-        &concrete_lane,
-        &args.preconditions.idempotency_key,
-        &committed_tip,
-        &args.timestamp,
-    )
-    .await?;
 
     Ok(AppendCommitResult {
         disposition: AppendCommitDisposition::Applied,
@@ -456,14 +480,13 @@ fn extract_committed_tip_id(
     Ok(pointer.commit_id)
 }
 
-async fn insert_idempotency_row(
-    transaction: &mut dyn LixTransaction,
+fn insert_idempotency_row_sql(
     concrete_lane: &ConcreteWriteLane,
     idempotency_key: &str,
     commit_id: &str,
     created_at: &str,
-) -> Result<(), AppendCommitError> {
-    let sql = format!(
+) -> String {
+    format!(
         "INSERT INTO {table_name} (write_lane, idempotency_key, commit_id, created_at) \
          VALUES ('{write_lane}', '{idempotency_key}', '{commit_id}', '{created_at}')",
         table_name = COMMIT_IDEMPOTENCY_TABLE,
@@ -471,12 +494,7 @@ async fn insert_idempotency_row(
         idempotency_key = escape_sql_string(idempotency_key),
         commit_id = escape_sql_string(commit_id),
         created_at = escape_sql_string(created_at),
-    );
-    transaction
-        .execute(&sql, &[])
-        .await
-        .map_err(backend_error)?;
-    Ok(())
+    )
 }
 
 fn lane_storage_key(concrete_lane: &ConcreteWriteLane) -> String {
