@@ -173,7 +173,9 @@ pub(crate) enum PublicWriteExecutionPartition {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TrackedWriteExecution {
     pub(crate) schema_registrations: Vec<SchemaRegistration>,
-    pub(crate) domain_change_batch: DomainChangeBatch,
+    pub(crate) domain_change_batch: Option<DomainChangeBatch>,
+    pub(crate) lazy_exact_file_metadata_update:
+        Option<crate::sql::public::planner::ir::LazyExactFileMetadataUpdate>,
     pub(crate) append_preconditions: AppendCommitPreconditions,
     pub(crate) semantic_effects: PlanEffects,
     pub(crate) persist_filesystem_payloads_before_write: bool,
@@ -1604,9 +1606,6 @@ fn build_public_write_execution(
 
         match partition.execution_mode {
             crate::sql::public::planner::ir::WriteMode::Tracked => {
-                let Some(domain_change_batch) = tracked_batches.next().cloned() else {
-                    return Ok(None);
-                };
                 let Some(commit_preconditions) = tracked_preconditions.next() else {
                     return Ok(None);
                 };
@@ -1614,18 +1613,37 @@ fn build_public_write_execution(
                     return Ok(None);
                 }
 
+                let lazy_exact_file_metadata_update =
+                    partition.lazy_exact_file_metadata_update.clone();
+                let domain_change_batch = if lazy_exact_file_metadata_update.is_some() {
+                    None
+                } else {
+                    let Some(domain_change_batch) = tracked_batches.next().cloned() else {
+                        return Ok(None);
+                    };
+                    Some(domain_change_batch)
+                };
+
                 partitions.push(PublicWriteExecutionPartition::Tracked(
                     TrackedWriteExecution {
                         schema_registrations: schema_registrations_from_partition(partition),
                         append_preconditions: append_commit_preconditions_for_public_write(
                             planned_write,
-                            &domain_change_batch,
+                            domain_change_batch.as_ref(),
                             commit_preconditions,
                         )?,
-                        semantic_effects: semantic_plan_effects_from_domain_changes(
-                            &domain_change_batch.changes,
-                            state_commit_stream_operation(planned_write.command.operation_kind),
-                        )?,
+                        semantic_effects: domain_change_batch
+                            .as_ref()
+                            .map(|domain_change_batch| {
+                                semantic_plan_effects_from_domain_changes(
+                                    &domain_change_batch.changes,
+                                    state_commit_stream_operation(
+                                        planned_write.command.operation_kind,
+                                    ),
+                                )
+                            })
+                            .transpose()?
+                            .unwrap_or_default(),
                         persist_filesystem_payloads_before_write,
                         filesystem_payload_changes_committed_by_write:
                             public_write_commits_filesystem_payload_domain_changes(
@@ -1633,6 +1651,7 @@ fn build_public_write_execution(
                                 partition,
                             ),
                         domain_change_batch,
+                        lazy_exact_file_metadata_update,
                     },
                 ));
             }
@@ -1828,7 +1847,9 @@ fn public_write_persists_filesystem_payloads(
     )
 }
 
-fn state_commit_stream_operation(operation_kind: WriteOperationKind) -> StateCommitStreamOperation {
+pub(crate) fn state_commit_stream_operation(
+    operation_kind: WriteOperationKind,
+) -> StateCommitStreamOperation {
     match operation_kind {
         WriteOperationKind::Insert => StateCommitStreamOperation::Insert,
         WriteOperationKind::Update => StateCommitStreamOperation::Update,
@@ -1838,7 +1859,7 @@ fn state_commit_stream_operation(operation_kind: WriteOperationKind) -> StateCom
 
 fn append_commit_preconditions_for_public_write(
     planned_write: &PlannedWrite,
-    batch: &DomainChangeBatch,
+    batch: Option<&DomainChangeBatch>,
     commit_preconditions: &CommitPreconditions,
 ) -> Result<AppendCommitPreconditions, LixError> {
     let write_lane = match &commit_preconditions.write_lane {
@@ -1847,9 +1868,10 @@ fn append_commit_preconditions_for_public_write(
         }
         crate::sql::public::planner::ir::WriteLane::ActiveVersion => {
             let version_id = batch
-                .changes
-                .first()
+                .into_iter()
+                .flat_map(|batch| batch.changes.first())
                 .map(|change| change.version_id.clone())
+                .next()
                 .or_else(|| {
                     planned_write
                         .command
@@ -1942,7 +1964,7 @@ fn semantic_plan_effects_from_untracked_public_write(
     Ok(effects)
 }
 
-fn semantic_plan_effects_from_domain_changes(
+pub(crate) fn semantic_plan_effects_from_domain_changes(
     changes: &[ProposedDomainChange],
     stream_operation: StateCommitStreamOperation,
 ) -> Result<PlanEffects, LixError> {

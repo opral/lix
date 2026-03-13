@@ -555,6 +555,28 @@ pub(crate) struct RowLineage {
     pub(crate) source_commit_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OptionalTextPatch {
+    Unchanged,
+    Set(Option<String>),
+}
+
+impl OptionalTextPatch {
+    pub(crate) fn apply(&self, current: Option<String>) -> Option<String> {
+        match self {
+            Self::Unchanged => current,
+            Self::Set(value) => value.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LazyExactFileMetadataUpdate {
+    pub(crate) file_id: String,
+    pub(crate) version_id: String,
+    pub(crate) metadata: OptionalTextPatch,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedWritePartition {
     pub(crate) execution_mode: WriteMode,
@@ -563,6 +585,7 @@ pub(crate) struct ResolvedWritePartition {
     pub(crate) tombstones: Vec<ResolvedRowRef>,
     pub(crate) lineage: Vec<RowLineage>,
     pub(crate) target_write_lane: Option<WriteLane>,
+    pub(crate) lazy_exact_file_metadata_update: Option<LazyExactFileMetadataUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -654,9 +677,10 @@ impl ResolvedWritePlan {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.partitions
-            .iter()
-            .all(|partition| partition.intended_post_state.is_empty())
+        self.partitions.iter().all(|partition| {
+            partition.intended_post_state.is_empty()
+                && partition.lazy_exact_file_metadata_update.is_none()
+        })
     }
 }
 
