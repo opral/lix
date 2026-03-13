@@ -12,6 +12,11 @@ pub enum SqlDialect {
 pub trait LixBackend: Send + Sync {
     fn dialect(&self) -> SqlDialect;
 
+    /// Executes one engine SQL unit of work.
+    ///
+    /// `sql` may be a single statement or a semicolon-separated batch/script.
+    /// Backends must treat one call as one execution roundtrip.
+    /// `params` bind across the full SQL payload.
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
 
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError>;
@@ -43,6 +48,11 @@ pub trait LixBackend: Send + Sync {
 pub trait LixTransaction {
     fn dialect(&self) -> SqlDialect;
 
+    /// Executes one SQL unit of work inside the current transaction.
+    ///
+    /// `sql` may be a single statement or a semicolon-separated batch/script.
+    /// Backends must treat one call as one execution roundtrip.
+    /// `params` bind across the full SQL payload.
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
 
     async fn commit(self: Box<Self>) -> Result<(), LixError>;
