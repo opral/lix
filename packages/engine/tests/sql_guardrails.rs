@@ -288,6 +288,329 @@ fn guardrail_legacy_canonical_statement_rewrite_is_filesystem_blind() {
 }
 
 #[test]
+fn guardrail_filesystem_insert_planning_stays_out_of_write_resolver() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let write_resolver =
+        fs::read_to_string(root.join("src/sql/public/planner/semantics/write_resolver.rs"))
+            .expect("write_resolver.rs should be readable");
+    let filesystem_writes = fs::read_to_string(
+        root.join("src/sql/public/planner/semantics/write_resolver/filesystem_writes.rs"),
+    )
+    .expect("filesystem_writes.rs should be readable");
+    let filesystem_planning =
+        fs::read_to_string(root.join("src/sql/public/planner/semantics/filesystem_planning.rs"))
+            .expect("filesystem_planning.rs should be readable");
+
+    for required in ["plan_directory_insert_batch(", "plan_file_insert_batch("] {
+        assert!(
+            filesystem_writes.contains(required),
+            "filesystem_writes.rs must delegate filesystem insert planning via {required}"
+        );
+        assert!(
+            !write_resolver.contains(required),
+            "write_resolver.rs must not bypass filesystem_writes.rs for filesystem insert planning via {required}"
+        );
+    }
+
+    for forbidden in [
+        "PendingFilesystemInsertBatch",
+        "resolve_file_insert_target(",
+        "resolve_directory_insert_target(",
+        "finalize_pending_directory_insert_batch(",
+        "finalize_pending_file_insert_batch(",
+        "ensure_parent_directories_for_insert_batch(",
+        "lookup_directory_id_by_path_in_insert_batch(",
+        "lookup_directory_path_by_id_in_insert_batch(",
+        "ensure_no_file_at_directory_path_in_insert_batch(",
+        "ensure_no_directory_at_file_path_in_insert_batch(",
+    ] {
+        assert!(
+            !write_resolver.contains(forbidden),
+            "write_resolver must not reintroduce filesystem insert planning helper {forbidden}"
+        );
+        assert!(
+            filesystem_planning.contains(forbidden),
+            "filesystem_planning.rs should own extracted helper {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn guardrail_generic_filesystem_queries_stay_out_of_write_resolver() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let write_resolver =
+        fs::read_to_string(root.join("src/sql/public/planner/semantics/write_resolver.rs"))
+            .expect("write_resolver.rs should be readable");
+    let filesystem_queries =
+        fs::read_to_string(root.join("src/sql/public/planner/semantics/filesystem_queries.rs"))
+            .expect("filesystem_queries.rs should be readable");
+
+    for forbidden_definition in [
+        "async fn lookup_directory_id_by_path(",
+        "async fn lookup_file_id_by_path(",
+        "async fn lookup_directory_path_by_id(",
+        "async fn load_directory_row_by_id(",
+        "async fn load_directory_row_by_path(",
+        "async fn load_file_row_by_id(",
+        "async fn load_file_row_by_path(",
+        "async fn load_directory_rows_under_path(",
+        "async fn load_file_rows_under_path(",
+        "async fn ensure_no_file_at_directory_path(",
+        "async fn ensure_no_directory_at_file_path(",
+        "struct DirectoryFilesystemRow",
+        "struct FileFilesystemRow",
+    ] {
+        assert!(
+            !write_resolver.contains(forbidden_definition),
+            "write_resolver must not define extracted generic filesystem query helper {forbidden_definition}"
+        );
+        assert!(
+            filesystem_queries.contains(forbidden_definition),
+            "filesystem_queries.rs should own extracted helper {forbidden_definition}"
+        );
+    }
+}
+
+#[test]
+fn guardrail_top_level_filesystem_write_coordination_stays_out_of_write_resolver() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let resolver_path = root.join("src/sql/public/planner/semantics/write_resolver.rs");
+    let resolver_source =
+        fs::read_to_string(&resolver_path).expect("write_resolver.rs should be readable");
+    let filesystem_writes_path =
+        root.join("src/sql/public/planner/semantics/write_resolver/filesystem_writes.rs");
+    let filesystem_writes_source = fs::read_to_string(&filesystem_writes_path)
+        .expect("filesystem_writes.rs should be readable");
+
+    assert!(
+        resolver_source.contains("use filesystem_writes::resolve_filesystem_write;"),
+        "write_resolver should delegate top-level filesystem coordination through filesystem_writes.rs"
+    );
+
+    for forbidden in [
+        "async fn resolve_filesystem_write(",
+        "async fn resolve_directory_insert_write_plan(",
+        "async fn resolve_existing_directory_write(",
+        "async fn resolve_file_insert_write_plan(",
+        "async fn resolve_existing_file_write(",
+    ] {
+        assert!(
+            !resolver_source.contains(forbidden),
+            "top-level filesystem write coordinator must stay out of write_resolver.rs: {forbidden}"
+        );
+        assert!(
+            filesystem_writes_source.contains(forbidden),
+            "filesystem_writes.rs should own extracted top-level filesystem coordinator helper: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn guardrail_filesystem_helper_cluster_stays_out_of_write_resolver() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let resolver_path = root.join("src/sql/public/planner/semantics/write_resolver.rs");
+    let resolver_source =
+        fs::read_to_string(&resolver_path).expect("write_resolver.rs should be readable");
+    let filesystem_writes_path =
+        root.join("src/sql/public/planner/semantics/write_resolver/filesystem_writes.rs");
+    let filesystem_writes_source = fs::read_to_string(&filesystem_writes_path)
+        .expect("filesystem_writes.rs should be readable");
+
+    for helper in [
+        "async fn resolve_parent_directory_target(",
+        "async fn resolve_missing_directory_rows(",
+        "async fn resolve_file_update_target(",
+        "fn file_descriptor_changed(",
+        "async fn resolve_directory_update_target(",
+        "struct ProposedDirectoryUpdate",
+        "async fn resolve_directory_update_targets_batch(",
+        "fn resolve_proposed_directory_path(",
+        "async fn load_target_directory_rows_for_selector(",
+        "async fn load_target_file_rows_for_selector(",
+        "async fn assert_no_directory_cycle(",
+        "fn directory_descriptor_row(",
+        "fn file_descriptor_row(",
+        "fn file_descriptor_tombstone_row(",
+        "fn directory_descriptor_tombstone_row(",
+        "fn binary_blob_ref_row(",
+        "fn binary_blob_ref_tombstone_row(",
+        "fn auto_directory_id(",
+        "fn auto_file_id(",
+    ] {
+        assert!(
+            !resolver_source.contains(helper),
+            "filesystem helper cluster must stay out of write_resolver.rs: {helper}"
+        );
+        assert!(
+            filesystem_writes_source.contains(helper),
+            "filesystem_writes.rs should own extracted filesystem helper: {helper}"
+        );
+    }
+}
+
+#[test]
+fn guardrail_effective_state_pushdown_policy_stays_in_surface_semantics() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let effective_state_resolver = fs::read_to_string(
+        root.join("src/sql/public/planner/semantics/effective_state_resolver.rs"),
+    )
+    .expect("effective_state_resolver.rs should be readable");
+    let surface_semantics =
+        fs::read_to_string(root.join("src/sql/public/planner/semantics/surface_semantics.rs"))
+            .expect("surface_semantics.rs should be readable");
+
+    assert!(
+        effective_state_resolver.contains("effective_state_pushdown_predicates("),
+        "effective_state_resolver must delegate pushdown policy through surface_semantics"
+    );
+
+    for helper in [
+        "fn state_predicate_is_pushdown_safe",
+        "fn state_pushdown_column",
+        "fn identifier_column_name",
+        "fn constant_like_expr",
+    ] {
+        assert!(
+            !effective_state_resolver.contains(helper),
+            "effective_state_resolver must not redefine pushdown helper {helper}"
+        );
+        assert!(
+            surface_semantics.contains(helper),
+            "surface_semantics.rs should own extracted pushdown helper {helper}"
+        );
+    }
+}
+
+#[test]
+fn guardrail_state_assignment_semantics_stay_out_of_write_resolver() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let write_resolver =
+        fs::read_to_string(root.join("src/sql/public/planner/semantics/write_resolver.rs"))
+            .expect("write_resolver.rs should be readable");
+    let state_assignments =
+        fs::read_to_string(root.join("src/sql/public/planner/semantics/state_assignments.rs"))
+            .expect("state_assignments.rs should be readable");
+
+    for required_use in [
+        "assignments_from_payload(",
+        "apply_state_assignments(",
+        "apply_entity_state_assignments(",
+        "build_state_insert_row(",
+        "build_entity_insert_rows_from_assignments(",
+        "ensure_identity_columns_preserved(",
+    ] {
+        assert!(
+            write_resolver.contains(required_use),
+            "write_resolver should delegate shared state semantics through {required_use}"
+        );
+    }
+
+    for extracted_definition in [
+        "fn assignments_from_payload(",
+        "fn apply_state_assignments(",
+        "fn build_state_insert_row(",
+        "fn build_entity_insert_rows(",
+        "fn ensure_identity_columns_preserved(",
+        "fn apply_entity_state_assignments(",
+    ] {
+        assert!(
+            !write_resolver.contains(extracted_definition),
+            "write_resolver must not redefine shared state assignment helper {extracted_definition}"
+        );
+        assert!(
+            state_assignments.contains(extracted_definition),
+            "state_assignments.rs should own extracted helper {extracted_definition}"
+        );
+    }
+}
+
+#[test]
+fn guardrail_exact_row_targeting_stays_shared_between_read_and_write() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let write_resolver =
+        fs::read_to_string(root.join("src/sql/public/planner/semantics/write_resolver.rs"))
+            .expect("write_resolver.rs should be readable");
+    let effective_state_resolver = fs::read_to_string(
+        root.join("src/sql/public/planner/semantics/effective_state_resolver.rs"),
+    )
+    .expect("effective_state_resolver.rs should be readable");
+    let ir_mod = fs::read_to_string(root.join("src/sql/public/planner/ir/mod.rs"))
+        .expect("planner ir mod should be readable");
+
+    for required in [
+        "CanonicalStateRowKey",
+        "CanonicalStateSelector",
+        "resolve_exact_effective_state_row(",
+        "ExactEffectiveStateRowRequest {",
+        "targets_single_effective_row(",
+    ] {
+        assert!(
+            write_resolver.contains(required),
+            "write_resolver must share canonical exact-row targeting through {required}"
+        );
+    }
+
+    for required in [
+        "ExactEffectiveStateRowRequest",
+        "row_key: CanonicalStateRowKey",
+        "resolve_exact_effective_state_row(",
+    ] {
+        assert!(
+            effective_state_resolver.contains(required),
+            "effective_state_resolver must share canonical exact-row targeting through {required}"
+        );
+    }
+
+    assert!(
+        ir_mod.contains("fn targets_single_effective_row(&self"),
+        "CanonicalStateRowKey should remain the shared exact-row completeness check"
+    );
+}
+
+#[test]
+fn guardrail_filesystem_path_normalization_stays_in_filesystem_assignments() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let filesystem_assignments =
+        fs::read_to_string(root.join("src/sql/public/planner/semantics/filesystem_assignments.rs"))
+            .expect("filesystem_assignments.rs should be readable");
+    let write_resolver =
+        fs::read_to_string(root.join("src/sql/public/planner/semantics/write_resolver.rs"))
+            .expect("write_resolver.rs should be readable");
+    let filesystem_writes = fs::read_to_string(
+        root.join("src/sql/public/planner/semantics/write_resolver/filesystem_writes.rs"),
+    )
+    .expect("filesystem_writes.rs should be readable");
+    let filesystem_planning =
+        fs::read_to_string(root.join("src/sql/public/planner/semantics/filesystem_planning.rs"))
+            .expect("filesystem_planning.rs should be readable");
+    let filesystem_queries =
+        fs::read_to_string(root.join("src/sql/public/planner/semantics/filesystem_queries.rs"))
+            .expect("filesystem_queries.rs should be readable");
+
+    for helper in [
+        "normalize_directory_path(",
+        "normalize_path_segment(",
+        "parse_file_path(",
+    ] {
+        assert!(
+            filesystem_assignments.contains(helper),
+            "filesystem_assignments.rs should own path normalization helper {helper}"
+        );
+        for (label, source) in [
+            ("write_resolver.rs", &write_resolver),
+            ("filesystem_writes.rs", &filesystem_writes),
+            ("filesystem_planning.rs", &filesystem_planning),
+            ("filesystem_queries.rs", &filesystem_queries),
+        ] {
+            assert!(
+                !source.contains(helper),
+                "{label} must not reintroduce filesystem path normalization helper {helper}"
+            );
+        }
+    }
+}
+
+#[test]
 fn guardrail_legacy_filesystem_mutation_rewrite_is_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
