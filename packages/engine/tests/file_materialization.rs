@@ -991,12 +991,12 @@ simulation_test!(
         let err = engine
             .execute(
                 &format!(
-                    "INSERT INTO lix_state_by_version (\
-                     entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
-                     ) VALUES (\
-                     'blob-ref-missing', 'lix_binary_blob_ref', '1', 'blob-ref-missing', '{}', 'manual', \
-                     '{{\"id\":\"blob-ref-missing\",\"blob_hash\":\"fakehash\",\"size_bytes\":3}}'\
-                     )",
+                    "UPDATE lix_state_by_version \
+                     SET snapshot_content = '{{\"id\":\"blob-ref-missing\",\"blob_hash\":\"fakehash\",\"size_bytes\":3}}' \
+                     WHERE entity_id = 'blob-ref-missing' \
+                       AND schema_key = 'lix_binary_blob_ref' \
+                       AND file_id = 'blob-ref-missing' \
+                       AND version_id = '{}'",
                     version_id
                 ),
                 &[],
@@ -1052,13 +1052,13 @@ simulation_test!(
         engine
             .execute(
                 &format!(
-                    "INSERT INTO lix_state_by_version (\
-                     entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
-                     ) VALUES (\
-                     'blob-target', 'lix_binary_blob_ref', '1', 'blob-target', '{}', 'manual', \
-                     '{{\"id\":\"blob-target\",\"blob_hash\":\"{}\",\"size_bytes\":6}}'\
-                     )",
-                    version_id, source_blob_hash
+                    "UPDATE lix_state_by_version \
+                     SET snapshot_content = '{{\"id\":\"blob-target\",\"blob_hash\":\"{}\",\"size_bytes\":6}}' \
+                     WHERE entity_id = 'blob-target' \
+                       AND schema_key = 'lix_binary_blob_ref' \
+                       AND file_id = 'blob-target' \
+                       AND version_id = '{}'",
+                    source_blob_hash, version_id
                 ),
                 &[],
             )
@@ -1118,12 +1118,12 @@ simulation_test!(
                 Box::pin(async move {
                     tx.execute(
                         &format!(
-                            "INSERT INTO lix_state_by_version (\
-                             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
-                             ) VALUES (\
-                             'blob-ref-missing-tx', 'lix_binary_blob_ref', '1', 'blob-ref-missing-tx', '{}', 'manual', \
-                             '{{\"id\":\"blob-ref-missing-tx\",\"blob_hash\":\"fakehash\",\"size_bytes\":3}}'\
-                             )",
+                            "UPDATE lix_state_by_version \
+                             SET snapshot_content = '{{\"id\":\"blob-ref-missing-tx\",\"blob_hash\":\"fakehash\",\"size_bytes\":3}}' \
+                             WHERE entity_id = 'blob-ref-missing-tx' \
+                               AND schema_key = 'lix_binary_blob_ref' \
+                               AND file_id = 'blob-ref-missing-tx' \
+                               AND version_id = '{}'",
                             version_id
                         ),
                         &[],

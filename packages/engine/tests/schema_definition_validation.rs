@@ -726,59 +726,6 @@ fn x_version_rejects_leading_zeros() {
 }
 
 #[test]
-fn x_lix_unique_is_optional_duplicate() {
-    let schema = json!({
-        "type": "object",
-        "x-lix-key": "mock",
-        "x-lix-version": "1",
-        "properties": {
-            "name": { "type": "string" }
-        },
-        "required": ["name"],
-        "additionalProperties": false
-    });
-
-    assert!(validate_lix_schema_definition(&schema).is_ok());
-}
-
-#[test]
-fn x_lix_unique_must_be_array_of_arrays_when_present_duplicate() {
-    let schema = json!({
-        "type": "object",
-        "x-lix-key": "mock",
-        "x-lix-version": "1",
-        "x-lix-unique": [["/id"], ["/name", "/age"]],
-        "properties": {
-            "id": { "type": "string" },
-            "name": { "type": "string" },
-            "age": { "type": "number" }
-        },
-        "required": ["id", "name", "age"],
-        "additionalProperties": false
-    });
-
-    assert!(validate_lix_schema_definition(&schema).is_ok());
-}
-
-#[test]
-fn x_lix_unique_fails_with_invalid_structure_duplicate() {
-    let schema = json!({
-        "type": "object",
-        "x-lix-key": "mock",
-        "x-lix-version": "1",
-        "x-lix-unique": ["/id", "/name"],
-        "properties": {
-            "id": { "type": "string" },
-            "name": { "type": "string" }
-        },
-        "required": ["id", "name"],
-        "additionalProperties": false
-    });
-
-    assert!(validate_lix_schema_definition(&schema).is_err());
-}
-
-#[test]
 fn x_lix_default_accepts_valid_cel_expression() {
     let schema = json!({
         "type": "object",
