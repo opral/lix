@@ -34,6 +34,10 @@ wasmtime-wasi = "30"
 name = "lix_file_recursive_update"
 harness = false
 
+[[bench]]
+name = "lix_file_update"
+harness = false
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zstd = "0.13"
 futures-timer = "3"

@@ -651,8 +651,8 @@ async fn lookup_directory_id_by_path_in_insert_batch(
         &NormalizedDirectoryPath::from_normalized(path.to_string()),
         lookup_scope,
     )
-        .await
-        .map_err(Into::into)
+    .await
+    .map_err(Into::into)
 }
 
 async fn lookup_directory_path_by_id_in_insert_batch(
@@ -697,8 +697,8 @@ async fn ensure_no_file_at_directory_path_in_insert_batch(
         &NormalizedDirectoryPath::from_normalized(directory_path.to_string()),
         lookup_scope,
     )
-        .await
-        .map_err(Into::into)
+    .await
+    .map_err(Into::into)
 }
 
 async fn ensure_no_directory_at_file_path_in_insert_batch(
@@ -708,8 +708,8 @@ async fn ensure_no_directory_at_file_path_in_insert_batch(
     lookup_scope: FilesystemProjectionScope,
     batch: &PendingFilesystemInsertBatch,
 ) -> Result<(), FilesystemPlanningError> {
-    let file_path =
-        ParsedFilePath::from_normalized_path(file_path.to_string()).map_err(filesystem_path_error)?;
+    let file_path = ParsedFilePath::from_normalized_path(file_path.to_string())
+        .map_err(filesystem_path_error)?;
     let directory_path = NormalizedDirectoryPath::from_normalized(format!(
         "{}/",
         file_path.normalized_path.as_str().trim_end_matches('/')
