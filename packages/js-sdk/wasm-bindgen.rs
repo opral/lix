@@ -85,7 +85,7 @@ export type LixWasmRuntime = {
 export type LixBootKeyValue = {
   key: string;
   value: unknown;
-  lixcol_version_id?: string;
+  lixcol_global?: boolean;
   lixcol_untracked?: boolean;
 };
 
@@ -404,27 +404,53 @@ export type LixObserveEvents = {
 
             if Reflect::has(&entry, &JsValue::from_str("versionId")).map_err(js_to_lix_error)? {
                 return Err(LixError {
-            code: "LIX_ERROR_JS_SDK".to_string(),
+                    code: "LIX_ERROR_JS_SDK".to_string(),
                     description:
-                        "initLix keyValues entries must use 'lixcol_version_id' instead of 'versionId'"
+                        "initLix keyValues entries must use 'lixcol_global' instead of 'versionId'"
                             .to_string(),
                 });
             }
             if Reflect::has(&entry, &JsValue::from_str("version_id")).map_err(js_to_lix_error)? {
                 return Err(LixError {
-            code: "LIX_ERROR_JS_SDK".to_string(),
+                    code: "LIX_ERROR_JS_SDK".to_string(),
                     description:
-                        "initLix keyValues entries must use 'lixcol_version_id' instead of 'version_id'"
+                        "initLix keyValues entries must use 'lixcol_global' instead of 'version_id'"
+                            .to_string(),
+                });
+            }
+            if Reflect::has(&entry, &JsValue::from_str("lixcol_version_id"))
+                .map_err(js_to_lix_error)?
+            {
+                return Err(LixError {
+                    code: "LIX_ERROR_JS_SDK".to_string(),
+                    description:
+                        "initLix keyValues entries must use 'lixcol_global' instead of 'lixcol_version_id'"
+                            .to_string(),
+                });
+            }
+            if Reflect::has(&entry, &JsValue::from_str("global")).map_err(js_to_lix_error)? {
+                return Err(LixError {
+                    code: "LIX_ERROR_JS_SDK".to_string(),
+                    description:
+                        "initLix keyValues entries must use 'lixcol_global' instead of 'global'"
+                            .to_string(),
+                });
+            }
+            if Reflect::has(&entry, &JsValue::from_str("untracked")).map_err(js_to_lix_error)? {
+                return Err(LixError {
+                    code: "LIX_ERROR_JS_SDK".to_string(),
+                    description:
+                        "initLix keyValues entries must use 'lixcol_untracked' instead of 'untracked'"
                             .to_string(),
                 });
             }
 
-            let version_id = read_optional_string_property_with_context(
+            let lixcol_global = read_optional_bool_property_with_context(
                 &entry,
-                "lixcol_version_id",
+                "lixcol_global",
                 "initLix keyValues entry",
             )?;
-            let untracked = read_optional_bool_property_with_context(
+            let lixcol_untracked = read_optional_bool_property_with_context(
                 &entry,
                 "lixcol_untracked",
                 "initLix keyValues entry",
@@ -433,8 +459,8 @@ export type LixObserveEvents = {
             parsed.push(BootKeyValue {
                 key,
                 value,
-                version_id,
-                untracked,
+                lixcol_global,
+                lixcol_untracked,
             });
         }
 

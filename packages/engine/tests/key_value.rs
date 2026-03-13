@@ -2,7 +2,8 @@ mod support;
 
 use std::collections::HashMap;
 
-use lix_engine::Value;
+use lix_engine::{BootKeyValue, Value};
+use serde_json::json;
 
 fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     format!(
@@ -100,6 +101,92 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
     sim.assert_deterministic(after_delete.statements[0].rows.clone());
     assert_eq!(after_delete.statements[0].rows.len(), 0);
 });
+
+simulation_test!(
+    boot_key_values_default_to_active_version_scope,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: vec![BootKeyValue {
+                    key: "boot-default-active".to_string(),
+                    value: json!("active-value"),
+                    lixcol_global: None,
+                    lixcol_untracked: Some(false),
+                }],
+                ..Default::default()
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.initialize().await.unwrap();
+
+        let active_version = engine
+            .execute(
+                "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        let active_version_id = match &active_version.statements[0].rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected text active version id, got {other:?}"),
+        };
+
+        let result = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = 'boot-default-active' \
+                   AND version_id = $1 \
+                   AND global = false \
+                   AND snapshot_content IS NOT NULL",
+                &[Value::Text(active_version_id)],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.statements[0].rows, vec![vec![Value::Integer(1)]]);
+    }
+);
+
+simulation_test!(
+    boot_key_values_can_target_global_scope,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: vec![BootKeyValue {
+                    key: "boot-global".to_string(),
+                    value: json!("global-value"),
+                    lixcol_global: Some(true),
+                    lixcol_untracked: Some(false),
+                }],
+                ..Default::default()
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = 'boot-global' \
+                   AND version_id = 'global' \
+                   AND global = true \
+                   AND snapshot_content IS NOT NULL",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.statements[0].rows, vec![vec![Value::Integer(1)]]);
+    }
+);
 
 simulation_test!(
     key_value_update_with_sparse_placeholders_routes_through_public_lowering,
