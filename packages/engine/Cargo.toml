@@ -25,28 +25,13 @@ criterion = "0.8.2"
 postgresql_embedded = { version = "0.20", features = ["tokio"] }
 paste = "1"
 sqlx = { version = "0.8", features = ["sqlite", "postgres", "runtime-tokio-rustls"] }
+tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 wasmtime = { version = "30", features = ["component-model"] }
 wasmtime-wasi = "30"
 
 [[bench]]
-name = "lix_state"
-harness = false
-
-[[bench]]
-name = "lix_file"
-harness = false
-
-[[bench]]
-name = "lix_state_by_version"
-harness = false
-
-[[bench]]
-name = "lix_state_history"
-harness = false
-
-[[bench]]
-name = "binary_storage"
+name = "lix_file_recursive_update"
 harness = false
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

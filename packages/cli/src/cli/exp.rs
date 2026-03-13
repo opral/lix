@@ -38,4 +38,20 @@ pub struct ExpGitReplayArgs {
     /// Verify file paths and payload hashes after each replayed commit.
     #[arg(long, default_value_t = false)]
     pub verify_state: bool,
+
+    /// Overwrite output files if they already exist.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+
+    /// Write per-commit replay profiling data as JSON.
+    #[arg(long, value_hint = ValueHint::FilePath)]
+    pub profile_json: Option<PathBuf>,
+
+    /// Write backend SQL tracing data as JSON.
+    #[arg(long, value_hint = ValueHint::FilePath)]
+    pub trace_sql_json: Option<PathBuf>,
+
+    /// Trace only the replayed commit matching this full SHA or unique SHA prefix.
+    #[arg(long)]
+    pub trace_commit: Option<String>,
 }
