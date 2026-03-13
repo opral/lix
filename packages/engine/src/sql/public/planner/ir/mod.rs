@@ -515,6 +515,7 @@ pub(crate) enum WriteLane {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpectedTip {
+    CurrentTip,
     CommitId(String),
     CreateIfMissing,
 }
