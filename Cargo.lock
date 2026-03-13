@@ -2058,11 +2058,13 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 name = "lix_cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "clap",
  "comfy-table",
  "lix_rs_sdk",
  "pollster",
+ "serde",
  "serde_json",
  "sha2",
 ]
@@ -2090,6 +2092,7 @@ dependencies = [
  "serde_json",
  "sqlparser",
  "sqlx",
+ "tempfile",
  "tokio",
  "unicode-normalization",
  "uuid",
