@@ -1,0 +1,34 @@
+{
+  "bench": "lix_file_recursive_update",
+  "generated_at": "2026-03-13T02:02:39.580Z",
+  "git_commit": "3a99018922d533fe77731a7a949aaeb5779f6330",
+  "command": "cargo bench -p lix_engine --bench lix_file_recursive_update",
+  "results": [
+    {
+      "group": "lix_file",
+      "benchmark": "update_existing_row_deep_history",
+      "depth": 1,
+      "unit": "ms",
+      "mean_ms": 14.133,
+      "mean_ci_lower_ms": 12.879,
+      "mean_ci_upper_ms": 16.076,
+      "median_ms": 13.069,
+      "median_ci_lower_ms": 12.514,
+      "median_ci_upper_ms": 14.524,
+      "std_dev_ms": 2.867
+    },
+    {
+      "group": "lix_file",
+      "benchmark": "update_existing_row_deep_history",
+      "depth": 128,
+      "unit": "ms",
+      "mean_ms": 16.365,
+      "mean_ci_lower_ms": 15.285,
+      "mean_ci_upper_ms": 17.569,
+      "median_ms": 15.959,
+      "median_ci_lower_ms": 14.814,
+      "median_ci_upper_ms": 17.995,
+      "std_dev_ms": 1.954
+    }
+  ]
+}

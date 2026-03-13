@@ -11,6 +11,17 @@ Make filesystem CRUD history-insensitive.
 
 The current bottleneck is that `lix_file` writes prefetch through live projection SQL that rebuilds current file, directory, and blob state from descriptor candidates using recursive CTEs, unions, and `ROW_NUMBER()` ranking. That makes one logical update get slower as accumulated state grows.
 
+## Revised Strategy
+
+Do not jump straight to a new filesystem-specific storage model.
+
+Use the existing authoritative live state first:
+
+- `lix_internal_live_v1_*` as committed live state
+- `lix_internal_live_untracked_v1` as untracked live state
+
+Only introduce a filesystem-specific copy-on-write layer if branch semantics still require it after the live-state hot path has been corrected.
+
 ## First-Principles Model
 
 Separate two concerns:
@@ -24,21 +35,72 @@ For branching, present state cannot be physically copied per branch. Instead, br
 
 ## Authoritative State
 
-Introduce an authoritative filesystem state layer:
+The first step is to fully exploit the authoritative live state that already exists.
+
+That means:
+
+- direct reads from `lix_internal_live_v1_lix_file_descriptor`
+- direct reads from `lix_internal_live_v1_lix_directory_descriptor`
+- direct reads from `lix_internal_live_v1_lix_binary_blob_ref`
+- overlay with `lix_internal_live_untracked_v1` only where effective live state is required
+
+Before any new storage model, the engine should stop rebuilding committed state from history on the CRUD hot path.
+
+Only if that still leaves an unsolved branching/storage problem should we introduce a dedicated filesystem state layer such as:
 
 - `lix_internal_fs_version_root`
 - `lix_internal_fs_file_live`
 - `lix_internal_fs_directory_live`
 
-These replace legacy filesystem materialization as the source of truth for CRUD.
+Those would replace the schema-level live tables as the filesystem source of truth only in a later stage.
 
-Legacy tables to remove from the CRUD path:
+Existing live tables to use directly in the first stage:
 
 - `lix_internal_live_v1_lix_file_descriptor`
 - `lix_internal_live_v1_lix_directory_descriptor`
 - `lix_internal_live_v1_lix_binary_blob_ref`
 
-Those tables may be deleted entirely if no other subsystem depends on them.
+Legacy behavior to remove from the CRUD path:
+
+- recursive live projection queries over those tables
+- rebuild-plan-based exact committed state resolution
+
+The live tables themselves should not be deleted unless a later dedicated filesystem layer fully subsumes them.
+
+## Stage 1: Exploit Existing Live State
+
+Before introducing any new filesystem-specific layer, do the following:
+
+1. Make exact committed reads direct.
+2. Read file descriptors, directory descriptors, and blob refs directly from live tables.
+3. Use `lix_internal_live_untracked_v1` only as an overlay for effective live state.
+4. Remove live projection SQL from ordinary file CRUD where a direct live-table lookup is possible.
+5. Add any missing direct indexes or denormalized columns needed for path-based lookups.
+
+Expected outcome:
+
+- history depth disappears from ordinary CRUD cost
+- the current recursive query blow-up is removed without a storage redesign
+
+## What Live State Can Likely Solve
+
+With the existing live tables used correctly, we should be able to get:
+
+- exact row lookup by id without history reconstruction
+- direct sibling/path collision checks using existing descriptor indexes
+- direct blob-ref lookup
+- direct committed live state reads for write planning
+
+This is likely enough to fix most of the current replay and single-update slowdown.
+
+## What Live State Alone May Not Solve
+
+Two issues may remain after the hot path is fixed:
+
+- path lookup may still be recursive if path is not stored/indexed directly
+- branch creation may still require copying visible state per `version_id`
+
+If those remain real bottlenecks after Stage 1, then a dedicated filesystem-specific copy-on-write layer becomes justified.
 
 ## Data Model
 
@@ -91,6 +153,17 @@ This table maps each branch-like `version_id` to the current live filesystem gen
 - `commit_id`
 - primary key: `(generation_id, directory_id)`
 - unique index: `(generation_id, parent_directory_id, name)`
+
+## Stage 2: Filesystem-Specific Copy-On-Write
+
+Only enter this stage if Stage 1 is insufficient.
+
+The reason to do so would be:
+
+- branch creation still scales with live row count
+- or filesystem live tables still force too much duplication per `version_id`
+
+If that happens, move to copy-on-write semantics.
 
 ## Copy-On-Write Semantics
 
@@ -148,7 +221,7 @@ Conclusion:
 - parent-linked table inheritance is not enough
 - to get both `O(1)` CRUD and `O(1)` branching, the live filesystem state must be represented as a persistent map, not as ordinary copied SQL rows
 
-## Recommended Design
+## Recommended Design If Stage 2 Is Needed
 
 Use a persistent key-space with copy-on-write roots.
 
@@ -202,7 +275,7 @@ If we want the simplest defensible target, we should state:
 
 That is still the correct asymptotic fix because history depth disappears from the cost.
 
-## Write Algorithm
+## Write Algorithm For Stage 2
 
 For `UPDATE lix_file SET ... WHERE id = ?`:
 
@@ -224,7 +297,7 @@ For directory writes, do the same with:
 - `directories_by_id`
 - `directory_child_by_parent_name`
 
-## Read Algorithm
+## Read Algorithm For Stage 2
 
 Exact lookup by file id:
 
@@ -265,14 +338,18 @@ That is the right place for branching semantics, not ordinary CRUD queries.
 
 ## What to Delete
 
-Delete legacy filesystem effective-state reconstruction from the CRUD path:
+Stage 1 deletes behavior, not necessarily tables.
+
+Delete from the CRUD path:
 
 - `build_live_file_prefetch_projection_sql()`
 - filesystem descriptor candidate/ranking queries
 - write-time file prefetch through live projection
 - generic exact committed-state resolution for filesystem CRUD
 
-Delete filesystem-specific materialized state tables if nothing else depends on them:
+Do not delete the schema live tables in Stage 1.
+
+Only if Stage 2 lands and fully replaces them should we consider deleting:
 
 - `lix_file_descriptor`
 - `lix_directory_descriptor`
@@ -288,22 +365,23 @@ Retain generic history/state infrastructure only where it is still needed for:
 
 ### Stage 1
 
-Introduce the new authoritative filesystem live layer and route `lix_file` CRUD to it.
+Exploit the existing authoritative live state correctly.
 
 Success criterion:
 
-- no `WITH RECURSIVE` live projection query on ordinary file update
+- no `WITH RECURSIVE` committed-state/live-projection query on ordinary file update
+- exact committed row resolution does direct live-table reads
 
 ### Stage 2
 
-Add branch root indirection:
+If needed, add filesystem-specific branch root indirection:
 
 - `version_id -> generation_id`
 - branch creation becomes root-pointer copy
 
 ### Stage 3
 
-Back the live layer with a persistent map implementation.
+If needed, back the filesystem-specific live layer with a persistent map implementation.
 
 Success criterion:
 
@@ -312,7 +390,7 @@ Success criterion:
 
 ### Stage 4
 
-Delete legacy filesystem materialization and projection code.
+Delete superseded filesystem live-table/projection code only if Stage 2 fully replaces it.
 
 ## Benchmark Target
 
@@ -329,7 +407,11 @@ The benchmark is the guardrail:
 
 Do not optimize the current recursive SQL path.
 
-Replace it with:
+First:
+
+- exploit authoritative live state directly
+
+Then, only if necessary, replace it with:
 
 - authoritative live filesystem state
 - copy-on-write version roots
