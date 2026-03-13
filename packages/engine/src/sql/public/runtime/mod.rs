@@ -112,6 +112,8 @@ pub(crate) struct PreparedPublicRead {
     pub(crate) debug_trace: PublicExecutionDebugTrace,
 }
 
+pub(crate) use read::decode_public_read_result;
+
 impl PreparedPublicRead {
     pub(crate) fn structured_read(&self) -> Option<&StructuredPublicRead> {
         self.optimization
@@ -1413,6 +1415,7 @@ fn wrap_lowered_read_for_explain(
             })
             .collect(),
         pushdown_decision: program.pushdown_decision,
+        result_columns: program.result_columns,
     }
 }
 

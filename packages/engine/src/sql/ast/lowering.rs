@@ -7,12 +7,12 @@ use crate::backend::SqlDialect;
 use crate::LixError;
 
 use super::lower_json_fn::{
-    lower_lix_empty_blob, lower_lix_json, lower_lix_json_extract, lower_lix_text_decode,
-    lower_lix_text_encode,
+    lower_lix_empty_blob, lower_lix_json, lower_lix_json_extract, lower_lix_json_extract_boolean,
+    lower_lix_text_decode, lower_lix_text_encode,
 };
 use super::lower_logical_fn::{
-    parse_lix_empty_blob, parse_lix_json, parse_lix_json_extract, parse_lix_text_decode,
-    parse_lix_text_encode,
+    parse_lix_empty_blob, parse_lix_json, parse_lix_json_extract, parse_lix_json_extract_boolean,
+    parse_lix_text_decode, parse_lix_text_encode,
 };
 
 pub(crate) fn lower_statement(
@@ -45,6 +45,14 @@ impl VisitorMut for LogicalFunctionLowerer {
         };
 
         let Some(call) = parsed else {
+            let parsed_boolean = match parse_lix_json_extract_boolean(function) {
+                Ok(parsed) => parsed,
+                Err(error) => return ControlFlow::Break(error),
+            };
+            if let Some(call) = parsed_boolean {
+                *expr = lower_lix_json_extract_boolean(&call, self.dialect);
+                return ControlFlow::Continue(());
+            }
             let parsed_json = match parse_lix_json(function) {
                 Ok(parsed) => parsed,
                 Err(error) => return ControlFlow::Break(error),
