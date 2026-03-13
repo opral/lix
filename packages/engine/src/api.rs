@@ -11,7 +11,9 @@ use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path;
 use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
 use crate::sql::execution::transaction_session::execute_public_sql;
-use crate::sql::public::runtime::classify_public_execution_route_with_registry;
+use crate::sql::public::runtime::{
+    classify_public_execution_route_with_registry, decode_public_read_result,
+};
 use crate::state::internal::inline_functions::inline_lix_functions_with_provider;
 use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
 use crate::state::internal::statement_references_internal_state_vtable;
@@ -311,8 +313,14 @@ impl Engine {
         }
         self.emit_state_commit_stream_changes(state_commit_stream_changes);
 
+        let public_result = if let Some(public_read) = prepared.public_read.as_ref() {
+            decode_public_read_result(execution.public_result, &public_read.lowered_read)
+        } else {
+            execution.public_result
+        };
+
         Ok(ExecuteResult {
-            statements: vec![execution.public_result],
+            statements: vec![public_result],
         })
     }
 

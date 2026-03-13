@@ -9,8 +9,8 @@ use crate::filesystem::live_projection::{
 };
 use crate::sql::public::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::public::catalog::{
-    SurfaceBinding, SurfaceFamily, SurfaceOverridePredicate, SurfaceOverrideValue, SurfaceRegistry,
-    SurfaceVariant,
+    SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
+    SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
 };
 use crate::sql::public::core::parser::parse_sql_script;
 use crate::sql::public::planner::ir::{
@@ -32,12 +32,25 @@ use sqlparser::ast::{
     JoinConstraint, JoinOperator, LimitClause, OrderBy, OrderByExpr, OrderByKind, Query, Select,
     SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LoweredReadProgram {
     pub(crate) statements: Vec<Statement>,
     pub(crate) pushdown_decision: PushdownDecision,
+    pub(crate) result_columns: LoweredResultColumns,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoweredResultColumn {
+    Untyped,
+    Boolean,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LoweredResultColumns {
+    Static(Vec<LoweredResultColumn>),
+    ByColumnName(BTreeMap<String, LoweredResultColumn>),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -74,6 +87,7 @@ pub(crate) fn lower_read_for_execution(
     effective_state_request: Option<&EffectiveStateRequest>,
     effective_state_plan: Option<&EffectiveStatePlan>,
 ) -> Result<Option<LoweredReadProgram>, LixError> {
+    let result_columns = lowered_result_columns(structured_read);
     match structured_read.surface_binding.descriptor.surface_family {
         SurfaceFamily::State => {
             let Some(effective_state_request) = effective_state_request else {
@@ -91,6 +105,7 @@ pub(crate) fn lower_read_for_execution(
                 statement.map(|statement| LoweredReadProgram {
                     statements: vec![statement],
                     pushdown_decision: build_pushdown_decision(effective_state_plan),
+                    result_columns: result_columns.clone(),
                 })
             })
         }
@@ -110,6 +125,7 @@ pub(crate) fn lower_read_for_execution(
                 statement.map(|statement| LoweredReadProgram {
                     statements: vec![statement],
                     pushdown_decision: build_pushdown_decision(effective_state_plan),
+                    result_columns: result_columns.clone(),
                 })
             })
         }
@@ -125,6 +141,7 @@ pub(crate) fn lower_read_for_execution(
                 statement.map(|statement| LoweredReadProgram {
                     statements: vec![statement],
                     pushdown_decision,
+                    result_columns: result_columns.clone(),
                 })
             })
         }
@@ -132,6 +149,7 @@ pub(crate) fn lower_read_for_execution(
             statement.map(|statement| LoweredReadProgram {
                 statements: vec![statement],
                 pushdown_decision: admin_pushdown_decision(structured_read),
+                result_columns: result_columns.clone(),
             })
         }),
         SurfaceFamily::Filesystem => {
@@ -139,6 +157,7 @@ pub(crate) fn lower_read_for_execution(
                 statement.map(|statement| LoweredReadProgram {
                     statements: vec![statement],
                     pushdown_decision: filesystem_pushdown_decision(structured_read),
+                    result_columns: result_columns.clone(),
                 })
             })
         }
@@ -238,6 +257,79 @@ fn build_lowered_read_query(
         format_clause: None,
         pipe_operators: Vec::new(),
     })
+}
+
+fn lowered_result_columns(structured_read: &StructuredPublicRead) -> LoweredResultColumns {
+    if structured_read.query.uses_wildcard_projection() {
+        let columns = structured_read
+            .surface_binding
+            .column_types
+            .iter()
+            .map(|(name, column_type)| {
+                (
+                    name.clone(),
+                    lowered_result_column_from_surface_type(*column_type),
+                )
+            })
+            .collect();
+        return LoweredResultColumns::ByColumnName(columns);
+    }
+
+    LoweredResultColumns::Static(
+        structured_read
+            .query
+            .projection
+            .iter()
+            .map(|item| {
+                lowered_result_column_for_projection_item(item, &structured_read.surface_binding)
+            })
+            .collect(),
+    )
+}
+
+fn lowered_result_column_for_projection_item(
+    item: &SelectItem,
+    surface_binding: &SurfaceBinding,
+) -> LoweredResultColumn {
+    let expr = match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+            return LoweredResultColumn::Untyped;
+        }
+    };
+
+    let column = match expr {
+        Expr::Identifier(ident) => ident.value.as_str(),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|part| part.value.as_str())
+            .unwrap_or_default(),
+        _ => return LoweredResultColumn::Untyped,
+    };
+
+    surface_column_type(surface_binding, column)
+        .map(lowered_result_column_from_surface_type)
+        .unwrap_or(LoweredResultColumn::Untyped)
+}
+
+fn lowered_result_column_from_surface_type(column_type: SurfaceColumnType) -> LoweredResultColumn {
+    match column_type {
+        SurfaceColumnType::Boolean => LoweredResultColumn::Boolean,
+        SurfaceColumnType::String
+        | SurfaceColumnType::Integer
+        | SurfaceColumnType::Number
+        | SurfaceColumnType::Json => LoweredResultColumn::Untyped,
+    }
+}
+
+fn surface_column_type(
+    surface_binding: &SurfaceBinding,
+    column: &str,
+) -> Option<SurfaceColumnType> {
+    surface_binding
+        .column_types
+        .iter()
+        .find_map(|(candidate, kind)| candidate.eq_ignore_ascii_case(column).then_some(*kind))
 }
 
 fn state_read_exposed_column_error(
@@ -817,7 +909,7 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
             "SELECT \
                 d.entity_id AS id, \
                 lix_json_extract(d.snapshot_content, 'name') AS name, \
-                COALESCE(lix_json_extract(d.snapshot_content, 'hidden'), 'false') AS hidden, \
+                COALESCE(lix_json_extract_boolean(d.snapshot_content, 'hidden'), false) AS hidden, \
                 lix_json_extract(t.snapshot_content, 'commit_id') AS commit_id \
              FROM lix_internal_state_materialized_v1_lix_version_descriptor d \
              LEFT JOIN ( \
@@ -1068,7 +1160,7 @@ fn explicit_target_versions_cte_sql(
         format!("version_id = '{}'", escape_sql_string(GLOBAL_VERSION_ID)),
         "is_tombstone = 0".to_string(),
         "snapshot_content IS NOT NULL".to_string(),
-        "COALESCE(lix_json_extract(snapshot_content, 'hidden'), 'false') != 'true'".to_string(),
+        "COALESCE(lix_json_extract_boolean(snapshot_content, 'hidden'), false) = false".to_string(),
     ];
     let schema_local_rows = schema_keys
         .iter()
@@ -2198,9 +2290,19 @@ fn entity_projection_sql_for_column(
     {
         let alias = render_identifier(column);
         let path = escape_sql_string(column);
-        return Some(format!(
-            "lix_json_extract(snapshot_content, '{path}') AS {alias}"
-        ));
+        let expression = match surface_column_type(surface_binding, column) {
+            Some(SurfaceColumnType::Boolean) => {
+                format!("lix_json_extract_boolean(snapshot_content, '{path}')")
+            }
+            Some(
+                SurfaceColumnType::String
+                | SurfaceColumnType::Integer
+                | SurfaceColumnType::Number
+                | SurfaceColumnType::Json,
+            )
+            | None => format!("lix_json_extract(snapshot_content, '{path}')"),
+        };
+        return Some(format!("{expression} AS {alias}"));
     }
 
     None
@@ -2488,6 +2590,7 @@ mod tests {
     use crate::sql::public::planner::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
     use crate::sql::public::planner::semantics::effective_state_resolver::build_effective_state;
     use crate::{SqlDialect, Value};
+    use std::collections::BTreeMap;
 
     fn lowered_program(registry: &SurfaceRegistry, sql: &str) -> Option<LoweredReadProgram> {
         let mut statements =
@@ -2614,6 +2717,7 @@ mod tests {
             crate::sql::public::catalog::DynamicEntitySurfaceSpec {
                 schema_key: "message".to_string(),
                 visible_columns: vec!["body".to_string(), "id".to_string()],
+                column_types: BTreeMap::new(),
                 fixed_version_id: None,
                 predicate_overrides: vec![
                     crate::sql::public::catalog::SurfaceOverridePredicate {

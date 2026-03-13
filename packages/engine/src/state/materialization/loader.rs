@@ -29,6 +29,11 @@ pub(crate) struct CommitRecord {
 pub(crate) struct VersionDescriptorRecord {
     pub id: String,
     pub entity_id: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub plugin_key: String,
+    pub snapshot_content: String,
+    pub metadata: Option<String>,
     pub created_at: String,
 }
 
@@ -110,6 +115,11 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
                     let candidate = VersionDescriptorRecord {
                         id: id.clone(),
                         entity_id: entity_id.clone(),
+                        schema_version: schema_version.clone(),
+                        file_id: file_id.clone(),
+                        plugin_key: plugin_key.clone(),
+                        snapshot_content: snapshot_raw,
+                        metadata: metadata.clone(),
                         created_at,
                     };
                     upsert_latest_by_entity(&mut version_descriptors, candidate, |record| {

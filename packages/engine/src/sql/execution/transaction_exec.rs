@@ -8,7 +8,8 @@ use crate::sql::execution::shared_path;
 use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::sql::public::runtime::{
-    apply_public_surface_registry_mutations, public_surface_registry_mutations,
+    apply_public_surface_registry_mutations, decode_public_read_result,
+    public_surface_registry_mutations,
 };
 use crate::{
     ExecuteOptions, LixError, LixTransaction, QueryResult, StateCommitStreamChange, Value,
@@ -245,6 +246,11 @@ impl Engine {
         })?;
 
         pending_state_commit_stream_changes.extend(state_commit_stream_changes);
-        Ok(execution.public_result)
+        let public_result = if let Some(public_read) = prepared.public_read.as_ref() {
+            decode_public_read_result(execution.public_result, &public_read.lowered_read)
+        } else {
+            execution.public_result
+        };
+        Ok(public_result)
     }
 }
