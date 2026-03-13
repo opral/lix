@@ -898,13 +898,6 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
             file_id = escape_sql_string(active_account_file_id()),
             storage_version_id = escape_sql_string(active_account_storage_version_id()),
         ),
-        CanonicalAdminKind::StoredSchema => "SELECT \
-                lix_json_extract(snapshot_content, 'value') AS value, \
-                lix_json_extract(snapshot_content, 'value.x-lix-key') AS lixcol_schema_key, \
-                lix_json_extract(snapshot_content, 'value.x-lix-version') AS lixcol_schema_version \
-             FROM lix_internal_stored_schema_bootstrap \
-             WHERE snapshot_content IS NOT NULL"
-            .to_string(),
         CanonicalAdminKind::Version => format!(
             "SELECT \
                 d.entity_id AS id, \
@@ -2934,24 +2927,23 @@ mod tests {
     }
 
     #[test]
-    fn lowers_stored_schema_reads_through_bootstrap_table() {
+    fn lowers_stored_schema_reads_through_entity_surface() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
         let lowered = lowered_program(
             &registry,
-            "SELECT value, lixcol_schema_key FROM lix_stored_schema WHERE lixcol_schema_key = 'x'",
+            "SELECT value, lixcol_entity_id FROM lix_stored_schema WHERE lixcol_entity_id = 'x~1'",
         )
         .expect("stored schema read should lower");
         let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered_sql.contains("FROM lix_internal_stored_schema_bootstrap"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_stored_schema"));
+        assert!(lowered_sql.contains("file_id = 'lix'"));
+        assert!(lowered_sql.contains("plugin_key = 'lix'"));
+        assert!(lowered_sql.contains("global = true"));
         assert!(!lowered_sql.contains("FROM lix_stored_schema"));
         assert_eq!(
-            lowered.pushdown_decision.accepted_predicates,
-            Vec::<String>::new()
-        );
-        assert_eq!(
             lowered.pushdown_decision.residual_predicates,
-            vec!["lixcol_schema_key = 'x'".to_string()]
+            vec!["lixcol_entity_id = 'x~1'".to_string()]
         );
     }
 
