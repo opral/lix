@@ -8,6 +8,7 @@ use crate::sql::ast::walk::object_name_matches;
 use crate::sql::common::ast::lower_statement;
 use crate::sql::execution::execute;
 use crate::sql::execution::parse::parse_sql;
+use crate::sql::execution::post_commit_effects::apply_owned_execution_post_commit_effects;
 use crate::sql::execution::shared_path;
 use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
 use crate::sql::execution::transaction_session::execute_public_sql;
@@ -213,96 +214,15 @@ impl Engine {
                 Err(error) => return Err(error),
             };
 
-        if !write_owned_transaction_committed {
-            execute::persist_runtime_sequence(
-                self,
-                prepared.settings,
-                prepared.sequence_start,
-                &prepared.functions,
-            )
-            .await?;
-        }
-
-        let active_effects = execution
-            .plan_effects_override
-            .as_ref()
-            .unwrap_or(&prepared.plan.effects);
-        let effects_are_authoritative = execution.plan_effects_override.is_some();
-
-        if let Some(version_id) = &active_effects.next_active_version_id {
-            self.set_active_version_id(version_id.clone());
-        }
-
-        let _file_cache_refresh_targets = shared_path::derive_cache_targets(
-            &prepared.plan,
-            active_effects,
-            effects_are_authoritative,
-            execution.postprocess_file_cache_targets.clone(),
+        apply_owned_execution_post_commit_effects(
+            self,
+            &prepared,
+            &execution,
+            writer_key,
+            write_owned_transaction_committed,
+            public_surface_registry_dirty,
         )
-        .file_cache_refresh_targets;
-
-        let filesystem_payload_domain_changes = self
-            .collect_live_filesystem_payload_domain_changes(
-                &prepared.intent.pending_file_writes,
-                &prepared.intent.pending_file_delete_targets,
-                writer_key,
-            )
-            .await?;
-        let filesystem_payload_domain_changes =
-            crate::engine::dedupe_filesystem_payload_domain_changes(
-                &filesystem_payload_domain_changes,
-            );
-        let payload_domain_changes_to_persist =
-            if shared_path::public_write_filesystem_payload_changes_already_committed(&prepared) {
-                Vec::new()
-            } else if execution.plugin_changes_committed {
-                crate::engine::dedupe_filesystem_payload_domain_changes(
-                    &filesystem_payload_domain_changes,
-                )
-            } else {
-                filesystem_payload_domain_changes.clone()
-            };
-        let should_run_binary_gc = crate::engine::should_run_binary_cas_gc(
-            &prepared.plan.preprocess.mutations,
-            &filesystem_payload_domain_changes,
-        );
-
-        if !shared_path::public_write_filesystem_payload_changes_already_committed(&prepared) {
-            self.persist_pending_file_data_updates(&prepared.intent.pending_file_writes)
-                .await?;
-        }
-        if !payload_domain_changes_to_persist.is_empty() {
-            self.persist_filesystem_payload_domain_changes(&payload_domain_changes_to_persist)
-                .await?;
-        }
-        if should_run_binary_gc {
-            self.garbage_collect_unreachable_binary_cas().await?;
-        }
-
-        let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
-        state_commit_stream_changes.extend(execution.state_commit_stream_changes);
-        self.maybe_invalidate_deterministic_settings_cache(
-            &prepared.plan.preprocess.mutations,
-            &state_commit_stream_changes,
-        );
-        let should_emit_observe_tick = !state_commit_stream_changes.is_empty();
-
-        if !effects_are_authoritative
-            && prepared
-                .plan
-                .requirements
-                .should_invalidate_installed_plugins_cache
-        {
-            self.invalidate_installed_plugins_cache()?;
-        }
-        if should_emit_observe_tick && !write_owned_transaction_committed {
-            self.append_observe_tick(options.writer_key.as_deref())
-                .await?;
-        }
-        if public_surface_registry_dirty {
-            self.refresh_public_surface_registry().await?;
-        }
-        self.emit_state_commit_stream_changes(state_commit_stream_changes);
+        .await?;
 
         let public_result = if let Some(public_read) = prepared.public_read.as_ref() {
             decode_public_read_result(execution.public_result, &public_read.lowered_read)

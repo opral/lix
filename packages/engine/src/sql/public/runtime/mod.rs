@@ -211,6 +211,9 @@ struct BoundPublicReadSummary {
 
 mod bind;
 mod read;
+mod tracked_write_plan;
+
+pub(crate) use tracked_write_plan::{build_tracked_write_txn_plan, TrackedWriteTxnPlan};
 
 pub(crate) async fn prepare_public_execution(
     backend: &dyn LixBackend,
