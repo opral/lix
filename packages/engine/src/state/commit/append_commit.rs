@@ -33,15 +33,22 @@ pub(crate) enum AppendWriteLane {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AppendExpectedTip {
+    CurrentTip,
     CommitId(String),
     CreateIfMissing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AppendIdempotencyKey {
+    Exact(String),
+    CurrentTipFingerprint(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AppendCommitPreconditions {
     pub(crate) write_lane: AppendWriteLane,
     pub(crate) expected_tip: AppendExpectedTip,
-    pub(crate) idempotency_key: String,
+    pub(crate) idempotency_key: AppendIdempotencyKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,17 +115,29 @@ pub(crate) async fn append_commit_if_preconditions_hold(
         let mut executor = TransactionCommitExecutor { transaction };
         load_current_tip_commit_id(&mut executor, &concrete_lane).await?
     };
+    let resolved_idempotency_key =
+        resolve_idempotency_key(&args.preconditions, current_tip.as_deref());
     let existing_replay = {
         let mut executor = TransactionCommitExecutor { transaction };
         load_existing_idempotency_commit_id(
             &mut executor,
             &concrete_lane,
-            &args.preconditions.idempotency_key,
+            &resolved_idempotency_key,
         )
         .await?
     };
 
     match (&args.preconditions.expected_tip, current_tip.as_deref()) {
+        (AppendExpectedTip::CurrentTip, Some(_)) => {}
+        (AppendExpectedTip::CurrentTip, None) => {
+            return Err(AppendCommitError {
+                kind: AppendCommitErrorKind::MissingWriteLane,
+                message: format!(
+                    "append precondition failed for '{}': version pointer is missing",
+                    lane_storage_key(&concrete_lane)
+                ),
+            });
+        }
         (AppendExpectedTip::CommitId(expected), Some(current)) if current != expected => {
             if existing_replay.as_deref() == Some(current) {
                 return Ok(AppendCommitResult {
@@ -255,7 +274,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
     write_program.push_statement(
         insert_idempotency_row_sql(
             &concrete_lane,
-            &args.preconditions.idempotency_key,
+            &resolved_idempotency_key,
             &committed_tip,
             &args.timestamp,
         ),
@@ -428,6 +447,20 @@ async fn load_existing_idempotency_commit_id(
     }
 }
 
+fn resolve_idempotency_key(
+    preconditions: &AppendCommitPreconditions,
+    current_tip: Option<&str>,
+) -> String {
+    match &preconditions.idempotency_key {
+        AppendIdempotencyKey::Exact(value) => value.clone(),
+        AppendIdempotencyKey::CurrentTipFingerprint(fingerprint) => serde_json::json!({
+            "tip": current_tip,
+            "fingerprint": fingerprint,
+        })
+        .to_string(),
+    }
+}
+
 fn extract_committed_tip_id(
     commit_result: &GenerateCommitResult,
     concrete_lane: &ConcreteWriteLane,
@@ -520,7 +553,7 @@ mod tests {
     use super::{
         append_commit_if_preconditions_hold, AppendCommitArgs, AppendCommitDisposition,
         AppendCommitError, AppendCommitErrorKind, AppendCommitInvariantChecker,
-        AppendCommitPreconditions, AppendExpectedTip, AppendWriteLane,
+        AppendCommitPreconditions, AppendExpectedTip, AppendIdempotencyKey, AppendWriteLane,
     };
     use crate::functions::LixFunctionProvider;
     use crate::version::GLOBAL_VERSION_ID;
@@ -731,7 +764,7 @@ mod tests {
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
-                    idempotency_key: "idem-1".to_string(),
+                    idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
                 },
             },
             &mut functions,
@@ -787,7 +820,7 @@ mod tests {
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
-                    idempotency_key: "idem-1".to_string(),
+                    idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
                 },
             },
             &mut functions,
@@ -819,7 +852,7 @@ mod tests {
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
-                    idempotency_key: "idem-1".to_string(),
+                    idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
                 },
             },
             &mut functions,
@@ -845,7 +878,7 @@ mod tests {
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
-                    idempotency_key: "idem-1".to_string(),
+                    idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
                 },
             },
             &mut functions,
@@ -870,7 +903,7 @@ mod tests {
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CreateIfMissing,
-                    idempotency_key: "idem-create".to_string(),
+                    idempotency_key: AppendIdempotencyKey::Exact("idem-create".to_string()),
                 },
             },
             &mut functions,
@@ -899,7 +932,7 @@ mod tests {
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::GlobalAdmin,
                     expected_tip: AppendExpectedTip::CommitId("commit-global-123".to_string()),
-                    idempotency_key: "idem-global".to_string(),
+                    idempotency_key: AppendIdempotencyKey::Exact("idem-global".to_string()),
                 },
             },
             &mut functions,
@@ -935,7 +968,7 @@ mod tests {
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
-                    idempotency_key: "idem-1".to_string(),
+                    idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
                 },
             },
             &mut functions,

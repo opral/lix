@@ -834,10 +834,11 @@ fn pending_session_matches_append(
     preconditions: &AppendCommitPreconditions,
 ) -> bool {
     session.lane == preconditions.write_lane
-        && matches!(
-            &preconditions.expected_tip,
-            AppendExpectedTip::CommitId(commit_id) if commit_id == &session.commit_id
-        )
+        && match &preconditions.expected_tip {
+            AppendExpectedTip::CurrentTip => true,
+            AppendExpectedTip::CommitId(commit_id) => commit_id == &session.commit_id,
+            AppendExpectedTip::CreateIfMissing => false,
+        }
 }
 
 async fn build_pending_public_append_session(

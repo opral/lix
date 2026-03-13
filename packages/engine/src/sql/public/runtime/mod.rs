@@ -38,7 +38,7 @@ use crate::sql::public::planner::semantics::write_analysis::analyze_write;
 use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan;
 use crate::state::commit::{
     load_committed_version_tip_commit_id, AppendCommitPreconditions, AppendExpectedTip,
-    AppendWriteLane, ProposedDomainChange,
+    AppendIdempotencyKey, AppendWriteLane, ProposedDomainChange,
 };
 use crate::state::stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
@@ -1868,6 +1868,7 @@ fn append_commit_preconditions_for_public_write(
         crate::sql::public::planner::ir::WriteLane::GlobalAdmin => AppendWriteLane::GlobalAdmin,
     };
     let expected_tip = match &commit_preconditions.expected_tip {
+        crate::sql::public::planner::ir::ExpectedTip::CurrentTip => AppendExpectedTip::CurrentTip,
         crate::sql::public::planner::ir::ExpectedTip::CommitId(commit_id) => {
             AppendExpectedTip::CommitId(commit_id.clone())
         }
@@ -1879,7 +1880,14 @@ fn append_commit_preconditions_for_public_write(
     Ok(AppendCommitPreconditions {
         write_lane,
         expected_tip,
-        idempotency_key: commit_preconditions.idempotency_key.0.clone(),
+        idempotency_key: match &commit_preconditions.expected_tip {
+            crate::sql::public::planner::ir::ExpectedTip::CurrentTip => {
+                AppendIdempotencyKey::CurrentTipFingerprint(
+                    commit_preconditions.idempotency_key.0.clone(),
+                )
+            }
+            _ => AppendIdempotencyKey::Exact(commit_preconditions.idempotency_key.0.clone()),
+        },
     })
 }
 

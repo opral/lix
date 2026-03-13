@@ -298,6 +298,19 @@ fn print_trace_report(label: &str, operations: &[SqlTraceOperation]) {
             summarize_sql(&sql),
         );
     }
+
+    if std::env::var_os("LIX_BENCH_TRACE_VERBOSE").is_some() {
+        for op in operations {
+            eprintln!(
+                "[bench-trace] raw label={} seq={} kind={} ms={:.3} sql={}",
+                label,
+                op.sequence,
+                op.kind,
+                op.duration_ms,
+                summarize_sql(op.sql.as_deref().unwrap_or("<no-sql>")),
+            );
+        }
+    }
 }
 
 fn classify_phase(operation: &SqlTraceOperation) -> &'static str {
