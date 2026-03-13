@@ -134,6 +134,59 @@ simulation_test!(
 );
 
 simulation_test!(
+    stored_schema_public_surface_round_trips_inserted_rows,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_stored_schema (value) VALUES (\
+                 lix_json('{\"x-lix-key\":\"qa_test\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}')\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let public_rows = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_stored_schema \
+                 WHERE lixcol_entity_id = 'qa_test~1'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            public_rows.statements[0].rows,
+            vec![vec![Value::Integer(1)]]
+        );
+
+        let state_rows = engine
+            .execute(
+                "SELECT entity_id \
+                 FROM lix_state \
+                 WHERE schema_key = 'lix_stored_schema' \
+                   AND entity_id = 'qa_test~1'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state_rows.statements[0].rows,
+            vec![vec![Value::Text("qa_test~1".to_string())]]
+        );
+    }
+);
+
+simulation_test!(
     stored_schema_requires_foreign_key_targets_are_unique_or_primary,
     |sim| async move {
         let engine = sim

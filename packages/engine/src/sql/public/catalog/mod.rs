@@ -403,7 +403,6 @@ fn builtin_surface_descriptors() -> Vec<SurfaceDescriptor> {
         filesystem_surface_descriptor("lix_directory_history", SurfaceVariant::History),
         admin_surface_descriptor("lix_version", SurfaceVariant::Default),
         admin_surface_descriptor("lix_active_version", SurfaceVariant::Active),
-        admin_surface_descriptor("lix_stored_schema", SurfaceVariant::Default),
         admin_surface_descriptor("lix_active_account", SurfaceVariant::Active),
     ]
 }
@@ -545,7 +544,6 @@ fn filesystem_surface_descriptor(name: &str, variant: SurfaceVariant) -> Surface
 fn admin_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescriptor {
     let capability = match name {
         "lix_version" | "lix_active_version" | "lix_active_account" => SurfaceCapability::ReadWrite,
-        "lix_stored_schema" => SurfaceCapability::ReadOnly,
         _ => SurfaceCapability::ReadOnly,
     };
 
@@ -1089,20 +1087,6 @@ fn admin_columns(name: &str) -> Vec<String> {
     match name {
         "lix_active_version" => vec!["id".to_string(), "version_id".to_string()],
         "lix_active_account" => vec!["id".to_string(), "account_id".to_string()],
-        "lix_stored_schema" => vec![
-            "value".to_string(),
-            "lixcol_entity_id".to_string(),
-            "lixcol_schema_key".to_string(),
-            "lixcol_file_id".to_string(),
-            "lixcol_plugin_key".to_string(),
-            "lixcol_schema_version".to_string(),
-            "lixcol_created_at".to_string(),
-            "lixcol_updated_at".to_string(),
-            "lixcol_global".to_string(),
-            "lixcol_change_id".to_string(),
-            "lixcol_untracked".to_string(),
-            "lixcol_metadata".to_string(),
-        ],
         "lix_version" => vec![
             "id".to_string(),
             "name".to_string(),
@@ -1115,10 +1099,6 @@ fn admin_columns(name: &str) -> Vec<String> {
 
 fn admin_column_types(name: &str) -> BTreeMap<String, SurfaceColumnType> {
     match name {
-        "lix_stored_schema" => BTreeMap::from([
-            ("lixcol_global".to_string(), SurfaceColumnType::Boolean),
-            ("lixcol_untracked".to_string(), SurfaceColumnType::Boolean),
-        ]),
         "lix_version" => BTreeMap::from([("hidden".to_string(), SurfaceColumnType::Boolean)]),
         _ => BTreeMap::new(),
     }
@@ -1285,6 +1265,22 @@ mod tests {
             binding.implicit_overrides.fixed_schema_key.as_deref(),
             Some("lix_stored_schema")
         );
+    }
+
+    #[test]
+    fn builtin_registry_exposes_stored_schema_default_entity_surface() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let binding = registry
+            .bind_relation_name("lix_stored_schema")
+            .expect("stored schema default surface should bind");
+
+        assert_eq!(binding.descriptor.surface_family, SurfaceFamily::Entity);
+        assert_eq!(binding.descriptor.surface_variant, SurfaceVariant::Default);
+        assert_eq!(
+            binding.implicit_overrides.fixed_schema_key.as_deref(),
+            Some("lix_stored_schema")
+        );
+        assert_eq!(binding.implicit_overrides.fixed_version_id.as_deref(), None);
     }
 
     #[test]
