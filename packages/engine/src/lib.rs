@@ -37,6 +37,7 @@ pub use errors::LixError;
 pub use lix::{InitResult, Lix, LixConfig};
 pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
 pub use state::checkpoint::CreateCheckpointResult;
+pub use state::image::{ImageChunkReader, ImageChunkWriter};
 pub use state::materialization::{
     apply_live_state_rebuild_plan, live_state_rebuild_plan, rebuild_live_state,
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
@@ -45,7 +46,6 @@ pub use state::materialization::{
     LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
     TraversedEdgeDebugRow, VersionAncestryDebugRow, VersionPointerDebugRow,
 };
-pub use state::snapshot::{SnapshotChunkReader, SnapshotChunkWriter};
 pub use state::stream::{
     StateCommitStream, StateCommitStreamBatch, StateCommitStreamChange, StateCommitStreamFilter,
     StateCommitStreamOperation,

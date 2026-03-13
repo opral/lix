@@ -6,11 +6,12 @@ mod wasm {
     use lix_engine::wire::{WireQueryResult, WireValue};
     use lix_engine::{
         BootKeyValue, CreateCheckpointResult, CreateVersionOptions, CreateVersionResult,
-        ExecuteOptions, ExecuteResult as EngineExecuteResult, InitResult as EngineInitResult,
-        Lix as CoreLix, LixBackend, LixConfig, LixError, LixTransaction,
-        ObserveEvent as EngineObserveEvent, ObserveEventsOwned as EngineObserveEvents,
-        ObserveQuery as EngineObserveQuery, QueryResult as EngineQueryResult, SnapshotChunkWriter,
-        SqlDialect, Value as EngineValue, WasmComponentInstance, WasmLimits, WasmRuntime,
+        ExecuteOptions, ExecuteResult as EngineExecuteResult, ImageChunkWriter,
+        InitResult as EngineInitResult, Lix as CoreLix, LixBackend, LixConfig, LixError,
+        LixTransaction, ObserveEvent as EngineObserveEvent,
+        ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
+        QueryResult as EngineQueryResult, SqlDialect, Value as EngineValue, WasmComponentInstance,
+        WasmLimits, WasmRuntime,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -58,7 +59,7 @@ export type LixBackend = {
   ): Promise<LixQueryResult> | LixQueryResult;
   beginTransaction?: () => Promise<LixTransaction> | LixTransaction;
   // Should return a SQLite database file payload.
-  exportSnapshot?: () => Promise<Uint8Array | ArrayBuffer> | Uint8Array | ArrayBuffer;
+  export_image?: () => Promise<Uint8Array | ArrayBuffer> | Uint8Array | ArrayBuffer;
 };
 
 export type LixWasmLimits = {
@@ -192,9 +193,9 @@ export type LixObserveEvents = {
             self.lix.switch_version(version_id).await.map_err(js_error)
         }
 
-        #[wasm_bindgen(js_name = exportSnapshot)]
-        pub async fn export_snapshot(&self) -> Result<Uint8Array, JsValue> {
-            let bytes = self.lix.export_snapshot().await.map_err(js_error)?;
+        #[wasm_bindgen(js_name = export_image)]
+        pub async fn export_image(&self) -> Result<Uint8Array, JsValue> {
+            let bytes = self.lix.export_image().await.map_err(js_error)?;
             Ok(Uint8Array::from(bytes.as_slice()))
         }
 
@@ -943,21 +944,15 @@ export type LixObserveEvents = {
             }))
         }
 
-        async fn export_snapshot(
-            &self,
-            writer: &mut dyn SnapshotChunkWriter,
-        ) -> Result<(), LixError> {
-            let export_snapshot = Self::get_optional_method(&self.backend, "exportSnapshot")?
+        async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
+            let export_image = Self::get_optional_method(&self.backend, "export_image")?
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
-                    description: "backend.exportSnapshot is required for export_snapshot"
-                        .to_string(),
+                    description: "backend.export_image is required for export_image".to_string(),
                 })?;
-            let result = export_snapshot
-                .call0(&self.backend)
-                .map_err(js_to_lix_error)?;
+            let result = export_image.call0(&self.backend).map_err(js_to_lix_error)?;
             let resolved = Self::await_if_promise(result).await?;
-            let bytes = js_bytes_from_value(resolved, "backend.exportSnapshot result")?;
+            let bytes = js_bytes_from_value(resolved, "backend.export_image result")?;
             writer.write_chunk(&bytes).await?;
             writer.finish().await
         }

@@ -158,7 +158,7 @@ export async function createWasmSqliteBackend(): Promise<LixBackend> {
 				return createTransaction();
 			});
 		},
-		async exportSnapshot(): Promise<Uint8Array> {
+		async export_image(): Promise<Uint8Array> {
 			return runSerialized(() => {
 				ensureBackendOpen();
 				return db.sqlite3.capi.sqlite3_js_db_export(db, "main");

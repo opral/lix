@@ -114,7 +114,7 @@ async function main() {
     sourceRepoPath: sourceRepo.repoPath,
     gitReplayPath: gitReplay.path,
     lixPath: replay.outputPath ?? config.lixPath,
-    lixBytes: replay.snapshotBytes,
+    lixBytes: replay.imageBytes,
   });
   const storageMs = performance.now() - storageStarted;
 
@@ -150,8 +150,8 @@ async function main() {
       noopCommits: replay.noopCommits,
       changedPaths: replay.changedPaths,
       outputPath: replay.outputPath,
-      outputBytes: replay.snapshotBytes,
-      outputExported: replay.snapshotExported,
+      outputBytes: replay.imageBytes,
+      outputExported: replay.imageExported,
       pageSize: replay.pageSize,
       pageCount: replay.pageCount,
       estimatedBytes: replay.estimatedBytes,
@@ -329,14 +329,14 @@ async function replayCommitsToLix(args) {
   const pageSize = await queryScalarNumber(lix, "PRAGMA page_size", "page_size");
   const pageCount = await queryScalarNumber(lix, "PRAGMA page_count", "page_count");
   const estimatedBytes = pageSize * pageCount;
-  const snapshotBytes = await fileOrFallbackSize(outputPath, estimatedBytes);
-  const snapshotExported = true;
+  const imageBytes = await fileOrFallbackSize(outputPath, estimatedBytes);
+  const imageExported = true;
 
   return {
     lix,
     outputPath,
-    snapshotBytes,
-    snapshotExported,
+    imageBytes,
+    imageExported,
     pageSize,
     pageCount,
     estimatedBytes,

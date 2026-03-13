@@ -381,15 +381,15 @@ test("installPlugin stores plugin metadata", async () => {
 	await lix.close();
 });
 
-test("exportSnapshot returns sqlite bytes", async () => {
+test("export_image returns sqlite bytes", async () => {
 	const lix = await createInitializedLix();
 	await lix.execute(
 		"INSERT INTO lix_file (id, path, data) VALUES ('f1', '/a.txt', x'01')",
 		[],
 	);
-	const snapshot = await lix.exportSnapshot();
-	expect(snapshot).toBeInstanceOf(Uint8Array);
-	expect(snapshot.byteLength).toBeGreaterThan(0);
+	const image = await lix.export_image();
+	expect(image).toBeInstanceOf(Uint8Array);
+	expect(image.byteLength).toBeGreaterThan(0);
 	await lix.close();
 });
 

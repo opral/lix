@@ -107,7 +107,7 @@ export async function createBetterSqlite3Backend(
 			runQuery("BEGIN", []);
 			return createTransaction();
 		},
-		async exportSnapshot(): Promise<Uint8Array> {
+		async export_image(): Promise<Uint8Array> {
 			ensureBackendOpen();
 			return db.serialize();
 		},
