@@ -6,20 +6,20 @@ use serde_json::Value as JsonValue;
 
 use crate::{LixBackend, LixError};
 
-use super::key::{schema_from_stored_snapshot, SchemaKey};
-use super::provider::{SchemaProvider, SqlStoredSchemaProvider};
+use super::key::{schema_from_registered_snapshot, SchemaKey};
+use super::provider::{SchemaProvider, SqlRegisteredSchemaProvider};
 
 pub struct OverlaySchemaProvider<'a> {
-    base: SqlStoredSchemaProvider<'a>,
+    base: SqlRegisteredSchemaProvider<'a>,
     pending: HashMap<SchemaKey, JsonValue>,
 }
 
 impl<'a> OverlaySchemaProvider<'a> {
     pub fn from_backend(backend: &'a dyn LixBackend) -> Self {
-        Self::new(SqlStoredSchemaProvider::new(backend))
+        Self::new(SqlRegisteredSchemaProvider::new(backend))
     }
 
-    pub fn new(base: SqlStoredSchemaProvider<'a>) -> Self {
+    pub fn new(base: SqlRegisteredSchemaProvider<'a>) -> Self {
         Self {
             base,
             pending: HashMap::new(),
@@ -34,7 +34,7 @@ impl<'a> OverlaySchemaProvider<'a> {
         &mut self,
         snapshot: &JsonValue,
     ) -> Result<(), LixError> {
-        let (key, schema) = schema_from_stored_snapshot(snapshot)?;
+        let (key, schema) = schema_from_registered_snapshot(snapshot)?;
         self.pending.insert(key, schema);
         Ok(())
     }
@@ -63,15 +63,15 @@ impl SchemaProvider for OverlaySchemaProvider<'_> {
         let stored_latest = self.base.load_latest_schema_entry(schema_key).await?;
 
         match (pending_latest, stored_latest) {
-            (Some((pending_key, pending_schema)), Some((stored_key, stored_schema))) => {
+            (Some((pending_key, pending_schema)), Some((stored_key, registered_schema))) => {
                 if compare_schema_keys(&pending_key, &stored_key) != Ordering::Less {
                     Ok(pending_schema)
                 } else {
-                    Ok(stored_schema)
+                    Ok(registered_schema)
                 }
             }
             (Some((_, pending_schema)), None) => Ok(pending_schema),
-            (None, Some((_, stored_schema))) => Ok(stored_schema),
+            (None, Some((_, registered_schema))) => Ok(registered_schema),
             (None, None) => self.base.load_latest_schema(schema_key).await,
         }
     }
@@ -94,7 +94,7 @@ mod tests {
 
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
-    use super::{OverlaySchemaProvider, SchemaKey, SchemaProvider, SqlStoredSchemaProvider};
+    use super::{OverlaySchemaProvider, SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider};
 
     #[derive(Default)]
     struct FakeBackend {
@@ -219,7 +219,7 @@ mod tests {
                 "title": "stored"
             })),
         );
-        let base = SqlStoredSchemaProvider::new(&backend);
+        let base = SqlRegisteredSchemaProvider::new(&backend);
         let mut provider = OverlaySchemaProvider::new(base);
         provider.remember_pending_schema(
             SchemaKey::new("users", "1"),
@@ -254,7 +254,7 @@ mod tests {
                 "type": "object"
             })),
         );
-        let base = SqlStoredSchemaProvider::new(&backend);
+        let base = SqlRegisteredSchemaProvider::new(&backend);
         let mut provider = OverlaySchemaProvider::new(base);
         provider.remember_pending_schema(
             SchemaKey::new("users", "2"),
@@ -284,7 +284,7 @@ mod tests {
                 "type": "object"
             })),
         );
-        let base = SqlStoredSchemaProvider::new(&backend);
+        let base = SqlRegisteredSchemaProvider::new(&backend);
         let mut provider = OverlaySchemaProvider::new(base);
         provider.remember_pending_schema(
             SchemaKey::new("users", "2"),
@@ -306,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn load_latest_uses_base_whitelist_for_lix_state() {
         let backend = FakeBackend::default();
-        let base = SqlStoredSchemaProvider::new(&backend);
+        let base = SqlRegisteredSchemaProvider::new(&backend);
         let mut provider = OverlaySchemaProvider::new(base);
 
         let latest = provider
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn remember_pending_schema_from_snapshot_validates_shape() {
         let backend = FakeBackend::default();
-        let base = SqlStoredSchemaProvider::new(&backend);
+        let base = SqlRegisteredSchemaProvider::new(&backend);
         let mut provider = OverlaySchemaProvider::new(base);
 
         let err = provider

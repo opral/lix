@@ -22,7 +22,7 @@ use crate::state::internal::param_context::{
 use crate::state::internal::{
     object_name_matches, parse_single_query, quote_ident, resolve_expr_cell_with_state,
     MutationOperation, MutationRow, PlaceholderState, ResolvedCell, RowSourceResolver,
-    SchemaRegistration, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
+    SchemaLiveTableRequirement, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::Value as EngineValue;
@@ -63,7 +63,7 @@ impl CommitQueryExecutor for BackendExecutor<'_> {
 pub struct VtableWriteRewrite {
     pub statements: Vec<Statement>,
     pub params: Vec<EngineValue>,
-    pub registrations: Vec<SchemaRegistration>,
+    pub live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub mutations: Vec<MutationRow>,
 }
 
@@ -136,14 +136,14 @@ pub fn rewrite_insert_with_writer_key(
 
     let mut statements: Vec<Statement> = Vec::new();
     let generated_params: Vec<EngineValue> = Vec::new();
-    let mut registrations: Vec<SchemaRegistration> = Vec::new();
+    let mut live_table_requirements: Vec<SchemaLiveTableRequirement> = Vec::new();
     let mut mutations: Vec<MutationRow> = Vec::new();
 
     if !tracked_rows.is_empty() {
         let tracked = rewrite_tracked_rows(
             &insert,
             tracked_rows,
-            &mut registrations,
+            &mut live_table_requirements,
             &mut mutations,
             writer_key,
             functions,
@@ -165,7 +165,7 @@ pub fn rewrite_insert_with_writer_key(
     Ok(Some(VtableWriteRewrite {
         statements,
         params: generated_params,
-        registrations,
+        live_table_requirements,
         mutations,
     }))
 }
@@ -209,7 +209,7 @@ pub async fn rewrite_insert_with_backend(
 
     let mut statements: Vec<Statement> = Vec::new();
     let mut generated_params: Vec<EngineValue> = Vec::new();
-    let mut registrations: Vec<SchemaRegistration> = Vec::new();
+    let mut live_table_requirements: Vec<SchemaLiveTableRequirement> = Vec::new();
     let mut mutations: Vec<MutationRow> = Vec::new();
 
     if !tracked_rows.is_empty() {
@@ -217,7 +217,7 @@ pub async fn rewrite_insert_with_backend(
             backend,
             &insert,
             tracked_rows,
-            &mut registrations,
+            &mut live_table_requirements,
             &mut mutations,
             params.len() + generated_param_offset,
             writer_key,
@@ -242,7 +242,7 @@ pub async fn rewrite_insert_with_backend(
     Ok(Some(VtableWriteRewrite {
         statements,
         params: generated_params,
-        registrations,
+        live_table_requirements,
         mutations,
     }))
 }
@@ -838,7 +838,7 @@ fn split_insert_rows(
 fn rewrite_tracked_rows(
     insert: &sqlparser::ast::Insert,
     rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
-    registrations: &mut Vec<SchemaRegistration>,
+    live_table_requirements: &mut Vec<SchemaLiveTableRequirement>,
     mutations: &mut Vec<MutationRow>,
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
@@ -870,8 +870,11 @@ fn rewrite_tracked_rows(
             "schema_key",
         )?;
 
-        if !registrations.iter().any(|reg| reg.schema_key == schema_key) {
-            registrations.push(SchemaRegistration {
+        if !live_table_requirements
+            .iter()
+            .any(|reg| reg.schema_key == schema_key)
+        {
+            live_table_requirements.push(SchemaLiveTableRequirement {
                 schema_key: schema_key.clone(),
             });
         }
@@ -1060,7 +1063,7 @@ async fn rewrite_tracked_rows_with_backend(
     backend: &dyn LixBackend,
     insert: &sqlparser::ast::Insert,
     rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
-    registrations: &mut Vec<SchemaRegistration>,
+    live_table_requirements: &mut Vec<SchemaLiveTableRequirement>,
     mutations: &mut Vec<MutationRow>,
     placeholder_offset: usize,
     writer_key: Option<&str>,
@@ -1125,7 +1128,7 @@ async fn rewrite_tracked_rows_with_backend(
         };
         let domain_writer_key = explicit_writer_key.or_else(|| writer_key.map(ToString::to_string));
 
-        ensure_registration(registrations, &schema_key);
+        ensure_live_table_requirement(live_table_requirements, &schema_key);
 
         let change_id = functions.uuid_v7();
         affected_versions.insert(version_id.clone());
@@ -1177,7 +1180,7 @@ async fn rewrite_tracked_rows_with_backend(
     )?;
 
     for row in &commit_result.live_state_rows {
-        ensure_registration(registrations, &row.schema_key);
+        ensure_live_table_requirement(live_table_requirements, &row.schema_key);
     }
 
     build_statement_batch_from_generate_commit_result(
@@ -1188,14 +1191,17 @@ async fn rewrite_tracked_rows_with_backend(
     )
 }
 
-fn ensure_registration(registrations: &mut Vec<SchemaRegistration>, schema_key: &str) {
-    if registrations
+fn ensure_live_table_requirement(
+    live_table_requirements: &mut Vec<SchemaLiveTableRequirement>,
+    schema_key: &str,
+) {
+    if live_table_requirements
         .iter()
         .any(|registration| registration.schema_key == schema_key)
     {
         return;
     }
-    registrations.push(SchemaRegistration {
+    live_table_requirements.push(SchemaLiveTableRequirement {
         schema_key: schema_key.to_string(),
     });
 }

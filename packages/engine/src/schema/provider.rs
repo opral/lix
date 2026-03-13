@@ -6,9 +6,9 @@ use serde_json::{json, Value as JsonValue};
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 
-use super::key::{schema_from_stored_snapshot, SchemaKey};
+use super::key::{schema_from_registered_snapshot, SchemaKey};
 
-const STORED_SCHEMA_TABLE: &str = "lix_internal_stored_schema_bootstrap";
+const REGISTERED_SCHEMA_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const GLOBAL_VERSION: &str = "global";
 const INTERNAL_SCHEMA_VERSION: &str = "1";
 
@@ -18,12 +18,12 @@ pub trait SchemaProvider {
     async fn load_latest_schema(&mut self, schema_key: &str) -> Result<JsonValue, LixError>;
 }
 
-pub struct SqlStoredSchemaProvider<'a> {
+pub struct SqlRegisteredSchemaProvider<'a> {
     backend: &'a dyn LixBackend,
     cache: HashMap<SchemaKey, JsonValue>,
 }
 
-impl<'a> SqlStoredSchemaProvider<'a> {
+impl<'a> SqlRegisteredSchemaProvider<'a> {
     pub fn new(backend: &'a dyn LixBackend) -> Self {
         Self {
             backend,
@@ -47,7 +47,7 @@ impl<'a> SqlStoredSchemaProvider<'a> {
                AND snapshot_content IS NOT NULL \
              ORDER BY CAST(schema_version AS INTEGER) DESC \
              LIMIT 1",
-            table = STORED_SCHEMA_TABLE,
+            table = REGISTERED_SCHEMA_TABLE,
             prefix_len = prefix_len,
             prefix_escaped = prefix_escaped,
             global_version = GLOBAL_VERSION,
@@ -76,7 +76,7 @@ impl<'a> SqlStoredSchemaProvider<'a> {
              WHERE version_id = '{global_version}' \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL",
-            table = STORED_SCHEMA_TABLE,
+            table = REGISTERED_SCHEMA_TABLE,
             global_version = GLOBAL_VERSION,
         );
 
@@ -87,9 +87,9 @@ impl<'a> SqlStoredSchemaProvider<'a> {
             let snapshot: JsonValue =
                 serde_json::from_str(&snapshot_content).map_err(|err| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!("stored schema snapshot_content invalid JSON: {err}"),
+                    description: format!("registered schema snapshot_content invalid JSON: {err}"),
                 })?;
-            let (key, schema) = schema_from_stored_snapshot(&snapshot)?;
+            let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
             self.cache.insert(key.clone(), schema.clone());
 
             let should_replace = latest_by_schema_key
@@ -113,7 +113,7 @@ impl<'a> SqlStoredSchemaProvider<'a> {
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
              LIMIT 1",
-            table = STORED_SCHEMA_TABLE,
+            table = REGISTERED_SCHEMA_TABLE,
             entity_id = entity_id,
             global_version = GLOBAL_VERSION,
         );
@@ -131,7 +131,7 @@ impl<'a> SqlStoredSchemaProvider<'a> {
 }
 
 #[async_trait(?Send)]
-impl SchemaProvider for SqlStoredSchemaProvider<'_> {
+impl SchemaProvider for SqlRegisteredSchemaProvider<'_> {
     async fn load_schema(&mut self, key: &SchemaKey) -> Result<JsonValue, LixError> {
         if let Some(schema) = whitelisted_internal_schema(&key.schema_key) {
             if key.schema_version == INTERNAL_SCHEMA_VERSION {
@@ -205,12 +205,12 @@ fn whitelisted_internal_schema(schema_key: &str) -> Option<JsonValue> {
 fn schema_from_snapshot_content(raw: &str) -> Result<JsonValue, LixError> {
     let parsed: JsonValue = serde_json::from_str(raw).map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("stored schema snapshot_content invalid JSON: {err}"),
+        description: format!("registered schema snapshot_content invalid JSON: {err}"),
     })?;
 
     parsed.get("value").cloned().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "stored schema snapshot_content missing value".to_string(),
+        description: "registered schema snapshot_content missing value".to_string(),
     })
 }
 
@@ -241,7 +241,7 @@ mod tests {
 
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
-    use super::{SchemaKey, SchemaProvider, SqlStoredSchemaProvider};
+    use super::{SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider};
 
     #[derive(Default)]
     struct FakeBackend {
@@ -375,7 +375,7 @@ mod tests {
                 "type": "object"
             })),
         );
-        let mut provider = SqlStoredSchemaProvider::new(&backend);
+        let mut provider = SqlRegisteredSchemaProvider::new(&backend);
         let key = SchemaKey::new("users", "1");
 
         let first = provider.load_schema(&key).await.expect("first load");
@@ -391,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn load_schema_returns_missing_error() {
         let backend = FakeBackend::default();
-        let mut provider = SqlStoredSchemaProvider::new(&backend);
+        let mut provider = SqlRegisteredSchemaProvider::new(&backend);
         let key = SchemaKey::new("missing", "1");
 
         let err = provider
@@ -412,7 +412,7 @@ mod tests {
                 "type": "object"
             })),
         );
-        let mut provider = SqlStoredSchemaProvider::new(&backend);
+        let mut provider = SqlRegisteredSchemaProvider::new(&backend);
 
         let latest = provider
             .load_latest_schema("users")
@@ -438,7 +438,7 @@ mod tests {
     #[tokio::test]
     async fn load_schema_rejects_invalid_snapshot_content() {
         let backend = FakeBackend::default().with_schema("users~1", "{not-json");
-        let mut provider = SqlStoredSchemaProvider::new(&backend);
+        let mut provider = SqlRegisteredSchemaProvider::new(&backend);
 
         let err = provider
             .load_schema(&SchemaKey::new("users", "1"))
@@ -450,7 +450,7 @@ mod tests {
     #[tokio::test]
     async fn load_latest_uses_internal_whitelist_for_lix_state() {
         let backend = FakeBackend::default();
-        let mut provider = SqlStoredSchemaProvider::new(&backend);
+        let mut provider = SqlRegisteredSchemaProvider::new(&backend);
 
         let schema = provider
             .load_latest_schema("lix_state")
@@ -467,7 +467,7 @@ mod tests {
     #[tokio::test]
     async fn load_schema_uses_internal_whitelist_for_lix_state() {
         let backend = FakeBackend::default();
-        let mut provider = SqlStoredSchemaProvider::new(&backend);
+        let mut provider = SqlRegisteredSchemaProvider::new(&backend);
 
         let schema = provider
             .load_schema(&SchemaKey::new("lix_state", "1"))
@@ -518,7 +518,7 @@ mod tests {
                     }
                 })),
             );
-        let mut provider = SqlStoredSchemaProvider::new(&backend);
+        let mut provider = SqlRegisteredSchemaProvider::new(&backend);
         let mut entries = provider
             .load_latest_schema_entries()
             .await

@@ -663,7 +663,7 @@ mod tests {
                 .push(sql.to_string());
             if sql.contains("lix_deterministic_mode")
                 || sql.contains("lix_internal_live_untracked_v1")
-                || sql.contains("lix_internal_stored_schema_bootstrap")
+                || sql.contains("lix_internal_registered_schema_bootstrap")
             {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",

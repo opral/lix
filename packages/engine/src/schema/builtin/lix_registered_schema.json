@@ -1,5 +1,5 @@
 {
-  "x-lix-key": "lix_stored_schema",
+  "x-lix-key": "lix_registered_schema",
   "x-lix-version": "1",
   "x-lix-primary-key": [
     "/value/x-lix-key",

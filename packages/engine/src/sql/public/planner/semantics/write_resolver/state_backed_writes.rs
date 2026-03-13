@@ -4,7 +4,7 @@ use super::selector_queries::{
 };
 use super::*;
 use crate::schema::builtin::builtin_schema_definition;
-use crate::schema::{SchemaProvider, SqlStoredSchemaProvider};
+use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
 use crate::sql::public::planner::ir::CanonicalStateAssignments;
 use crate::sql::public::planner::ir::CanonicalStateRowKey;
 use crate::sql::public::planner::semantics::state_assignments::{
@@ -33,7 +33,7 @@ pub(super) async fn resolve_entity_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let mut provider = SqlStoredSchemaProvider::new(backend);
+    let mut provider = SqlRegisteredSchemaProvider::new(backend);
     let entity_schema = load_entity_schema(&mut provider, planned_write)
         .await
         .map_err(write_resolve_backend_error)?;

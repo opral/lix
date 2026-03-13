@@ -139,7 +139,7 @@ fn can_merge_coalescable_insert(left: &Insert, right: &Insert) -> bool {
     if !insert_targets_coalescable_table(left) || !insert_targets_coalescable_table(right) {
         return false;
     }
-    if insert_targets_stored_schema(left) || insert_targets_stored_schema(right) {
+    if insert_targets_registered_schema(left) || insert_targets_registered_schema(right) {
         return false;
     }
     if left.columns != right.columns {
@@ -212,7 +212,7 @@ fn insert_targets_coalescable_table(insert: &Insert) -> bool {
     }
 }
 
-fn insert_targets_stored_schema(insert: &Insert) -> bool {
+fn insert_targets_registered_schema(insert: &Insert) -> bool {
     let schema_key_index = insert
         .columns
         .iter()
@@ -227,7 +227,7 @@ fn insert_targets_stored_schema(insert: &Insert) -> bool {
 
     rows.iter().any(|row| {
         row.get(schema_key_index)
-            .is_some_and(expr_is_stored_schema_literal)
+            .is_some_and(expr_is_registered_schema_literal)
     })
 }
 
@@ -253,11 +253,11 @@ fn plain_values_rows_mut(insert: &mut Insert) -> Option<&mut Vec<Vec<Expr>>> {
     Some(&mut values.rows)
 }
 
-fn expr_is_stored_schema_literal(expr: &Expr) -> bool {
+fn expr_is_registered_schema_literal(expr: &Expr) -> bool {
     match expr {
         Expr::Value(value) => match &value.value {
             SqlAstValue::SingleQuotedString(text) | SqlAstValue::DoubleQuotedString(text) => {
-                text.eq_ignore_ascii_case("lix_stored_schema")
+                text.eq_ignore_ascii_case("lix_registered_schema")
             }
             _ => false,
         },

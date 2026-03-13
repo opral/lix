@@ -3,10 +3,22 @@ use crate::sql::analysis::state_resolution::canonical::should_invalidate_install
 use crate::sql::execution::parse::parse_sql;
 use crate::{ExecuteResult, LixError, Value};
 use futures_util::FutureExt;
+use serde_json::Value as JsonValue;
 use std::future::Future;
 use std::pin::Pin;
 
+const REGISTER_SCHEMA_HELPER_SQL: &str =
+    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))";
+
 impl Engine {
+    pub async fn register_schema(&self, schema: &JsonValue) -> Result<(), LixError> {
+        let mut transaction = self
+            .begin_transaction_with_options(ExecuteOptions::default())
+            .await?;
+        transaction.register_schema(schema).await?;
+        transaction.commit().await
+    }
+
     pub async fn begin_transaction_with_options(
         &self,
         options: ExecuteOptions,
@@ -55,6 +67,16 @@ impl Engine {
 }
 
 impl EngineTransaction<'_> {
+    pub async fn register_schema(&mut self, schema: &JsonValue) -> Result<(), LixError> {
+        let schema_json = serde_json::to_string(schema).map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("failed to serialize schema definition: {error}"),
+        })?;
+        self.execute(REGISTER_SCHEMA_HELPER_SQL, &[Value::Text(schema_json)])
+            .await?;
+        Ok(())
+    }
+
     pub async fn execute(
         &mut self,
         sql: &str,

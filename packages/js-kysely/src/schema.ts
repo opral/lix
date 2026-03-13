@@ -13,7 +13,7 @@ import {
 	LixFileDescriptorSchema,
 	LixKeyValueSchema,
 	LixLabelSchema,
-	LixStoredSchemaSchema,
+	LixStoredSchemaSchema as LixRegisteredSchemaSchema,
 	LixVersionDescriptorSchema,
 } from "@lix-js/sdk";
 import type { Generated } from "kysely";
@@ -282,8 +282,8 @@ export type LixDatabaseSchema = {
 	EntityViews<typeof LixLabelSchema, "lix_label"> &
 	EntityViews<typeof LixEntityLabelSchema, "lix_entity_label"> &
 	EntityViews<
-		typeof LixStoredSchemaSchema,
-		"lix_stored_schema",
+		typeof LixRegisteredSchemaSchema,
+		"lix_registered_schema",
 		{ value: any }
 	> &
 	EntityViews<

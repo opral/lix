@@ -35,7 +35,7 @@ pub(super) async fn execute_public_read_query_strict(
     let mut required_schema_keys = lowered.required_schema_keys;
     required_schema_keys.extend(nested_required_schema_keys);
     for schema_key in &required_schema_keys {
-        crate::schema::registry::register_schema(backend, schema_key).await?;
+        crate::schema::registry::ensure_schema_live_table(backend, schema_key).await?;
     }
     let bound = bind_public_query(lowered.query, params, backend.dialect())?;
     let result = backend.execute(&bound.sql, &bound.params).await?;

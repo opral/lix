@@ -647,14 +647,13 @@ async fn resolve_missing_directory_rows(
     paths.push(directory_path.to_string());
 
     for candidate_path in paths {
-        if let Some(existing_id) =
-            lookup_directory_id_by_path(
-                backend,
-                version_id,
-                &NormalizedDirectoryPath::from_normalized(candidate_path.clone()),
-                lookup_scope,
-            )
-            .await?
+        if let Some(existing_id) = lookup_directory_id_by_path(
+            backend,
+            version_id,
+            &NormalizedDirectoryPath::from_normalized(candidate_path.clone()),
+            lookup_scope,
+        )
+        .await?
         {
             known_ids.insert(candidate_path, existing_id);
             continue;
@@ -670,14 +669,13 @@ async fn resolve_missing_directory_rows(
             Some(parent_path) => {
                 if let Some(parent_id) = known_ids.get(&parent_path).cloned() {
                     Some(parent_id)
-                } else if let Some(existing_parent_id) =
-                    lookup_directory_id_by_path(
-                        backend,
-                        version_id,
-                        &NormalizedDirectoryPath::from_normalized(parent_path.clone()),
-                        lookup_scope,
-                    )
-                    .await?
+                } else if let Some(existing_parent_id) = lookup_directory_id_by_path(
+                    backend,
+                    version_id,
+                    &NormalizedDirectoryPath::from_normalized(parent_path.clone()),
+                    lookup_scope,
+                )
+                .await?
                 {
                     Some(existing_parent_id)
                 } else {
@@ -717,13 +715,7 @@ async fn resolve_file_update_target(
     let mut ancestor_rows = Vec::new();
     let (next_directory_id, next_name, next_extension, next_path) =
         if let Some(parsed) = assignments.path.as_ref() {
-            ensure_no_directory_at_file_path(
-                backend,
-                version_id,
-                parsed,
-                lookup_scope,
-            )
-            .await?;
+            ensure_no_directory_at_file_path(backend, version_id, parsed, lookup_scope).await?;
             let (directory_id, missing_ancestors) = resolve_parent_directory_target(
                 backend,
                 version_id,
@@ -809,21 +801,16 @@ async fn resolve_directory_update_target(
             message: "Directory name must be provided".to_string(),
         })?;
         let parent_id = match parent_directory_path(normalized_path) {
-            Some(parent_path) => {
-                lookup_directory_id_by_path(
-                    backend,
-                    version_id,
-                    &NormalizedDirectoryPath::from_normalized(parent_path.clone()),
-                    lookup_scope,
-                )
-                .await?
-                    .ok_or_else(|| WriteResolveError {
-                        message: format!(
-                            "Parent directory does not exist for path {}",
-                            parent_path
-                        ),
-                    })?
-            }
+            Some(parent_path) => lookup_directory_id_by_path(
+                backend,
+                version_id,
+                &NormalizedDirectoryPath::from_normalized(parent_path.clone()),
+                lookup_scope,
+            )
+            .await?
+            .ok_or_else(|| WriteResolveError {
+                message: format!("Parent directory does not exist for path {}", parent_path),
+            })?,
             None => String::new(),
         };
         let parent_id_opt = if parent_id.is_empty() {
@@ -1026,14 +1013,13 @@ async fn resolve_directory_update_targets_batch(
                 });
             }
         }
-        if let Some(existing_id) =
-            lookup_directory_id_by_path(
-                backend,
-                version_id,
-                &NormalizedDirectoryPath::from_normalized(path.clone()),
-                lookup_scope,
-            )
-            .await?
+        if let Some(existing_id) = lookup_directory_id_by_path(
+            backend,
+            version_id,
+            &NormalizedDirectoryPath::from_normalized(path.clone()),
+            lookup_scope,
+        )
+        .await?
         {
             if existing_id == row.id {
                 continue;

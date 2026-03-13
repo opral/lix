@@ -38,7 +38,7 @@ pub(crate) async fn materialize_vtable_insert_select_sources(
             ))
             .await?;
             for schema_key in &rewritten_source.required_schema_keys {
-                crate::schema::registry::register_schema(backend, schema_key).await?;
+                crate::schema::registry::ensure_schema_live_table(backend, schema_key).await?;
             }
             let lowered_source = lower_statement(
                 Statement::Query(Box::new(rewritten_source.query)),

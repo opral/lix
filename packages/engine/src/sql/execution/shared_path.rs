@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::schema::registry::register_schema_sql_statements;
+use crate::schema::registry::ensure_schema_live_table_in_transaction;
 use crate::sql::public::runtime::{
     finalize_public_write_execution, prepare_public_execution_with_internal_access,
     prepare_public_execution_with_registry_and_internal_access,
@@ -29,7 +29,7 @@ use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::contracts::execution_plan::ExecutionPlan;
 use crate::sql::execution::contracts::planned_statement::{
-    PlannedStatementSet, SchemaRegistration,
+    PlannedStatementSet, SchemaLiveTableRequirement,
 };
 use crate::sql::execution::contracts::requirements::PlanRequirements;
 use crate::sql::execution::contracts::result_contract::ResultContract;
@@ -43,8 +43,8 @@ use crate::sql::execution::plan::build_execution_plan;
 use serde_json::{json, Value as JsonValue};
 use sqlparser::ast::Statement;
 
-const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
-const STORED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_stored_schema_bootstrap";
+const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
+const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
 const GLOBAL_VERSION_ID: &str = "global";
 
@@ -75,7 +75,9 @@ pub(crate) fn prepared_execution_mutates_public_surface_registry(
     }
 
     if prepared.plan.preprocess.mutations.iter().any(|row| {
-        row.schema_key == STORED_SCHEMA_KEY && row.version_id == GLOBAL_VERSION_ID && !row.untracked
+        row.schema_key == REGISTERED_SCHEMA_KEY
+            && row.version_id == GLOBAL_VERSION_ID
+            && !row.untracked
     }) {
         return Ok(true);
     }
@@ -83,10 +85,10 @@ pub(crate) fn prepared_execution_mutates_public_surface_registry(
     let dirty = match prepared.plan.preprocess.internal_state.as_ref() {
         Some(crate::state::internal::InternalStatePlan {
             postprocess: Some(crate::state::internal::PostprocessPlan::VtableUpdate(plan)),
-        }) => plan.schema_key == STORED_SCHEMA_KEY,
+        }) => plan.schema_key == REGISTERED_SCHEMA_KEY,
         Some(crate::state::internal::InternalStatePlan {
             postprocess: Some(crate::state::internal::PostprocessPlan::VtableDelete(plan)),
-        }) => plan.schema_key == STORED_SCHEMA_KEY,
+        }) => plan.schema_key == REGISTERED_SCHEMA_KEY,
         _ => false,
     };
 
@@ -288,7 +290,7 @@ pub(crate) async fn prepare_execution_with_backend(
                                 .iter()
                                 .filter_map(|partition| match partition {
                                     PublicWriteExecutionPartition::Tracked(execution) => {
-                                        Some(execution.schema_registrations.clone())
+                                        Some(execution.schema_live_table_requirements.clone())
                                     }
                                     PublicWriteExecutionPartition::Untracked(_) => None,
                                 })
@@ -376,13 +378,13 @@ pub(crate) async fn prepare_execution_with_backend(
 
 fn passthrough_execution_plan_for_public_write(
     statements: &[Statement],
-    registrations: Vec<SchemaRegistration>,
+    live_table_requirements: Vec<SchemaLiveTableRequirement>,
 ) -> ExecutionPlan {
     ExecutionPlan {
         preprocess: PlannedStatementSet {
             sql: String::new(),
             prepared_statements: Vec::new(),
-            registrations,
+            live_table_requirements,
             internal_state: None,
             mutations: Vec::new(),
             update_validations: Vec::new(),
@@ -614,21 +616,16 @@ async fn execute_public_tracked_write_with_transaction(
             })?;
     }
 
-    for registration in &execution.schema_registrations {
-        for statement in
-            register_schema_sql_statements(&registration.schema_key, transaction.dialect())
-        {
-            transaction
-                .execute(&statement, &[])
-                .await
-                .map_err(|error| LixError {
-                    code: error.code,
-                    description: format!(
-                        "public tracked write schema registration failed for '{}': {}",
-                        registration.schema_key, error.description
-                    ),
-                })?;
-        }
+    for live_table_requirement in &execution.schema_live_table_requirements {
+        ensure_schema_live_table_in_transaction(transaction, &live_table_requirement.schema_key)
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "public tracked write schema live-table ensure failed for '{}': {}",
+                    live_table_requirement.schema_key, error.description
+                ),
+            })?;
     }
 
     if execution.domain_change_batch.changes.is_empty() {
@@ -689,12 +686,12 @@ async fn execute_public_tracked_write_with_transaction(
     .map_err(append_commit_error_to_lix_error)?;
 
     if let Some(commit_result) = append_result.commit_result.as_ref() {
-        mirror_public_stored_schema_bootstrap_rows(transaction, commit_result)
+        mirror_public_registered_schema_bootstrap_rows(transaction, commit_result)
             .await
             .map_err(|error| LixError {
                 code: error.code,
                 description: format!(
-                    "public tracked write stored-schema bootstrap mirroring failed: {}",
+                    "public tracked write registered-schema bootstrap mirroring failed: {}",
                     error.description
                 ),
             })?;
@@ -1429,12 +1426,12 @@ fn append_commit_error_to_lix_error(error: crate::state::commit::AppendCommitErr
     }
 }
 
-async fn mirror_public_stored_schema_bootstrap_rows(
+async fn mirror_public_registered_schema_bootstrap_rows(
     transaction: &mut dyn LixTransaction,
     commit_result: &crate::state::commit::GenerateCommitResult,
 ) -> Result<(), LixError> {
     for row in &commit_result.live_state_rows {
-        if row.schema_key != STORED_SCHEMA_KEY || row.lixcol_version_id != GLOBAL_VERSION_ID {
+        if row.schema_key != REGISTERED_SCHEMA_KEY || row.lixcol_version_id != GLOBAL_VERSION_ID {
             continue;
         }
 
@@ -1471,7 +1468,7 @@ async fn mirror_public_stored_schema_bootstrap_rows(
              writer_key = excluded.writer_key, \
              is_tombstone = excluded.is_tombstone, \
              updated_at = excluded.updated_at",
-            table = STORED_SCHEMA_BOOTSTRAP_TABLE,
+            table = REGISTERED_SCHEMA_BOOTSTRAP_TABLE,
             entity_id = escape_sql_string(&row.entity_id),
             schema_key = escape_sql_string(&row.schema_key),
             schema_version = escape_sql_string(&row.schema_version),

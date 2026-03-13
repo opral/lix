@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::deterministic_mode::DeterministicSettings;
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::functions::SharedFunctionProvider;
-use crate::schema::registry::register_schema_sql_statements;
+use crate::schema::registry::ensure_schema_live_table_in_transaction;
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::contracts::execution_plan::ExecutionPlan;
 use crate::sql::execution::contracts::executor_error::ExecutorError;
@@ -32,10 +32,13 @@ pub(crate) async fn execute_plan_sql(
 ) -> Result<SqlExecutionOutcome, ExecutorError> {
     let prepared_statements = lower_to_prepared_statements(plan);
 
-    for registration in &plan.preprocess.registrations {
-        crate::schema::registry::register_schema(engine.backend_ref(), &registration.schema_key)
-            .await
-            .map_err(ExecutorError::execute)?;
+    for registration in &plan.preprocess.live_table_requirements {
+        crate::schema::registry::ensure_schema_live_table(
+            engine.backend_ref(),
+            &registration.schema_key,
+        )
+        .await
+        .map_err(ExecutorError::execute)?;
     }
 
     let outcome = execute_internal_state_plan_with_backend(
@@ -72,15 +75,10 @@ pub(crate) async fn execute_plan_sql_with_transaction(
 ) -> Result<SqlExecutionOutcome, ExecutorError> {
     let prepared_statements = lower_to_prepared_statements(plan);
 
-    for registration in &plan.preprocess.registrations {
-        for statement in
-            register_schema_sql_statements(&registration.schema_key, transaction.dialect())
-        {
-            transaction
-                .execute(&statement, &[])
-                .await
-                .map_err(ExecutorError::execute)?;
-        }
+    for registration in &plan.preprocess.live_table_requirements {
+        ensure_schema_live_table_in_transaction(transaction, &registration.schema_key)
+            .await
+            .map_err(ExecutorError::execute)?;
     }
 
     let outcome = execute_internal_state_plan_with_transaction(
