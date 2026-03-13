@@ -37,6 +37,13 @@ fn assert_bool(value: &Value, expected: bool) {
     }
 }
 
+fn assert_non_text_bool(value: &Value, expected: bool) {
+    match value {
+        Value::Boolean(actual) => assert_eq!(*actual, expected),
+        other => panic!("expected engine boolean value, got {other:?}"),
+    }
+}
+
 async fn register_test_state_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
@@ -413,6 +420,115 @@ simulation_test!(
         assert_bool(&result.statements[0].rows[0][1], true);
         assert_text(&result.statements[0].rows[1][0], "version-or-b");
         assert_bool(&result.statements[0].rows[1][1], true);
+    }
+);
+
+simulation_test!(
+    lix_version_hidden_projects_as_engine_boolean,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute(
+                "SELECT hidden \
+                 FROM lix_version \
+                 WHERE name = 'main'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_non_text_bool(&result.statements[0].rows[0][0], false);
+    }
+);
+
+simulation_test!(
+    lix_version_descriptor_boolean_columns_are_not_text_in_sqlite,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_version_descriptor (id, name, hidden) VALUES \
+                 ('descriptor-bool', 'Descriptor Bool', false)",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let initial = engine
+            .execute(
+                "SELECT id, hidden, typeof(hidden) \
+                 FROM lix_version_descriptor \
+                 WHERE id = 'descriptor-bool'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(initial.statements[0].rows.len(), 1);
+        let row = &initial.statements[0].rows[0];
+        assert_text(&row[0], "descriptor-bool");
+        assert_non_text_bool(&row[1], false);
+        assert_text(&row[2], "integer");
+
+        let false_literal = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_version_descriptor \
+                 WHERE id = 'descriptor-bool' AND hidden = false",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            false_literal.statements[0].rows,
+            vec![vec![Value::Integer(1)]]
+        );
+
+        let false_text = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_version_descriptor \
+                 WHERE id = 'descriptor-bool' AND hidden = 'false'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(false_text.statements[0].rows, vec![vec![Value::Integer(0)]]);
+
+        engine
+            .execute(
+                "UPDATE lix_version_descriptor \
+                 SET hidden = true \
+                 WHERE id = 'descriptor-bool'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let updated = engine
+            .execute(
+                "SELECT hidden, typeof(hidden) \
+                 FROM lix_version_descriptor \
+                 WHERE id = 'descriptor-bool'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.statements[0].rows.len(), 1);
+        assert_non_text_bool(&updated.statements[0].rows[0][0], true);
+        assert_text(&updated.statements[0].rows[0][1], "integer");
     }
 );
 

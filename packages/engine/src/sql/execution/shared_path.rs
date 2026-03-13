@@ -8,7 +8,7 @@ use crate::sql::public::runtime::{
     finalize_public_write_execution, prepare_public_execution_with_internal_access,
     prepare_public_execution_with_registry_and_internal_access,
     prepared_public_write_mutates_public_surface_registry, PreparedPublicExecution,
-    PreparedPublicWrite, PublicWriteExecutionPartition,
+    PreparedPublicRead, PreparedPublicWrite, PublicWriteExecutionPartition,
 };
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{
@@ -58,6 +58,7 @@ pub(crate) struct PreparedExecutionContext {
     pub(crate) sequence_start: i64,
     pub(crate) functions: SharedFunctionProvider<RuntimeFunctionProvider>,
     pub(crate) plan: ExecutionPlan,
+    pub(crate) public_read: Option<PreparedPublicRead>,
     pub(crate) public_write: Option<PreparedPublicWrite>,
 }
 
@@ -368,6 +369,7 @@ pub(crate) async fn prepare_execution_with_backend(
         sequence_start,
         functions,
         plan,
+        public_read,
         public_write,
     })
 }
