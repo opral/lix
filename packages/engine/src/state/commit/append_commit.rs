@@ -4,6 +4,7 @@ use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
     parse_active_account_snapshot,
 };
+use crate::deterministic_mode::build_persist_sequence_highest_sql;
 use crate::functions::LixFunctionProvider;
 use crate::schema::builtin::types::LixVersionPointer;
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
@@ -67,6 +68,8 @@ pub(crate) struct AppendCommitArgs {
     pub(crate) changes: Vec<ProposedDomainChange>,
     pub(crate) lazy_exact_file_metadata_update: Option<LazyExactFileMetadataUpdate>,
     pub(crate) preconditions: AppendCommitPreconditions,
+    pub(crate) should_emit_observe_tick: bool,
+    pub(crate) observe_tick_writer_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,6 +312,14 @@ pub(crate) async fn append_commit_if_preconditions_hold(
         &committed_tip,
         &timestamp,
     ));
+    if let Some(highest_seen) = functions.deterministic_sequence_persist_highest_seen() {
+        prepared_batch.append_sql(build_persist_sequence_highest_sql(highest_seen));
+    }
+    if args.should_emit_observe_tick {
+        prepared_batch.append_sql(build_observe_tick_insert_sql(
+            args.observe_tick_writer_key.as_deref(),
+        ));
+    }
 
     let mut write_program = WriteProgram::new();
     write_program.push_batch(prepared_batch);
@@ -322,6 +333,19 @@ pub(crate) async fn append_commit_if_preconditions_hold(
         commit_result: Some(commit_result),
         applied_domain_changes,
     })
+}
+
+fn build_observe_tick_insert_sql(writer_key: Option<&str>) -> String {
+    match writer_key {
+        Some(writer_key) => format!(
+            "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+             VALUES (CURRENT_TIMESTAMP, '{}')",
+            escape_sql_string(writer_key)
+        ),
+        None => "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+                  VALUES (CURRENT_TIMESTAMP, NULL)"
+            .to_string(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1265,6 +1289,8 @@ mod tests {
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
                     idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                should_emit_observe_tick: false,
+                observe_tick_writer_key: None,
             },
             &mut functions,
             Some(&mut checker),
@@ -1327,6 +1353,8 @@ mod tests {
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
                     idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                should_emit_observe_tick: false,
+                observe_tick_writer_key: None,
             },
             &mut functions,
             Some(&mut checker),
@@ -1370,6 +1398,8 @@ mod tests {
                         "fp-1".to_string(),
                     ),
                 },
+                should_emit_observe_tick: false,
+                observe_tick_writer_key: None,
             },
             &mut functions,
             None,
@@ -1402,6 +1432,8 @@ mod tests {
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
                     idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                should_emit_observe_tick: false,
+                observe_tick_writer_key: None,
             },
             &mut functions,
             Some(&mut checker),
@@ -1429,6 +1461,8 @@ mod tests {
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
                     idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                should_emit_observe_tick: false,
+                observe_tick_writer_key: None,
             },
             &mut functions,
             None,
@@ -1455,6 +1489,8 @@ mod tests {
                     expected_tip: AppendExpectedTip::CreateIfMissing,
                     idempotency_key: AppendIdempotencyKey::Exact("idem-create".to_string()),
                 },
+                should_emit_observe_tick: false,
+                observe_tick_writer_key: None,
             },
             &mut functions,
             None,
@@ -1485,6 +1521,8 @@ mod tests {
                     expected_tip: AppendExpectedTip::CommitId("commit-global-123".to_string()),
                     idempotency_key: AppendIdempotencyKey::Exact("idem-global".to_string()),
                 },
+                should_emit_observe_tick: false,
+                observe_tick_writer_key: None,
             },
             &mut functions,
             None,
@@ -1522,6 +1560,8 @@ mod tests {
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
                     idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                should_emit_observe_tick: false,
+                observe_tick_writer_key: None,
             },
             &mut functions,
             Some(&mut checker),

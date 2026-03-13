@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::deterministic_mode::{
-    build_persist_sequence_highest_sql, DeterministicSettings, RuntimeFunctionProvider,
-};
+use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::registry::register_schema_sql_statements;
@@ -35,7 +33,6 @@ use crate::sql::execution::contracts::execution_plan::ExecutionPlan;
 use crate::sql::execution::contracts::planned_statement::{
     PlannedStatementSet, SchemaRegistration,
 };
-use crate::sql::execution::contracts::prepared_statement::PreparedBatch;
 use crate::sql::execution::contracts::requirements::PlanRequirements;
 use crate::sql::execution::contracts::result_contract::ResultContract;
 use crate::sql::execution::derive_requirements::derive_plan_requirements;
@@ -542,59 +539,8 @@ pub(crate) async fn maybe_execute_public_write_with_backend(
         Some(execution) => execution,
         None => return Ok(None),
     };
-    let should_emit_observe_tick = execution
-        .plan_effects_override
-        .as_ref()
-        .map(|effects| !effects.state_commit_stream_changes.is_empty())
-        .unwrap_or(false)
-        || !execution.state_commit_stream_changes.is_empty();
-    execute_public_write_followup_batch(
-        engine,
-        transaction.as_mut(),
-        prepared.settings,
-        prepared.sequence_start,
-        &prepared.functions,
-        writer_key,
-        should_emit_observe_tick,
-    )
-    .await?;
     transaction.commit().await?;
     Ok(Some(execution))
-}
-
-async fn execute_public_write_followup_batch(
-    engine: &Engine,
-    transaction: &mut dyn LixTransaction,
-    settings: DeterministicSettings,
-    sequence_start: i64,
-    functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
-    writer_key: Option<&str>,
-    should_emit_observe_tick: bool,
-) -> Result<(), LixError> {
-    let mut batch = PreparedBatch {
-        sql: String::new(),
-        params: Vec::new(),
-    };
-
-    if settings.enabled {
-        let sequence_end = functions.with_lock(|provider| provider.next_sequence());
-        if sequence_end > sequence_start {
-            batch.append_sql(build_persist_sequence_highest_sql(sequence_end - 1));
-        }
-    }
-
-    if should_emit_observe_tick {
-        batch.append_sql(engine.build_observe_tick_insert_sql(writer_key));
-    }
-
-    if batch.sql.trim().is_empty() {
-        return Ok(());
-    }
-
-    let mut program = WriteProgram::new();
-    program.push_batch(batch);
-    execute_write_program_with_transaction(transaction, program).await?;
-    Ok(())
 }
 
 pub(crate) async fn maybe_execute_public_write_with_transaction(
@@ -750,6 +696,11 @@ async fn execute_public_tracked_write_with_transaction(
     }
 
     let mut invariant_checker = Sql2AppendInvariantChecker::new(&public_write.planned_write);
+    let should_emit_observe_tick = has_lazy_exact_file_metadata_update
+        || !execution
+            .semantic_effects
+            .state_commit_stream_changes
+            .is_empty();
     let append_result = append_commit_if_preconditions_hold(
         transaction,
         AppendCommitArgs {
@@ -761,6 +712,8 @@ async fn execute_public_tracked_write_with_transaction(
                 .unwrap_or_default(),
             lazy_exact_file_metadata_update: execution.lazy_exact_file_metadata_update.clone(),
             preconditions: execution.append_preconditions.clone(),
+            should_emit_observe_tick,
+            observe_tick_writer_key: writer_key.map(str::to_string),
         },
         &mut append_functions,
         Some(&mut invariant_checker),

@@ -16,6 +16,10 @@ pub trait LixFunctionProvider {
     }
 
     fn initialize_deterministic_sequence(&mut self, _sequence_start: i64) {}
+
+    fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
+        None
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -90,5 +94,9 @@ impl<P: LixFunctionProvider> LixFunctionProvider for SharedFunctionProvider<P> {
 
     fn initialize_deterministic_sequence(&mut self, sequence_start: i64) {
         self.with_lock_mut(|provider| provider.initialize_deterministic_sequence(sequence_start))
+    }
+
+    fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
+        self.with_lock(|provider| provider.deterministic_sequence_persist_highest_seen())
     }
 }
