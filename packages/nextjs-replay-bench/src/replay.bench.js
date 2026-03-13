@@ -34,8 +34,8 @@ const CONFIG = {
   progressEvery: parseEnvInt("BENCH_REPLAY_PROGRESS_EVERY", 25),
   showProgress: parseEnvBool("BENCH_REPLAY_PROGRESS", true),
   installTextPlugin: parseTextPluginInstallFlag(true),
-  exportSnapshot: parseEnvBool("BENCH_REPLAY_EXPORT_SNAPSHOT", false),
-  exportSnapshotPath: process.env.BENCH_REPLAY_SNAPSHOT_PATH ?? "",
+  export_image: parseEnvBool("BENCH_REPLAY_EXPORT_IMAGE", false),
+  export_image_path: process.env.BENCH_REPLAY_IMAGE_PATH ?? "",
   collectStorageCounters: parseEnvBool("BENCH_REPLAY_STORAGE_COUNTERS", true),
   maxInsertRows: parseEnvInt("BENCH_REPLAY_MAX_INSERT_ROWS", 200),
   maxInsertSqlChars: parseEnvInt("BENCH_REPLAY_MAX_INSERT_SQL_CHARS", 1_500_000),
@@ -504,17 +504,17 @@ function statementChars(statements) {
 }
 
 async function maybeWriteSnapshotArtifact(lix) {
-  if (!CONFIG.exportSnapshot && !CONFIG.exportSnapshotPath) {
+  if (!CONFIG.export_image && !CONFIG.export_image_path) {
     return null;
   }
 
-  const outputPath = CONFIG.exportSnapshotPath || join(OUTPUT_DIR, "nextjs-replay.snapshot.lix");
-  const snapshotBytes = await lix.exportSnapshot();
+  const outputPath = CONFIG.export_image_path || join(OUTPUT_DIR, "nextjs-replay.image.lix");
+  const imageBytes = await lix.export_image();
   await mkdir(dirname(outputPath), { recursive: true });
-  await writeFile(outputPath, snapshotBytes);
+  await writeFile(outputPath, imageBytes);
   return {
     path: outputPath,
-    bytes: snapshotBytes.byteLength,
+    bytes: imageBytes.byteLength,
   };
 }
 

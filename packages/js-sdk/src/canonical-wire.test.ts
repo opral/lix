@@ -121,9 +121,9 @@ async function createCanonicalBoundaryLix() {
 	if (typeof beginTransaction !== "function") {
 		throw new Error("runtime backend beginTransaction() is required for this test");
 	}
-	const exportSnapshot = runtimeBackend.exportSnapshot;
-	if (typeof exportSnapshot !== "function") {
-		throw new Error("runtime backend exportSnapshot() is required for this test");
+	const export_image = runtimeBackend.export_image;
+	if (typeof export_image !== "function") {
+		throw new Error("runtime backend export_image() is required for this test");
 	}
 	const backend = {
 		dialect: "sqlite" as const,
@@ -157,8 +157,8 @@ async function createCanonicalBoundaryLix() {
 				},
 			};
 		},
-		async exportSnapshot() {
-			return exportSnapshot();
+		async export_image() {
+			return export_image();
 		},
 	};
 
