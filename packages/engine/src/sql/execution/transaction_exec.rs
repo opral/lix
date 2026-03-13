@@ -147,6 +147,10 @@ impl Engine {
 
         let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
         state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());
+        self.maybe_invalidate_deterministic_settings_cache(
+            &prepared.plan.preprocess.mutations,
+            &state_commit_stream_changes,
+        );
 
         if skip_side_effect_collection && deferred_side_effects.is_none() {
             // Internal callers can request executing SQL rewrite/validation without

@@ -1,5 +1,9 @@
 use std::collections::BTreeSet;
 
+use crate::account::{
+    active_account_file_id, active_account_schema_key, active_account_storage_version_id,
+    parse_active_account_snapshot,
+};
 use crate::functions::LixFunctionProvider;
 use crate::schema::builtin::types::LixVersionPointer;
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
@@ -11,19 +15,18 @@ use async_trait::async_trait;
 use super::generate_commit::generate_commit;
 use super::runtime::{
     bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
-    load_commit_active_accounts,
 };
-use super::state_source::{
-    load_committed_global_tip_commit_id, load_committed_version_tip_commit_id,
-    load_version_info_for_versions, CommitQueryExecutor,
-};
+use super::state_source::{load_version_info_for_versions, CommitQueryExecutor};
 use super::types::{
     DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange, VersionInfo,
     VersionSnapshot,
 };
 
 const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
+const LIVE_VERSION_POINTER_TABLE: &str = "lix_internal_live_v1_lix_version_pointer";
+const LIVE_UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
 const VERSION_POINTER_SCHEMA_KEY: &str = "lix_version_pointer";
+const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AppendWriteLane {
@@ -111,10 +114,20 @@ pub(crate) async fn append_commit_if_preconditions_hold(
     let concrete_lane = concrete_lane(&args.preconditions)?;
     validate_change_versions(&args.changes, &concrete_lane)?;
 
-    let current_tip = {
+    let needs_active_accounts = !args
+        .changes
+        .iter()
+        .all(|change| change.schema_key == CHANGE_AUTHOR_SCHEMA_KEY);
+    let preflight = {
         let mut executor = TransactionCommitExecutor { transaction };
-        load_current_tip_commit_id(&mut executor, &concrete_lane).await?
+        load_append_preflight_state_with_active_accounts(
+            &mut executor,
+            &concrete_lane,
+            needs_active_accounts,
+        )
+        .await?
     };
+    let current_tip = preflight.current_tip;
     let resolved_idempotency_key =
         resolve_idempotency_key(&args.preconditions, current_tip.as_deref());
     let existing_replay = {
@@ -239,16 +252,10 @@ pub(crate) async fn append_commit_if_preconditions_hold(
             });
         global_version.parent_commit_ids = current_tip.clone().into_iter().collect();
     }
-    let active_accounts = {
-        let mut executor = TransactionCommitExecutor { transaction };
-        load_commit_active_accounts(&mut executor, &domain_changes)
-            .await
-            .map_err(backend_error)?
-    };
     let commit_result = generate_commit(
         GenerateCommitArgs {
             timestamp: args.timestamp.clone(),
-            active_accounts,
+            active_accounts: preflight.active_accounts,
             changes: domain_changes,
             versions,
         },
@@ -402,20 +409,110 @@ fn require_change_field(
     })
 }
 
-async fn load_current_tip_commit_id(
+struct AppendPreflightState {
+    current_tip: Option<String>,
+    active_accounts: Vec<String>,
+}
+
+async fn load_append_preflight_state_with_active_accounts(
     executor: &mut dyn CommitQueryExecutor,
     concrete_lane: &ConcreteWriteLane,
-) -> Result<Option<String>, AppendCommitError> {
-    match concrete_lane {
-        ConcreteWriteLane::Version { version_id } => {
-            load_committed_version_tip_commit_id(executor, version_id)
-                .await
-                .map_err(backend_error)
+    include_active_accounts: bool,
+) -> Result<AppendPreflightState, AppendCommitError> {
+    let lane_entity_id = match concrete_lane {
+        ConcreteWriteLane::Version { version_id } => version_id.as_str(),
+        ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
+    };
+    let active_account_sql = if include_active_accounts {
+        format!(
+            " UNION ALL \
+              SELECT 'active_account' AS row_kind, snapshot_content AS value \
+              FROM {untracked_table} \
+              WHERE schema_key = '{schema_key}' \
+                AND file_id = '{file_id}' \
+                AND version_id = '{version_id}' \
+                AND snapshot_content IS NOT NULL",
+            untracked_table = LIVE_UNTRACKED_TABLE,
+            schema_key = escape_sql_string(active_account_schema_key()),
+            file_id = escape_sql_string(active_account_file_id()),
+            version_id = escape_sql_string(active_account_storage_version_id()),
+        )
+    } else {
+        String::new()
+    };
+    let sql = format!(
+        "SELECT row_kind, value \
+         FROM (\
+           SELECT 'current_tip' AS row_kind, snapshot_content AS value \
+           FROM {version_pointer_table} \
+           WHERE schema_key = '{schema_key}' \
+             AND entity_id = '{entity_id}' \
+             AND file_id = 'lix' \
+             AND plugin_key = 'lix' \
+             AND version_id = '{version_id}' \
+             AND snapshot_content IS NOT NULL{active_account_sql}\
+         ) append_preflight",
+        version_pointer_table = LIVE_VERSION_POINTER_TABLE,
+        schema_key = VERSION_POINTER_SCHEMA_KEY,
+        entity_id = escape_sql_string(lane_entity_id),
+        version_id = escape_sql_string(GLOBAL_VERSION_ID),
+        active_account_sql = active_account_sql,
+    );
+    let result = executor.execute(&sql, &[]).await.map_err(backend_error)?;
+    let mut current_tip = None;
+    let mut active_accounts = BTreeSet::new();
+    for row in result.rows {
+        let Some(kind) = row.first() else {
+            continue;
+        };
+        let Some(value) = row.get(1) else {
+            continue;
+        };
+        let kind = match kind {
+            Value::Text(text) => text.as_str(),
+            Value::Null => continue,
+            other => {
+                return Err(AppendCommitError {
+                    kind: AppendCommitErrorKind::Internal,
+                    message: format!("append preflight returned unexpected kind value {other:?}"),
+                })
+            }
+        };
+        match (kind, value) {
+            ("current_tip", Value::Text(snapshot_content)) => {
+                let pointer: LixVersionPointer =
+                    serde_json::from_str(snapshot_content).map_err(|error| AppendCommitError {
+                        kind: AppendCommitErrorKind::Internal,
+                        message: format!(
+                            "append preflight version pointer snapshot could not be parsed: {error}"
+                        ),
+                    })?;
+                if !pointer.commit_id.is_empty() {
+                    current_tip = Some(pointer.commit_id);
+                }
+            }
+            ("active_account", Value::Text(snapshot_content)) => {
+                let account_id =
+                    parse_active_account_snapshot(snapshot_content).map_err(backend_error)?;
+                active_accounts.insert(account_id);
+            }
+            (_, Value::Null) => {}
+            ("current_tip", other) | ("active_account", other) => {
+                return Err(AppendCommitError {
+                    kind: AppendCommitErrorKind::Internal,
+                    message: format!(
+                        "append preflight returned unexpected '{kind}' value {other:?}"
+                    ),
+                })
+            }
+            _ => {}
         }
-        ConcreteWriteLane::GlobalAdmin => load_committed_global_tip_commit_id(executor)
-            .await
-            .map_err(backend_error),
     }
+
+    Ok(AppendPreflightState {
+        current_tip,
+        active_accounts: active_accounts.into_iter().collect(),
+    })
 }
 
 async fn load_existing_idempotency_commit_id(
@@ -598,6 +695,30 @@ mod tests {
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             self.executed_sql.push(sql.to_string());
+
+            if sql.contains("SELECT row_kind, value")
+                && sql.contains("FROM lix_internal_live_v1_lix_version_pointer")
+            {
+                let rows = self
+                    .version_tips
+                    .iter()
+                    .filter(|(version_id, _)| {
+                        sql.contains(&format!("entity_id = '{}'", version_id))
+                    })
+                    .map(|(version_id, commit_id)| {
+                        vec![
+                            Value::Text("current_tip".to_string()),
+                            Value::Text(crate::version::version_pointer_snapshot_content(
+                                version_id, commit_id,
+                            )),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(QueryResult {
+                    rows,
+                    columns: vec!["row_kind".to_string(), "value".to_string()],
+                });
+            }
 
             if sql.contains("FROM lix_internal_live_v1_lix_version_pointer")
                 && sql.contains("entity_id = 'global'")

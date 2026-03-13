@@ -1,6 +1,6 @@
 use crate::deterministic_mode::{
-    build_persist_sequence_highest_batch, load_runtime_state, persist_sequence_highest,
-    DeterministicRuntimeState, DeterministicSettings, RuntimeFunctionProvider,
+    build_persist_sequence_highest_batch, load_runtime_sequence_start, load_runtime_settings,
+    persist_sequence_highest, DeterministicSettings, RuntimeFunctionProvider,
 };
 use crate::engine::Engine;
 use crate::functions::SharedFunctionProvider;
@@ -20,20 +20,19 @@ impl Engine {
         ),
         LixError,
     > {
-        let runtime_state = if self.deterministic_boot_pending() {
-            let persisted = load_runtime_state(backend).await?;
-            DeterministicRuntimeState {
-                settings: self
-                    .boot_deterministic_settings()
-                    .unwrap_or(persisted.settings),
-                ..persisted
-            }
+        let settings = if self.deterministic_boot_pending() {
+            self.boot_deterministic_settings()
+                .unwrap_or_else(DeterministicSettings::disabled)
+        } else if let Some(settings) = self.cached_deterministic_settings() {
+            settings
         } else {
-            load_runtime_state(backend).await?
+            let settings = load_runtime_settings(backend).await?;
+            self.cache_deterministic_settings(settings);
+            settings
         };
-        let settings = runtime_state.settings;
+
         let sequence_start = if settings.enabled {
-            runtime_state.next_sequence
+            load_runtime_sequence_start(backend).await?
         } else {
             0
         };
@@ -77,5 +76,87 @@ impl Engine {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{boot, BootArgs, NoopWasmRuntime, QueryResult, SqlDialect, Value};
+    use async_trait::async_trait;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct CountingBackend {
+        execute_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait(?Send)]
+    impl LixBackend for CountingBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            })
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
+            Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "transactions are not needed in this test",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn caches_disabled_deterministic_settings_until_invalidated() {
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+        let backend = CountingBackend {
+            execute_calls: Arc::clone(&execute_calls),
+        };
+        let engine = boot(BootArgs::new(Box::new(backend), Arc::new(NoopWasmRuntime)));
+
+        let (settings, sequence_start, _) = engine
+            .prepare_runtime_functions_with_backend(engine.backend_ref())
+            .await
+            .expect("first runtime preparation should succeed");
+        assert!(!settings.enabled);
+        assert_eq!(sequence_start, 0);
+        assert_eq!(
+            execute_calls.load(Ordering::SeqCst),
+            1,
+            "first call should read deterministic settings from the backend"
+        );
+
+        let (_settings, sequence_start, _) = engine
+            .prepare_runtime_functions_with_backend(engine.backend_ref())
+            .await
+            .expect("second runtime preparation should succeed");
+        assert_eq!(sequence_start, 0);
+        assert_eq!(
+            execute_calls.load(Ordering::SeqCst),
+            1,
+            "disabled deterministic settings should be served from cache"
+        );
+
+        engine.invalidate_deterministic_settings_cache();
+
+        let (_settings, sequence_start, _) = engine
+            .prepare_runtime_functions_with_backend(engine.backend_ref())
+            .await
+            .expect("runtime preparation after invalidation should succeed");
+        assert_eq!(sequence_start, 0);
+        assert_eq!(
+            execute_calls.load(Ordering::SeqCst),
+            2,
+            "cache invalidation should force a backend refresh"
+        );
     }
 }
