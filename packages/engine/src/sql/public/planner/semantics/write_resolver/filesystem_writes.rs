@@ -530,6 +530,13 @@ async fn resolve_existing_file_write(
                 }
 
                 if let Some(bytes) = assignments.data.bytes() {
+                    partition.authoritative_pre_state.push(ResolvedRowRef {
+                        entity_id: current_row.id.clone(),
+                        schema_key: FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
+                        version_id: Some(version_id.clone()),
+                        source_change_id: None,
+                        source_commit_id: None,
+                    });
                     partition.intended_post_state.push(binary_blob_ref_row(
                         &current_row.id,
                         &version_id,

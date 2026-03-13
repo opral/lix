@@ -361,10 +361,14 @@ pub(crate) fn collapse_pending_file_writes_for_transaction(
         Vec::<crate::filesystem::pending_file_writes::PendingFileWrite>::with_capacity(
             writes.len(),
         );
-    let mut index_by_key = BTreeMap::<(String, String), usize>::new();
+    let mut index_by_key = BTreeMap::<(String, String, bool), usize>::new();
 
     for write in writes {
-        let key = (write.file_id.clone(), write.version_id.clone());
+        let key = (
+            write.file_id.clone(),
+            write.version_id.clone(),
+            write.untracked,
+        );
         if let Some(index) = index_by_key.get(&key).copied() {
             let existing = &mut collapsed[index];
             existing.after_path = write.after_path.clone();
@@ -461,16 +465,17 @@ pub(crate) fn collect_postprocess_file_cache_targets(
 }
 
 trait DedupableFilesystemPayloadChange {
-    fn dedupe_key(&self) -> (&str, &str, &str, &str);
+    fn dedupe_key(&self) -> (&str, &str, &str, &str, bool);
 }
 
 impl DedupableFilesystemPayloadChange for FilesystemPayloadDomainChange {
-    fn dedupe_key(&self) -> (&str, &str, &str, &str) {
+    fn dedupe_key(&self) -> (&str, &str, &str, &str, bool) {
         (
             &self.file_id,
             &self.version_id,
             &self.schema_key,
             &self.entity_id,
+            self.untracked,
         )
     }
 }
@@ -479,7 +484,7 @@ fn dedupe_detected_changes<T>(changes: &[T]) -> Vec<T>
 where
     T: DedupableFilesystemPayloadChange + Clone,
 {
-    let mut latest_by_key: BTreeMap<(&str, &str, &str, &str), usize> = BTreeMap::new();
+    let mut latest_by_key: BTreeMap<(&str, &str, &str, &str, bool), usize> = BTreeMap::new();
     for (index, change) in changes.iter().enumerate() {
         latest_by_key.insert(change.dedupe_key(), index);
     }

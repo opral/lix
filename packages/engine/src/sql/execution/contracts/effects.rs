@@ -9,6 +9,7 @@ pub(crate) struct FilesystemPayloadDomainChange {
     pub(crate) schema_version: String,
     pub(crate) file_id: String,
     pub(crate) version_id: String,
+    pub(crate) untracked: bool,
     pub(crate) plugin_key: String,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
