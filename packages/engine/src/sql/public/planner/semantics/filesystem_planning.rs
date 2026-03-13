@@ -1,7 +1,7 @@
 use crate::filesystem::live_projection::FilesystemProjectionScope;
 use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
-    parent_directory_path,
+    parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
 use crate::sql::public::planner::semantics::filesystem_assignments::{
     DirectoryInsertAssignments, FileInsertAssignments,
@@ -324,7 +324,7 @@ async fn resolve_file_insert_target(
     ensure_no_directory_at_file_path_in_insert_batch(
         backend,
         version_id,
-        &parsed.normalized_path,
+        parsed.normalized_path.as_str(),
         lookup_scope,
         batch,
     )
@@ -332,23 +332,23 @@ async fn resolve_file_insert_target(
     let directory_path = ensure_parent_directories_for_insert_batch(
         backend,
         version_id,
-        parsed.directory_path.as_deref(),
+        parsed.directory_path.as_ref(),
         lookup_scope,
         batch,
     )
     .await?;
 
-    if let Some(existing_id) = batch.pending_file_id_by_path(&parsed.normalized_path) {
+    if let Some(existing_id) = batch.pending_file_id_by_path(parsed.normalized_path.as_str()) {
         if explicit_id != Some(existing_id.as_str()) {
             return Err(FilesystemPlanningError {
                 message: format!(
                     "Unique constraint violation: file path '{}' already exists in this INSERT",
-                    parsed.normalized_path
+                    parsed.normalized_path.as_str()
                 ),
             });
         }
     } else if let Some(existing_id) =
-        lookup_file_id_by_path(backend, version_id, &parsed.normalized_path, lookup_scope).await?
+        lookup_file_id_by_path(backend, version_id, parsed, lookup_scope).await?
     {
         let same_id = explicit_id
             .map(|value| value == existing_id.as_str())
@@ -357,7 +357,8 @@ async fn resolve_file_insert_target(
             return Err(FilesystemPlanningError {
                 message: format!(
                     "Unique constraint violation: file path '{}' already exists in version '{}'",
-                    parsed.normalized_path, version_id
+                    parsed.normalized_path.as_str(),
+                    version_id
                 ),
             });
         }
@@ -367,9 +368,9 @@ async fn resolve_file_insert_target(
         id: assignments
             .id
             .clone()
-            .unwrap_or_else(|| auto_file_id(version_id, &parsed.normalized_path)),
-        path: parsed.normalized_path.clone(),
-        directory_path,
+            .unwrap_or_else(|| auto_file_id(version_id, parsed.normalized_path.as_str())),
+        path: parsed.normalized_path.as_str().to_string(),
+        directory_path: directory_path.map(|path| path.as_str().to_string()),
         name: parsed.name.clone(),
         extension: parsed.extension.clone(),
         hidden: assignments.hidden,
@@ -387,10 +388,10 @@ async fn resolve_directory_insert_target(
     let explicit_id = assignments.id.as_deref();
     let explicit_parent_id = assignments.parent_id.as_deref();
     let explicit_name = assignments.name.as_deref();
-    let explicit_path = assignments.path.as_deref();
+    let explicit_path = assignments.path.as_ref();
 
     let (parent_path, name, normalized_path) = if let Some(raw_path) = explicit_path {
-        let normalized_path = raw_path.to_string();
+        let normalized_path = raw_path.as_str().to_string();
         let derived_name =
             directory_name_from_path(&normalized_path).ok_or_else(|| FilesystemPlanningError {
                 message: "Directory name must be provided".to_string(),
@@ -398,7 +399,9 @@ async fn resolve_directory_insert_target(
         let derived_parent_path = ensure_parent_directories_for_insert_batch(
             backend,
             version_id,
-            parent_directory_path(&normalized_path).as_deref(),
+            parent_directory_path(&normalized_path)
+                .map(NormalizedDirectoryPath::from_normalized)
+                .as_ref(),
             lookup_scope,
             batch,
         )
@@ -471,8 +474,13 @@ async fn resolve_directory_insert_target(
                 ),
             });
         }
-    } else if let Some(existing_id) =
-        lookup_directory_id_by_path(backend, version_id, &normalized_path, lookup_scope).await?
+    } else if let Some(existing_id) = lookup_directory_id_by_path(
+        backend,
+        version_id,
+        &NormalizedDirectoryPath::from_normalized(normalized_path.clone()),
+        lookup_scope,
+    )
+    .await?
     {
         let same_id = explicit_id
             .map(|value| value == existing_id.as_str())
@@ -511,7 +519,7 @@ async fn resolve_directory_insert_target(
 async fn ensure_parent_directories_for_insert_batch(
     backend: &dyn LixBackend,
     version_id: &str,
-    directory_path: Option<&str>,
+    directory_path: Option<&NormalizedDirectoryPath>,
     lookup_scope: FilesystemProjectionScope,
     batch: &mut PendingFilesystemInsertBatch,
 ) -> Result<Option<String>, FilesystemPlanningError> {
@@ -519,8 +527,8 @@ async fn ensure_parent_directories_for_insert_batch(
         return Ok(None);
     };
 
-    let mut paths = directory_ancestor_paths(directory_path);
-    paths.push(directory_path.to_string());
+    let mut paths = directory_ancestor_paths(directory_path.as_str());
+    paths.push(directory_path.as_str().to_string());
 
     for candidate_path in paths {
         if batch
@@ -529,9 +537,14 @@ async fn ensure_parent_directories_for_insert_batch(
         {
             continue;
         }
-        if lookup_directory_id_by_path(backend, version_id, &candidate_path, lookup_scope)
-            .await?
-            .is_some()
+        if lookup_directory_id_by_path(
+            backend,
+            version_id,
+            &NormalizedDirectoryPath::from_normalized(candidate_path.clone()),
+            lookup_scope,
+        )
+        .await?
+        .is_some()
         {
             continue;
         }
@@ -546,7 +559,7 @@ async fn ensure_parent_directories_for_insert_batch(
         batch.register_implicit_directory(version_id, &candidate_path)?;
     }
 
-    Ok(Some(directory_path.to_string()))
+    Ok(Some(directory_path.as_str().to_string()))
 }
 
 async fn finalize_pending_directory_insert_batch(
@@ -632,7 +645,12 @@ async fn lookup_directory_id_by_path_in_insert_batch(
     if let Some(directory_id) = batch.pending_directory_id_by_path(path) {
         return Ok(Some(directory_id));
     }
-    lookup_directory_id_by_path(backend, version_id, path, lookup_scope)
+    lookup_directory_id_by_path(
+        backend,
+        version_id,
+        &NormalizedDirectoryPath::from_normalized(path.to_string()),
+        lookup_scope,
+    )
         .await
         .map_err(Into::into)
 }
@@ -659,13 +677,26 @@ async fn ensure_no_file_at_directory_path_in_insert_batch(
     lookup_scope: FilesystemProjectionScope,
     batch: &PendingFilesystemInsertBatch,
 ) -> Result<(), FilesystemPlanningError> {
-    let file_path = directory_path.trim_end_matches('/').to_string();
-    if batch.pending_file_id_by_path(&file_path).is_some() {
+    let file_path =
+        ParsedFilePath::from_normalized_path(directory_path.trim_end_matches('/').to_string())
+            .map_err(filesystem_path_error)?;
+    if batch
+        .pending_file_id_by_path(file_path.normalized_path.as_str())
+        .is_some()
+    {
         return Err(FilesystemPlanningError {
-            message: format!("Directory path collides with existing file path: {file_path}"),
+            message: format!(
+                "Directory path collides with existing file path: {}",
+                file_path.normalized_path.as_str()
+            ),
         });
     }
-    ensure_no_file_at_directory_path(backend, version_id, directory_path, lookup_scope)
+    ensure_no_file_at_directory_path(
+        backend,
+        version_id,
+        &NormalizedDirectoryPath::from_normalized(directory_path.to_string()),
+        lookup_scope,
+    )
         .await
         .map_err(Into::into)
 }
@@ -677,16 +708,24 @@ async fn ensure_no_directory_at_file_path_in_insert_batch(
     lookup_scope: FilesystemProjectionScope,
     batch: &PendingFilesystemInsertBatch,
 ) -> Result<(), FilesystemPlanningError> {
-    let directory_path = format!("{}/", file_path.trim_end_matches('/'));
+    let file_path =
+        ParsedFilePath::from_normalized_path(file_path.to_string()).map_err(filesystem_path_error)?;
+    let directory_path = NormalizedDirectoryPath::from_normalized(format!(
+        "{}/",
+        file_path.normalized_path.as_str().trim_end_matches('/')
+    ));
     if batch
-        .pending_directory_id_by_path(&directory_path)
+        .pending_directory_id_by_path(directory_path.as_str())
         .is_some()
     {
         return Err(FilesystemPlanningError {
-            message: format!("File path collides with existing directory path: {directory_path}"),
+            message: format!(
+                "File path collides with existing directory path: {}",
+                directory_path.as_str()
+            ),
         });
     }
-    ensure_no_directory_at_file_path(backend, version_id, file_path, lookup_scope)
+    ensure_no_directory_at_file_path(backend, version_id, &file_path, lookup_scope)
         .await
         .map_err(Into::into)
 }

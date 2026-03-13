@@ -1,5 +1,5 @@
 use crate::filesystem::path::{
-    normalize_directory_path, normalize_path_segment, parse_file_path, ParsedFilePath,
+    normalize_path_segment, NormalizedDirectoryPath, ParsedFilePath,
 };
 use crate::Value;
 use std::collections::BTreeMap;
@@ -41,7 +41,7 @@ impl BlobAssignment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DirectoryUpdateAssignments {
-    pub(crate) path: Option<String>,
+    pub(crate) path: Option<NormalizedDirectoryPath>,
     pub(crate) parent_id: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) hidden: Option<bool>,
@@ -67,7 +67,7 @@ pub(crate) struct DirectoryInsertAssignments {
     pub(crate) id: Option<String>,
     pub(crate) parent_id: Option<String>,
     pub(crate) name: Option<String>,
-    pub(crate) path: Option<String>,
+    pub(crate) path: Option<NormalizedDirectoryPath>,
     pub(crate) hidden: bool,
     pub(crate) metadata: Option<String>,
 }
@@ -97,7 +97,7 @@ pub(crate) fn parse_directory_update_assignments(
             .get("path")
             .map(|value| text_value_required(value, "public filesystem directory update", "path"))
             .transpose()?
-            .map(|path| normalize_directory_path(&path))
+            .map(|path| NormalizedDirectoryPath::try_from_path(&path))
             .transpose()
             .map_err(filesystem_path_error)?,
         parent_id: payload.get("parent_id").and_then(text_from_value),
@@ -128,7 +128,7 @@ pub(crate) fn parse_file_update_assignments(
             .get("path")
             .map(|value| text_value_required(value, "public filesystem file update", "path"))
             .transpose()?
-            .map(|path| parse_file_path(&path))
+            .map(|path| ParsedFilePath::try_from_path(&path))
             .transpose()
             .map_err(filesystem_path_error)?,
         hidden: payload.get("hidden").and_then(value_as_bool),
@@ -154,7 +154,7 @@ pub(crate) fn parse_directory_insert_assignments(
             .get("path")
             .map(|value| text_value_required(value, "public filesystem directory insert", "path"))
             .transpose()?
-            .map(|path| normalize_directory_path(&path))
+            .map(|path| NormalizedDirectoryPath::try_from_path(&path))
             .transpose()
             .map_err(filesystem_path_error)?,
         hidden: payload
@@ -187,7 +187,7 @@ pub(crate) fn parse_file_insert_assignments(
 
     Ok(FileInsertAssignments {
         id: payload.get("id").and_then(text_from_value),
-        path: parse_file_path(&raw_path).map_err(filesystem_path_error)?,
+        path: ParsedFilePath::try_from_path(&raw_path).map_err(filesystem_path_error)?,
         hidden: payload
             .get("hidden")
             .and_then(value_as_bool)
