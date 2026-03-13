@@ -1214,11 +1214,7 @@ async fn execute_generated_commit_result(
         )?,
         transaction.dialect(),
     )?;
-    for statement in prepared {
-        transaction
-            .execute(&statement.sql, &statement.params)
-            .await?;
-    }
+    transaction.execute(&prepared.sql, &prepared.params).await?;
     Ok(())
 }
 

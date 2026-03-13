@@ -1,4 +1,4 @@
-use crate::sql::execution::contracts::prepared_statement::PreparedStatement;
+use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
 use crate::{LixBackend, LixError, LixTransaction, QueryResult};
 
 pub(crate) async fn execute_prepared_with_backend(
@@ -29,4 +29,11 @@ pub(crate) async fn execute_prepared_with_transaction(
             .await?;
     }
     Ok(last_result)
+}
+
+pub(crate) async fn execute_prepared_batch_with_transaction(
+    transaction: &mut dyn LixTransaction,
+    batch: &PreparedBatch,
+) -> Result<QueryResult, LixError> {
+    transaction.execute(&batch.sql, &batch.params).await
 }

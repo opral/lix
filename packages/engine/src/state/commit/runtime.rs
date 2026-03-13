@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
 
 use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
@@ -6,6 +7,7 @@ use sqlparser::ast::{
     ConflictTarget, DoUpdate, Expr, Ident, ObjectName, ObjectNamePart, OnConflict,
     OnConflictAction, OnInsert, Query, SetExpr, Statement, TableObject, Value as SqlValue, Values,
 };
+use sqlparser::ast::{VisitMut, VisitorMut};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -15,7 +17,10 @@ use crate::account::{
 };
 use crate::functions::LixFunctionProvider;
 
-use crate::sql::execution::contracts::prepared_statement::PreparedStatement;
+use crate::sql::ast::utils::{
+    bind_sql, parse_sql_statements, resolve_placeholder_index, PlaceholderState,
+};
+use crate::sql::execution::contracts::prepared_statement::PreparedBatch;
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, SqlDialect, Value as EngineValue};
@@ -47,17 +52,110 @@ pub(crate) struct StatementBatch {
 pub(crate) fn bind_statement_batch_for_dialect(
     batch: StatementBatch,
     dialect: SqlDialect,
-) -> Result<Vec<PreparedStatement>, LixError> {
+) -> Result<PreparedBatch, LixError> {
     let mut prepared = Vec::with_capacity(batch.statements.len());
     for statement in batch.statements {
-        let bound =
-            crate::sql::ast::utils::bind_sql(&statement.to_string(), &batch.params, dialect)?;
-        prepared.push(PreparedStatement {
-            sql: bound.sql,
-            params: bound.params,
-        });
+        prepared.push(bind_statement_for_batch(statement, &batch.params, dialect)?);
     }
-    Ok(prepared)
+
+    Ok(PreparedBatch {
+        sql: prepared.join("; "),
+        params: Vec::new(),
+    })
+}
+
+fn bind_statement_for_batch(
+    statement: Statement,
+    params: &[EngineValue],
+    dialect: SqlDialect,
+) -> Result<String, LixError> {
+    let bound = bind_sql(&statement.to_string(), params, dialect)?;
+    inline_bound_statement(&bound.sql, &bound.params, dialect)
+}
+
+fn inline_bound_statement(
+    sql: &str,
+    params: &[EngineValue],
+    dialect: SqlDialect,
+) -> Result<String, LixError> {
+    let mut statements = parse_sql_statements(sql)?;
+    let mut state = PlaceholderState::new();
+
+    for statement in &mut statements {
+        let mut visitor = PlaceholderLiteralInliner {
+            params,
+            dialect,
+            state: &mut state,
+        };
+        if let ControlFlow::Break(error) = statement.visit(&mut visitor) {
+            return Err(error);
+        }
+    }
+
+    Ok(statements
+        .into_iter()
+        .map(|statement| statement.to_string())
+        .collect::<Vec<_>>()
+        .join("; "))
+}
+
+struct PlaceholderLiteralInliner<'a> {
+    params: &'a [EngineValue],
+    dialect: SqlDialect,
+    state: &'a mut PlaceholderState,
+}
+
+impl VisitorMut for PlaceholderLiteralInliner<'_> {
+    type Break = LixError;
+
+    fn pre_visit_value(&mut self, value: &mut SqlValue) -> ControlFlow<Self::Break> {
+        let SqlValue::Placeholder(token) = value else {
+            return ControlFlow::Continue(());
+        };
+
+        let source_index = match resolve_placeholder_index(token, self.params.len(), self.state) {
+            Ok(index) => index,
+            Err(error) => return ControlFlow::Break(error),
+        };
+
+        *value = match engine_value_to_sql_literal(&self.params[source_index], self.dialect) {
+            Ok(value) => value,
+            Err(error) => return ControlFlow::Break(error),
+        };
+
+        ControlFlow::Continue(())
+    }
+}
+
+fn engine_value_to_sql_literal(
+    value: &EngineValue,
+    dialect: SqlDialect,
+) -> Result<SqlValue, LixError> {
+    match value {
+        EngineValue::Null => Ok(SqlValue::Null),
+        EngineValue::Boolean(value) => Ok(SqlValue::Boolean(*value)),
+        EngineValue::Integer(value) => Ok(SqlValue::Number(value.to_string(), false)),
+        EngineValue::Real(value) => Ok(SqlValue::Number(value.to_string(), false)),
+        EngineValue::Text(value) => Ok(SqlValue::SingleQuotedString(value.clone())),
+        EngineValue::Json(value) => Ok(SqlValue::SingleQuotedString(value.to_string())),
+        EngineValue::Blob(value) => match dialect {
+            SqlDialect::Sqlite => Ok(SqlValue::HexStringLiteral(encode_hex_upper(value))),
+            SqlDialect::Postgres => Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "postgres batch literal inlining does not support blob parameters",
+            )),
+        },
+    }
+}
+
+fn encode_hex_upper(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0F) as usize] as char);
+    }
+    out
 }
 
 pub(crate) async fn load_commit_active_accounts(
