@@ -17,6 +17,7 @@ use crate::sql::execution::write_program_runner::{
 use crate::sql::public::runtime::{
     classify_public_execution_route_with_registry, decode_public_read_result,
 };
+use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::internal::inline_functions::inline_lix_functions_with_provider;
 use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
 use crate::state::internal::statement_references_internal_state_vtable;
@@ -30,6 +31,19 @@ use sqlparser::ast::{Expr, Function, Statement, Visit, Visitor};
 use std::ops::ControlFlow;
 
 impl Engine {
+    pub(crate) fn build_observe_tick_insert_sql(&self, writer_key: Option<&str>) -> String {
+        match writer_key {
+            Some(writer_key) => format!(
+                "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+                 VALUES (CURRENT_TIMESTAMP, '{}')",
+                escape_sql_string(writer_key)
+            ),
+            None => "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+                      VALUES (CURRENT_TIMESTAMP, NULL)"
+                .to_string(),
+        }
+    }
+
     #[doc(hidden)]
     pub async fn open_existing(&self) -> Result<(), LixError> {
         if !self.is_initialized().await? {
@@ -53,18 +67,7 @@ impl Engine {
         writer_key: Option<&str>,
     ) -> Result<(), LixError> {
         let mut program = WriteProgram::new();
-        match writer_key {
-            Some(writer_key) => program.push_statement(
-                "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
-                 VALUES (CURRENT_TIMESTAMP, $1)",
-                vec![Value::Text(writer_key.to_string())],
-            ),
-            None => program.push_statement(
-                "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
-                 VALUES (CURRENT_TIMESTAMP, NULL)",
-                Vec::new(),
-            ),
-        }
+        program.push_statement(self.build_observe_tick_insert_sql(writer_key), Vec::new());
         execute_write_program_with_backend(self.backend.as_ref(), program).await?;
         Ok(())
     }
@@ -75,18 +78,7 @@ impl Engine {
         writer_key: Option<&str>,
     ) -> Result<(), LixError> {
         let mut program = WriteProgram::new();
-        match writer_key {
-            Some(writer_key) => program.push_statement(
-                "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
-                 VALUES (CURRENT_TIMESTAMP, $1)",
-                vec![Value::Text(writer_key.to_string())],
-            ),
-            None => program.push_statement(
-                "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
-                 VALUES (CURRENT_TIMESTAMP, NULL)",
-                Vec::new(),
-            ),
-        }
+        program.push_statement(self.build_observe_tick_insert_sql(writer_key), Vec::new());
         execute_write_program_with_transaction(transaction, program).await?;
         Ok(())
     }
@@ -333,7 +325,7 @@ impl Engine {
             plain_backend_read_uses_runtime_functions(&parsed_statements[0]);
         let (statement, settings, sequence_start, functions) = if uses_runtime_functions {
             let (settings, sequence_start, functions) = self
-                .prepare_runtime_functions_with_backend(self.backend.as_ref())
+                .prepare_runtime_functions_with_backend(self.backend.as_ref(), false)
                 .await?;
             let mut provider = functions.clone();
             (

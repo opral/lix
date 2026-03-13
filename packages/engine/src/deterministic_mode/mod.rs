@@ -45,13 +45,16 @@ impl DeterministicSettings {
 #[derive(Debug, Clone)]
 pub struct RuntimeFunctionProvider {
     settings: DeterministicSettings,
+    sequence_start: Option<i64>,
     next_sequence: i64,
 }
 
 impl RuntimeFunctionProvider {
-    pub fn new(settings: DeterministicSettings, next_sequence: i64) -> Self {
+    pub fn new(settings: DeterministicSettings, sequence_start: Option<i64>) -> Self {
+        let next_sequence = sequence_start.unwrap_or(0);
         Self {
             settings,
+            sequence_start,
             next_sequence,
         }
     }
@@ -60,7 +63,15 @@ impl RuntimeFunctionProvider {
         self.next_sequence
     }
 
+    pub fn sequence_start(&self) -> Option<i64> {
+        self.sequence_start
+    }
+
     fn take_sequence(&mut self) -> i64 {
+        assert!(
+            !self.settings.enabled || self.sequence_start.is_some(),
+            "deterministic runtime sequence used before initialization"
+        );
         let current = self.next_sequence;
         self.next_sequence += 1;
         current
@@ -90,6 +101,22 @@ impl LixFunctionProvider for RuntimeFunctionProvider {
             return dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         }
         timestamp()
+    }
+
+    fn deterministic_sequence_enabled(&self) -> bool {
+        self.settings.enabled
+    }
+
+    fn deterministic_sequence_initialized(&self) -> bool {
+        !self.settings.enabled || self.sequence_start.is_some()
+    }
+
+    fn initialize_deterministic_sequence(&mut self, sequence_start: i64) {
+        if !self.settings.enabled || self.sequence_start.is_some() {
+            return;
+        }
+        self.sequence_start = Some(sequence_start);
+        self.next_sequence = sequence_start;
     }
 }
 
@@ -210,6 +237,35 @@ pub(crate) fn build_persist_sequence_highest_batch(
         sql: rewritten.sql,
         params,
     })
+}
+
+pub(crate) fn build_persist_sequence_highest_sql(highest_seen: i64) -> String {
+    let snapshot_content = serde_json::json!({
+        "key": SEQUENCE_KEY,
+        "value": highest_seen
+    })
+    .to_string();
+
+    format!(
+        "INSERT INTO lix_internal_live_untracked_v1 \
+         (entity_id, schema_key, file_id, version_id, global, plugin_key, snapshot_content, metadata, writer_key, schema_version, created_at, updated_at) \
+         VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', FALSE, '{plugin_key}', '{snapshot_content}', NULL, NULL, '{schema_version}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) \
+         ON CONFLICT (entity_id, schema_key, file_id, version_id) DO UPDATE SET \
+           global = excluded.global, \
+           plugin_key = excluded.plugin_key, \
+           snapshot_content = excluded.snapshot_content, \
+           metadata = excluded.metadata, \
+           writer_key = excluded.writer_key, \
+           schema_version = excluded.schema_version, \
+           updated_at = CURRENT_TIMESTAMP",
+        entity_id = escape_sql_string(SEQUENCE_KEY),
+        schema_key = escape_sql_string(key_value_schema_key()),
+        file_id = escape_sql_string(key_value_file_id()),
+        version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
+        plugin_key = escape_sql_string(key_value_plugin_key()),
+        schema_version = escape_sql_string(key_value_schema_version()),
+        snapshot_content = escape_sql_string(&snapshot_content),
+    )
 }
 
 async fn load_key_value_payloads(

@@ -1,14 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
+use crate::deterministic_mode::{
+    build_persist_sequence_highest_sql, DeterministicSettings, RuntimeFunctionProvider,
+};
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::registry::register_schema_sql_statements;
 use crate::sql::public::runtime::{
     finalize_public_write_execution, prepare_public_execution_with_internal_access,
     prepare_public_execution_with_registry_and_internal_access,
-    prepared_public_write_mutates_public_surface_registry, PreparedPublicExecution,
-    PreparedPublicRead, PreparedPublicWrite, PublicWriteExecutionPartition,
+    prepared_public_write_mutates_public_surface_registry,
+    semantic_plan_effects_from_domain_changes, state_commit_stream_operation,
+    PreparedPublicExecution, PreparedPublicRead, PreparedPublicWrite,
+    PublicWriteExecutionPartition,
 };
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{
@@ -31,6 +35,7 @@ use crate::sql::execution::contracts::execution_plan::ExecutionPlan;
 use crate::sql::execution::contracts::planned_statement::{
     PlannedStatementSet, SchemaRegistration,
 };
+use crate::sql::execution::contracts::prepared_statement::PreparedBatch;
 use crate::sql::execution::contracts::requirements::PlanRequirements;
 use crate::sql::execution::contracts::result_contract::ResultContract;
 use crate::sql::execution::derive_requirements::derive_plan_requirements;
@@ -165,8 +170,12 @@ pub(crate) async fn prepare_execution_with_backend(
     public_surface_registry_override: Option<&crate::sql::public::catalog::SurfaceRegistry>,
     policy: PreparationPolicy,
 ) -> Result<PreparedExecutionContext, LixError> {
+    let defer_runtime_sequence_load = !allow_internal_tables
+        && !crate::filesystem::pending_file_writes::statements_require_generated_file_insert_ids(
+            parsed_statements,
+        );
     let (settings, sequence_start, functions) = engine
-        .prepare_runtime_functions_with_backend(backend)
+        .prepare_runtime_functions_with_backend(backend, defer_runtime_sequence_load)
         .await?;
 
     let mut statements = parsed_statements.to_vec();
@@ -533,27 +542,59 @@ pub(crate) async fn maybe_execute_public_write_with_backend(
         Some(execution) => execution,
         None => return Ok(None),
     };
-    engine
-        .persist_runtime_sequence_in_transaction(
-            transaction.as_mut(),
-            prepared.settings,
-            prepared.sequence_start,
-            &prepared.functions,
-        )
-        .await?;
     let should_emit_observe_tick = execution
         .plan_effects_override
         .as_ref()
         .map(|effects| !effects.state_commit_stream_changes.is_empty())
         .unwrap_or(false)
         || !execution.state_commit_stream_changes.is_empty();
-    if should_emit_observe_tick {
-        engine
-            .append_observe_tick_in_transaction(transaction.as_mut(), writer_key)
-            .await?;
-    }
+    execute_public_write_followup_batch(
+        engine,
+        transaction.as_mut(),
+        prepared.settings,
+        prepared.sequence_start,
+        &prepared.functions,
+        writer_key,
+        should_emit_observe_tick,
+    )
+    .await?;
     transaction.commit().await?;
     Ok(Some(execution))
+}
+
+async fn execute_public_write_followup_batch(
+    engine: &Engine,
+    transaction: &mut dyn LixTransaction,
+    settings: DeterministicSettings,
+    sequence_start: i64,
+    functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
+    writer_key: Option<&str>,
+    should_emit_observe_tick: bool,
+) -> Result<(), LixError> {
+    let mut batch = PreparedBatch {
+        sql: String::new(),
+        params: Vec::new(),
+    };
+
+    if settings.enabled {
+        let sequence_end = functions.with_lock(|provider| provider.next_sequence());
+        if sequence_end > sequence_start {
+            batch.append_sql(build_persist_sequence_highest_sql(sequence_end - 1));
+        }
+    }
+
+    if should_emit_observe_tick {
+        batch.append_sql(engine.build_observe_tick_insert_sql(writer_key));
+    }
+
+    if batch.sql.trim().is_empty() {
+        return Ok(());
+    }
+
+    let mut program = WriteProgram::new();
+    program.push_batch(batch);
+    execute_write_program_with_transaction(transaction, program).await?;
+    Ok(())
 }
 
 pub(crate) async fn maybe_execute_public_write_with_transaction(
@@ -652,17 +693,27 @@ async fn execute_public_tracked_write_with_transaction(
         }
     }
 
-    if execution.domain_change_batch.changes.is_empty() {
+    let has_lazy_exact_file_metadata_update = execution.lazy_exact_file_metadata_update.is_some();
+    if execution
+        .domain_change_batch
+        .as_ref()
+        .is_some_and(|batch| batch.changes.is_empty())
+        && !has_lazy_exact_file_metadata_update
+    {
         return Ok(Some(empty_public_write_execution_outcome()));
     }
 
     let mut append_functions = prepared.functions.clone();
-    let timestamp = append_functions.timestamp();
     if let Some(session_slot) = pending_append_session.as_mut() {
-        let can_merge = session_slot.as_ref().is_some_and(|session| {
-            pending_session_matches_append(session, &execution.append_preconditions)
-        });
+        let can_merge = !has_lazy_exact_file_metadata_update
+            && session_slot.as_ref().is_some_and(|session| {
+                pending_session_matches_append(session, &execution.append_preconditions)
+            });
         if can_merge {
+            engine
+                .ensure_runtime_sequence_initialized_in_transaction(transaction, &append_functions)
+                .await?;
+            let timestamp = append_functions.timestamp();
             let mut invariant_checker =
                 Sql2AppendInvariantChecker::new(&public_write.planned_write);
             invariant_checker
@@ -675,7 +726,10 @@ async fn execute_public_tracked_write_with_transaction(
             merge_public_domain_change_batch_into_pending_commit(
                 transaction,
                 session,
-                &execution.domain_change_batch,
+                execution
+                    .domain_change_batch
+                    .as_ref()
+                    .expect("merged tracked writes should have a domain change batch"),
                 &mut append_functions,
                 &timestamp,
             )
@@ -699,8 +753,13 @@ async fn execute_public_tracked_write_with_transaction(
     let append_result = append_commit_if_preconditions_hold(
         transaction,
         AppendCommitArgs {
-            timestamp,
-            changes: execution.domain_change_batch.changes.clone(),
+            timestamp: None,
+            changes: execution
+                .domain_change_batch
+                .as_ref()
+                .map(|batch| batch.changes.clone())
+                .unwrap_or_default(),
+            lazy_exact_file_metadata_update: execution.lazy_exact_file_metadata_update.clone(),
             preconditions: execution.append_preconditions.clone(),
         },
         &mut append_functions,
@@ -720,11 +779,48 @@ async fn execute_public_tracked_write_with_transaction(
                 ),
             })?;
     }
-    if matches!(append_result.disposition, AppendCommitDisposition::Applied) {
+    let applied_domain_change_batch =
+        if matches!(append_result.disposition, AppendCommitDisposition::Applied) {
+            Some(
+                crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch {
+                    changes: append_result.applied_domain_changes.clone(),
+                    write_lane: execution
+                        .domain_change_batch
+                        .as_ref()
+                        .map(|batch| batch.write_lane.clone())
+                        .unwrap_or_else(|| match &execution.append_preconditions.write_lane {
+                            AppendWriteLane::Version(version_id) => {
+                                crate::sql::public::planner::ir::WriteLane::SingleVersion(
+                                    version_id.clone(),
+                                )
+                            }
+                            AppendWriteLane::GlobalAdmin => {
+                                crate::sql::public::planner::ir::WriteLane::GlobalAdmin
+                            }
+                        }),
+                    writer_key: execution
+                        .domain_change_batch
+                        .as_ref()
+                        .and_then(|batch| batch.writer_key.clone())
+                        .or_else(|| {
+                            public_write
+                                .planned_write
+                                .command
+                                .execution_context
+                                .writer_key
+                                .clone()
+                        }),
+                    semantic_effects: Vec::new(),
+                },
+            )
+        } else {
+            None
+        };
+    if let Some(applied_domain_change_batch) = applied_domain_change_batch.as_ref() {
         apply_public_version_last_checkpoint_side_effects(
             transaction,
             public_write,
-            &execution.domain_change_batch,
+            applied_domain_change_batch,
         )
         .await
         .map_err(|error| LixError {
@@ -757,7 +853,14 @@ async fn execute_public_tracked_write_with_transaction(
         };
     }
     let plan_effects_override = if plugin_changes_committed {
-        execution.semantic_effects.clone()
+        if has_lazy_exact_file_metadata_update {
+            semantic_plan_effects_from_domain_changes(
+                &append_result.applied_domain_changes,
+                state_commit_stream_operation(public_write.planned_write.command.operation_kind),
+            )?
+        } else {
+            execution.semantic_effects.clone()
+        }
     } else {
         PlanEffects::default()
     };

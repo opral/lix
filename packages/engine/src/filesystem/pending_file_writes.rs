@@ -143,32 +143,23 @@ pub(crate) async fn collect_pending_file_writes_from_statements(
     })
 }
 
+pub(crate) fn statements_require_generated_file_insert_ids(statements: &[Statement]) -> bool {
+    statements
+        .iter()
+        .any(statement_requires_generated_file_insert_id)
+}
+
 pub(crate) fn ensure_file_insert_ids_for_data_writes<P: LixFunctionProvider>(
     statements: &mut [Statement],
     functions: &SharedFunctionProvider<P>,
 ) -> Result<(), LixError> {
     for statement in statements.iter_mut() {
+        if !statement_requires_generated_file_insert_id(statement) {
+            continue;
+        }
         let Statement::Insert(insert) = statement else {
             continue;
         };
-        if file_write_target_from_insert(&insert.table).is_none() {
-            continue;
-        }
-        let data_index = insert
-            .columns
-            .iter()
-            .position(|column| column.value.eq_ignore_ascii_case("data"));
-        let path_index = insert
-            .columns
-            .iter()
-            .position(|column| column.value.eq_ignore_ascii_case("path"));
-        let id_index = insert
-            .columns
-            .iter()
-            .position(|column| column.value.eq_ignore_ascii_case("id"));
-        if data_index.is_none() || path_index.is_none() || id_index.is_some() {
-            continue;
-        }
 
         let current_column_count = insert.columns.len();
         insert.columns.push("id".into());
@@ -188,6 +179,28 @@ pub(crate) fn ensure_file_insert_ids_for_data_writes<P: LixFunctionProvider>(
     }
 
     Ok(())
+}
+
+fn statement_requires_generated_file_insert_id(statement: &Statement) -> bool {
+    let Statement::Insert(insert) = statement else {
+        return false;
+    };
+    if file_write_target_from_insert(&insert.table).is_none() {
+        return false;
+    }
+    let data_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("data"));
+    let path_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("path"));
+    let id_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("id"));
+    data_index.is_some() && path_index.is_some() && id_index.is_none()
 }
 
 pub(crate) async fn collect_pending_file_delete_targets_from_statements(

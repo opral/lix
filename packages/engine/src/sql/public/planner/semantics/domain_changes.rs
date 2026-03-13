@@ -37,7 +37,10 @@ pub(crate) fn build_domain_change_batch(
     resolved
         .partitions
         .iter()
-        .filter(|partition| partition.execution_mode == WriteMode::Tracked)
+        .filter(|partition| {
+            partition.execution_mode == WriteMode::Tracked
+                && partition.lazy_exact_file_metadata_update.is_none()
+        })
         .map(|partition| build_domain_change_batch_for_partition(planned_write, partition))
         .collect()
 }
@@ -157,7 +160,7 @@ fn build_idempotency_key(
         "lane": format!("{:?}", write_lane),
         "writer_key": planned_write.command.execution_context.writer_key,
         "payload": summarize_mutation_payload(&planned_write.command.payload),
-        "resolved_rows": summarize_planned_rows(&partition.intended_post_state),
+        "resolved_rows": summarize_partition_rows(partition),
     });
     let summarized_bytes = serde_json::to_vec(&summarized).map_err(|error| DomainChangeError {
         message: format!("public idempotency-key serialization failed: {error}"),
@@ -174,6 +177,32 @@ fn build_idempotency_key(
         })
         .to_string(),
     ))
+}
+
+fn summarize_partition_rows(partition: &ResolvedWritePartition) -> JsonValue {
+    if let Some(lazy) = partition.lazy_exact_file_metadata_update.as_ref() {
+        return json!({
+            "kind": "lazy_exact_file_metadata_update",
+            "file_id": lazy.file_id,
+            "version_id": lazy.version_id,
+            "metadata": summarize_optional_text_patch(&lazy.metadata),
+        });
+    }
+    summarize_planned_rows(&partition.intended_post_state)
+}
+
+fn summarize_optional_text_patch(
+    patch: &crate::sql::public::planner::ir::OptionalTextPatch,
+) -> JsonValue {
+    match patch {
+        crate::sql::public::planner::ir::OptionalTextPatch::Unchanged => json!({
+            "kind": "unchanged",
+        }),
+        crate::sql::public::planner::ir::OptionalTextPatch::Set(value) => json!({
+            "kind": "set",
+            "value": value,
+        }),
+    }
 }
 
 fn summarize_mutation_payload(payload: &MutationPayload) -> JsonValue {

@@ -4,6 +4,7 @@ use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
+use crate::sql::public::planner::ir::{LazyExactFileMetadataUpdate, OptionalTextPatch};
 use crate::sql::public::planner::semantics::filesystem_assignments::{
     parse_directory_insert_assignments, parse_directory_update_assignments,
     parse_file_insert_assignments, parse_file_update_assignments, DirectoryUpdateAssignments,
@@ -401,6 +402,30 @@ async fn resolve_existing_file_write(
             let payload = payload_map(planned_write)?;
             let assignments = parse_file_update_assignments(&payload)
                 .map_err(write_resolve_filesystem_assignments_error)?;
+            if let Some(file_id) =
+                lazy_exact_file_metadata_update_candidate(planned_write, &version_id, &assignments)
+            {
+                let execution_mode =
+                    default_execution_mode_for_request(planned_write.command.requested_mode);
+                let target_write_lane = target_write_lane_for_version(
+                    planned_write,
+                    execution_mode,
+                    Some(version_id.as_str()),
+                )?;
+                return Ok(ResolvedWritePlan::from_partition(ResolvedWritePartition {
+                    execution_mode,
+                    authoritative_pre_state: Vec::new(),
+                    intended_post_state: Vec::new(),
+                    tombstones: Vec::new(),
+                    lineage: Vec::new(),
+                    target_write_lane,
+                    lazy_exact_file_metadata_update: Some(LazyExactFileMetadataUpdate {
+                        file_id,
+                        version_id: version_id.clone(),
+                        metadata: optional_text_patch(&assignments.metadata),
+                    }),
+                }));
+            }
             let current_rows = load_target_file_rows_for_selector(
                 backend,
                 planned_write,
@@ -578,6 +603,40 @@ async fn resolve_existing_file_write(
         WriteOperationKind::Insert => Err(WriteResolveError {
             message: "public filesystem existing-row resolver does not handle inserts".to_string(),
         }),
+    }
+}
+
+fn lazy_exact_file_metadata_update_candidate(
+    planned_write: &PlannedWrite,
+    _version_id: &str,
+    assignments: &FileUpdateAssignments,
+) -> Option<String> {
+    if matches!(
+        planned_write.command.requested_mode,
+        WriteModeRequest::ForceUntracked
+    ) {
+        return None;
+    }
+    if assignments.path.is_some()
+        || assignments.hidden.is_some()
+        || assignments.data.bytes().is_some()
+    {
+        return None;
+    }
+    let file_id = exact_id_selector_value(planned_write)?;
+    Some(file_id)
+}
+
+fn optional_text_patch(
+    assignment: &crate::sql::public::planner::semantics::filesystem_assignments::OptionalTextAssignment,
+) -> OptionalTextPatch {
+    match assignment {
+        crate::sql::public::planner::semantics::filesystem_assignments::OptionalTextAssignment::Unchanged => {
+            OptionalTextPatch::Unchanged
+        }
+        crate::sql::public::planner::semantics::filesystem_assignments::OptionalTextAssignment::Set(value) => {
+            OptionalTextPatch::Set(value.clone())
+        }
     }
 }
 
