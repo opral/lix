@@ -159,11 +159,7 @@ fn parse_schema_metadata(schema_key: &str) -> SchemaMetadata {
         if overrides.get("lixcol_global").and_then(JsonValue::as_str) == Some("true") {
             GLOBAL_VERSION_ID.to_string()
         } else {
-            overrides
-                .get("lixcol_version_id")
-                .and_then(JsonValue::as_str)
-                .map(decode_lixcol_literal)
-                .unwrap_or_else(|| ACCOUNT_STORAGE_VERSION_ID.to_string())
+            ACCOUNT_STORAGE_VERSION_ID.to_string()
         };
 
     SchemaMetadata {

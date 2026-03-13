@@ -9,7 +9,7 @@ use sqlparser::ast::Expr;
 use super::prepared_statement::PreparedStatement;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SchemaRegistration {
+pub(crate) struct SchemaLiveTableRequirement {
     pub(crate) schema_key: String,
 }
 
@@ -43,7 +43,7 @@ pub(crate) struct UpdateValidationPlan {
 pub(crate) struct PlannedStatementSet {
     pub(crate) sql: String,
     pub(crate) prepared_statements: Vec<PreparedStatement>,
-    pub(crate) registrations: Vec<SchemaRegistration>,
+    pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub(crate) internal_state: Option<InternalStatePlan>,
     pub(crate) mutations: Vec<MutationRow>,
     pub(crate) update_validations: Vec<UpdateValidationPlan>,

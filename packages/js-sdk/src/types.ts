@@ -41,7 +41,7 @@ export type LixBackend = {
 		params: ReadonlyArray<LixRuntimeValue>,
 	): Promise<LixRuntimeQueryResult> | LixRuntimeQueryResult;
 	beginTransaction?: () => Promise<LixTransaction> | LixTransaction;
-	exportSnapshot?: () =>
+	export_image?: () =>
 		| Promise<Uint8Array | ArrayBuffer>
 		| Uint8Array
 		| ArrayBuffer;

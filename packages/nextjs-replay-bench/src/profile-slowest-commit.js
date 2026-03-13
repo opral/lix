@@ -395,8 +395,8 @@ function createTracingBackend(baseBackend) {
         },
       };
     },
-    async exportSnapshot() {
-      return await baseBackend.exportSnapshot();
+    async export_image() {
+      return await baseBackend.export_image();
     },
     async close() {
       if (typeof baseBackend.close === "function") {

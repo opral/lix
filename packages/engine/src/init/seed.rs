@@ -45,7 +45,7 @@ impl Engine {
             let existing = self
                 .execute_internal(
                     "SELECT 1 FROM lix_internal_state_vtable \
-                     WHERE schema_key = 'lix_stored_schema' \
+                     WHERE schema_key = 'lix_registered_schema' \
                        AND entity_id = $1 \
                        AND version_id = 'global' \
                        AND snapshot_content IS NOT NULL \
@@ -72,7 +72,7 @@ impl Engine {
             self.execute_internal(
                 "INSERT INTO lix_internal_state_vtable (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, created_at, updated_at, untracked\
-                 ) VALUES ($1, 'lix_stored_schema', 'lix', 'global', 'lix', $2, '1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z', true)",
+                 ) VALUES ($1, 'lix_registered_schema', 'lix', 'global', 'lix', $2, '1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z', true)",
                 &[
                     Value::Text(entity_id),
                     Value::Text(snapshot_content),

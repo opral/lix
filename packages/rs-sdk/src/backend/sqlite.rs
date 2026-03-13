@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use lix_engine::{
-    LixBackend, LixError, LixTransaction, QueryResult, SnapshotChunkReader, SnapshotChunkWriter,
+    ImageChunkReader, ImageChunkWriter, LixBackend, LixError, LixTransaction, QueryResult,
     SqlDialect, Value,
 };
 use rusqlite::{
@@ -73,15 +73,15 @@ impl LixBackend for SqliteBackend {
         }))
     }
 
-    async fn export_snapshot(&self, writer: &mut dyn SnapshotChunkWriter) -> Result<(), LixError> {
+    async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
         let conn = self.conn.lock().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "sqlite mutex poisoned".to_string(),
         })?;
-        let snapshot_path = temp_snapshot_path("export");
+        let image_path = temp_image_path("export");
 
         let export_result = (|| -> Result<(), LixError> {
-            let mut snapshot_conn = Connection::open(&snapshot_path).map_err(|err| LixError {
+            let mut snapshot_conn = Connection::open(&image_path).map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
             })?;
@@ -93,11 +93,11 @@ impl LixBackend for SqliteBackend {
             Ok(())
         })();
 
-        let bytes = std::fs::read(&snapshot_path).map_err(|err| LixError {
+        let bytes = std::fs::read(&image_path).map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: err.to_string(),
         });
-        let _ = std::fs::remove_file(&snapshot_path);
+        let _ = std::fs::remove_file(&image_path);
         export_result?;
         let bytes = bytes?;
 
@@ -108,10 +108,7 @@ impl LixBackend for SqliteBackend {
         Ok(())
     }
 
-    async fn restore_from_snapshot(
-        &self,
-        reader: &mut dyn SnapshotChunkReader,
-    ) -> Result<(), LixError> {
+    async fn restore_from_image(&self, reader: &mut dyn ImageChunkReader) -> Result<(), LixError> {
         let mut bytes = Vec::new();
         while let Some(chunk) = reader.read_chunk().await? {
             bytes.extend_from_slice(&chunk);
@@ -119,18 +116,18 @@ impl LixBackend for SqliteBackend {
         if bytes.is_empty() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "snapshot stream is empty".to_string(),
+                description: "image stream is empty".to_string(),
             });
         }
 
-        let snapshot_path = temp_snapshot_path("restore");
-        std::fs::write(&snapshot_path, &bytes).map_err(|err| LixError {
+        let image_path = temp_image_path("restore");
+        std::fs::write(&image_path, &bytes).map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: err.to_string(),
         })?;
 
         let restore_result = (|| -> Result<(), LixError> {
-            let source_conn = Connection::open(&snapshot_path).map_err(|err| LixError {
+            let source_conn = Connection::open(&image_path).map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
             })?;
@@ -145,7 +142,7 @@ impl LixBackend for SqliteBackend {
             run_backup_to_completion(&backup)?;
             Ok(())
         })();
-        let _ = std::fs::remove_file(&snapshot_path);
+        let _ = std::fs::remove_file(&image_path);
         restore_result
     }
 }
@@ -244,7 +241,7 @@ fn run_backup_to_completion(backup: &Backup<'_, '_>) -> Result<(), LixError> {
     }
 }
 
-fn temp_snapshot_path(operation: &str) -> PathBuf {
+fn temp_image_path(operation: &str) -> PathBuf {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

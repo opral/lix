@@ -10,7 +10,7 @@ async fn insert_schema(engine: &support::simulation_test::SimulationEngine, sche
     engine
         .execute(
             &format!(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('lix_stored_schema', '{}')",
+                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('lix_registered_schema', '{}')",
                 schema.replace('\'', "''")
             ), &[])
         .await

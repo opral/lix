@@ -6,8 +6,8 @@ use jsonschema::JSONSchema;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::schema::{
-    schema_from_stored_snapshot, validate_lix_schema_definition, OverlaySchemaProvider, SchemaKey,
-    SchemaProvider, SqlStoredSchemaProvider,
+    schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
+    SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,
 };
 use crate::sql::ast::utils::bind_sql;
 use crate::sql::execution::contracts::planned_statement::{
@@ -17,10 +17,10 @@ use crate::sql::public::planner::ir::{PlannedStateRow, PlannedWrite, WriteOperat
 use crate::{LixBackend, LixError, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
-const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
-const STORED_SCHEMA_FILE_ID: &str = "lix";
-const STORED_SCHEMA_PLUGIN_KEY: &str = "lix";
-const STORED_SCHEMA_VERSION_ID: &str = "global";
+const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
+const REGISTERED_SCHEMA_FILE_ID: &str = "lix";
+const REGISTERED_SCHEMA_PLUGIN_KEY: &str = "lix";
+const REGISTERED_SCHEMA_VERSION_ID: &str = "global";
 
 #[derive(Debug, Default)]
 pub struct SchemaCache {
@@ -47,10 +47,10 @@ pub async fn validate_inserts(
             continue;
         }
 
-        if row.schema_key == STORED_SCHEMA_KEY {
-            validate_stored_schema_insert(&mut schema_provider, row).await?;
+        if row.schema_key == REGISTERED_SCHEMA_KEY {
+            validate_registered_schema_insert(&mut schema_provider, row).await?;
             if let Some(snapshot) = row.snapshot_content.as_ref() {
-                let (key, schema) = schema_from_stored_snapshot(snapshot)?;
+                let (key, schema) = schema_from_registered_snapshot(snapshot)?;
                 schema_provider.remember_pending_schema(key, schema);
             }
             continue;
@@ -81,7 +81,7 @@ pub async fn validate_updates(
     plans: &[UpdateValidationPlan],
     params: &[Value],
 ) -> Result<(), LixError> {
-    let mut schema_provider = SqlStoredSchemaProvider::new(backend);
+    let mut schema_provider = SqlRegisteredSchemaProvider::new(backend);
 
     for plan in plans {
         let mut sql = format!(
@@ -105,9 +105,9 @@ pub async fn validate_updates(
             let schema_version = value_to_string(&row[5], "schema_version")?;
             let snapshot = resolve_update_snapshot(plan, row.get(6), &schema_key)?;
 
-            if schema_key == STORED_SCHEMA_KEY {
+            if schema_key == REGISTERED_SCHEMA_KEY {
                 if let Some(snapshot) = snapshot.as_ref() {
-                    validate_stored_schema_snapshot(&mut schema_provider, snapshot).await?;
+                    validate_registered_schema_snapshot(&mut schema_provider, snapshot).await?;
                 }
                 continue;
             }
@@ -272,9 +272,9 @@ async fn validate_sql2_planned_row(
         return Ok(());
     };
 
-    if row.schema_key == STORED_SCHEMA_KEY {
-        validate_stored_schema_snapshot(provider, &snapshot).await?;
-        let (key, schema) = schema_from_stored_snapshot(&snapshot)?;
+    if row.schema_key == REGISTERED_SCHEMA_KEY {
+        validate_registered_schema_snapshot(provider, &snapshot).await?;
+        let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
         let expected_entity_id = key.entity_id();
         let actual_version_id = planned_row_required_text(row, "version_id")?;
         let actual_file_id = planned_row_required_text(row, "file_id")?;
@@ -285,35 +285,35 @@ async fn validate_sql2_planned_row(
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
-                    "stored schema entity_id '{}' must match '{}'",
+                    "registered schema entity_id '{}' must match '{}'",
                     row.entity_id, expected_entity_id
                 ),
             });
         }
-        if actual_version_id != STORED_SCHEMA_VERSION_ID {
+        if actual_version_id != REGISTERED_SCHEMA_VERSION_ID {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
-                    "stored schema version_id '{}' must be '{}'",
-                    actual_version_id, STORED_SCHEMA_VERSION_ID
+                    "registered schema version_id '{}' must be '{}'",
+                    actual_version_id, REGISTERED_SCHEMA_VERSION_ID
                 ),
             });
         }
-        if actual_file_id != STORED_SCHEMA_FILE_ID {
+        if actual_file_id != REGISTERED_SCHEMA_FILE_ID {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
-                    "stored schema file_id '{}' must be '{}'",
-                    actual_file_id, STORED_SCHEMA_FILE_ID
+                    "registered schema file_id '{}' must be '{}'",
+                    actual_file_id, REGISTERED_SCHEMA_FILE_ID
                 ),
             });
         }
-        if actual_plugin_key != STORED_SCHEMA_PLUGIN_KEY {
+        if actual_plugin_key != REGISTERED_SCHEMA_PLUGIN_KEY {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
-                    "stored schema plugin_key '{}' must be '{}'",
-                    actual_plugin_key, STORED_SCHEMA_PLUGIN_KEY
+                    "registered schema plugin_key '{}' must be '{}'",
+                    actual_plugin_key, REGISTERED_SCHEMA_PLUGIN_KEY
                 ),
             });
         }
@@ -321,7 +321,7 @@ async fn validate_sql2_planned_row(
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
-                    "stored schema row schema_version '{}' must match '{}'",
+                    "registered schema row schema_version '{}' must match '{}'",
                     actual_schema_version, key.schema_version
                 ),
             });
@@ -374,18 +374,18 @@ async fn binary_cas_blob_exists(
     Ok(!result.rows.is_empty())
 }
 
-fn extract_stored_schema_value(snapshot: &JsonValue) -> Result<&JsonValue, LixError> {
+fn extract_registered_schema_value(snapshot: &JsonValue) -> Result<&JsonValue, LixError> {
     snapshot.get("value").ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "stored schema snapshot_content missing value".to_string(),
+        description: "registered schema snapshot_content missing value".to_string(),
     })
 }
 
-async fn validate_stored_schema_snapshot<P: SchemaProvider + ?Sized>(
+async fn validate_registered_schema_snapshot<P: SchemaProvider + ?Sized>(
     provider: &mut P,
     snapshot: &JsonValue,
 ) -> Result<(), LixError> {
-    let schema_value = extract_stored_schema_value(snapshot)?;
+    let schema_value = extract_registered_schema_value(snapshot)?;
     validate_lix_schema_definition(schema_value)?;
     validate_foreign_key_reference_targets(provider, schema_value).await?;
     Ok(())
@@ -425,15 +425,15 @@ async fn validate_filesystem_snapshot_integrity(
     Ok(())
 }
 
-async fn validate_stored_schema_insert<P: SchemaProvider + ?Sized>(
+async fn validate_registered_schema_insert<P: SchemaProvider + ?Sized>(
     provider: &mut P,
     row: &MutationRow,
 ) -> Result<(), LixError> {
     let snapshot = row.snapshot_content.as_ref().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "stored schema insert requires snapshot_content".to_string(),
+        description: "registered schema insert requires snapshot_content".to_string(),
     })?;
-    validate_stored_schema_snapshot(provider, snapshot).await?;
+    validate_registered_schema_snapshot(provider, snapshot).await?;
 
     Ok(())
 }

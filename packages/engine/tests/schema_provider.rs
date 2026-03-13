@@ -23,7 +23,7 @@ simulation_test!(
         let result = engine
             .execute(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
+             'lix_registered_schema',\
              '{\"value\":{\"x-lix-key\":\"same_request_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
              );\
              INSERT INTO lix_internal_state_vtable (\
@@ -50,7 +50,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    same_request_stored_schema_foreign_key_uses_pending_target,
+    same_request_registered_schema_foreign_key_uses_pending_target,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
@@ -62,11 +62,11 @@ simulation_test!(
         let result = engine
             .execute(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
+             'lix_registered_schema',\
              '{\"value\":{\"x-lix-key\":\"same_request_parent\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
              );\
              INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
+             'lix_registered_schema',\
              '{\"value\":{\"x-lix-key\":\"same_request_child\",\"x-lix-version\":\"1\",\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"same_request_parent\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"parent_id\":{\"type\":\"string\"}},\"required\":[\"parent_id\"],\"additionalProperties\":false}}'\
              )", &[])
             .await;
@@ -76,7 +76,7 @@ simulation_test!(
         let count = engine
             .execute(
                 "SELECT COUNT(*) FROM lix_internal_state_vtable \
-             WHERE schema_key = 'lix_stored_schema' \
+             WHERE schema_key = 'lix_registered_schema' \
                AND entity_id IN ('same_request_parent~1', 'same_request_child~1')",
                 &[],
             )
@@ -100,7 +100,7 @@ simulation_test!(
         let result = engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
+             'lix_registered_schema',\
              '{\"value\":{\"x-lix-key\":\"same_request_default_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"slug\":{\"type\":\"string\",\"x-lix-default\":\"name + ''-slug''\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
              );\
              INSERT INTO lix_internal_state_vtable (\

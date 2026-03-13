@@ -92,7 +92,7 @@ Public table names are registered as API surfaces (including `lix_state`, `lix_s
 
 ### 3.2 Entity views are dynamic schema frontends
 
-Entity view names are derived from schema keys (`lix_<schema>`, suffix `_by_version`, `_history`) and resolved from builtin/stored schema definitions.
+Entity view names are derived from schema keys (`lix_<schema>`, suffix `_by_version`, `_history`) and resolved from builtin/registered schema definitions.
 
 - View name resolution and variants in `entity_views/target.rs`.
 - Entity reads are thin wrappers over `lix_state`, `lix_state_by_version`, or `lix_state_history` with JSON property extraction and `lixcol_*` alias projection.

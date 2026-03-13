@@ -1,13 +1,26 @@
-use crate::{LixBackend, LixError, SqlDialect};
+use crate::{LixBackend, LixError, LixTransaction, SqlDialect};
 
-pub async fn register_schema(backend: &dyn LixBackend, schema_key: &str) -> Result<(), LixError> {
-    for statement in register_schema_sql_statements(schema_key, backend.dialect()) {
+pub async fn ensure_schema_live_table(
+    backend: &dyn LixBackend,
+    schema_key: &str,
+) -> Result<(), LixError> {
+    for statement in ensure_schema_live_table_sql_statements(schema_key, backend.dialect()) {
         backend.execute(&statement, &[]).await?;
     }
     Ok(())
 }
 
-pub fn register_schema_sql(schema_key: &str) -> String {
+pub async fn ensure_schema_live_table_in_transaction(
+    transaction: &mut dyn LixTransaction,
+    schema_key: &str,
+) -> Result<(), LixError> {
+    for statement in ensure_schema_live_table_sql_statements(schema_key, transaction.dialect()) {
+        transaction.execute(&statement, &[]).await?;
+    }
+    Ok(())
+}
+
+pub fn ensure_schema_live_table_sql(schema_key: &str) -> String {
     let table_name = format!("lix_internal_live_v1_{}", schema_key);
     let table_ident = quote_ident(&table_name);
 
@@ -33,11 +46,14 @@ pub fn register_schema_sql(schema_key: &str) -> String {
     )
 }
 
-pub fn register_schema_sql_statements(schema_key: &str, dialect: SqlDialect) -> Vec<String> {
+pub fn ensure_schema_live_table_sql_statements(
+    schema_key: &str,
+    dialect: SqlDialect,
+) -> Vec<String> {
     let table_name = format!("lix_internal_live_v1_{}", schema_key);
     let table_ident = quote_ident(&table_name);
 
-    let mut statements = vec![register_schema_sql(schema_key)];
+    let mut statements = vec![ensure_schema_live_table_sql(schema_key)];
 
     let index_statements = vec![
         format!(
@@ -131,16 +147,17 @@ fn json_text_extract_expr(dialect: SqlDialect, key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::register_schema_sql_statements;
+    use super::ensure_schema_live_table_sql_statements;
     use crate::SqlDialect;
     use std::collections::BTreeMap;
 
     #[test]
     fn version_descriptor_indexes_do_not_reference_inheritance_state() {
         let sqlite_statements =
-            register_schema_sql_statements("lix_version_descriptor", SqlDialect::Sqlite).join("\n");
+            ensure_schema_live_table_sql_statements("lix_version_descriptor", SqlDialect::Sqlite)
+                .join("\n");
         let postgres_statements =
-            register_schema_sql_statements("lix_version_descriptor", SqlDialect::Postgres)
+            ensure_schema_live_table_sql_statements("lix_version_descriptor", SqlDialect::Postgres)
                 .join("\n");
         assert!(!sqlite_statements.contains("inherits_from_version_id"));
         assert!(!postgres_statements.contains("inherits_from_version_id"));
@@ -149,7 +166,7 @@ mod tests {
     #[test]
     fn postgres_file_descriptor_index_names_do_not_truncate_to_collisions() {
         let statements =
-            register_schema_sql_statements("lix_file_descriptor", SqlDialect::Postgres);
+            ensure_schema_live_table_sql_statements("lix_file_descriptor", SqlDialect::Postgres);
         let mut by_truncated = BTreeMap::<String, Vec<String>>::new();
         for statement in statements {
             let Some(rest) = statement.strip_prefix("CREATE INDEX IF NOT EXISTS \"") else {

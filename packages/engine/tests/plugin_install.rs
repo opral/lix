@@ -384,7 +384,7 @@ simulation_test!(
         let schema_count = engine
             .execute(
                 "SELECT COUNT(*) \
-                 FROM lix_stored_schema_by_version \
+                 FROM lix_registered_schema_by_version \
                  WHERE lixcol_entity_id = 'plugin_json_schema~1'",
                 &[],
             )
