@@ -15,6 +15,13 @@ use crate::sql::public::planner::semantics::state_assignments::{
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
+fn authoritative_version_id_for_effective_row(current_row: &ExactEffectiveStateRow) -> String {
+    match current_row.overlay_lane {
+        OverlayLane::GlobalTracked | OverlayLane::GlobalUntracked => GLOBAL_VERSION_ID.to_string(),
+        OverlayLane::LocalTracked | OverlayLane::LocalUntracked => current_row.version_id.clone(),
+    }
+}
+
 pub(super) async fn resolve_state_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
@@ -305,14 +312,20 @@ fn resolve_state_backed_existing_write_from_rows(
                     planned_write.command.requested_mode,
                     &current_row,
                 )?;
+                let authoritative_version_id =
+                    authoritative_version_id_for_effective_row(&current_row);
                 let row_ref = ResolvedRowRef {
                     entity_id: current_row.entity_id.clone(),
                     schema_key: current_row.schema_key.clone(),
-                    version_id: Some(current_row.version_id.clone()),
+                    version_id: Some(authoritative_version_id.clone()),
                     source_change_id: current_row.source_change_id.clone(),
                     source_commit_id: None,
                 };
-                let values = surface.apply_update_assignments(assignments, &current_row)?;
+                let mut values = surface.apply_update_assignments(assignments, &current_row)?;
+                values.insert(
+                    "version_id".to_string(),
+                    Value::Text(authoritative_version_id.clone()),
+                );
                 let target_write_lane = target_write_lane_for_effective_row(
                     planned_write,
                     execution_mode,
@@ -323,7 +336,7 @@ fn resolve_state_backed_existing_write_from_rows(
                 partition.intended_post_state.push(PlannedStateRow {
                     entity_id: current_row.entity_id.clone(),
                     schema_key: current_row.schema_key.clone(),
-                    version_id: Some(current_row.version_id.clone()),
+                    version_id: Some(authoritative_version_id),
                     values,
                     tombstone: false,
                 });
@@ -341,10 +354,12 @@ fn resolve_state_backed_existing_write_from_rows(
                     planned_write.command.requested_mode,
                     &current_row,
                 )?;
+                let authoritative_version_id =
+                    authoritative_version_id_for_effective_row(&current_row);
                 let row_ref = ResolvedRowRef {
                     entity_id: current_row.entity_id.clone(),
                     schema_key: current_row.schema_key.clone(),
-                    version_id: Some(current_row.version_id.clone()),
+                    version_id: Some(authoritative_version_id.clone()),
                     source_change_id: current_row.source_change_id.clone(),
                     source_commit_id: None,
                 };
@@ -358,7 +373,7 @@ fn resolve_state_backed_existing_write_from_rows(
                 partition.intended_post_state.push(PlannedStateRow {
                     entity_id: current_row.entity_id.clone(),
                     schema_key: current_row.schema_key.clone(),
-                    version_id: Some(current_row.version_id.clone()),
+                    version_id: Some(authoritative_version_id.clone()),
                     values: current_row.values,
                     tombstone: true,
                 });
