@@ -6,8 +6,8 @@ use crate::filesystem::path::{
 };
 use crate::sql::common::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::public::planner::ir::{
-    LazyExactFileDataUpdate, LazyExactFileDelete, LazyExactFileMetadataUpdate, LazyExactFileUpdate,
-    OptionalTextPatch,
+    FilesystemPayloadWriteIntent, LazyExactFileDataUpdate, LazyExactFileDelete,
+    LazyExactFileMetadataUpdate, LazyExactFileUpdate, OptionalTextPatch,
 };
 use crate::sql::public::planner::semantics::filesystem_assignments::{
     parse_directory_insert_assignments, parse_directory_update_assignments,
@@ -317,6 +317,11 @@ async fn resolve_existing_directory_write(
                     .push(binary_blob_ref_tombstone_row(&row.id, &version_id));
                 partition.tombstones.push(file_ref);
                 partition.tombstones.push(blob_ref);
+                if execution_mode == WriteMode::Untracked {
+                    partition
+                        .filesystem_payload_delete_targets
+                        .insert((row.id.clone(), version_id.clone()));
+                }
                 partition.lineage.push(RowLineage {
                     entity_id: row.id.clone(),
                     source_change_id: row.change_id.clone(),
@@ -352,6 +357,8 @@ async fn resolve_file_insert_write_plan(
             .map_err(write_resolve_filesystem_planning_error)?;
     let mut intended_post_state = Vec::new();
     let mut lineage = Vec::new();
+    let execution_mode = default_execution_mode_for_request(planned_write.command.requested_mode);
+    let mut filesystem_payload_writes = Vec::new();
     for directory in planned_batch.directories {
         intended_post_state.push(directory_descriptor_row(
             &directory.id,
@@ -379,6 +386,12 @@ async fn resolve_file_insert_write_plan(
         ));
         if let Some(bytes) = file.data.as_deref() {
             intended_post_state.push(binary_blob_ref_row(&file.id, &version_id, bytes)?);
+            filesystem_payload_writes.push(FilesystemPayloadWriteIntent {
+                file_id: file.id.clone(),
+                version_id: version_id.clone(),
+                untracked: execution_mode == WriteMode::Untracked,
+                data: bytes.to_vec(),
+            });
         }
         lineage.push(RowLineage {
             entity_id: file.id,
@@ -387,13 +400,17 @@ async fn resolve_file_insert_write_plan(
         });
     }
 
-    Ok(single_partition_write_plan(
-        default_execution_mode_for_request(planned_write.command.requested_mode),
-        Vec::new(),
+    Ok(ResolvedWritePlan::from_partition(ResolvedWritePartition {
+        execution_mode,
+        authoritative_pre_state: Vec::new(),
         intended_post_state,
-        Vec::new(),
+        tombstones: Vec::new(),
         lineage,
-    ))
+        target_write_lane: None,
+        lazy_exact_file_update: None,
+        filesystem_payload_writes,
+        filesystem_payload_delete_targets: BTreeSet::new(),
+    }))
 }
 
 async fn resolve_existing_file_write(
@@ -425,6 +442,8 @@ async fn resolve_existing_file_write(
                     lineage: Vec::new(),
                     target_write_lane,
                     lazy_exact_file_update: Some(lazy_exact_file_update),
+                    filesystem_payload_writes: Vec::new(),
+                    filesystem_payload_delete_targets: BTreeSet::new(),
                 }));
             }
             let current_rows = load_target_file_rows_for_selector(
@@ -534,6 +553,14 @@ async fn resolve_existing_file_write(
                         &version_id,
                         bytes,
                     )?);
+                    partition
+                        .filesystem_payload_writes
+                        .push(FilesystemPayloadWriteIntent {
+                            file_id: current_row.id.clone(),
+                            version_id: version_id.clone(),
+                            untracked: execution_mode == WriteMode::Untracked,
+                            data: bytes.to_vec(),
+                        });
                 }
             }
 
@@ -557,6 +584,8 @@ async fn resolve_existing_file_write(
                         Some(version_id.as_str()),
                     )?,
                     lazy_exact_file_update: Some(lazy_exact_file_update),
+                    filesystem_payload_writes: Vec::new(),
+                    filesystem_payload_delete_targets: BTreeSet::new(),
                 }));
             }
             let current_rows = load_target_file_rows_for_selector(
@@ -619,6 +648,11 @@ async fn resolve_existing_file_write(
                     .push(binary_blob_ref_tombstone_row(&current_row.id, &version_id));
                 partition.tombstones.push(row_ref);
                 partition.tombstones.push(blob_ref);
+                if execution_mode == WriteMode::Untracked {
+                    partition
+                        .filesystem_payload_delete_targets
+                        .insert((current_row.id.clone(), version_id.clone()));
+                }
                 partition.lineage.push(RowLineage {
                     entity_id: current_row.id,
                     source_change_id: current_row.change_id,

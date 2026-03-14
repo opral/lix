@@ -613,6 +613,14 @@ impl LazyExactFileUpdate {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FilesystemPayloadWriteIntent {
+    pub(crate) file_id: String,
+    pub(crate) version_id: String,
+    pub(crate) untracked: bool,
+    pub(crate) data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedWritePartition {
     pub(crate) execution_mode: WriteMode,
@@ -622,6 +630,8 @@ pub(crate) struct ResolvedWritePartition {
     pub(crate) lineage: Vec<RowLineage>,
     pub(crate) target_write_lane: Option<WriteLane>,
     pub(crate) lazy_exact_file_update: Option<LazyExactFileUpdate>,
+    pub(crate) filesystem_payload_writes: Vec<FilesystemPayloadWriteIntent>,
+    pub(crate) filesystem_payload_delete_targets: BTreeSet<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -700,6 +710,22 @@ impl ResolvedWritePlan {
         self.partitions
             .iter()
             .filter(|partition| partition.execution_mode == WriteMode::Tracked)
+    }
+
+    pub(crate) fn filesystem_payload_writes(
+        &self,
+    ) -> impl Iterator<Item = &FilesystemPayloadWriteIntent> {
+        self.partitions
+            .iter()
+            .flat_map(|partition| partition.filesystem_payload_writes.iter())
+    }
+
+    pub(crate) fn filesystem_payload_delete_targets(
+        &self,
+    ) -> impl Iterator<Item = &(String, String)> {
+        self.partitions
+            .iter()
+            .flat_map(|partition| partition.filesystem_payload_delete_targets.iter())
     }
 
     pub(crate) fn untracked_partitions(&self) -> impl Iterator<Item = &ResolvedWritePartition> {

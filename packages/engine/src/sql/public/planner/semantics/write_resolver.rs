@@ -58,6 +58,8 @@ struct ResolvedWritePartitionBuilder {
     intended_post_state: Vec<PlannedStateRow>,
     tombstones: Vec<ResolvedRowRef>,
     lineage: Vec<RowLineage>,
+    filesystem_payload_writes: Vec<crate::sql::public::planner::ir::FilesystemPayloadWriteIntent>,
+    filesystem_payload_delete_targets: std::collections::BTreeSet<(String, String)>,
 }
 
 impl ResolvedWritePartitionBuilder {
@@ -77,6 +79,8 @@ impl ResolvedWritePartitionBuilder {
             lineage: self.lineage,
             target_write_lane: None,
             lazy_exact_file_update: None,
+            filesystem_payload_writes: self.filesystem_payload_writes,
+            filesystem_payload_delete_targets: self.filesystem_payload_delete_targets,
         })
     }
 }
@@ -1011,6 +1015,8 @@ fn single_partition_write_plan(
         lineage,
         target_write_lane: None,
         lazy_exact_file_update: None,
+        filesystem_payload_writes: Vec::new(),
+        filesystem_payload_delete_targets: std::collections::BTreeSet::new(),
     })
 }
 

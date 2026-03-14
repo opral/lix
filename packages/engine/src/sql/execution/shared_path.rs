@@ -250,11 +250,8 @@ pub(crate) async fn prepare_execution_with_backend(
             })
         });
 
-    let intent = if let Some(intent) = public_write
-        .as_ref()
-        .and_then(derived_public_execution_intent)
-    {
-        intent
+    let intent = if let Some(public_write) = public_write.as_ref() {
+        derived_public_execution_intent(public_write)
     } else {
         collect_execution_intent_with_backend(
             engine,
@@ -401,123 +398,37 @@ pub(crate) async fn prepare_execution_with_backend(
 
 fn derived_public_execution_intent(
     prepared: &PreparedPublicWrite,
-) -> Option<crate::sql::execution::intent::ExecutionIntent> {
-    let execution = prepared.execution.as_ref()?;
-    if !execution
-        .partitions
-        .iter()
-        .all(|partition| matches!(partition, PublicWriteExecutionPartition::Untracked(_)))
-    {
-        return None;
-    }
-    if !matches!(
-        prepared
-            .planned_write
-            .command
-            .target
-            .descriptor
-            .public_name
-            .as_str(),
-        "lix_file" | "lix_file_by_version" | "lix_directory" | "lix_directory_by_version"
-    ) {
-        return None;
-    }
-
-    let pending_file_writes = derive_untracked_filesystem_pending_file_writes(prepared)?;
-    let pending_file_delete_targets = derive_untracked_filesystem_delete_targets(prepared)?;
-    Some(crate::sql::execution::intent::ExecutionIntent {
-        pending_file_writes,
-        pending_file_delete_targets,
-    })
-}
-
-fn derive_untracked_filesystem_pending_file_writes(
-    prepared: &PreparedPublicWrite,
-) -> Option<Vec<crate::filesystem::pending_file_writes::PendingFileWrite>> {
-    let resolved = prepared.planned_write.resolved_write_plan.as_ref()?;
-    let shared_update_bytes = match &prepared.planned_write.command.payload {
-        crate::sql::public::planner::ir::MutationPayload::UpdatePatch(columns) => {
-            columns.get("data").and_then(pending_write_bytes_from_value)
-        }
-        _ => None,
+) -> crate::sql::execution::intent::ExecutionIntent {
+    let Some(resolved) = prepared.planned_write.resolved_write_plan.as_ref() else {
+        return crate::sql::execution::intent::ExecutionIntent {
+            pending_file_writes: Vec::new(),
+            pending_file_delete_targets: BTreeSet::new(),
+        };
     };
-    let mut insert_bytes_by_file_id = std::collections::BTreeMap::new();
-    if let crate::sql::public::planner::ir::MutationPayload::InsertRows(rows) =
-        &prepared.planned_write.command.payload
-    {
-        for row in rows {
-            let Some(crate::Value::Text(file_id)) = row.get("id") else {
-                continue;
-            };
-            let Some(bytes) = row.get("data").and_then(pending_write_bytes_from_value) else {
-                continue;
-            };
-            insert_bytes_by_file_id.insert(file_id.clone(), bytes);
-        }
-    }
 
-    let mut writes = Vec::new();
-    for partition in &resolved.partitions {
-        if partition.execution_mode != crate::sql::public::planner::ir::WriteMode::Untracked {
-            continue;
-        }
-        for row in &partition.intended_post_state {
-            if row.tombstone || row.schema_key != "lix_binary_blob_ref" {
-                continue;
-            }
-            let bytes = insert_bytes_by_file_id
-                .get(&row.entity_id)
-                .cloned()
-                .or_else(|| shared_update_bytes.clone());
-            let Some(after_data) = bytes else {
-                continue;
-            };
-            writes.push(crate::filesystem::pending_file_writes::PendingFileWrite {
-                file_id: row.entity_id.clone(),
-                version_id: row
-                    .version_id
-                    .clone()
-                    .unwrap_or_else(|| crate::version::GLOBAL_VERSION_ID.to_string()),
-                untracked: true,
+    let pending_file_writes = resolved
+        .filesystem_payload_writes()
+        .map(
+            |write| crate::filesystem::pending_file_writes::PendingFileWrite {
+                file_id: write.file_id.clone(),
+                version_id: write.version_id.clone(),
+                untracked: write.untracked,
                 before_path: None,
                 after_path: None,
                 data_is_authoritative: true,
                 before_data: None,
-                after_data,
-            });
-        }
-    }
+                after_data: write.data.clone(),
+            },
+        )
+        .collect();
+    let pending_file_delete_targets = resolved
+        .filesystem_payload_delete_targets()
+        .cloned()
+        .collect();
 
-    Some(writes)
-}
-
-fn derive_untracked_filesystem_delete_targets(
-    prepared: &PreparedPublicWrite,
-) -> Option<std::collections::BTreeSet<(String, String)>> {
-    let resolved = prepared.planned_write.resolved_write_plan.as_ref()?;
-    let mut targets = std::collections::BTreeSet::new();
-    for partition in &resolved.partitions {
-        if partition.execution_mode != crate::sql::public::planner::ir::WriteMode::Untracked {
-            continue;
-        }
-        for row in &partition.tombstones {
-            if row.schema_key != "lix_binary_blob_ref" {
-                continue;
-            }
-            let Some(version_id) = row.version_id.as_ref() else {
-                continue;
-            };
-            targets.insert((row.entity_id.clone(), version_id.clone()));
-        }
-    }
-    Some(targets)
-}
-
-fn pending_write_bytes_from_value(value: &crate::Value) -> Option<Vec<u8>> {
-    match value {
-        crate::Value::Blob(bytes) => Some(bytes.clone()),
-        crate::Value::Text(text) => Some(text.as_bytes().to_vec()),
-        _ => None,
+    crate::sql::execution::intent::ExecutionIntent {
+        pending_file_writes,
+        pending_file_delete_targets,
     }
 }
 
