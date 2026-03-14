@@ -6,7 +6,9 @@ use sqlparser::ast::{
 
 use crate::backend::SqlDialect;
 
-use super::lower_logical_fn::{LixJsonCall, LixJsonExtractCall, LixTextCodecCall};
+use super::lower_logical_fn::{
+    LixJsonCall, LixJsonExtractCall, LixJsonPathSegment, LixTextCodecCall,
+};
 
 pub(crate) fn lower_lix_json_extract(call: &LixJsonExtractCall, dialect: SqlDialect) -> Expr {
     match dialect {
@@ -26,11 +28,12 @@ pub(crate) fn lower_lix_json_extract_boolean(
 }
 
 pub(crate) fn lower_lix_json(call: &LixJsonCall, dialect: SqlDialect) -> Expr {
+    let json_input_expr = lower_json_input_expr(&call.json_expr);
     match dialect {
-        SqlDialect::Sqlite => function_expr("json", vec![call.json_expr.clone()]),
+        SqlDialect::Sqlite => function_expr("json", vec![json_input_expr]),
         SqlDialect::Postgres => Expr::Cast {
             kind: CastKind::Cast,
-            expr: Box::new(call.json_expr.clone()),
+            expr: Box::new(json_input_expr),
             data_type: DataType::JSONB,
             format: None,
         },
@@ -118,11 +121,11 @@ fn lower_sqlite_json_text(call: &LixJsonExtractCall) -> Expr {
         conditions: vec![
             sqlparser::ast::CaseWhen {
                 condition: string_literal_expr("true".to_string()),
-                result: integer_literal_expr(1),
+                result: string_literal_expr("true".to_string()),
             },
             sqlparser::ast::CaseWhen {
                 condition: string_literal_expr("false".to_string()),
-                result: integer_literal_expr(0),
+                result: string_literal_expr("false".to_string()),
             },
         ],
         else_result: Some(Box::new(sqlite_text_expr)),
@@ -137,11 +140,7 @@ fn lower_postgres_json_text(call: &LixJsonExtractCall) -> Expr {
         data_type: DataType::JSONB,
         format: None,
     });
-    args.extend(
-        call.path
-            .iter()
-            .map(|segment| string_literal_expr(segment.clone())),
-    );
+    args.extend(call.path.iter().map(postgres_json_path_segment_expr));
 
     function_expr("jsonb_extract_path_text", args)
 }
@@ -181,11 +180,7 @@ fn lower_postgres_json_boolean(call: &LixJsonExtractCall) -> Expr {
     };
     let mut jsonb_extract_args = Vec::with_capacity(call.path.len() + 1);
     jsonb_extract_args.push(jsonb_cast_expr.clone());
-    jsonb_extract_args.extend(
-        call.path
-            .iter()
-            .map(|segment| string_literal_expr(segment.clone())),
-    );
+    jsonb_extract_args.extend(call.path.iter().map(postgres_json_path_segment_expr));
 
     let jsonb_extract_expr = function_expr("jsonb_extract_path", jsonb_extract_args.clone());
     let jsonb_extract_text_expr = function_expr("jsonb_extract_path_text", jsonb_extract_args);
@@ -212,25 +207,61 @@ fn lower_postgres_json_boolean(call: &LixJsonExtractCall) -> Expr {
     }
 }
 
-fn sqlite_json_path_literal(path: &[String]) -> String {
+fn lower_json_input_expr(expr: &Expr) -> Expr {
+    if let Some(json_literal) = json_literal_text(expr) {
+        return string_literal_expr(json_literal);
+    }
+
+    function_expr(
+        "coalesce",
+        vec![
+            Expr::Cast {
+                kind: CastKind::Cast,
+                expr: Box::new(expr.clone()),
+                data_type: DataType::Text,
+                format: None,
+            },
+            string_literal_expr("null".to_string()),
+        ],
+    )
+}
+
+fn json_literal_text(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            AstValue::Boolean(value) => Some(value.to_string()),
+            AstValue::Null => Some("null".to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn postgres_json_path_segment_expr(segment: &LixJsonPathSegment) -> Expr {
+    match segment {
+        LixJsonPathSegment::Key(key) => string_literal_expr(key.clone()),
+        LixJsonPathSegment::Index(index) => string_literal_expr(index.to_string()),
+    }
+}
+
+fn sqlite_json_path_literal(path: &[LixJsonPathSegment]) -> String {
     let mut json_path = "$".to_string();
     for segment in path {
-        if sqlite_path_segment_is_array_index(segment) {
-            json_path.push('[');
-            json_path.push_str(segment);
-            json_path.push(']');
-        } else {
-            json_path.push('.');
-            json_path.push('"');
-            json_path.push_str(&segment.replace('\\', "\\\\").replace('"', "\\\""));
-            json_path.push('"');
+        match segment {
+            LixJsonPathSegment::Key(key) => {
+                json_path.push('.');
+                json_path.push('"');
+                json_path.push_str(&key.replace('\\', "\\\\").replace('"', "\\\""));
+                json_path.push('"');
+            }
+            LixJsonPathSegment::Index(index) => {
+                json_path.push('[');
+                json_path.push_str(&index.to_string());
+                json_path.push(']');
+            }
         }
     }
     json_path
-}
-
-fn sqlite_path_segment_is_array_index(segment: &str) -> bool {
-    !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn function_expr(name: &str, args: Vec<Expr>) -> Expr {
