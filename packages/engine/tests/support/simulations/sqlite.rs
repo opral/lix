@@ -63,7 +63,8 @@ impl SqliteBackend {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: err.to_string(),
                     })?
-                    .foreign_keys(true);
+                    .foreign_keys(true)
+                    .busy_timeout(std::time::Duration::from_secs(30));
 
                 SqlitePoolOptions::new()
                     .connect_with(options)
