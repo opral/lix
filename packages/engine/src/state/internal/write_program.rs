@@ -104,6 +104,10 @@ impl WriteProgram {
             params,
         });
     }
+
+    pub(crate) fn extend(&mut self, other: WriteProgram) {
+        self.steps.extend(other.steps);
+    }
 }
 
 pub(crate) fn lower_write_program(program: WriteProgram) -> PreparedProgram {

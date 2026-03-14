@@ -4,7 +4,9 @@ use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
-use crate::sql::public::planner::ir::{LazyExactFileMetadataUpdate, OptionalTextPatch};
+use crate::sql::public::planner::ir::{
+    LazyExactFileDataUpdate, LazyExactFileMetadataUpdate, LazyExactFileUpdate, OptionalTextPatch,
+};
 use crate::sql::public::planner::semantics::filesystem_assignments::{
     parse_directory_insert_assignments, parse_directory_update_assignments,
     parse_file_insert_assignments, parse_file_update_assignments, DirectoryUpdateAssignments,
@@ -402,8 +404,8 @@ async fn resolve_existing_file_write(
             let payload = payload_map(planned_write)?;
             let assignments = parse_file_update_assignments(&payload)
                 .map_err(write_resolve_filesystem_assignments_error)?;
-            if let Some(file_id) =
-                lazy_exact_file_metadata_update_candidate(planned_write, &version_id, &assignments)
+            if let Some(lazy_exact_file_update) =
+                lazy_exact_file_update_candidate(planned_write, &version_id, &assignments)
             {
                 let execution_mode =
                     default_execution_mode_for_request(planned_write.command.requested_mode);
@@ -419,11 +421,7 @@ async fn resolve_existing_file_write(
                     tombstones: Vec::new(),
                     lineage: Vec::new(),
                     target_write_lane,
-                    lazy_exact_file_metadata_update: Some(LazyExactFileMetadataUpdate {
-                        file_id,
-                        version_id: version_id.clone(),
-                        metadata: optional_text_patch(&assignments.metadata),
-                    }),
+                    lazy_exact_file_update: Some(lazy_exact_file_update),
                 }));
             }
             let current_rows = load_target_file_rows_for_selector(
@@ -606,25 +604,41 @@ async fn resolve_existing_file_write(
     }
 }
 
-fn lazy_exact_file_metadata_update_candidate(
+fn lazy_exact_file_update_candidate(
     planned_write: &PlannedWrite,
-    _version_id: &str,
+    version_id: &str,
     assignments: &FileUpdateAssignments,
-) -> Option<String> {
+) -> Option<LazyExactFileUpdate> {
     if matches!(
         planned_write.command.requested_mode,
         WriteModeRequest::ForceUntracked
     ) {
         return None;
     }
-    if assignments.path.is_some()
-        || assignments.hidden.is_some()
-        || assignments.data.bytes().is_some()
-    {
+    let file_id = exact_id_selector_value(planned_write)?;
+    if assignments.path.is_some() || assignments.hidden.is_some() {
         return None;
     }
-    let file_id = exact_id_selector_value(planned_write)?;
-    Some(file_id)
+
+    if let Some(bytes) = assignments.data.bytes() {
+        if !matches!(
+            assignments.metadata,
+            crate::sql::public::planner::semantics::filesystem_assignments::OptionalTextAssignment::Unchanged
+        ) {
+            return None;
+        }
+        return Some(LazyExactFileUpdate::Data(LazyExactFileDataUpdate {
+            file_id,
+            version_id: version_id.to_string(),
+            data: bytes.to_vec(),
+        }));
+    }
+
+    Some(LazyExactFileUpdate::Metadata(LazyExactFileMetadataUpdate {
+        file_id,
+        version_id: version_id.to_string(),
+        metadata: optional_text_patch(&assignments.metadata),
+    }))
 }
 
 fn optional_text_patch(

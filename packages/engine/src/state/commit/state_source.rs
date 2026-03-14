@@ -6,7 +6,7 @@ use crate::errors::classification::is_missing_relation_error;
 use crate::schema::builtin::types::LixVersionPointer;
 use crate::version::{
     version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key,
-    version_pointer_storage_version_id, GLOBAL_VERSION_ID,
+    version_pointer_storage_version_id,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 
@@ -83,12 +83,6 @@ pub(crate) async fn load_committed_version_tip_commit_id(
         version_pointer_plugin_key(),
     )
     .await
-}
-
-pub(crate) async fn load_committed_global_tip_commit_id(
-    executor: &mut dyn CommitQueryExecutor,
-) -> Result<Option<String>, LixError> {
-    load_committed_version_tip_commit_id(executor, GLOBAL_VERSION_ID).await
 }
 
 pub(crate) async fn load_version_info_for_versions(

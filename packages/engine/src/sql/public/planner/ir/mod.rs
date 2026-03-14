@@ -575,6 +575,35 @@ pub(crate) struct LazyExactFileMetadataUpdate {
     pub(crate) metadata: OptionalTextPatch,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LazyExactFileDataUpdate {
+    pub(crate) file_id: String,
+    pub(crate) version_id: String,
+    pub(crate) data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LazyExactFileUpdate {
+    Metadata(LazyExactFileMetadataUpdate),
+    Data(LazyExactFileDataUpdate),
+}
+
+impl LazyExactFileUpdate {
+    pub(crate) fn file_id(&self) -> &str {
+        match self {
+            Self::Metadata(update) => update.file_id.as_str(),
+            Self::Data(update) => update.file_id.as_str(),
+        }
+    }
+
+    pub(crate) fn version_id(&self) -> &str {
+        match self {
+            Self::Metadata(update) => update.version_id.as_str(),
+            Self::Data(update) => update.version_id.as_str(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedWritePartition {
     pub(crate) execution_mode: WriteMode,
@@ -583,7 +612,7 @@ pub(crate) struct ResolvedWritePartition {
     pub(crate) tombstones: Vec<ResolvedRowRef>,
     pub(crate) lineage: Vec<RowLineage>,
     pub(crate) target_write_lane: Option<WriteLane>,
-    pub(crate) lazy_exact_file_metadata_update: Option<LazyExactFileMetadataUpdate>,
+    pub(crate) lazy_exact_file_update: Option<LazyExactFileUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -676,8 +705,7 @@ impl ResolvedWritePlan {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.partitions.iter().all(|partition| {
-            partition.intended_post_state.is_empty()
-                && partition.lazy_exact_file_metadata_update.is_none()
+            partition.intended_post_state.is_empty() && partition.lazy_exact_file_update.is_none()
         })
     }
 }

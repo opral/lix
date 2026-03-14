@@ -7,8 +7,9 @@ use crate::account::{
 use crate::deterministic_mode::build_persist_sequence_highest_sql;
 use crate::functions::LixFunctionProvider;
 use crate::schema::builtin::types::LixVersionPointer;
+use crate::sql::execution::runtime_effects::build_binary_blob_fastcdc_write_program;
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
-use crate::sql::public::planner::ir::LazyExactFileMetadataUpdate;
+use crate::sql::public::planner::ir::LazyExactFileUpdate;
 use crate::state::internal::write_program::WriteProgram;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, LixTransaction, QueryResult, Value};
@@ -66,7 +67,7 @@ pub(crate) struct AppendCommitPreconditions {
 pub(crate) struct AppendCommitArgs {
     pub(crate) timestamp: Option<String>,
     pub(crate) changes: Vec<ProposedDomainChange>,
-    pub(crate) lazy_exact_file_metadata_update: Option<LazyExactFileMetadataUpdate>,
+    pub(crate) lazy_exact_file_update: Option<LazyExactFileUpdate>,
     pub(crate) preconditions: AppendCommitPreconditions,
     pub(crate) should_emit_observe_tick: bool,
     pub(crate) observe_tick_writer_key: Option<String>,
@@ -117,7 +118,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
     invariant_checker: Option<&mut dyn AppendCommitInvariantChecker>,
 ) -> Result<AppendCommitResult, AppendCommitError> {
     if args.changes.is_empty() {
-        if args.lazy_exact_file_metadata_update.is_none() {
+        if args.lazy_exact_file_update.is_none() {
             return Err(AppendCommitError {
                 kind: AppendCommitErrorKind::EmptyBatch,
                 message: "append_commit_if_preconditions_hold requires at least one change"
@@ -129,7 +130,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
     let concrete_lane = concrete_lane(&args.preconditions)?;
     validate_change_versions(
         &args.changes,
-        args.lazy_exact_file_metadata_update.as_ref(),
+        args.lazy_exact_file_update.as_ref(),
         &concrete_lane,
     )?;
 
@@ -145,7 +146,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
             &mut executor,
             &concrete_lane,
             &args.preconditions,
-            args.lazy_exact_file_metadata_update.as_ref(),
+            args.lazy_exact_file_update.as_ref(),
             needs_deterministic_sequence,
             needs_active_accounts,
         )
@@ -237,7 +238,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
 
     let applied_domain_changes = resolve_proposed_domain_changes(
         &args.changes,
-        args.lazy_exact_file_metadata_update.as_ref(),
+        args.lazy_exact_file_update.as_ref(),
         &preflight,
     )?;
     let domain_changes =
@@ -322,6 +323,12 @@ pub(crate) async fn append_commit_if_preconditions_hold(
     }
 
     let mut write_program = WriteProgram::new();
+    if let Some(LazyExactFileUpdate::Data(lazy)) = args.lazy_exact_file_update.as_ref() {
+        write_program.extend(
+            build_binary_blob_fastcdc_write_program(&lazy.file_id, &lazy.version_id, &lazy.data)
+                .map_err(backend_error)?,
+        );
+    }
     write_program.push_batch(prepared_batch);
     execute_write_program_with_transaction(transaction, write_program)
         .await
@@ -378,10 +385,10 @@ fn concrete_lane(
 
 fn resolve_proposed_domain_changes(
     changes: &[ProposedDomainChange],
-    lazy_exact_file_metadata_update: Option<&LazyExactFileMetadataUpdate>,
+    lazy_exact_file_update: Option<&LazyExactFileUpdate>,
     preflight: &AppendPreflightState,
 ) -> Result<Vec<ProposedDomainChange>, AppendCommitError> {
-    if let Some(lazy) = lazy_exact_file_metadata_update {
+    if let Some(lazy) = lazy_exact_file_update {
         let current = preflight
             .file_descriptor
             .as_ref()
@@ -392,31 +399,57 @@ fn resolve_proposed_domain_changes(
         if current.untracked {
             return Err(AppendCommitError {
                 kind: AppendCommitErrorKind::Internal,
-                message: "lazy exact file metadata update does not support untracked visible rows"
+                message: "lazy exact file update does not support untracked visible rows"
                     .to_string(),
             });
         }
-        return Ok(vec![ProposedDomainChange {
-            entity_id: lazy.file_id.clone(),
-            schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
-            schema_version: Some(FILESYSTEM_FILE_SCHEMA_VERSION.to_string()),
-            file_id: Some(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
-            version_id: lazy.version_id.clone(),
-            plugin_key: Some(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
-            snapshot_content: Some(
-                serde_json::json!({
-                    "id": lazy.file_id,
-                    "directory_id": current.directory_id,
-                    "name": current.name,
-                    "extension": current.extension,
-                    "metadata": lazy.metadata.apply(current.metadata.clone()),
-                    "hidden": current.hidden,
-                })
-                .to_string(),
-            ),
-            metadata: lazy.metadata.apply(current.metadata.clone()),
-            writer_key: None,
-        }]);
+        return match lazy {
+            LazyExactFileUpdate::Metadata(lazy) => Ok(vec![ProposedDomainChange {
+                entity_id: lazy.file_id.clone(),
+                schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
+                schema_version: Some(FILESYSTEM_FILE_SCHEMA_VERSION.to_string()),
+                file_id: Some(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
+                version_id: lazy.version_id.clone(),
+                plugin_key: Some(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
+                snapshot_content: Some(
+                    serde_json::json!({
+                        "id": lazy.file_id,
+                        "directory_id": current.directory_id,
+                        "name": current.name,
+                        "extension": current.extension,
+                        "metadata": lazy.metadata.apply(current.metadata.clone()),
+                        "hidden": current.hidden,
+                    })
+                    .to_string(),
+                ),
+                metadata: lazy.metadata.apply(current.metadata.clone()),
+                writer_key: None,
+            }]),
+            LazyExactFileUpdate::Data(lazy) => Ok(vec![ProposedDomainChange {
+                entity_id: lazy.file_id.clone(),
+                schema_key: "lix_binary_blob_ref".to_string(),
+                schema_version: Some("1".to_string()),
+                file_id: Some(lazy.file_id.clone()),
+                version_id: lazy.version_id.clone(),
+                plugin_key: Some(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
+                snapshot_content: Some(
+                    serde_json::json!({
+                        "id": lazy.file_id,
+                        "blob_hash": crate::plugin::runtime::binary_blob_hash_hex(&lazy.data),
+                        "size_bytes": u64::try_from(lazy.data.len()).map_err(|_| AppendCommitError {
+                            kind: AppendCommitErrorKind::Internal,
+                            message: format!(
+                                "exact file data update exceeds supported size for '{}'",
+                                lazy.file_id
+                            ),
+                        })?,
+                    })
+                    .to_string(),
+                ),
+                metadata: None,
+                writer_key: None,
+            }]),
+        };
     }
     Ok(changes.to_vec())
 }
@@ -494,7 +527,7 @@ async fn load_append_preflight_state_with_active_accounts(
     executor: &mut dyn CommitQueryExecutor,
     concrete_lane: &ConcreteWriteLane,
     preconditions: &AppendCommitPreconditions,
-    lazy_exact_file_metadata_update: Option<&LazyExactFileMetadataUpdate>,
+    lazy_exact_file_update: Option<&LazyExactFileUpdate>,
     include_deterministic_sequence: bool,
     include_active_accounts: bool,
 ) -> Result<AppendPreflightState, AppendCommitError> {
@@ -518,7 +551,7 @@ async fn load_append_preflight_state_with_active_accounts(
     let existing_replay_sql = match &preconditions.idempotency_key {
         AppendIdempotencyKey::Exact(value) => format!(
             " UNION ALL \
-              SELECT 'existing_replay' AS row_kind, commit_id AS value, NULL AS metadata_value, NULL AS untracked_value \
+              SELECT CAST('existing_replay' AS TEXT) AS row_kind, CAST(commit_id AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value \
               FROM {table_name} \
               WHERE write_lane = '{write_lane}' \
                 AND idempotency_kind = '{kind}' \
@@ -531,7 +564,7 @@ async fn load_append_preflight_state_with_active_accounts(
         ),
         AppendIdempotencyKey::CurrentTipFingerprint(fingerprint) => format!(
             " UNION ALL \
-              SELECT 'existing_replay' AS row_kind, idempotency.commit_id AS value, NULL AS metadata_value, NULL AS untracked_value \
+              SELECT CAST('existing_replay' AS TEXT) AS row_kind, CAST(idempotency.commit_id AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value \
               FROM (SELECT snapshot_content {current_tip_source_sql}) current_tip \
               JOIN {table_name} idempotency \
                 ON idempotency.write_lane = '{write_lane}' \
@@ -548,7 +581,7 @@ async fn load_append_preflight_state_with_active_accounts(
     let active_account_sql = if include_active_accounts {
         format!(
             " UNION ALL \
-              SELECT 'active_account' AS row_kind, snapshot_content AS value, NULL AS metadata_value, NULL AS untracked_value \
+              SELECT CAST('active_account' AS TEXT) AS row_kind, CAST(snapshot_content AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value \
               FROM {untracked_table} \
               WHERE schema_key = '{schema_key}' \
                 AND file_id = '{file_id}' \
@@ -564,18 +597,18 @@ async fn load_append_preflight_state_with_active_accounts(
     };
     let deterministic_sequence_sql = if include_deterministic_sequence {
         " UNION ALL \
-           SELECT 'deterministic_sequence' AS row_kind, deterministic_sequence.value AS value, NULL AS metadata_value, NULL AS untracked_value \
+           SELECT CAST('deterministic_sequence' AS TEXT) AS row_kind, CAST(deterministic_sequence.value AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value \
            FROM (\
              SELECT value \
              FROM (\
-               SELECT snapshot_content AS value, 0 AS precedence \
+               SELECT CAST(snapshot_content AS TEXT) AS value, 0 AS precedence \
                FROM lix_internal_live_untracked_v1 \
                WHERE schema_key = 'lix_key_value' \
                  AND entity_id = 'lix_deterministic_sequence_number' \
                  AND version_id = 'global' \
                  AND snapshot_content IS NOT NULL \
                UNION ALL \
-               SELECT snapshot_content AS value, 1 AS precedence \
+               SELECT CAST(snapshot_content AS TEXT) AS value, 1 AS precedence \
                FROM lix_internal_live_v1_lix_key_value \
                WHERE entity_id = 'lix_deterministic_sequence_number' \
                  AND version_id = 'global' \
@@ -590,12 +623,12 @@ async fn load_append_preflight_state_with_active_accounts(
     } else {
         String::new()
     };
-    let file_descriptor_sql = if let Some(lazy) = lazy_exact_file_metadata_update {
+    let file_descriptor_sql = if let Some(lazy) = lazy_exact_file_update {
         format!(
             " UNION ALL \
-              SELECT 'file_descriptor' AS row_kind, snapshot_content AS value, metadata AS metadata_value, untracked AS untracked_value \
+              SELECT CAST('file_descriptor' AS TEXT) AS row_kind, CAST(snapshot_content AS TEXT) AS value, CAST(metadata AS TEXT) AS metadata_value, CAST(untracked AS INTEGER) AS untracked_value \
               FROM ({descriptor_sql}) file_descriptor",
-            descriptor_sql = exact_file_descriptor_preflight_sql(&lazy.file_id, &lazy.version_id),
+            descriptor_sql = exact_file_descriptor_preflight_sql(lazy.file_id(), lazy.version_id()),
         )
     } else {
         String::new()
@@ -603,7 +636,7 @@ async fn load_append_preflight_state_with_active_accounts(
     let sql = format!(
         "SELECT row_kind, value, metadata_value, untracked_value \
          FROM (\
-           SELECT 'current_tip' AS row_kind, snapshot_content AS value, NULL AS metadata_value, NULL AS untracked_value \
+           SELECT CAST('current_tip' AS TEXT) AS row_kind, CAST(snapshot_content AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value \
            {current_tip_source_sql}{existing_replay_sql}{deterministic_sequence_sql}{active_account_sql}{file_descriptor_sql}\
          ) append_preflight",
         current_tip_source_sql = current_tip_source_sql,
@@ -740,29 +773,29 @@ fn parse_file_descriptor_preflight_row(
 
 fn exact_file_descriptor_preflight_sql(file_id: &str, version_id: &str) -> String {
     format!(
-        "SELECT snapshot_content, metadata, untracked \
+        "SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, CAST(untracked AS INTEGER) AS untracked \
          FROM (\
-           SELECT snapshot_content, metadata, 1 AS untracked, 1 AS precedence \
+           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, 1 AS untracked, 1 AS precedence \
            FROM {untracked_table} \
            WHERE version_id = '{version_id}' \
              AND schema_key = '{schema_key}' \
              AND file_id = '{file_id_value}' \
              AND entity_id = '{entity_id}' \
            UNION ALL \
-           SELECT snapshot_content, metadata, 0 AS untracked, 2 AS precedence \
+           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, 0 AS untracked, 2 AS precedence \
            FROM {tracked_table} \
            WHERE version_id = '{version_id}' \
              AND file_id = '{file_id_value}' \
              AND entity_id = '{entity_id}' \
            UNION ALL \
-           SELECT snapshot_content, metadata, 1 AS untracked, 3 AS precedence \
+           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, 1 AS untracked, 3 AS precedence \
            FROM {untracked_table} \
            WHERE version_id = '{global_version_id}' \
              AND schema_key = '{schema_key}' \
              AND file_id = '{file_id_value}' \
              AND entity_id = '{entity_id}' \
            UNION ALL \
-           SELECT snapshot_content, metadata, 0 AS untracked, 4 AS precedence \
+           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, 0 AS untracked, 4 AS precedence \
            FROM {tracked_table} \
            WHERE version_id = '{global_version_id}' \
              AND file_id = '{file_id_value}' \
@@ -817,15 +850,15 @@ fn append_preflight_value_as_bool(value: &Value) -> Option<bool> {
 
 fn validate_change_versions(
     changes: &[ProposedDomainChange],
-    lazy_exact_file_metadata_update: Option<&LazyExactFileMetadataUpdate>,
+    lazy_exact_file_update: Option<&LazyExactFileUpdate>,
     concrete_lane: &ConcreteWriteLane,
 ) -> Result<(), AppendCommitError> {
-    if let Some(lazy) = lazy_exact_file_metadata_update {
+    if let Some(lazy) = lazy_exact_file_update {
         let expected_version_id = match concrete_lane {
             ConcreteWriteLane::Version { version_id } => version_id,
             ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
         };
-        if lazy.version_id != *expected_version_id {
+        if lazy.version_id() != expected_version_id {
             return Err(AppendCommitError {
                 kind: AppendCommitErrorKind::Internal,
                 message: format!(
@@ -1283,7 +1316,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_metadata_update: None,
+                lazy_exact_file_update: None,
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
@@ -1347,7 +1380,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_metadata_update: None,
+                lazy_exact_file_update: None,
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
@@ -1390,7 +1423,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_metadata_update: None,
+                lazy_exact_file_update: None,
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CurrentTip,
@@ -1426,7 +1459,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_metadata_update: None,
+                lazy_exact_file_update: None,
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
@@ -1455,7 +1488,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_metadata_update: None,
+                lazy_exact_file_update: None,
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
@@ -1483,7 +1516,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_metadata_update: None,
+                lazy_exact_file_update: None,
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CreateIfMissing,
@@ -1515,7 +1548,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_global_change()],
-                lazy_exact_file_metadata_update: None,
+                lazy_exact_file_update: None,
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::GlobalAdmin,
                     expected_tip: AppendExpectedTip::CommitId("commit-global-123".to_string()),
@@ -1554,7 +1587,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_metadata_update: None,
+                lazy_exact_file_update: None,
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
