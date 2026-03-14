@@ -11,6 +11,7 @@ use std::ops::ControlFlow;
 
 use crate::errors;
 use crate::functions::LixFunctionProvider;
+use crate::sql::execution::contracts::planned_statement::UpdateValidationKind;
 use crate::state::commit::{
     build_statement_batch_from_generate_commit_result, load_commit_active_accounts,
     load_version_info_for_versions, CommitQueryExecutor, StatementBatch,
@@ -89,14 +90,21 @@ pub struct VtableUpdateRewrite {
 
 #[derive(Debug)]
 pub enum DeleteRewrite {
-    Statement(Statement),
+    Statement(VtableDeleteStatement),
     Planned(VtableDeleteRewrite),
+}
+
+#[derive(Debug)]
+pub struct VtableDeleteStatement {
+    pub statement: Statement,
+    pub validation: Option<UpdateValidationPlan>,
 }
 
 #[derive(Debug)]
 pub struct VtableDeleteRewrite {
     pub statement: Statement,
     pub plan: VtableDeletePlan,
+    pub validation: Option<UpdateValidationPlan>,
 }
 
 pub fn rewrite_insert_with_writer_key(
@@ -509,9 +517,13 @@ pub fn rewrite_delete_with_options(
         let mut new_delete = delete.clone();
         replace_delete_from_untracked(&mut new_delete);
         new_delete.selection = try_strip_untracked_predicate(selection, params).unwrap_or(None);
-        return Ok(Some(DeleteRewrite::Statement(Statement::Delete(
-            new_delete,
-        ))));
+        return Ok(Some(DeleteRewrite::Statement(VtableDeleteStatement {
+            validation: build_delete_validation_plan(
+                Some(UNTRACKED_TABLE.to_string()),
+                new_delete.selection.clone(),
+            ),
+            statement: Statement::Delete(new_delete),
+        })));
     }
 
     if delete.using.is_some() {
@@ -611,11 +623,15 @@ pub fn rewrite_delete_with_options(
     Ok(Some(DeleteRewrite::Planned(VtableDeleteRewrite {
         statement: Statement::Update(update),
         plan: VtableDeletePlan {
-            schema_key,
+            schema_key: schema_key.clone(),
             effective_scope_fallback,
             effective_scope_selection_sql,
             effective_scope_untracked_selection_sql,
         },
+        validation: build_delete_validation_plan(
+            Some(format!("{}{}", LIVE_STATE_PREFIX, schema_key)),
+            Some(stripped_selection),
+        ),
     })))
 }
 
@@ -2176,11 +2192,26 @@ fn build_update_validation_plan(
     })?;
 
     Ok(Some(UpdateValidationPlan {
+        kind: UpdateValidationKind::Update,
         table,
         where_clause,
         snapshot_content,
         snapshot_patch,
     }))
+}
+
+fn build_delete_validation_plan(
+    table_name: Option<String>,
+    where_clause: Option<Expr>,
+) -> Option<UpdateValidationPlan> {
+    let table = table_name?;
+    Some(UpdateValidationPlan {
+        kind: UpdateValidationKind::Delete,
+        table,
+        where_clause,
+        snapshot_content: None,
+        snapshot_patch: None,
+    })
 }
 
 fn snapshot_content_from_assignments(

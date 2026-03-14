@@ -6,8 +6,8 @@ use serde_json::{json, Value as JsonValue};
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 
-use super::builtin::builtin_schema_definition;
-use super::key::{schema_from_registered_snapshot, SchemaKey};
+use super::builtin::{builtin_schema_definition, builtin_schema_keys};
+use super::key::{schema_from_registered_snapshot, schema_key_from_definition, SchemaKey};
 
 const REGISTERED_SCHEMA_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const GLOBAL_VERSION: &str = "global";
@@ -15,6 +15,9 @@ const GLOBAL_VERSION: &str = "global";
 pub trait SchemaProvider {
     async fn load_schema(&mut self, key: &SchemaKey) -> Result<JsonValue, LixError>;
     async fn load_latest_schema(&mut self, schema_key: &str) -> Result<JsonValue, LixError>;
+    async fn load_visible_schema_entries(
+        &mut self,
+    ) -> Result<Vec<(SchemaKey, JsonValue)>, LixError>;
 }
 
 pub struct SqlRegisteredSchemaProvider<'a> {
@@ -103,6 +106,35 @@ impl<'a> SqlRegisteredSchemaProvider<'a> {
         Ok(latest_by_schema_key.into_values().collect())
     }
 
+    pub(crate) async fn load_stored_schema_entries(
+        &mut self,
+    ) -> Result<Vec<(SchemaKey, JsonValue)>, LixError> {
+        let sql = format!(
+            "SELECT snapshot_content FROM {table} \
+             WHERE version_id = '{global_version}' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL",
+            table = REGISTERED_SCHEMA_TABLE,
+            global_version = GLOBAL_VERSION,
+        );
+
+        let result = self.backend.execute(&sql, &[]).await?;
+        let mut entries = Vec::new();
+        for row in result.rows {
+            let snapshot_content = value_to_string(&row[0], "snapshot_content")?;
+            let snapshot: JsonValue =
+                serde_json::from_str(&snapshot_content).map_err(|err| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!("registered schema snapshot_content invalid JSON: {err}"),
+                })?;
+            let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
+            self.cache.insert(key.clone(), schema.clone());
+            entries.push((key, schema));
+        }
+
+        Ok(entries)
+    }
+
     async fn load_schema_row(&self, key: &SchemaKey) -> Result<Option<JsonValue>, LixError> {
         let entity_id = escape_sql_string(&key.entity_id());
         let sql = format!(
@@ -177,6 +209,33 @@ impl SchemaProvider for SqlRegisteredSchemaProvider<'_> {
         };
 
         Ok(schema)
+    }
+
+    async fn load_visible_schema_entries(
+        &mut self,
+    ) -> Result<Vec<(SchemaKey, JsonValue)>, LixError> {
+        let mut entries_by_key = HashMap::<SchemaKey, JsonValue>::new();
+
+        if let Some(schema) = whitelisted_internal_schema("lix_state") {
+            let key = SchemaKey::new("lix_state", INTERNAL_SCHEMA_VERSION);
+            self.cache.insert(key.clone(), schema.clone());
+            entries_by_key.insert(key, schema);
+        }
+
+        for schema_key in builtin_schema_keys() {
+            let Some(schema) = builtin_schema_definition(schema_key) else {
+                continue;
+            };
+            let key = schema_key_from_definition(schema)?;
+            self.cache.insert(key.clone(), schema.clone());
+            entries_by_key.insert(key, schema.clone());
+        }
+
+        for (key, schema) in self.load_stored_schema_entries().await? {
+            entries_by_key.insert(key, schema);
+        }
+
+        Ok(entries_by_key.into_iter().collect())
     }
 }
 

@@ -75,6 +75,23 @@ impl SchemaProvider for OverlaySchemaProvider<'_> {
             (None, None) => self.base.load_latest_schema(schema_key).await,
         }
     }
+
+    async fn load_visible_schema_entries(
+        &mut self,
+    ) -> Result<Vec<(SchemaKey, JsonValue)>, LixError> {
+        let mut entries_by_key = self
+            .base
+            .load_visible_schema_entries()
+            .await?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+
+        for (key, schema) in &self.pending {
+            entries_by_key.insert(key.clone(), schema.clone());
+        }
+
+        Ok(entries_by_key.into_iter().collect())
+    }
 }
 
 fn compare_schema_keys(left: &SchemaKey, right: &SchemaKey) -> Ordering {

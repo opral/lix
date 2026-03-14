@@ -158,13 +158,13 @@ fn rewrite_vtable_delete_output(
 
     match rewritten {
         Some(vtable_write::DeleteRewrite::Statement(statement)) => Ok(RewriteOutput {
-            statements: vec![statement],
+            statements: vec![statement.statement],
             effect_only: false,
             params: Vec::new(),
             live_table_requirements: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),
-            update_validations: Vec::new(),
+            update_validations: statement.validation.into_iter().collect(),
         }),
         Some(vtable_write::DeleteRewrite::Planned(rewrite)) => Ok(RewriteOutput {
             statements: vec![rewrite.statement],
@@ -173,7 +173,7 @@ fn rewrite_vtable_delete_output(
             live_table_requirements: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableDelete(rewrite.plan)),
             mutations: Vec::new(),
-            update_validations: Vec::new(),
+            update_validations: rewrite.validation.into_iter().collect(),
         }),
         None => {
             let target = delete_target_name(&delete);

@@ -45,6 +45,7 @@
               "properties",
               "references"
             ],
+            "additionalProperties": false,
             "properties": {
               "properties": {
                 "type": "array",
@@ -81,14 +82,6 @@
                     "description": "Remote property names (same length as local properties)"
                   }
                 }
-              },
-              "mode": {
-                "type": "string",
-                "enum": [
-                  "immediate",
-                  "materialized"
-                ],
-                "description": "Validation mode: immediate (default) or materialized (defer insert/update existence checks)"
               },
               "scope": {
                 "type": "array",
