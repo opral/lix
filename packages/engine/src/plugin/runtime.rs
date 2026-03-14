@@ -1301,7 +1301,6 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
     };
     match value {
         Value::Blob(bytes) => Ok(bytes.clone()),
-        Value::Text(text) => Ok(text.as_bytes().to_vec()),
         other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "plugin materialization: expected blob column '{column}' at index {index}, got {other:?}"
             ),
@@ -1311,10 +1310,12 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
 
 #[cfg(test)]
 mod tests {
-    use super::{load_or_init_plugin_component, select_plugin_for_path, CachedPluginComponent};
+    use super::{
+        blob_required, load_or_init_plugin_component, select_plugin_for_path, CachedPluginComponent,
+    };
     use crate::plugin::matching::glob_matches_path;
     use crate::plugin::types::{InstalledPlugin, PluginContentType, PluginRuntime};
-    use crate::{LixError, WasmComponentInstance, WasmLimits, WasmRuntime};
+    use crate::{LixError, Value, WasmComponentInstance, WasmLimits, WasmRuntime};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1375,6 +1376,19 @@ mod tests {
     #[test]
     fn match_path_glob_invalid_pattern_does_not_match() {
         assert!(!glob_matches_path("*.{md,mdx", "/notes.md"));
+    }
+
+    #[test]
+    fn blob_required_rejects_text_values() {
+        let err = blob_required(&[Value::Text("hello".to_string())], 0, "data")
+            .expect_err("text should not be accepted as blob data");
+
+        assert!(
+            err.description
+                .contains("expected blob column 'data' at index 0"),
+            "unexpected error: {}",
+            err.description
+        );
     }
 
     #[test]
