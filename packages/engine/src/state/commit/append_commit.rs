@@ -775,27 +775,27 @@ fn exact_file_descriptor_preflight_sql(file_id: &str, version_id: &str) -> Strin
     format!(
         "SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, CAST(untracked AS INTEGER) AS untracked \
          FROM (\
-           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, 1 AS untracked, 1 AS precedence \
+           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, CAST(1 AS INTEGER) AS untracked, CAST(1 AS INTEGER) AS precedence \
            FROM {untracked_table} \
            WHERE version_id = '{version_id}' \
              AND schema_key = '{schema_key}' \
              AND file_id = '{file_id_value}' \
              AND entity_id = '{entity_id}' \
            UNION ALL \
-           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, 0 AS untracked, 2 AS precedence \
+           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, CAST(0 AS INTEGER) AS untracked, CAST(2 AS INTEGER) AS precedence \
            FROM {tracked_table} \
            WHERE version_id = '{version_id}' \
              AND file_id = '{file_id_value}' \
              AND entity_id = '{entity_id}' \
            UNION ALL \
-           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, 1 AS untracked, 3 AS precedence \
+           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, CAST(1 AS INTEGER) AS untracked, CAST(3 AS INTEGER) AS precedence \
            FROM {untracked_table} \
            WHERE version_id = '{global_version_id}' \
              AND schema_key = '{schema_key}' \
              AND file_id = '{file_id_value}' \
              AND entity_id = '{entity_id}' \
            UNION ALL \
-           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, 0 AS untracked, 4 AS precedence \
+           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, CAST(0 AS INTEGER) AS untracked, CAST(4 AS INTEGER) AS precedence \
            FROM {tracked_table} \
            WHERE version_id = '{global_version_id}' \
              AND file_id = '{file_id_value}' \

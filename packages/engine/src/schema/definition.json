@@ -82,18 +82,6 @@
                     "description": "Remote property names (same length as local properties)"
                   }
                 }
-              },
-              "scope": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "enum": [
-                    "version_id",
-                    "file_id"
-                  ]
-                },
-                "uniqueItems": true,
-                "description": "Implicit columns (version_id and/or file_id) used to scope the foreign key relationship"
               }
             }
           }
@@ -122,19 +110,6 @@
             "type": "string",
             "format": "cel"
           }
-        },
-        "x-lix-entity-views": {
-          "type": "array",
-          "description": "Restricts which SQL entity views (lix_state/lix_state_by_version/lix_state_history) are generated. When omitted, all views are created.",
-          "items": {
-            "type": "string",
-            "enum": [
-              "lix_state",
-              "lix_state_by_version",
-              "lix_state_history"
-            ]
-          },
-          "uniqueItems": true
         },
         "x-lix-version": {
           "type": "string",
