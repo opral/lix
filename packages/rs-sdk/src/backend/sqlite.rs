@@ -26,6 +26,11 @@ impl SqliteBackend {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: err.to_string(),
         })?;
+        conn.busy_timeout(Duration::from_secs(30))
+            .map_err(|err| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: err.to_string(),
+            })?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -36,6 +41,11 @@ impl SqliteBackend {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: err.to_string(),
         })?;
+        conn.busy_timeout(Duration::from_secs(30))
+            .map_err(|err| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: err.to_string(),
+            })?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

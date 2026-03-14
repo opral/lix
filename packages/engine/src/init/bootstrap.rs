@@ -5,6 +5,7 @@ use crate::version::{
     GLOBAL_VERSION_ID,
 };
 use crate::{LixError, SqlDialect, Value};
+use std::time::Duration;
 
 impl Engine {
     #[doc(hidden)]
@@ -130,11 +131,43 @@ impl Engine {
         if is_init_conflict_error(&error.description) {
             return crate::errors::already_initialized_error();
         }
+        if is_init_locked_error(&error.description)
+            && self
+                .wait_for_concurrent_init_resolution()
+                .await
+                .unwrap_or(false)
+        {
+            return crate::errors::already_initialized_error();
+        }
 
         match self.backend_has_been_initialized().await {
             Ok(true) => crate::errors::already_initialized_error(),
             _ => error,
         }
+    }
+
+    async fn wait_for_concurrent_init_resolution(&self) -> Result<bool, LixError> {
+        const ATTEMPTS: usize = 60;
+        const DELAY_MS: u64 = 50;
+
+        for attempt in 0..ATTEMPTS {
+            match self.backend_has_been_initialized().await {
+                Ok(true) => return Ok(true),
+                Ok(false) => {
+                    if attempt + 1 == ATTEMPTS {
+                        return Ok(false);
+                    }
+                }
+                Err(error) if is_init_locked_error(&error.description) => {
+                    if attempt + 1 == ATTEMPTS {
+                        return Ok(false);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+            std::thread::sleep(Duration::from_millis(DELAY_MS));
+        }
+        Ok(false)
     }
 }
 
@@ -143,4 +176,11 @@ fn is_init_conflict_error(description: &str) -> bool {
     normalized.contains("unique constraint failed")
         || normalized.contains("unique constraint violation")
         || normalized.contains("already exists in version 'global'")
+}
+
+fn is_init_locked_error(description: &str) -> bool {
+    let normalized = description.to_ascii_lowercase();
+    normalized.contains("database is locked")
+        || normalized.contains("database schema is locked")
+        || normalized.contains("database table is locked")
 }

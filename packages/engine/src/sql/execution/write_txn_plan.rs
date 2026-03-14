@@ -53,6 +53,36 @@ pub(crate) struct WriteTxnPlan {
 }
 
 impl WriteTxnPlan {
+    pub(crate) fn extend(&mut self, other: WriteTxnPlan) {
+        self.units.extend(other.units);
+        self.coalesce_exact_filesystem_tracked_units();
+    }
+
+    pub(crate) fn bind_runtime(
+        &mut self,
+        settings: DeterministicSettings,
+        sequence_start: i64,
+        functions: SharedFunctionProvider<RuntimeFunctionProvider>,
+    ) {
+        for unit in &mut self.units {
+            match unit {
+                WriteTxnUnit::PublicTracked(tracked) => {
+                    tracked.functions = functions.clone();
+                }
+                WriteTxnUnit::PublicUntracked(untracked) => {
+                    untracked.settings = settings;
+                    untracked.sequence_start = sequence_start;
+                    untracked.functions = functions.clone();
+                }
+                WriteTxnUnit::Internal(internal) => {
+                    internal.settings = settings;
+                    internal.sequence_start = sequence_start;
+                    internal.functions = functions.clone();
+                }
+            }
+        }
+    }
+
     pub(crate) fn coalesce_exact_filesystem_tracked_units(&mut self) {
         let mut coalesced = Vec::with_capacity(self.units.len());
         for unit in std::mem::take(&mut self.units) {
