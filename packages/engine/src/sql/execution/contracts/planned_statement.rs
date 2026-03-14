@@ -18,6 +18,12 @@ pub(crate) enum MutationOperation {
     Insert,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateValidationKind {
+    Update,
+    Delete,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MutationRow {
     pub(crate) operation: MutationOperation,
@@ -33,6 +39,7 @@ pub(crate) struct MutationRow {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UpdateValidationPlan {
+    pub(crate) kind: UpdateValidationKind,
     pub(crate) table: String,
     pub(crate) where_clause: Option<Expr>,
     pub(crate) snapshot_content: Option<JsonValue>,

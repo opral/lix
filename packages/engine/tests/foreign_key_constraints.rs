@@ -246,3 +246,64 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    foreign_key_restricts_delete_of_referenced_target,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        register_parent_schema(&engine, "fk_parent_delete_restrict").await;
+        register_child_schema(
+            &engine,
+            "fk_child_delete_restrict",
+            "fk_parent_delete_restrict",
+        )
+        .await;
+        insert_version(&engine, "version-a").await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'parent-1', 'fk_parent_delete_restrict', 'alpha.md', 'version-a', 'lix', '1', '{\"id\":\"parent-1\",\"name\":\"parent\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'child-1', 'fk_child_delete_restrict', 'alpha.md', 'version-a', 'lix', '1', '{\"id\":\"child-1\",\"parent_id\":\"parent-1\",\"name\":\"child\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let delete_parent = engine
+            .execute(
+                "DELETE FROM lix_state_by_version \
+                 WHERE entity_id = 'parent-1' \
+                   AND schema_key = 'fk_parent_delete_restrict' \
+                   AND file_id = 'alpha.md' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await;
+
+        assert!(
+            delete_parent.is_err(),
+            "deleting a referenced target should be restricted by foreign-key enforcement"
+        );
+    }
+);
