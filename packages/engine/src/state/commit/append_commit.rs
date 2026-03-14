@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
@@ -67,7 +67,7 @@ pub(crate) struct AppendCommitPreconditions {
 pub(crate) struct AppendCommitArgs {
     pub(crate) timestamp: Option<String>,
     pub(crate) changes: Vec<ProposedDomainChange>,
-    pub(crate) lazy_exact_file_update: Option<LazyExactFileUpdate>,
+    pub(crate) lazy_exact_file_updates: Vec<LazyExactFileUpdate>,
     pub(crate) preconditions: AppendCommitPreconditions,
     pub(crate) should_emit_observe_tick: bool,
     pub(crate) observe_tick_writer_key: Option<String>,
@@ -118,7 +118,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
     invariant_checker: Option<&mut dyn AppendCommitInvariantChecker>,
 ) -> Result<AppendCommitResult, AppendCommitError> {
     if args.changes.is_empty() {
-        if args.lazy_exact_file_update.is_none() {
+        if args.lazy_exact_file_updates.is_empty() {
             return Err(AppendCommitError {
                 kind: AppendCommitErrorKind::EmptyBatch,
                 message: "append_commit_if_preconditions_hold requires at least one change"
@@ -128,11 +128,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
     }
 
     let concrete_lane = concrete_lane(&args.preconditions)?;
-    validate_change_versions(
-        &args.changes,
-        args.lazy_exact_file_update.as_ref(),
-        &concrete_lane,
-    )?;
+    validate_change_versions(&args.changes, &args.lazy_exact_file_updates, &concrete_lane)?;
 
     let needs_active_accounts = !args
         .changes
@@ -146,7 +142,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
             &mut executor,
             &concrete_lane,
             &args.preconditions,
-            args.lazy_exact_file_update.as_ref(),
+            &args.lazy_exact_file_updates,
             needs_deterministic_sequence,
             needs_active_accounts,
         )
@@ -236,11 +232,16 @@ pub(crate) async fn append_commit_if_preconditions_hold(
         invariant_checker.recheck_invariants(transaction).await?;
     }
 
-    let applied_domain_changes = resolve_proposed_domain_changes(
-        &args.changes,
-        args.lazy_exact_file_update.as_ref(),
-        &preflight,
-    )?;
+    let applied_domain_changes =
+        resolve_proposed_domain_changes(&args.changes, &args.lazy_exact_file_updates, &preflight)?;
+    if applied_domain_changes.is_empty() {
+        return Ok(AppendCommitResult {
+            disposition: AppendCommitDisposition::Replay,
+            committed_tip: current_tip.unwrap_or_default(),
+            commit_result: None,
+            applied_domain_changes: Vec::new(),
+        });
+    }
     let domain_changes =
         materialize_domain_changes(&timestamp, &applied_domain_changes, functions)?;
     let affected_versions = domain_changes
@@ -323,11 +324,17 @@ pub(crate) async fn append_commit_if_preconditions_hold(
     }
 
     let mut write_program = WriteProgram::new();
-    if let Some(LazyExactFileUpdate::Data(lazy)) = args.lazy_exact_file_update.as_ref() {
-        write_program.extend(
-            build_binary_blob_fastcdc_write_program(&lazy.file_id, &lazy.version_id, &lazy.data)
+    for lazy in &args.lazy_exact_file_updates {
+        if let LazyExactFileUpdate::Data(lazy) = lazy {
+            write_program.extend(
+                build_binary_blob_fastcdc_write_program(
+                    &lazy.file_id,
+                    &lazy.version_id,
+                    &lazy.data,
+                )
                 .map_err(backend_error)?,
-        );
+            );
+        }
     }
     write_program.push_batch(prepared_batch);
     execute_write_program_with_transaction(transaction, write_program)
@@ -385,73 +392,129 @@ fn concrete_lane(
 
 fn resolve_proposed_domain_changes(
     changes: &[ProposedDomainChange],
-    lazy_exact_file_update: Option<&LazyExactFileUpdate>,
+    lazy_exact_file_updates: &[LazyExactFileUpdate],
     preflight: &AppendPreflightState,
 ) -> Result<Vec<ProposedDomainChange>, AppendCommitError> {
-    if let Some(lazy) = lazy_exact_file_update {
-        let current = preflight
-            .file_descriptor
-            .as_ref()
-            .ok_or_else(|| AppendCommitError {
-                kind: AppendCommitErrorKind::Internal,
-                message: "append preflight did not load the exact file descriptor row".to_string(),
-            })?;
-        if current.untracked {
-            return Err(AppendCommitError {
-                kind: AppendCommitErrorKind::Internal,
-                message: "lazy exact file update does not support untracked visible rows"
-                    .to_string(),
-            });
-        }
-        return match lazy {
-            LazyExactFileUpdate::Metadata(lazy) => Ok(vec![ProposedDomainChange {
-                entity_id: lazy.file_id.clone(),
-                schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
-                schema_version: Some(FILESYSTEM_FILE_SCHEMA_VERSION.to_string()),
-                file_id: Some(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
-                version_id: lazy.version_id.clone(),
-                plugin_key: Some(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
-                snapshot_content: Some(
-                    serde_json::json!({
-                        "id": lazy.file_id,
-                        "directory_id": current.directory_id,
-                        "name": current.name,
-                        "extension": current.extension,
-                        "metadata": lazy.metadata.apply(current.metadata.clone()),
-                        "hidden": current.hidden,
-                    })
-                    .to_string(),
-                ),
-                metadata: lazy.metadata.apply(current.metadata.clone()),
-                writer_key: None,
-            }]),
-            LazyExactFileUpdate::Data(lazy) => Ok(vec![ProposedDomainChange {
-                entity_id: lazy.file_id.clone(),
-                schema_key: "lix_binary_blob_ref".to_string(),
-                schema_version: Some("1".to_string()),
-                file_id: Some(lazy.file_id.clone()),
-                version_id: lazy.version_id.clone(),
-                plugin_key: Some(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
-                snapshot_content: Some(
-                    serde_json::json!({
-                        "id": lazy.file_id,
-                        "blob_hash": crate::plugin::runtime::binary_blob_hash_hex(&lazy.data),
-                        "size_bytes": u64::try_from(lazy.data.len()).map_err(|_| AppendCommitError {
-                            kind: AppendCommitErrorKind::Internal,
-                            message: format!(
-                                "exact file data update exceeds supported size for '{}'",
-                                lazy.file_id
-                            ),
-                        })?,
-                    })
-                    .to_string(),
-                ),
-                metadata: None,
-                writer_key: None,
-            }]),
-        };
+    if lazy_exact_file_updates.is_empty() {
+        return Ok(changes.to_vec());
     }
-    Ok(changes.to_vec())
+    let mut resolved = changes.to_vec();
+    for lazy in lazy_exact_file_updates {
+        match lazy {
+            LazyExactFileUpdate::Metadata(lazy) => {
+                let current = required_exact_file_descriptor(preflight, &lazy.file_id)?;
+                resolved.push(ProposedDomainChange {
+                    entity_id: lazy.file_id.clone(),
+                    schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
+                    schema_version: Some(FILESYSTEM_FILE_SCHEMA_VERSION.to_string()),
+                    file_id: Some(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
+                    version_id: lazy.version_id.clone(),
+                    plugin_key: Some(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
+                    snapshot_content: Some(
+                        serde_json::json!({
+                            "id": lazy.file_id,
+                            "directory_id": current.directory_id,
+                            "name": current.name,
+                            "extension": current.extension,
+                            "metadata": lazy.metadata.apply(current.metadata.clone()),
+                            "hidden": current.hidden,
+                        })
+                        .to_string(),
+                    ),
+                    metadata: lazy.metadata.apply(current.metadata.clone()),
+                    writer_key: None,
+                });
+            }
+            LazyExactFileUpdate::Data(lazy) => {
+                let _current = required_exact_file_descriptor(preflight, &lazy.file_id)?;
+                resolved.push(ProposedDomainChange {
+                    entity_id: lazy.file_id.clone(),
+                    schema_key: "lix_binary_blob_ref".to_string(),
+                    schema_version: Some("1".to_string()),
+                    file_id: Some(lazy.file_id.clone()),
+                    version_id: lazy.version_id.clone(),
+                    plugin_key: Some(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
+                    snapshot_content: Some(
+                        serde_json::json!({
+                            "id": lazy.file_id,
+                            "blob_hash": crate::plugin::runtime::binary_blob_hash_hex(&lazy.data),
+                            "size_bytes": u64::try_from(lazy.data.len()).map_err(|_| AppendCommitError {
+                                kind: AppendCommitErrorKind::Internal,
+                                message: format!(
+                                    "exact file data update exceeds supported size for '{}'",
+                                    lazy.file_id
+                                ),
+                            })?,
+                        })
+                        .to_string(),
+                    ),
+                    metadata: None,
+                    writer_key: None,
+                });
+            }
+            LazyExactFileUpdate::Delete(lazy) => {
+                for file_id in &lazy.file_ids {
+                    let Some(current) = preflight.file_descriptors.get(file_id) else {
+                        continue;
+                    };
+                    if current.untracked {
+                        return Err(AppendCommitError {
+                            kind: AppendCommitErrorKind::Internal,
+                            message:
+                                "lazy exact file update does not support untracked visible rows"
+                                    .to_string(),
+                        });
+                    }
+                    resolved.push(ProposedDomainChange {
+                        entity_id: file_id.clone(),
+                        schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
+                        schema_version: Some(FILESYSTEM_FILE_SCHEMA_VERSION.to_string()),
+                        file_id: Some(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
+                        version_id: lazy.version_id.clone(),
+                        plugin_key: Some(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
+                        snapshot_content: None,
+                        metadata: None,
+                        writer_key: None,
+                    });
+                    resolved.push(ProposedDomainChange {
+                        entity_id: file_id.clone(),
+                        schema_key: "lix_binary_blob_ref".to_string(),
+                        schema_version: Some("1".to_string()),
+                        file_id: Some(file_id.clone()),
+                        version_id: lazy.version_id.clone(),
+                        plugin_key: Some(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
+                        snapshot_content: None,
+                        metadata: None,
+                        writer_key: None,
+                    });
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn required_exact_file_descriptor<'a>(
+    preflight: &'a AppendPreflightState,
+    file_id: &str,
+) -> Result<&'a AppendPreflightFileDescriptor, AppendCommitError> {
+    let current = preflight
+        .file_descriptors
+        .get(file_id)
+        .ok_or_else(|| AppendCommitError {
+            kind: AppendCommitErrorKind::Internal,
+            message: format!(
+                "append preflight did not load the exact file descriptor row for '{}'",
+                file_id
+            ),
+        })?;
+    if current.untracked {
+        return Err(AppendCommitError {
+            kind: AppendCommitErrorKind::Internal,
+            message: "lazy exact file update does not support untracked visible rows".to_string(),
+        });
+    }
+    Ok(current)
 }
 
 fn materialize_domain_changes(
@@ -511,7 +574,7 @@ struct AppendPreflightState {
     existing_replay: Option<String>,
     deterministic_sequence_start: Option<i64>,
     active_accounts: Vec<String>,
-    file_descriptor: Option<AppendPreflightFileDescriptor>,
+    file_descriptors: BTreeMap<String, AppendPreflightFileDescriptor>,
 }
 
 struct AppendPreflightFileDescriptor {
@@ -527,7 +590,7 @@ async fn load_append_preflight_state_with_active_accounts(
     executor: &mut dyn CommitQueryExecutor,
     concrete_lane: &ConcreteWriteLane,
     preconditions: &AppendCommitPreconditions,
-    lazy_exact_file_update: Option<&LazyExactFileUpdate>,
+    lazy_exact_file_updates: &[LazyExactFileUpdate],
     include_deterministic_sequence: bool,
     include_active_accounts: bool,
 ) -> Result<AppendPreflightState, AppendCommitError> {
@@ -551,7 +614,7 @@ async fn load_append_preflight_state_with_active_accounts(
     let existing_replay_sql = match &preconditions.idempotency_key {
         AppendIdempotencyKey::Exact(value) => format!(
             " UNION ALL \
-              SELECT CAST('existing_replay' AS TEXT) AS row_kind, CAST(commit_id AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value \
+              SELECT CAST('existing_replay' AS TEXT) AS row_kind, CAST(commit_id AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value, CAST(NULL AS TEXT) AS entity_id \
               FROM {table_name} \
               WHERE write_lane = '{write_lane}' \
                 AND idempotency_kind = '{kind}' \
@@ -564,7 +627,7 @@ async fn load_append_preflight_state_with_active_accounts(
         ),
         AppendIdempotencyKey::CurrentTipFingerprint(fingerprint) => format!(
             " UNION ALL \
-              SELECT CAST('existing_replay' AS TEXT) AS row_kind, CAST(idempotency.commit_id AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value \
+              SELECT CAST('existing_replay' AS TEXT) AS row_kind, CAST(idempotency.commit_id AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value, CAST(NULL AS TEXT) AS entity_id \
               FROM (SELECT snapshot_content {current_tip_source_sql}) current_tip \
               JOIN {table_name} idempotency \
                 ON idempotency.write_lane = '{write_lane}' \
@@ -581,7 +644,7 @@ async fn load_append_preflight_state_with_active_accounts(
     let active_account_sql = if include_active_accounts {
         format!(
             " UNION ALL \
-              SELECT CAST('active_account' AS TEXT) AS row_kind, CAST(snapshot_content AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value \
+              SELECT CAST('active_account' AS TEXT) AS row_kind, CAST(snapshot_content AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value, CAST(NULL AS TEXT) AS entity_id \
               FROM {untracked_table} \
               WHERE schema_key = '{schema_key}' \
                 AND file_id = '{file_id}' \
@@ -597,7 +660,7 @@ async fn load_append_preflight_state_with_active_accounts(
     };
     let deterministic_sequence_sql = if include_deterministic_sequence {
         " UNION ALL \
-           SELECT CAST('deterministic_sequence' AS TEXT) AS row_kind, CAST(deterministic_sequence.value AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value \
+           SELECT CAST('deterministic_sequence' AS TEXT) AS row_kind, CAST(deterministic_sequence.value AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value, CAST(NULL AS TEXT) AS entity_id \
            FROM (\
              SELECT value \
              FROM (\
@@ -623,20 +686,27 @@ async fn load_append_preflight_state_with_active_accounts(
     } else {
         String::new()
     };
-    let file_descriptor_sql = if let Some(lazy) = lazy_exact_file_update {
+    let exact_file_ids = lazy_exact_file_updates
+        .iter()
+        .flat_map(LazyExactFileUpdate::file_ids)
+        .collect::<BTreeSet<_>>();
+    let file_descriptor_sql = if exact_file_ids.is_empty() {
+        String::new()
+    } else {
         format!(
             " UNION ALL \
-              SELECT CAST('file_descriptor' AS TEXT) AS row_kind, CAST(snapshot_content AS TEXT) AS value, CAST(metadata AS TEXT) AS metadata_value, CAST(untracked AS INTEGER) AS untracked_value \
+              SELECT CAST('file_descriptor' AS TEXT) AS row_kind, CAST(snapshot_content AS TEXT) AS value, CAST(metadata AS TEXT) AS metadata_value, CAST(untracked AS INTEGER) AS untracked_value, CAST(entity_id AS TEXT) AS entity_id \
               FROM ({descriptor_sql}) file_descriptor",
-            descriptor_sql = exact_file_descriptor_preflight_sql(lazy.file_id(), lazy.version_id()),
+            descriptor_sql = exact_file_descriptor_preflight_sql(
+                &exact_file_ids.into_iter().map(str::to_string).collect::<Vec<_>>(),
+                lane_entity_id,
+            ),
         )
-    } else {
-        String::new()
     };
     let sql = format!(
-        "SELECT row_kind, value, metadata_value, untracked_value \
+        "SELECT row_kind, value, metadata_value, untracked_value, entity_id \
          FROM (\
-           SELECT CAST('current_tip' AS TEXT) AS row_kind, CAST(snapshot_content AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value \
+           SELECT CAST('current_tip' AS TEXT) AS row_kind, CAST(snapshot_content AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value, CAST(NULL AS TEXT) AS entity_id \
            {current_tip_source_sql}{existing_replay_sql}{deterministic_sequence_sql}{active_account_sql}{file_descriptor_sql}\
          ) append_preflight",
         current_tip_source_sql = current_tip_source_sql,
@@ -651,7 +721,7 @@ async fn load_append_preflight_state_with_active_accounts(
     let mut existing_replay = None;
     let mut deterministic_sequence_start = None;
     let mut active_accounts = BTreeSet::new();
-    let mut file_descriptor = None;
+    let mut file_descriptors = BTreeMap::new();
     for row in result.rows {
         let Some(kind) = row.first() else {
             continue;
@@ -698,13 +768,24 @@ async fn load_append_preflight_state_with_active_accounts(
                 active_accounts.insert(account_id);
             }
             ("file_descriptor", Value::Text(snapshot_content)) => {
-                file_descriptor = Some(parse_file_descriptor_preflight_row(
-                    snapshot_content,
-                    row.get(2).and_then(append_preflight_text_from_value),
-                    row.get(3)
-                        .and_then(append_preflight_value_as_bool)
-                        .unwrap_or(false),
-                )?);
+                let Some(entity_id) = row.get(4).and_then(append_preflight_text_from_value) else {
+                    return Err(AppendCommitError {
+                        kind: AppendCommitErrorKind::Internal,
+                        message:
+                            "append preflight returned a file descriptor row without entity_id"
+                                .to_string(),
+                    });
+                };
+                file_descriptors.insert(
+                    entity_id,
+                    parse_file_descriptor_preflight_row(
+                        snapshot_content,
+                        row.get(2).and_then(append_preflight_text_from_value),
+                        row.get(3)
+                            .and_then(append_preflight_value_as_bool)
+                            .unwrap_or(false),
+                    )?,
+                );
             }
             (_, Value::Null) => {}
             ("current_tip", other)
@@ -723,13 +804,17 @@ async fn load_append_preflight_state_with_active_accounts(
         }
     }
 
+    if include_deterministic_sequence && deterministic_sequence_start.is_none() {
+        deterministic_sequence_start = Some(0);
+    }
+
     Ok(AppendPreflightState {
         current_tip,
         current_tip_snapshot,
         existing_replay,
         deterministic_sequence_start,
         active_accounts: active_accounts.into_iter().collect(),
-        file_descriptor,
+        file_descriptors,
     })
 }
 
@@ -771,46 +856,60 @@ fn parse_file_descriptor_preflight_row(
     })
 }
 
-fn exact_file_descriptor_preflight_sql(file_id: &str, version_id: &str) -> String {
+fn exact_file_descriptor_preflight_sql(file_ids: &[String], version_id: &str) -> String {
+    let requested_rows = file_ids
+        .iter()
+        .map(|file_id| format!("('{}')", escape_sql_string(file_id)))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, CAST(untracked AS INTEGER) AS untracked \
-         FROM (\
-           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, CAST(1 AS INTEGER) AS untracked, CAST(1 AS INTEGER) AS precedence \
-           FROM {untracked_table} \
-           WHERE version_id = '{version_id}' \
-             AND schema_key = '{schema_key}' \
-             AND file_id = '{file_id_value}' \
-             AND entity_id = '{entity_id}' \
+        "WITH requested(entity_id) AS (VALUES {requested_rows}), \
+         descriptor_candidates AS (\
+           SELECT requested.entity_id, CAST(untracked.snapshot_content AS TEXT) AS snapshot_content, CAST(untracked.metadata AS TEXT) AS metadata, CAST(1 AS INTEGER) AS untracked, CAST(1 AS INTEGER) AS precedence \
+           FROM requested \
+           JOIN {untracked_table} untracked \
+             ON untracked.entity_id = requested.entity_id \
+            AND untracked.version_id = '{version_id}' \
+            AND untracked.schema_key = '{schema_key}' \
+            AND untracked.file_id = '{file_id_value}' \
            UNION ALL \
-           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, CAST(0 AS INTEGER) AS untracked, CAST(2 AS INTEGER) AS precedence \
-           FROM {tracked_table} \
-           WHERE version_id = '{version_id}' \
-             AND file_id = '{file_id_value}' \
-             AND entity_id = '{entity_id}' \
+           SELECT requested.entity_id, CAST(tracked.snapshot_content AS TEXT) AS snapshot_content, CAST(tracked.metadata AS TEXT) AS metadata, CAST(0 AS INTEGER) AS untracked, CAST(2 AS INTEGER) AS precedence \
+           FROM requested \
+           JOIN {tracked_table} tracked \
+             ON tracked.entity_id = requested.entity_id \
+            AND tracked.version_id = '{version_id}' \
+            AND tracked.file_id = '{file_id_value}' \
            UNION ALL \
-           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, CAST(1 AS INTEGER) AS untracked, CAST(3 AS INTEGER) AS precedence \
-           FROM {untracked_table} \
-           WHERE version_id = '{global_version_id}' \
-             AND schema_key = '{schema_key}' \
-             AND file_id = '{file_id_value}' \
-             AND entity_id = '{entity_id}' \
+           SELECT requested.entity_id, CAST(untracked.snapshot_content AS TEXT) AS snapshot_content, CAST(untracked.metadata AS TEXT) AS metadata, CAST(1 AS INTEGER) AS untracked, CAST(3 AS INTEGER) AS precedence \
+           FROM requested \
+           JOIN {untracked_table} untracked \
+             ON untracked.entity_id = requested.entity_id \
+            AND untracked.version_id = '{global_version_id}' \
+            AND untracked.schema_key = '{schema_key}' \
+            AND untracked.file_id = '{file_id_value}' \
            UNION ALL \
-           SELECT CAST(snapshot_content AS TEXT) AS snapshot_content, CAST(metadata AS TEXT) AS metadata, CAST(0 AS INTEGER) AS untracked, CAST(4 AS INTEGER) AS precedence \
-           FROM {tracked_table} \
-           WHERE version_id = '{global_version_id}' \
-             AND file_id = '{file_id_value}' \
-             AND entity_id = '{entity_id}' \
-         ) descriptor \
-         WHERE snapshot_content IS NOT NULL \
-         ORDER BY precedence ASC \
-         LIMIT 1",
+           SELECT requested.entity_id, CAST(tracked.snapshot_content AS TEXT) AS snapshot_content, CAST(tracked.metadata AS TEXT) AS metadata, CAST(0 AS INTEGER) AS untracked, CAST(4 AS INTEGER) AS precedence \
+           FROM requested \
+           JOIN {tracked_table} tracked \
+             ON tracked.entity_id = requested.entity_id \
+            AND tracked.version_id = '{global_version_id}' \
+            AND tracked.file_id = '{file_id_value}' \
+         ), ranked AS (\
+           SELECT entity_id, snapshot_content, metadata, untracked, precedence, \
+                  ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY precedence ASC) AS rn \
+           FROM descriptor_candidates \
+           WHERE snapshot_content IS NOT NULL\
+         ) \
+         SELECT entity_id, snapshot_content, metadata, untracked \
+         FROM ranked \
+         WHERE rn = 1",
+        requested_rows = requested_rows,
         tracked_table = "lix_internal_live_v1_lix_file_descriptor",
         untracked_table = LIVE_UNTRACKED_TABLE,
         version_id = escape_sql_string(version_id),
         global_version_id = escape_sql_string(GLOBAL_VERSION_ID),
         schema_key = escape_sql_string(FILESYSTEM_FILE_SCHEMA_KEY),
         file_id_value = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
-        entity_id = escape_sql_string(file_id),
     )
 }
 
@@ -850,15 +949,18 @@ fn append_preflight_value_as_bool(value: &Value) -> Option<bool> {
 
 fn validate_change_versions(
     changes: &[ProposedDomainChange],
-    lazy_exact_file_update: Option<&LazyExactFileUpdate>,
+    lazy_exact_file_updates: &[LazyExactFileUpdate],
     concrete_lane: &ConcreteWriteLane,
 ) -> Result<(), AppendCommitError> {
-    if let Some(lazy) = lazy_exact_file_update {
+    if !lazy_exact_file_updates.is_empty() {
         let expected_version_id = match concrete_lane {
             ConcreteWriteLane::Version { version_id } => version_id,
             ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
         };
-        if lazy.version_id() != expected_version_id {
+        if lazy_exact_file_updates
+            .iter()
+            .any(|lazy| lazy.version_id() != expected_version_id)
+        {
             return Err(AppendCommitError {
                 kind: AppendCommitErrorKind::Internal,
                 message: format!(
@@ -867,7 +969,9 @@ fn validate_change_versions(
                 ),
             });
         }
-        return Ok(());
+        if changes.is_empty() {
+            return Ok(());
+        }
     }
     validate_change_versions_without_lazy(changes, concrete_lane)
 }
@@ -1316,7 +1420,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_update: None,
+                lazy_exact_file_updates: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
@@ -1380,7 +1484,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_update: None,
+                lazy_exact_file_updates: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
@@ -1423,7 +1527,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_update: None,
+                lazy_exact_file_updates: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CurrentTip,
@@ -1459,7 +1563,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_update: None,
+                lazy_exact_file_updates: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
@@ -1488,7 +1592,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_update: None,
+                lazy_exact_file_updates: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
@@ -1516,7 +1620,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_update: None,
+                lazy_exact_file_updates: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CreateIfMissing,
@@ -1548,7 +1652,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_global_change()],
-                lazy_exact_file_update: None,
+                lazy_exact_file_updates: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::GlobalAdmin,
                     expected_tip: AppendExpectedTip::CommitId("commit-global-123".to_string()),
@@ -1587,7 +1691,7 @@ mod tests {
             AppendCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_update: None,
+                lazy_exact_file_updates: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),

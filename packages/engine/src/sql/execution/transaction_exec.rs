@@ -6,6 +6,8 @@ use crate::sql::execution::execute;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path;
 use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
+use crate::sql::execution::write_txn_plan::{build_write_txn_plan, WriteTxnRunMode};
+use crate::sql::execution::write_txn_runner::run_write_txn_plan_with_transaction;
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::sql::public::runtime::{
     apply_public_surface_registry_mutations, decode_public_read_result,
@@ -67,17 +69,18 @@ impl Engine {
             })?
         };
 
-        let execution = match shared_path::maybe_execute_public_write_with_transaction(
-            self,
-            transaction,
-            &prepared,
-            writer_key,
-            Some(pending_public_append_session),
-        )
-        .await
-        {
-            Ok(Some(execution)) => execution,
-            Ok(None) => match execute::execute_plan_sql_with_transaction(
+        let write_txn_plan = build_write_txn_plan(&prepared, writer_key);
+        let execution = if let Some(plan) = write_txn_plan.as_ref() {
+            run_write_txn_plan_with_transaction(
+                self,
+                transaction,
+                plan,
+                WriteTxnRunMode::Borrowed,
+                Some(pending_public_append_session),
+            )
+            .await?
+        } else {
+            match execute::execute_plan_sql_with_transaction(
                 transaction,
                 &prepared.plan,
                 prepared.plan.requirements.should_refresh_file_cache,
@@ -104,15 +107,6 @@ impl Engine {
                         ),
                     });
                 }
-            },
-            Err(error) => {
-                return Err(LixError {
-                    code: error.code,
-                    description: format!(
-                        "transaction public write execution failed: {}",
-                        error.description
-                    ),
-                })
             }
         };
 
@@ -152,7 +146,11 @@ impl Engine {
             &state_commit_stream_changes,
         );
 
-        if skip_side_effect_collection && deferred_side_effects.is_none() {
+        let write_handled_by_runner = write_txn_plan.is_some();
+
+        if write_handled_by_runner {
+            // The universal write runner owns all transactional DB side effects for writes.
+        } else if skip_side_effect_collection && deferred_side_effects.is_none() {
             // Internal callers can request executing SQL rewrite/validation without
             // file side-effect collection/persistence/invalidation.
         } else if let Some(deferred) = deferred_side_effects {
@@ -234,20 +232,22 @@ impl Engine {
                     })?;
             }
         }
-        self.persist_runtime_sequence_in_transaction(
-            transaction,
-            prepared.settings,
-            prepared.sequence_start,
-            &prepared.functions,
-        )
-        .await
-        .map_err(|error| LixError {
-            code: error.code,
-            description: format!(
-                "transaction runtime-sequence persistence failed: {}",
-                error.description
-            ),
-        })?;
+        if !write_handled_by_runner {
+            self.persist_runtime_sequence_in_transaction(
+                transaction,
+                prepared.settings,
+                prepared.sequence_start,
+                &prepared.functions,
+            )
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "transaction runtime-sequence persistence failed: {}",
+                    error.description
+                ),
+            })?;
+        }
 
         pending_state_commit_stream_changes.extend(state_commit_stream_changes);
         let public_result = if let Some(public_read) = prepared.public_read.as_ref() {

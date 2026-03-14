@@ -4,8 +4,10 @@ use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
+use crate::sql::common::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::public::planner::ir::{
-    LazyExactFileDataUpdate, LazyExactFileMetadataUpdate, LazyExactFileUpdate, OptionalTextPatch,
+    LazyExactFileDataUpdate, LazyExactFileDelete, LazyExactFileMetadataUpdate, LazyExactFileUpdate,
+    OptionalTextPatch,
 };
 use crate::sql::public::planner::semantics::filesystem_assignments::{
     parse_directory_insert_assignments, parse_directory_update_assignments,
@@ -22,6 +24,7 @@ use crate::sql::public::planner::semantics::filesystem_queries::{
     lookup_file_id_by_path, DirectoryFilesystemRow, FileFilesystemRow,
 };
 use serde_json::json;
+use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue, ValueWithSpan};
 use std::collections::{BTreeMap, BTreeSet};
 
 const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
@@ -537,6 +540,25 @@ async fn resolve_existing_file_write(
             Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
         WriteOperationKind::Delete => {
+            if let Some(lazy_exact_file_update) =
+                lazy_exact_file_delete_candidate(planned_write, &version_id)
+            {
+                return Ok(ResolvedWritePlan::from_partition(ResolvedWritePartition {
+                    execution_mode: default_execution_mode_for_request(
+                        planned_write.command.requested_mode,
+                    ),
+                    authoritative_pre_state: Vec::new(),
+                    intended_post_state: Vec::new(),
+                    tombstones: Vec::new(),
+                    lineage: Vec::new(),
+                    target_write_lane: target_write_lane_for_version(
+                        planned_write,
+                        default_execution_mode_for_request(planned_write.command.requested_mode),
+                        Some(version_id.as_str()),
+                    )?,
+                    lazy_exact_file_update: Some(lazy_exact_file_update),
+                }));
+            }
             let current_rows = load_target_file_rows_for_selector(
                 backend,
                 planned_write,
@@ -645,6 +667,26 @@ fn lazy_exact_file_update_candidate(
         file_id,
         version_id: version_id.to_string(),
         metadata: optional_text_patch(&assignments.metadata),
+    }))
+}
+
+fn lazy_exact_file_delete_candidate(
+    planned_write: &PlannedWrite,
+    version_id: &str,
+) -> Option<LazyExactFileUpdate> {
+    if matches!(
+        planned_write.command.requested_mode,
+        WriteModeRequest::ForceUntracked
+    ) {
+        return None;
+    }
+    let file_ids = exact_id_selector_values(planned_write)?;
+    if file_ids.is_empty() {
+        return None;
+    }
+    Some(LazyExactFileUpdate::Delete(LazyExactFileDelete {
+        file_ids,
+        version_id: version_id.to_string(),
     }))
 }
 
@@ -1232,8 +1274,14 @@ async fn load_target_file_rows_for_selector(
 }
 
 fn exact_id_selector_value(planned_write: &PlannedWrite) -> Option<String> {
+    exact_id_selector_values(planned_write)
+        .filter(|ids| ids.len() == 1)
+        .and_then(|ids| ids.into_iter().next())
+}
+
+fn exact_id_selector_values(planned_write: &PlannedWrite) -> Option<Vec<String>> {
     if !planned_write.command.selector.exact_only {
-        return None;
+        return exact_id_selector_values_from_residuals(planned_write);
     }
     if !planned_write
         .command
@@ -1250,6 +1298,159 @@ fn exact_id_selector_value(planned_write: &PlannedWrite) -> Option<String> {
         .exact_filters
         .get("id")
         .and_then(text_from_value)
+        .map(|value| vec![value])
+}
+
+fn exact_id_selector_values_from_residuals(planned_write: &PlannedWrite) -> Option<Vec<String>> {
+    let [predicate] = planned_write
+        .command
+        .selector
+        .residual_predicates
+        .as_slice()
+    else {
+        return None;
+    };
+    let mut file_ids = BTreeSet::new();
+    let mut placeholder_state = PlaceholderState::new();
+    if !collect_exact_id_selector_values(
+        predicate,
+        &planned_write.command.bound_parameters,
+        &mut placeholder_state,
+        &mut file_ids,
+    ) {
+        return None;
+    }
+    if file_ids.is_empty() {
+        None
+    } else {
+        Some(file_ids.into_iter().collect())
+    }
+}
+
+fn collect_exact_id_selector_values(
+    expr: &Expr,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+    file_ids: &mut BTreeSet<String>,
+) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_exact_id_selector_values(left, params, placeholder_state, file_ids)
+                && collect_exact_id_selector_values(right, params, placeholder_state, file_ids)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            let Some(column) =
+                exact_selector_column_name(left).or_else(|| exact_selector_column_name(right))
+            else {
+                return false;
+            };
+            if column == "id" {
+                let value_expr = if exact_selector_column_name(left).is_some() {
+                    right
+                } else {
+                    left
+                };
+                let value = exact_expr_text_value(value_expr, params, placeholder_state);
+                if let Some(value) = value {
+                    file_ids.insert(value);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                matches!(column.as_str(), "version_id" | "lixcol_version_id")
+            }
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            let Some(column) = exact_selector_column_name(expr) else {
+                return false;
+            };
+            if column != "id" {
+                return matches!(column.as_str(), "version_id" | "lixcol_version_id");
+            }
+            let mut local = Vec::with_capacity(list.len());
+            for value_expr in list {
+                let Some(value) = exact_expr_text_value(value_expr, params, placeholder_state)
+                else {
+                    return false;
+                };
+                local.push(value);
+            }
+            file_ids.extend(local);
+            true
+        }
+        Expr::Nested(inner) => {
+            collect_exact_id_selector_values(inner, params, placeholder_state, file_ids)
+        }
+        _ => false,
+    }
+}
+
+fn exact_selector_column_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(identifier) => Some(identifier.value.to_ascii_lowercase()),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|identifier| identifier.value.to_ascii_lowercase()),
+        Expr::Nested(inner) => exact_selector_column_name(inner),
+        _ => None,
+    }
+}
+
+fn exact_expr_text_value(
+    expr: &Expr,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+) -> Option<String> {
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value:
+                SqlValue::SingleQuotedString(value)
+                | SqlValue::DoubleQuotedString(value)
+                | SqlValue::TripleSingleQuotedString(value)
+                | SqlValue::TripleDoubleQuotedString(value)
+                | SqlValue::EscapedStringLiteral(value)
+                | SqlValue::SingleQuotedByteStringLiteral(value)
+                | SqlValue::DoubleQuotedByteStringLiteral(value),
+            ..
+        }) => Some(value.clone()),
+        Expr::Value(ValueWithSpan {
+            value: SqlValue::Number(value, _),
+            ..
+        }) => Some(value.clone()),
+        Expr::Value(ValueWithSpan {
+            value: SqlValue::Boolean(value),
+            ..
+        }) => Some(value.to_string()),
+        Expr::Value(ValueWithSpan {
+            value: SqlValue::Placeholder(token),
+            ..
+        }) => {
+            let index = resolve_placeholder_index(token, params.len(), placeholder_state).ok()?;
+            match params.get(index)? {
+                Value::Text(value) => Some(value.clone()),
+                Value::Json(value) => Some(value.to_string()),
+                Value::Integer(value) => Some(value.to_string()),
+                Value::Real(value) => Some(value.to_string()),
+                Value::Boolean(value) => Some(value.to_string()),
+                Value::Null | Value::Blob(_) => None,
+            }
+        }
+        Expr::Nested(inner) => exact_expr_text_value(inner, params, placeholder_state),
+        _ => None,
+    }
 }
 
 async fn assert_no_directory_cycle(

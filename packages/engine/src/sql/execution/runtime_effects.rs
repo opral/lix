@@ -1,49 +1,21 @@
 use crate::engine::{
-    collapse_pending_file_writes_for_transaction, dedupe_filesystem_payload_domain_changes,
-    should_run_binary_cas_gc, CollectedExecutionSideEffects, DeferredTransactionSideEffects,
-    Engine, TransactionBackendAdapter,
+    dedupe_filesystem_payload_domain_changes, CollectedExecutionSideEffects, Engine,
+    TransactionBackendAdapter,
 };
 use crate::sql::analysis::history_reads as history_plugin_inputs;
 use crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange;
-use crate::sql::execution::parse::parse_sql;
-use crate::sql::execution::shared_path;
 use crate::sql::storage::queries::{
     filesystem as filesystem_queries, history as history_queries, state as state_queries,
 };
 use crate::sql::storage::tables;
 use crate::state::internal::write_program::{WriteProgram, WriteStep};
-use crate::{ExecuteOptions, LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
+use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
 use sqlparser::ast::Statement;
 use std::collections::{BTreeMap, BTreeSet};
 
 const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
-
-async fn resolve_pending_write_file_id_with_backend(
-    backend: &dyn LixBackend,
-    write: &crate::filesystem::pending_file_writes::PendingFileWrite,
-) -> Result<String, LixError> {
-    let Some(path) =
-        crate::filesystem::pending_file_writes::unresolved_auto_file_path_from_id(&write.file_id)
-    else {
-        return Ok(write.file_id.clone());
-    };
-    let resolved = crate::filesystem::live_projection::resolve_file_id_by_path_in_version(
-        backend,
-        &write.version_id,
-        path,
-    )
-    .await?;
-    let Some(file_id) = resolved else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                "pending file write: unable to resolve auto-generated file id for path '{}' in version '{}'",
-                path, write.version_id
-            ),
-        });
-    };
-    Ok(file_id)
-}
 
 async fn resolve_pending_write_file_id_in_transaction(
     transaction: &mut dyn LixTransaction,
@@ -197,58 +169,6 @@ impl Engine {
         })
     }
 
-    pub(crate) async fn flush_deferred_transaction_side_effects_in_transaction(
-        &self,
-        transaction: &mut dyn LixTransaction,
-        side_effects: &mut DeferredTransactionSideEffects,
-        writer_key: Option<&str>,
-    ) -> Result<(), LixError> {
-        let collapsed_writes =
-            collapse_pending_file_writes_for_transaction(&side_effects.pending_file_writes);
-        side_effects.pending_file_writes = collapsed_writes;
-
-        let filesystem_payload_domain_changes = dedupe_filesystem_payload_domain_changes(
-            &self
-                .collect_live_filesystem_payload_domain_changes_in_transaction(
-                    transaction,
-                    &side_effects.pending_file_writes,
-                    &side_effects.pending_file_delete_targets,
-                    writer_key,
-                )
-                .await?,
-        );
-        let should_run_binary_gc =
-            should_run_binary_cas_gc(&[], &filesystem_payload_domain_changes);
-        let _ = std::mem::take(&mut side_effects.pending_file_delete_targets);
-
-        self.persist_pending_file_data_updates_in_transaction(
-            transaction,
-            &side_effects.pending_file_writes,
-        )
-        .await?;
-        if !filesystem_payload_domain_changes.is_empty() {
-            self.persist_filesystem_payload_domain_changes_in_transaction(
-                transaction,
-                &filesystem_payload_domain_changes,
-            )
-            .await?;
-        }
-        if should_run_binary_gc {
-            self.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    pub(crate) async fn persist_filesystem_payload_domain_changes(
-        &self,
-        changes: &[FilesystemPayloadDomainChange],
-    ) -> Result<(), LixError> {
-        self.persist_filesystem_payload_domain_changes_partitioned(changes)
-            .await
-    }
-
     pub(crate) async fn persist_filesystem_payload_domain_changes_in_transaction(
         &self,
         transaction: &mut dyn LixTransaction,
@@ -259,33 +179,6 @@ impl Engine {
             changes,
         )
         .await
-    }
-
-    async fn persist_filesystem_payload_domain_changes_partitioned(
-        &self,
-        changes: &[FilesystemPayloadDomainChange],
-    ) -> Result<(), LixError> {
-        let tracked = changes
-            .iter()
-            .filter(|change| !change.untracked)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !tracked.is_empty() {
-            self.persist_filesystem_payload_domain_changes_with_untracked(&tracked, false)
-                .await?;
-        }
-
-        let untracked = changes
-            .iter()
-            .filter(|change| change.untracked)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !untracked.is_empty() {
-            self.persist_filesystem_payload_domain_changes_with_untracked(&untracked, true)
-                .await?;
-        }
-
-        Ok(())
     }
 
     async fn persist_filesystem_payload_domain_changes_partitioned_in_transaction(
@@ -324,58 +217,6 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) async fn persist_filesystem_payload_domain_changes_with_untracked(
-        &self,
-        changes: &[FilesystemPayloadDomainChange],
-        untracked: bool,
-    ) -> Result<(), LixError> {
-        let deduped_changes = dedupe_filesystem_payload_domain_changes(changes);
-        if deduped_changes.is_empty() {
-            return Ok(());
-        }
-
-        let (sql, params) =
-            build_filesystem_payload_domain_changes_insert(&deduped_changes, untracked);
-        let mut transaction = self.backend.begin_transaction().await?;
-        let mut active_version_id = self.require_active_version_id()?;
-        let mut public_surface_registry = self.public_surface_registry();
-        let mut public_surface_registry_dirty = false;
-        let previous_active_version_id = active_version_id.clone();
-        let mut pending_state_commit_stream_changes = Vec::new();
-        let mut pending_public_append_session = None;
-        let result = self
-            .execute_with_options_in_transaction(
-                transaction.as_mut(),
-                &sql,
-                &params,
-                &ExecuteOptions::default(),
-                true,
-                &mut public_surface_registry,
-                &mut public_surface_registry_dirty,
-                &mut active_version_id,
-                None,
-                true,
-                &mut pending_state_commit_stream_changes,
-                &mut pending_public_append_session,
-            )
-            .await;
-        match result {
-            Ok(_) => {
-                transaction.commit().await?;
-                if active_version_id != previous_active_version_id {
-                    self.set_active_version_id(active_version_id);
-                }
-                self.emit_state_commit_stream_changes(pending_state_commit_stream_changes);
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                return Err(error);
-            }
-        }
-
-        Ok(())
-    }
-
     pub(crate) async fn persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
         &self,
         transaction: &mut dyn LixTransaction,
@@ -389,83 +230,9 @@ impl Engine {
 
         let (sql, params) =
             build_filesystem_payload_domain_changes_insert(&deduped_changes, untracked);
-        let parsed_statements = parse_sql(&sql).map_err(LixError::from)?;
-        let active_version_id = self
-            .require_active_version_id()
-            .unwrap_or_else(|_| crate::version::GLOBAL_VERSION_ID.to_string());
-        let prepared = {
-            let backend = TransactionBackendAdapter::new(transaction);
-            shared_path::prepare_execution_with_backend(
-                self,
-                &backend,
-                &parsed_statements,
-                &params,
-                &active_version_id,
-                None,
-                true,
-                None,
-                shared_path::PreparationPolicy {
-                    skip_side_effect_collection: true,
-                },
-            )
-            .await?
-        };
-        match shared_path::maybe_execute_public_write_with_transaction(
-            self,
-            transaction,
-            &prepared,
-            None,
-            None,
-        )
-        .await?
-        {
-            Some(_) => {}
-            None => {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "filesystem payload domain-change persistence must route through sql2",
-                ))
-            }
-        }
+        transaction.execute(&sql, &params).await?;
 
         Ok(())
-    }
-
-    pub(crate) async fn collect_live_filesystem_payload_domain_changes(
-        &self,
-        writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
-        delete_targets: &BTreeSet<(String, String)>,
-        writer_key: Option<&str>,
-    ) -> Result<Vec<FilesystemPayloadDomainChange>, LixError> {
-        let mut latest_by_key = BTreeMap::new();
-
-        for write in writes {
-            if !write.data_is_authoritative {
-                continue;
-            }
-            let resolved_file_id =
-                resolve_pending_write_file_id_with_backend(self.backend.as_ref(), write).await?;
-            let change = binary_blob_ref_change_for_bytes(
-                &resolved_file_id,
-                &write.version_id,
-                &write.after_data,
-                write.untracked,
-                writer_key,
-            )?;
-            latest_by_key.insert(
-                (resolved_file_id, write.version_id.clone(), write.untracked),
-                change,
-            );
-        }
-
-        for (file_id, version_id) in delete_targets {
-            latest_by_key.insert(
-                (file_id.clone(), version_id.clone(), false),
-                binary_blob_ref_tombstone_change_for_target(file_id, version_id, false, writer_key),
-            );
-        }
-
-        Ok(latest_by_key.into_values().collect())
     }
 
     pub(crate) async fn collect_live_filesystem_payload_domain_changes_in_transaction(
@@ -506,40 +273,6 @@ impl Engine {
         Ok(latest_by_key.into_values().collect())
     }
 
-    pub(crate) async fn persist_pending_file_data_updates(
-        &self,
-        writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
-    ) -> Result<(), LixError> {
-        let mut latest_index_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
-        for (index, write) in writes.iter().enumerate() {
-            if !write.data_is_authoritative {
-                continue;
-            }
-            let resolved_file_id =
-                resolve_pending_write_file_id_with_backend(self.backend.as_ref(), write).await?;
-            latest_index_by_key.insert((resolved_file_id, write.version_id.clone()), index);
-        }
-
-        for ((file_id, version_id), index) in &latest_index_by_key {
-            let write = writes.get(*index).ok_or_else(|| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "file data write persistence failed: invalid write index {} for file '{}' version '{}'",
-                    index, file_id, version_id
-                ),
-            })?;
-            persist_binary_blob_with_fastcdc_backend(
-                self.backend.as_ref(),
-                file_id,
-                version_id,
-                &write.after_data,
-            )
-            .await?;
-        }
-
-        Ok(())
-    }
-
     pub(crate) async fn persist_pending_file_data_updates_in_transaction(
         &self,
         transaction: &mut dyn LixTransaction,
@@ -575,10 +308,6 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) async fn garbage_collect_unreachable_binary_cas(&self) -> Result<(), LixError> {
-        garbage_collect_unreachable_binary_cas_with_backend(self.backend.as_ref()).await
-    }
-
     pub(crate) async fn garbage_collect_unreachable_binary_cas_in_transaction(
         &self,
         transaction: &mut dyn LixTransaction,
@@ -587,7 +316,7 @@ impl Engine {
     }
 }
 
-fn build_filesystem_payload_domain_changes_insert(
+pub(crate) fn build_filesystem_payload_domain_changes_insert(
     changes: &[FilesystemPayloadDomainChange],
     untracked: bool,
 ) -> (String, Vec<Value>) {
@@ -673,25 +402,6 @@ trait BinaryCasExecutor {
     async fn binary_blob_ref_relation_exists(&mut self) -> Result<bool, LixError>;
 }
 
-struct BackendBinaryCasExecutor<'a> {
-    backend: &'a dyn LixBackend,
-}
-
-#[async_trait::async_trait(?Send)]
-impl<'a> BinaryCasExecutor for BackendBinaryCasExecutor<'a> {
-    fn dialect(&self) -> SqlDialect {
-        self.backend.dialect()
-    }
-
-    async fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        self.backend.execute(sql, params).await
-    }
-
-    async fn binary_blob_ref_relation_exists(&mut self) -> Result<bool, LixError> {
-        binary_blob_ref_relation_exists_with_backend(self.backend).await
-    }
-}
-
 struct TransactionBinaryCasExecutor<'a> {
     transaction: &'a mut dyn LixTransaction,
 }
@@ -709,16 +419,6 @@ impl<'a> BinaryCasExecutor for TransactionBinaryCasExecutor<'a> {
     async fn binary_blob_ref_relation_exists(&mut self) -> Result<bool, LixError> {
         binary_blob_ref_relation_exists_in_transaction(self.transaction).await
     }
-}
-
-async fn persist_binary_blob_with_fastcdc_backend(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
-    data: &[u8],
-) -> Result<(), LixError> {
-    let mut executor = BackendBinaryCasExecutor { backend };
-    persist_binary_blob_with_fastcdc(&mut executor, file_id, version_id, data).await
 }
 
 async fn persist_binary_blob_with_fastcdc_in_transaction(
@@ -911,13 +611,6 @@ fn compress_binary_chunk_payload(chunk_data: &[u8]) -> Result<Vec<u8>, LixError>
     ))
 }
 
-async fn garbage_collect_unreachable_binary_cas_with_backend(
-    backend: &dyn LixBackend,
-) -> Result<(), LixError> {
-    let mut executor = BackendBinaryCasExecutor { backend };
-    garbage_collect_unreachable_binary_cas_with_executor(&mut executor).await
-}
-
 async fn garbage_collect_unreachable_binary_cas_in_transaction(
     transaction: &mut dyn LixTransaction,
 ) -> Result<(), LixError> {
@@ -965,40 +658,6 @@ async fn garbage_collect_unreachable_binary_cas_with_executor(
         .await?;
 
     Ok(())
-}
-
-async fn binary_blob_ref_relation_exists_with_backend(
-    backend: &dyn LixBackend,
-) -> Result<bool, LixError> {
-    match backend.dialect() {
-        SqlDialect::Sqlite => {
-            let result = backend
-                .execute(
-                    "SELECT 1 \
-                     FROM sqlite_master \
-                     WHERE name = $1 \
-                       AND type IN ('table', 'view') \
-                     LIMIT 1",
-                    &[Value::Text(tables::state::STATE_BY_VERSION.to_string())],
-                )
-                .await?;
-            Ok(!result.rows.is_empty())
-        }
-        SqlDialect::Postgres => {
-            let result = backend
-                .execute(
-                    "SELECT 1 \
-                     FROM pg_catalog.pg_class c \
-                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE n.nspname = current_schema() \
-                       AND c.relname = $1 \
-                     LIMIT 1",
-                    &[Value::Text(tables::state::STATE_BY_VERSION.to_string())],
-                )
-                .await?;
-            Ok(!result.rows.is_empty())
-        }
-    }
 }
 
 async fn binary_blob_ref_relation_exists_in_transaction(

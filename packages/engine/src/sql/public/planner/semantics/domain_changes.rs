@@ -197,6 +197,11 @@ fn summarize_partition_rows(partition: &ResolvedWritePartition) -> JsonValue {
                     "len": lazy.data.len(),
                 },
             }),
+            crate::sql::public::planner::ir::LazyExactFileUpdate::Delete(lazy) => json!({
+                "kind": "lazy_exact_file_delete",
+                "file_ids": lazy.file_ids,
+                "version_id": lazy.version_id,
+            }),
         };
     }
     summarize_planned_rows(&partition.intended_post_state)

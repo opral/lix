@@ -1,9 +1,14 @@
-use crate::engine::{
-    CollectedExecutionSideEffects, DeferredTransactionSideEffects, Engine,
-    TransactionBackendAdapter,
-};
+use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
-use crate::state::internal::script::prepare_statement_script_sql_statements;
+use crate::sql::execution::shared_path::{
+    self, prepared_execution_mutates_public_surface_registry,
+};
+use crate::sql::execution::write_txn_plan::build_write_txn_plan;
+use crate::sql::execution::write_txn_runner::run_write_txn_plan_with_transaction;
+use crate::sql::public::runtime::classify_public_execution_route_with_registry;
+use crate::state::internal::script::{
+    coalesce_vtable_inserts_in_statement_list, prepare_statement_script_sql_statements,
+};
 use crate::state::stream::StateCommitStreamChange;
 use crate::{ExecuteOptions, ExecuteResult, LixError, LixTransaction, Value};
 use sqlparser::ast::Statement;
@@ -99,60 +104,177 @@ impl Engine {
             crate::sql::execution::shared_path::PendingPublicAppendSession,
         >,
     ) -> Result<ExecuteResult, LixError> {
-        let can_defer_side_effects = false;
-        let mut deferred_side_effects = if can_defer_side_effects {
-            let CollectedExecutionSideEffects {
-                pending_file_writes,
-                pending_file_delete_targets,
-                ..
-            } = {
-                let backend = TransactionBackendAdapter::new(transaction);
-                self.collect_execution_side_effects_with_backend_from_statements(
-                    &backend,
-                    &original_statements,
-                    params,
-                    active_version_id,
-                    options.writer_key.as_deref(),
-                )
-                .await?
-            };
-            Some(DeferredTransactionSideEffects {
-                pending_file_writes,
-                pending_file_delete_targets: pending_file_delete_targets.clone(),
-            })
-        } else {
-            None
-        };
+        let result_statement_count = original_statements.len();
+        let script_statements = coalesce_vtable_inserts_in_statement_list(original_statements)?;
         let sql_statements = prepare_statement_script_sql_statements(
-            original_statements,
+            script_statements.clone(),
             params,
             transaction.dialect(),
         )?;
-        let skip_statement_side_effect_collection = deferred_side_effects.is_some();
+        self.execute_statement_script_as_combined_write_txn_in_transaction(
+            transaction,
+            &script_statements,
+            params,
+            &sql_statements,
+            result_statement_count,
+            options,
+            allow_internal_tables,
+            public_surface_registry,
+            public_surface_registry_dirty,
+            active_version_id,
+            pending_state_commit_stream_changes,
+            pending_public_append_session,
+        )
+        .await
+    }
 
-        let mut statement_results = Vec::with_capacity(sql_statements.len());
-        for (sql, statement_params) in sql_statements {
-            let result = if skip_statement_side_effect_collection {
-                self.execute_with_options_in_transaction(
+    async fn execute_statement_script_as_combined_write_txn_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        original_statements: &[Statement],
+        params: &[Value],
+        sql_statements: &[(String, Vec<Value>)],
+        result_statement_count: usize,
+        options: &ExecuteOptions,
+        allow_internal_tables: bool,
+        public_surface_registry: &mut crate::sql::public::catalog::SurfaceRegistry,
+        public_surface_registry_dirty: &mut bool,
+        active_version_id: &mut String,
+        pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
+        pending_public_append_session: &mut Option<
+            crate::sql::execution::shared_path::PendingPublicAppendSession,
+        >,
+    ) -> Result<ExecuteResult, LixError> {
+        if original_statements.len() != sql_statements.len() {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "statement script preparation produced a mismatched statement count"
+                    .to_string(),
+            });
+        }
+
+        let writer_key = options.writer_key.as_deref();
+        let mut executable_statements = Vec::new();
+        for (statement, statement_sql) in original_statements.iter().zip(sql_statements.iter()) {
+            if matches!(
+                statement,
+                Statement::StartTransaction { .. }
+                    | Statement::Commit { .. }
+                    | Statement::Rollback { .. }
+            ) {
+                continue;
+            }
+            executable_statements.push((statement, statement_sql));
+        }
+        if executable_statements.is_empty() {
+            return Ok(ExecuteResult {
+                statements: vec![
+                    crate::QueryResult {
+                        rows: Vec::new(),
+                        columns: Vec::new(),
+                    };
+                    result_statement_count
+                ],
+            });
+        }
+
+        let internal_only_script = original_statements.iter().all(|statement| {
+            classify_public_execution_route_with_registry(
+                public_surface_registry,
+                std::slice::from_ref(statement),
+            )
+            .is_none()
+        });
+        let internal_only_mutating_script = internal_only_script
+            && original_statements.iter().all(|statement| {
+                !matches!(statement, Statement::Query(_) | Statement::Explain { .. })
+            });
+        if internal_only_mutating_script {
+            let backend = TransactionBackendAdapter::new(transaction);
+            let combined_prepared = shared_path::prepare_execution_with_backend(
+                self,
+                &backend,
+                original_statements,
+                params,
+                active_version_id.as_str(),
+                writer_key,
+                allow_internal_tables,
+                Some(public_surface_registry),
+                shared_path::PreparationPolicy {
+                    skip_side_effect_collection: false,
+                },
+            )
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "statement script combined prepare_execution_with_backend failed: {}",
+                    error.description
+                ),
+            })?;
+            let Some(combined_plan) = build_write_txn_plan(&combined_prepared, writer_key) else {
+                return Ok(ExecuteResult {
+                    statements: vec![
+                        crate::QueryResult {
+                            rows: Vec::new(),
+                            columns: Vec::new(),
+                        };
+                        result_statement_count
+                    ],
+                });
+            };
+            let execution = run_write_txn_plan_with_transaction(
+                self,
+                transaction,
+                &combined_plan,
+                crate::sql::execution::write_txn_plan::WriteTxnRunMode::Borrowed,
+                Some(pending_public_append_session),
+            )
+            .await?;
+
+            let active_effects = execution
+                .plan_effects_override
+                .as_ref()
+                .cloned()
+                .unwrap_or_default();
+            let mut state_commit_stream_changes =
+                active_effects.state_commit_stream_changes.clone();
+            state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());
+            if let Some(version_id) = &active_effects.next_active_version_id {
+                *active_version_id = version_id.clone();
+            }
+
+            self.maybe_invalidate_deterministic_settings_cache(
+                &combined_prepared.plan.preprocess.mutations,
+                &state_commit_stream_changes,
+            );
+            if prepared_execution_mutates_public_surface_registry(&combined_prepared)? {
+                let backend = TransactionBackendAdapter::new(transaction);
+                *public_surface_registry =
+                    crate::sql::public::catalog::SurfaceRegistry::bootstrap_with_backend(&backend)
+                        .await?;
+                *public_surface_registry_dirty = true;
+            }
+
+            pending_state_commit_stream_changes.extend(state_commit_stream_changes);
+            return Ok(ExecuteResult {
+                statements: vec![
+                    crate::QueryResult {
+                        rows: Vec::new(),
+                        columns: Vec::new(),
+                    };
+                    result_statement_count
+                ],
+            });
+        }
+
+        let mut results = Vec::with_capacity(result_statement_count);
+        for (_statement, (sql, statement_params)) in executable_statements {
+            let result = self
+                .execute_with_options_in_transaction(
                     transaction,
-                    &sql,
-                    &statement_params,
-                    options,
-                    allow_internal_tables,
-                    public_surface_registry,
-                    public_surface_registry_dirty,
-                    active_version_id,
-                    deferred_side_effects.as_mut(),
-                    true,
-                    pending_state_commit_stream_changes,
-                    pending_public_append_session,
-                )
-                .await
-            } else {
-                self.execute_with_options_in_transaction(
-                    transaction,
-                    &sql,
-                    &statement_params,
+                    sql,
+                    statement_params,
                     options,
                     allow_internal_tables,
                     public_surface_registry,
@@ -163,29 +285,11 @@ impl Engine {
                     pending_state_commit_stream_changes,
                     pending_public_append_session,
                 )
-                .await
-            };
-
-            match result {
-                Ok(query_result) => {
-                    statement_results.push(query_result);
-                }
-                Err(error) => {
-                    return Err(error);
-                }
-            }
-        }
-
-        if let Some(side_effects) = deferred_side_effects.as_mut() {
-            self.flush_deferred_transaction_side_effects_in_transaction(
-                transaction,
-                side_effects,
-                options.writer_key.as_deref(),
-            )
-            .await?;
+                .await?;
+            results.push(result);
         }
         Ok(ExecuteResult {
-            statements: statement_results,
+            statements: results,
         })
     }
 }

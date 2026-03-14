@@ -16,7 +16,7 @@ pub(crate) struct TrackedWriteTxnPlan {
 
 impl TrackedWriteTxnPlan {
     pub(crate) fn should_emit_observe_tick(&self) -> bool {
-        self.execution.lazy_exact_file_update.is_some()
+        !self.execution.lazy_exact_file_updates.is_empty()
             || !self
                 .execution
                 .semantic_effects
@@ -24,8 +24,8 @@ impl TrackedWriteTxnPlan {
                 .is_empty()
     }
 
-    pub(crate) fn has_lazy_exact_file_update(&self) -> bool {
-        self.execution.lazy_exact_file_update.is_some()
+    pub(crate) fn has_lazy_exact_file_updates(&self) -> bool {
+        !self.execution.lazy_exact_file_updates.is_empty()
     }
 }
 

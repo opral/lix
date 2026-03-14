@@ -118,12 +118,10 @@ pub(crate) fn prepare_statement_script_sql_statements(
     dialect: SqlDialect,
 ) -> Result<Vec<(String, Vec<Value>)>, LixError> {
     if params.is_empty() {
-        return Ok(
-            coalesce_vtable_inserts_in_statement_list(original_statements)?
-                .into_iter()
-                .map(|statement| (statement.to_string(), Vec::new()))
-                .collect(),
-        );
+        return Ok(original_statements
+            .into_iter()
+            .map(|statement| (statement.to_string(), Vec::new()))
+            .collect());
     }
 
     bind_script_placeholders_once(&original_statements, params, dialect).map_err(LixError::from)
