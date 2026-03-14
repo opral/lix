@@ -186,7 +186,9 @@ async fn resolve_admin_write(
             }),
         },
         "lix_active_account" => match planned_write.command.operation_kind {
-            WriteOperationKind::Insert => resolve_active_account_insert_write_plan(planned_write),
+            WriteOperationKind::Insert => {
+                resolve_active_account_insert_write_plan(backend, planned_write).await
+            }
             WriteOperationKind::Delete => {
                 resolve_active_account_delete_write_plan(backend, planned_write).await
             }
@@ -300,7 +302,8 @@ async fn resolve_active_version_update_write_plan(
     ))
 }
 
-fn resolve_active_account_insert_write_plan(
+async fn resolve_active_account_insert_write_plan(
+    backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let MutationPayload::InsertRows(payloads) = &planned_write.command.payload else {
@@ -329,16 +332,54 @@ fn resolve_active_account_insert_write_plan(
         });
     }
 
-    Ok(single_partition_write_plan(
-        default_execution_mode_for_request(planned_write.command.requested_mode),
-        Vec::new(),
-        vec![active_account_admin_row(&account_id)],
-        Vec::new(),
-        vec![RowLineage {
-            entity_id: account_id,
+    let current_rows = load_active_account_admin_rows(backend)
+        .await
+        .map_err(write_resolve_backend_error)?;
+    if current_rows.len() == 1 && current_rows[0].account_id == account_id {
+        return Ok(noop_resolved_write_plan(
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+        ));
+    }
+
+    let authoritative_pre_state = current_rows
+        .iter()
+        .map(active_account_admin_pre_state_ref)
+        .collect::<Vec<_>>();
+    let mut intended_post_state = current_rows
+        .iter()
+        .filter(|row| row.account_id != account_id)
+        .map(|row| active_account_admin_tombstone_row(&row.account_id))
+        .collect::<Vec<_>>();
+    let tombstones = current_rows
+        .iter()
+        .filter(|row| row.account_id != account_id)
+        .map(active_account_admin_pre_state_ref)
+        .collect::<Vec<_>>();
+    let mut lineage = current_rows
+        .iter()
+        .filter(|row| row.account_id != account_id)
+        .map(|row| RowLineage {
+            entity_id: row.account_id.clone(),
             source_change_id: None,
             source_commit_id: None,
-        }],
+        })
+        .collect::<Vec<_>>();
+
+    if !current_rows.iter().any(|row| row.account_id == account_id) {
+        intended_post_state.push(active_account_admin_row(&account_id));
+        lineage.push(RowLineage {
+            entity_id: account_id.clone(),
+            source_change_id: None,
+            source_commit_id: None,
+        });
+    }
+
+    Ok(single_partition_write_plan(
+        default_execution_mode_for_request(planned_write.command.requested_mode),
+        authoritative_pre_state,
+        intended_post_state,
+        tombstones,
+        lineage,
     ))
 }
 
