@@ -21,15 +21,16 @@ use crate::sql::ast::lowering::lower_statement;
 use crate::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
 use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
 use crate::sql::execution::execute_prepared::{
-    execute_prepared_batch_with_transaction, execute_prepared_with_backend,
-    execute_prepared_with_transaction,
+    execute_prepared_with_backend, execute_prepared_with_transaction,
 };
+use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{
     bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
     load_commit_active_accounts, load_version_info_for_versions, CommitQueryExecutor,
     StatementBatch,
 };
+use crate::state::internal::write_program::WriteProgram;
 use crate::state::internal::{
     InternalStatePlan, PostprocessPlan, VtableDeletePlan, VtableUpdatePlan,
 };
@@ -191,7 +192,9 @@ pub(crate) async fn execute_postprocess_with_transaction(
             .await?
         }
     };
-    execute_prepared_batch_with_transaction(transaction, &followup_statements).await?;
+    let mut program = WriteProgram::new();
+    program.push_batch(followup_statements);
+    execute_write_program_with_transaction(transaction, program).await?;
 
     Ok(PostprocessExecutionOutcome {
         internal_result,

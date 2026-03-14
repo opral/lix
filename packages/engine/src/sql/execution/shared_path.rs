@@ -3,22 +3,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::schema::registry::ensure_schema_live_table_in_transaction;
 use crate::sql::public::runtime::{
-    finalize_public_write_execution, prepare_public_execution_with_internal_access,
+    build_tracked_write_txn_plan, finalize_public_write_execution,
+    prepare_public_execution_with_internal_access,
     prepare_public_execution_with_registry_and_internal_access,
     prepared_public_write_mutates_public_surface_registry, PreparedPublicExecution,
     PreparedPublicRead, PreparedPublicWrite, PublicWriteExecutionPartition,
 };
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{
-    append_commit_if_preconditions_hold, bind_statement_batch_for_dialect,
-    build_statement_batch_from_generate_commit_result, generate_commit,
-    load_commit_active_accounts, load_version_info_for_versions, AppendCommitArgs,
-    AppendCommitDisposition, AppendCommitError, AppendCommitErrorKind,
-    AppendCommitInvariantChecker, AppendCommitPreconditions, AppendExpectedTip, AppendWriteLane,
-    CommitQueryExecutor, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
-    MaterializedStateRow, VersionInfo,
+    bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
+    generate_commit, load_commit_active_accounts, load_version_info_for_versions,
+    AppendCommitError, AppendCommitErrorKind, AppendCommitInvariantChecker,
+    AppendCommitPreconditions, AppendExpectedTip, AppendWriteLane, CommitQueryExecutor,
+    DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow, VersionInfo,
 };
 use crate::state::validation::{
     validate_inserts, validate_sql2_append_time_write, validate_sql2_batch_local_write,
@@ -40,6 +38,9 @@ use crate::sql::execution::intent::{
     ExecutionIntent, IntentCollectionPolicy,
 };
 use crate::sql::execution::plan::build_execution_plan;
+use crate::sql::execution::tracked_write_runner::run_tracked_write_txn_plan_with_transaction;
+use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
+use crate::state::internal::write_program::WriteProgram;
 use serde_json::{json, Value as JsonValue};
 use sqlparser::ast::Statement;
 
@@ -95,10 +96,6 @@ pub(crate) fn prepared_execution_mutates_public_surface_registry(
     Ok(dirty)
 }
 
-pub(crate) struct CacheTargets {
-    pub(crate) file_cache_refresh_targets: BTreeSet<(String, String)>,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct PendingPublicAppendSession {
     pub(crate) lane: AppendWriteLane,
@@ -113,13 +110,13 @@ pub(crate) struct PendingPublicAppendSession {
     pub(crate) commit_snapshot: JsonValue,
 }
 
-struct Sql2AppendInvariantChecker<'a> {
+pub(crate) struct Sql2AppendInvariantChecker<'a> {
     planned_write: &'a crate::sql::public::planner::ir::PlannedWrite,
     schema_cache: crate::state::validation::SchemaCache,
 }
 
 impl<'a> Sql2AppendInvariantChecker<'a> {
-    fn new(planned_write: &'a crate::sql::public::planner::ir::PlannedWrite) -> Self {
+    pub(crate) fn new(planned_write: &'a crate::sql::public::planner::ir::PlannedWrite) -> Self {
         Self {
             planned_write,
             schema_cache: crate::state::validation::SchemaCache::new(),
@@ -165,8 +162,12 @@ pub(crate) async fn prepare_execution_with_backend(
     public_surface_registry_override: Option<&crate::sql::public::catalog::SurfaceRegistry>,
     policy: PreparationPolicy,
 ) -> Result<PreparedExecutionContext, LixError> {
+    let defer_runtime_sequence_load = !allow_internal_tables
+        && !crate::filesystem::pending_file_writes::statements_require_generated_file_insert_ids(
+            parsed_statements,
+        );
     let (settings, sequence_start, functions) = engine
-        .prepare_runtime_functions_with_backend(backend)
+        .prepare_runtime_functions_with_backend(backend, defer_runtime_sequence_load)
         .await?;
 
     let mut statements = parsed_statements.to_vec();
@@ -488,26 +489,6 @@ mod tests {
     }
 }
 
-pub(crate) fn derive_cache_targets(
-    plan: &ExecutionPlan,
-    active_effects: &PlanEffects,
-    effects_are_authoritative: bool,
-    postprocess_file_cache_targets: BTreeSet<(String, String)>,
-) -> CacheTargets {
-    let file_cache_refresh_targets =
-        if effects_are_authoritative || plan.requirements.should_refresh_file_cache {
-            let mut targets = active_effects.file_cache_refresh_targets.clone();
-            targets.extend(postprocess_file_cache_targets.clone());
-            targets
-        } else {
-            BTreeSet::new()
-        };
-
-    CacheTargets {
-        file_cache_refresh_targets,
-    }
-}
-
 pub(crate) async fn maybe_execute_public_write_with_backend(
     engine: &Engine,
     prepared: &PreparedExecutionContext,
@@ -598,160 +579,14 @@ async fn execute_public_tracked_write_with_transaction(
     public_write: &PreparedPublicWrite,
     prepared: &PreparedExecutionContext,
     writer_key: Option<&str>,
-    mut pending_append_session: Option<&mut Option<PendingPublicAppendSession>>,
+    pending_append_session: Option<&mut Option<PendingPublicAppendSession>>,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    if execution.persist_filesystem_payloads_before_write {
-        engine
-            .persist_pending_file_data_updates_in_transaction(
-                transaction,
-                &prepared.intent.pending_file_writes,
-            )
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "public tracked filesystem payload persistence failed before append: {}",
-                    error.description
-                ),
-            })?;
-    }
-
-    for live_table_requirement in &execution.schema_live_table_requirements {
-        ensure_schema_live_table_in_transaction(transaction, &live_table_requirement.schema_key)
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "public tracked write schema live-table ensure failed for '{}': {}",
-                    live_table_requirement.schema_key, error.description
-                ),
-            })?;
-    }
-
-    if execution.domain_change_batch.changes.is_empty() {
-        return Ok(Some(empty_public_write_execution_outcome()));
-    }
-
-    let mut append_functions = prepared.functions.clone();
-    let timestamp = append_functions.timestamp();
-    if let Some(session_slot) = pending_append_session.as_mut() {
-        let can_merge = session_slot.as_ref().is_some_and(|session| {
-            pending_session_matches_append(session, &execution.append_preconditions)
-        });
-        if can_merge {
-            let mut invariant_checker =
-                Sql2AppendInvariantChecker::new(&public_write.planned_write);
-            invariant_checker
-                .recheck_invariants(transaction)
-                .await
-                .map_err(append_commit_error_to_lix_error)?;
-            let session = session_slot
-                .as_mut()
-                .expect("session should exist when can_merge is true");
-            merge_public_domain_change_batch_into_pending_commit(
-                transaction,
-                session,
-                &execution.domain_change_batch,
-                &mut append_functions,
-                &timestamp,
-            )
-            .await?;
-
-            let _ = writer_key;
-            return Ok(Some(SqlExecutionOutcome {
-                public_result: QueryResult {
-                    rows: Vec::new(),
-                    columns: Vec::new(),
-                },
-                postprocess_file_cache_targets: BTreeSet::new(),
-                plugin_changes_committed: true,
-                plan_effects_override: Some(execution.semantic_effects.clone()),
-                state_commit_stream_changes: Vec::new(),
-            }));
-        }
-    }
-
-    let mut invariant_checker = Sql2AppendInvariantChecker::new(&public_write.planned_write);
-    let append_result = append_commit_if_preconditions_hold(
-        transaction,
-        AppendCommitArgs {
-            timestamp,
-            changes: execution.domain_change_batch.changes.clone(),
-            preconditions: execution.append_preconditions.clone(),
-        },
-        &mut append_functions,
-        Some(&mut invariant_checker),
-    )
-    .await
-    .map_err(append_commit_error_to_lix_error)?;
-
-    if let Some(commit_result) = append_result.commit_result.as_ref() {
-        mirror_public_registered_schema_bootstrap_rows(transaction, commit_result)
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "public tracked write registered-schema bootstrap mirroring failed: {}",
-                    error.description
-                ),
-            })?;
-    }
-    if matches!(append_result.disposition, AppendCommitDisposition::Applied) {
-        apply_public_version_last_checkpoint_side_effects(
-            transaction,
-            public_write,
-            &execution.domain_change_batch,
-        )
+    let plan = build_tracked_write_txn_plan(public_write, execution, prepared, writer_key);
+    run_tracked_write_txn_plan_with_transaction(engine, transaction, &plan, pending_append_session)
         .await
-        .map_err(|error| LixError {
-            code: error.code,
-            description: format!(
-                "public tracked write version checkpoint side effects failed: {}",
-                error.description
-            ),
-        })?;
-    }
-
-    let plugin_changes_committed =
-        matches!(append_result.disposition, AppendCommitDisposition::Applied);
-    if let Some(session_slot) = pending_append_session.as_mut() {
-        **session_slot = if plugin_changes_committed {
-            if let Some(commit_result) = append_result.commit_result.as_ref() {
-                Some(
-                    build_pending_public_append_session(
-                        transaction,
-                        execution.append_preconditions.write_lane.clone(),
-                        commit_result,
-                    )
-                    .await?,
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-    }
-    let plan_effects_override = if plugin_changes_committed {
-        execution.semantic_effects.clone()
-    } else {
-        PlanEffects::default()
-    };
-
-    let _ = writer_key;
-    Ok(Some(SqlExecutionOutcome {
-        public_result: QueryResult {
-            rows: Vec::new(),
-            columns: Vec::new(),
-        },
-        postprocess_file_cache_targets: BTreeSet::new(),
-        plugin_changes_committed,
-        plan_effects_override: Some(plan_effects_override),
-        state_commit_stream_changes: Vec::new(),
-    }))
 }
 
-fn empty_public_write_execution_outcome() -> SqlExecutionOutcome {
+pub(crate) fn empty_public_write_execution_outcome() -> SqlExecutionOutcome {
     SqlExecutionOutcome {
         public_result: QueryResult {
             rows: Vec::new(),
@@ -805,18 +640,19 @@ fn merge_plan_effects_override(existing: &mut Option<PlanEffects>, next: Option<
     }
 }
 
-fn pending_session_matches_append(
+pub(crate) fn pending_session_matches_append(
     session: &PendingPublicAppendSession,
     preconditions: &AppendCommitPreconditions,
 ) -> bool {
     session.lane == preconditions.write_lane
-        && matches!(
-            &preconditions.expected_tip,
-            AppendExpectedTip::CommitId(commit_id) if commit_id == &session.commit_id
-        )
+        && match &preconditions.expected_tip {
+            AppendExpectedTip::CurrentTip => true,
+            AppendExpectedTip::CommitId(commit_id) => commit_id == &session.commit_id,
+            AppendExpectedTip::CreateIfMissing => false,
+        }
 }
 
-async fn build_pending_public_append_session(
+pub(crate) async fn build_pending_public_append_session(
     transaction: &mut dyn LixTransaction,
     lane: AppendWriteLane,
     commit_result: &GenerateCommitResult,
@@ -908,7 +744,7 @@ async fn build_pending_public_append_session(
     })
 }
 
-async fn merge_public_domain_change_batch_into_pending_commit(
+pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
     transaction: &mut dyn LixTransaction,
     session: &mut PendingPublicAppendSession,
     batch: &crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch,
@@ -1214,7 +1050,9 @@ async fn execute_generated_commit_result(
         )?,
         transaction.dialect(),
     )?;
-    transaction.execute(&prepared.sql, &prepared.params).await?;
+    let mut program = WriteProgram::new();
+    program.push_batch(prepared);
+    execute_write_program_with_transaction(transaction, program).await?;
     Ok(())
 }
 
@@ -1415,14 +1253,16 @@ fn value_as_bool(value: &Value) -> Option<bool> {
     }
 }
 
-fn append_commit_error_to_lix_error(error: crate::state::commit::AppendCommitError) -> LixError {
+pub(crate) fn append_commit_error_to_lix_error(
+    error: crate::state::commit::AppendCommitError,
+) -> LixError {
     LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: error.message,
     }
 }
 
-async fn mirror_public_registered_schema_bootstrap_rows(
+pub(crate) async fn mirror_public_registered_schema_bootstrap_rows(
     transaction: &mut dyn LixTransaction,
     commit_result: &crate::state::commit::GenerateCommitResult,
 ) -> Result<(), LixError> {
@@ -1486,7 +1326,7 @@ async fn mirror_public_registered_schema_bootstrap_rows(
     Ok(())
 }
 
-async fn apply_public_version_last_checkpoint_side_effects(
+pub(crate) async fn apply_public_version_last_checkpoint_side_effects(
     transaction: &mut dyn LixTransaction,
     public_write: &PreparedPublicWrite,
     batch: &crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch,

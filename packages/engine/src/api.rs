@@ -8,15 +8,21 @@ use crate::sql::ast::walk::object_name_matches;
 use crate::sql::common::ast::lower_statement;
 use crate::sql::execution::execute;
 use crate::sql::execution::parse::parse_sql;
+use crate::sql::execution::post_commit_effects::apply_owned_execution_post_commit_effects;
 use crate::sql::execution::shared_path;
 use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
 use crate::sql::execution::transaction_session::execute_public_sql;
+use crate::sql::execution::write_program_runner::{
+    execute_write_program_with_backend, execute_write_program_with_transaction,
+};
 use crate::sql::public::runtime::{
     classify_public_execution_route_with_registry, decode_public_read_result,
 };
+use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::internal::inline_functions::inline_lix_functions_with_provider;
 use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
 use crate::state::internal::statement_references_internal_state_vtable;
+use crate::state::internal::write_program::WriteProgram;
 use crate::state::materialization::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
 };
@@ -26,6 +32,19 @@ use sqlparser::ast::{Expr, Function, Statement, Visit, Visitor};
 use std::ops::ControlFlow;
 
 impl Engine {
+    pub(crate) fn build_observe_tick_insert_sql(&self, writer_key: Option<&str>) -> String {
+        match writer_key {
+            Some(writer_key) => format!(
+                "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+                 VALUES (CURRENT_TIMESTAMP, '{}')",
+                escape_sql_string(writer_key)
+            ),
+            None => "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+                      VALUES (CURRENT_TIMESTAMP, NULL)"
+                .to_string(),
+        }
+    }
+
     #[doc(hidden)]
     pub async fn open_existing(&self) -> Result<(), LixError> {
         if !self.is_initialized().await? {
@@ -48,26 +67,9 @@ impl Engine {
         &self,
         writer_key: Option<&str>,
     ) -> Result<(), LixError> {
-        match writer_key {
-            Some(writer_key) => {
-                self.backend
-                    .execute(
-                        "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
-                         VALUES (CURRENT_TIMESTAMP, $1)",
-                        &[Value::Text(writer_key.to_string())],
-                    )
-                    .await?;
-            }
-            None => {
-                self.backend
-                    .execute(
-                        "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
-                         VALUES (CURRENT_TIMESTAMP, NULL)",
-                        &[],
-                    )
-                    .await?;
-            }
-        }
+        let mut program = WriteProgram::new();
+        program.push_statement(self.build_observe_tick_insert_sql(writer_key), Vec::new());
+        execute_write_program_with_backend(self.backend.as_ref(), program).await?;
         Ok(())
     }
 
@@ -76,26 +78,9 @@ impl Engine {
         transaction: &mut dyn LixTransaction,
         writer_key: Option<&str>,
     ) -> Result<(), LixError> {
-        match writer_key {
-            Some(writer_key) => {
-                transaction
-                    .execute(
-                        "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
-                         VALUES (CURRENT_TIMESTAMP, $1)",
-                        &[Value::Text(writer_key.to_string())],
-                    )
-                    .await?;
-            }
-            None => {
-                transaction
-                    .execute(
-                        "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
-                         VALUES (CURRENT_TIMESTAMP, NULL)",
-                        &[],
-                    )
-                    .await?;
-            }
-        }
+        let mut program = WriteProgram::new();
+        program.push_statement(self.build_observe_tick_insert_sql(writer_key), Vec::new());
+        execute_write_program_with_transaction(transaction, program).await?;
         Ok(())
     }
 
@@ -183,6 +168,7 @@ impl Engine {
                 .execute_plain_backend_read(sql, params, &parsed_statements)
                 .await;
         }
+        let public_surface_registry = self.public_surface_registry();
         let prepared = shared_path::prepare_execution_with_backend(
             self,
             self.backend.as_ref(),
@@ -191,7 +177,7 @@ impl Engine {
             &active_version_id,
             writer_key,
             allow_internal_sql,
-            None,
+            Some(&public_surface_registry),
             shared_path::PreparationPolicy {
                 skip_side_effect_collection: false,
             },
@@ -200,11 +186,11 @@ impl Engine {
         let public_surface_registry_dirty =
             prepared_execution_mutates_public_surface_registry(&prepared)?;
 
-        let execution =
+        let (execution, write_owned_transaction_committed) =
             match shared_path::maybe_execute_public_write_with_backend(self, &prepared, writer_key)
                 .await
             {
-                Ok(Some(execution)) => execution,
+                Ok(Some(execution)) => (execution, true),
                 Ok(None) => match execute::execute_plan_sql(
                     self,
                     &prepared.plan,
@@ -215,7 +201,7 @@ impl Engine {
                 .await
                 .map_err(LixError::from)
                 {
-                    Ok(execution) => execution,
+                    Ok(execution) => (execution, false),
                     Err(error) => {
                         return Err(normalize_sql_execution_error_with_backend(
                             self.backend.as_ref(),
@@ -228,90 +214,15 @@ impl Engine {
                 Err(error) => return Err(error),
             };
 
-        execute::persist_runtime_sequence(
+        apply_owned_execution_post_commit_effects(
             self,
-            prepared.settings,
-            prepared.sequence_start,
-            &prepared.functions,
+            &prepared,
+            &execution,
+            writer_key,
+            write_owned_transaction_committed,
+            public_surface_registry_dirty,
         )
         .await?;
-
-        let active_effects = execution
-            .plan_effects_override
-            .as_ref()
-            .unwrap_or(&prepared.plan.effects);
-        let effects_are_authoritative = execution.plan_effects_override.is_some();
-
-        if let Some(version_id) = &active_effects.next_active_version_id {
-            self.set_active_version_id(version_id.clone());
-        }
-
-        let _file_cache_refresh_targets = shared_path::derive_cache_targets(
-            &prepared.plan,
-            active_effects,
-            effects_are_authoritative,
-            execution.postprocess_file_cache_targets.clone(),
-        )
-        .file_cache_refresh_targets;
-
-        let filesystem_payload_domain_changes = self
-            .collect_live_filesystem_payload_domain_changes(
-                &prepared.intent.pending_file_writes,
-                &prepared.intent.pending_file_delete_targets,
-                writer_key,
-            )
-            .await?;
-        let filesystem_payload_domain_changes =
-            crate::engine::dedupe_filesystem_payload_domain_changes(
-                &filesystem_payload_domain_changes,
-            );
-        let payload_domain_changes_to_persist =
-            if shared_path::public_write_filesystem_payload_changes_already_committed(&prepared) {
-                Vec::new()
-            } else if execution.plugin_changes_committed {
-                crate::engine::dedupe_filesystem_payload_domain_changes(
-                    &filesystem_payload_domain_changes,
-                )
-            } else {
-                filesystem_payload_domain_changes.clone()
-            };
-        let should_run_binary_gc = crate::engine::should_run_binary_cas_gc(
-            &prepared.plan.preprocess.mutations,
-            &filesystem_payload_domain_changes,
-        );
-
-        if !shared_path::public_write_filesystem_payload_changes_already_committed(&prepared) {
-            self.persist_pending_file_data_updates(&prepared.intent.pending_file_writes)
-                .await?;
-        }
-        if !payload_domain_changes_to_persist.is_empty() {
-            self.persist_filesystem_payload_domain_changes(&payload_domain_changes_to_persist)
-                .await?;
-        }
-        if should_run_binary_gc {
-            self.garbage_collect_unreachable_binary_cas().await?;
-        }
-
-        let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
-        state_commit_stream_changes.extend(execution.state_commit_stream_changes);
-        let should_emit_observe_tick = !state_commit_stream_changes.is_empty();
-
-        if !effects_are_authoritative
-            && prepared
-                .plan
-                .requirements
-                .should_invalidate_installed_plugins_cache
-        {
-            self.invalidate_installed_plugins_cache()?;
-        }
-        if should_emit_observe_tick {
-            self.append_observe_tick(options.writer_key.as_deref())
-                .await?;
-        }
-        if public_surface_registry_dirty {
-            self.refresh_public_surface_registry().await?;
-        }
-        self.emit_state_commit_stream_changes(state_commit_stream_changes);
 
         let public_result = if let Some(public_read) = prepared.public_read.as_ref() {
             decode_public_read_result(execution.public_result, &public_read.lowered_read)
@@ -334,7 +245,7 @@ impl Engine {
             plain_backend_read_uses_runtime_functions(&parsed_statements[0]);
         let (statement, settings, sequence_start, functions) = if uses_runtime_functions {
             let (settings, sequence_start, functions) = self
-                .prepare_runtime_functions_with_backend(self.backend.as_ref())
+                .prepare_runtime_functions_with_backend(self.backend.as_ref(), false)
                 .await?;
             let mut provider = functions.clone();
             (

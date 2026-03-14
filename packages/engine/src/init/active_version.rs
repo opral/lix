@@ -72,7 +72,7 @@ impl Engine {
 
     pub(crate) async fn generate_runtime_uuid(&self) -> Result<String, LixError> {
         let (settings, sequence_start, functions) = self
-            .prepare_runtime_functions_with_backend(self.backend.as_ref())
+            .prepare_runtime_functions_with_backend(self.backend.as_ref(), false)
             .await?;
         let uuid = functions.call_uuid_v7();
         self.persist_runtime_sequence_with_backend(

@@ -7,10 +7,12 @@ use crate::key_value::{
     KEY_VALUE_GLOBAL_VERSION,
 };
 use crate::sql::ast::utils::parse_sql_statements;
+use crate::sql::execution::contracts::prepared_statement::PreparedBatch;
 use crate::sql::execution::preprocess::preprocess_statements_with_provider_to_plan as preprocess_statements_with_provider;
+use crate::sql::execution::write_program_runner::execute_write_program_with_backend;
 use crate::sql::storage::sql_text::escape_sql_string;
-use crate::LixBackend;
-use crate::{LixError, Value};
+use crate::state::internal::write_program::WriteProgram;
+use crate::{LixBackend, LixError, SqlDialect, Value};
 
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 const SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
@@ -23,6 +25,10 @@ pub struct DeterministicSettings {
     pub uuid_v7_enabled: bool,
     pub timestamp_enabled: bool,
     pub timestamp_shuffle_enabled: bool,
+}
+
+pub(crate) fn deterministic_mode_key() -> &'static str {
+    DETERMINISTIC_MODE_KEY
 }
 
 impl DeterministicSettings {
@@ -39,13 +45,16 @@ impl DeterministicSettings {
 #[derive(Debug, Clone)]
 pub struct RuntimeFunctionProvider {
     settings: DeterministicSettings,
+    sequence_start: Option<i64>,
     next_sequence: i64,
 }
 
 impl RuntimeFunctionProvider {
-    pub fn new(settings: DeterministicSettings, next_sequence: i64) -> Self {
+    pub fn new(settings: DeterministicSettings, sequence_start: Option<i64>) -> Self {
+        let next_sequence = sequence_start.unwrap_or(0);
         Self {
             settings,
+            sequence_start,
             next_sequence,
         }
     }
@@ -54,7 +63,15 @@ impl RuntimeFunctionProvider {
         self.next_sequence
     }
 
+    pub fn sequence_start(&self) -> Option<i64> {
+        self.sequence_start
+    }
+
     fn take_sequence(&mut self) -> i64 {
+        assert!(
+            !self.settings.enabled || self.sequence_start.is_some(),
+            "deterministic runtime sequence used before initialization"
+        );
         let current = self.next_sequence;
         self.next_sequence += 1;
         current
@@ -84,6 +101,30 @@ impl LixFunctionProvider for RuntimeFunctionProvider {
             return dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         }
         timestamp()
+    }
+
+    fn deterministic_sequence_enabled(&self) -> bool {
+        self.settings.enabled
+    }
+
+    fn deterministic_sequence_initialized(&self) -> bool {
+        !self.settings.enabled || self.sequence_start.is_some()
+    }
+
+    fn initialize_deterministic_sequence(&mut self, sequence_start: i64) {
+        if !self.settings.enabled || self.sequence_start.is_some() {
+            return;
+        }
+        self.sequence_start = Some(sequence_start);
+        self.next_sequence = sequence_start;
+    }
+
+    fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
+        let sequence_start = self.sequence_start?;
+        if !self.settings.enabled || self.next_sequence <= sequence_start {
+            return None;
+        }
+        Some(self.next_sequence - 1)
     }
 }
 
@@ -132,34 +173,51 @@ pub(crate) fn parse_deterministic_settings_value(mode_value: &JsonValue) -> Dete
     }
 }
 
-pub async fn load_settings(backend: &dyn LixBackend) -> Result<DeterministicSettings, LixError> {
-    let mode_value = match load_key_value_payload(backend, DETERMINISTIC_MODE_KEY).await {
-        Ok(value) => value,
-        Err(err) if is_missing_relation_error(&err) => return Ok(DeterministicSettings::disabled()),
-        Err(err) => return Err(err),
-    };
-    let Some(mode_value) = mode_value else {
-        return Ok(DeterministicSettings::disabled());
-    };
-
-    Ok(parse_deterministic_settings_value(&mode_value))
-}
-
-pub async fn load_persisted_sequence_next(backend: &dyn LixBackend) -> Result<i64, LixError> {
-    let committed_highest = load_sequence_highest_from_committed_state(backend).await?;
-    let untracked_highest = load_sequence_highest_from_untracked_state(backend).await?;
-    let highest_seen = committed_highest
-        .into_iter()
-        .chain(untracked_highest)
-        .max()
-        .unwrap_or(-1);
-    Ok(highest_seen + 1)
-}
-
 pub async fn persist_sequence_highest(
     backend: &dyn LixBackend,
     highest_seen: i64,
 ) -> Result<(), LixError> {
+    let batch = build_persist_sequence_highest_batch(highest_seen, backend.dialect())?;
+    let mut program = WriteProgram::new();
+    program.push_batch(batch);
+    match execute_write_program_with_backend(backend, program).await {
+        Ok(_) => {}
+        Err(err) if is_missing_relation_error(&err) => return Ok(()),
+        Err(err) => return Err(err),
+    }
+    Ok(())
+}
+
+pub(crate) async fn load_runtime_settings(
+    backend: &dyn LixBackend,
+) -> Result<DeterministicSettings, LixError> {
+    let values = match load_key_value_payloads(backend, &[DETERMINISTIC_MODE_KEY]).await {
+        Ok(values) => values,
+        Err(err) if is_missing_relation_error(&err) => return Ok(DeterministicSettings::disabled()),
+        Err(err) => return Err(err),
+    };
+
+    Ok(values
+        .get(DETERMINISTIC_MODE_KEY)
+        .map(parse_deterministic_settings_value)
+        .unwrap_or_else(DeterministicSettings::disabled))
+}
+
+pub(crate) async fn load_runtime_sequence_start(backend: &dyn LixBackend) -> Result<i64, LixError> {
+    let values = match load_key_value_payloads(backend, &[SEQUENCE_KEY]).await {
+        Ok(values) => values,
+        Err(err) if is_missing_relation_error(&err) => return Ok(0),
+        Err(err) => return Err(err),
+    };
+
+    let highest_seen = values.get(SEQUENCE_KEY).and_then(parse_integer_value);
+    Ok(highest_seen.unwrap_or(-1) + 1)
+}
+
+pub(crate) fn build_persist_sequence_highest_batch(
+    highest_seen: i64,
+    dialect: SqlDialect,
+) -> Result<PreparedBatch, LixError> {
     let snapshot_content = serde_json::json!({
         "key": SEQUENCE_KEY,
         "value": highest_seen
@@ -181,136 +239,104 @@ pub async fn persist_sequence_highest(
 
     let mut provider = FixedTimestampFunctionProvider;
     let statements = parse_sql_statements(&sql)?;
-    let rewritten =
-        preprocess_statements_with_provider(statements, &[], &mut provider, backend.dialect())?;
-    if let Err(err) = backend
-        .execute(&rewritten.sql, rewritten.single_statement_params()?)
-        .await
-    {
-        if is_missing_relation_error(&err) {
-            return Ok(());
-        }
-        return Err(err);
-    }
-    Ok(())
+    let rewritten = preprocess_statements_with_provider(statements, &[], &mut provider, dialect)?;
+    let params = rewritten.single_statement_params()?.to_vec();
+    Ok(PreparedBatch {
+        sql: rewritten.sql,
+        params,
+    })
 }
 
-async fn load_key_value_payload(
-    backend: &dyn LixBackend,
-    entity_id: &str,
-) -> Result<Option<JsonValue>, LixError> {
-    let untracked_payload = load_first_payload_from_table(
-        backend,
-        "lix_internal_live_untracked_v1",
-        &format!(
-            "schema_key = '{schema_key}' \
-             AND entity_id = '{entity_id}' \
-             AND version_id = '{version_id}' \
-             AND snapshot_content IS NOT NULL",
-            schema_key = escape_sql_string(key_value_schema_key()),
-            entity_id = escape_sql_string(entity_id),
-            version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
-        ),
+pub(crate) fn build_persist_sequence_highest_sql(highest_seen: i64) -> String {
+    let snapshot_content = serde_json::json!({
+        "key": SEQUENCE_KEY,
+        "value": highest_seen
+    })
+    .to_string();
+
+    format!(
+        "INSERT INTO lix_internal_live_untracked_v1 \
+         (entity_id, schema_key, file_id, version_id, global, plugin_key, snapshot_content, metadata, writer_key, schema_version, created_at, updated_at) \
+         VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', FALSE, '{plugin_key}', '{snapshot_content}', NULL, NULL, '{schema_version}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) \
+         ON CONFLICT (entity_id, schema_key, file_id, version_id) DO UPDATE SET \
+           global = excluded.global, \
+           plugin_key = excluded.plugin_key, \
+           snapshot_content = excluded.snapshot_content, \
+           metadata = excluded.metadata, \
+           writer_key = excluded.writer_key, \
+           schema_version = excluded.schema_version, \
+           updated_at = CURRENT_TIMESTAMP",
+        entity_id = escape_sql_string(SEQUENCE_KEY),
+        schema_key = escape_sql_string(key_value_schema_key()),
+        file_id = escape_sql_string(key_value_file_id()),
+        version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
+        plugin_key = escape_sql_string(key_value_plugin_key()),
+        schema_version = escape_sql_string(key_value_schema_version()),
+        snapshot_content = escape_sql_string(&snapshot_content),
     )
-    .await?;
-    if untracked_payload.is_some() {
-        return Ok(untracked_payload);
+}
+
+async fn load_key_value_payloads(
+    backend: &dyn LixBackend,
+    entity_ids: &[&str],
+) -> Result<std::collections::BTreeMap<String, JsonValue>, LixError> {
+    if entity_ids.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
     }
 
     let table_name = format!("lix_internal_live_v1_{}", key_value_schema_key());
-    load_first_payload_from_table(
-        backend,
-        &table_name,
-        &format!(
-            "entity_id = '{entity_id}' \
-             AND version_id = '{version_id}' \
-             AND snapshot_content IS NOT NULL \
-             AND is_tombstone = 0",
-            entity_id = escape_sql_string(entity_id),
-            version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
-        ),
-    )
-    .await
-}
-
-async fn load_sequence_highest_from_committed_state(
-    backend: &dyn LixBackend,
-) -> Result<Option<i64>, LixError> {
-    let table_name = format!("lix_internal_live_v1_{}", key_value_schema_key());
-    load_sequence_highest_from_table(
-        backend,
-        &table_name,
-        &format!(
-            "entity_id = '{entity_id}' \
-             AND version_id = '{version_id}' \
-             AND snapshot_content IS NOT NULL \
-             AND is_tombstone = 0",
-            entity_id = escape_sql_string(SEQUENCE_KEY),
-            version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
-        ),
-    )
-    .await
-}
-
-async fn load_sequence_highest_from_untracked_state(
-    backend: &dyn LixBackend,
-) -> Result<Option<i64>, LixError> {
-    load_sequence_highest_from_table(
-        backend,
-        "lix_internal_live_untracked_v1",
-        &format!(
-            "schema_key = '{schema_key}' \
-             AND entity_id = '{entity_id}' \
-             AND version_id = '{version_id}' \
-             AND snapshot_content IS NOT NULL",
-            schema_key = escape_sql_string(key_value_schema_key()),
-            entity_id = escape_sql_string(SEQUENCE_KEY),
-            version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
-        ),
-    )
-    .await
-}
-
-async fn load_sequence_highest_from_table(
-    backend: &dyn LixBackend,
-    table_name: &str,
-    where_clause: &str,
-) -> Result<Option<i64>, LixError> {
-    let sql = format!(
-        "SELECT snapshot_content \
-         FROM {table_name} \
-         WHERE {where_clause}",
-    );
-    let result = match backend.execute(&sql, &[]).await {
-        Ok(result) => result,
-        Err(err) if is_missing_relation_error(&err) => return Ok(None),
-        Err(err) => return Err(err),
-    };
-    Ok(result
-        .rows
+    let in_list = entity_ids
         .iter()
-        .filter_map(|row| parse_first_payload(Some(row)).ok().flatten())
-        .filter_map(|value| parse_integer_value(&value))
-        .max())
-}
-
-async fn load_first_payload_from_table(
-    backend: &dyn LixBackend,
-    table_name: &str,
-    where_clause: &str,
-) -> Result<Option<JsonValue>, LixError> {
+        .map(|entity_id| format!("'{}'", escape_sql_string(entity_id)))
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!(
-        "SELECT snapshot_content \
-         FROM {table_name} \
-         WHERE {where_clause} \
-         LIMIT 1",
+        "SELECT entity_id, snapshot_content, precedence \
+         FROM (\
+           SELECT entity_id, snapshot_content, 0 AS precedence \
+           FROM lix_internal_live_untracked_v1 \
+           WHERE schema_key = '{schema_key}' \
+             AND entity_id IN ({in_list}) \
+             AND version_id = '{version_id}' \
+             AND snapshot_content IS NOT NULL \
+           UNION ALL \
+           SELECT entity_id, snapshot_content, 1 AS precedence \
+           FROM {table_name} \
+           WHERE entity_id IN ({in_list}) \
+             AND version_id = '{version_id}' \
+             AND snapshot_content IS NOT NULL \
+             AND is_tombstone = 0\
+         ) visible_key_values \
+         ORDER BY entity_id ASC, precedence ASC",
+        schema_key = escape_sql_string(key_value_schema_key()),
+        in_list = in_list,
+        version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
+        table_name = table_name,
     );
-    let result = match backend.execute(&sql, &[]).await {
-        Ok(result) => result,
-        Err(err) if is_missing_relation_error(&err) => return Ok(None),
-        Err(err) => return Err(err),
-    };
-    parse_first_payload(result.rows.first())
+    let result = backend.execute(&sql, &[]).await?;
+    let mut values = std::collections::BTreeMap::new();
+    for row in result.rows {
+        let Some(entity_id_value) = row.first() else {
+            continue;
+        };
+        let entity_id = value_to_string(entity_id_value, "entity_id")?;
+        if values.contains_key(&entity_id) {
+            continue;
+        }
+        let Some(snapshot_value) = row.get(1) else {
+            continue;
+        };
+        let raw = value_to_string(snapshot_value, "snapshot_content")?;
+        let parsed: JsonValue = serde_json::from_str(&raw).map_err(|err| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("deterministic mode snapshot_content invalid JSON: {err}"),
+        })?;
+        if let Some(value) = parsed.get("value") {
+            values.insert(entity_id, value.clone());
+        }
+    }
+
+    Ok(values)
 }
 
 fn parse_integer_value(value: &JsonValue) -> Option<i64> {
@@ -329,18 +355,6 @@ fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
             description: format!("expected text value for {name}"),
         }),
     }
-}
-
-fn parse_first_payload(row: Option<&Vec<Value>>) -> Result<Option<JsonValue>, LixError> {
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let raw = value_to_string(&row[0], "snapshot_content")?;
-    let parsed: JsonValue = serde_json::from_str(&raw).map_err(|err| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("deterministic mode snapshot_content invalid JSON: {err}"),
-    })?;
-    Ok(parsed.get("value").cloned())
 }
 
 struct FixedTimestampFunctionProvider;

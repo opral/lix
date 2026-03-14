@@ -4,6 +4,7 @@ use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
+use crate::sql::public::planner::ir::{LazyExactFileMetadataUpdate, OptionalTextPatch};
 use crate::sql::public::planner::semantics::filesystem_assignments::{
     parse_directory_insert_assignments, parse_directory_update_assignments,
     parse_file_insert_assignments, parse_file_update_assignments, DirectoryUpdateAssignments,
@@ -14,9 +15,9 @@ use crate::sql::public::planner::semantics::filesystem_planning::{
 };
 use crate::sql::public::planner::semantics::filesystem_queries::{
     ensure_no_directory_at_file_path, ensure_no_file_at_directory_path, load_directory_row_by_id,
-    load_directory_rows_under_path, load_file_row_by_id, load_file_rows_under_path,
-    lookup_directory_id_by_path, lookup_directory_path_by_id, lookup_file_id_by_path,
-    DirectoryFilesystemRow, FileFilesystemRow,
+    load_directory_rows_under_path, load_file_row_by_id, load_file_row_by_id_without_path,
+    load_file_rows_under_path, lookup_directory_id_by_path, lookup_directory_path_by_id,
+    lookup_file_id_by_path, DirectoryFilesystemRow, FileFilesystemRow,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -73,57 +74,18 @@ fn filesystem_write_lookup_scope(planned_write: &PlannedWrite) -> FilesystemProj
 }
 
 async fn resolved_filesystem_version_id(
-    backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<String, WriteResolveError> {
-    match planned_write.command.target.descriptor.public_name.as_str() {
-        "lix_file" | "lix_directory" => load_active_filesystem_version_id(backend).await,
-        _ => resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
-            message: "public filesystem write requires a concrete version_id".to_string(),
-        }),
-    }
-}
-
-async fn load_active_filesystem_version_id(
-    backend: &dyn LixBackend,
-) -> Result<String, WriteResolveError> {
-    let result = backend
-        .execute(
-            "SELECT snapshot_content \
-             FROM lix_internal_live_untracked_v1 \
-             WHERE schema_key = $1 \
-               AND file_id = $2 \
-               AND version_id = $3 \
-               AND snapshot_content IS NOT NULL \
-             ORDER BY updated_at DESC \
-             LIMIT 1",
-            &[
-                Value::Text(active_version_schema_key().to_string()),
-                Value::Text(active_version_file_id().to_string()),
-                Value::Text(active_version_storage_version_id().to_string()),
-            ],
-        )
-        .await
-        .map_err(write_resolve_backend_error)?;
-    let Some(row) = result.rows.first() else {
-        return Err(WriteResolveError {
-            message: "public filesystem write requires an active version".to_string(),
-        });
-    };
-    let Some(snapshot_content) = row.first().and_then(text_from_value) else {
-        return Err(WriteResolveError {
-            message: "public filesystem active-version lookup expected snapshot_content text"
-                .to_string(),
-        });
-    };
-    parse_active_version_snapshot(&snapshot_content).map_err(write_resolve_backend_error)
+    resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
+        message: "public filesystem write requires a concrete version_id".to_string(),
+    })
 }
 
 async fn resolve_directory_insert_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let version_id = resolved_filesystem_version_id(backend, planned_write).await?;
+    let version_id = resolved_filesystem_version_id(planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
     let mut assignments_batch = Vec::new();
     for payload in payload_maps(planned_write)? {
@@ -167,7 +129,7 @@ async fn resolve_existing_directory_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let version_id = resolved_filesystem_version_id(backend, planned_write).await?;
+    let version_id = resolved_filesystem_version_id(planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
     let current_rows =
         load_target_directory_rows_for_selector(backend, planned_write, &version_id, lookup_scope)
@@ -370,7 +332,7 @@ async fn resolve_file_insert_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let version_id = resolved_filesystem_version_id(backend, planned_write).await?;
+    let version_id = resolved_filesystem_version_id(planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
     let mut assignments_batch = Vec::new();
     for payload in payload_maps(planned_write)? {
@@ -433,21 +395,50 @@ async fn resolve_existing_file_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let version_id = resolved_filesystem_version_id(backend, planned_write).await?;
+    let version_id = resolved_filesystem_version_id(planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
-    let current_rows =
-        load_target_file_rows_for_selector(backend, planned_write, &version_id, lookup_scope)
-            .await?;
-    if current_rows.is_empty() {
-        return Ok(noop_resolved_write_plan(
-            default_execution_mode_for_request(planned_write.command.requested_mode),
-        ));
-    }
     match planned_write.command.operation_kind {
         WriteOperationKind::Update => {
             let payload = payload_map(planned_write)?;
             let assignments = parse_file_update_assignments(&payload)
                 .map_err(write_resolve_filesystem_assignments_error)?;
+            if let Some(file_id) =
+                lazy_exact_file_metadata_update_candidate(planned_write, &version_id, &assignments)
+            {
+                let execution_mode =
+                    default_execution_mode_for_request(planned_write.command.requested_mode);
+                let target_write_lane = target_write_lane_for_version(
+                    planned_write,
+                    execution_mode,
+                    Some(version_id.as_str()),
+                )?;
+                return Ok(ResolvedWritePlan::from_partition(ResolvedWritePartition {
+                    execution_mode,
+                    authoritative_pre_state: Vec::new(),
+                    intended_post_state: Vec::new(),
+                    tombstones: Vec::new(),
+                    lineage: Vec::new(),
+                    target_write_lane,
+                    lazy_exact_file_metadata_update: Some(LazyExactFileMetadataUpdate {
+                        file_id,
+                        version_id: version_id.clone(),
+                        metadata: optional_text_patch(&assignments.metadata),
+                    }),
+                }));
+            }
+            let current_rows = load_target_file_rows_for_selector(
+                backend,
+                planned_write,
+                &version_id,
+                lookup_scope,
+                assignments.path.is_some(),
+            )
+            .await?;
+            if current_rows.is_empty() {
+                return Ok(noop_resolved_write_plan(
+                    default_execution_mode_for_request(planned_write.command.requested_mode),
+                ));
+            }
             if current_rows.len() > 1 && assignments.path.is_some() {
                 return Err(WriteResolveError {
                     message: format!(
@@ -548,6 +539,19 @@ async fn resolve_existing_file_write(
             Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
         WriteOperationKind::Delete => {
+            let current_rows = load_target_file_rows_for_selector(
+                backend,
+                planned_write,
+                &version_id,
+                lookup_scope,
+                true,
+            )
+            .await?;
+            if current_rows.is_empty() {
+                return Ok(noop_resolved_write_plan(
+                    default_execution_mode_for_request(planned_write.command.requested_mode),
+                ));
+            }
             let mut partitions = ResolvedWritePlanBuilder::default();
             for current_row in current_rows {
                 let execution_mode = resolve_execution_mode_for_untracked_flag(
@@ -606,6 +610,40 @@ async fn resolve_existing_file_write(
         WriteOperationKind::Insert => Err(WriteResolveError {
             message: "public filesystem existing-row resolver does not handle inserts".to_string(),
         }),
+    }
+}
+
+fn lazy_exact_file_metadata_update_candidate(
+    planned_write: &PlannedWrite,
+    _version_id: &str,
+    assignments: &FileUpdateAssignments,
+) -> Option<String> {
+    if matches!(
+        planned_write.command.requested_mode,
+        WriteModeRequest::ForceUntracked
+    ) {
+        return None;
+    }
+    if assignments.path.is_some()
+        || assignments.hidden.is_some()
+        || assignments.data.bytes().is_some()
+    {
+        return None;
+    }
+    let file_id = exact_id_selector_value(planned_write)?;
+    Some(file_id)
+}
+
+fn optional_text_patch(
+    assignment: &crate::sql::public::planner::semantics::filesystem_assignments::OptionalTextAssignment,
+) -> OptionalTextPatch {
+    match assignment {
+        crate::sql::public::planner::semantics::filesystem_assignments::OptionalTextAssignment::Unchanged => {
+            OptionalTextPatch::Unchanged
+        }
+        crate::sql::public::planner::semantics::filesystem_assignments::OptionalTextAssignment::Set(value) => {
+            OptionalTextPatch::Set(value.clone())
+        }
     }
 }
 
@@ -736,33 +774,35 @@ async fn resolve_file_update_target(
                 directory_id,
                 parsed.name.clone(),
                 parsed.extension.clone(),
-                parsed.normalized_path.as_str().to_string(),
+                Some(parsed.normalized_path.as_str().to_string()),
             )
         } else {
             (
                 current_row.directory_id.clone(),
                 current_row.name.clone(),
                 current_row.extension.clone(),
-                current_row.path.clone(),
+                None,
             )
         };
 
-    if let Some(existing_id) = lookup_file_id_by_path(
-        backend,
-        version_id,
-        &ParsedFilePath::from_normalized_path(next_path.clone())
-            .map_err(write_resolve_backend_error)?,
-        lookup_scope,
-    )
-    .await?
-    {
-        if existing_id != current_row.id {
-            return Err(WriteResolveError {
-                message: format!(
-                    "Unique constraint violation: file path '{}' already exists in version '{}'",
-                    next_path, version_id
-                ),
-            });
+    if let Some(next_path) = next_path.as_ref() {
+        if let Some(existing_id) = lookup_file_id_by_path(
+            backend,
+            version_id,
+            &ParsedFilePath::from_normalized_path(next_path.clone())
+                .map_err(write_resolve_backend_error)?,
+            lookup_scope,
+        )
+        .await?
+        {
+            if existing_id != current_row.id {
+                return Err(WriteResolveError {
+                    message: format!(
+                        "Unique constraint violation: file path '{}' already exists in version '{}'",
+                        next_path, version_id
+                    ),
+                });
+            }
         }
     }
 
@@ -772,7 +812,7 @@ async fn resolve_file_update_target(
             directory_id: next_directory_id,
             name: next_name,
             extension: next_extension,
-            path: next_path,
+            path: next_path.unwrap_or_default(),
             hidden: next_hidden,
             version_id: version_id.to_string(),
             untracked: current_row.untracked,
@@ -1146,14 +1186,15 @@ async fn load_target_file_rows_for_selector(
     planned_write: &PlannedWrite,
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
+    require_paths: bool,
 ) -> Result<Vec<FileFilesystemRow>, WriteResolveError> {
     if let Some(file_id) = exact_id_selector_value(planned_write) {
-        return Ok(
-            load_file_row_by_id(backend, version_id, &file_id, lookup_scope)
-                .await?
-                .into_iter()
-                .collect(),
-        );
+        let row = if require_paths {
+            load_file_row_by_id(backend, version_id, &file_id, lookup_scope).await?
+        } else {
+            load_file_row_by_id_without_path(backend, version_id, &file_id, lookup_scope).await?
+        };
+        return Ok(row.into_iter().collect());
     }
     let file_ids = query_text_selector_values_for_write_selector(
         backend,
@@ -1164,7 +1205,12 @@ async fn load_target_file_rows_for_selector(
     .await?;
     let mut rows = Vec::new();
     for file_id in file_ids {
-        if let Some(row) = load_file_row_by_id(backend, version_id, &file_id, lookup_scope).await? {
+        let row = if require_paths {
+            load_file_row_by_id(backend, version_id, &file_id, lookup_scope).await?
+        } else {
+            load_file_row_by_id_without_path(backend, version_id, &file_id, lookup_scope).await?
+        };
+        if let Some(row) = row {
             rows.push(row);
         }
     }

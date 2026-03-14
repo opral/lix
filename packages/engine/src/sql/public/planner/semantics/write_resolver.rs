@@ -76,6 +76,7 @@ impl ResolvedWritePartitionBuilder {
             tombstones: self.tombstones,
             lineage: self.lineage,
             target_write_lane: None,
+            lazy_exact_file_metadata_update: None,
         })
     }
 }
@@ -1009,6 +1010,7 @@ fn single_partition_write_plan(
         tombstones,
         lineage,
         target_write_lane: None,
+        lazy_exact_file_metadata_update: None,
     })
 }
 
@@ -1219,9 +1221,10 @@ fn finalize_resolved_write_plan(
     planned_write: &PlannedWrite,
     mut resolved: ResolvedWritePlan,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    resolved
-        .partitions
-        .retain(|partition| !partition.intended_post_state.is_empty());
+    resolved.partitions.retain(|partition| {
+        !partition.intended_post_state.is_empty()
+            || partition.lazy_exact_file_metadata_update.is_some()
+    });
     for partition in &mut resolved.partitions {
         if partition.execution_mode == WriteMode::Untracked {
             partition.target_write_lane = None;
