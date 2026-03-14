@@ -217,7 +217,8 @@ impl SchemaProvider for SqlRegisteredSchemaProvider<'_> {
         let mut entries_by_key = HashMap::<SchemaKey, JsonValue>::new();
 
         if let Some(schema) = whitelisted_internal_schema("lix_state") {
-            let key = SchemaKey::new("lix_state", INTERNAL_SCHEMA_VERSION);
+            let schema_version = builtin_schema_version(&schema)?;
+            let key = SchemaKey::new("lix_state", schema_version);
             self.cache.insert(key.clone(), schema.clone());
             entries_by_key.insert(key, schema);
         }
