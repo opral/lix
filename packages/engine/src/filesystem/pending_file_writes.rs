@@ -11,6 +11,7 @@ use crate::sql::ast::utils::{
 };
 use crate::sql::common::ast::lower_statement;
 use crate::sql::execution::preprocess::preprocess_sql_to_plan as preprocess_sql;
+use crate::sql::public::planner::semantics::filesystem_queries::load_file_row_by_id_without_path;
 use crate::sql::public::runtime::prepare_public_read;
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::version::{
@@ -606,9 +607,12 @@ async fn collect_update_writes(
                     return Ok(());
                 }
 
-                let live_rows =
-                    load_live_file_prefetch_rows_by_key(backend, std::slice::from_ref(&key))
-                        .await?;
+                let live_rows = load_live_file_prefetch_rows_by_key(
+                    backend,
+                    std::slice::from_ref(&key),
+                    next_path.is_some(),
+                )
+                .await?;
                 if let Some(before_row) = live_rows.get(&key) {
                     let path = next_path.clone().unwrap_or_else(|| before_row.path.clone());
                     let mut write = PendingFileWrite {
@@ -1607,6 +1611,7 @@ fn insert_target_table_name(insert: &sqlparser::ast::Insert) -> Option<String> {
 async fn load_live_file_prefetch_rows_by_key(
     backend: &dyn LixBackend,
     keys: &[(String, String)],
+    include_path: bool,
 ) -> Result<BTreeMap<(String, String), LiveFilePrefetchRow>, LixError> {
     if keys.is_empty() {
         return Ok(BTreeMap::new());
@@ -1614,7 +1619,9 @@ async fn load_live_file_prefetch_rows_by_key(
 
     let mut out = BTreeMap::new();
     for (file_id, version_id) in keys {
-        if let Some(row) = load_exact_live_file_prefetch_row(backend, file_id, version_id).await? {
+        if let Some(row) =
+            load_exact_live_file_prefetch_row(backend, file_id, version_id, include_path).await?
+        {
             out.insert((file_id.clone(), version_id.clone()), row);
         }
     }
@@ -1626,6 +1633,7 @@ async fn load_exact_live_file_prefetch_row(
     backend: &dyn LixBackend,
     file_id: &str,
     version_id: &str,
+    include_path: bool,
 ) -> Result<Option<LiveFilePrefetchRow>, LixError> {
     let descriptor_directory_expr = coalesced_json_field_sql(
         ["fdu_local", "fd_local", "fdu_global", "fd_global"],
@@ -1735,16 +1743,20 @@ async fn load_exact_live_file_prefetch_row(
     let data = row.get(4).and_then(value_as_blob_or_text_bytes);
     let untracked = row.get(5).is_some_and(value_is_truthy);
 
-    let path = match directory_id.as_deref() {
-        Some(directory_id) => {
-            let Some(directory_path) =
-                load_live_directory_path_by_id(backend, version_id, directory_id).await?
-            else {
-                return Ok(None);
-            };
-            compose_live_file_path(&directory_path, &name, extension.as_deref())
+    let path = if include_path {
+        match directory_id.as_deref() {
+            Some(directory_id) => {
+                let Some(directory_path) =
+                    load_live_directory_path_by_id(backend, version_id, directory_id).await?
+                else {
+                    return Ok(None);
+                };
+                compose_live_file_path(&directory_path, &name, extension.as_deref())
+            }
+            None => compose_live_file_path("/", &name, extension.as_deref()),
         }
-        None => compose_live_file_path("/", &name, extension.as_deref()),
+    } else {
+        String::new()
     };
 
     Ok(Some(LiveFilePrefetchRow {
@@ -2707,56 +2719,34 @@ async fn execute_exact_delete_target_prefetch_query(
         return Ok(Vec::new());
     }
 
-    let query_sql = match target {
-        FileWriteTarget::ActiveVersion => {
-            let ids = exact_targets
-                .iter()
-                .map(|(file_id, _)| format!("'{}'", escape_sql_string(file_id)))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "SELECT id, lixcol_version_id \
-                 FROM ({live_projection_sql}) AS live_files \
-                 WHERE lixcol_version_id = '{active_version_id}' \
-                   AND id IN ({ids})",
-                live_projection_sql = build_live_file_prefetch_projection_sql(),
-                active_version_id = escape_sql_string(active_version_id),
-            )
-        }
-        FileWriteTarget::ExplicitVersion => {
-            let requested_rows = exact_targets
-                .iter()
-                .map(|(file_id, version_id)| {
-                    format!(
-                        "('{}', '{}')",
-                        escape_sql_string(file_id),
-                        escape_sql_string(version_id)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "WITH requested(file_id, version_id) AS (VALUES {requested_rows}) \
-                 SELECT live_files.id, live_files.lixcol_version_id \
-                 FROM ({live_projection_sql}) AS live_files \
-                 JOIN requested \
-                   ON requested.file_id = live_files.id \
-                  AND requested.version_id = live_files.lixcol_version_id",
-                live_projection_sql = build_live_file_prefetch_projection_sql(),
-            )
-        }
-    };
+    let mut rows = Vec::new();
+    for (file_id, requested_version_id) in exact_targets {
+        let version_id = match target {
+            FileWriteTarget::ActiveVersion => active_version_id,
+            FileWriteTarget::ExplicitVersion => requested_version_id.as_str(),
+        };
+        let Some(_) = load_file_row_by_id_without_path(
+            backend,
+            version_id,
+            file_id,
+            crate::filesystem::live_projection::FilesystemProjectionScope::ExplicitVersion,
+        )
+        .await
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: error.message,
+        })?
+        else {
+            continue;
+        };
 
-    execute_prefetch_query(
-        backend,
-        "pending.collect_delete_targets.exact",
-        &query_sql,
-        &[],
-    )
-    .await
-    .map(|result| result.rows)
+        rows.push(vec![
+            Value::Text(file_id.clone()),
+            Value::Text(version_id.to_string()),
+        ]);
+    }
+
+    Ok(rows)
 }
 
 fn overlay_rows_for_target(
