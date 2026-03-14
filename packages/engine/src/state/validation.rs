@@ -12,7 +12,7 @@ use crate::schema::{
 };
 use crate::sql::ast::utils::bind_sql;
 use crate::sql::execution::contracts::planned_statement::{
-    MutationOperation, MutationRow, UpdateValidationPlan,
+    MutationOperation, MutationRow, UpdateValidationKind, UpdateValidationPlan,
 };
 use crate::sql::public::catalog::SurfaceFamily;
 use crate::sql::public::planner::ir::{
@@ -71,6 +71,14 @@ struct ConstraintCommittedRow {
     snapshot: JsonValue,
 }
 
+#[derive(Debug, Clone)]
+struct ConstraintDeletedRow {
+    identity: ConstraintRowIdentity,
+    schema_version: String,
+    snapshot: JsonValue,
+    storage: ConstraintStorageKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConstraintScopeKey {
     storage: ConstraintStorageKind,
@@ -79,10 +87,20 @@ struct ConstraintScopeKey {
     version_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ConstraintSchemaVersionKey {
+    storage: ConstraintStorageKind,
+    schema_key: String,
+    version_id: String,
+}
+
 #[derive(Debug, Default)]
 struct ConstraintContext {
     pending_rows: Vec<ConstraintCandidateRow>,
+    deleted_rows: Vec<ConstraintDeletedRow>,
+    deleted_identities: HashSet<(ConstraintStorageKind, ConstraintRowIdentity)>,
     committed_rows: HashMap<ConstraintScopeKey, Vec<ConstraintCommittedRow>>,
+    committed_schema_version_rows: HashMap<ConstraintSchemaVersionKey, Vec<ConstraintCommittedRow>>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +152,10 @@ pub async fn validate_inserts(
 
     let mut constraints = ConstraintContext {
         pending_rows,
+        deleted_rows: Vec::new(),
+        deleted_identities: HashSet::new(),
         committed_rows: HashMap::new(),
+        committed_schema_version_rows: HashMap::new(),
     };
     for row in &constraints.pending_rows.clone() {
         validate_row_constraints(backend, &mut schema_provider, &mut constraints, row).await?;
@@ -151,6 +172,7 @@ pub async fn validate_updates(
 ) -> Result<(), LixError> {
     let mut schema_provider = SqlRegisteredSchemaProvider::new(backend);
     let mut pending_rows = Vec::new();
+    let mut deleted_rows = Vec::new();
 
     for plan in plans {
         let mut sql = format!(
@@ -173,11 +195,28 @@ pub async fn validate_updates(
             let schema_key = value_to_string(&row[4], "schema_key")?;
             let schema_version = value_to_string(&row[5], "schema_version")?;
             let snapshot = resolve_update_snapshot(plan, row.get(6), &schema_key)?;
+            let storage = storage_kind_for_table(&plan.table);
 
             if schema_key == REGISTERED_SCHEMA_KEY {
                 if let Some(snapshot) = snapshot.as_ref() {
                     validate_registered_schema_snapshot(&mut schema_provider, snapshot).await?;
                 }
+                continue;
+            }
+
+            if plan.kind == UpdateValidationKind::Delete {
+                let snapshot = parse_row_snapshot_content(row.get(6), &schema_key)?;
+                deleted_rows.push(ConstraintDeletedRow {
+                    identity: ConstraintRowIdentity {
+                        entity_id,
+                        schema_key,
+                        file_id: value_to_string(&row[1], "file_id")?,
+                        version_id: value_to_string(&row[2], "version_id")?,
+                    },
+                    schema_version,
+                    snapshot,
+                    storage,
+                });
                 continue;
             }
 
@@ -214,19 +253,36 @@ pub async fn validate_updates(
                     },
                     schema_version,
                     snapshot: snapshot.clone(),
-                    storage: storage_kind_for_table(&plan.table),
+                    storage,
                     shadows_committed_identity: true,
                 });
             }
         }
     }
 
+    let deleted_identities = deleted_rows
+        .iter()
+        .map(|row| (row.storage, row.identity.clone()))
+        .collect();
     let mut constraints = ConstraintContext {
         pending_rows,
+        deleted_rows,
+        deleted_identities,
         committed_rows: HashMap::new(),
+        committed_schema_version_rows: HashMap::new(),
     };
     for row in &constraints.pending_rows.clone() {
         validate_row_constraints(backend, &mut schema_provider, &mut constraints, row).await?;
+    }
+    let deleted_rows = constraints.deleted_rows.clone();
+    if !deleted_rows.is_empty() {
+        validate_delete_constraints(
+            backend,
+            &mut schema_provider,
+            &mut constraints,
+            &deleted_rows,
+        )
+        .await?;
     }
 
     Ok(())
@@ -271,6 +327,7 @@ async fn validate_sql2_write(
             .as_ref()
             .is_some_and(|conflict| conflict.action == InsertOnConflictAction::DoUpdate);
     let pending_rows = collect_sql2_constraint_candidates(resolved, shadows_committed_identity)?;
+    let deleted_rows = collect_sql2_delete_candidates(resolved)?;
 
     if planned_write.command.operation_kind == WriteOperationKind::Update {
         for row in resolved.intended_post_state() {
@@ -302,10 +359,28 @@ async fn validate_sql2_write(
 
     let mut constraints = ConstraintContext {
         pending_rows,
+        deleted_rows,
+        deleted_identities: HashSet::new(),
         committed_rows: HashMap::new(),
+        committed_schema_version_rows: HashMap::new(),
     };
+    constraints.deleted_identities = constraints
+        .deleted_rows
+        .iter()
+        .map(|row| (row.storage, row.identity.clone()))
+        .collect();
     for row in &constraints.pending_rows.clone() {
         validate_row_constraints(backend, &mut schema_provider, &mut constraints, row).await?;
+    }
+    let deleted_rows = constraints.deleted_rows.clone();
+    if !deleted_rows.is_empty() {
+        validate_delete_constraints(
+            backend,
+            &mut schema_provider,
+            &mut constraints,
+            &deleted_rows,
+        )
+        .await?;
     }
 
     Ok(())
@@ -393,6 +468,37 @@ fn collect_sql2_constraint_candidates(
                 shadows_committed_identity,
             });
             next_index += 1;
+        }
+    }
+
+    Ok(rows)
+}
+
+fn collect_sql2_delete_candidates(
+    resolved: &ResolvedWritePlan,
+) -> Result<Vec<ConstraintDeletedRow>, LixError> {
+    let mut rows = Vec::new();
+
+    for partition in &resolved.partitions {
+        let storage = storage_kind_for_write_mode(partition.execution_mode);
+        for row in &partition.intended_post_state {
+            if !row.tombstone || row.schema_key == REGISTERED_SCHEMA_KEY {
+                continue;
+            }
+            let Some(snapshot) = planned_row_snapshot(row)? else {
+                continue;
+            };
+            rows.push(ConstraintDeletedRow {
+                identity: ConstraintRowIdentity {
+                    entity_id: row.entity_id.clone(),
+                    schema_key: row.schema_key.clone(),
+                    file_id: planned_row_required_text(row, "file_id")?,
+                    version_id: planned_row_required_text(row, "version_id")?,
+                },
+                schema_version: planned_row_required_text(row, "schema_version")?,
+                snapshot,
+                storage,
+            });
         }
     }
 
@@ -860,6 +966,7 @@ async fn validate_constraint_group_conflict(
             && pending.identity.schema_key == row.identity.schema_key
             && pending.identity.version_id == row.identity.version_id
             && pending.identity.file_id == row.identity.file_id
+            && pending_row_is_visible(context, pending)
     }) {
         let pending_view = ConstraintRowView {
             identity: &pending.identity,
@@ -1056,6 +1163,255 @@ async fn validate_foreign_key_constraints(
     Ok(())
 }
 
+async fn validate_delete_constraints<P: SchemaProvider + ?Sized>(
+    backend: &dyn LixBackend,
+    provider: &mut P,
+    context: &mut ConstraintContext,
+    deleted_rows: &[ConstraintDeletedRow],
+) -> Result<(), LixError> {
+    let source_schemas = provider.load_visible_schema_entries().await?;
+
+    for deleted_row in deleted_rows {
+        validate_delete_constraints_for_row(backend, context, deleted_row, &source_schemas).await?;
+    }
+
+    Ok(())
+}
+
+async fn validate_delete_constraints_for_row(
+    backend: &dyn LixBackend,
+    context: &mut ConstraintContext,
+    deleted_row: &ConstraintDeletedRow,
+    source_schemas: &[(SchemaKey, JsonValue)],
+) -> Result<(), LixError> {
+    let deleted_view = ConstraintRowView {
+        identity: &deleted_row.identity,
+        schema_version: &deleted_row.schema_version,
+        snapshot: &deleted_row.snapshot,
+    };
+
+    for (source_key, source_schema) in source_schemas {
+        let Some(foreign_keys) = source_schema
+            .get("x-lix-foreign-keys")
+            .and_then(JsonValue::as_array)
+        else {
+            continue;
+        };
+
+        let source_scope = ConstraintSchemaVersionKey {
+            storage: deleted_row.storage,
+            schema_key: source_key.schema_key.clone(),
+            version_id: deleted_row.identity.version_id.clone(),
+        };
+
+        for (index, foreign_key) in foreign_keys.iter().enumerate() {
+            let local_properties = foreign_key
+                .get("properties")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "foreign key at index {index} missing properties array in schema '{}'",
+                            source_key.schema_key
+                        ),
+                    )
+                })?;
+            let local_properties =
+                json_pointer_group(local_properties, "x-lix-foreign-keys.properties")?;
+
+            let references = foreign_key
+                .get("references")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "foreign key at index {index} missing references object in schema '{}'",
+                            source_key.schema_key
+                        ),
+                    )
+                })?;
+            let referenced_schema_key = references
+                .get("schemaKey")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "foreign key at index {index} references.schemaKey must be a string in schema '{}'",
+                            source_key.schema_key
+                        ),
+                    )
+                })?;
+            let referenced_properties = references
+                .get("properties")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "foreign key at index {index} references.properties must be an array in schema '{}'",
+                            source_key.schema_key
+                        ),
+                    )
+                })?;
+            let referenced_properties = json_pointer_group(
+                referenced_properties,
+                "x-lix-foreign-keys.references.properties",
+            )?;
+
+            if local_properties.len() != referenced_properties.len() {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "foreign key at index {index} in schema '{}' must have the same number of local and referenced properties",
+                        source_key.schema_key
+                    ),
+                ));
+            }
+
+            let Some(target_values) = extract_pointer_tuple(&deleted_view, &referenced_properties)?
+            else {
+                continue;
+            };
+
+            if delete_has_referencing_row(
+                backend,
+                context,
+                deleted_row,
+                source_key,
+                &source_scope,
+                &source_key.schema_key,
+                referenced_schema_key,
+                &local_properties,
+                &referenced_properties,
+                &target_values,
+                index,
+            )
+            .await?
+            {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "foreign key restrict violation for schema '{}': entity '{}' is still referenced in version '{}' and file '{}'",
+                        deleted_row.identity.schema_key,
+                        deleted_row.identity.entity_id,
+                        deleted_row.identity.version_id,
+                        deleted_row.identity.file_id
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn delete_has_referencing_row(
+    backend: &dyn LixBackend,
+    context: &mut ConstraintContext,
+    deleted_row: &ConstraintDeletedRow,
+    source_key: &SchemaKey,
+    source_scope: &ConstraintSchemaVersionKey,
+    source_schema_key: &str,
+    referenced_schema_key: &str,
+    local_properties: &[String],
+    referenced_properties: &[String],
+    target_values: &[JsonValue],
+    index: usize,
+) -> Result<bool, LixError> {
+    for pending in context.pending_rows.iter().filter(|pending| {
+        pending.storage == deleted_row.storage
+            && pending.identity.schema_key == source_scope.schema_key
+            && pending.identity.version_id == source_scope.version_id
+            && pending.schema_version == source_key.schema_version
+            && pending_row_is_visible(context, pending)
+    }) {
+        let pending_view = ConstraintRowView {
+            identity: &pending.identity,
+            schema_version: &pending.schema_version,
+            snapshot: &pending.snapshot,
+        };
+        if row_references_deleted_target(
+            &pending_view,
+            deleted_row,
+            source_schema_key,
+            referenced_schema_key,
+            local_properties,
+            referenced_properties,
+            target_values,
+            index,
+        )? {
+            return Ok(true);
+        }
+    }
+
+    let shadowed_identities = shadowed_committed_identities(context, deleted_row.storage);
+    let committed_rows = load_committed_schema_version_rows(backend, context, source_scope).await?;
+    for committed in committed_rows.iter().filter(|committed| {
+        committed.schema_version == source_key.schema_version
+            && !shadowed_identities.contains(&committed.identity)
+    }) {
+        let committed_view = ConstraintRowView {
+            identity: &committed.identity,
+            schema_version: &committed.schema_version,
+            snapshot: &committed.snapshot,
+        };
+        if row_references_deleted_target(
+            &committed_view,
+            deleted_row,
+            source_schema_key,
+            referenced_schema_key,
+            local_properties,
+            referenced_properties,
+            target_values,
+            index,
+        )? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn row_references_deleted_target(
+    source_row: &ConstraintRowView<'_>,
+    deleted_row: &ConstraintDeletedRow,
+    source_schema_key: &str,
+    referenced_schema_key: &str,
+    local_properties: &[String],
+    referenced_properties: &[String],
+    target_values: &[JsonValue],
+    index: usize,
+) -> Result<bool, LixError> {
+    let Some(local_values) = extract_pointer_tuple(source_row, local_properties)? else {
+        return Ok(false);
+    };
+
+    let effective_target_schema_key = effective_foreign_key_target_schema_key(
+        referenced_schema_key,
+        referenced_properties,
+        &local_values,
+        index,
+        source_schema_key,
+    )?;
+    if effective_target_schema_key != deleted_row.identity.schema_key {
+        return Ok(false);
+    }
+
+    let effective_target_file_id = effective_foreign_key_target_file_id(
+        &source_row.identity.file_id,
+        referenced_properties,
+        &local_values,
+    )?;
+    if effective_target_file_id != deleted_row.identity.file_id {
+        return Ok(false);
+    }
+
+    Ok(local_values == target_values)
+}
+
 async fn foreign_key_target_exists(
     backend: &dyn LixBackend,
     context: &mut ConstraintContext,
@@ -1104,6 +1460,7 @@ async fn foreign_key_target_exists_in_storage(
             && pending.identity.schema_key == target_scope.schema_key
             && pending.identity.version_id == target_scope.version_id
             && pending.identity.file_id == target_scope.file_id
+            && pending_row_is_visible(context, pending)
     }) {
         let pending_view = ConstraintRowView {
             identity: &pending.identity,
@@ -1155,6 +1512,23 @@ async fn load_committed_scope_rows<'a>(
         .committed_rows
         .get(scope)
         .expect("constraint scope cache should be populated"))
+}
+
+async fn load_committed_schema_version_rows<'a>(
+    backend: &dyn LixBackend,
+    context: &'a mut ConstraintContext,
+    scope: &ConstraintSchemaVersionKey,
+) -> Result<&'a Vec<ConstraintCommittedRow>, LixError> {
+    if !context.committed_schema_version_rows.contains_key(scope) {
+        let rows = query_committed_schema_version_rows(backend, scope).await?;
+        context
+            .committed_schema_version_rows
+            .insert(scope.clone(), rows);
+    }
+    Ok(context
+        .committed_schema_version_rows
+        .get(scope)
+        .expect("constraint schema-version cache should be populated"))
 }
 
 async fn query_committed_scope_rows(
@@ -1227,6 +1601,77 @@ async fn query_committed_scope_rows(
                     entity_id,
                     schema_key: scope.schema_key.clone(),
                     file_id: scope.file_id.clone(),
+                    version_id: scope.version_id.clone(),
+                },
+                schema_version,
+                snapshot,
+            })
+        })
+        .collect()
+}
+
+async fn query_committed_schema_version_rows(
+    backend: &dyn LixBackend,
+    scope: &ConstraintSchemaVersionKey,
+) -> Result<Vec<ConstraintCommittedRow>, LixError> {
+    let rows = match scope.storage {
+        ConstraintStorageKind::Tracked => {
+            let table_name = live_table_name(&scope.schema_key);
+            if !relation_exists(backend, &table_name).await? {
+                return Ok(Vec::new());
+            }
+            let sql = format!(
+                "SELECT entity_id, file_id, schema_version, snapshot_content \
+                 FROM {} \
+                 WHERE version_id = $1 \
+                   AND is_tombstone = 0 \
+                   AND snapshot_content IS NOT NULL",
+                quote_sql_ident(&table_name)
+            );
+            backend
+                .execute(&sql, &[Value::Text(scope.version_id.clone())])
+                .await?
+                .rows
+        }
+        ConstraintStorageKind::Untracked => {
+            backend
+                .execute(
+                    "SELECT entity_id, file_id, schema_version, snapshot_content \
+                     FROM lix_internal_live_untracked_v1 \
+                     WHERE schema_key = $1 \
+                       AND version_id = $2 \
+                       AND snapshot_content IS NOT NULL",
+                    &[
+                        Value::Text(scope.schema_key.clone()),
+                        Value::Text(scope.version_id.clone()),
+                    ],
+                )
+                .await?
+                .rows
+        }
+    };
+
+    rows.into_iter()
+        .map(|row| {
+            let entity_id = value_to_string(&row[0], "entity_id")?;
+            let file_id = value_to_string(&row[1], "file_id")?;
+            let schema_version = value_to_string(&row[2], "schema_version")?;
+            let snapshot_raw = value_to_string(&row[3], "snapshot_content")?;
+            let snapshot = serde_json::from_str::<JsonValue>(&snapshot_raw).map_err(|err| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "stored snapshot_content for schema '{}' is invalid JSON: {err}",
+                        scope.schema_key
+                    ),
+                )
+            })?;
+
+            Ok(ConstraintCommittedRow {
+                identity: ConstraintRowIdentity {
+                    entity_id,
+                    schema_key: scope.schema_key.clone(),
+                    file_id,
                     version_id: scope.version_id.clone(),
                 },
                 schema_version,
@@ -1383,16 +1828,30 @@ fn json_value_to_string(value: &JsonValue, label: &str) -> Result<String, LixErr
     }
 }
 
+fn pending_row_is_visible(context: &ConstraintContext, pending: &ConstraintCandidateRow) -> bool {
+    !context
+        .deleted_identities
+        .contains(&(pending.storage, pending.identity.clone()))
+}
+
 fn shadowed_committed_identities(
     context: &ConstraintContext,
     storage: ConstraintStorageKind,
 ) -> HashSet<ConstraintRowIdentity> {
-    context
+    let mut identities = context
         .pending_rows
         .iter()
         .filter(|row| row.storage == storage && row.shadows_committed_identity)
         .map(|row| row.identity.clone())
-        .collect()
+        .collect::<HashSet<_>>();
+    identities.extend(
+        context
+            .deleted_rows
+            .iter()
+            .filter(|row| row.storage == storage)
+            .map(|row| row.identity.clone()),
+    );
+    identities
 }
 
 fn live_table_name(schema_key: &str) -> String {

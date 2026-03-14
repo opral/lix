@@ -1133,6 +1133,7 @@ mod tests {
 
     fn update_validation_plan(where_clause: Expr, version_id: &str) -> UpdateValidationPlan {
         UpdateValidationPlan {
+            kind: crate::sql::execution::contracts::planned_statement::UpdateValidationKind::Update,
             table: "lix_internal_live_untracked_v1".to_string(),
             where_clause: Some(where_clause),
             snapshot_content: Some(json!({

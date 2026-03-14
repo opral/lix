@@ -322,14 +322,17 @@ fn validate_statement_output(output: &RewriteOutput) -> Result<(), LixError> {
         });
     }
     if !output.update_validations.is_empty()
-        && !output
-            .statements
-            .iter()
-            .all(|statement| matches!(statement, sqlparser::ast::Statement::Update(_)))
+        && !output.statements.iter().all(|statement| {
+            matches!(
+                statement,
+                sqlparser::ast::Statement::Update(_) | sqlparser::ast::Statement::Delete(_)
+            )
+        })
     {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "update validations require an UPDATE statement output".to_string(),
+            description: "update validations require an UPDATE or DELETE statement output"
+                .to_string(),
         });
     }
     if let Some(postprocess) = &output.postprocess {
