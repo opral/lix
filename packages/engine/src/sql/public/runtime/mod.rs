@@ -3,6 +3,7 @@ use crate::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
 };
 use crate::filesystem::pending_file_writes::PendingFileWrite;
+use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::common::dependency_spec::DependencySpec;
@@ -37,7 +38,7 @@ use crate::sql::public::planner::semantics::write_analysis::analyze_write;
 use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan;
 use crate::state::commit::{
     load_committed_version_tip_commit_id, AppendCommitPreconditions, AppendExpectedTip,
-    AppendWriteLane, ProposedDomainChange,
+    AppendIdempotencyKey, AppendWriteLane, ProposedDomainChange,
 };
 use crate::state::stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
@@ -172,7 +173,9 @@ pub(crate) enum PublicWriteExecutionPartition {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TrackedWriteExecution {
     pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
-    pub(crate) domain_change_batch: DomainChangeBatch,
+    pub(crate) domain_change_batch: Option<DomainChangeBatch>,
+    pub(crate) lazy_exact_file_metadata_update:
+        Option<crate::sql::public::planner::ir::LazyExactFileMetadataUpdate>,
     pub(crate) append_preconditions: AppendCommitPreconditions,
     pub(crate) semantic_effects: PlanEffects,
     pub(crate) persist_filesystem_payloads_before_write: bool,
@@ -208,6 +211,9 @@ struct BoundPublicReadSummary {
 
 mod bind;
 mod read;
+mod tracked_write_plan;
+
+pub(crate) use tracked_write_plan::{build_tracked_write_txn_plan, TrackedWriteTxnPlan};
 
 pub(crate) async fn prepare_public_execution(
     backend: &dyn LixBackend,
@@ -1603,9 +1609,6 @@ fn build_public_write_execution(
 
         match partition.execution_mode {
             crate::sql::public::planner::ir::WriteMode::Tracked => {
-                let Some(domain_change_batch) = tracked_batches.next().cloned() else {
-                    return Ok(None);
-                };
                 let Some(commit_preconditions) = tracked_preconditions.next() else {
                     return Ok(None);
                 };
@@ -1613,19 +1616,38 @@ fn build_public_write_execution(
                     return Ok(None);
                 }
 
+                let lazy_exact_file_metadata_update =
+                    partition.lazy_exact_file_metadata_update.clone();
+                let domain_change_batch = if lazy_exact_file_metadata_update.is_some() {
+                    None
+                } else {
+                    let Some(domain_change_batch) = tracked_batches.next().cloned() else {
+                        return Ok(None);
+                    };
+                    Some(domain_change_batch)
+                };
+
                 partitions.push(PublicWriteExecutionPartition::Tracked(
                     TrackedWriteExecution {
                         schema_live_table_requirements:
                             schema_live_table_requirements_from_partition(partition),
                         append_preconditions: append_commit_preconditions_for_public_write(
                             planned_write,
-                            &domain_change_batch,
+                            domain_change_batch.as_ref(),
                             commit_preconditions,
                         )?,
-                        semantic_effects: semantic_plan_effects_from_domain_changes(
-                            &domain_change_batch.changes,
-                            state_commit_stream_operation(planned_write.command.operation_kind),
-                        )?,
+                        semantic_effects: domain_change_batch
+                            .as_ref()
+                            .map(|domain_change_batch| {
+                                semantic_plan_effects_from_domain_changes(
+                                    &domain_change_batch.changes,
+                                    state_commit_stream_operation(
+                                        planned_write.command.operation_kind,
+                                    ),
+                                )
+                            })
+                            .transpose()?
+                            .unwrap_or_default(),
                         persist_filesystem_payloads_before_write,
                         filesystem_payload_changes_committed_by_write:
                             public_write_commits_filesystem_payload_domain_changes(
@@ -1633,6 +1655,7 @@ fn build_public_write_execution(
                                 partition,
                             ),
                         domain_change_batch,
+                        lazy_exact_file_metadata_update,
                     },
                 ));
             }
@@ -1706,6 +1729,7 @@ fn schema_live_table_requirements_from_partition(
 
     schema_keys
         .into_iter()
+        .filter(|schema_key| builtin_schema_definition(schema_key).is_none())
         .map(|schema_key| SchemaLiveTableRequirement { schema_key })
         .collect()
 }
@@ -1827,7 +1851,9 @@ fn public_write_persists_filesystem_payloads(
     )
 }
 
-fn state_commit_stream_operation(operation_kind: WriteOperationKind) -> StateCommitStreamOperation {
+pub(crate) fn state_commit_stream_operation(
+    operation_kind: WriteOperationKind,
+) -> StateCommitStreamOperation {
     match operation_kind {
         WriteOperationKind::Insert => StateCommitStreamOperation::Insert,
         WriteOperationKind::Update => StateCommitStreamOperation::Update,
@@ -1837,7 +1863,7 @@ fn state_commit_stream_operation(operation_kind: WriteOperationKind) -> StateCom
 
 fn append_commit_preconditions_for_public_write(
     planned_write: &PlannedWrite,
-    batch: &DomainChangeBatch,
+    batch: Option<&DomainChangeBatch>,
     commit_preconditions: &CommitPreconditions,
 ) -> Result<AppendCommitPreconditions, LixError> {
     let write_lane = match &commit_preconditions.write_lane {
@@ -1846,9 +1872,10 @@ fn append_commit_preconditions_for_public_write(
         }
         crate::sql::public::planner::ir::WriteLane::ActiveVersion => {
             let version_id = batch
-                .changes
-                .first()
+                .into_iter()
+                .flat_map(|batch| batch.changes.first())
                 .map(|change| change.version_id.clone())
+                .next()
                 .or_else(|| {
                     planned_write
                         .command
@@ -1867,6 +1894,7 @@ fn append_commit_preconditions_for_public_write(
         crate::sql::public::planner::ir::WriteLane::GlobalAdmin => AppendWriteLane::GlobalAdmin,
     };
     let expected_tip = match &commit_preconditions.expected_tip {
+        crate::sql::public::planner::ir::ExpectedTip::CurrentTip => AppendExpectedTip::CurrentTip,
         crate::sql::public::planner::ir::ExpectedTip::CommitId(commit_id) => {
             AppendExpectedTip::CommitId(commit_id.clone())
         }
@@ -1878,7 +1906,14 @@ fn append_commit_preconditions_for_public_write(
     Ok(AppendCommitPreconditions {
         write_lane,
         expected_tip,
-        idempotency_key: commit_preconditions.idempotency_key.0.clone(),
+        idempotency_key: match &commit_preconditions.expected_tip {
+            crate::sql::public::planner::ir::ExpectedTip::CurrentTip => {
+                AppendIdempotencyKey::CurrentTipFingerprint(
+                    commit_preconditions.idempotency_key.0.clone(),
+                )
+            }
+            _ => AppendIdempotencyKey::Exact(commit_preconditions.idempotency_key.0.clone()),
+        },
     })
 }
 
@@ -1933,7 +1968,7 @@ fn semantic_plan_effects_from_untracked_public_write(
     Ok(effects)
 }
 
-fn semantic_plan_effects_from_domain_changes(
+pub(crate) fn semantic_plan_effects_from_domain_changes(
     changes: &[ProposedDomainChange],
     stream_operation: StateCommitStreamOperation,
 ) -> Result<PlanEffects, LixError> {

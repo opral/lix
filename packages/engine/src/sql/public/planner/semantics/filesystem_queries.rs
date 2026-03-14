@@ -288,6 +288,31 @@ pub(crate) async fn load_file_row_by_id(
     }))
 }
 
+pub(crate) async fn load_file_row_by_id_without_path(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    file_id: &str,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+    let Some(descriptor) = load_file_descriptor_by_id(backend, version_id, file_id, scope).await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(FileFilesystemRow {
+        id: descriptor.id,
+        directory_id: descriptor.directory_id,
+        name: descriptor.name,
+        extension: descriptor.extension,
+        path: String::new(),
+        hidden: descriptor.hidden,
+        version_id: version_id.to_string(),
+        untracked: descriptor.untracked,
+        metadata: descriptor.metadata,
+        change_id: descriptor.change_id,
+    }))
+}
+
 pub(crate) async fn load_directory_rows_under_path(
     backend: &dyn LixBackend,
     version_id: &str,

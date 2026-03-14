@@ -11,8 +11,6 @@ use super::key::{schema_from_registered_snapshot, schema_key_from_definition, Sc
 
 const REGISTERED_SCHEMA_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const GLOBAL_VERSION: &str = "global";
-const INTERNAL_SCHEMA_VERSION: &str = "1";
-
 #[async_trait(?Send)]
 pub trait SchemaProvider {
     async fn load_schema(&mut self, key: &SchemaKey) -> Result<JsonValue, LixError>;
@@ -166,11 +164,9 @@ impl<'a> SqlRegisteredSchemaProvider<'a> {
 #[async_trait(?Send)]
 impl SchemaProvider for SqlRegisteredSchemaProvider<'_> {
     async fn load_schema(&mut self, key: &SchemaKey) -> Result<JsonValue, LixError> {
-        if let Some(schema) = whitelisted_internal_schema(&key.schema_key) {
-            if key.schema_version == INTERNAL_SCHEMA_VERSION {
-                self.cache.insert(key.clone(), schema.clone());
-                return Ok(schema);
-            }
+        if let Some(schema) = builtin_schema_for_key(key) {
+            self.cache.insert(key.clone(), schema.clone());
+            return Ok(schema);
         }
 
         if let Some(schema) = self.cache.get(key) {
@@ -192,9 +188,17 @@ impl SchemaProvider for SqlRegisteredSchemaProvider<'_> {
 
     async fn load_latest_schema(&mut self, schema_key: &str) -> Result<JsonValue, LixError> {
         if let Some(schema) = whitelisted_internal_schema(schema_key) {
-            let key = SchemaKey::new(schema_key.to_string(), INTERNAL_SCHEMA_VERSION.to_string());
+            let schema_version = builtin_schema_version(&schema)?;
+            let key = SchemaKey::new(schema_key.to_string(), schema_version);
             self.cache.insert(key, schema.clone());
             return Ok(schema);
+        }
+
+        if let Some(schema) = builtin_schema_definition(schema_key) {
+            let schema_version = builtin_schema_version(schema)?;
+            let key = SchemaKey::new(schema_key.to_string(), schema_version);
+            self.cache.insert(key, schema.clone());
+            return Ok(schema.clone());
         }
 
         let Some((_, schema)) = self.load_latest_schema_entry(schema_key).await? else {
@@ -235,11 +239,38 @@ impl SchemaProvider for SqlRegisteredSchemaProvider<'_> {
     }
 }
 
+fn builtin_schema_for_key(key: &SchemaKey) -> Option<JsonValue> {
+    if let Some(schema) = whitelisted_internal_schema(&key.schema_key) {
+        let schema_version = schema.get("x-lix-version").and_then(JsonValue::as_str)?;
+        if schema_version == key.schema_version {
+            return Some(schema);
+        }
+    }
+
+    let schema = builtin_schema_definition(&key.schema_key)?;
+    let schema_version = schema.get("x-lix-version").and_then(JsonValue::as_str)?;
+    if schema_version != key.schema_version {
+        return None;
+    }
+    Some(schema.clone())
+}
+
+fn builtin_schema_version(schema: &JsonValue) -> Result<String, LixError> {
+    schema
+        .get("x-lix-version")
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "builtin schema is missing string x-lix-version".to_string(),
+        })
+}
+
 fn whitelisted_internal_schema(schema_key: &str) -> Option<JsonValue> {
     match schema_key {
         "lix_state" => Some(json!({
             "x-lix-key": "lix_state",
-            "x-lix-version": INTERNAL_SCHEMA_VERSION,
+            "x-lix-version": "1",
             "x-lix-primary-key": [
                 "/entity_id",
                 "/schema_key",

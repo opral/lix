@@ -9,7 +9,8 @@ mod types;
 pub(crate) use append_commit::{
     append_commit_if_preconditions_hold, AppendCommitArgs, AppendCommitDisposition,
     AppendCommitError, AppendCommitErrorKind, AppendCommitInvariantChecker,
-    AppendCommitPreconditions, AppendCommitResult, AppendExpectedTip, AppendWriteLane,
+    AppendCommitPreconditions, AppendCommitResult, AppendExpectedTip, AppendIdempotencyKey,
+    AppendWriteLane,
 };
 pub(crate) use generate_commit::generate_commit;
 pub(crate) use runtime::{
@@ -17,9 +18,9 @@ pub(crate) use runtime::{
     load_commit_active_accounts, StatementBatch,
 };
 pub(crate) use state_source::{
-    load_committed_global_tip_commit_id, load_committed_version_tip_commit_id,
-    load_exact_committed_state_row, load_version_info_for_versions, CommitQueryExecutor,
-    ExactCommittedStateRow, ExactCommittedStateRowRequest,
+    load_committed_version_tip_commit_id, load_exact_committed_state_row,
+    load_version_info_for_versions, CommitQueryExecutor, ExactCommittedStateRow,
+    ExactCommittedStateRowRequest,
 };
 pub(crate) use types::ProposedDomainChange;
 pub(crate) use types::{

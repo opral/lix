@@ -1,5 +1,6 @@
 use crate::cel::CelEvaluator;
-use crate::deterministic_mode::DeterministicSettings;
+use crate::deterministic_mode::{deterministic_mode_key, DeterministicSettings};
+use crate::key_value::key_value_schema_key;
 use crate::plugin::types::InstalledPlugin;
 use crate::sql::execution::transaction_session::PublicSqlSessionState;
 use crate::sql::public::catalog::SurfaceRegistry;
@@ -44,6 +45,7 @@ pub struct Engine {
     boot_active_account: Option<BootAccount>,
     boot_deterministic_settings: Option<DeterministicSettings>,
     deterministic_boot_pending: AtomicBool,
+    deterministic_settings_cache: RwLock<Option<DeterministicSettings>>,
     init_state: AtomicU8,
     active_version_id: RwLock<Option<String>>,
     public_surface_registry: RwLock<SurfaceRegistry>,
@@ -111,6 +113,20 @@ impl Engine {
         self.boot_deterministic_settings
     }
 
+    pub(crate) fn cached_deterministic_settings(&self) -> Option<DeterministicSettings> {
+        *self
+            .deterministic_settings_cache
+            .read()
+            .expect("deterministic settings cache lock poisoned")
+    }
+
+    pub(crate) fn cache_deterministic_settings(&self, settings: DeterministicSettings) {
+        *self
+            .deterministic_settings_cache
+            .write()
+            .expect("deterministic settings cache lock poisoned") = Some(settings);
+    }
+
     pub(crate) fn boot_key_values(&self) -> &[BootKeyValue] {
         &self.boot_key_values
     }
@@ -176,6 +192,13 @@ impl Engine {
             .store(false, Ordering::SeqCst);
     }
 
+    pub(crate) fn invalidate_deterministic_settings_cache(&self) {
+        *self
+            .deterministic_settings_cache
+            .write()
+            .expect("deterministic settings cache lock poisoned") = None;
+    }
+
     pub(crate) fn mark_init_completed(&self) {
         self.init_state
             .store(INIT_STATE_COMPLETED, Ordering::SeqCst);
@@ -188,6 +211,23 @@ impl Engine {
 
     pub(crate) fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
         self.state_commit_stream_bus.emit(changes);
+    }
+
+    pub(crate) fn maybe_invalidate_deterministic_settings_cache(
+        &self,
+        mutations: &[MutationRow],
+        state_commit_stream_changes: &[StateCommitStreamChange],
+    ) {
+        let touched = mutations.iter().any(|row| {
+            row.schema_key == key_value_schema_key() && row.entity_id == deterministic_mode_key()
+        }) || state_commit_stream_changes.iter().any(|change| {
+            change.schema_key == key_value_schema_key()
+                && change.entity_id == deterministic_mode_key()
+        });
+
+        if touched {
+            self.invalidate_deterministic_settings_cache();
+        }
     }
 
     pub(crate) fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
@@ -340,6 +380,7 @@ impl Engine {
             boot_active_account: args.active_account,
             boot_deterministic_settings,
             deterministic_boot_pending: AtomicBool::new(deterministic_boot_pending),
+            deterministic_settings_cache: RwLock::new(boot_deterministic_settings),
             init_state: AtomicU8::new(INIT_STATE_NOT_STARTED),
             active_version_id: RwLock::new(None),
             public_surface_registry: RwLock::new(SurfaceRegistry::with_builtin_surfaces()),

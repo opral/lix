@@ -2,9 +2,7 @@ use crate::sql::public::planner::ir::{
     CommitPreconditions, ExpectedTip, IdempotencyKey, MutationPayload, PlannedStateRow,
     PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode,
 };
-use crate::state::commit::{
-    load_committed_global_tip_commit_id, load_committed_version_tip_commit_id, ProposedDomainChange,
-};
+use crate::state::commit::ProposedDomainChange;
 use crate::{LixBackend, LixError};
 use serde_json::{json, Map, Value as JsonValue};
 
@@ -39,13 +37,16 @@ pub(crate) fn build_domain_change_batch(
     resolved
         .partitions
         .iter()
-        .filter(|partition| partition.execution_mode == WriteMode::Tracked)
+        .filter(|partition| {
+            partition.execution_mode == WriteMode::Tracked
+                && partition.lazy_exact_file_metadata_update.is_none()
+        })
         .map(|partition| build_domain_change_batch_for_partition(planned_write, partition))
         .collect()
 }
 
 pub(crate) async fn derive_commit_preconditions(
-    backend: &dyn LixBackend,
+    _backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<Vec<CommitPreconditions>, DomainChangeError> {
     let resolved = planned_write
@@ -70,19 +71,11 @@ pub(crate) async fn derive_commit_preconditions(
                     "public commit precondition derivation requires exactly one tracked write lane"
                         .to_string(),
             })?;
-        let mut executor = backend;
-        let current_tip =
-            current_tip_for_write_lane(&mut executor, &write_lane, planned_write).await?;
-        let idempotency_key = build_idempotency_key(
-            planned_write,
-            partition,
-            partition_index,
-            &write_lane,
-            &current_tip,
-        )?;
+        let idempotency_key =
+            build_idempotency_key(planned_write, partition, partition_index, &write_lane)?;
         preconditions.push(CommitPreconditions {
             write_lane,
-            expected_tip: ExpectedTip::CommitId(current_tip),
+            expected_tip: ExpectedTip::CurrentTip,
             idempotency_key,
         });
     }
@@ -154,69 +147,20 @@ fn build_domain_change_batch_for_partition(
     })
 }
 
-async fn current_tip_for_write_lane(
-    executor: &mut dyn crate::state::commit::CommitQueryExecutor,
-    write_lane: &WriteLane,
-    planned_write: &PlannedWrite,
-) -> Result<String, DomainChangeError> {
-    match write_lane {
-        WriteLane::ActiveVersion => {
-            let version_id = planned_write
-            .command
-            .execution_context
-            .requested_version_id
-            .clone()
-            .ok_or_else(|| DomainChangeError {
-                message: "public commit precondition derivation requires requested_version_id for ActiveVersion writes".to_string(),
-            })?;
-            load_committed_version_tip_commit_id(executor, &version_id)
-                .await
-                .map_err(domain_change_backend_error)?
-                .ok_or_else(|| DomainChangeError {
-                    message: format!(
-                        "public commit precondition derivation could not find a version tip for '{}'",
-                        version_id
-                    ),
-                })
-        }
-        WriteLane::SingleVersion(version_id) => {
-            load_committed_version_tip_commit_id(executor, version_id)
-                .await
-                .map_err(domain_change_backend_error)?
-                .ok_or_else(|| DomainChangeError {
-                    message: format!(
-                "public commit precondition derivation could not find a version tip for '{}'",
-                version_id
-            ),
-                })
-        }
-        WriteLane::GlobalAdmin => load_committed_global_tip_commit_id(executor)
-            .await
-            .map_err(domain_change_backend_error)?
-            .ok_or_else(|| DomainChangeError {
-                message:
-                    "public commit precondition derivation could not find the global admin tip"
-                        .to_string(),
-            }),
-    }
-}
-
 fn build_idempotency_key(
     planned_write: &PlannedWrite,
     partition: &ResolvedWritePartition,
     partition_index: usize,
     write_lane: &WriteLane,
-    current_tip: &str,
 ) -> Result<IdempotencyKey, DomainChangeError> {
     let summarized = json!({
         "surface": planned_write.command.target.descriptor.public_name,
         "operation": format!("{:?}", planned_write.command.operation_kind),
         "partition_index": partition_index,
         "lane": format!("{:?}", write_lane),
-        "tip": current_tip,
         "writer_key": planned_write.command.execution_context.writer_key,
         "payload": summarize_mutation_payload(&planned_write.command.payload),
-        "resolved_rows": summarize_planned_rows(&partition.intended_post_state),
+        "resolved_rows": summarize_partition_rows(partition),
     });
     let summarized_bytes = serde_json::to_vec(&summarized).map_err(|error| DomainChangeError {
         message: format!("public idempotency-key serialization failed: {error}"),
@@ -229,11 +173,36 @@ fn build_idempotency_key(
             "operation": format!("{:?}", planned_write.command.operation_kind),
             "partition_index": partition_index,
             "lane": format!("{:?}", write_lane),
-            "tip": current_tip,
             "fingerprint": fingerprint,
         })
         .to_string(),
     ))
+}
+
+fn summarize_partition_rows(partition: &ResolvedWritePartition) -> JsonValue {
+    if let Some(lazy) = partition.lazy_exact_file_metadata_update.as_ref() {
+        return json!({
+            "kind": "lazy_exact_file_metadata_update",
+            "file_id": lazy.file_id,
+            "version_id": lazy.version_id,
+            "metadata": summarize_optional_text_patch(&lazy.metadata),
+        });
+    }
+    summarize_planned_rows(&partition.intended_post_state)
+}
+
+fn summarize_optional_text_patch(
+    patch: &crate::sql::public::planner::ir::OptionalTextPatch,
+) -> JsonValue {
+    match patch {
+        crate::sql::public::planner::ir::OptionalTextPatch::Unchanged => json!({
+            "kind": "unchanged",
+        }),
+        crate::sql::public::planner::ir::OptionalTextPatch::Set(value) => json!({
+            "kind": "set",
+            "value": value,
+        }),
+    }
 }
 
 fn summarize_mutation_payload(payload: &MutationPayload) -> JsonValue {
@@ -508,7 +477,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn derives_commit_preconditions_from_version_pointer_tip() {
+    async fn derives_commit_preconditions_against_current_tip() {
         let planned_write = planned_write(
             "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
              VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')",
@@ -531,13 +500,14 @@ mod tests {
             preconditions.write_lane,
             WriteLane::SingleVersion("version-a".to_string())
         );
-        assert_eq!(
-            preconditions.expected_tip,
-            ExpectedTip::CommitId("commit-123".to_string())
+        assert_eq!(preconditions.expected_tip, ExpectedTip::CurrentTip);
+        assert!(
+            preconditions.idempotency_key.0.contains("\"fingerprint\""),
+            "idempotency key should carry a stable payload fingerprint"
         );
         assert!(
-            preconditions.idempotency_key.0.contains("commit-123"),
-            "idempotency key should reflect the expected tip"
+            !preconditions.idempotency_key.0.contains("commit-123"),
+            "idempotency key should no longer force a pre-read of the current tip"
         );
     }
 
@@ -571,8 +541,8 @@ mod tests {
             "idempotency key should stay compact for large blob payloads"
         );
         assert!(
-            preconditions.idempotency_key.0.contains("commit-123"),
-            "idempotency key should still reflect the expected tip"
+            !preconditions.idempotency_key.0.contains("commit-123"),
+            "idempotency key should stay tip-independent for large payloads"
         );
     }
 }
