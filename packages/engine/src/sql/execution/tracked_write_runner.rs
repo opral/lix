@@ -62,14 +62,14 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
         .domain_change_batch
         .as_ref()
         .is_some_and(|batch| batch.changes.is_empty())
-        && !plan.has_lazy_exact_file_metadata_update()
+        && !plan.has_lazy_exact_file_update()
     {
         return Ok(Some(empty_public_write_execution_outcome()));
     }
 
     let mut append_functions = plan.functions.clone();
     if let Some(session_slot) = pending_append_session.as_mut() {
-        let can_merge = !plan.has_lazy_exact_file_metadata_update()
+        let can_merge = !plan.has_lazy_exact_file_update()
             && session_slot.as_ref().is_some_and(|session| {
                 pending_session_matches_append(session, &plan.execution.append_preconditions)
             });
@@ -123,7 +123,7 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
                 .as_ref()
                 .map(|batch| batch.changes.clone())
                 .unwrap_or_default(),
-            lazy_exact_file_metadata_update: plan.execution.lazy_exact_file_metadata_update.clone(),
+            lazy_exact_file_update: plan.execution.lazy_exact_file_update.clone(),
             preconditions: plan.execution.append_preconditions.clone(),
             should_emit_observe_tick: plan.should_emit_observe_tick(),
             observe_tick_writer_key: plan.writer_key.clone(),
@@ -217,7 +217,7 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
     }
 
     let plan_effects_override = if plugin_changes_committed {
-        if plan.has_lazy_exact_file_metadata_update() {
+        if plan.has_lazy_exact_file_update() {
             semantic_plan_effects_from_domain_changes(
                 &append_result.applied_domain_changes,
                 state_commit_stream_operation(

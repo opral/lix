@@ -235,6 +235,22 @@ pub(crate) async fn prepare_execution_with_backend(
         .map(|prepared| prepared.lowered_read.statements.clone())
         .unwrap_or_else(|| statements.clone());
 
+    let skip_side_effect_collection = policy.skip_side_effect_collection
+        || public_write.as_ref().is_some_and(|prepared| {
+            prepared.execution.as_ref().is_some_and(|execution| {
+                execution.partitions.iter().any(|partition| {
+                    matches!(
+                        partition,
+                        PublicWriteExecutionPartition::Tracked(execution)
+                            if matches!(
+                                execution.lazy_exact_file_update.as_ref(),
+                                Some(crate::sql::public::planner::ir::LazyExactFileUpdate::Data(_))
+                            )
+                    )
+                })
+            })
+        });
+
     let intent = collect_execution_intent_with_backend(
         engine,
         backend,
@@ -244,7 +260,7 @@ pub(crate) async fn prepare_execution_with_backend(
         writer_key,
         &requirements,
         IntentCollectionPolicy {
-            skip_side_effect_collection: policy.skip_side_effect_collection,
+            skip_side_effect_collection,
         },
     )
     .await

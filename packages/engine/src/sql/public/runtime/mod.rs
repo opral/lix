@@ -174,8 +174,7 @@ pub(crate) enum PublicWriteExecutionPartition {
 pub(crate) struct TrackedWriteExecution {
     pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub(crate) domain_change_batch: Option<DomainChangeBatch>,
-    pub(crate) lazy_exact_file_metadata_update:
-        Option<crate::sql::public::planner::ir::LazyExactFileMetadataUpdate>,
+    pub(crate) lazy_exact_file_update: Option<crate::sql::public::planner::ir::LazyExactFileUpdate>,
     pub(crate) append_preconditions: AppendCommitPreconditions,
     pub(crate) semantic_effects: PlanEffects,
     pub(crate) persist_filesystem_payloads_before_write: bool,
@@ -1616,9 +1615,8 @@ fn build_public_write_execution(
                     return Ok(None);
                 }
 
-                let lazy_exact_file_metadata_update =
-                    partition.lazy_exact_file_metadata_update.clone();
-                let domain_change_batch = if lazy_exact_file_metadata_update.is_some() {
+                let lazy_exact_file_update = partition.lazy_exact_file_update.clone();
+                let domain_change_batch = if lazy_exact_file_update.is_some() {
                     None
                 } else {
                     let Some(domain_change_batch) = tracked_batches.next().cloned() else {
@@ -1655,7 +1653,7 @@ fn build_public_write_execution(
                                 partition,
                             ),
                         domain_change_batch,
-                        lazy_exact_file_metadata_update,
+                        lazy_exact_file_update,
                     },
                 ));
             }
@@ -1841,6 +1839,14 @@ fn public_write_persists_filesystem_payloads(
     planned_write: &PlannedWrite,
     partition: &crate::sql::public::planner::ir::ResolvedWritePartition,
 ) -> bool {
+    if matches!(
+        partition.lazy_exact_file_update.as_ref(),
+        Some(crate::sql::public::planner::ir::LazyExactFileUpdate::Data(
+            _
+        ))
+    ) {
+        return false;
+    }
     matches!(
         planned_write.command.target.descriptor.public_name.as_str(),
         "lix_file" | "lix_file_by_version"

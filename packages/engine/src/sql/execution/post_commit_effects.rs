@@ -7,6 +7,7 @@ use crate::sql::execution::execute::{self, SqlExecutionOutcome};
 use crate::sql::execution::shared_path::{
     public_write_filesystem_payload_changes_already_committed, PreparedExecutionContext,
 };
+use crate::sql::public::runtime::PublicWriteExecutionPartition;
 use crate::LixError;
 
 pub(crate) async fn apply_owned_execution_post_commit_effects(
@@ -99,7 +100,10 @@ pub(crate) async fn apply_owned_execution_post_commit_effects(
     {
         engine.invalidate_installed_plugins_cache()?;
     }
-    if should_emit_observe_tick && !write_owned_transaction_committed {
+    if should_emit_observe_tick
+        && (!write_owned_transaction_committed
+            || owned_public_write_requires_post_commit_observe_tick(prepared))
+    {
         engine.append_observe_tick(writer_key).await?;
     }
     if public_surface_registry_dirty {
@@ -108,6 +112,28 @@ pub(crate) async fn apply_owned_execution_post_commit_effects(
     engine.emit_state_commit_stream_changes(state_commit_stream_changes);
 
     Ok(())
+}
+
+fn owned_public_write_requires_post_commit_observe_tick(
+    prepared: &PreparedExecutionContext,
+) -> bool {
+    let Some(public_write) = prepared.public_write.as_ref() else {
+        return false;
+    };
+    let Some(execution) = public_write.execution.as_ref() else {
+        return false;
+    };
+
+    let saw_untracked = execution
+        .partitions
+        .iter()
+        .any(|partition| matches!(partition, PublicWriteExecutionPartition::Untracked(_)));
+    let saw_tracked = execution
+        .partitions
+        .iter()
+        .any(|partition| matches!(partition, PublicWriteExecutionPartition::Tracked(_)));
+
+    saw_untracked && !saw_tracked
 }
 
 pub(crate) struct CacheTargets {
