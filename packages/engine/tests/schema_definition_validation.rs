@@ -396,7 +396,7 @@ fn x_lix_override_lixcols_rejects_complex_values() {
 }
 
 #[test]
-fn x_lix_entity_views_accepts_known_view_names() {
+fn x_lix_entity_views_is_rejected() {
     let schema = json!({
         "type": "object",
         "x-lix-key": "mock",
@@ -409,24 +409,9 @@ fn x_lix_entity_views_accepts_known_view_names() {
         "additionalProperties": false
     });
 
-    assert!(validate_lix_schema_definition(&schema).is_ok());
-}
-
-#[test]
-fn x_lix_entity_views_rejects_unknown_view_names() {
-    let schema = json!({
-        "type": "object",
-        "x-lix-key": "mock",
-        "x-lix-version": "1",
-        "x-lix-entity-views": ["lix_state", "unknown"],
-        "properties": {
-            "name": { "type": "string" }
-        },
-        "required": ["name"],
-        "additionalProperties": false
-    });
-
-    assert!(validate_lix_schema_definition(&schema).is_err());
+    let err =
+        validate_lix_schema_definition(&schema).expect_err("x-lix-entity-views should be rejected");
+    assert!(err.to_string().contains("x-lix-entity-views"));
 }
 
 #[test]
@@ -613,6 +598,32 @@ fn x_lix_foreign_keys_rejects_mode_field() {
 
     let err = validate_lix_schema_definition(&schema).expect_err("mode should be rejected");
     assert!(err.to_string().contains("mode"));
+}
+
+#[test]
+fn x_lix_foreign_keys_rejects_scope_field() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "child_entity",
+        "x-lix-version": "1",
+        "x-lix-primary-key": ["/id"],
+        "x-lix-foreign-keys": [
+            {
+                "properties": ["/parent_id"],
+                "references": { "schemaKey": "parent_entity", "properties": ["/id"] },
+                "scope": ["file_id"]
+            }
+        ],
+        "properties": {
+            "id": { "type": "string" },
+            "parent_id": { "type": "string" }
+        },
+        "required": ["id", "parent_id"],
+        "additionalProperties": false
+    });
+
+    let err = validate_lix_schema_definition(&schema).expect_err("scope should be rejected");
+    assert!(err.to_string().contains("scope"));
 }
 
 #[test]

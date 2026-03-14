@@ -35,6 +35,7 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
     assert_primary_key_pointers(schema)?;
     assert_unique_pointers(schema)?;
     assert_non_aliased_lix_foreign_key_references(schema)?;
+    assert_removed_entity_views_absent(schema)?;
     assert_removed_lixcol_version_override_absent(schema)?;
 
     Ok(())
@@ -224,6 +225,19 @@ fn assert_removed_lixcol_version_override_absent(schema: &JsonValue) -> Result<(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description:
                 "Invalid Lix schema definition: x-lix-override-lixcols.lixcol_version_id is no longer supported; use lixcol_global for global write scope.".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn assert_removed_entity_views_absent(schema: &JsonValue) -> Result<(), LixError> {
+    if schema.get("x-lix-entity-views").is_some() {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description:
+                "Invalid Lix schema definition: x-lix-entity-views is no longer supported."
+                    .to_string(),
         });
     }
 
