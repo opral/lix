@@ -4,8 +4,7 @@ use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::public::runtime::{
-    build_tracked_write_txn_plan, finalize_public_write_execution,
-    prepare_public_execution_with_internal_access,
+    finalize_public_write_execution, prepare_public_execution_with_internal_access,
     prepare_public_execution_with_registry_and_internal_access,
     prepared_public_write_mutates_public_surface_registry, PreparedPublicExecution,
     PreparedPublicRead, PreparedPublicWrite, PublicWriteExecutionPartition,
@@ -38,7 +37,6 @@ use crate::sql::execution::intent::{
     ExecutionIntent, IntentCollectionPolicy,
 };
 use crate::sql::execution::plan::build_execution_plan;
-use crate::sql::execution::tracked_write_runner::run_tracked_write_txn_plan_with_transaction;
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::state::internal::write_program::WriteProgram;
 use serde_json::{json, Value as JsonValue};
@@ -46,7 +44,6 @@ use sqlparser::ast::Statement;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
-const UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
 const GLOBAL_VERSION_ID: &str = "global";
 
 pub(crate) struct PreparationPolicy {
@@ -242,35 +239,44 @@ pub(crate) async fn prepare_execution_with_backend(
                     matches!(
                         partition,
                         PublicWriteExecutionPartition::Tracked(execution)
-                            if matches!(
-                                execution.lazy_exact_file_update.as_ref(),
-                                Some(crate::sql::public::planner::ir::LazyExactFileUpdate::Data(_))
-                            )
+                            if execution.lazy_exact_file_updates.iter().any(|update| {
+                                matches!(
+                                    update,
+                                    crate::sql::public::planner::ir::LazyExactFileUpdate::Data(_)
+                                )
+                            })
                     )
                 })
             })
         });
 
-    let intent = collect_execution_intent_with_backend(
-        engine,
-        backend,
-        &statements,
-        params,
-        active_version_id,
-        writer_key,
-        &requirements,
-        IntentCollectionPolicy {
-            skip_side_effect_collection,
-        },
-    )
-    .await
-    .map_err(|error| LixError {
-        code: error.code,
-        description: format!(
-            "prepare_execution_with_backend intent collection failed: {}",
-            error.description
-        ),
-    })?;
+    let intent = if let Some(intent) = public_write
+        .as_ref()
+        .and_then(derived_public_execution_intent)
+    {
+        intent
+    } else {
+        collect_execution_intent_with_backend(
+            engine,
+            backend,
+            &statements,
+            params,
+            active_version_id,
+            writer_key,
+            &requirements,
+            IntentCollectionPolicy {
+                skip_side_effect_collection,
+            },
+        )
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "prepare_execution_with_backend intent collection failed: {}",
+                error.description
+            ),
+        })?
+    };
 
     let public_write_owns_execution = public_write.is_some();
     if let Some(public_write) = public_write.as_mut() {
@@ -393,6 +399,128 @@ pub(crate) async fn prepare_execution_with_backend(
     })
 }
 
+fn derived_public_execution_intent(
+    prepared: &PreparedPublicWrite,
+) -> Option<crate::sql::execution::intent::ExecutionIntent> {
+    let execution = prepared.execution.as_ref()?;
+    if !execution
+        .partitions
+        .iter()
+        .all(|partition| matches!(partition, PublicWriteExecutionPartition::Untracked(_)))
+    {
+        return None;
+    }
+    if !matches!(
+        prepared
+            .planned_write
+            .command
+            .target
+            .descriptor
+            .public_name
+            .as_str(),
+        "lix_file" | "lix_file_by_version" | "lix_directory" | "lix_directory_by_version"
+    ) {
+        return None;
+    }
+
+    let pending_file_writes = derive_untracked_filesystem_pending_file_writes(prepared)?;
+    let pending_file_delete_targets = derive_untracked_filesystem_delete_targets(prepared)?;
+    Some(crate::sql::execution::intent::ExecutionIntent {
+        pending_file_writes,
+        pending_file_delete_targets,
+    })
+}
+
+fn derive_untracked_filesystem_pending_file_writes(
+    prepared: &PreparedPublicWrite,
+) -> Option<Vec<crate::filesystem::pending_file_writes::PendingFileWrite>> {
+    let resolved = prepared.planned_write.resolved_write_plan.as_ref()?;
+    let shared_update_bytes = match &prepared.planned_write.command.payload {
+        crate::sql::public::planner::ir::MutationPayload::UpdatePatch(columns) => {
+            columns.get("data").and_then(pending_write_bytes_from_value)
+        }
+        _ => None,
+    };
+    let mut insert_bytes_by_file_id = std::collections::BTreeMap::new();
+    if let crate::sql::public::planner::ir::MutationPayload::InsertRows(rows) =
+        &prepared.planned_write.command.payload
+    {
+        for row in rows {
+            let Some(crate::Value::Text(file_id)) = row.get("id") else {
+                continue;
+            };
+            let Some(bytes) = row.get("data").and_then(pending_write_bytes_from_value) else {
+                continue;
+            };
+            insert_bytes_by_file_id.insert(file_id.clone(), bytes);
+        }
+    }
+
+    let mut writes = Vec::new();
+    for partition in &resolved.partitions {
+        if partition.execution_mode != crate::sql::public::planner::ir::WriteMode::Untracked {
+            continue;
+        }
+        for row in &partition.intended_post_state {
+            if row.tombstone || row.schema_key != "lix_binary_blob_ref" {
+                continue;
+            }
+            let bytes = insert_bytes_by_file_id
+                .get(&row.entity_id)
+                .cloned()
+                .or_else(|| shared_update_bytes.clone());
+            let Some(after_data) = bytes else {
+                continue;
+            };
+            writes.push(crate::filesystem::pending_file_writes::PendingFileWrite {
+                file_id: row.entity_id.clone(),
+                version_id: row
+                    .version_id
+                    .clone()
+                    .unwrap_or_else(|| crate::version::GLOBAL_VERSION_ID.to_string()),
+                untracked: true,
+                before_path: None,
+                after_path: None,
+                data_is_authoritative: true,
+                before_data: None,
+                after_data,
+            });
+        }
+    }
+
+    Some(writes)
+}
+
+fn derive_untracked_filesystem_delete_targets(
+    prepared: &PreparedPublicWrite,
+) -> Option<std::collections::BTreeSet<(String, String)>> {
+    let resolved = prepared.planned_write.resolved_write_plan.as_ref()?;
+    let mut targets = std::collections::BTreeSet::new();
+    for partition in &resolved.partitions {
+        if partition.execution_mode != crate::sql::public::planner::ir::WriteMode::Untracked {
+            continue;
+        }
+        for row in &partition.tombstones {
+            if row.schema_key != "lix_binary_blob_ref" {
+                continue;
+            }
+            let Some(version_id) = row.version_id.as_ref() else {
+                continue;
+            };
+            targets.insert((row.entity_id.clone(), version_id.clone()));
+        }
+    }
+    Some(targets)
+}
+
+fn pending_write_bytes_from_value(value: &crate::Value) -> Option<Vec<u8>> {
+    match value {
+        crate::Value::Blob(bytes) => Some(bytes.clone()),
+        crate::Value::Text(text) => Some(text.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
 fn passthrough_execution_plan_for_public_write(
     statements: &[Statement],
     live_table_requirements: Vec<SchemaLiveTableRequirement>,
@@ -505,103 +633,6 @@ mod tests {
     }
 }
 
-pub(crate) async fn maybe_execute_public_write_with_backend(
-    engine: &Engine,
-    prepared: &PreparedExecutionContext,
-    writer_key: Option<&str>,
-) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    let Some(public_write) = prepared.public_write.as_ref() else {
-        return Ok(None);
-    };
-    if public_write.execution.is_none() {
-        return Ok(None);
-    }
-
-    let mut transaction: Box<dyn LixTransaction> = engine.backend.begin_transaction().await?;
-    let execution = match maybe_execute_public_write_with_transaction(
-        engine,
-        transaction.as_mut(),
-        prepared,
-        writer_key,
-        None,
-    )
-    .await?
-    {
-        Some(execution) => execution,
-        None => return Ok(None),
-    };
-    transaction.commit().await?;
-    Ok(Some(execution))
-}
-
-pub(crate) async fn maybe_execute_public_write_with_transaction(
-    engine: &Engine,
-    transaction: &mut dyn LixTransaction,
-    prepared: &PreparedExecutionContext,
-    writer_key: Option<&str>,
-    pending_append_session: Option<&mut Option<PendingPublicAppendSession>>,
-) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    let mut pending_append_session = pending_append_session;
-    let Some(public_write) = prepared.public_write.as_ref() else {
-        return Ok(None);
-    };
-    let Some(execution) = public_write.execution.as_ref() else {
-        return Ok(None);
-    };
-
-    let mut combined_outcome = None;
-    for partition in &execution.partitions {
-        let outcome = match partition {
-            PublicWriteExecutionPartition::Untracked(execution) => {
-                if let Some(session_slot) = pending_append_session.as_mut() {
-                    **session_slot = None;
-                }
-                execute_public_untracked_write_with_transaction(
-                    engine,
-                    transaction,
-                    execution,
-                    prepared,
-                )
-                .await?
-            }
-            PublicWriteExecutionPartition::Tracked(execution) => {
-                execute_public_tracked_write_with_transaction(
-                    engine,
-                    transaction,
-                    execution,
-                    public_write,
-                    prepared,
-                    writer_key,
-                    pending_append_session.as_deref_mut(),
-                )
-                .await?
-            }
-        };
-
-        if let Some(outcome) = outcome {
-            merge_public_write_execution_outcome(&mut combined_outcome, outcome);
-        }
-    }
-
-    Ok(Some(
-        combined_outcome.unwrap_or_else(empty_public_write_execution_outcome),
-    ))
-}
-
-async fn execute_public_tracked_write_with_transaction(
-    engine: &Engine,
-    transaction: &mut dyn LixTransaction,
-    execution: &crate::sql::public::runtime::TrackedWriteExecution,
-    public_write: &PreparedPublicWrite,
-    prepared: &PreparedExecutionContext,
-    writer_key: Option<&str>,
-    pending_append_session: Option<&mut Option<PendingPublicAppendSession>>,
-) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    let plan = build_tracked_write_txn_plan(public_write, execution, prepared, writer_key);
-    run_tracked_write_txn_plan_with_transaction(engine, transaction, &plan, pending_append_session)
-        .await
-}
-
 pub(crate) fn empty_public_write_execution_outcome() -> SqlExecutionOutcome {
     SqlExecutionOutcome {
         public_result: QueryResult {
@@ -612,47 +643,6 @@ pub(crate) fn empty_public_write_execution_outcome() -> SqlExecutionOutcome {
         plugin_changes_committed: false,
         plan_effects_override: Some(PlanEffects::default()),
         state_commit_stream_changes: Vec::new(),
-    }
-}
-
-fn merge_public_write_execution_outcome(
-    combined: &mut Option<SqlExecutionOutcome>,
-    outcome: SqlExecutionOutcome,
-) {
-    let Some(existing) = combined.as_mut() else {
-        *combined = Some(outcome);
-        return;
-    };
-    existing
-        .postprocess_file_cache_targets
-        .extend(outcome.postprocess_file_cache_targets);
-    existing.plugin_changes_committed |= outcome.plugin_changes_committed;
-    existing
-        .state_commit_stream_changes
-        .extend(outcome.state_commit_stream_changes);
-    merge_plan_effects_override(
-        &mut existing.plan_effects_override,
-        outcome.plan_effects_override,
-    );
-}
-
-fn merge_plan_effects_override(existing: &mut Option<PlanEffects>, next: Option<PlanEffects>) {
-    match (existing, next) {
-        (_, None) => {}
-        (slot @ None, Some(next)) => {
-            *slot = Some(next);
-        }
-        (Some(current), Some(next)) => {
-            current
-                .state_commit_stream_changes
-                .extend(next.state_commit_stream_changes);
-            current
-                .file_cache_refresh_targets
-                .extend(next.file_cache_refresh_targets);
-            if next.next_active_version_id.is_some() {
-                current.next_active_version_id = next.next_active_version_id;
-            }
-        }
     }
 }
 
@@ -1072,43 +1062,6 @@ async fn execute_generated_commit_result(
     Ok(())
 }
 
-async fn execute_public_untracked_write_with_transaction(
-    engine: &Engine,
-    transaction: &mut dyn LixTransaction,
-    execution: &crate::sql::public::runtime::UntrackedWriteExecution,
-    prepared: &PreparedExecutionContext,
-) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    let mut runtime_functions = prepared.functions.clone();
-    let timestamp = runtime_functions.timestamp();
-    if execution.persist_filesystem_payloads_before_write {
-        engine
-            .persist_pending_file_data_updates_in_transaction(
-                transaction,
-                &prepared.intent.pending_file_writes,
-            )
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "public untracked filesystem payload persistence failed before state apply: {}",
-                    error.description
-                ),
-            })?;
-    }
-    apply_public_untracked_rows(transaction, &execution.intended_post_state, &timestamp).await?;
-
-    Ok(Some(SqlExecutionOutcome {
-        public_result: QueryResult {
-            rows: Vec::new(),
-            columns: Vec::new(),
-        },
-        postprocess_file_cache_targets: BTreeSet::new(),
-        plugin_changes_committed: false,
-        plan_effects_override: Some(execution.semantic_effects.clone()),
-        state_commit_stream_changes: Vec::new(),
-    }))
-}
-
 pub(crate) fn public_write_filesystem_payload_changes_already_committed(
     prepared: &PreparedExecutionContext,
 ) -> bool {
@@ -1124,149 +1077,6 @@ pub(crate) fn public_write_filesystem_payload_changes_already_committed(
             )
         })
     })
-}
-
-async fn apply_public_untracked_rows(
-    transaction: &mut dyn LixTransaction,
-    rows: &[crate::sql::public::planner::ir::PlannedStateRow],
-    timestamp: &str,
-) -> Result<(), LixError> {
-    for row in rows {
-        if row.tombstone {
-            apply_public_untracked_delete(transaction, row).await?;
-        } else {
-            apply_public_untracked_upsert(transaction, row, timestamp).await?;
-        }
-    }
-    Ok(())
-}
-
-async fn apply_public_untracked_upsert(
-    transaction: &mut dyn LixTransaction,
-    row: &crate::sql::public::planner::ir::PlannedStateRow,
-    timestamp: &str,
-) -> Result<(), LixError> {
-    let file_id = planned_row_text_value(row, "file_id")?;
-    let plugin_key = planned_row_text_value(row, "plugin_key")?;
-    let schema_version = planned_row_text_value(row, "schema_version")?;
-    let snapshot_content = planned_row_json_text_value(row, "snapshot_content")?;
-    let metadata_sql = planned_row_optional_text_value(row, "metadata")
-        .map(|value| format!("'{}'", escape_sql_string(value)))
-        .unwrap_or_else(|| "NULL".to_string());
-    let writer_key_sql = planned_row_optional_text_value(row, "writer_key")
-        .map(|value| format!("'{}'", escape_sql_string(value)))
-        .unwrap_or_else(|| "NULL".to_string());
-    let global = row
-        .values
-        .get("global")
-        .and_then(value_as_bool)
-        .unwrap_or_else(|| row.version_id.as_deref() == Some(GLOBAL_VERSION_ID));
-
-    let sql = format!(
-        "INSERT INTO {table} (\
-         entity_id, schema_key, file_id, version_id, global, plugin_key, snapshot_content, metadata, writer_key, schema_version, created_at, updated_at\
-         ) VALUES (\
-         '{entity_id}', '{schema_key}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{snapshot_content}', {metadata}, {writer_key}, '{schema_version}', '{timestamp}', '{timestamp}'\
-         ) ON CONFLICT (entity_id, schema_key, file_id, version_id) DO UPDATE SET \
-         global = excluded.global, \
-         plugin_key = excluded.plugin_key, \
-         snapshot_content = excluded.snapshot_content, \
-         metadata = excluded.metadata, \
-         writer_key = excluded.writer_key, \
-         schema_version = excluded.schema_version, \
-         updated_at = excluded.updated_at",
-        table = UNTRACKED_TABLE,
-        entity_id = escape_sql_string(&row.entity_id),
-        schema_key = escape_sql_string(&row.schema_key),
-        file_id = escape_sql_string(file_id),
-        version_id = escape_sql_string(row.version_id.as_deref().unwrap_or(GLOBAL_VERSION_ID)),
-        global = if global { "true" } else { "false" },
-        plugin_key = escape_sql_string(plugin_key),
-        snapshot_content = escape_sql_string(&snapshot_content),
-        metadata = metadata_sql,
-        writer_key = writer_key_sql,
-        schema_version = escape_sql_string(schema_version),
-        timestamp = escape_sql_string(timestamp),
-    );
-    transaction.execute(&sql, &[]).await?;
-    Ok(())
-}
-
-async fn apply_public_untracked_delete(
-    transaction: &mut dyn LixTransaction,
-    row: &crate::sql::public::planner::ir::PlannedStateRow,
-) -> Result<(), LixError> {
-    let file_id = planned_row_text_value(row, "file_id")?;
-    let sql = format!(
-        "DELETE FROM {table} \
-         WHERE entity_id = '{entity_id}' \
-           AND schema_key = '{schema_key}' \
-           AND file_id = '{file_id}' \
-           AND version_id = '{version_id}'",
-        table = UNTRACKED_TABLE,
-        entity_id = escape_sql_string(&row.entity_id),
-        schema_key = escape_sql_string(&row.schema_key),
-        file_id = escape_sql_string(file_id),
-        version_id = escape_sql_string(row.version_id.as_deref().unwrap_or(GLOBAL_VERSION_ID)),
-    );
-    transaction.execute(&sql, &[]).await?;
-    Ok(())
-}
-
-fn planned_row_text_value<'a>(
-    row: &'a crate::sql::public::planner::ir::PlannedStateRow,
-    key: &str,
-) -> Result<&'a str, LixError> {
-    planned_row_optional_text_value(row, key).ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("public untracked execution requires '{key}' in the resolved row"),
-    })
-}
-
-fn planned_row_json_text_value(
-    row: &crate::sql::public::planner::ir::PlannedStateRow,
-    key: &str,
-) -> Result<String, LixError> {
-    planned_row_optional_json_text_value(row, key)
-        .map(|value| value.into_owned())
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("public untracked execution requires '{key}' in the resolved row"),
-        })
-}
-
-fn planned_row_optional_text_value<'a>(
-    row: &'a crate::sql::public::planner::ir::PlannedStateRow,
-    key: &str,
-) -> Option<&'a str> {
-    match row.values.get(key) {
-        Some(Value::Text(value)) => Some(value.as_str()),
-        _ => None,
-    }
-}
-
-fn planned_row_optional_json_text_value<'a>(
-    row: &'a crate::sql::public::planner::ir::PlannedStateRow,
-    key: &str,
-) -> Option<std::borrow::Cow<'a, str>> {
-    match row.values.get(key) {
-        Some(Value::Text(value)) => Some(std::borrow::Cow::Borrowed(value.as_str())),
-        Some(Value::Json(value)) => Some(std::borrow::Cow::Owned(value.to_string())),
-        _ => None,
-    }
-}
-
-fn value_as_bool(value: &Value) -> Option<bool> {
-    match value {
-        Value::Boolean(value) => Some(*value),
-        Value::Integer(value) => Some(*value != 0),
-        Value::Text(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" => Some(true),
-            "0" | "false" => Some(false),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 pub(crate) fn append_commit_error_to_lix_error(

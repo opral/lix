@@ -653,8 +653,8 @@ fn open_lix_at_path(
         key_values: vec![BootKeyValue {
             key: "lix_deterministic_mode".to_string(),
             value: json!({ "enabled": true }),
-            version_id: Some("global".to_string()),
-            untracked: None,
+            lixcol_global: Some(true),
+            lixcol_untracked: None,
         }],
     };
 
@@ -1260,14 +1260,21 @@ fn build_replay_commit_statements(
     }
 
     for row in &batch.updates {
-        statements.push(SqlStatement {
-            sql: "UPDATE lix_file SET path = ?, data = ? WHERE id = ?".to_string(),
-            params: vec![
-                Value::Text(row.path.clone()),
-                Value::Blob(row.data.clone()),
-                Value::Text(row.id.clone()),
-            ],
-        });
+        if stable_file_id(&row.path) == row.id {
+            statements.push(SqlStatement {
+                sql: "UPDATE lix_file SET data = ? WHERE id = ?".to_string(),
+                params: vec![Value::Blob(row.data.clone()), Value::Text(row.id.clone())],
+            });
+        } else {
+            statements.push(SqlStatement {
+                sql: "UPDATE lix_file SET path = ?, data = ? WHERE id = ?".to_string(),
+                params: vec![
+                    Value::Text(row.path.clone()),
+                    Value::Blob(row.data.clone()),
+                    Value::Text(row.id.clone()),
+                ],
+            });
+        }
     }
 
     statements
@@ -1756,6 +1763,63 @@ mod tests {
         );
 
         fs::remove_dir_all(&temp_dir).expect("temp dir should be removable");
+    }
+
+    #[test]
+    fn build_replay_commit_statements_omits_path_for_stable_updates() {
+        let batch = PreparedBatch {
+            deletes: Vec::new(),
+            inserts: Vec::new(),
+            updates: vec![WriteRow {
+                id: "/src/main.ts".to_string(),
+                path: "/src/main.ts".to_string(),
+                data: b"hello".to_vec(),
+            }],
+        };
+
+        let statements = build_replay_commit_statements(&batch, DEFAULT_INSERT_BATCH_ROWS);
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0].sql,
+            "UPDATE lix_file SET data = ? WHERE id = ?"
+        );
+        assert_eq!(
+            statements[0].params,
+            vec![
+                Value::Blob(b"hello".to_vec()),
+                Value::Text("/src/main.ts".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn build_replay_commit_statements_preserves_path_for_renames() {
+        let batch = PreparedBatch {
+            deletes: Vec::new(),
+            inserts: Vec::new(),
+            updates: vec![WriteRow {
+                id: "/src/old.ts".to_string(),
+                path: "/src/new.ts".to_string(),
+                data: b"hello".to_vec(),
+            }],
+        };
+
+        let statements = build_replay_commit_statements(&batch, DEFAULT_INSERT_BATCH_ROWS);
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            statements[0].sql,
+            "UPDATE lix_file SET path = ?, data = ? WHERE id = ?"
+        );
+        assert_eq!(
+            statements[0].params,
+            vec![
+                Value::Text("/src/new.ts".to_string()),
+                Value::Blob(b"hello".to_vec()),
+                Value::Text("/src/old.ts".to_string())
+            ]
+        );
     }
 
     fn unique_temp_dir() -> PathBuf {

@@ -12,9 +12,9 @@ use crate::sql::execution::post_commit_effects::apply_owned_execution_post_commi
 use crate::sql::execution::shared_path;
 use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
 use crate::sql::execution::transaction_session::execute_public_sql;
-use crate::sql::execution::write_program_runner::{
-    execute_write_program_with_backend, execute_write_program_with_transaction,
-};
+use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
+use crate::sql::execution::write_txn_plan::build_write_txn_plan;
+use crate::sql::execution::write_txn_runner::run_write_txn_plan_with_backend;
 use crate::sql::public::runtime::{
     classify_public_execution_route_with_registry, decode_public_read_result,
 };
@@ -61,16 +61,6 @@ impl Engine {
         params: &[Value],
     ) -> Result<QueryResult, LixError> {
         self.backend.execute(sql, params).await
-    }
-
-    pub(crate) async fn append_observe_tick(
-        &self,
-        writer_key: Option<&str>,
-    ) -> Result<(), LixError> {
-        let mut program = WriteProgram::new();
-        program.push_statement(self.build_observe_tick_insert_sql(writer_key), Vec::new());
-        execute_write_program_with_backend(self.backend.as_ref(), program).await?;
-        Ok(())
     }
 
     pub(crate) async fn append_observe_tick_in_transaction(
@@ -186,33 +176,34 @@ impl Engine {
         let public_surface_registry_dirty =
             prepared_execution_mutates_public_surface_registry(&prepared)?;
 
-        let (execution, write_owned_transaction_committed) =
-            match shared_path::maybe_execute_public_write_with_backend(self, &prepared, writer_key)
-                .await
-            {
-                Ok(Some(execution)) => (execution, true),
-                Ok(None) => match execute::execute_plan_sql(
-                    self,
-                    &prepared.plan,
-                    prepared.plan.requirements.should_refresh_file_cache,
-                    &prepared.functions,
-                    writer_key,
-                )
-                .await
-                .map_err(LixError::from)
-                {
-                    Ok(execution) => (execution, false),
-                    Err(error) => {
-                        return Err(normalize_sql_execution_error_with_backend(
-                            self.backend.as_ref(),
-                            error,
-                            &parsed_statements,
-                        )
-                        .await)
-                    }
-                },
+        let write_txn_plan = build_write_txn_plan(&prepared, writer_key);
+        let (execution, write_owned_transaction_committed) = if let Some(plan) = write_txn_plan {
+            match run_write_txn_plan_with_backend(self, &plan, None).await {
+                Ok(execution) => (execution, true),
                 Err(error) => return Err(error),
-            };
+            }
+        } else {
+            match execute::execute_plan_sql(
+                self,
+                &prepared.plan,
+                prepared.plan.requirements.should_refresh_file_cache,
+                &prepared.functions,
+                writer_key,
+            )
+            .await
+            .map_err(LixError::from)
+            {
+                Ok(execution) => (execution, false),
+                Err(error) => {
+                    return Err(normalize_sql_execution_error_with_backend(
+                        self.backend.as_ref(),
+                        error,
+                        &parsed_statements,
+                    )
+                    .await)
+                }
+            }
+        };
 
         apply_owned_execution_post_commit_effects(
             self,

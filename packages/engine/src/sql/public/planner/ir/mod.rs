@@ -583,16 +583,24 @@ pub(crate) struct LazyExactFileDataUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LazyExactFileDelete {
+    pub(crate) file_ids: Vec<String>,
+    pub(crate) version_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LazyExactFileUpdate {
     Metadata(LazyExactFileMetadataUpdate),
     Data(LazyExactFileDataUpdate),
+    Delete(LazyExactFileDelete),
 }
 
 impl LazyExactFileUpdate {
-    pub(crate) fn file_id(&self) -> &str {
+    pub(crate) fn file_ids(&self) -> Vec<&str> {
         match self {
-            Self::Metadata(update) => update.file_id.as_str(),
-            Self::Data(update) => update.file_id.as_str(),
+            Self::Metadata(update) => vec![update.file_id.as_str()],
+            Self::Data(update) => vec![update.file_id.as_str()],
+            Self::Delete(update) => update.file_ids.iter().map(String::as_str).collect(),
         }
     }
 
@@ -600,6 +608,7 @@ impl LazyExactFileUpdate {
         match self {
             Self::Metadata(update) => update.version_id.as_str(),
             Self::Data(update) => update.version_id.as_str(),
+            Self::Delete(update) => update.version_id.as_str(),
         }
     }
 }

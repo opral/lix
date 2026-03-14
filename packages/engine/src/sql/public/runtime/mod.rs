@@ -174,7 +174,7 @@ pub(crate) enum PublicWriteExecutionPartition {
 pub(crate) struct TrackedWriteExecution {
     pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub(crate) domain_change_batch: Option<DomainChangeBatch>,
-    pub(crate) lazy_exact_file_update: Option<crate::sql::public::planner::ir::LazyExactFileUpdate>,
+    pub(crate) lazy_exact_file_updates: Vec<crate::sql::public::planner::ir::LazyExactFileUpdate>,
     pub(crate) append_preconditions: AppendCommitPreconditions,
     pub(crate) semantic_effects: PlanEffects,
     pub(crate) persist_filesystem_payloads_before_write: bool,
@@ -1615,8 +1615,12 @@ fn build_public_write_execution(
                     return Ok(None);
                 }
 
-                let lazy_exact_file_update = partition.lazy_exact_file_update.clone();
-                let domain_change_batch = if lazy_exact_file_update.is_some() {
+                let lazy_exact_file_updates = partition
+                    .lazy_exact_file_update
+                    .clone()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let domain_change_batch = if !lazy_exact_file_updates.is_empty() {
                     None
                 } else {
                     let Some(domain_change_batch) = tracked_batches.next().cloned() else {
@@ -1653,7 +1657,7 @@ fn build_public_write_execution(
                                 partition,
                             ),
                         domain_change_batch,
-                        lazy_exact_file_update,
+                        lazy_exact_file_updates,
                     },
                 ));
             }

@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use crate::deterministic_mode::DeterministicSettings;
 use crate::engine::Engine;
 use crate::functions::LixFunctionProvider;
 use crate::schema::registry::ensure_schema_live_table_in_transaction;
@@ -62,14 +63,14 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
         .domain_change_batch
         .as_ref()
         .is_some_and(|batch| batch.changes.is_empty())
-        && !plan.has_lazy_exact_file_update()
+        && !plan.has_lazy_exact_file_updates()
     {
         return Ok(Some(empty_public_write_execution_outcome()));
     }
 
     let mut append_functions = plan.functions.clone();
     if let Some(session_slot) = pending_append_session.as_mut() {
-        let can_merge = !plan.has_lazy_exact_file_update()
+        let can_merge = !plan.has_lazy_exact_file_updates()
             && session_slot.as_ref().is_some_and(|session| {
                 pending_session_matches_append(session, &plan.execution.append_preconditions)
             });
@@ -98,6 +99,21 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
                 &timestamp,
             )
             .await?;
+            if append_functions
+                .deterministic_sequence_persist_highest_seen()
+                .is_some()
+            {
+                let mut settings = DeterministicSettings::disabled();
+                settings.enabled = append_functions.deterministic_sequence_enabled();
+                engine
+                    .persist_runtime_sequence_in_transaction(
+                        transaction,
+                        settings,
+                        0,
+                        &append_functions,
+                    )
+                    .await?;
+            }
 
             return Ok(Some(SqlExecutionOutcome {
                 public_result: QueryResult {
@@ -123,7 +139,7 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
                 .as_ref()
                 .map(|batch| batch.changes.clone())
                 .unwrap_or_default(),
-            lazy_exact_file_update: plan.execution.lazy_exact_file_update.clone(),
+            lazy_exact_file_updates: plan.execution.lazy_exact_file_updates.clone(),
             preconditions: plan.execution.append_preconditions.clone(),
             should_emit_observe_tick: plan.should_emit_observe_tick(),
             observe_tick_writer_key: plan.writer_key.clone(),
@@ -217,7 +233,7 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
     }
 
     let plan_effects_override = if plugin_changes_committed {
-        if plan.has_lazy_exact_file_update() {
+        if plan.has_lazy_exact_file_updates() {
             semantic_plan_effects_from_domain_changes(
                 &append_result.applied_domain_changes,
                 state_commit_stream_operation(

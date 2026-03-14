@@ -259,7 +259,6 @@ pub(crate) struct CollectedExecutionSideEffects {
 #[derive(Default)]
 pub(crate) struct DeferredTransactionSideEffects {
     pub(crate) pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
-    pub(crate) pending_file_delete_targets: BTreeSet<(String, String)>,
 }
 
 pub(crate) fn reject_internal_table_writes(statements: &[Statement]) -> Result<(), LixError> {
@@ -393,43 +392,6 @@ impl Engine {
             observe_shared_sources: Mutex::new(BTreeMap::new()),
         }
     }
-}
-
-pub(crate) fn collapse_pending_file_writes_for_transaction(
-    writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
-) -> Vec<crate::filesystem::pending_file_writes::PendingFileWrite> {
-    let mut collapsed =
-        Vec::<crate::filesystem::pending_file_writes::PendingFileWrite>::with_capacity(
-            writes.len(),
-        );
-    let mut index_by_key = BTreeMap::<(String, String, bool), usize>::new();
-
-    for write in writes {
-        let key = (
-            write.file_id.clone(),
-            write.version_id.clone(),
-            write.untracked,
-        );
-        if let Some(index) = index_by_key.get(&key).copied() {
-            let existing = &mut collapsed[index];
-            existing.after_path = write.after_path.clone();
-            existing.after_data = write.after_data.clone();
-            existing.data_is_authoritative =
-                existing.data_is_authoritative || write.data_is_authoritative;
-            if existing.before_path.is_none() {
-                existing.before_path = write.before_path.clone();
-            }
-            if existing.before_data.is_none() {
-                existing.before_data = write.before_data.clone();
-            }
-            continue;
-        }
-
-        index_by_key.insert(key, collapsed.len());
-        collapsed.push(write.clone());
-    }
-
-    collapsed
 }
 
 pub(crate) fn direct_state_file_cache_refresh_targets(
