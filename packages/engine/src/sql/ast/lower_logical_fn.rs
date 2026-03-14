@@ -8,7 +8,13 @@ use crate::LixError;
 #[derive(Debug, Clone)]
 pub(crate) struct LixJsonExtractCall {
     pub(crate) json_expr: Expr,
-    pub(crate) path: Vec<String>,
+    pub(crate) path: Vec<LixJsonPathSegment>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum LixJsonPathSegment {
+    Key(String),
+    Index(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -72,17 +78,13 @@ fn parse_lix_json_extract_named(
     let mut path = Vec::with_capacity(args.len() - 1);
     for arg in &args[1..] {
         let expr = function_arg_expr(arg, &call_name)?;
-        let key = string_literal(&expr).ok_or_else(|| LixError {
+        let segment = path_segment_literal(&expr).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("{function_name}() path arguments must be single-quoted strings"),
+            description: format!(
+                "{function_name}() path arguments must be single-quoted strings for object keys or non-negative integer literals for array indexes"
+            ),
         })?;
-        if key.is_empty() {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("{function_name}() path segments must not be empty"),
-            });
-        }
-        path.push(key.to_string());
+        path.push(segment);
     }
 
     Ok(Some(LixJsonExtractCall { json_expr, path }))
@@ -245,6 +247,22 @@ fn string_literal(expr: &Expr) -> Option<&str> {
             value: AstValue::SingleQuotedString(value),
             ..
         }) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn path_segment_literal(expr: &Expr) -> Option<LixJsonPathSegment> {
+    if let Some(key) = string_literal(expr) {
+        return Some(LixJsonPathSegment::Key(key.to_string()));
+    }
+
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: AstValue::Number(raw, false),
+            ..
+        }) if raw.bytes().all(|byte| byte.is_ascii_digit()) => {
+            raw.parse::<u64>().ok().map(LixJsonPathSegment::Index)
+        }
         _ => None,
     }
 }
