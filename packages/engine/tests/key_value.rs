@@ -382,7 +382,7 @@ simulation_test!(
 
         let result = engine
             .execute(
-                "SELECT lix_json_extract(snapshot_content, 'value', '1') \
+                "SELECT lix_json_extract(snapshot_content, 'value', 1) \
                  FROM lix_internal_state_vtable \
                  WHERE schema_key = 'lix_key_value' AND entity_id = 'array_extract' \
                  LIMIT 1",
@@ -396,6 +396,151 @@ simulation_test!(
         assert_eq!(
             result.statements[0].rows[0][0],
             Value::Text("20".to_string())
+        );
+    }
+);
+
+simulation_test!(
+    key_value_lix_json_extract_supports_numeric_object_key_segments,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                &insert_key_value_sql("numeric_key_extract", "{\"1\":\"one\"}"),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let result = engine
+            .execute(
+                "SELECT lix_json_extract(snapshot_content, 'value', '1') \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_key_value' AND entity_id = 'numeric_key_extract' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(result.statements[0].rows.clone());
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![Value::Text("one".to_string())]]
+        );
+    }
+);
+
+simulation_test!(
+    key_value_lix_json_extract_supports_empty_object_key_segments,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                &insert_key_value_sql("empty_key_extract", "{\"\":\"blank\"}"),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let result = engine
+            .execute(
+                "SELECT lix_json_extract(snapshot_content, 'value', '') \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_key_value' AND entity_id = 'empty_key_extract' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(result.statements[0].rows.clone());
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![Value::Text("blank".to_string())]]
+        );
+    }
+);
+
+simulation_test!(
+    key_value_lix_json_extract_returns_json_boolean_lexemes,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute(
+                "SELECT \
+                    lix_json_extract('{\"value\":true}', 'value'), \
+                    lix_json_extract('{\"value\":false}', 'value'), \
+                    lix_json_extract_boolean('{\"value\":true}', 'value'), \
+                    lix_json_extract_boolean('{\"value\":\"true\"}', 'value')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic_normalized(result.statements[0].rows.clone());
+        assert_eq!(
+            result.statements[0].rows[0][0],
+            Value::Text("true".to_string())
+        );
+        assert_eq!(
+            result.statements[0].rows[0][1],
+            Value::Text("false".to_string())
+        );
+        support::simulation_test::assert_boolean_like(&result.statements[0].rows[0][2], true);
+        assert_eq!(result.statements[0].rows[0][3], Value::Null);
+    }
+);
+
+simulation_test!(
+    key_value_lix_json_normalizes_literal_scalars,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute(
+                "SELECT \
+                CAST(lix_json(true) AS TEXT), \
+                CAST(lix_json(false) AS TEXT), \
+                CAST(lix_json(NULL) AS TEXT), \
+                CAST(lix_json(1) AS TEXT)",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(result.statements[0].rows.clone());
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![
+                Value::Text("true".to_string()),
+                Value::Text("false".to_string()),
+                Value::Text("null".to_string()),
+                Value::Text("1".to_string()),
+            ]]
         );
     }
 );
