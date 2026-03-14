@@ -590,8 +590,8 @@ fn x_lix_foreign_keys_rejects_schema_version() {
 }
 
 #[test]
-fn x_lix_foreign_keys_supports_modes() {
-    let schema_materialized = json!({
+fn x_lix_foreign_keys_rejects_mode_field() {
+    let schema = json!({
         "type": "object",
         "x-lix-key": "child_entity",
         "x-lix-version": "1",
@@ -611,53 +611,8 @@ fn x_lix_foreign_keys_supports_modes() {
         "additionalProperties": false
     });
 
-    let schema_immediate = json!({
-        "type": "object",
-        "x-lix-key": "comment",
-        "x-lix-version": "1",
-        "x-lix-primary-key": ["/id"],
-        "x-lix-foreign-keys": [
-            {
-                "properties": ["/post_id"],
-                "references": { "schemaKey": "post", "properties": ["/id"] },
-                "mode": "immediate"
-            }
-        ],
-        "properties": {
-            "id": { "type": "string" },
-            "post_id": { "type": "string" }
-        },
-        "required": ["id", "post_id"],
-        "additionalProperties": false
-    });
-
-    assert!(validate_lix_schema_definition(&schema_materialized).is_ok());
-    assert!(validate_lix_schema_definition(&schema_immediate).is_ok());
-}
-
-#[test]
-fn x_lix_foreign_keys_fails_with_invalid_mode_value() {
-    let schema = json!({
-        "type": "object",
-        "x-lix-key": "child_entity",
-        "x-lix-version": "1",
-        "x-lix-primary-key": ["/id"],
-        "x-lix-foreign-keys": [
-            {
-                "properties": ["/parent_id"],
-                "references": { "schemaKey": "parent_entity", "properties": ["/id"] },
-                "mode": "deferred"
-            }
-        ],
-        "properties": {
-            "id": { "type": "string" },
-            "parent_id": { "type": "string" }
-        },
-        "required": ["id", "parent_id"],
-        "additionalProperties": false
-    });
-
-    assert!(validate_lix_schema_definition(&schema).is_err());
+    let err = validate_lix_schema_definition(&schema).expect_err("mode should be rejected");
+    assert!(err.to_string().contains("mode"));
 }
 
 #[test]
@@ -764,59 +719,6 @@ fn x_version_rejects_leading_zeros() {
             "name": { "type": "string" }
         },
         "required": ["name"],
-        "additionalProperties": false
-    });
-
-    assert!(validate_lix_schema_definition(&schema).is_err());
-}
-
-#[test]
-fn x_lix_unique_is_optional_duplicate() {
-    let schema = json!({
-        "type": "object",
-        "x-lix-key": "mock",
-        "x-lix-version": "1",
-        "properties": {
-            "name": { "type": "string" }
-        },
-        "required": ["name"],
-        "additionalProperties": false
-    });
-
-    assert!(validate_lix_schema_definition(&schema).is_ok());
-}
-
-#[test]
-fn x_lix_unique_must_be_array_of_arrays_when_present_duplicate() {
-    let schema = json!({
-        "type": "object",
-        "x-lix-key": "mock",
-        "x-lix-version": "1",
-        "x-lix-unique": [["/id"], ["/name", "/age"]],
-        "properties": {
-            "id": { "type": "string" },
-            "name": { "type": "string" },
-            "age": { "type": "number" }
-        },
-        "required": ["id", "name", "age"],
-        "additionalProperties": false
-    });
-
-    assert!(validate_lix_schema_definition(&schema).is_ok());
-}
-
-#[test]
-fn x_lix_unique_fails_with_invalid_structure_duplicate() {
-    let schema = json!({
-        "type": "object",
-        "x-lix-key": "mock",
-        "x-lix-version": "1",
-        "x-lix-unique": ["/id", "/name"],
-        "properties": {
-            "id": { "type": "string" },
-            "name": { "type": "string" }
-        },
-        "required": ["id", "name"],
         "additionalProperties": false
     });
 

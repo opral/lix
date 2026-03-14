@@ -30,6 +30,7 @@ const AUTO_FILE_ID_SENTINEL_PREFIX: &str = "lix_pending_auto_file_id::";
 pub(crate) struct PendingFileWrite {
     pub(crate) file_id: String,
     pub(crate) version_id: String,
+    pub(crate) untracked: bool,
     pub(crate) before_path: Option<String>,
     pub(crate) after_path: Option<String>,
     pub(crate) data_is_authoritative: bool,
@@ -60,6 +61,7 @@ struct LiveFilePrefetchRow {
     path: String,
     data: Option<Vec<u8>>,
     blob_hash: Option<String>,
+    untracked: bool,
 }
 
 #[cfg(test)]
@@ -297,6 +299,10 @@ fn collect_insert_writes(
         column.value.eq_ignore_ascii_case("lixcol_version_id")
             || column.value.eq_ignore_ascii_case("version_id")
     });
+    let untracked_index = insert.columns.iter().position(|column| {
+        column.value.eq_ignore_ascii_case("lixcol_untracked")
+            || column.value.eq_ignore_ascii_case("untracked")
+    });
 
     let (Some(data_index), Some(path_index)) = (data_index, path_index) else {
         return Ok(());
@@ -329,10 +335,15 @@ fn collect_insert_writes(
                 version_id
             }
         };
+        let untracked = untracked_index
+            .and_then(|index| resolved_row.get(index))
+            .and_then(|resolved| resolved.value.as_ref())
+            .is_some_and(value_is_truthy);
 
         writes.push(PendingFileWrite {
             file_id,
             version_id,
+            untracked,
             before_path: None,
             after_path: Some(path),
             data_is_authoritative: true,
@@ -443,6 +454,7 @@ async fn collect_delete_writes(
         pending.push(PendingFileWrite {
             file_id,
             version_id,
+            untracked: false,
             before_path: Some(before_path),
             after_path: None,
             data_is_authoritative: true,
@@ -478,6 +490,7 @@ async fn collect_delete_writes(
         pending.push(PendingFileWrite {
             file_id,
             version_id,
+            untracked: overlay_state.untracked,
             before_path: Some(overlay_state.path.clone()),
             after_path: None,
             data_is_authoritative: true,
@@ -579,6 +592,7 @@ async fn collect_update_writes(
                     let mut write = PendingFileWrite {
                         file_id: exact_target.file_id,
                         version_id,
+                        untracked: overlay_state.untracked,
                         before_path: Some(before_path),
                         after_path: Some(path),
                         data_is_authoritative: saw_data_assignment,
@@ -600,6 +614,7 @@ async fn collect_update_writes(
                     let mut write = PendingFileWrite {
                         file_id: exact_target.file_id,
                         version_id,
+                        untracked: before_row.untracked,
                         before_path: Some(before_row.path.clone()),
                         after_path: Some(path),
                         data_is_authoritative: saw_data_assignment,
@@ -624,7 +639,7 @@ async fn collect_update_writes(
 
     let live_projection_sql = build_live_file_prefetch_projection_sql();
     let mut query_sql = format!(
-        "SELECT id, path, data, lixcol_version_id, {blob_hash_column} \
+        "SELECT id, path, data, lixcol_version_id, {blob_hash_column}, lixcol_untracked \
          FROM ({live_projection_sql}) AS live_files",
         blob_hash_column = LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN,
     );
@@ -721,6 +736,7 @@ async fn collect_update_writes(
         pending.push(PendingFileWrite {
             file_id,
             version_id,
+            untracked: row.get(5).is_some_and(value_is_truthy),
             before_path: Some(before_path_for_write),
             after_path: Some(path),
             data_is_authoritative,
@@ -937,6 +953,7 @@ async fn collect_delete_targets(
 struct OverlayWriteState {
     path: String,
     data: Vec<u8>,
+    untracked: bool,
 }
 
 const ACTIVE_VERSION_VIEW: &str = "lix_active_version";
@@ -959,6 +976,7 @@ fn apply_statement_writes_to_overlay(
             OverlayWriteState {
                 path: path.clone(),
                 data: write.after_data.clone(),
+                untracked: write.untracked,
             },
         );
     }
@@ -1559,6 +1577,7 @@ fn active_version_id_from_snapshot_value(value: &Value) -> Option<String> {
 
 fn value_is_truthy(value: &Value) -> bool {
     match value {
+        Value::Boolean(value) => *value,
         Value::Integer(value) => *value != 0,
         Value::Text(value) => {
             let normalized = value.trim().to_ascii_lowercase();
@@ -1618,6 +1637,14 @@ async fn load_exact_live_file_prefetch_row(
         ["fdu_local", "fd_local", "fdu_global", "fd_global"],
         "extension",
     );
+    let descriptor_untracked_expr = "\
+        CASE \
+            WHEN fdu_local.snapshot_content IS NOT NULL THEN 1 \
+            WHEN fd_local.snapshot_content IS NOT NULL THEN 0 \
+            WHEN fdu_global.snapshot_content IS NOT NULL THEN 1 \
+            WHEN fd_global.snapshot_content IS NOT NULL THEN 0 \
+            ELSE 0 \
+        END";
     let blob_hash_expr = coalesced_json_field_sql(
         ["bru_local", "br_local", "bru_global", "br_global"],
         "blob_hash",
@@ -1628,6 +1655,7 @@ async fn load_exact_live_file_prefetch_row(
              {descriptor_directory_expr} AS directory_id, \
              {descriptor_name_expr} AS name, \
              {descriptor_extension_expr} AS extension, \
+             {descriptor_untracked_expr} AS lixcol_untracked, \
              {blob_hash_expr} AS {blob_hash_column} \
            FROM (SELECT $1 AS file_id, $2 AS version_id) input \
            LEFT JOIN {untracked_table} fdu_local \
@@ -1667,7 +1695,7 @@ async fn load_exact_live_file_prefetch_row(
             AND br_global.version_id = '{global_version_id}' \
             AND br_global.snapshot_content IS NOT NULL \
          ) \
-         SELECT directory_id, name, extension, {blob_hash_column}, bbs.data \
+         SELECT directory_id, name, extension, {blob_hash_column}, bbs.data, lixcol_untracked \
          FROM resolved_file rf \
          LEFT JOIN lix_internal_binary_blob_store bbs \
            ON bbs.blob_hash = rf.{blob_hash_column} \
@@ -1676,6 +1704,7 @@ async fn load_exact_live_file_prefetch_row(
         descriptor_directory_expr = descriptor_directory_expr,
         descriptor_name_expr = descriptor_name_expr,
         descriptor_extension_expr = descriptor_extension_expr,
+        descriptor_untracked_expr = descriptor_untracked_expr,
         blob_hash_expr = blob_hash_expr,
         blob_hash_column = LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN,
         untracked_table = INTERNAL_STATE_UNTRACKED,
@@ -1704,6 +1733,7 @@ async fn load_exact_live_file_prefetch_row(
     let extension = row.get(2).and_then(value_as_text);
     let blob_hash = row.get(3).and_then(value_as_text);
     let data = row.get(4).and_then(value_as_blob_or_text_bytes);
+    let untracked = row.get(5).is_some_and(value_is_truthy);
 
     let path = match directory_id.as_deref() {
         Some(directory_id) => {
@@ -1721,6 +1751,7 @@ async fn load_exact_live_file_prefetch_row(
         path,
         data,
         blob_hash,
+        untracked,
     }))
 }
 

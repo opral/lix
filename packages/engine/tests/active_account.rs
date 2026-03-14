@@ -103,6 +103,100 @@ simulation_test!(
 );
 
 simulation_test!(
+    active_account_view_insert_replaces_previous_selection,
+    simulations = [sqlite, materialization],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_active_account (account_id) VALUES ('acct-first')",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_active_account (account_id) VALUES ('acct-second')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = read_active_account_rows(&engine).await;
+        assert_eq!(
+            rows,
+            vec![("acct-second".to_string(), "acct-second".to_string())]
+        );
+
+        let stored = engine
+            .execute(
+                "SELECT entity_id \
+             FROM lix_internal_live_untracked_v1 \
+             WHERE schema_key = 'lix_active_account' \
+               AND file_id = 'lix' \
+               AND version_id = 'global'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.statements[0].rows.len(), 1);
+        assert_text(&stored.statements[0].rows[0][0], "acct-second");
+    }
+);
+
+simulation_test!(
+    active_account_view_insert_same_account_is_noop,
+    simulations = [sqlite, materialization],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_active_account (account_id) VALUES ('acct-stable')",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_active_account (account_id) VALUES ('acct-stable')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = read_active_account_rows(&engine).await;
+        assert_eq!(
+            rows,
+            vec![("acct-stable".to_string(), "acct-stable".to_string())]
+        );
+
+        let stored = engine
+            .execute(
+                "SELECT entity_id \
+             FROM lix_internal_live_untracked_v1 \
+             WHERE schema_key = 'lix_active_account' \
+               AND file_id = 'lix' \
+               AND version_id = 'global'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.statements[0].rows.len(), 1);
+        assert_text(&stored.statements[0].rows[0][0], "acct-stable");
+    }
+);
+
+simulation_test!(
     active_account_view_delete_removes_matching_row,
     simulations = [sqlite, materialization],
     |sim| async move {

@@ -77,6 +77,7 @@ fn binary_blob_ref_change_for_bytes(
     file_id: &str,
     version_id: &str,
     data: &[u8],
+    untracked: bool,
     writer_key: Option<&str>,
 ) -> Result<FilesystemPayloadDomainChange, LixError> {
     let size_bytes = u64::try_from(data.len()).map_err(|_| LixError {
@@ -98,6 +99,7 @@ fn binary_blob_ref_change_for_bytes(
         schema_version: BINARY_BLOB_REF_SCHEMA_VERSION.to_string(),
         file_id: file_id.to_string(),
         version_id: version_id.to_string(),
+        untracked,
         plugin_key: INTERNAL_FILESYSTEM_PLUGIN_KEY.to_string(),
         snapshot_content: Some(snapshot_content),
         metadata: None,
@@ -108,6 +110,7 @@ fn binary_blob_ref_change_for_bytes(
 fn binary_blob_ref_tombstone_change_for_target(
     file_id: &str,
     version_id: &str,
+    untracked: bool,
     writer_key: Option<&str>,
 ) -> FilesystemPayloadDomainChange {
     FilesystemPayloadDomainChange {
@@ -116,6 +119,7 @@ fn binary_blob_ref_tombstone_change_for_target(
         schema_version: BINARY_BLOB_REF_SCHEMA_VERSION.to_string(),
         file_id: file_id.to_string(),
         version_id: version_id.to_string(),
+        untracked,
         plugin_key: INTERNAL_FILESYSTEM_PLUGIN_KEY.to_string(),
         snapshot_content: None,
         metadata: None,
@@ -241,7 +245,7 @@ impl Engine {
         &self,
         changes: &[FilesystemPayloadDomainChange],
     ) -> Result<(), LixError> {
-        self.persist_filesystem_payload_domain_changes_with_untracked(changes, false)
+        self.persist_filesystem_payload_domain_changes_partitioned(changes)
             .await
     }
 
@@ -250,12 +254,74 @@ impl Engine {
         transaction: &mut dyn LixTransaction,
         changes: &[FilesystemPayloadDomainChange],
     ) -> Result<(), LixError> {
-        self.persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
+        self.persist_filesystem_payload_domain_changes_partitioned_in_transaction(
             transaction,
             changes,
-            false,
         )
         .await
+    }
+
+    async fn persist_filesystem_payload_domain_changes_partitioned(
+        &self,
+        changes: &[FilesystemPayloadDomainChange],
+    ) -> Result<(), LixError> {
+        let tracked = changes
+            .iter()
+            .filter(|change| !change.untracked)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !tracked.is_empty() {
+            self.persist_filesystem_payload_domain_changes_with_untracked(&tracked, false)
+                .await?;
+        }
+
+        let untracked = changes
+            .iter()
+            .filter(|change| change.untracked)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !untracked.is_empty() {
+            self.persist_filesystem_payload_domain_changes_with_untracked(&untracked, true)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn persist_filesystem_payload_domain_changes_partitioned_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        changes: &[FilesystemPayloadDomainChange],
+    ) -> Result<(), LixError> {
+        let tracked = changes
+            .iter()
+            .filter(|change| !change.untracked)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !tracked.is_empty() {
+            self.persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
+                transaction,
+                &tracked,
+                false,
+            )
+            .await?;
+        }
+
+        let untracked = changes
+            .iter()
+            .filter(|change| change.untracked)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !untracked.is_empty() {
+            self.persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
+                transaction,
+                &untracked,
+                true,
+            )
+            .await?;
+        }
+
+        Ok(())
     }
 
     pub(crate) async fn persist_filesystem_payload_domain_changes_with_untracked(
@@ -383,15 +449,19 @@ impl Engine {
                 &resolved_file_id,
                 &write.version_id,
                 &write.after_data,
+                write.untracked,
                 writer_key,
             )?;
-            latest_by_key.insert((resolved_file_id, write.version_id.clone()), change);
+            latest_by_key.insert(
+                (resolved_file_id, write.version_id.clone(), write.untracked),
+                change,
+            );
         }
 
         for (file_id, version_id) in delete_targets {
             latest_by_key.insert(
-                (file_id.clone(), version_id.clone()),
-                binary_blob_ref_tombstone_change_for_target(file_id, version_id, writer_key),
+                (file_id.clone(), version_id.clone(), false),
+                binary_blob_ref_tombstone_change_for_target(file_id, version_id, false, writer_key),
             );
         }
 
@@ -417,15 +487,19 @@ impl Engine {
                 &resolved_file_id,
                 &write.version_id,
                 &write.after_data,
+                write.untracked,
                 writer_key,
             )?;
-            latest_by_key.insert((resolved_file_id, write.version_id.clone()), change);
+            latest_by_key.insert(
+                (resolved_file_id, write.version_id.clone(), write.untracked),
+                change,
+            );
         }
 
         for (file_id, version_id) in delete_targets {
             latest_by_key.insert(
-                (file_id.clone(), version_id.clone()),
-                binary_blob_ref_tombstone_change_for_target(file_id, version_id, writer_key),
+                (file_id.clone(), version_id.clone(), false),
+                binary_blob_ref_tombstone_change_for_target(file_id, version_id, false, writer_key),
             );
         }
 
