@@ -288,23 +288,23 @@ pub async fn validate_updates(
     Ok(())
 }
 
-pub(crate) async fn validate_sql2_batch_local_write(
+pub(crate) async fn validate_batch_local_write(
     backend: &dyn LixBackend,
     cache: &SchemaCache,
     planned_write: &PlannedWrite,
 ) -> Result<(), LixError> {
-    validate_sql2_write(backend, cache, planned_write, false).await
+    validate_planned_write(backend, cache, planned_write, false).await
 }
 
-pub(crate) async fn validate_sql2_append_time_write(
+pub(crate) async fn validate_commit_time_write(
     backend: &dyn LixBackend,
     cache: &SchemaCache,
     planned_write: &PlannedWrite,
 ) -> Result<(), LixError> {
-    validate_sql2_write(backend, cache, planned_write, true).await
+    validate_planned_write(backend, cache, planned_write, true).await
 }
 
-async fn validate_sql2_write(
+async fn validate_planned_write(
     backend: &dyn LixBackend,
     cache: &SchemaCache,
     planned_write: &PlannedWrite,
@@ -315,10 +315,10 @@ async fn validate_sql2_write(
         .as_ref()
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "sql2 validation requires a resolved write plan".to_string(),
+            description: "planned write validation requires a resolved write plan".to_string(),
         })?;
     let mut schema_provider = OverlaySchemaProvider::from_backend(backend);
-    remember_pending_sql2_registered_schemas(&mut schema_provider, resolved).await?;
+    remember_pending_registered_schemas(&mut schema_provider, resolved).await?;
     let planned_binary_blob_hashes =
         collect_planned_binary_blob_hashes(resolved, require_binary_blob_ref_cas)?;
     let shadows_committed_identity = planned_write.command.operation_kind
@@ -328,20 +328,20 @@ async fn validate_sql2_write(
             .on_conflict
             .as_ref()
             .is_some_and(|conflict| conflict.action == InsertOnConflictAction::DoUpdate);
-    let pending_rows = collect_sql2_constraint_candidates(resolved, shadows_committed_identity)?;
-    let deleted_rows = collect_sql2_delete_candidates(resolved)?;
+    let pending_rows = collect_constraint_candidates(resolved, shadows_committed_identity)?;
+    let deleted_rows = collect_delete_candidates(resolved)?;
 
     if planned_write.command.operation_kind == WriteOperationKind::Update {
         for row in resolved.intended_post_state() {
             if row.tombstone {
                 continue;
             }
-            validate_sql2_update_is_mutable(&mut schema_provider, row).await?;
+            validate_update_is_mutable(&mut schema_provider, row).await?;
         }
     }
 
     for row in resolved.intended_post_state() {
-        validate_sql2_planned_row(
+        validate_planned_row(
             backend,
             &mut schema_provider,
             cache,
@@ -389,7 +389,7 @@ async fn validate_sql2_write(
     Ok(())
 }
 
-async fn remember_pending_sql2_registered_schemas(
+async fn remember_pending_registered_schemas(
     provider: &mut OverlaySchemaProvider<'_>,
     resolved: &ResolvedWritePlan,
 ) -> Result<(), LixError> {
@@ -441,7 +441,7 @@ fn collect_insert_constraint_candidates(mutations: &[MutationRow]) -> Vec<Constr
     )
 }
 
-fn collect_sql2_constraint_candidates(
+fn collect_constraint_candidates(
     resolved: &ResolvedWritePlan,
     shadows_committed_identity: bool,
 ) -> Result<Vec<ConstraintCandidateRow>, LixError> {
@@ -477,7 +477,7 @@ fn collect_sql2_constraint_candidates(
     Ok(rows)
 }
 
-fn collect_sql2_delete_candidates(
+fn collect_delete_candidates(
     resolved: &ResolvedWritePlan,
 ) -> Result<Vec<ConstraintDeletedRow>, LixError> {
     let mut rows = Vec::new();
@@ -581,7 +581,7 @@ async fn validate_snapshot_content<P: SchemaProvider + ?Sized>(
     Ok(())
 }
 
-async fn validate_sql2_update_is_mutable(
+async fn validate_update_is_mutable(
     provider: &mut OverlaySchemaProvider<'_>,
     row: &PlannedStateRow,
 ) -> Result<(), LixError> {
@@ -604,7 +604,7 @@ async fn validate_sql2_update_is_mutable(
     Ok(())
 }
 
-async fn validate_sql2_planned_row(
+async fn validate_planned_row(
     backend: &dyn LixBackend,
     provider: &mut OverlaySchemaProvider<'_>,
     cache: &SchemaCache,
@@ -1948,7 +1948,7 @@ fn planned_row_required_text(row: &PlannedStateRow, name: &str) -> Result<String
 
     value.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("sql2 validation requires text-compatible '{name}'"),
+        description: format!("planned write validation requires text-compatible '{name}'"),
     })
 }
 
@@ -1965,14 +1965,14 @@ fn planned_row_snapshot(row: &PlannedStateRow) -> Result<Option<JsonValue>, LixE
             .map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
-                    "snapshot_content for schema '{}' is not valid JSON during sql2 validation: {err}",
+                    "snapshot_content for schema '{}' is not valid JSON during planned write validation: {err}",
                     row.schema_key
                 ),
             }),
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
-                "snapshot_content for schema '{}' must be JSON, text, or null during sql2 validation, got {other:?}",
+                "snapshot_content for schema '{}' must be JSON, text, or null during planned write validation, got {other:?}",
                 row.schema_key
             ),
         }),

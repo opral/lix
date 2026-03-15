@@ -32,64 +32,64 @@ const LIVE_UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
 const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
 const IDEMPOTENCY_KIND_EXACT: &str = "exact";
-const IDEMPOTENCY_KIND_CURRENT_TIP_FINGERPRINT: &str = "current_tip_fingerprint";
+const IDEMPOTENCY_KIND_CURRENT_HEAD_FINGERPRINT: &str = "current_head_fingerprint";
 const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
 const FILESYSTEM_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
 const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
 const FILESYSTEM_FILE_SCHEMA_VERSION: &str = "1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AppendWriteLane {
+pub(crate) enum CreateCommitWriteLane {
     Version(String),
     GlobalAdmin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AppendExpectedTip {
-    CurrentTip,
+pub(crate) enum CreateCommitExpectedHead {
+    CurrentHead,
     CommitId(String),
     CreateIfMissing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AppendIdempotencyKey {
+pub(crate) enum CreateCommitIdempotencyKey {
     Exact(String),
-    CurrentTipFingerprint(String),
+    CurrentHeadFingerprint(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AppendCommitPreconditions {
-    pub(crate) write_lane: AppendWriteLane,
-    pub(crate) expected_tip: AppendExpectedTip,
-    pub(crate) idempotency_key: AppendIdempotencyKey,
+pub(crate) struct CreateCommitPreconditions {
+    pub(crate) write_lane: CreateCommitWriteLane,
+    pub(crate) expected_head: CreateCommitExpectedHead,
+    pub(crate) idempotency_key: CreateCommitIdempotencyKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AppendCommitArgs {
+pub(crate) struct CreateCommitArgs {
     pub(crate) timestamp: Option<String>,
     pub(crate) changes: Vec<ProposedDomainChange>,
     pub(crate) lazy_exact_file_updates: Vec<LazyExactFileUpdate>,
-    pub(crate) preconditions: AppendCommitPreconditions,
+    pub(crate) preconditions: CreateCommitPreconditions,
     pub(crate) should_emit_observe_tick: bool,
     pub(crate) observe_tick_writer_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AppendCommitDisposition {
+pub(crate) enum CreateCommitDisposition {
     Applied,
     Replay,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AppendCommitResult {
-    pub(crate) disposition: AppendCommitDisposition,
-    pub(crate) committed_tip: String,
+pub(crate) struct CreateCommitResult {
+    pub(crate) disposition: CreateCommitDisposition,
+    pub(crate) committed_head: String,
     pub(crate) commit_result: Option<GenerateCommitResult>,
     pub(crate) applied_domain_changes: Vec<ProposedDomainChange>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AppendCommitErrorKind {
+pub(crate) enum CreateCommitErrorKind {
     EmptyBatch,
     MissingDomainField,
     MissingWriteLane,
@@ -99,31 +99,30 @@ pub(crate) enum AppendCommitErrorKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AppendCommitError {
-    pub(crate) kind: AppendCommitErrorKind,
+pub(crate) struct CreateCommitError {
+    pub(crate) kind: CreateCommitErrorKind,
     pub(crate) message: String,
 }
 
 #[async_trait(?Send)]
-pub(crate) trait AppendCommitInvariantChecker {
+pub(crate) trait CreateCommitInvariantChecker {
     async fn recheck_invariants(
         &mut self,
         transaction: &mut dyn LixTransaction,
-    ) -> Result<(), AppendCommitError>;
+    ) -> Result<(), CreateCommitError>;
 }
 
-pub(crate) async fn append_commit_if_preconditions_hold(
+pub(crate) async fn create_commit(
     transaction: &mut dyn LixTransaction,
-    args: AppendCommitArgs,
+    args: CreateCommitArgs,
     functions: &mut dyn LixFunctionProvider,
-    invariant_checker: Option<&mut dyn AppendCommitInvariantChecker>,
-) -> Result<AppendCommitResult, AppendCommitError> {
+    invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
+) -> Result<CreateCommitResult, CreateCommitError> {
     if args.changes.is_empty() {
         if args.lazy_exact_file_updates.is_empty() {
-            return Err(AppendCommitError {
-                kind: AppendCommitErrorKind::EmptyBatch,
-                message: "append_commit_if_preconditions_hold requires at least one change"
-                    .to_string(),
+            return Err(CreateCommitError {
+                kind: CreateCommitErrorKind::EmptyBatch,
+                message: "create_commit requires at least one change".to_string(),
             });
         }
     }
@@ -139,7 +138,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
         && !functions.deterministic_sequence_initialized();
     let preflight = {
         let mut executor = TransactionCommitExecutor { transaction };
-        load_append_preflight_state_with_active_accounts(
+        load_create_commit_preflight_state_with_active_accounts(
             &mut executor,
             &concrete_lane,
             &args.preconditions,
@@ -153,77 +152,78 @@ pub(crate) async fn append_commit_if_preconditions_hold(
         functions.initialize_deterministic_sequence(sequence_start);
     }
     let resolved_idempotency = resolve_idempotency_state(&args.preconditions, &preflight);
-    let current_tip = preflight.current_tip.clone();
+    let current_head = preflight.current_head.clone();
     let existing_replay = preflight.existing_replay.clone();
     let timestamp = args
         .timestamp
         .clone()
         .unwrap_or_else(|| functions.timestamp());
 
-    match (&args.preconditions.expected_tip, current_tip.as_deref()) {
-        (AppendExpectedTip::CurrentTip, Some(_)) => {}
-        (AppendExpectedTip::CurrentTip, None) => {
-            return Err(AppendCommitError {
-                kind: AppendCommitErrorKind::MissingWriteLane,
+    match (&args.preconditions.expected_head, current_head.as_deref()) {
+        (CreateCommitExpectedHead::CurrentHead, Some(_)) => {}
+        (CreateCommitExpectedHead::CurrentHead, None) => {
+            return Err(CreateCommitError {
+                kind: CreateCommitErrorKind::MissingWriteLane,
                 message: format!(
-                    "append precondition failed for '{}': version ref is missing",
+                    "create commit precondition failed for '{}': version ref is missing",
                     lane_storage_key(&concrete_lane)
                 ),
             });
         }
-        (AppendExpectedTip::CommitId(expected), Some(current)) if current != expected => {
+        (CreateCommitExpectedHead::CommitId(expected), Some(current)) if current != expected => {
             if existing_replay.as_deref() == Some(current) {
-                return Ok(AppendCommitResult {
-                    disposition: AppendCommitDisposition::Replay,
-                    committed_tip: current.to_string(),
+                return Ok(CreateCommitResult {
+                    disposition: CreateCommitDisposition::Replay,
+                    committed_head: current.to_string(),
                     commit_result: None,
                     applied_domain_changes: Vec::new(),
                 });
             }
-            return Err(AppendCommitError {
-                kind: AppendCommitErrorKind::TipDrift,
+            return Err(CreateCommitError {
+                kind: CreateCommitErrorKind::TipDrift,
                 message: format!(
-                    "append precondition failed for '{}': expected tip '{}', found '{}'",
+                    "create commit precondition failed for '{}': expected head '{}', found '{}'",
                     lane_storage_key(&concrete_lane),
                     expected,
                     current
                 ),
             });
         }
-        (AppendExpectedTip::CommitId(_), None) => {
-            return Err(AppendCommitError {
-                kind: AppendCommitErrorKind::MissingWriteLane,
+        (CreateCommitExpectedHead::CommitId(_), None) => {
+            return Err(CreateCommitError {
+                kind: CreateCommitErrorKind::MissingWriteLane,
                 message: format!(
-                    "append precondition failed for '{}': version ref is missing",
+                    "create commit precondition failed for '{}': version ref is missing",
                     lane_storage_key(&concrete_lane)
                 ),
             });
         }
-        (AppendExpectedTip::CreateIfMissing, Some(current)) => {
+        (CreateCommitExpectedHead::CreateIfMissing, Some(current)) => {
             if existing_replay.as_deref() == Some(current) {
-                return Ok(AppendCommitResult {
-                    disposition: AppendCommitDisposition::Replay,
-                    committed_tip: current.to_string(),
+                return Ok(CreateCommitResult {
+                    disposition: CreateCommitDisposition::Replay,
+                    committed_head: current.to_string(),
                     commit_result: None,
                     applied_domain_changes: Vec::new(),
                 });
             }
-            return Err(AppendCommitError {
-                kind: AppendCommitErrorKind::TipDrift,
+            return Err(CreateCommitError {
+                kind: CreateCommitErrorKind::TipDrift,
                 message: format!(
-                    "append precondition failed for '{}': lane already exists at '{}'",
+                    "create commit precondition failed for '{}': lane already exists at '{}'",
                     lane_storage_key(&concrete_lane),
                     current
                 ),
             });
         }
-        (AppendExpectedTip::CreateIfMissing, None) | (AppendExpectedTip::CommitId(_), Some(_)) => {}
+        (CreateCommitExpectedHead::CreateIfMissing, None)
+        | (CreateCommitExpectedHead::CommitId(_), Some(_)) => {}
     }
 
     if let Some(commit_id) = existing_replay {
-        return Ok(AppendCommitResult {
-            disposition: AppendCommitDisposition::Replay,
-            committed_tip: commit_id,
+        return Ok(CreateCommitResult {
+            disposition: CreateCommitDisposition::Replay,
+            committed_head: commit_id,
             commit_result: None,
             applied_domain_changes: Vec::new(),
         });
@@ -236,9 +236,9 @@ pub(crate) async fn append_commit_if_preconditions_hold(
     let applied_domain_changes =
         resolve_proposed_domain_changes(&args.changes, &args.lazy_exact_file_updates, &preflight)?;
     if applied_domain_changes.is_empty() {
-        return Ok(AppendCommitResult {
-            disposition: AppendCommitDisposition::Replay,
-            committed_tip: current_tip.unwrap_or_default(),
+        return Ok(CreateCommitResult {
+            disposition: CreateCommitDisposition::Replay,
+            committed_head: current_head.unwrap_or_default(),
             commit_result: None,
             applied_domain_changes: Vec::new(),
         });
@@ -268,7 +268,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
         versions.insert(
             version_id.clone(),
             VersionInfo {
-                parent_commit_ids: current_tip.clone().into_iter().collect(),
+                parent_commit_ids: current_head.clone().into_iter().collect(),
                 snapshot: VersionSnapshot {
                     id: version_id.clone(),
                 },
@@ -284,7 +284,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
                     id: GLOBAL_VERSION_ID.to_string(),
                 },
             });
-        global_version.parent_commit_ids = current_tip.clone().into_iter().collect();
+        global_version.parent_commit_ids = current_head.clone().into_iter().collect();
     }
     let commit_result = generate_commit(
         GenerateCommitArgs {
@@ -296,7 +296,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
         || functions.uuid_v7(),
     )
     .map_err(backend_error)?;
-    let committed_tip = extract_committed_tip_id(&commit_result, &concrete_lane)?;
+    let committed_head = extract_committed_head_id(&commit_result, &concrete_lane)?;
 
     let mut prepared_batch = bind_statement_batch_for_dialect(
         build_statement_batch_from_generate_commit_result(
@@ -312,7 +312,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
     prepared_batch.append_sql(insert_idempotency_row_sql(
         &concrete_lane,
         &resolved_idempotency,
-        &committed_tip,
+        &committed_head,
         &timestamp,
     ));
     if let Some(highest_seen) = functions.deterministic_sequence_persist_highest_seen() {
@@ -344,9 +344,9 @@ pub(crate) async fn append_commit_if_preconditions_hold(
         .await
         .map_err(backend_error)?;
 
-    Ok(AppendCommitResult {
-        disposition: AppendCommitDisposition::Applied,
-        committed_tip,
+    Ok(CreateCommitResult {
+        disposition: CreateCommitDisposition::Applied,
+        committed_head,
         commit_result: Some(commit_result),
         applied_domain_changes,
     })
@@ -383,21 +383,21 @@ impl CommitQueryExecutor for TransactionCommitExecutor<'_> {
 }
 
 fn concrete_lane(
-    preconditions: &AppendCommitPreconditions,
-) -> Result<ConcreteWriteLane, AppendCommitError> {
+    preconditions: &CreateCommitPreconditions,
+) -> Result<ConcreteWriteLane, CreateCommitError> {
     match &preconditions.write_lane {
-        AppendWriteLane::Version(version_id) => Ok(ConcreteWriteLane::Version {
+        CreateCommitWriteLane::Version(version_id) => Ok(ConcreteWriteLane::Version {
             version_id: version_id.clone(),
         }),
-        AppendWriteLane::GlobalAdmin => Ok(ConcreteWriteLane::GlobalAdmin),
+        CreateCommitWriteLane::GlobalAdmin => Ok(ConcreteWriteLane::GlobalAdmin),
     }
 }
 
 fn resolve_proposed_domain_changes(
     changes: &[ProposedDomainChange],
     lazy_exact_file_updates: &[LazyExactFileUpdate],
-    preflight: &AppendPreflightState,
-) -> Result<Vec<ProposedDomainChange>, AppendCommitError> {
+    preflight: &CreateCommitPreflightState,
+) -> Result<Vec<ProposedDomainChange>, CreateCommitError> {
     if lazy_exact_file_updates.is_empty() {
         return Ok(changes.to_vec());
     }
@@ -441,8 +441,8 @@ fn resolve_proposed_domain_changes(
                         serde_json::json!({
                             "id": lazy.file_id,
                             "blob_hash": crate::plugin::runtime::binary_blob_hash_hex(&lazy.data),
-                            "size_bytes": u64::try_from(lazy.data.len()).map_err(|_| AppendCommitError {
-                                kind: AppendCommitErrorKind::Internal,
+                            "size_bytes": u64::try_from(lazy.data.len()).map_err(|_| CreateCommitError {
+                                kind: CreateCommitErrorKind::Internal,
                                 message: format!(
                                     "exact file data update exceeds supported size for '{}'",
                                     lazy.file_id
@@ -461,8 +461,8 @@ fn resolve_proposed_domain_changes(
                         continue;
                     };
                     if current.untracked {
-                        return Err(AppendCommitError {
-                            kind: AppendCommitErrorKind::Internal,
+                        return Err(CreateCommitError {
+                            kind: CreateCommitErrorKind::Internal,
                             message:
                                 "lazy exact file update does not support untracked visible rows"
                                     .to_string(),
@@ -498,22 +498,22 @@ fn resolve_proposed_domain_changes(
 }
 
 fn required_exact_file_descriptor<'a>(
-    preflight: &'a AppendPreflightState,
+    preflight: &'a CreateCommitPreflightState,
     file_id: &str,
-) -> Result<&'a AppendPreflightFileDescriptor, AppendCommitError> {
+) -> Result<&'a CreateCommitPreflightFileDescriptor, CreateCommitError> {
     let current = preflight
         .file_descriptors
         .get(file_id)
-        .ok_or_else(|| AppendCommitError {
-            kind: AppendCommitErrorKind::Internal,
+        .ok_or_else(|| CreateCommitError {
+            kind: CreateCommitErrorKind::Internal,
             message: format!(
-                "append preflight did not load the exact file descriptor row for '{}'",
+                "create commit preflight did not load the exact file descriptor row for '{}'",
                 file_id
             ),
         })?;
     if current.untracked {
-        return Err(AppendCommitError {
-            kind: AppendCommitErrorKind::Internal,
+        return Err(CreateCommitError {
+            kind: CreateCommitErrorKind::Internal,
             message: "lazy exact file update does not support untracked visible rows".to_string(),
         });
     }
@@ -524,7 +524,7 @@ fn materialize_domain_changes(
     timestamp: &str,
     changes: &[ProposedDomainChange],
     functions: &mut dyn LixFunctionProvider,
-) -> Result<Vec<DomainChangeInput>, AppendCommitError> {
+) -> Result<Vec<DomainChangeInput>, CreateCommitError> {
     changes
         .iter()
         .map(|change| {
@@ -561,26 +561,26 @@ fn require_change_field(
     value: Option<String>,
     schema_key: &str,
     field_name: &str,
-) -> Result<String, AppendCommitError> {
-    value.ok_or_else(|| AppendCommitError {
-        kind: AppendCommitErrorKind::MissingDomainField,
+) -> Result<String, CreateCommitError> {
+    value.ok_or_else(|| CreateCommitError {
+        kind: CreateCommitErrorKind::MissingDomainField,
         message: format!(
-            "append batch requires '{field_name}' for schema '{}'",
+            "create commit batch requires '{field_name}' for schema '{}'",
             schema_key
         ),
     })
 }
 
-struct AppendPreflightState {
-    current_tip: Option<String>,
-    current_tip_snapshot: Option<String>,
+struct CreateCommitPreflightState {
+    current_head: Option<String>,
+    current_head_snapshot: Option<String>,
     existing_replay: Option<String>,
     deterministic_sequence_start: Option<i64>,
     active_accounts: Vec<String>,
-    file_descriptors: BTreeMap<String, AppendPreflightFileDescriptor>,
+    file_descriptors: BTreeMap<String, CreateCommitPreflightFileDescriptor>,
 }
 
-struct AppendPreflightFileDescriptor {
+struct CreateCommitPreflightFileDescriptor {
     directory_id: Option<String>,
     name: String,
     extension: Option<String>,
@@ -589,19 +589,19 @@ struct AppendPreflightFileDescriptor {
     untracked: bool,
 }
 
-async fn load_append_preflight_state_with_active_accounts(
+async fn load_create_commit_preflight_state_with_active_accounts(
     executor: &mut dyn CommitQueryExecutor,
     concrete_lane: &ConcreteWriteLane,
-    preconditions: &AppendCommitPreconditions,
+    preconditions: &CreateCommitPreconditions,
     lazy_exact_file_updates: &[LazyExactFileUpdate],
     include_deterministic_sequence: bool,
     include_active_accounts: bool,
-) -> Result<AppendPreflightState, AppendCommitError> {
+) -> Result<CreateCommitPreflightState, CreateCommitError> {
     let lane_entity_id = match concrete_lane {
         ConcreteWriteLane::Version { version_id } => version_id.as_str(),
         ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
     };
-    let current_tip_source_sql = format!(
+    let current_head_source_sql = format!(
         "FROM {version_ref_table} \
          WHERE schema_key = '{schema_key}' \
            AND entity_id = '{entity_id}' \
@@ -615,32 +615,32 @@ async fn load_append_preflight_state_with_active_accounts(
         version_id = escape_sql_string(GLOBAL_VERSION_ID),
     );
     let existing_replay_sql = match &preconditions.idempotency_key {
-        AppendIdempotencyKey::Exact(value) => format!(
+        CreateCommitIdempotencyKey::Exact(value) => format!(
             " UNION ALL \
               SELECT CAST('existing_replay' AS TEXT) AS row_kind, CAST(commit_id AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value, CAST(NULL AS TEXT) AS entity_id \
               FROM {table_name} \
               WHERE write_lane = '{write_lane}' \
                 AND idempotency_kind = '{kind}' \
                 AND idempotency_value = '{value}' \
-                AND parent_tip_snapshot_content = ''",
+                AND parent_head_snapshot_content = ''",
             table_name = COMMIT_IDEMPOTENCY_TABLE,
             write_lane = escape_sql_string(&lane_storage_key(concrete_lane)),
             kind = IDEMPOTENCY_KIND_EXACT,
             value = escape_sql_string(value),
         ),
-        AppendIdempotencyKey::CurrentTipFingerprint(fingerprint) => format!(
+        CreateCommitIdempotencyKey::CurrentHeadFingerprint(fingerprint) => format!(
             " UNION ALL \
               SELECT CAST('existing_replay' AS TEXT) AS row_kind, CAST(idempotency.commit_id AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value, CAST(NULL AS TEXT) AS entity_id \
-              FROM (SELECT snapshot_content {current_tip_source_sql}) current_tip \
+              FROM (SELECT snapshot_content {current_head_source_sql}) current_head \
               JOIN {table_name} idempotency \
                 ON idempotency.write_lane = '{write_lane}' \
                AND idempotency.idempotency_kind = '{kind}' \
                AND idempotency.idempotency_value = '{value}' \
-               AND idempotency.parent_tip_snapshot_content = current_tip.snapshot_content",
-            current_tip_source_sql = current_tip_source_sql,
+               AND idempotency.parent_head_snapshot_content = current_head.snapshot_content",
+            current_head_source_sql = current_head_source_sql,
             table_name = COMMIT_IDEMPOTENCY_TABLE,
             write_lane = escape_sql_string(&lane_storage_key(concrete_lane)),
-            kind = IDEMPOTENCY_KIND_CURRENT_TIP_FINGERPRINT,
+            kind = IDEMPOTENCY_KIND_CURRENT_HEAD_FINGERPRINT,
             value = escape_sql_string(fingerprint),
         ),
     };
@@ -709,18 +709,18 @@ async fn load_append_preflight_state_with_active_accounts(
     let sql = format!(
         "SELECT row_kind, value, metadata_value, untracked_value, entity_id \
          FROM (\
-           SELECT CAST('current_tip' AS TEXT) AS row_kind, CAST(snapshot_content AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value, CAST(NULL AS TEXT) AS entity_id \
-           {current_tip_source_sql}{existing_replay_sql}{deterministic_sequence_sql}{active_account_sql}{file_descriptor_sql}\
-         ) append_preflight",
-        current_tip_source_sql = current_tip_source_sql,
+           SELECT CAST('current_head' AS TEXT) AS row_kind, CAST(snapshot_content AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value, CAST(NULL AS TEXT) AS entity_id \
+           {current_head_source_sql}{existing_replay_sql}{deterministic_sequence_sql}{active_account_sql}{file_descriptor_sql}\
+         ) create_commit_preflight",
+        current_head_source_sql = current_head_source_sql,
         existing_replay_sql = existing_replay_sql,
         deterministic_sequence_sql = deterministic_sequence_sql,
         active_account_sql = active_account_sql,
         file_descriptor_sql = file_descriptor_sql,
     );
     let result = executor.execute(&sql, &[]).await.map_err(backend_error)?;
-    let mut current_tip = None;
-    let mut current_tip_snapshot = None;
+    let mut current_head = None;
+    let mut current_head_snapshot = None;
     let mut existing_replay = None;
     let mut deterministic_sequence_start = None;
     let mut active_accounts = BTreeSet::new();
@@ -736,24 +736,26 @@ async fn load_append_preflight_state_with_active_accounts(
             Value::Text(text) => text.as_str(),
             Value::Null => continue,
             other => {
-                return Err(AppendCommitError {
-                    kind: AppendCommitErrorKind::Internal,
-                    message: format!("append preflight returned unexpected kind value {other:?}"),
+                return Err(CreateCommitError {
+                    kind: CreateCommitErrorKind::Internal,
+                    message: format!(
+                        "create commit preflight returned unexpected kind value {other:?}"
+                    ),
                 })
             }
         };
         match (kind, value) {
-            ("current_tip", Value::Text(snapshot_content)) => {
-                current_tip_snapshot = Some(snapshot_content.clone());
+            ("current_head", Value::Text(snapshot_content)) => {
+                current_head_snapshot = Some(snapshot_content.clone());
                 let pointer: LixVersionRef =
-                    serde_json::from_str(snapshot_content).map_err(|error| AppendCommitError {
-                        kind: AppendCommitErrorKind::Internal,
+                    serde_json::from_str(snapshot_content).map_err(|error| CreateCommitError {
+                        kind: CreateCommitErrorKind::Internal,
                         message: format!(
-                            "append preflight version ref snapshot could not be parsed: {error}"
+                            "create commit preflight version ref snapshot could not be parsed: {error}"
                         ),
                     })?;
                 if !pointer.commit_id.is_empty() {
-                    current_tip = Some(pointer.commit_id);
+                    current_head = Some(pointer.commit_id);
                 }
             }
             ("existing_replay", Value::Text(commit_id)) => {
@@ -771,11 +773,12 @@ async fn load_append_preflight_state_with_active_accounts(
                 active_accounts.insert(account_id);
             }
             ("file_descriptor", Value::Text(snapshot_content)) => {
-                let Some(entity_id) = row.get(4).and_then(append_preflight_text_from_value) else {
-                    return Err(AppendCommitError {
-                        kind: AppendCommitErrorKind::Internal,
+                let Some(entity_id) = row.get(4).and_then(create_commit_preflight_text_from_value)
+                else {
+                    return Err(CreateCommitError {
+                        kind: CreateCommitErrorKind::Internal,
                         message:
-                            "append preflight returned a file descriptor row without entity_id"
+                            "create commit preflight returned a file descriptor row without entity_id"
                                 .to_string(),
                     });
                 };
@@ -783,23 +786,23 @@ async fn load_append_preflight_state_with_active_accounts(
                     entity_id,
                     parse_file_descriptor_preflight_row(
                         snapshot_content,
-                        row.get(2).and_then(append_preflight_text_from_value),
+                        row.get(2).and_then(create_commit_preflight_text_from_value),
                         row.get(3)
-                            .and_then(append_preflight_value_as_bool)
+                            .and_then(create_commit_preflight_value_as_bool)
                             .unwrap_or(false),
                     )?,
                 );
             }
             (_, Value::Null) => {}
-            ("current_tip", other)
+            ("current_head", other)
             | ("existing_replay", other)
             | ("deterministic_sequence", other)
             | ("active_account", other)
             | ("file_descriptor", other) => {
-                return Err(AppendCommitError {
-                    kind: AppendCommitErrorKind::Internal,
+                return Err(CreateCommitError {
+                    kind: CreateCommitErrorKind::Internal,
                     message: format!(
-                        "append preflight returned unexpected '{kind}' value {other:?}"
+                        "create commit preflight returned unexpected '{kind}' value {other:?}"
                     ),
                 })
             }
@@ -811,9 +814,9 @@ async fn load_append_preflight_state_with_active_accounts(
         deterministic_sequence_start = Some(0);
     }
 
-    Ok(AppendPreflightState {
-        current_tip,
-        current_tip_snapshot,
+    Ok(CreateCommitPreflightState {
+        current_head,
+        current_head_snapshot,
         existing_replay,
         deterministic_sequence_start,
         active_accounts: active_accounts.into_iter().collect(),
@@ -825,15 +828,15 @@ fn parse_file_descriptor_preflight_row(
     snapshot_content: &str,
     metadata: Option<String>,
     untracked: bool,
-) -> Result<AppendPreflightFileDescriptor, AppendCommitError> {
+) -> Result<CreateCommitPreflightFileDescriptor, CreateCommitError> {
     let parsed: serde_json::Value =
-        serde_json::from_str(snapshot_content).map_err(|error| AppendCommitError {
-            kind: AppendCommitErrorKind::Internal,
+        serde_json::from_str(snapshot_content).map_err(|error| CreateCommitError {
+            kind: CreateCommitErrorKind::Internal,
             message: format!(
-                "append preflight file descriptor snapshot could not be parsed: {error}"
+                "create commit preflight file descriptor snapshot could not be parsed: {error}"
             ),
         })?;
-    Ok(AppendPreflightFileDescriptor {
+    Ok(CreateCommitPreflightFileDescriptor {
         directory_id: parsed.get("directory_id").and_then(|value| match value {
             serde_json::Value::Null => None,
             serde_json::Value::String(text) => Some(text.clone()),
@@ -916,12 +919,12 @@ fn exact_file_descriptor_preflight_sql(file_ids: &[String], version_id: &str) ->
     )
 }
 
-fn parse_deterministic_sequence_snapshot(snapshot_content: &str) -> Result<i64, AppendCommitError> {
+fn parse_deterministic_sequence_snapshot(snapshot_content: &str) -> Result<i64, CreateCommitError> {
     let parsed: serde_json::Value =
-        serde_json::from_str(snapshot_content).map_err(|error| AppendCommitError {
-            kind: AppendCommitErrorKind::Internal,
+        serde_json::from_str(snapshot_content).map_err(|error| CreateCommitError {
+            kind: CreateCommitErrorKind::Internal,
             message: format!(
-                "append preflight deterministic sequence snapshot could not be parsed: {error}"
+                "create commit preflight deterministic sequence snapshot could not be parsed: {error}"
             ),
         })?;
     let value = parsed
@@ -935,14 +938,14 @@ fn parse_deterministic_sequence_snapshot(snapshot_content: &str) -> Result<i64, 
     Ok(value + 1)
 }
 
-fn append_preflight_text_from_value(value: &Value) -> Option<String> {
+fn create_commit_preflight_text_from_value(value: &Value) -> Option<String> {
     match value {
         Value::Text(text) => Some(text.clone()),
         _ => None,
     }
 }
 
-fn append_preflight_value_as_bool(value: &Value) -> Option<bool> {
+fn create_commit_preflight_value_as_bool(value: &Value) -> Option<bool> {
     match value {
         Value::Boolean(flag) => Some(*flag),
         Value::Integer(integer) => Some(*integer != 0),
@@ -954,7 +957,7 @@ fn validate_change_versions(
     changes: &[ProposedDomainChange],
     lazy_exact_file_updates: &[LazyExactFileUpdate],
     concrete_lane: &ConcreteWriteLane,
-) -> Result<(), AppendCommitError> {
+) -> Result<(), CreateCommitError> {
     if !lazy_exact_file_updates.is_empty() {
         let expected_version_id = match concrete_lane {
             ConcreteWriteLane::Version { version_id } => version_id,
@@ -964,10 +967,10 @@ fn validate_change_versions(
             .iter()
             .any(|lazy| lazy.version_id() != expected_version_id)
         {
-            return Err(AppendCommitError {
-                kind: AppendCommitErrorKind::Internal,
+            return Err(CreateCommitError {
+                kind: CreateCommitErrorKind::Internal,
                 message: format!(
-                    "append batch must target exactly one version lane '{}'",
+                    "create commit batch must target exactly one version lane '{}'",
                     expected_version_id
                 ),
             });
@@ -982,7 +985,7 @@ fn validate_change_versions(
 fn validate_change_versions_without_lazy(
     changes: &[ProposedDomainChange],
     concrete_lane: &ConcreteWriteLane,
-) -> Result<(), AppendCommitError> {
+) -> Result<(), CreateCommitError> {
     let version_ids = changes
         .iter()
         .map(|change| change.version_id.as_str())
@@ -990,10 +993,10 @@ fn validate_change_versions_without_lazy(
     match concrete_lane {
         ConcreteWriteLane::Version { version_id } => {
             if version_ids.len() != 1 || !version_ids.contains(version_id.as_str()) {
-                return Err(AppendCommitError {
-                    kind: AppendCommitErrorKind::Internal,
+                return Err(CreateCommitError {
+                    kind: CreateCommitErrorKind::Internal,
                     message: format!(
-                        "append batch must target exactly one version lane '{}'",
+                        "create commit batch must target exactly one version lane '{}'",
                         version_id
                     ),
                 });
@@ -1001,9 +1004,10 @@ fn validate_change_versions_without_lazy(
         }
         ConcreteWriteLane::GlobalAdmin => {
             if version_ids.len() != 1 || !version_ids.contains(GLOBAL_VERSION_ID) {
-                return Err(AppendCommitError {
-                    kind: AppendCommitErrorKind::Internal,
-                    message: "append batch must target exactly the global admin lane".to_string(),
+                return Err(CreateCommitError {
+                    kind: CreateCommitErrorKind::Internal,
+                    message: "create commit batch must target exactly the global admin lane"
+                        .to_string(),
                 });
             }
         }
@@ -1016,17 +1020,17 @@ struct ResolvedIdempotencyState {
     legacy_key: String,
     kind: &'static str,
     value: String,
-    parent_tip_snapshot_content: String,
+    parent_head_snapshot_content: String,
 }
 
 fn resolve_idempotency_key(
-    preconditions: &AppendCommitPreconditions,
-    current_tip: Option<&str>,
+    preconditions: &CreateCommitPreconditions,
+    current_head: Option<&str>,
 ) -> String {
     match &preconditions.idempotency_key {
-        AppendIdempotencyKey::Exact(value) => value.clone(),
-        AppendIdempotencyKey::CurrentTipFingerprint(fingerprint) => serde_json::json!({
-            "tip": current_tip,
+        CreateCommitIdempotencyKey::Exact(value) => value.clone(),
+        CreateCommitIdempotencyKey::CurrentHeadFingerprint(fingerprint) => serde_json::json!({
+            "head": current_head,
             "fingerprint": fingerprint,
         })
         .to_string(),
@@ -1034,30 +1038,35 @@ fn resolve_idempotency_key(
 }
 
 fn resolve_idempotency_state(
-    preconditions: &AppendCommitPreconditions,
-    preflight: &AppendPreflightState,
+    preconditions: &CreateCommitPreconditions,
+    preflight: &CreateCommitPreflightState,
 ) -> ResolvedIdempotencyState {
-    let legacy_key = resolve_idempotency_key(preconditions, preflight.current_tip.as_deref());
+    let legacy_key = resolve_idempotency_key(preconditions, preflight.current_head.as_deref());
     match &preconditions.idempotency_key {
-        AppendIdempotencyKey::Exact(value) => ResolvedIdempotencyState {
+        CreateCommitIdempotencyKey::Exact(value) => ResolvedIdempotencyState {
             legacy_key,
             kind: IDEMPOTENCY_KIND_EXACT,
             value: value.clone(),
-            parent_tip_snapshot_content: String::new(),
+            parent_head_snapshot_content: String::new(),
         },
-        AppendIdempotencyKey::CurrentTipFingerprint(fingerprint) => ResolvedIdempotencyState {
-            legacy_key,
-            kind: IDEMPOTENCY_KIND_CURRENT_TIP_FINGERPRINT,
-            value: fingerprint.clone(),
-            parent_tip_snapshot_content: preflight.current_tip_snapshot.clone().unwrap_or_default(),
-        },
+        CreateCommitIdempotencyKey::CurrentHeadFingerprint(fingerprint) => {
+            ResolvedIdempotencyState {
+                legacy_key,
+                kind: IDEMPOTENCY_KIND_CURRENT_HEAD_FINGERPRINT,
+                value: fingerprint.clone(),
+                parent_head_snapshot_content: preflight
+                    .current_head_snapshot
+                    .clone()
+                    .unwrap_or_default(),
+            }
+        }
     }
 }
 
-fn extract_committed_tip_id(
+fn extract_committed_head_id(
     commit_result: &GenerateCommitResult,
     concrete_lane: &ConcreteWriteLane,
-) -> Result<String, AppendCommitError> {
+) -> Result<String, CreateCommitError> {
     let version_id = match concrete_lane {
         ConcreteWriteLane::Version { version_id } => version_id.as_str(),
         ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
@@ -1068,8 +1077,8 @@ fn extract_committed_tip_id(
         .find(|change| {
             change.schema_key == VERSION_REF_SCHEMA_KEY && change.entity_id == version_id
         })
-        .ok_or_else(|| AppendCommitError {
-            kind: AppendCommitErrorKind::Internal,
+        .ok_or_else(|| CreateCommitError {
+            kind: CreateCommitErrorKind::Internal,
             message: format!(
                 "generated commit result did not include a version ref for '{}'",
                 version_id
@@ -1079,24 +1088,24 @@ fn extract_committed_tip_id(
         pointer_change
             .snapshot_content
             .as_ref()
-            .ok_or_else(|| AppendCommitError {
-                kind: AppendCommitErrorKind::Internal,
+            .ok_or_else(|| CreateCommitError {
+                kind: CreateCommitErrorKind::Internal,
                 message: format!(
                     "generated version ref for '{}' is missing snapshot_content",
                     version_id
                 ),
             })?;
     let pointer: LixVersionRef =
-        serde_json::from_str(snapshot_content).map_err(|error| AppendCommitError {
-            kind: AppendCommitErrorKind::Internal,
+        serde_json::from_str(snapshot_content).map_err(|error| CreateCommitError {
+            kind: CreateCommitErrorKind::Internal,
             message: format!(
                 "generated version ref for '{}' could not be parsed: {error}",
                 version_id
             ),
         })?;
     if pointer.commit_id.is_empty() {
-        return Err(AppendCommitError {
-            kind: AppendCommitErrorKind::Internal,
+        return Err(CreateCommitError {
+            kind: CreateCommitErrorKind::Internal,
             message: format!(
                 "generated version ref for '{}' contained an empty commit_id",
                 version_id
@@ -1114,14 +1123,15 @@ fn insert_idempotency_row_sql(
 ) -> String {
     format!(
         "INSERT INTO {table_name} \
-         (write_lane, idempotency_key, idempotency_kind, idempotency_value, parent_tip_snapshot_content, commit_id, created_at) \
-         VALUES ('{write_lane}', '{idempotency_key}', '{idempotency_kind}', '{idempotency_value}', '{parent_tip_snapshot_content}', '{commit_id}', '{created_at}')",
+         (write_lane, idempotency_key, idempotency_kind, idempotency_value, parent_head_snapshot_content, commit_id, created_at) \
+         VALUES ('{write_lane}', '{idempotency_key}', '{idempotency_kind}', '{idempotency_value}', '{parent_head_snapshot_content}', '{commit_id}', '{created_at}')",
         table_name = COMMIT_IDEMPOTENCY_TABLE,
         write_lane = escape_sql_string(&lane_storage_key(concrete_lane)),
         idempotency_key = escape_sql_string(&idempotency.legacy_key),
         idempotency_kind = escape_sql_string(idempotency.kind),
         idempotency_value = escape_sql_string(&idempotency.value),
-        parent_tip_snapshot_content = escape_sql_string(&idempotency.parent_tip_snapshot_content),
+        parent_head_snapshot_content =
+            escape_sql_string(&idempotency.parent_head_snapshot_content),
         commit_id = escape_sql_string(commit_id),
         created_at = escape_sql_string(created_at),
     )
@@ -1134,9 +1144,9 @@ fn lane_storage_key(concrete_lane: &ConcreteWriteLane) -> String {
     }
 }
 
-fn backend_error(error: LixError) -> AppendCommitError {
-    AppendCommitError {
-        kind: AppendCommitErrorKind::Internal,
+fn backend_error(error: LixError) -> CreateCommitError {
+    CreateCommitError {
+        kind: CreateCommitErrorKind::Internal,
         message: error.description,
     }
 }
@@ -1148,9 +1158,9 @@ fn escape_sql_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_commit_if_preconditions_hold, AppendCommitArgs, AppendCommitDisposition,
-        AppendCommitError, AppendCommitErrorKind, AppendCommitInvariantChecker,
-        AppendCommitPreconditions, AppendExpectedTip, AppendIdempotencyKey, AppendWriteLane,
+        create_commit, CreateCommitArgs, CreateCommitDisposition, CreateCommitError,
+        CreateCommitErrorKind, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
+        CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
     };
     use crate::functions::LixFunctionProvider;
     use crate::version::GLOBAL_VERSION_ID;
@@ -1207,7 +1217,7 @@ mod tests {
                     })
                     .map(|(version_id, commit_id)| {
                         vec![
-                            Value::Text("current_tip".to_string()),
+                            Value::Text("current_head".to_string()),
                             Value::Text(crate::version::version_ref_snapshot_content(
                                 version_id, commit_id,
                             )),
@@ -1218,18 +1228,18 @@ mod tests {
                     rows.extend(
                         self.idempotency_rows
                             .iter()
-                            .filter(|((lane, kind, value, parent_tip_snapshot_content), _)| {
+                            .filter(|((lane, kind, value, parent_head_snapshot_content), _)| {
                                 sql.contains(&format!("write_lane = '{}'", lane))
                                     && sql.contains(&format!("idempotency_kind = '{}'", kind))
                                     && sql.contains(&format!("idempotency_value = '{}'", value))
                                     && if sql.contains(
-                                        "parent_tip_snapshot_content = current_tip.snapshot_content",
+                                        "parent_head_snapshot_content = current_head.snapshot_content",
                                     ) {
-                                        !parent_tip_snapshot_content.is_empty()
+                                        !parent_head_snapshot_content.is_empty()
                                     } else {
                                         sql.contains(&format!(
-                                            "parent_tip_snapshot_content = '{}'",
-                                            parent_tip_snapshot_content
+                                            "parent_head_snapshot_content = '{}'",
+                                            parent_head_snapshot_content
                                         ))
                                     }
                             })
@@ -1305,13 +1315,13 @@ mod tests {
                 let rows = self
                     .idempotency_rows
                     .iter()
-                    .filter(|((lane, kind, value, parent_tip_snapshot_content), _)| {
+                    .filter(|((lane, kind, value, parent_head_snapshot_content), _)| {
                         sql.contains(&format!("write_lane = '{}'", lane))
                             && sql.contains(&format!("idempotency_kind = '{}'", kind))
                             && sql.contains(&format!("idempotency_value = '{}'", value))
                             && sql.contains(&format!(
-                                "parent_tip_snapshot_content = '{}'",
-                                parent_tip_snapshot_content
+                                "parent_head_snapshot_content = '{}'",
+                                parent_head_snapshot_content
                             ))
                     })
                     .map(|(_, commit_id)| vec![Value::Text(commit_id.clone())])
@@ -1331,13 +1341,13 @@ mod tests {
                     .expect("kind should be present");
                 let value = extract_nth_single_quoted_value(idempotency_sql, 3)
                     .expect("value should be present");
-                let parent_tip_snapshot_content =
+                let parent_head_snapshot_content =
                     extract_nth_single_quoted_value(idempotency_sql, 4)
-                        .expect("parent tip snapshot content should be present");
+                        .expect("parent head snapshot content should be present");
                 let commit_id = extract_nth_single_quoted_value(idempotency_sql, 5)
                     .expect("commit id should be present");
                 self.idempotency_rows
-                    .insert((lane, kind, value, parent_tip_snapshot_content), commit_id);
+                    .insert((lane, kind, value, parent_head_snapshot_content), commit_id);
             }
 
             Ok(QueryResult {
@@ -1390,15 +1400,15 @@ mod tests {
     #[derive(Default)]
     struct RecordingInvariantChecker {
         calls: usize,
-        failure: Option<AppendCommitError>,
+        failure: Option<CreateCommitError>,
     }
 
     #[async_trait(?Send)]
-    impl AppendCommitInvariantChecker for RecordingInvariantChecker {
+    impl CreateCommitInvariantChecker for RecordingInvariantChecker {
         async fn recheck_invariants(
             &mut self,
             _transaction: &mut dyn LixTransaction,
-        ) -> Result<(), AppendCommitError> {
+        ) -> Result<(), CreateCommitError> {
             self.calls += 1;
             if let Some(error) = self.failure.clone() {
                 return Err(error);
@@ -1408,7 +1418,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applies_commit_when_tip_matches_expected() {
+    async fn applies_commit_when_head_matches_expected() {
         let mut transaction = FakeTransaction::default();
         transaction
             .version_heads
@@ -1416,16 +1426,16 @@ mod tests {
         let mut functions = CountingFunctionProvider::default();
         let mut checker = RecordingInvariantChecker::default();
 
-        let result = append_commit_if_preconditions_hold(
+        let result = create_commit(
             &mut transaction,
-            AppendCommitArgs {
+            CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
                 lazy_exact_file_updates: Vec::new(),
-                preconditions: AppendCommitPreconditions {
-                    write_lane: AppendWriteLane::Version("version-a".to_string()),
-                    expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
-                    idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
+                    idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
@@ -1434,9 +1444,9 @@ mod tests {
             Some(&mut checker),
         )
         .await
-        .expect("append should succeed");
+        .expect("create_commit should succeed");
 
-        assert_eq!(result.disposition, AppendCommitDisposition::Applied);
+        assert_eq!(result.disposition, CreateCommitDisposition::Applied);
         assert!(result.commit_result.is_some());
         assert_eq!(checker.calls, 1);
         let generated_commit_batches = transaction
@@ -1458,7 +1468,7 @@ mod tests {
                 .executed_sql
                 .iter()
                 .any(|sql| sql.contains("INSERT INTO lix_internal_commit_idempotency ")),
-            "append should persist idempotency state in the executed batch"
+            "create_commit should persist idempotency state in the executed batch"
         );
     }
 
@@ -1480,16 +1490,16 @@ mod tests {
         let mut functions = CountingFunctionProvider::default();
         let mut checker = RecordingInvariantChecker::default();
 
-        let result = append_commit_if_preconditions_hold(
+        let result = create_commit(
             &mut transaction,
-            AppendCommitArgs {
+            CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
                 lazy_exact_file_updates: Vec::new(),
-                preconditions: AppendCommitPreconditions {
-                    write_lane: AppendWriteLane::Version("version-a".to_string()),
-                    expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
-                    idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
+                    idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
@@ -1500,14 +1510,14 @@ mod tests {
         .await
         .expect("replay should succeed");
 
-        assert_eq!(result.disposition, AppendCommitDisposition::Replay);
-        assert_eq!(result.committed_tip, "commit-456");
+        assert_eq!(result.disposition, CreateCommitDisposition::Replay);
+        assert_eq!(result.committed_head, "commit-456");
         assert!(result.commit_result.is_none());
         assert_eq!(checker.calls, 0);
     }
 
     #[tokio::test]
-    async fn replays_when_same_current_tip_fingerprint_already_committed() {
+    async fn replays_when_same_current_head_fingerprint_already_committed() {
         let mut transaction = FakeTransaction::default();
         transaction
             .version_heads
@@ -1515,7 +1525,7 @@ mod tests {
         transaction.idempotency_rows.insert(
             (
                 "version:version-a".to_string(),
-                "current_tip_fingerprint".to_string(),
+                "current_head_fingerprint".to_string(),
                 "fp-1".to_string(),
                 crate::version::version_ref_snapshot_content("version-a", "commit-456"),
             ),
@@ -1523,16 +1533,16 @@ mod tests {
         );
         let mut functions = CountingFunctionProvider::default();
 
-        let result = append_commit_if_preconditions_hold(
+        let result = create_commit(
             &mut transaction,
-            AppendCommitArgs {
+            CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
                 lazy_exact_file_updates: Vec::new(),
-                preconditions: AppendCommitPreconditions {
-                    write_lane: AppendWriteLane::Version("version-a".to_string()),
-                    expected_tip: AppendExpectedTip::CurrentTip,
-                    idempotency_key: AppendIdempotencyKey::CurrentTipFingerprint(
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                    expected_head: CreateCommitExpectedHead::CurrentHead,
+                    idempotency_key: CreateCommitIdempotencyKey::CurrentHeadFingerprint(
                         "fp-1".to_string(),
                     ),
                 },
@@ -1545,13 +1555,13 @@ mod tests {
         .await
         .expect("fingerprint replay should succeed");
 
-        assert_eq!(result.disposition, AppendCommitDisposition::Replay);
-        assert_eq!(result.committed_tip, "commit-456");
+        assert_eq!(result.disposition, CreateCommitDisposition::Replay);
+        assert_eq!(result.committed_head, "commit-456");
         assert!(result.commit_result.is_none());
     }
 
     #[tokio::test]
-    async fn rejects_tip_drift_without_matching_idempotency_row() {
+    async fn rejects_head_drift_without_matching_idempotency_row() {
         let mut transaction = FakeTransaction::default();
         transaction
             .version_heads
@@ -1559,16 +1569,16 @@ mod tests {
         let mut functions = CountingFunctionProvider::default();
         let mut checker = RecordingInvariantChecker::default();
 
-        let error = append_commit_if_preconditions_hold(
+        let error = create_commit(
             &mut transaction,
-            AppendCommitArgs {
+            CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
                 lazy_exact_file_updates: Vec::new(),
-                preconditions: AppendCommitPreconditions {
-                    write_lane: AppendWriteLane::Version("version-a".to_string()),
-                    expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
-                    idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
+                    idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
@@ -1577,9 +1587,9 @@ mod tests {
             Some(&mut checker),
         )
         .await
-        .expect_err("tip drift should fail");
+        .expect_err("head drift should fail");
 
-        assert_eq!(error.kind, AppendCommitErrorKind::TipDrift);
+        assert_eq!(error.kind, CreateCommitErrorKind::TipDrift);
         assert_eq!(checker.calls, 0);
     }
 
@@ -1588,16 +1598,16 @@ mod tests {
         let mut transaction = FakeTransaction::default();
         let mut functions = CountingFunctionProvider::default();
 
-        let error = append_commit_if_preconditions_hold(
+        let error = create_commit(
             &mut transaction,
-            AppendCommitArgs {
+            CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
                 lazy_exact_file_updates: Vec::new(),
-                preconditions: AppendCommitPreconditions {
-                    write_lane: AppendWriteLane::Version("version-a".to_string()),
-                    expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
-                    idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
+                    idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
@@ -1608,7 +1618,7 @@ mod tests {
         .await
         .expect_err("missing lane should fail");
 
-        assert_eq!(error.kind, AppendCommitErrorKind::MissingWriteLane);
+        assert_eq!(error.kind, CreateCommitErrorKind::MissingWriteLane);
     }
 
     #[tokio::test]
@@ -1616,16 +1626,16 @@ mod tests {
         let mut transaction = FakeTransaction::default();
         let mut functions = CountingFunctionProvider::default();
 
-        let result = append_commit_if_preconditions_hold(
+        let result = create_commit(
             &mut transaction,
-            AppendCommitArgs {
+            CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
                 lazy_exact_file_updates: Vec::new(),
-                preconditions: AppendCommitPreconditions {
-                    write_lane: AppendWriteLane::Version("version-a".to_string()),
-                    expected_tip: AppendExpectedTip::CreateIfMissing,
-                    idempotency_key: AppendIdempotencyKey::Exact("idem-create".to_string()),
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                    expected_head: CreateCommitExpectedHead::CreateIfMissing,
+                    idempotency_key: CreateCommitIdempotencyKey::Exact("idem-create".to_string()),
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
@@ -1636,11 +1646,11 @@ mod tests {
         .await
         .expect("create-if-missing should succeed");
 
-        assert_eq!(result.disposition, AppendCommitDisposition::Applied);
+        assert_eq!(result.disposition, CreateCommitDisposition::Applied);
     }
 
     #[tokio::test]
-    async fn applies_global_admin_lane_when_tip_matches_expected() {
+    async fn applies_global_admin_lane_when_head_matches_expected() {
         let mut transaction = FakeTransaction::default();
         transaction.version_heads.insert(
             GLOBAL_VERSION_ID.to_string(),
@@ -1648,16 +1658,18 @@ mod tests {
         );
         let mut functions = CountingFunctionProvider::default();
 
-        let result = append_commit_if_preconditions_hold(
+        let result = create_commit(
             &mut transaction,
-            AppendCommitArgs {
+            CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_global_change()],
                 lazy_exact_file_updates: Vec::new(),
-                preconditions: AppendCommitPreconditions {
-                    write_lane: AppendWriteLane::GlobalAdmin,
-                    expected_tip: AppendExpectedTip::CommitId("commit-global-123".to_string()),
-                    idempotency_key: AppendIdempotencyKey::Exact("idem-global".to_string()),
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::GlobalAdmin,
+                    expected_head: CreateCommitExpectedHead::CommitId(
+                        "commit-global-123".to_string(),
+                    ),
+                    idempotency_key: CreateCommitIdempotencyKey::Exact("idem-global".to_string()),
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
@@ -1666,14 +1678,14 @@ mod tests {
             None,
         )
         .await
-        .expect("global admin append should succeed");
+        .expect("global admin create_commit should succeed");
 
-        assert_eq!(result.disposition, AppendCommitDisposition::Applied);
+        assert_eq!(result.disposition, CreateCommitDisposition::Applied);
         assert!(result.commit_result.is_some());
     }
 
     #[tokio::test]
-    async fn invariant_recheck_failure_aborts_append_before_commit_generation() {
+    async fn invariant_recheck_failure_aborts_create_commit_before_generation() {
         let mut transaction = FakeTransaction::default();
         transaction
             .version_heads
@@ -1681,22 +1693,22 @@ mod tests {
         let mut functions = CountingFunctionProvider::default();
         let mut checker = RecordingInvariantChecker {
             calls: 0,
-            failure: Some(AppendCommitError {
-                kind: AppendCommitErrorKind::Internal,
-                message: "append invariant failed".to_string(),
+            failure: Some(CreateCommitError {
+                kind: CreateCommitErrorKind::Internal,
+                message: "create commit invariant failed".to_string(),
             }),
         };
 
-        let error = append_commit_if_preconditions_hold(
+        let error = create_commit(
             &mut transaction,
-            AppendCommitArgs {
+            CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
                 lazy_exact_file_updates: Vec::new(),
-                preconditions: AppendCommitPreconditions {
-                    write_lane: AppendWriteLane::Version("version-a".to_string()),
-                    expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
-                    idempotency_key: AppendIdempotencyKey::Exact("idem-1".to_string()),
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
+                    idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
@@ -1705,16 +1717,16 @@ mod tests {
             Some(&mut checker),
         )
         .await
-        .expect_err("append invariant failure should abort");
+        .expect_err("create commit invariant failure should abort");
 
         assert_eq!(checker.calls, 1);
-        assert_eq!(error.message, "append invariant failed");
+        assert_eq!(error.message, "create commit invariant failed");
         assert!(
             !transaction
                 .executed_sql
                 .iter()
                 .any(|sql| sql.contains("INSERT INTO lix_internal_commit_idempotency ")),
-            "append should abort before persisting idempotency state"
+            "create_commit should abort before persisting idempotency state"
         );
     }
 

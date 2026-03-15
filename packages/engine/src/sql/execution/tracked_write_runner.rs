@@ -7,11 +7,11 @@ use crate::schema::registry::ensure_schema_live_table_in_transaction;
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::execute::SqlExecutionOutcome;
 use crate::sql::execution::shared_path::{
-    append_commit_error_to_lix_error, apply_public_version_last_checkpoint_side_effects,
-    build_pending_public_append_session, empty_public_write_execution_outcome,
+    apply_public_version_last_checkpoint_side_effects, build_pending_public_commit_session,
+    create_commit_error_to_lix_error, empty_public_write_execution_outcome,
     merge_public_domain_change_batch_into_pending_commit,
-    mirror_public_registered_schema_bootstrap_rows, pending_session_matches_append,
-    PendingPublicAppendSession, Sql2AppendInvariantChecker,
+    mirror_public_registered_schema_bootstrap_rows, pending_session_matches_create_commit,
+    PendingPublicCommitSession, PublicCommitInvariantChecker,
 };
 use crate::sql::public::planner::ir::WriteLane;
 use crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch;
@@ -19,8 +19,8 @@ use crate::sql::public::runtime::{
     semantic_plan_effects_from_domain_changes, state_commit_stream_operation, TrackedWriteTxnPlan,
 };
 use crate::state::commit::{
-    append_commit_if_preconditions_hold, AppendCommitArgs, AppendCommitDisposition,
-    AppendCommitInvariantChecker, AppendWriteLane,
+    create_commit, CreateCommitArgs, CreateCommitDisposition, CreateCommitInvariantChecker,
+    CreateCommitWriteLane,
 };
 use crate::{LixError, LixTransaction, QueryResult};
 
@@ -28,7 +28,7 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
     engine: &Engine,
     transaction: &mut dyn LixTransaction,
     plan: &TrackedWriteTxnPlan,
-    mut pending_append_session: Option<&mut Option<PendingPublicAppendSession>>,
+    mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
     if plan.execution.persist_filesystem_payloads_before_write {
         engine
@@ -40,7 +40,7 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
             .map_err(|error| LixError {
                 code: error.code,
                 description: format!(
-                    "public tracked filesystem payload persistence failed before append: {}",
+                    "public tracked filesystem payload persistence failed before commit creation: {}",
                     error.description
                 ),
             })?;
@@ -68,23 +68,26 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
         return Ok(Some(empty_public_write_execution_outcome()));
     }
 
-    let mut append_functions = plan.functions.clone();
-    if let Some(session_slot) = pending_append_session.as_mut() {
+    let mut create_commit_functions = plan.functions.clone();
+    if let Some(session_slot) = pending_commit_session.as_mut() {
         let can_merge = !plan.has_lazy_exact_file_updates()
             && session_slot.as_ref().is_some_and(|session| {
-                pending_session_matches_append(session, &plan.execution.append_preconditions)
+                pending_session_matches_create_commit(session, &plan.execution.create_preconditions)
             });
         if can_merge {
             engine
-                .ensure_runtime_sequence_initialized_in_transaction(transaction, &append_functions)
+                .ensure_runtime_sequence_initialized_in_transaction(
+                    transaction,
+                    &create_commit_functions,
+                )
                 .await?;
-            let timestamp = append_functions.timestamp();
+            let timestamp = create_commit_functions.timestamp();
             let mut invariant_checker =
-                Sql2AppendInvariantChecker::new(&plan.public_write.planned_write);
+                PublicCommitInvariantChecker::new(&plan.public_write.planned_write);
             invariant_checker
                 .recheck_invariants(transaction)
                 .await
-                .map_err(append_commit_error_to_lix_error)?;
+                .map_err(create_commit_error_to_lix_error)?;
             let session = session_slot
                 .as_mut()
                 .expect("session should exist when can_merge is true");
@@ -95,22 +98,22 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
                     .domain_change_batch
                     .as_ref()
                     .expect("merged tracked writes should have a domain change batch"),
-                &mut append_functions,
+                &mut create_commit_functions,
                 &timestamp,
             )
             .await?;
-            if append_functions
+            if create_commit_functions
                 .deterministic_sequence_persist_highest_seen()
                 .is_some()
             {
                 let mut settings = DeterministicSettings::disabled();
-                settings.enabled = append_functions.deterministic_sequence_enabled();
+                settings.enabled = create_commit_functions.deterministic_sequence_enabled();
                 engine
                     .persist_runtime_sequence_in_transaction(
                         transaction,
                         settings,
                         0,
-                        &append_functions,
+                        &create_commit_functions,
                     )
                     .await?;
             }
@@ -128,15 +131,15 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
         }
     }
 
-    let mut invariant_checker = Sql2AppendInvariantChecker::new(&plan.public_write.planned_write);
+    let mut invariant_checker = PublicCommitInvariantChecker::new(&plan.public_write.planned_write);
     let invariant_checker = if plan.is_merged_transaction_plan() {
         None
     } else {
-        Some(&mut invariant_checker as &mut dyn AppendCommitInvariantChecker)
+        Some(&mut invariant_checker as &mut dyn CreateCommitInvariantChecker)
     };
-    let append_result = append_commit_if_preconditions_hold(
+    let create_result = create_commit(
         transaction,
-        AppendCommitArgs {
+        CreateCommitArgs {
             timestamp: None,
             changes: plan
                 .execution
@@ -145,17 +148,17 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
                 .map(|batch| batch.changes.clone())
                 .unwrap_or_default(),
             lazy_exact_file_updates: plan.execution.lazy_exact_file_updates.clone(),
-            preconditions: plan.execution.append_preconditions.clone(),
+            preconditions: plan.execution.create_preconditions.clone(),
             should_emit_observe_tick: plan.should_emit_observe_tick(),
             observe_tick_writer_key: plan.writer_key.clone(),
         },
-        &mut append_functions,
+        &mut create_commit_functions,
         invariant_checker,
     )
     .await
-    .map_err(append_commit_error_to_lix_error)?;
+    .map_err(create_commit_error_to_lix_error)?;
 
-    if let Some(commit_result) = append_result.commit_result.as_ref() {
+    if let Some(commit_result) = create_result.commit_result.as_ref() {
         mirror_public_registered_schema_bootstrap_rows(transaction, commit_result)
             .await
             .map_err(|error| LixError {
@@ -168,19 +171,19 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
     }
 
     let applied_domain_change_batch =
-        if matches!(append_result.disposition, AppendCommitDisposition::Applied) {
+        if matches!(create_result.disposition, CreateCommitDisposition::Applied) {
             Some(DomainChangeBatch {
-                changes: append_result.applied_domain_changes.clone(),
+                changes: create_result.applied_domain_changes.clone(),
                 write_lane: plan
                     .execution
                     .domain_change_batch
                     .as_ref()
                     .map(|batch| batch.write_lane.clone())
-                    .unwrap_or_else(|| match &plan.execution.append_preconditions.write_lane {
-                        AppendWriteLane::Version(version_id) => {
+                    .unwrap_or_else(|| match &plan.execution.create_preconditions.write_lane {
+                        CreateCommitWriteLane::Version(version_id) => {
                             WriteLane::SingleVersion(version_id.clone())
                         }
-                        AppendWriteLane::GlobalAdmin => WriteLane::GlobalAdmin,
+                        CreateCommitWriteLane::GlobalAdmin => WriteLane::GlobalAdmin,
                     }),
                 writer_key: plan
                     .execution
@@ -217,14 +220,14 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
     }
 
     let plugin_changes_committed =
-        matches!(append_result.disposition, AppendCommitDisposition::Applied);
-    if let Some(session_slot) = pending_append_session.as_mut() {
+        matches!(create_result.disposition, CreateCommitDisposition::Applied);
+    if let Some(session_slot) = pending_commit_session.as_mut() {
         **session_slot = if plugin_changes_committed {
-            if let Some(commit_result) = append_result.commit_result.as_ref() {
+            if let Some(commit_result) = create_result.commit_result.as_ref() {
                 Some(
-                    build_pending_public_append_session(
+                    build_pending_public_commit_session(
                         transaction,
-                        plan.execution.append_preconditions.write_lane.clone(),
+                        plan.execution.create_preconditions.write_lane.clone(),
                         commit_result,
                     )
                     .await?,
@@ -240,7 +243,7 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
     let plan_effects_override = if plugin_changes_committed {
         if plan.has_lazy_exact_file_updates() {
             semantic_plan_effects_from_domain_changes(
-                &append_result.applied_domain_changes,
+                &create_result.applied_domain_changes,
                 state_commit_stream_operation(
                     plan.public_write.planned_write.command.operation_kind,
                 ),

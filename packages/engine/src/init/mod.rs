@@ -30,10 +30,10 @@ const INIT_STATEMENTS: &[&str] = &[
      idempotency_key TEXT NOT NULL,\
      idempotency_kind TEXT NOT NULL,\
      idempotency_value TEXT NOT NULL,\
-     parent_tip_snapshot_content TEXT NOT NULL,\
+     parent_head_snapshot_content TEXT NOT NULL,\
      commit_id TEXT NOT NULL,\
      created_at TEXT NOT NULL,\
-     PRIMARY KEY (write_lane, idempotency_kind, idempotency_value, parent_tip_snapshot_content)\
+     PRIMARY KEY (write_lane, idempotency_kind, idempotency_value, parent_head_snapshot_content)\
      )",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_commit_idempotency_commit_id \
      ON lix_internal_commit_idempotency (commit_id)",

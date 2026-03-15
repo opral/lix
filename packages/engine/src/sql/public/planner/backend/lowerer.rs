@@ -950,7 +950,7 @@ fn build_entity_source_query(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
-                "sql2 entity read lowerer requires fixed schema binding for '{}'",
+                "public entity read lowerer requires fixed schema binding for '{}'",
                 surface_binding.descriptor.public_name
             ),
         });
@@ -1012,7 +1012,7 @@ fn build_effective_state_source_sql(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
-                "sql2 state read lowerer requires a bounded schema set for '{}'",
+                "public state read lowerer requires a bounded schema set for '{}'",
                 surface_binding.descriptor.public_name
             ),
         });
@@ -2379,7 +2379,7 @@ fn build_pushdown_decision(effective_state_plan: &EffectiveStatePlan) -> Pushdow
             .map(|predicate| RejectedPredicate {
                 predicate: predicate.to_string(),
                 reason:
-                    "day-1 sql2 read lowering keeps this predicate above effective-state resolution"
+                    "day-1 public read lowering keeps this predicate above effective-state resolution"
                         .to_string(),
                 support: PushdownSupport::Unsupported,
             })
@@ -2400,7 +2400,7 @@ fn change_pushdown_decision(canonicalized: &StructuredPublicRead) -> PushdownDec
             .iter()
             .map(|predicate| RejectedPredicate {
                 predicate: predicate.clone(),
-                reason: "sql2 change-scan lowering keeps change predicates above the derived change source".to_string(),
+                reason: "public change-scan lowering keeps change predicates above the derived change source".to_string(),
                 support: PushdownSupport::Unsupported,
             })
             .collect(),
@@ -2416,7 +2416,7 @@ fn working_changes_pushdown_decision(canonicalized: &StructuredPublicRead) -> Pu
             .iter()
             .map(|predicate| RejectedPredicate {
                 predicate: predicate.clone(),
-                reason: "sql2 working-changes lowering keeps predicates above the derived working-changes source".to_string(),
+                reason: "public working-changes lowering keeps predicates above the derived working-changes source".to_string(),
                 support: PushdownSupport::Unsupported,
             })
             .collect(),
@@ -2433,7 +2433,7 @@ fn admin_pushdown_decision(canonicalized: &StructuredPublicRead) -> PushdownDeci
             .map(|predicate| RejectedPredicate {
                 predicate: predicate.clone(),
                 reason:
-                    "sql2 admin-scan lowering keeps admin predicates above the derived admin source"
+                    "public admin-scan lowering keeps admin predicates above the derived admin source"
                         .to_string(),
                 support: PushdownSupport::Unsupported,
             })
@@ -2451,7 +2451,7 @@ fn filesystem_pushdown_decision(canonicalized: &StructuredPublicRead) -> Pushdow
             .map(|predicate| RejectedPredicate {
                 predicate: predicate.clone(),
                 reason:
-                    "sql2 filesystem lowering keeps filesystem predicates above the derived source"
+                    "public filesystem lowering keeps filesystem predicates above the derived source"
                         .to_string(),
                 support: PushdownSupport::Unsupported,
             })
@@ -2535,13 +2535,13 @@ fn parse_single_query(sql: &str) -> Result<Query, LixError> {
     if statements.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "expected a single lowered sql2 read statement".to_string(),
+            description: "expected a single lowered public read statement".to_string(),
         });
     }
     let Statement::Query(query) = statements.remove(0) else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "expected lowered sql2 read to parse as a query".to_string(),
+            description: "expected lowered public read to parse as a query".to_string(),
         });
     };
     Ok(*query)

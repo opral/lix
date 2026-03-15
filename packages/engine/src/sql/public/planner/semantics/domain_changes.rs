@@ -1,5 +1,5 @@
 use crate::sql::public::planner::ir::{
-    CommitPreconditions, ExpectedTip, IdempotencyKey, MutationPayload, PlannedStateRow,
+    CommitPreconditions, ExpectedHead, IdempotencyKey, MutationPayload, PlannedStateRow,
     PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode,
 };
 use crate::state::commit::ProposedDomainChange;
@@ -75,7 +75,7 @@ pub(crate) async fn derive_commit_preconditions(
             build_idempotency_key(planned_write, partition, partition_index, &write_lane)?;
         preconditions.push(CommitPreconditions {
             write_lane,
-            expected_tip: ExpectedTip::CurrentTip,
+            expected_head: ExpectedHead::CurrentHead,
             idempotency_key,
         });
     }
@@ -366,7 +366,7 @@ mod tests {
     use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql::public::core::parser::parse_sql_script;
     use crate::sql::public::planner::canonicalize::canonicalize_write;
-    use crate::sql::public::planner::ir::{ExpectedTip, WriteLane};
+    use crate::sql::public::planner::ir::{ExpectedHead, WriteLane};
     use crate::sql::public::planner::semantics::write_analysis::analyze_write;
     use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn derives_commit_preconditions_against_current_tip() {
+    async fn derives_commit_preconditions_against_current_head() {
         let planned_write = planned_write(
             "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
              VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')",
@@ -516,14 +516,14 @@ mod tests {
             preconditions.write_lane,
             WriteLane::SingleVersion("version-a".to_string())
         );
-        assert_eq!(preconditions.expected_tip, ExpectedTip::CurrentTip);
+        assert_eq!(preconditions.expected_head, ExpectedHead::CurrentHead);
         assert!(
             preconditions.idempotency_key.0.contains("\"fingerprint\""),
             "idempotency key should carry a stable payload fingerprint"
         );
         assert!(
             !preconditions.idempotency_key.0.contains("commit-123"),
-            "idempotency key should no longer force a pre-read of the current tip"
+            "idempotency key should no longer force a pre-read of the current head"
         );
     }
 

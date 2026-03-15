@@ -136,7 +136,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("invalid snapshot_content should fail on sql2 insert");
+            .expect_err("invalid snapshot_content should fail on public insert");
 
         assert!(
             err.description
@@ -800,7 +800,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("immutable schema update should fail on sql2 path");
+            .expect_err("immutable schema update should fail on public path");
 
         assert!(
             err.description

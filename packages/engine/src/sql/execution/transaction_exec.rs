@@ -31,7 +31,7 @@ impl Engine {
         deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
         skip_side_effect_collection: bool,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
-        pending_public_append_session: &mut Option<shared_path::PendingPublicAppendSession>,
+        pending_public_commit_session: &mut Option<shared_path::PendingPublicCommitSession>,
     ) -> Result<QueryResult, LixError> {
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         if parsed_statements.len() != 1 {
@@ -76,7 +76,7 @@ impl Engine {
                 transaction,
                 plan,
                 WriteTxnRunMode::Borrowed,
-                Some(pending_public_append_session),
+                Some(pending_public_commit_session),
             )
             .await?
         } else {
@@ -116,7 +116,7 @@ impl Engine {
                 sqlparser::ast::Statement::Query(_) | sqlparser::ast::Statement::Explain { .. }
             )
         {
-            *pending_public_append_session = None;
+            *pending_public_commit_session = None;
         }
 
         if let Some(public_write) = prepared.public_write.as_ref() {

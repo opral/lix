@@ -81,7 +81,7 @@ async fn install_plugin_in_transaction(
     active_version_id: &mut String,
     pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
 ) -> Result<(), LixError> {
-    let mut pending_public_append_session = None;
+    let mut pending_public_commit_session = None;
     let mut public_surface_registry = engine.public_surface_registry();
     let mut public_surface_registry_dirty = false;
     for schema in &parsed.schemas {
@@ -98,7 +98,7 @@ async fn install_plugin_in_transaction(
                 None,
                 false,
                 pending_state_commit_stream_changes,
-                &mut pending_public_append_session,
+                &mut pending_public_commit_session,
             )
             .await?;
     }
@@ -122,7 +122,7 @@ async fn install_plugin_in_transaction(
             None,
             false,
             pending_state_commit_stream_changes,
-            &mut pending_public_append_session,
+            &mut pending_public_commit_session,
         )
         .await?;
 
@@ -145,7 +145,7 @@ async fn install_plugin_in_transaction(
             None,
             false,
             pending_state_commit_stream_changes,
-            &mut pending_public_append_session,
+            &mut pending_public_commit_session,
         )
         .await?;
 

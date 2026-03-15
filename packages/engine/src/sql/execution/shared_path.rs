@@ -13,13 +13,12 @@ use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{
     bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
     generate_commit, load_commit_active_accounts, load_version_info_for_versions,
-    AppendCommitError, AppendCommitErrorKind, AppendCommitInvariantChecker,
-    AppendCommitPreconditions, AppendExpectedTip, AppendWriteLane, CommitQueryExecutor,
+    CommitQueryExecutor, CreateCommitError, CreateCommitErrorKind, CreateCommitExpectedHead,
+    CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
     DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow, VersionInfo,
 };
 use crate::state::validation::{
-    validate_inserts, validate_sql2_append_time_write, validate_sql2_batch_local_write,
-    validate_updates,
+    validate_batch_local_write, validate_commit_time_write, validate_inserts, validate_updates,
 };
 use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
 
@@ -94,8 +93,8 @@ pub(crate) fn prepared_execution_mutates_public_surface_registry(
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PendingPublicAppendSession {
-    pub(crate) lane: AppendWriteLane,
+pub(crate) struct PendingPublicCommitSession {
+    pub(crate) lane: CreateCommitWriteLane,
     pub(crate) commit_id: String,
     pub(crate) change_set_id: String,
     pub(crate) commit_change_id: String,
@@ -107,12 +106,12 @@ pub(crate) struct PendingPublicAppendSession {
     pub(crate) commit_snapshot: JsonValue,
 }
 
-pub(crate) struct Sql2AppendInvariantChecker<'a> {
+pub(crate) struct PublicCommitInvariantChecker<'a> {
     planned_write: &'a crate::sql::public::planner::ir::PlannedWrite,
     schema_cache: crate::state::validation::SchemaCache,
 }
 
-impl<'a> Sql2AppendInvariantChecker<'a> {
+impl<'a> PublicCommitInvariantChecker<'a> {
     pub(crate) fn new(planned_write: &'a crate::sql::public::planner::ir::PlannedWrite) -> Self {
         Self {
             planned_write,
@@ -122,16 +121,16 @@ impl<'a> Sql2AppendInvariantChecker<'a> {
 }
 
 #[async_trait::async_trait(?Send)]
-impl AppendCommitInvariantChecker for Sql2AppendInvariantChecker<'_> {
+impl CreateCommitInvariantChecker for PublicCommitInvariantChecker<'_> {
     async fn recheck_invariants(
         &mut self,
         transaction: &mut dyn LixTransaction,
-    ) -> Result<(), AppendCommitError> {
+    ) -> Result<(), CreateCommitError> {
         let backend = TransactionBackendAdapter::new(transaction);
-        validate_sql2_append_time_write(&backend, &self.schema_cache, self.planned_write)
+        validate_commit_time_write(&backend, &self.schema_cache, self.planned_write)
             .await
-            .map_err(|error| AppendCommitError {
-                kind: AppendCommitErrorKind::Internal,
+            .map_err(|error| CreateCommitError {
+                kind: CreateCommitErrorKind::Internal,
                 message: error.description,
             })
     }
@@ -374,7 +373,7 @@ pub(crate) async fn prepare_execution_with_backend(
         })?;
     }
     if let Some(public_write) = public_write.as_ref() {
-        validate_sql2_batch_local_write(backend, &engine.schema_cache, &public_write.planned_write)
+        validate_batch_local_write(backend, &engine.schema_cache, &public_write.planned_write)
             .await
             .map_err(|error| LixError {
                 code: error.code,
@@ -557,23 +556,23 @@ pub(crate) fn empty_public_write_execution_outcome() -> SqlExecutionOutcome {
     }
 }
 
-pub(crate) fn pending_session_matches_append(
-    session: &PendingPublicAppendSession,
-    preconditions: &AppendCommitPreconditions,
+pub(crate) fn pending_session_matches_create_commit(
+    session: &PendingPublicCommitSession,
+    preconditions: &CreateCommitPreconditions,
 ) -> bool {
     session.lane == preconditions.write_lane
-        && match &preconditions.expected_tip {
-            AppendExpectedTip::CurrentTip => true,
-            AppendExpectedTip::CommitId(commit_id) => commit_id == &session.commit_id,
-            AppendExpectedTip::CreateIfMissing => false,
+        && match &preconditions.expected_head {
+            CreateCommitExpectedHead::CurrentHead => true,
+            CreateCommitExpectedHead::CommitId(commit_id) => commit_id == &session.commit_id,
+            CreateCommitExpectedHead::CreateIfMissing => false,
         }
 }
 
-pub(crate) async fn build_pending_public_append_session(
+pub(crate) async fn build_pending_public_commit_session(
     transaction: &mut dyn LixTransaction,
-    lane: AppendWriteLane,
+    lane: CreateCommitWriteLane,
     commit_result: &GenerateCommitResult,
-) -> Result<PendingPublicAppendSession, LixError> {
+) -> Result<PendingPublicCommitSession, LixError> {
     let commit_row = commit_result
         .live_state_rows
         .iter()
@@ -581,19 +580,19 @@ pub(crate) async fn build_pending_public_append_session(
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "public append session requires a lix_commit materialized row",
+                "public commit session requires a lix_commit materialized row",
             )
         })?;
     let commit_snapshot = commit_row.snapshot_content.as_deref().ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "public append session requires commit snapshot_content",
+            "public commit session requires commit snapshot_content",
         )
     })?;
     let commit_snapshot: JsonValue = serde_json::from_str(commit_snapshot).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("public append session commit snapshot is invalid JSON: {error}"),
+            format!("public commit session commit snapshot is invalid JSON: {error}"),
         )
     })?;
     let change_set_id = commit_snapshot
@@ -603,7 +602,7 @@ pub(crate) async fn build_pending_public_append_session(
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "public append session commit snapshot is missing change_set_id",
+                "public commit session commit snapshot is missing change_set_id",
             )
         })?
         .to_string();
@@ -615,7 +614,7 @@ pub(crate) async fn build_pending_public_append_session(
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "public append session requires a lix_commit change row",
+                "public commit session requires a lix_commit change row",
             )
         })?;
     let snapshot_id_result = transaction
@@ -643,11 +642,11 @@ pub(crate) async fn build_pending_public_append_session(
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "public append session could not load commit snapshot_id",
+                "public commit session could not load commit snapshot_id",
             )
         })?;
 
-    Ok(PendingPublicAppendSession {
+    Ok(PendingPublicCommitSession {
         lane,
         commit_id: commit_row.entity_id.clone(),
         change_set_id,
@@ -663,7 +662,7 @@ pub(crate) async fn build_pending_public_append_session(
 
 pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
     transaction: &mut dyn LixTransaction,
-    session: &mut PendingPublicAppendSession,
+    session: &mut PendingPublicCommitSession,
     batch: &crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch,
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
     timestamp: &str,
@@ -772,7 +771,7 @@ async fn load_version_info_for_domain_changes(
 }
 
 fn rewrite_generated_commit_result_for_pending_session(
-    session: &PendingPublicAppendSession,
+    session: &PendingPublicCommitSession,
     generated: GenerateCommitResult,
     domain_change_count: usize,
     timestamp: &str,
@@ -916,10 +915,10 @@ fn rewrite_change_set_element_snapshot(
     Ok((format!("{change_set_id}~{change_id}"), parsed.to_string()))
 }
 
-fn pending_session_version_ref_entity_id(lane: &AppendWriteLane) -> &str {
+fn pending_session_version_ref_entity_id(lane: &CreateCommitWriteLane) -> &str {
     match lane {
-        AppendWriteLane::Version(version_id) => version_id.as_str(),
-        AppendWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
+        CreateCommitWriteLane::Version(version_id) => version_id.as_str(),
+        CreateCommitWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
     }
 }
 
@@ -990,8 +989,8 @@ pub(crate) fn public_write_filesystem_payload_changes_already_committed(
     })
 }
 
-pub(crate) fn append_commit_error_to_lix_error(
-    error: crate::state::commit::AppendCommitError,
+pub(crate) fn create_commit_error_to_lix_error(
+    error: crate::state::commit::CreateCommitError,
 ) -> LixError {
     LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),

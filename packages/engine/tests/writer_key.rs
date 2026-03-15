@@ -511,7 +511,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    sql2_state_by_version_update_uses_current_execution_writer_key,
+    public_state_by_version_update_uses_current_execution_writer_key,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -528,7 +528,7 @@ simulation_test!(
                     "INSERT INTO lix_internal_state_vtable (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) VALUES (\
-                     'wk-sql2-update', 'wk_writer_key_schema', 'file-1', '{version_id}', 'lix', '{{\"key\":\"before\"}}', '1'\
+                     'wk-public-update', 'wk_writer_key_schema', 'file-1', '{version_id}', 'lix', '{{\"key\":\"before\"}}', '1'\
                      )"
                 ),
                 &[],
@@ -545,7 +545,7 @@ simulation_test!(
                     "UPDATE lix_state_by_version \
                      SET snapshot_content = '{{\"key\":\"after\"}}' \
                      WHERE schema_key = 'wk_writer_key_schema' \
-                       AND entity_id = 'wk-sql2-update' \
+                       AND entity_id = 'wk-public-update' \
                        AND file_id = 'file-1' \
                        AND version_id = '{version_id}'"
                 ),
@@ -563,7 +563,7 @@ simulation_test!(
                     "SELECT writer_key \
                      FROM lix_state_by_version \
                      WHERE schema_key = 'wk_writer_key_schema' \
-                       AND entity_id = 'wk-sql2-update' \
+                       AND entity_id = 'wk-public-update' \
                        AND file_id = 'file-1' \
                        AND version_id = '{version_id}'"
                 ),

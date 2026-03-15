@@ -46,7 +46,7 @@ impl Engine {
         let mut public_surface_registry = self.public_surface_registry();
         let starting_active_version_id = active_version_id.clone();
         let mut pending_state_commit_stream_changes = Vec::new();
-        let mut pending_public_append_session = None;
+        let mut pending_public_commit_session = None;
         let mut public_surface_registry_dirty = false;
         let installed_plugins_cache_invalidation_pending =
             should_invalidate_installed_plugins_cache_for_statements(&statements);
@@ -61,7 +61,7 @@ impl Engine {
                 &mut public_surface_registry_dirty,
                 &mut active_version_id,
                 &mut pending_state_commit_stream_changes,
-                &mut pending_public_append_session,
+                &mut pending_public_commit_session,
             )
             .await;
         let result = match result {
@@ -104,8 +104,8 @@ impl Engine {
         public_surface_registry_dirty: &mut bool,
         active_version_id: &mut String,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
-        pending_public_append_session: &mut Option<
-            crate::sql::execution::shared_path::PendingPublicAppendSession,
+        pending_public_commit_session: &mut Option<
+            crate::sql::execution::shared_path::PendingPublicCommitSession,
         >,
     ) -> Result<ExecuteResult, LixError> {
         let result_statement_count = original_statements.len();
@@ -127,7 +127,7 @@ impl Engine {
             public_surface_registry_dirty,
             active_version_id,
             pending_state_commit_stream_changes,
-            pending_public_append_session,
+            pending_public_commit_session,
         )
         .await
     }
@@ -145,8 +145,8 @@ impl Engine {
         public_surface_registry_dirty: &mut bool,
         active_version_id: &mut String,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
-        pending_public_append_session: &mut Option<
-            crate::sql::execution::shared_path::PendingPublicAppendSession,
+        pending_public_commit_session: &mut Option<
+            crate::sql::execution::shared_path::PendingPublicCommitSession,
         >,
     ) -> Result<ExecuteResult, LixError> {
         if original_statements.len() != sql_statements.len() {
@@ -209,7 +209,7 @@ impl Engine {
                 transaction,
                 &combined_plan,
                 crate::sql::execution::write_txn_plan::WriteTxnRunMode::Borrowed,
-                Some(pending_public_append_session),
+                Some(pending_public_commit_session),
             )
             .await?;
 
@@ -330,7 +330,7 @@ impl Engine {
                 transaction,
                 &combined_plan,
                 crate::sql::execution::write_txn_plan::WriteTxnRunMode::Borrowed,
-                Some(pending_public_append_session),
+                Some(pending_public_commit_session),
             )
             .await?;
             let active_effects = execution
@@ -368,7 +368,7 @@ impl Engine {
                     None,
                     false,
                     pending_state_commit_stream_changes,
-                    pending_public_append_session,
+                    pending_public_commit_session,
                 )
                 .await?;
             results.push(result);

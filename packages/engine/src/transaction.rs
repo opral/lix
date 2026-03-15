@@ -35,7 +35,7 @@ impl Engine {
             installed_plugins_cache_invalidation_pending: false,
             public_surface_registry_dirty: false,
             pending_state_commit_stream_changes: Vec::new(),
-            pending_public_append_session: None,
+            pending_public_commit_session: None,
         })
     }
 
@@ -122,7 +122,7 @@ impl EngineTransaction<'_> {
                     &mut self.public_surface_registry_dirty,
                     &mut self.active_version_id,
                     &mut self.pending_state_commit_stream_changes,
-                    &mut self.pending_public_append_session,
+                    &mut self.pending_public_commit_session,
                 )
                 .await?
         } else {
@@ -140,7 +140,7 @@ impl EngineTransaction<'_> {
                     None,
                     false,
                     &mut self.pending_state_commit_stream_changes,
-                    &mut self.pending_public_append_session,
+                    &mut self.pending_public_commit_session,
                 )
                 .await?;
             ExecuteResult {
