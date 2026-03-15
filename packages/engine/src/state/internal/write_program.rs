@@ -111,28 +111,33 @@ impl WriteProgram {
 }
 
 pub(crate) fn lower_write_program(program: WriteProgram) -> PreparedProgram {
-    let steps = program
-        .steps
-        .into_iter()
-        .map(|step| match step {
-            WriteStep::PreparedBatch(batch) => PreparedStep {
-                sql: batch.sql,
-                params: batch
-                    .params
-                    .into_iter()
-                    .map(PreparedParam::Literal)
-                    .collect(),
-                capture: None,
-                relation_inputs: Vec::new(),
-            },
-            WriteStep::Statement { sql, params } => PreparedStep {
-                sql,
-                params: params.into_iter().map(PreparedParam::Literal).collect(),
-                capture: None,
-                relation_inputs: Vec::new(),
-            },
-        })
-        .collect();
+    let mut steps = Vec::new();
+    for step in program.steps {
+        match step {
+            WriteStep::PreparedBatch(batch) => {
+                for statement in batch.steps {
+                    steps.push(PreparedStep {
+                        sql: statement.sql,
+                        params: statement
+                            .params
+                            .into_iter()
+                            .map(PreparedParam::Literal)
+                            .collect(),
+                        capture: None,
+                        relation_inputs: Vec::new(),
+                    });
+                }
+            }
+            WriteStep::Statement { sql, params } => {
+                steps.push(PreparedStep {
+                    sql,
+                    params: params.into_iter().map(PreparedParam::Literal).collect(),
+                    capture: None,
+                    relation_inputs: Vec::new(),
+                });
+            }
+        }
+    }
 
     PreparedProgram {
         slots: Vec::new(),

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use lix_engine::{
-    ImageChunkReader, ImageChunkWriter, LixBackend, LixError, LixTransaction, QueryResult,
-    SqlDialect, Value,
+    collapse_prepared_batch_for_dialect, ImageChunkReader, ImageChunkWriter, LixBackend, LixError,
+    LixTransaction, PreparedBatch, QueryResult, SqlDialect, Value,
 };
 use rusqlite::{
     backup::{Backup, StepResult},
@@ -56,14 +56,6 @@ impl SqliteBackend {
 impl LixBackend for SqliteBackend {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
-    }
-
-    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let conn = self.conn.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "sqlite mutex poisoned".to_string(),
-        })?;
-        execute_sql(&conn, sql, params)
     }
 
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
@@ -167,6 +159,10 @@ impl LixTransaction for SqliteTransaction<'_> {
         execute_sql(&self.conn, sql, params)
     }
 
+    async fn execute_batch(&mut self, batch: &PreparedBatch) -> Result<QueryResult, LixError> {
+        execute_prepared_batch(&self.conn, batch, self.dialect())
+    }
+
     async fn commit(mut self: Box<Self>) -> Result<(), LixError> {
         self.conn.execute_batch("COMMIT").map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -197,17 +193,6 @@ impl Drop for SqliteTransaction<'_> {
 }
 
 fn execute_sql(conn: &Connection, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-    if params.is_empty() && sql.contains(';') {
-        conn.execute_batch(sql).map_err(|err| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: err.to_string(),
-        })?;
-        return Ok(QueryResult {
-            rows: Vec::new(),
-            columns: Vec::new(),
-        });
-    }
-
     let mut stmt = conn.prepare(sql).map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: err.to_string(),
@@ -234,6 +219,29 @@ fn execute_sql(conn: &Connection, sql: &str, params: &[Value]) -> Result<QueryRe
     Ok(QueryResult {
         rows: result_rows,
         columns,
+    })
+}
+
+fn execute_prepared_batch(
+    conn: &Connection,
+    batch: &PreparedBatch,
+    dialect: SqlDialect,
+) -> Result<QueryResult, LixError> {
+    let collapsed = collapse_prepared_batch_for_dialect(batch, dialect)?;
+    if collapsed.sql.trim().is_empty() {
+        return Ok(QueryResult {
+            rows: Vec::new(),
+            columns: Vec::new(),
+        });
+    }
+
+    conn.execute_batch(&collapsed.sql).map_err(|err| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: err.to_string(),
+    })?;
+    Ok(QueryResult {
+        rows: Vec::new(),
+        columns: Vec::new(),
     })
 }
 

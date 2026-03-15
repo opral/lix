@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
 use crate::{ImageChunkReader, ImageChunkWriter, LixError, QueryResult, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,12 +13,20 @@ pub enum SqlDialect {
 pub trait LixBackend: Send + Sync {
     fn dialect(&self) -> SqlDialect;
 
-    /// Executes one engine SQL unit of work.
-    ///
-    /// `sql` may be a single statement or a semicolon-separated batch/script.
-    /// Backends must treat one call as one execution roundtrip.
-    /// `params` bind across the full SQL payload.
-    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        let mut transaction = self.begin_transaction().await?;
+        let result = transaction.execute(sql, params).await;
+        match result {
+            Ok(result) => {
+                transaction.commit().await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
 
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError>;
 
@@ -45,14 +54,40 @@ pub trait LixBackend: Send + Sync {
 pub trait LixTransaction {
     fn dialect(&self) -> SqlDialect;
 
-    /// Executes one SQL unit of work inside the current transaction.
-    ///
-    /// `sql` may be a single statement or a semicolon-separated batch/script.
-    /// Backends must treat one call as one execution roundtrip.
-    /// `params` bind across the full SQL payload.
+    /// Executes one SQL statement inside the current transaction.
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
+
+    /// Executes one parameterized SQL batch inside the current transaction.
+    async fn execute_batch(&mut self, batch: &PreparedBatch) -> Result<QueryResult, LixError> {
+        let mut last_result = QueryResult {
+            rows: Vec::new(),
+            columns: Vec::new(),
+        };
+        for statement in &batch.steps {
+            last_result = self.execute(&statement.sql, &statement.params).await?;
+        }
+        Ok(last_result)
+    }
 
     async fn commit(self: Box<Self>) -> Result<(), LixError>;
 
     async fn rollback(self: Box<Self>) -> Result<(), LixError>;
+}
+
+pub async fn execute_statement_with_backend(
+    backend: &dyn LixBackend,
+    statement: PreparedStatement,
+) -> Result<QueryResult, LixError> {
+    let mut transaction = backend.begin_transaction().await?;
+    let result = transaction.execute(&statement.sql, &statement.params).await;
+    match result {
+        Ok(result) => {
+            transaction.commit().await?;
+            Ok(result)
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+    }
 }

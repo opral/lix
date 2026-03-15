@@ -554,6 +554,7 @@ pub(crate) fn empty_public_write_execution_outcome() -> SqlExecutionOutcome {
         plugin_changes_committed: false,
         plan_effects_override: Some(PlanEffects::default()),
         state_commit_stream_changes: Vec::new(),
+        observe_tick_emitted: false,
     }
 }
 

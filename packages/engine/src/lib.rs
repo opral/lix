@@ -27,6 +27,7 @@ pub use schema::{
     validate_lix_schema_definition,
 };
 
+pub use backend::execute_statement_with_backend;
 pub use backend::LixBackend;
 pub use backend::LixTransaction;
 pub use backend::SqlDialect;
@@ -36,6 +37,9 @@ pub use engine::{BootAccount, BootKeyValue, Engine, EngineTransaction, ExecuteOp
 pub use errors::LixError;
 pub use lix::{InitResult, Lix, LixConfig};
 pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
+pub use sql::execution::contracts::prepared_statement::{
+    collapse_prepared_batch_for_dialect, PreparedBatch, PreparedStatement,
+};
 pub use state::checkpoint::CreateCheckpointResult;
 pub use state::image::{ImageChunkReader, ImageChunkWriter};
 pub use state::materialization::{
