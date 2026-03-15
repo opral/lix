@@ -20,7 +20,7 @@ use crate::functions::LixFunctionProvider;
 use crate::sql::ast::utils::{
     bind_sql, parse_sql_statements, resolve_placeholder_index, PlaceholderState,
 };
-use crate::sql::execution::contracts::prepared_statement::PreparedBatch;
+use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, SqlDialect, Value as EngineValue};
@@ -55,13 +55,13 @@ pub(crate) fn bind_statement_batch_for_dialect(
 ) -> Result<PreparedBatch, LixError> {
     let mut prepared = Vec::with_capacity(batch.statements.len());
     for statement in batch.statements {
-        prepared.push(bind_statement_for_batch(statement, &batch.params, dialect)?);
+        prepared.push(PreparedStatement {
+            sql: bind_statement_for_batch(statement, &batch.params, dialect)?,
+            params: Vec::new(),
+        });
     }
 
-    Ok(PreparedBatch {
-        sql: prepared.join("; "),
-        params: Vec::new(),
-    })
+    Ok(PreparedBatch { steps: prepared })
 }
 
 fn bind_statement_for_batch(

@@ -69,6 +69,7 @@ pub(crate) struct AppendCommitArgs {
     pub(crate) timestamp: Option<String>,
     pub(crate) changes: Vec<ProposedDomainChange>,
     pub(crate) lazy_exact_file_updates: Vec<LazyExactFileUpdate>,
+    pub(crate) additional_binary_blob_payloads: Vec<Vec<u8>>,
     pub(crate) preconditions: AppendCommitPreconditions,
     pub(crate) should_emit_observe_tick: bool,
     pub(crate) observe_tick_writer_key: Option<String>,
@@ -335,6 +336,15 @@ pub(crate) async fn append_commit_if_preconditions_hold(
             }),
             _ => None,
         })
+        .chain(
+            args.additional_binary_blob_payloads
+                .iter()
+                .map(|data| BinaryBlobWriteInput {
+                    file_id: "",
+                    version_id: "",
+                    data,
+                }),
+        )
         .collect::<Vec<_>>();
     let mut write_program =
         build_binary_blob_fastcdc_write_program(transaction.dialect(), &payloads)
@@ -1348,6 +1358,18 @@ mod tests {
             })
         }
 
+        async fn execute_batch(
+            &mut self,
+            batch: &crate::sql::execution::contracts::prepared_statement::PreparedBatch,
+        ) -> Result<QueryResult, LixError> {
+            let collapsed =
+                crate::sql::execution::contracts::prepared_statement::collapse_prepared_batch_for_dialect(
+                    batch,
+                    self.dialect(),
+                )?;
+            self.execute(&collapsed.sql, &collapsed.params).await
+        }
+
         async fn commit(self: Box<Self>) -> Result<(), LixError> {
             Ok(())
         }
@@ -1424,6 +1446,7 @@ mod tests {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
                 lazy_exact_file_updates: Vec::new(),
+                additional_binary_blob_payloads: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
@@ -1488,6 +1511,7 @@ mod tests {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
                 lazy_exact_file_updates: Vec::new(),
+                additional_binary_blob_payloads: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
@@ -1531,6 +1555,7 @@ mod tests {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
                 lazy_exact_file_updates: Vec::new(),
+                additional_binary_blob_payloads: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CurrentTip,
@@ -1567,6 +1592,7 @@ mod tests {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
                 lazy_exact_file_updates: Vec::new(),
+                additional_binary_blob_payloads: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
@@ -1596,6 +1622,7 @@ mod tests {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
                 lazy_exact_file_updates: Vec::new(),
+                additional_binary_blob_payloads: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
@@ -1624,6 +1651,7 @@ mod tests {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
                 lazy_exact_file_updates: Vec::new(),
+                additional_binary_blob_payloads: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CreateIfMissing,
@@ -1656,6 +1684,7 @@ mod tests {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_global_change()],
                 lazy_exact_file_updates: Vec::new(),
+                additional_binary_blob_payloads: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::GlobalAdmin,
                     expected_tip: AppendExpectedTip::CommitId("commit-global-123".to_string()),
@@ -1695,6 +1724,7 @@ mod tests {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
                 lazy_exact_file_updates: Vec::new(),
+                additional_binary_blob_payloads: Vec::new(),
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::Version("version-a".to_string()),
                     expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
