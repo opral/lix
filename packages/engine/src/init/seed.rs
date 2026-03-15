@@ -13,6 +13,7 @@ use crate::key_value::{
 use crate::schema::builtin::types::LixVersionDescriptor;
 use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
 use crate::sql::storage::sql_text::escape_sql_string;
+use crate::state::commit::{build_commit_generation_seed_sql, COMMIT_GRAPH_NODE_TABLE};
 use crate::version::DEFAULT_ACTIVE_VERSION_NAME;
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
@@ -404,14 +405,17 @@ impl Engine {
         Ok(main_version_id)
     }
 
-    pub(crate) async fn seed_commit_ancestry(&self) -> Result<(), LixError> {
-        let ancestry_count_result = self
+    pub(crate) async fn seed_commit_graph_nodes(&self) -> Result<(), LixError> {
+        let graph_count_result = self
             .backend
-            .execute("SELECT COUNT(*) FROM lix_internal_commit_ancestry", &[])
+            .execute(
+                &format!("SELECT COUNT(*) FROM {COMMIT_GRAPH_NODE_TABLE}"),
+                &[],
+            )
             .await?;
-        let ancestry_count =
-            read_scalar_count(&ancestry_count_result, "lix_internal_commit_ancestry count")?;
-        if ancestry_count > 0 {
+        let graph_count =
+            read_scalar_count(&graph_count_result, "lix_internal_commit_graph_node count")?;
+        if graph_count > 0 {
             return Ok(());
         }
 
@@ -433,43 +437,7 @@ impl Engine {
         }
 
         self.backend
-            .execute(
-                "WITH RECURSIVE \
-                   commits AS ( \
-                     SELECT entity_id AS commit_id \
-                     FROM lix_internal_live_v1_lix_commit \
-                     WHERE schema_key = 'lix_commit' \
-                       AND version_id = 'global' \
-                       AND is_tombstone = 0 \
-                       AND snapshot_content IS NOT NULL \
-                   ), \
-                   edges AS ( \
-                     SELECT \
-                       lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
-                       lix_json_extract(snapshot_content, 'child_id') AS child_id \
-                     FROM lix_internal_live_v1_lix_commit_edge \
-                     WHERE schema_key = 'lix_commit_edge' \
-                       AND version_id = 'global' \
-                       AND is_tombstone = 0 \
-                       AND snapshot_content IS NOT NULL \
-                       AND lix_json_extract(snapshot_content, 'parent_id') IS NOT NULL \
-                       AND lix_json_extract(snapshot_content, 'child_id') IS NOT NULL \
-                   ), \
-                   walk(commit_id, ancestor_id, depth) AS ( \
-                     SELECT c.commit_id, c.commit_id AS ancestor_id, 0 AS depth \
-                     FROM commits c \
-                     UNION ALL \
-                     SELECT w.commit_id, e.parent_id AS ancestor_id, w.depth + 1 AS depth \
-                     FROM walk w \
-                     JOIN edges e ON e.child_id = w.ancestor_id \
-                     WHERE w.depth < 512 \
-                   ) \
-                 INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
-                 SELECT commit_id, ancestor_id, MIN(depth) AS depth \
-                 FROM walk \
-                 GROUP BY commit_id, ancestor_id",
-                &[],
-            )
+            .execute(&build_commit_generation_seed_sql(), &[])
             .await?;
 
         Ok(())
@@ -838,8 +806,23 @@ impl Engine {
     ) -> Result<Option<String>, LixError> {
         let rows = self
             .execute_internal(
-                "SELECT anc.ancestor_id \
-                 FROM lix_internal_commit_ancestry anc \
+                "WITH RECURSIVE reachable(commit_id, depth) AS ( \
+                   SELECT $1 AS commit_id, 0 AS depth \
+                   UNION ALL \
+                   SELECT \
+                     lix_json_extract(edge.snapshot_content, 'parent_id') AS commit_id, \
+                     reachable.depth + 1 AS depth \
+                   FROM reachable \
+                   JOIN lix_internal_live_v1_lix_commit_edge edge \
+                     ON lix_json_extract(edge.snapshot_content, 'child_id') = reachable.commit_id \
+                   WHERE edge.schema_key = 'lix_commit_edge' \
+                     AND edge.version_id = 'global' \
+                     AND edge.is_tombstone = 0 \
+                     AND edge.snapshot_content IS NOT NULL \
+                     AND lix_json_extract(edge.snapshot_content, 'parent_id') IS NOT NULL \
+                 ) \
+                 SELECT reachable.commit_id \
+                 FROM reachable \
                  JOIN ( \
                    SELECT \
                      lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
@@ -851,7 +834,7 @@ impl Engine {
                      AND version_id = 'global' \
                      AND snapshot_content IS NOT NULL \
                  ) el \
-                   ON el.entity_id = anc.ancestor_id \
+                   ON el.entity_id = reachable.commit_id \
                   AND el.schema_key = 'lix_commit' \
                  JOIN ( \
                    SELECT \
@@ -872,12 +855,11 @@ impl Engine {
                      AND file_id = 'lix' \
                      AND version_id = 'global' \
                      AND snapshot_content IS NOT NULL \
-                 ) c ON c.id = anc.ancestor_id \
-                 WHERE anc.commit_id = $1 \
+                 ) c ON c.id = reachable.commit_id \
                  ORDER BY \
-                   anc.depth ASC, \
+                   reachable.depth ASC, \
                    c.created_at DESC, \
-                   anc.ancestor_id DESC \
+                   reachable.commit_id DESC \
                  LIMIT 1",
                 &[Value::Text(head_commit_id.to_string())],
                 ExecuteOptions::default(),

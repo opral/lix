@@ -3026,7 +3026,9 @@ mod tests {
             .first()
             .expect("working-changes read should lower");
         assert!(lowered_sql.contains("FROM lix_internal_last_checkpoint"));
-        assert!(lowered_sql.contains("lix_internal_commit_ancestry"));
+        assert!(lowered_sql.contains("tip_ancestry_walk AS"));
+        assert!(lowered_sql.contains("baseline_ancestry_walk AS"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_commit_edge"));
     }
 
     #[tokio::test]
@@ -3165,7 +3167,8 @@ mod tests {
             .lowered_sql
             .first()
             .expect("filesystem history read should lower");
-        assert!(lowered_sql.contains("lix_internal_commit_ancestry"));
+        assert!(lowered_sql.contains("reachable_commit_walk AS"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_commit_edge"));
         assert!(lowered_sql.contains("lix_internal_change ch"));
         assert!(lowered_sql.contains("lix_internal_file_history_data_cache"));
         assert!(!lowered_sql.contains("FROM lix_file_history"));
@@ -3199,7 +3202,8 @@ mod tests {
             .lowered_sql
             .first()
             .expect("filesystem by-version history read should lower");
-        assert!(lowered_sql.contains("lix_internal_commit_ancestry"));
+        assert!(lowered_sql.contains("reachable_commit_walk AS"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_commit_edge"));
         assert!(lowered_sql.contains("lix_internal_change ch"));
         assert!(lowered_sql.contains("lix_internal_file_history_data_cache"));
         assert!(!lowered_sql.contains("FROM lix_file_history_by_version"));

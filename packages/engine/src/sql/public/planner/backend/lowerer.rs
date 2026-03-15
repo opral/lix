@@ -20,12 +20,13 @@ use crate::sql::public::planner::ir::{
 use crate::sql::public::planner::semantics::effective_state_resolver::{
     EffectiveStatePlan, EffectiveStateRequest,
 };
+use crate::state::commit::build_reachable_commits_from_requested_cte_sql;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     version_descriptor_schema_key, version_ref_file_id, version_ref_schema_key,
     version_ref_storage_version_id, GLOBAL_VERSION_ID,
 };
-use crate::LixError;
+use crate::{LixError, SqlDialect};
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
@@ -83,6 +84,7 @@ pub(crate) fn summarize_bound_public_read_statement_with_registry(
 }
 
 pub(crate) fn lower_read_for_execution(
+    dialect: SqlDialect,
     structured_read: &StructuredPublicRead,
     effective_state_request: Option<&EffectiveStateRequest>,
     effective_state_plan: Option<&EffectiveStatePlan>,
@@ -97,6 +99,7 @@ pub(crate) fn lower_read_for_execution(
                 return Ok(None);
             };
             lower_state_read_for_execution(
+                dialect,
                 structured_read,
                 effective_state_request,
                 effective_state_plan,
@@ -117,6 +120,7 @@ pub(crate) fn lower_read_for_execution(
                 return Ok(None);
             };
             lower_entity_read_for_execution(
+                dialect,
                 structured_read,
                 effective_state_request,
                 effective_state_plan,
@@ -152,19 +156,19 @@ pub(crate) fn lower_read_for_execution(
                 result_columns: result_columns.clone(),
             })
         }),
-        SurfaceFamily::Filesystem => {
-            lower_filesystem_read_for_execution(structured_read).map(|statement| {
+        SurfaceFamily::Filesystem => lower_filesystem_read_for_execution(dialect, structured_read)
+            .map(|statement| {
                 statement.map(|statement| LoweredReadProgram {
                     statements: vec![statement],
                     pushdown_decision: filesystem_pushdown_decision(structured_read),
                     result_columns: result_columns.clone(),
                 })
-            })
-        }
+            }),
     }
 }
 
 fn lower_state_read_for_execution(
+    dialect: SqlDialect,
     canonicalized: &StructuredPublicRead,
     effective_state_request: &EffectiveStateRequest,
     effective_state_plan: &EffectiveStatePlan,
@@ -180,6 +184,7 @@ fn lower_state_read_for_execution(
         effective_state_plan,
     );
     let Some(derived_query) = build_state_source_query(
+        dialect,
         &canonicalized.surface_binding,
         effective_state_request,
         &pushdown_predicates,
@@ -377,6 +382,7 @@ fn state_read_exposed_column_error(
 }
 
 fn lower_entity_read_for_execution(
+    dialect: SqlDialect,
     canonicalized: &StructuredPublicRead,
     effective_state_request: &EffectiveStateRequest,
     effective_state_plan: &EffectiveStatePlan,
@@ -390,6 +396,7 @@ fn lower_entity_read_for_execution(
         effective_state_plan,
     );
     let Some(derived_query) = build_entity_source_query(
+        dialect,
         &canonicalized.surface_binding,
         effective_state_request,
         &pushdown_predicates,
@@ -611,19 +618,22 @@ fn build_nested_filesystem_surface_query(surface_name: &str) -> Result<Option<Qu
             &build_filesystem_directory_projection_sql(FilesystemProjectionScope::ExplicitVersion),
         )?,
         "lix_file_history" => {
-            let state_history_source_sql = build_filesystem_history_source_sql(&[], true);
+            let state_history_source_sql =
+                build_filesystem_history_source_sql(SqlDialect::Sqlite, &[], true);
             parse_single_query(&build_filesystem_file_history_projection_sql(
                 &state_history_source_sql,
             ))?
         }
         "lix_file_history_by_version" => {
-            let state_history_source_sql = build_filesystem_history_source_sql(&[], false);
+            let state_history_source_sql =
+                build_filesystem_history_source_sql(SqlDialect::Sqlite, &[], false);
             parse_single_query(&build_filesystem_file_history_projection_sql(
                 &state_history_source_sql,
             ))?
         }
         "lix_directory_history" => {
-            let state_history_source_sql = build_filesystem_history_source_sql(&[], true);
+            let state_history_source_sql =
+                build_filesystem_history_source_sql(SqlDialect::Sqlite, &[], true);
             parse_single_query(&build_filesystem_directory_history_projection_sql(
                 &state_history_source_sql,
             ))?
@@ -774,6 +784,7 @@ fn lower_admin_read_for_execution(
 }
 
 fn lower_filesystem_read_for_execution(
+    dialect: SqlDialect,
     canonicalized: &StructuredPublicRead,
 ) -> Result<Option<Statement>, LixError> {
     let Some(filesystem_scan) = canonical_filesystem_scan(&canonicalized.read_command.root) else {
@@ -819,7 +830,7 @@ fn lower_filesystem_read_for_execution(
             if canonicalized.surface_binding.descriptor.public_name == "lix_file_history" =>
         {
             let state_history_source_sql =
-                build_filesystem_history_source_sql(&history_pushdown_predicates, true);
+                build_filesystem_history_source_sql(dialect, &history_pushdown_predicates, true);
             parse_single_query(&build_filesystem_file_history_projection_sql(
                 &state_history_source_sql,
             ))?
@@ -829,7 +840,7 @@ fn lower_filesystem_read_for_execution(
                 == "lix_file_history_by_version" =>
         {
             let state_history_source_sql =
-                build_filesystem_history_source_sql(&history_pushdown_predicates, false);
+                build_filesystem_history_source_sql(dialect, &history_pushdown_predicates, false);
             parse_single_query(&build_filesystem_file_history_projection_sql(
                 &state_history_source_sql,
             ))?
@@ -838,7 +849,7 @@ fn lower_filesystem_read_for_execution(
             if canonicalized.surface_binding.descriptor.public_name == "lix_directory_history" =>
         {
             let state_history_source_sql =
-                build_filesystem_history_source_sql(&history_pushdown_predicates, true);
+                build_filesystem_history_source_sql(dialect, &history_pushdown_predicates, true);
             parse_single_query(&build_filesystem_directory_history_projection_sql(
                 &state_history_source_sql,
             ))?
@@ -854,6 +865,7 @@ fn lower_filesystem_read_for_execution(
 }
 
 fn build_state_source_query(
+    dialect: SqlDialect,
     surface_binding: &SurfaceBinding,
     effective_state_request: &EffectiveStateRequest,
     pushdown_predicates: &[String],
@@ -864,7 +876,9 @@ fn build_state_source_query(
             surface_binding,
             pushdown_predicates,
         )?,
-        SurfaceVariant::History => build_state_history_source_sql(pushdown_predicates, true),
+        SurfaceVariant::History => {
+            build_state_history_source_sql(dialect, pushdown_predicates, true)
+        }
         SurfaceVariant::Active | SurfaceVariant::WorkingChanges => return Ok(None),
     };
     parse_single_query(&sql).map(Some)
@@ -938,6 +952,7 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
 }
 
 fn build_entity_source_query(
+    dialect: SqlDialect,
     surface_binding: &SurfaceBinding,
     effective_state_request: &EffectiveStateRequest,
     pushdown_predicates: &[String],
@@ -964,6 +979,7 @@ fn build_entity_source_query(
     };
 
     let Some(state_source_query) = build_state_source_query(
+        dialect,
         surface_binding,
         effective_state_request,
         pushdown_predicates,
@@ -1347,6 +1363,7 @@ fn effective_state_candidate_rows_sql(
 }
 
 fn build_state_history_source_sql(
+    dialect: SqlDialect,
     pushdown_predicates: &[String],
     force_active_scope: bool,
 ) -> String {
@@ -1418,8 +1435,10 @@ fn build_state_history_source_sql(
         )
     };
 
+    let reachable_commits_cte_sql =
+        build_reachable_commits_from_requested_cte_sql(dialect, "requested_commits", 512);
     format!(
-        "WITH \
+        "WITH RECURSIVE \
            {active_version_rows_sql}\
            {default_root_commits_sql}\
            commit_by_version AS ( \
@@ -1443,17 +1462,7 @@ fn build_state_history_source_sql(
                ON d.root_commit_id = c.id \
              {requested_where_sql} \
            ), \
-           reachable_commits AS ( \
-             SELECT \
-               ancestry.ancestor_id AS commit_id, \
-               requested.commit_id AS root_commit_id, \
-               requested.root_version_id AS root_version_id, \
-               ancestry.depth AS commit_depth \
-             FROM requested_commits requested \
-             JOIN lix_internal_commit_ancestry ancestry \
-               ON ancestry.commit_id = requested.commit_id \
-             WHERE ancestry.depth <= 512 \
-           ), \
+           {reachable_commits_cte_sql}\
            filtered_reachable_commits AS ( \
              SELECT \
                rc.commit_id, \
@@ -1523,10 +1532,12 @@ fn build_state_history_source_sql(
         default_root_commits_sql = default_root_commits_sql,
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
         requested_where_sql = requested_where_sql,
+        reachable_commits_cte_sql = reachable_commits_cte_sql,
     )
 }
 
 fn build_filesystem_history_source_sql(
+    dialect: SqlDialect,
     pushdown_predicates: &[String],
     force_active_scope: bool,
 ) -> String {
@@ -1544,6 +1555,7 @@ fn build_filesystem_history_source_sql(
         String::new()
     };
     build_filesystem_state_history_source_sql(
+        dialect,
         &requested_roots_where,
         &requested_versions_where,
         &default_root_scope,
@@ -1852,7 +1864,7 @@ fn build_change_source_query() -> Result<Query, LixError> {
 
 fn build_working_changes_source_query() -> Result<Query, LixError> {
     parse_single_query(
-        "WITH \
+        "WITH RECURSIVE \
             active_version AS ( \
                 SELECT lix_json_extract(snapshot_content, 'version_id') AS version_id \
                 FROM lix_internal_live_untracked_v1 \
@@ -1965,23 +1977,57 @@ fn build_working_changes_source_query() -> Result<Query, LixError> {
                   AND is_tombstone = 0 \
                   AND snapshot_content IS NOT NULL \
             ), \
-            tip_ancestry AS ( \
+            tip_ancestry_walk AS ( \
                 SELECT \
                     scope.scope AS scope, \
-                    anc.ancestor_id AS commit_id, \
-                    anc.depth AS depth \
+                    scope.head_commit_id AS commit_id, \
+                    0 AS depth \
                 FROM scope_baselines scope \
-                JOIN lix_internal_commit_ancestry anc \
-                    ON anc.commit_id = scope.head_commit_id \
+                UNION ALL \
+                SELECT \
+                    walk.scope AS scope, \
+                    lix_json_extract(edge.snapshot_content, 'parent_id') AS commit_id, \
+                    walk.depth + 1 AS depth \
+                FROM tip_ancestry_walk walk \
+                JOIN lix_internal_live_v1_lix_commit_edge edge \
+                    ON lix_json_extract(edge.snapshot_content, 'child_id') = walk.commit_id \
+                WHERE edge.schema_key = 'lix_commit_edge' \
+                  AND edge.version_id = 'global' \
+                  AND edge.is_tombstone = 0 \
+                  AND edge.snapshot_content IS NOT NULL \
+                  AND lix_json_extract(edge.snapshot_content, 'parent_id') IS NOT NULL \
+                  AND walk.depth < 512 \
+            ), \
+            tip_ancestry AS ( \
+                SELECT scope, commit_id, MIN(depth) AS depth \
+                FROM tip_ancestry_walk \
+                GROUP BY scope, commit_id \
+            ), \
+            baseline_ancestry_walk AS ( \
+                SELECT \
+                    scope.scope AS scope, \
+                    scope.baseline_commit_id AS commit_id, \
+                    0 AS depth \
+                FROM scope_baselines scope \
+                UNION ALL \
+                SELECT \
+                    walk.scope AS scope, \
+                    lix_json_extract(edge.snapshot_content, 'parent_id') AS commit_id, \
+                    walk.depth + 1 AS depth \
+                FROM baseline_ancestry_walk walk \
+                JOIN lix_internal_live_v1_lix_commit_edge edge \
+                    ON lix_json_extract(edge.snapshot_content, 'child_id') = walk.commit_id \
+                WHERE edge.schema_key = 'lix_commit_edge' \
+                  AND edge.version_id = 'global' \
+                  AND edge.is_tombstone = 0 \
+                  AND edge.snapshot_content IS NOT NULL \
+                  AND lix_json_extract(edge.snapshot_content, 'parent_id') IS NOT NULL \
+                  AND walk.depth < 512 \
             ), \
             baseline_ancestry AS ( \
-                SELECT \
-                    scope.scope AS scope, \
-                    anc.ancestor_id AS commit_id, \
-                    anc.depth AS depth \
-                FROM scope_baselines scope \
-                JOIN lix_internal_commit_ancestry anc \
-                    ON anc.commit_id = scope.baseline_commit_id \
+                SELECT scope, commit_id, MIN(depth) AS depth \
+                FROM baseline_ancestry_walk \
+                GROUP BY scope, commit_id \
             ), \
             tip_candidates AS ( \
                 SELECT \
@@ -2584,6 +2630,7 @@ mod tests {
         let dependency_spec = derive_dependency_spec_from_structured_public_read(&structured_read);
         let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
         lower_read_for_execution(
+            SqlDialect::Sqlite,
             &structured_read,
             effective_state.as_ref().map(|(request, _)| request),
             effective_state.as_ref().map(|(_, plan)| plan),
@@ -2797,7 +2844,7 @@ mod tests {
             "lowered sql still contains public lix_file: {lowered_sql}"
         );
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_file_descriptor"));
-        assert!(lowered_sql.contains("FROM (WITH active_version AS"));
+        assert!(lowered_sql.contains("FROM (WITH RECURSIVE"));
     }
 
     #[test]

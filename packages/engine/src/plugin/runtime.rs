@@ -11,6 +11,7 @@ use crate::sql::ast::lowering::lower_statement;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::preprocess::preprocess_sql_to_plan as preprocess_sql;
 use crate::sql::public::runtime::lower_public_read_query_with_backend;
+use crate::state::commit::build_exact_commit_depth_cte_sql;
 use crate::state::materialization::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
@@ -508,7 +509,8 @@ async fn load_file_paths_for_descriptors(
 async fn load_missing_file_history_descriptors(
     backend: &dyn LixBackend,
 ) -> Result<BTreeMap<(String, String, i64), FileHistoryDescriptorRow>, LixError> {
-    let history_source_sql = build_filesystem_state_history_source_sql("", "", "", false);
+    let history_source_sql =
+        build_filesystem_state_history_source_sql(backend.dialect(), "", "", "", false);
     let history_projection_sql = build_filesystem_file_history_projection_sql(&history_source_sql);
     let sql = format!(
         "SELECT \
@@ -579,23 +581,20 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
         Value::Text(commit_id.to_string()),
         Value::Integer(depth),
     ];
-    let sql = "WITH target_commit_depth AS (\
-            SELECT COALESCE((\
-              SELECT depth \
-              FROM lix_internal_commit_ancestry \
-              WHERE commit_id = $3 \
-                AND ancestor_id = $4 \
-              LIMIT 1\
-            ), $5) AS raw_depth\
-         ) \
+    let sql = format!(
+        "WITH {target_commit_depth_cte} \
          SELECT entity_id, schema_key, schema_version, snapshot_content, depth \
          FROM lix_state_history \
          WHERE file_id = $1 \
            AND plugin_key = $2 \
            AND root_commit_id = $3 \
            AND depth >= (SELECT raw_depth FROM target_commit_depth) \
-         ORDER BY entity_id ASC, depth ASC";
-    let rows = execute_read_query_with_public_lowering(backend, sql, &params).await?;
+         ORDER BY entity_id ASC, depth ASC",
+        target_commit_depth_cte =
+            build_exact_commit_depth_cte_sql(backend.dialect(), "$3", "$4", "$5")
+                .trim_end_matches(", "),
+    );
+    let rows = execute_read_query_with_public_lowering(backend, &sql, &params).await?;
 
     let mut changes = Vec::new();
     let mut previous_entity_id: Option<String> = None;
