@@ -1,3 +1,7 @@
+---
+description: Run Lix in deterministic mode for repeatable tests, debugging sessions, and simulations with stable time and randomness.
+---
+
 # Deterministic Mode
 
 > **Who is this for?** If you're testing, debugging, or simulating distributed systems with Lix and need predictable, reproducible behavior across runs, deterministic mode is for you.

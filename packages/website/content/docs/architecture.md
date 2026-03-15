@@ -1,3 +1,7 @@
+---
+description: How Lix models state with changes, change sets, commits, versions, and commit-graph materialization.
+---
+
 # Architecture
 
 This document explains Lix's technical design, state materialisation algorithm, and data model constraints. For a practical operational guide, see [What Is Lix](/docs/what-is-lix).

@@ -11,6 +11,7 @@ import {
   buildCanonicalUrl,
   buildWebPageJsonLd,
   resolveOgImage,
+  splitTitleFromHtml,
 } from "../../lib/seo";
 
 const blogMarkdownFiles = import.meta.glob<string>(
@@ -116,10 +117,12 @@ async function loadBlogPost(slug: string) {
   const parsed = await parse(rawMarkdown, {
     assetBaseUrl: `/blog/${folderName}/`,
   });
-  const title = getBlogTitle({
-    rawMarkdown,
-    frontmatter: parsed.frontmatter,
-  });
+  const rendered = splitTitleFromHtml(parsed.html);
+  const title =
+    getBlogTitle({
+      rawMarkdown,
+      frontmatter: parsed.frontmatter,
+    }) ?? rendered.title;
   const description = getBlogDescription({
     rawMarkdown,
     frontmatter: parsed.frontmatter,
@@ -155,10 +158,161 @@ async function loadBlogPost(slug: string) {
       ogImageAlt,
       imports,
     },
-    html: parsed.html,
+    html: rendered.body,
     rawMarkdown,
     prevPost,
     nextPost,
+  };
+}
+
+type BlogPostLoaderData = Awaited<ReturnType<typeof loadBlogPost>>;
+
+export function buildBlogPostHead(loaderData?: BlogPostLoaderData) {
+  const title = loaderData?.post.title;
+  const description = loaderData?.post.description;
+  const slug = loaderData?.post.slug;
+  const defaultOg = resolveOgImage();
+  const ogImageUrl = loaderData?.post.ogImage ?? defaultOg.url;
+  const ogImageAlt =
+    loaderData?.post.ogImageAlt ?? (title ? `${title} cover` : "Lix blog post");
+  const canonicalUrl = slug
+    ? buildCanonicalUrl(`/blog/${slug}`)
+    : buildCanonicalUrl("/blog");
+  const meta: Array<
+    | { title: string }
+    | { name: string; content: string }
+    | { property: string; content: string }
+  > = [
+    { title: title ? `${title} | Lix Blog` : "Lix Blog" },
+    { property: "og:url", content: canonicalUrl },
+    { property: "og:type", content: "article" },
+    { property: "og:site_name", content: "Lix" },
+    { property: "og:locale", content: "en_US" },
+    { property: "og:image", content: ogImageUrl },
+    { property: "og:image:width", content: String(ogImageWidth) },
+    { property: "og:image:height", content: String(ogImageHeight) },
+    { property: "og:image:alt", content: ogImageAlt },
+    { name: "twitter:card", content: "summary_large_image" },
+    { name: "twitter:image", content: ogImageUrl },
+    { name: "twitter:image:alt", content: ogImageAlt },
+  ];
+
+  if (description) {
+    meta.push(
+      { name: "description", content: description },
+      { property: "og:description", content: description },
+      { name: "twitter:description", content: description },
+    );
+  }
+
+  if (title) {
+    const pageTitle = `${title} | Lix Blog`;
+    meta.push(
+      { property: "og:title", content: pageTitle },
+      { name: "twitter:title", content: pageTitle },
+    );
+  }
+
+  if (loaderData?.post.date) {
+    meta.push({
+      property: "article:published_time",
+      content: loaderData.post.date,
+    });
+  }
+
+  if (loaderData?.post.authors) {
+    loaderData.post.authors.forEach((author) => {
+      meta.push({
+        property: "article:author",
+        content: author.name,
+      });
+    });
+  }
+
+  const links = [
+    { rel: "stylesheet", href: markdownPageCss },
+    { rel: "canonical", href: canonicalUrl },
+  ];
+  if (loaderData?.prevPost?.slug) {
+    links.push({
+      rel: "prev",
+      href: buildCanonicalUrl(`/blog/${loaderData.prevPost.slug}`),
+    });
+  }
+  if (loaderData?.nextPost?.slug) {
+    links.push({
+      rel: "next",
+      href: buildCanonicalUrl(`/blog/${loaderData.nextPost.slug}`),
+    });
+  }
+
+  const pageTitle = title ? `${title} | Lix Blog` : "Lix Blog";
+  const jsonLd = buildWebPageJsonLd({
+    title: pageTitle,
+    description,
+    canonicalUrl,
+    image: ogImageUrl,
+  });
+
+  return {
+    meta,
+    links,
+    scripts: slug
+      ? [
+          {
+            type: "application/ld+json",
+            children: JSON.stringify({
+              "@context": "https://schema.org",
+              "@type": "BlogPosting",
+              headline: title ?? slug,
+              description,
+              url: canonicalUrl,
+              image: ogImageUrl,
+              ...(loaderData?.post.date
+                ? { datePublished: loaderData.post.date }
+                : {}),
+              ...(loaderData?.post.authors
+                ? {
+                    author: loaderData.post.authors.map((author) => ({
+                      "@type": "Person",
+                      name: author.name,
+                      ...(author.avatar ? { image: author.avatar } : {}),
+                      ...(author.twitter || author.github
+                        ? {
+                            sameAs: [author.twitter, author.github].filter(
+                              (value): value is string => Boolean(value),
+                            ),
+                          }
+                        : {}),
+                    })),
+                  }
+                : {}),
+            }),
+          },
+          {
+            type: "application/ld+json",
+            children: JSON.stringify(jsonLd),
+          },
+          ...(loaderData?.post.authors
+            ? loaderData.post.authors.map((author) => ({
+                type: "application/ld+json",
+                children: JSON.stringify({
+                  "@context": "https://schema.org",
+                  "@type": "Person",
+                  name: author.name,
+                  ...(author.avatar ? { image: author.avatar } : {}),
+                  ...(author.twitter || author.github
+                    ? {
+                        sameAs: [author.twitter, author.github].filter(
+                          (value): value is string => Boolean(value),
+                        ),
+                      }
+                    : {}),
+                }),
+              }))
+            : []),
+        ]
+      : [],
   };
 }
 
@@ -170,154 +324,7 @@ export const Route = createFileRoute("/blog/$slug")({
       throw redirect({ to: "/blog" });
     }
   },
-  head: ({ loaderData }) => {
-    const title = loaderData?.post.title;
-    const description = loaderData?.post.description;
-    const slug = loaderData?.post.slug;
-    const defaultOg = resolveOgImage();
-    const ogImageUrl = loaderData?.post.ogImage ?? defaultOg.url;
-    const ogImageAlt =
-      loaderData?.post.ogImageAlt ??
-      (title ? `${title} cover` : "Lix blog post");
-    const canonicalUrl = slug
-      ? buildCanonicalUrl(`/blog/${slug}`)
-      : buildCanonicalUrl("/blog");
-    const meta: Array<
-      | { title: string }
-      | { name: string; content: string }
-      | { property: string; content: string }
-    > = [
-      { title: title ? `${title} | Lix Blog` : "Blog | Lix" },
-      { property: "og:url", content: canonicalUrl },
-      { property: "og:type", content: "article" },
-      { property: "og:site_name", content: "Lix" },
-      { property: "og:locale", content: "en_US" },
-      { property: "og:image", content: ogImageUrl },
-      { property: "og:image:width", content: String(ogImageWidth) },
-      { property: "og:image:height", content: String(ogImageHeight) },
-      { property: "og:image:alt", content: ogImageAlt },
-      { name: "twitter:card", content: "summary_large_image" },
-      { name: "twitter:image", content: ogImageUrl },
-      { name: "twitter:image:alt", content: ogImageAlt },
-    ];
-
-    if (description) {
-      meta.push(
-        { name: "description", content: description },
-        { property: "og:description", content: description },
-        { name: "twitter:description", content: description }
-      );
-    }
-
-    if (title) {
-      meta.push(
-        { property: "og:title", content: `${title} | Lix Blog` },
-        { name: "twitter:title", content: `${title} | Lix Blog` }
-      );
-    }
-
-    if (loaderData?.post.date) {
-      meta.push({
-        property: "article:published_time",
-        content: loaderData.post.date,
-      });
-    }
-
-    if (loaderData?.post.authors) {
-      loaderData.post.authors.forEach((author) => {
-        meta.push({
-          property: "article:author",
-          content: author.name,
-        });
-      });
-    }
-
-    const links = [
-      { rel: "stylesheet", href: markdownPageCss },
-      { rel: "canonical", href: canonicalUrl },
-    ];
-    if (loaderData?.prevPost?.slug) {
-      links.push({
-        rel: "prev",
-        href: buildCanonicalUrl(`/blog/${loaderData.prevPost.slug}`),
-      });
-    }
-    if (loaderData?.nextPost?.slug) {
-      links.push({
-        rel: "next",
-        href: buildCanonicalUrl(`/blog/${loaderData.nextPost.slug}`),
-      });
-    }
-
-    const pageTitle = title ? `${title} | Lix Blog` : "Blog | Lix";
-    const jsonLd = buildWebPageJsonLd({
-      title: pageTitle,
-      description,
-      canonicalUrl,
-      image: ogImageUrl,
-    });
-
-    return {
-      meta,
-      links,
-      scripts: slug
-        ? [
-            {
-              type: "application/ld+json",
-              children: JSON.stringify({
-                "@context": "https://schema.org",
-                "@type": "BlogPosting",
-                headline: title ?? slug,
-                description,
-                url: canonicalUrl,
-                image: ogImageUrl,
-                ...(loaderData?.post.date
-                  ? { datePublished: loaderData.post.date }
-                  : {}),
-                ...(loaderData?.post.authors
-                  ? {
-                      author: loaderData.post.authors.map((author) => ({
-                        "@type": "Person",
-                        name: author.name,
-                        ...(author.avatar ? { image: author.avatar } : {}),
-                        ...(author.twitter || author.github
-                          ? {
-                              sameAs: [author.twitter, author.github].filter(
-                                (value): value is string => Boolean(value)
-                              ),
-                            }
-                          : {}),
-                      })),
-                    }
-                  : {}),
-              }),
-            },
-            {
-              type: "application/ld+json",
-              children: JSON.stringify(jsonLd),
-            },
-            ...(loaderData?.post.authors
-              ? loaderData.post.authors.map((author) => ({
-                  type: "application/ld+json",
-                  children: JSON.stringify({
-                    "@context": "https://schema.org",
-                    "@type": "Person",
-                    name: author.name,
-                    ...(author.avatar ? { image: author.avatar } : {}),
-                    ...(author.twitter || author.github
-                      ? {
-                          sameAs: [author.twitter, author.github].filter(
-                            (value): value is string => Boolean(value)
-                          ),
-                        }
-                      : {}),
-                  }),
-                }))
-              : []),
-          ]
-        : [],
-    };
-  },
+  head: ({ loaderData }) => buildBlogPostHead(loaderData),
   component: BlogPostPage,
 });
 
@@ -481,7 +488,7 @@ function BlogPostPage() {
 
         <div className="mx-auto max-w-4xl px-6 py-12">
           <article
-            className="markdown-wc-body [&>h1:first-child]:hidden"
+            className="markdown-wc-body"
             dangerouslySetInnerHTML={{ __html: html }}
           />
 

@@ -139,7 +139,7 @@ When building experiences like rich text editors, dashboards, or collaborative v
 
 See the guide for the pattern, pitfalls, and a decision matrix:
 
-- https://lix.dev/guide/writer-key
+- https://lix.dev/docs/writer-key
 
 ## Provider and context
 
