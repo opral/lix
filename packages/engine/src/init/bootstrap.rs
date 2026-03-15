@@ -20,7 +20,7 @@ impl Engine {
             self.ensure_builtin_schemas_installed().await?;
             let default_active_version_id = self.seed_default_versions().await?;
             self.seed_global_system_directories().await?;
-            self.seed_commit_ancestry().await?;
+            self.seed_commit_graph_nodes().await?;
             self.seed_default_active_version(&default_active_version_id)
                 .await?;
             self.seed_default_checkpoint_label().await?;

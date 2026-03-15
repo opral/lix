@@ -954,6 +954,7 @@ async fn lower_public_read_query_with_details(
         );
         let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
         let lowered = lower_read_for_execution(
+            backend.dialect(),
             &structured_read,
             effective_state.as_ref().map(|(request, _)| request),
             effective_state.as_ref().map(|(_, plan)| plan),
@@ -1050,6 +1051,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
     }
     let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
     let lowered_read = match lower_read_for_execution(
+        backend.dialect(),
         &structured_read,
         effective_state.as_ref().map(|(request, _)| request),
         effective_state.as_ref().map(|(_, plan)| plan),

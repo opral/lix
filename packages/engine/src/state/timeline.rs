@@ -1,4 +1,5 @@
 use crate::backend::SqlDialect;
+use crate::state::commit::build_reachable_commits_for_root_cte_sql;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, QueryResult, Value};
 
@@ -77,8 +78,10 @@ fn build_phase1_source_query_sql(
     let cse_entity_id_sql = json_text_expr_sql(dialect, "snapshot_content", "entity_id");
     let cse_schema_key_sql = json_text_expr_sql(dialect, "snapshot_content", "schema_key");
     let cse_file_id_sql = json_text_expr_sql(dialect, "snapshot_content", "file_id");
+    let reachable_commits_cte_sql =
+        build_reachable_commits_for_root_cte_sql(dialect, root_commit_id, start_depth, end_depth);
     format!(
-        "WITH \
+        "WITH RECURSIVE \
            commit_by_version AS ( \
              SELECT \
                entity_id AS id, \
@@ -114,14 +117,7 @@ fn build_phase1_source_query_sql(
                ic.created_at \
              FROM lix_internal_change ic \
            ), \
-           reachable_commits AS ( \
-             SELECT \
-               ancestry.ancestor_id AS commit_id, \
-               ancestry.depth AS commit_depth \
-             FROM lix_internal_commit_ancestry ancestry \
-             WHERE ancestry.commit_id = '{root_commit_id}' \
-               AND ancestry.depth BETWEEN {start_depth} AND {end_depth} \
-           ), \
+           {reachable_commits_cte_sql}\
            commit_changesets AS ( \
              SELECT \
                c.id AS commit_id, \
@@ -185,9 +181,7 @@ fn build_phase1_source_query_sql(
         cse_entity_id_sql = cse_entity_id_sql,
         cse_schema_key_sql = cse_schema_key_sql,
         cse_file_id_sql = cse_file_id_sql,
-        root_commit_id = escape_sql_string(root_commit_id),
-        start_depth = start_depth,
-        end_depth = end_depth,
+        reachable_commits_cte_sql = reachable_commits_cte_sql,
     )
 }
 

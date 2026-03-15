@@ -1,11 +1,12 @@
 use crate::filesystem::path::ParsedFilePath;
 use crate::sql::public::planner::semantics::filesystem_queries::lookup_file_id_by_path;
 use crate::sql::storage::sql_text::escape_sql_string;
+use crate::state::commit::build_reachable_commits_from_requested_cte_sql;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     version_descriptor_schema_key, GLOBAL_VERSION_ID,
 };
-use crate::{LixBackend, LixError};
+use crate::{LixBackend, LixError, SqlDialect};
 
 pub(crate) const LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN: &str = "__lix_blob_hash";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -1025,6 +1026,7 @@ fn active_version_commit_id_sql() -> String {
 }
 
 pub(crate) fn build_filesystem_state_history_source_sql(
+    dialect: SqlDialect,
     requested_roots_where: &str,
     requested_versions_where: &str,
     default_root_scope: &str,
@@ -1101,8 +1103,10 @@ pub(crate) fn build_filesystem_state_history_source_sql(
             global_version = escape_sql_string(GLOBAL_VERSION_ID),
         )
     };
+    let reachable_commits_cte_sql =
+        build_reachable_commits_from_requested_cte_sql(dialect, "requested_commits", 512);
     format!(
-        "WITH \
+        "WITH RECURSIVE \
            {active_version_rows_sql}\
            {default_root_commits_sql}\
            requested_commits AS ( \
@@ -1118,17 +1122,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
                AND c.snapshot_content IS NOT NULL{requested_roots_where}{requested_versions_where} \
                {default_root_scope} \
            ), \
-           reachable_commits_from_requested AS ( \
-             SELECT \
-               ancestry.ancestor_id AS commit_id, \
-               requested.commit_id AS root_commit_id, \
-               requested.root_version_id AS root_version_id, \
-               ancestry.depth AS commit_depth \
-             FROM requested_commits requested \
-             JOIN lix_internal_commit_ancestry ancestry \
-               ON ancestry.commit_id = requested.commit_id \
-             WHERE ancestry.depth <= 512 \
-           ), \
+           {reachable_commits_cte_sql}\
            commit_changesets AS ( \
              SELECT \
                c.entity_id AS commit_id, \
@@ -1138,7 +1132,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
                rc.root_version_id AS root_version_id, \
                rc.commit_depth AS commit_depth \
              FROM lix_internal_live_v1_lix_commit c \
-             JOIN reachable_commits_from_requested rc \
+             JOIN reachable_commits rc \
                ON rc.commit_id = c.entity_id \
              WHERE c.schema_key = 'lix_commit' \
                AND c.version_id = '{global_version}' \
@@ -1216,6 +1210,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
            AND ranked.snapshot_content IS NOT NULL",
         active_version_rows_sql = active_version_rows_sql,
         default_root_commits_sql = default_root_commits_sql,
+        reachable_commits_cte_sql = reachable_commits_cte_sql,
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
         requested_roots_where = requested_roots_where,
         requested_versions_where = requested_versions_where,

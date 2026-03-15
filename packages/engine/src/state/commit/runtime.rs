@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
-use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     ConflictTarget, DoUpdate, Expr, Ident, ObjectName, ObjectNamePart, OnConflict,
@@ -22,9 +21,9 @@ use crate::sql::ast::utils::{
 };
 use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
 use crate::sql::storage::sql_text::escape_sql_string;
-use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, SqlDialect, Value as EngineValue};
 
+use super::graph_index::append_commit_graph_node_statements;
 use super::state_source::CommitQueryExecutor;
 use super::types::{DomainChangeInput, GenerateCommitResult, MaterializedStateRow};
 
@@ -33,9 +32,6 @@ const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
 const CHANGE_TABLE: &str = "lix_internal_change";
 const LIVE_STATE_PREFIX: &str = "lix_internal_live_v1_";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
-const COMMIT_SCHEMA_KEY: &str = "lix_commit";
-const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
-const COMMIT_ANCESTRY_TABLE: &str = "lix_internal_commit_ancestry";
 const GLOBAL_VERSION: &str = "global";
 const SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 32_766;
 const POSTGRES_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 65_535;
@@ -366,7 +362,7 @@ pub(crate) fn build_statement_batch_from_generate_commit_result(
         );
     }
 
-    append_commit_ancestry_statements(
+    append_commit_graph_node_statements(
         &mut statements,
         &mut statement_params,
         &mut next_placeholder,
@@ -425,112 +421,7 @@ fn push_chunked_insert_statements(
     }
 }
 
-fn append_commit_ancestry_statements(
-    statements: &mut Vec<Statement>,
-    params: &mut Vec<EngineValue>,
-    next_placeholder: &mut usize,
-    live_state_rows: &[MaterializedStateRow],
-) -> Result<(), LixError> {
-    let commit_parents = collect_commit_parent_map_for_ancestry(live_state_rows)?;
-    for (commit_id, parent_ids) in commit_parents {
-        let commit_placeholder = *next_placeholder;
-        *next_placeholder += 1;
-        params.push(EngineValue::Text(commit_id));
-
-        let self_insert_sql = format!(
-            "INSERT INTO {table} (commit_id, ancestor_id, depth) \
-             VALUES (?{commit_placeholder}, ?{commit_placeholder}, 0) \
-             ON CONFLICT (commit_id, ancestor_id) DO NOTHING",
-            table = COMMIT_ANCESTRY_TABLE,
-            commit_placeholder = commit_placeholder,
-        );
-        statements.push(parse_single_statement_from_sql(&self_insert_sql)?);
-
-        for parent_id in parent_ids {
-            let parent_placeholder = *next_placeholder;
-            *next_placeholder += 1;
-            params.push(EngineValue::Text(parent_id));
-
-            let insert_parent_ancestry_sql = format!(
-                "INSERT INTO {table} (commit_id, ancestor_id, depth) \
-                 SELECT ?{commit_placeholder} AS commit_id, candidate.ancestor_id, MIN(candidate.depth) AS depth \
-                 FROM ( \
-                   SELECT ?{parent_placeholder} AS ancestor_id, 1 AS depth \
-                   UNION ALL \
-                   SELECT ancestor_id, depth + 1 AS depth \
-                   FROM {table} \
-                   WHERE commit_id = ?{parent_placeholder} \
-                 ) AS candidate \
-                 GROUP BY candidate.ancestor_id \
-                 ON CONFLICT (commit_id, ancestor_id) DO UPDATE \
-                 SET depth = CASE \
-                   WHEN excluded.depth < {table}.depth THEN excluded.depth \
-                   ELSE {table}.depth \
-                 END",
-                table = COMMIT_ANCESTRY_TABLE,
-                commit_placeholder = commit_placeholder,
-                parent_placeholder = parent_placeholder,
-            );
-            statements.push(parse_single_statement_from_sql(
-                &insert_parent_ancestry_sql,
-            )?);
-        }
-    }
-    Ok(())
-}
-
-fn collect_commit_parent_map_for_ancestry(
-    live_state_rows: &[MaterializedStateRow],
-) -> Result<BTreeMap<String, BTreeSet<String>>, LixError> {
-    let mut out = BTreeMap::<String, BTreeSet<String>>::new();
-    for row in live_state_rows {
-        if row.schema_key == COMMIT_SCHEMA_KEY && row.lixcol_version_id == GLOBAL_VERSION_ID {
-            out.entry(row.entity_id.clone()).or_default();
-        }
-    }
-
-    for row in live_state_rows {
-        if row.schema_key != COMMIT_EDGE_SCHEMA_KEY || row.lixcol_version_id != GLOBAL_VERSION_ID {
-            continue;
-        }
-        let Some(raw) = row.snapshot_content.as_deref() else {
-            continue;
-        };
-        let Some((parent_id, child_id)) = parse_commit_edge_snapshot_for_ancestry(raw)? else {
-            continue;
-        };
-        if let Some(parents) = out.get_mut(&child_id) {
-            parents.insert(parent_id);
-        }
-    }
-
-    Ok(out)
-}
-
-fn parse_commit_edge_snapshot_for_ancestry(
-    raw: &str,
-) -> Result<Option<(String, String)>, LixError> {
-    let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("commit_edge snapshot invalid JSON: {error}"),
-    })?;
-    let parent_id = parsed
-        .get("parent_id")
-        .and_then(JsonValue::as_str)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    let child_id = parsed
-        .get("child_id")
-        .and_then(JsonValue::as_str)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    match (parent_id, child_id) {
-        (Some(parent_id), Some(child_id)) => Ok(Some((parent_id, child_id))),
-        _ => Ok(None),
-    }
-}
-
-fn parse_single_statement_from_sql(sql: &str) -> Result<Statement, LixError> {
+pub(crate) fn parse_single_statement_from_sql(sql: &str) -> Result<Statement, LixError> {
     let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: error.to_string(),

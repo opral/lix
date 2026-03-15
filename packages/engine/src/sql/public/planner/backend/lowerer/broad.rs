@@ -1196,7 +1196,7 @@ fn build_public_state_surface_query(
         predicate_classes: Vec::new(),
         required_columns: surface_binding.exposed_columns.clone(),
     };
-    build_state_source_query(surface_binding, &request, &[])
+    build_state_source_query(SqlDialect::Sqlite, surface_binding, &request, &[])
 }
 
 fn build_public_admin_surface_query(
@@ -1248,11 +1248,13 @@ fn build_builtin_entity_surface_query(surface_binding: &SurfaceBinding) -> Resul
         predicate_classes: Vec::new(),
         required_columns: surface_binding.exposed_columns.clone(),
     };
-    build_entity_source_query(surface_binding, &request, &[])?.ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "public-surface lowering could not lower entity surface '{}'",
-            surface_binding.descriptor.public_name
-        ),
-    })
+    build_entity_source_query(SqlDialect::Sqlite, surface_binding, &request, &[])?.ok_or_else(
+        || LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "public-surface lowering could not lower entity surface '{}'",
+                surface_binding.descriptor.public_name
+            ),
+        },
+    )
 }
