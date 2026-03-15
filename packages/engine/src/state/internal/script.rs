@@ -183,6 +183,11 @@ fn can_merge_coalescable_insert(left: &Insert, right: &Insert) -> bool {
     if left.into != right.into || left.has_table_keyword != right.has_table_keyword {
         return false;
     }
+    if insert_has_transaction_sensitive_public_filesystem_columns(left)
+        || insert_has_transaction_sensitive_public_filesystem_columns(right)
+    {
+        return false;
+    }
 
     plain_values_rows(left).is_some() && plain_values_rows(right).is_some()
 }
@@ -205,9 +210,26 @@ fn append_insert_rows(target: &mut Insert, incoming: &Insert) -> Result<(), LixE
 
 fn insert_targets_coalescable_table(insert: &Insert) -> bool {
     match &insert.table {
-        TableObject::TableName(name) => object_name_matches(name, "lix_internal_state_vtable"),
+        TableObject::TableName(name) => {
+            object_name_matches(name, "lix_internal_state_vtable")
+                || object_name_matches(name, "lix_file")
+        }
         _ => false,
     }
+}
+
+fn insert_has_transaction_sensitive_public_filesystem_columns(insert: &Insert) -> bool {
+    if !matches!(&insert.table, TableObject::TableName(name) if object_name_matches(name, "lix_file"))
+    {
+        return false;
+    }
+
+    insert.columns.iter().any(|column| {
+        matches!(
+            column.value.to_ascii_lowercase().as_str(),
+            "untracked" | "version_id" | "global"
+        )
+    })
 }
 
 fn insert_targets_registered_schema(insert: &Insert) -> bool {

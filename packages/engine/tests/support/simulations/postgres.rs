@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use postgresql_embedded::PostgreSQL;
+use sqlx::postgres::PgPoolOptions;
 use sqlx::{Column, Executor, PgPool, Row, ValueRef};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
@@ -190,7 +191,13 @@ impl PostgresBackend {
     async fn pool(&self) -> Result<&PgPool, LixError> {
         self.pool
             .get_or_try_init(|| async {
-                PgPool::connect(&self.config.connection_string)
+                PgPoolOptions::new()
+                    // Simulation tests are mostly single-threaded per engine. Keeping pools
+                    // small prevents one highly parallel test binary from exhausting the shared
+                    // embedded Postgres instance and stalling later tests at init time.
+                    .max_connections(2)
+                    .acquire_timeout(Duration::from_secs(60))
+                    .connect(&self.config.connection_string)
                     .await
                     .map_err(|err| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
