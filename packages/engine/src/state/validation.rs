@@ -319,6 +319,8 @@ async fn validate_sql2_write(
         })?;
     let mut schema_provider = OverlaySchemaProvider::from_backend(backend);
     remember_pending_sql2_registered_schemas(&mut schema_provider, resolved).await?;
+    let planned_binary_blob_hashes =
+        collect_planned_binary_blob_hashes(resolved, require_binary_blob_ref_cas)?;
     let shadows_committed_identity = planned_write.command.operation_kind
         == WriteOperationKind::Update
         || planned_write
@@ -346,6 +348,7 @@ async fn validate_sql2_write(
             planned_write.command.operation_kind,
             row,
             require_binary_blob_ref_cas,
+            Some(&planned_binary_blob_hashes),
         )
         .await?;
     }
@@ -608,6 +611,7 @@ async fn validate_sql2_planned_row(
     operation_kind: WriteOperationKind,
     row: &PlannedStateRow,
     require_binary_blob_ref_cas: bool,
+    planned_binary_blob_hashes: Option<&HashSet<String>>,
 ) -> Result<(), LixError> {
     if row.tombstone {
         return Ok(());
@@ -688,6 +692,7 @@ async fn validate_sql2_planned_row(
         &row.schema_key,
         &snapshot,
         require_binary_blob_ref_cas,
+        planned_binary_blob_hashes,
     )
     .await?;
 
@@ -699,7 +704,7 @@ async fn validate_filesystem_insert_integrity(
     row: &MutationRow,
     snapshot: &JsonValue,
 ) -> Result<(), LixError> {
-    validate_filesystem_snapshot_integrity(backend, &row.schema_key, snapshot, true).await
+    validate_filesystem_snapshot_integrity(backend, &row.schema_key, snapshot, true, None).await
 }
 
 async fn binary_cas_blob_exists(
@@ -741,6 +746,7 @@ async fn validate_filesystem_snapshot_integrity(
     schema_key: &str,
     snapshot: &JsonValue,
     require_binary_blob_ref_cas: bool,
+    planned_binary_blob_hashes: Option<&HashSet<String>>,
 ) -> Result<(), LixError> {
     if schema_key != BINARY_BLOB_REF_SCHEMA_KEY {
         return Ok(());
@@ -757,7 +763,12 @@ async fn validate_filesystem_snapshot_integrity(
                     .to_string(),
         })?;
 
-    if require_binary_blob_ref_cas && !binary_cas_blob_exists(backend, blob_hash).await? {
+    let is_planned_blob = planned_binary_blob_hashes
+        .is_some_and(|planned_binary_blob_hashes| planned_binary_blob_hashes.contains(blob_hash));
+    if require_binary_blob_ref_cas
+        && !is_planned_blob
+        && !binary_cas_blob_exists(backend, blob_hash).await?
+    {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
@@ -768,6 +779,30 @@ async fn validate_filesystem_snapshot_integrity(
     }
 
     Ok(())
+}
+
+fn collect_planned_binary_blob_hashes(
+    resolved: &ResolvedWritePlan,
+    require_binary_blob_ref_cas: bool,
+) -> Result<HashSet<String>, LixError> {
+    if !require_binary_blob_ref_cas {
+        return Ok(HashSet::new());
+    }
+
+    let mut hashes = HashSet::new();
+    for payload_write in resolved.filesystem_payload_writes() {
+        hashes.insert(crate::plugin::runtime::binary_blob_hash_hex(
+            &payload_write.data,
+        ));
+    }
+    for partition in &resolved.partitions {
+        if let Some(crate::sql::public::planner::ir::LazyExactFileUpdate::Data(update)) =
+            partition.lazy_exact_file_update.as_ref()
+        {
+            hashes.insert(crate::plugin::runtime::binary_blob_hash_hex(&update.data));
+        }
+    }
+    Ok(hashes)
 }
 
 async fn validate_registered_schema_insert<P: SchemaProvider + ?Sized>(

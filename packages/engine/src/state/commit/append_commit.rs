@@ -7,10 +7,11 @@ use crate::account::{
 use crate::deterministic_mode::build_persist_sequence_highest_sql;
 use crate::functions::LixFunctionProvider;
 use crate::schema::builtin::types::LixVersionPointer;
-use crate::sql::execution::runtime_effects::build_binary_blob_fastcdc_write_program;
+use crate::sql::execution::runtime_effects::{
+    build_binary_blob_fastcdc_write_program, BinaryBlobWriteInput,
+};
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::sql::public::planner::ir::LazyExactFileUpdate;
-use crate::state::internal::write_program::WriteProgram;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, LixTransaction, QueryResult, Value};
 use async_trait::async_trait;
@@ -323,19 +324,21 @@ pub(crate) async fn append_commit_if_preconditions_hold(
         ));
     }
 
-    let mut write_program = WriteProgram::new();
-    for lazy in &args.lazy_exact_file_updates {
-        if let LazyExactFileUpdate::Data(lazy) = lazy {
-            write_program.extend(
-                build_binary_blob_fastcdc_write_program(
-                    &lazy.file_id,
-                    &lazy.version_id,
-                    &lazy.data,
-                )
-                .map_err(backend_error)?,
-            );
-        }
-    }
+    let payloads = args
+        .lazy_exact_file_updates
+        .iter()
+        .filter_map(|lazy| match lazy {
+            LazyExactFileUpdate::Data(lazy) => Some(BinaryBlobWriteInput {
+                file_id: &lazy.file_id,
+                version_id: &lazy.version_id,
+                data: &lazy.data,
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut write_program =
+        build_binary_blob_fastcdc_write_program(transaction.dialect(), &payloads)
+            .map_err(backend_error)?;
     write_program.push_batch(prepared_batch);
     execute_write_program_with_transaction(transaction, write_program)
         .await
