@@ -15,7 +15,7 @@ The problem is modeling a company as filesystem doesn't work today because most 
 
 But, what if a system exists that turns binary files into structured data agents can read and write to?
 
-![Twitter discussion between Eli Mernit and Anvisha](./twitter-discussion-cards.png)
+![Twitter discussion between Eli Mernit and Anvisha](./twitter-discussion-cards.webp)
 
 ## The case for the filesystem
 

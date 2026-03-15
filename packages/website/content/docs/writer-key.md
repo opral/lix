@@ -1,3 +1,7 @@
+---
+description: Use writer keys to tag mutations, suppress local echo, and detect external updates across editors, tabs, services, and agents.
+---
+
 # Writer Key
 
 A writer key is a lightweight identity attached to state mutations. It lets UIs and services distinguish “my own writes” from external changes to the same entities, enabling echo‑suppression and correct refresh behavior without polling.

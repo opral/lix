@@ -1,3 +1,7 @@
+---
+description: Trace who changed each entity or file in Lix with attribution queries built for audit trails, blame views, and review tools.
+---
+
 # Attribution (Blame)
 
 Attribution enables seeing who made changes and when, providing transparency and accountability in collaborative environments. Lix surfaces attribution for every modification.

@@ -1,6 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { parse } from "@opral/markdown-wc";
 import { getBlogDescription, getBlogTitle } from "../../blog/blogMetadata";
+import { resolveOgImageUrl } from "../../blog/og-image";
 import { Footer } from "../../components/footer";
 import { Header } from "../../components/header";
 import { buildCanonicalUrl, resolveOgImage } from "../../lib/seo";
@@ -64,8 +65,16 @@ async function loadBlogIndex() {
           ? parsed.frontmatter["og:image"]
           : undefined;
       const ogImage = ogImageRaw
-        ? resolveLocalBlogAsset(ogImageRaw, folderName)
+        ? resolveOgImageUrl(ogImageRaw, folderName)
         : undefined;
+      const ogImageAlt =
+        (typeof parsed.frontmatter?.["og:image:alt"] === "string"
+          ? parsed.frontmatter["og:image:alt"]
+          : undefined) ??
+        (typeof parsed.frontmatter?.["twitter:image:alt"] === "string"
+          ? parsed.frontmatter["twitter:image:alt"]
+          : undefined) ??
+        (title ? `${title} cover image` : undefined);
 
       // Get date from frontmatter
       const date = parsed.frontmatter?.date as string | undefined;
@@ -77,6 +86,7 @@ async function loadBlogIndex() {
         date,
         authors,
         ogImage,
+        ogImageAlt,
       };
     })
   );
@@ -98,8 +108,10 @@ export const Route = createFileRoute("/blog/")({
   head: () => {
     const canonicalUrl = buildCanonicalUrl("/blog");
     const description =
-      "Updates and insights on Lix change control and developer workflows.";
+      "Product updates, architecture notes, and experiments from building Lix for AI agents and structured file workflows.";
     const ogImage = resolveOgImage();
+    const title =
+      "Lix Blog | Product updates, architecture notes, and AI workflow ideas";
 
     return {
       links: [{ rel: "canonical", href: canonicalUrl }],
@@ -116,9 +128,9 @@ export const Route = createFileRoute("/blog/")({
         },
       ],
       meta: [
-        { title: "Blog | Lix" },
+        { title },
         { name: "description", content: description },
-        { property: "og:title", content: "Blog | Lix" },
+        { property: "og:title", content: title },
         { property: "og:description", content: description },
         { property: "og:url", content: canonicalUrl },
         { property: "og:type", content: "website" },
@@ -129,7 +141,7 @@ export const Route = createFileRoute("/blog/")({
         { name: "twitter:card", content: "summary_large_image" },
         { name: "twitter:image", content: ogImage.url },
         { name: "twitter:image:alt", content: ogImage.alt },
-        { name: "twitter:title", content: "Blog | Lix" },
+        { name: "twitter:title", content: title },
         { name: "twitter:description", content: description },
       ],
     };
@@ -191,7 +203,9 @@ function BlogIndexPage() {
                     <div className="h-24 w-40 flex-shrink-0 overflow-hidden rounded-lg bg-slate-100">
                       <img
                         src={post.ogImage}
-                        alt=""
+                        alt={
+                          post.ogImageAlt ?? `${post.title ?? post.slug} cover image`
+                        }
                         className="h-full w-full object-cover"
                       />
                     </div>
@@ -274,10 +288,4 @@ function getBlogMarkdown(relativePath: string): Promise<string> {
     throw new Error(`Missing blog markdown: ${relativePath}`);
   }
   return loader();
-}
-
-function resolveLocalBlogAsset(value: string, folderName: string): string {
-  if (/^[a-z][a-z0-9+.-]*:/.test(value)) return value;
-  const normalized = value.replace(/^\.\//, "");
-  return `/blog/${folderName}/${normalized}`;
 }

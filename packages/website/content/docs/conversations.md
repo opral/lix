@@ -1,3 +1,7 @@
+---
+description: Attach threaded conversations to files, entities, versions, and change sets so review, collaboration, and AI context live together.
+---
+
 # Conversations
 
 Lix has a universal commenting system. You can attach conversations to any entity — paragraphs, JSON properties, CSV cells, files, change sets, versions, and more. This “attach to any entity” model is a core super power of Lix.

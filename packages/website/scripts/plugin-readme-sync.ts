@@ -5,6 +5,8 @@ import type { Plugin } from "vite";
 type PluginRegistry = {
   plugins?: Array<{
     key: string;
+    name?: string;
+    description?: string;
     readme?: string;
   }>;
 };
@@ -60,6 +62,21 @@ async function loadRegistry(registryPath: string): Promise<PluginRegistry> {
   return JSON.parse(raw) as PluginRegistry;
 }
 
+function buildSeoFrontmatter(plugin: NonNullable<PluginRegistry["plugins"]>[number]) {
+  const title = plugin.name ?? plugin.key;
+  const description = plugin.description
+    ? `${plugin.description}. Learn how to install it, supported file types, and how it fits into Lix workflows.`
+    : `Learn how to install ${title}, supported file types, and how it fits into Lix workflows.`;
+
+  return [
+    "---",
+    `title: ${JSON.stringify(title)}`,
+    `description: ${JSON.stringify(description)}`,
+    "---",
+    "",
+  ].join("\n");
+}
+
 /**
  * Downloads plugin readmes and writes them to the content directory.
  *
@@ -87,8 +104,9 @@ async function syncPluginReadmes(registry: PluginRegistry, contentDir: string) {
         rewriteRelativeImages(await response.text(), plugin.readme),
         plugin.readme,
       );
+      const content = `${buildSeoFrontmatter(plugin)}${markdown}`;
       const destination = path.join(contentDir, `${plugin.key}.md`);
-      await writeFile(destination, markdown);
+      await writeFile(destination, content);
     }),
   );
 }

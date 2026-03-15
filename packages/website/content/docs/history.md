@@ -1,3 +1,7 @@
+---
+description: Query file and entity history in Lix by walking the commit graph from any checkpoint with SQL.
+---
+
 # History
 
 Query complete change history for files and entities using SQL.

@@ -1,3 +1,7 @@
+---
+description: Query semantic diffs in Lix to compare entities, files, working state, and versions with SQL instead of line-based text patches.
+---
+
 # Diffs
 
 Unlike traditional version control that treats files as opaque blobs of text, Lix understands the structure of your data. Diffs are computed at the [entity](/docs/schemas) level, where an "entity" is a semantic unit defined by a [plugin](/docs/plugins). For example:

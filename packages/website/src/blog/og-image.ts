@@ -2,7 +2,7 @@ import { buildCanonicalUrl } from "../lib/seo";
 
 export function resolveOgImageUrl(value: string, folderName: string): string {
   if (isAbsoluteUrl(value)) return value;
-  const base = buildCanonicalUrl(`/blog/${folderName}/`);
+  const base = `${buildCanonicalUrl(`/blog/${folderName}`)}/`;
   return new URL(value, base).toString();
 }
 
