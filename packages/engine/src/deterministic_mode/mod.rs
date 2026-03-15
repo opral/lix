@@ -7,7 +7,7 @@ use crate::key_value::{
     KEY_VALUE_GLOBAL_VERSION,
 };
 use crate::sql::ast::utils::parse_sql_statements;
-use crate::sql::execution::contracts::prepared_statement::PreparedBatch;
+use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
 use crate::sql::execution::preprocess::preprocess_statements_with_provider_to_plan as preprocess_statements_with_provider;
 use crate::sql::execution::write_program_runner::execute_write_program_with_backend;
 use crate::sql::storage::sql_text::escape_sql_string;
@@ -242,8 +242,10 @@ pub(crate) fn build_persist_sequence_highest_batch(
     let rewritten = preprocess_statements_with_provider(statements, &[], &mut provider, dialect)?;
     let params = rewritten.single_statement_params()?.to_vec();
     Ok(PreparedBatch {
-        sql: rewritten.sql,
-        params,
+        steps: vec![PreparedStatement {
+            sql: rewritten.sql,
+            params,
+        }],
     })
 }
 

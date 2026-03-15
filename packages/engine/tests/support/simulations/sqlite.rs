@@ -4,7 +4,10 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Column, Executor, Row, SqlitePool, ValueRef};
 use tokio::sync::OnceCell;
 
-use lix_engine::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
+use lix_engine::{
+    collapse_prepared_batch_for_dialect, LixBackend, LixError, LixTransaction, PreparedBatch,
+    QueryResult, SqlDialect, Value,
+};
 
 use crate::support::simulation_test::{Simulation, SimulationBehavior};
 
@@ -84,55 +87,6 @@ impl LixBackend for SqliteBackend {
         SqlDialect::Sqlite
     }
 
-    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let pool = self.pool().await?;
-
-        if params.is_empty() && sql.contains(';') {
-            pool.execute(sql).await.map_err(|err| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: err.to_string(),
-            })?;
-            return Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            });
-        }
-
-        let mut query = sqlx::query(sql);
-
-        for param in params {
-            query = bind_param_sqlite(query, param);
-        }
-
-        let rows = query.fetch_all(pool).await.map_err(|err| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: err.to_string(),
-        })?;
-        let columns = rows
-            .first()
-            .map(|row| {
-                row.columns()
-                    .iter()
-                    .map(|column| column.name().to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        let mut result_rows = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut out = Vec::with_capacity(row.columns().len());
-            for i in 0..row.columns().len() {
-                out.push(map_sqlite_value(&row, i)?);
-            }
-            result_rows.push(out);
-        }
-
-        Ok(QueryResult {
-            rows: result_rows,
-            columns,
-        })
-    }
-
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
         let pool = self.pool().await?;
         let mut conn = pool.acquire().await.map_err(|err| LixError {
@@ -157,51 +111,27 @@ impl LixTransaction for SqliteBackendTransaction {
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        if params.is_empty() && sql.contains(';') {
-            self.conn.execute(sql).await.map_err(|err| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: err.to_string(),
-            })?;
+        execute_query_with_connection(&mut self.conn, sql, params).await
+    }
+
+    async fn execute_batch(&mut self, batch: &PreparedBatch) -> Result<QueryResult, LixError> {
+        let collapsed = collapse_prepared_batch_for_dialect(batch, self.dialect())?;
+        if collapsed.sql.trim().is_empty() {
             return Ok(QueryResult {
                 rows: Vec::new(),
                 columns: Vec::new(),
             });
         }
-
-        let mut query = sqlx::query(sql);
-        for param in params {
-            query = bind_param_sqlite(query, param);
-        }
-
-        let rows = query
-            .fetch_all(&mut *self.conn)
+        self.conn
+            .execute(collapsed.sql.as_str())
             .await
             .map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
             })?;
-        let columns = rows
-            .first()
-            .map(|row| {
-                row.columns()
-                    .iter()
-                    .map(|column| column.name().to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        let mut result_rows = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut out = Vec::with_capacity(row.columns().len());
-            for i in 0..row.columns().len() {
-                out.push(map_sqlite_value(&row, i)?);
-            }
-            result_rows.push(out);
-        }
-
         Ok(QueryResult {
-            rows: result_rows,
-            columns,
+            rows: Vec::new(),
+            columns: Vec::new(),
         })
     }
 
@@ -226,6 +156,45 @@ impl LixTransaction for SqliteBackendTransaction {
             })?;
         Ok(())
     }
+}
+
+async fn execute_query_with_connection(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    sql: &str,
+    params: &[Value],
+) -> Result<QueryResult, LixError> {
+    let mut query = sqlx::query(sql);
+    for param in params {
+        query = bind_param_sqlite(query, param);
+    }
+
+    let rows = query.fetch_all(&mut **conn).await.map_err(|err| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: err.to_string(),
+    })?;
+    let columns = rows
+        .first()
+        .map(|row| {
+            row.columns()
+                .iter()
+                .map(|column| column.name().to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut result_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut out = Vec::with_capacity(row.columns().len());
+        for i in 0..row.columns().len() {
+            out.push(map_sqlite_value(&row, i)?);
+        }
+        result_rows.push(out);
+    }
+
+    Ok(QueryResult {
+        rows: result_rows,
+        columns,
+    })
 }
 
 fn bind_param_sqlite<'q>(

@@ -70,6 +70,7 @@ pub struct EngineTransaction<'a> {
     pub(crate) installed_plugins_cache_invalidation_pending: bool,
     pub(crate) public_surface_registry_dirty: bool,
     pub(crate) pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
+    pub(crate) observe_tick_already_emitted: bool,
     pub(crate) pending_public_commit_session:
         Option<crate::sql::execution::shared_path::PendingPublicCommitSession>,
 }

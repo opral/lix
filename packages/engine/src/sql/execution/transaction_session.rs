@@ -64,6 +64,7 @@ struct SessionTransaction {
     installed_plugins_cache_invalidation_pending: bool,
     public_surface_registry_dirty: bool,
     pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
+    observe_tick_already_emitted: bool,
     pending_public_commit_session:
         Option<crate::sql::execution::shared_path::PendingPublicCommitSession>,
 }
@@ -86,7 +87,9 @@ impl SessionTransaction {
             .transaction
             .take()
             .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "transaction is no longer active"))?;
-        if !self.pending_state_commit_stream_changes.is_empty() {
+        if !self.observe_tick_already_emitted
+            && !self.pending_state_commit_stream_changes.is_empty()
+        {
             engine
                 .append_observe_tick_in_transaction(
                     transaction.as_mut(),
@@ -157,6 +160,7 @@ async fn execute_transaction_control(
                 installed_plugins_cache_invalidation_pending: false,
                 public_surface_registry_dirty: false,
                 pending_state_commit_stream_changes: Vec::new(),
+                observe_tick_already_emitted: false,
                 pending_public_commit_session: None,
             });
             sql_transaction_open.store(true, Ordering::SeqCst);
@@ -212,6 +216,7 @@ async fn execute_in_active_transaction(
                 &mut session_transaction.active_version_id,
                 &mut session_transaction.pending_state_commit_stream_changes,
                 &mut session_transaction.pending_public_commit_session,
+                &mut session_transaction.observe_tick_already_emitted,
             )
             .await?
     } else {

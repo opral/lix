@@ -3,8 +3,9 @@ use crate::db;
 use crate::error::CliError;
 use async_trait::async_trait;
 use lix_rs_sdk::{
-    BootKeyValue, Lix, LixBackend, LixConfig, LixError, LixTransaction, QueryResult, SqlDialect,
-    SqliteBackend, Value, WasmtimeRuntime,
+    BootKeyValue, Lix, LixBackend, LixConfig, LixError, LixTransaction,
+    PreparedBatch as EnginePreparedBatch, QueryResult, SqlDialect, SqliteBackend, Value,
+    WasmtimeRuntime,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -278,33 +279,6 @@ impl LixBackend for TracingSqliteBackend {
         self.inner.dialect()
     }
 
-    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let started = Instant::now();
-        let result = self.inner.execute(sql, params).await;
-        let duration = started.elapsed();
-        match &result {
-            Ok(query) => self.collector.record_operation(
-                "backend_execute",
-                Some(sql),
-                params,
-                duration,
-                Some(query.rows.len()),
-                Some(query.columns.len()),
-                None,
-            ),
-            Err(error) => self.collector.record_operation(
-                "backend_execute",
-                Some(sql),
-                params,
-                duration,
-                None,
-                None,
-                Some(error.description.clone()),
-            ),
-        }
-        result
-    }
-
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
         let started = Instant::now();
         let result = self.inner.begin_transaction().await;
@@ -364,6 +338,47 @@ impl LixTransaction for TracingSqliteTransaction<'_> {
                 "transaction_execute",
                 Some(sql),
                 params,
+                duration,
+                None,
+                None,
+                Some(error.description.clone()),
+            ),
+        }
+        result
+    }
+
+    async fn execute_batch(
+        &mut self,
+        batch: &EnginePreparedBatch,
+    ) -> Result<QueryResult, LixError> {
+        let started = Instant::now();
+        let result = self.inner.execute_batch(batch).await;
+        let duration = started.elapsed();
+        let sql = batch
+            .steps
+            .iter()
+            .map(|step| step.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let params = batch
+            .steps
+            .iter()
+            .flat_map(|step| step.params.iter().cloned())
+            .collect::<Vec<_>>();
+        match &result {
+            Ok(query) => self.collector.record_operation(
+                "transaction_execute_batch",
+                Some(&sql),
+                &params,
+                duration,
+                Some(query.rows.len()),
+                Some(query.columns.len()),
+                None,
+            ),
+            Err(error) => self.collector.record_operation(
+                "transaction_execute_batch",
+                Some(&sql),
+                &params,
                 duration,
                 None,
                 None,

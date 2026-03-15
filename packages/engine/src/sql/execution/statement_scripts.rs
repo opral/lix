@@ -47,6 +47,7 @@ impl Engine {
         let starting_active_version_id = active_version_id.clone();
         let mut pending_state_commit_stream_changes = Vec::new();
         let mut pending_public_commit_session = None;
+        let mut observe_tick_already_emitted = false;
         let mut public_surface_registry_dirty = false;
         let installed_plugins_cache_invalidation_pending =
             should_invalidate_installed_plugins_cache_for_statements(&statements);
@@ -62,6 +63,7 @@ impl Engine {
                 &mut active_version_id,
                 &mut pending_state_commit_stream_changes,
                 &mut pending_public_commit_session,
+                &mut observe_tick_already_emitted,
             )
             .await;
         let result = match result {
@@ -72,7 +74,7 @@ impl Engine {
             }
         };
 
-        if !pending_state_commit_stream_changes.is_empty() {
+        if !observe_tick_already_emitted && !pending_state_commit_stream_changes.is_empty() {
             self.append_observe_tick_in_transaction(
                 transaction.as_mut(),
                 options.writer_key.as_deref(),
@@ -107,6 +109,7 @@ impl Engine {
         pending_public_commit_session: &mut Option<
             crate::sql::execution::shared_path::PendingPublicCommitSession,
         >,
+        observe_tick_already_emitted: &mut bool,
     ) -> Result<ExecuteResult, LixError> {
         let result_statement_count = original_statements.len();
         let script_statements = coalesce_vtable_inserts_in_statement_list(original_statements)?;
@@ -128,6 +131,7 @@ impl Engine {
             active_version_id,
             pending_state_commit_stream_changes,
             pending_public_commit_session,
+            observe_tick_already_emitted,
         )
         .await
     }
@@ -148,6 +152,7 @@ impl Engine {
         pending_public_commit_session: &mut Option<
             crate::sql::execution::shared_path::PendingPublicCommitSession,
         >,
+        observe_tick_already_emitted: &mut bool,
     ) -> Result<ExecuteResult, LixError> {
         if original_statements.len() != sql_statements.len() {
             return Err(LixError {
@@ -350,6 +355,7 @@ impl Engine {
                 *public_surface_registry_dirty = true;
             }
             pending_state_commit_stream_changes.extend(state_commit_stream_changes);
+            *observe_tick_already_emitted |= execution.observe_tick_emitted;
             return Ok(empty_mutating_script_result(result_statement_count));
         }
 
