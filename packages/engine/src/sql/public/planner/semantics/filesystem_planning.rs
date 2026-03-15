@@ -8,12 +8,13 @@ use crate::sql::public::planner::semantics::filesystem_assignments::{
 };
 use crate::sql::public::planner::semantics::filesystem_queries::{
     ensure_no_directory_at_file_path, ensure_no_file_at_directory_path,
-    lookup_directory_id_by_path, lookup_directory_path_by_id, lookup_file_id_by_path,
-    FilesystemQueryError,
+    load_directory_descriptors_by_parent_name_pairs,
+    load_file_descriptors_by_directory_name_extension_triplets, lookup_directory_id_by_path,
+    lookup_directory_path_by_id, FilesystemQueryError,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixBackend;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilesystemPlanningError {
@@ -98,6 +99,12 @@ struct PendingFileInsert {
     data: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Default, Clone)]
+struct FileInsertPreflight {
+    existing_directory_ids_by_path: BTreeMap<String, String>,
+    existing_file_ids_by_path: BTreeMap<String, String>,
+}
+
 pub(crate) async fn plan_directory_insert_batch(
     backend: &dyn LixBackend,
     assignments: &[DirectoryInsertAssignments],
@@ -133,24 +140,14 @@ pub(crate) async fn plan_file_insert_batch(
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<PlannedFileInsertBatch, FilesystemPlanningError> {
+    let preflight =
+        build_file_insert_preflight(backend, assignments, version_id, lookup_scope).await?;
     let mut batch = PendingFilesystemInsertBatch::default();
     for assignments in assignments {
-        let computed =
-            resolve_file_insert_target(backend, assignments, version_id, lookup_scope, &mut batch)
-                .await?;
+        let computed = resolve_file_insert_target(assignments, version_id, &preflight, &mut batch)?;
         batch.register_file_target(computed, assignments.data.clone())?;
     }
-    Ok(PlannedFileInsertBatch {
-        directories: finalize_pending_directory_insert_batch(
-            backend,
-            &batch,
-            version_id,
-            lookup_scope,
-        )
-        .await?,
-        files: finalize_pending_file_insert_batch(backend, &batch, version_id, lookup_scope)
-            .await?,
-    })
+    finalize_pending_file_insert_batch(&batch, &preflight)
 }
 
 impl PendingFilesystemInsertBatch {
@@ -312,31 +309,25 @@ impl PendingFilesystemInsertBatch {
     }
 }
 
-async fn resolve_file_insert_target(
-    backend: &dyn LixBackend,
+fn resolve_file_insert_target(
     assignments: &FileInsertAssignments,
     version_id: &str,
-    lookup_scope: FilesystemProjectionScope,
+    preflight: &FileInsertPreflight,
     batch: &mut PendingFilesystemInsertBatch,
 ) -> Result<ResolvedFileInsertTarget, FilesystemPlanningError> {
     let parsed = &assignments.path;
     let explicit_id = assignments.id.as_deref();
-    ensure_no_directory_at_file_path_in_insert_batch(
-        backend,
-        version_id,
+    ensure_no_directory_at_file_path_in_file_insert_preflight(
         parsed.normalized_path.as_str(),
-        lookup_scope,
+        preflight,
         batch,
-    )
-    .await?;
-    let directory_path = ensure_parent_directories_for_insert_batch(
-        backend,
+    )?;
+    let directory_path = ensure_parent_directories_for_file_insert_batch(
         version_id,
         parsed.directory_path.as_ref(),
-        lookup_scope,
+        preflight,
         batch,
-    )
-    .await?;
+    )?;
 
     if let Some(existing_id) = batch.pending_file_id_by_path(parsed.normalized_path.as_str()) {
         if explicit_id != Some(existing_id.as_str()) {
@@ -347,8 +338,9 @@ async fn resolve_file_insert_target(
                 ),
             });
         }
-    } else if let Some(existing_id) =
-        lookup_file_id_by_path(backend, version_id, parsed, lookup_scope).await?
+    } else if let Some(existing_id) = preflight
+        .existing_file_ids_by_path
+        .get(parsed.normalized_path.as_str())
     {
         let same_id = explicit_id
             .map(|value| value == existing_id.as_str())
@@ -598,11 +590,73 @@ async fn finalize_pending_directory_insert_batch(
     Ok(directories)
 }
 
-async fn finalize_pending_file_insert_batch(
-    backend: &dyn LixBackend,
-    batch: &PendingFilesystemInsertBatch,
+fn ensure_parent_directories_for_file_insert_batch(
     version_id: &str,
-    lookup_scope: FilesystemProjectionScope,
+    directory_path: Option<&NormalizedDirectoryPath>,
+    preflight: &FileInsertPreflight,
+    batch: &mut PendingFilesystemInsertBatch,
+) -> Result<Option<String>, FilesystemPlanningError> {
+    let Some(directory_path) = directory_path else {
+        return Ok(None);
+    };
+
+    let mut paths = directory_ancestor_paths(directory_path.as_str());
+    paths.push(directory_path.as_str().to_string());
+
+    for candidate_path in paths {
+        if batch
+            .pending_directory_id_by_path(&candidate_path)
+            .is_some()
+        {
+            continue;
+        }
+        if preflight
+            .existing_directory_ids_by_path
+            .contains_key(&candidate_path)
+        {
+            continue;
+        }
+        ensure_no_file_at_directory_path_in_file_insert_preflight(
+            &candidate_path,
+            preflight,
+            batch,
+        )?;
+        batch.register_implicit_directory(version_id, &candidate_path)?;
+    }
+
+    Ok(Some(directory_path.as_str().to_string()))
+}
+
+fn finalize_file_insert_directories_from_preflight(
+    batch: &PendingFilesystemInsertBatch,
+    preflight: &FileInsertPreflight,
+) -> Result<Vec<PlannedDirectoryInsertTarget>, FilesystemPlanningError> {
+    let mut pending_directories: Vec<_> = batch.directories_by_path.values().cloned().collect();
+    pending_directories
+        .sort_by_key(|pending| pending_directory_insert_sort_key(&pending.target.path));
+
+    let mut directories = Vec::new();
+    for pending in pending_directories {
+        let parent_id = match pending.target.parent_path.as_deref() {
+            Some(parent_path) => {
+                lookup_directory_id_by_path_in_preflight(parent_path, preflight, batch)
+            }
+            None => None,
+        };
+        directories.push(PlannedDirectoryInsertTarget {
+            id: pending.target.id,
+            parent_id,
+            name: pending.target.name,
+            hidden: pending.target.hidden,
+            metadata: pending.target.metadata,
+        });
+    }
+    Ok(directories)
+}
+
+fn finalize_file_insert_files_from_preflight(
+    batch: &PendingFilesystemInsertBatch,
+    preflight: &FileInsertPreflight,
 ) -> Result<Vec<PlannedFileInsertTarget>, FilesystemPlanningError> {
     let mut pending_files: Vec<_> = batch.files_by_path.values().cloned().collect();
     pending_files.sort_by_key(|pending| pending.target.path.clone());
@@ -611,14 +665,7 @@ async fn finalize_pending_file_insert_batch(
     for pending in pending_files {
         let directory_id = match pending.target.directory_path.as_deref() {
             Some(directory_path) => {
-                lookup_directory_id_by_path_in_insert_batch(
-                    backend,
-                    version_id,
-                    directory_path,
-                    lookup_scope,
-                    batch,
-                )
-                .await?
+                lookup_directory_id_by_path_in_preflight(directory_path, preflight, batch)
             }
             None => None,
         };
@@ -633,6 +680,177 @@ async fn finalize_pending_file_insert_batch(
         });
     }
     Ok(files)
+}
+
+fn finalize_pending_file_insert_batch(
+    batch: &PendingFilesystemInsertBatch,
+    preflight: &FileInsertPreflight,
+) -> Result<PlannedFileInsertBatch, FilesystemPlanningError> {
+    Ok(PlannedFileInsertBatch {
+        directories: finalize_file_insert_directories_from_preflight(batch, preflight)?,
+        files: finalize_file_insert_files_from_preflight(batch, preflight)?,
+    })
+}
+
+async fn build_file_insert_preflight(
+    backend: &dyn LixBackend,
+    assignments: &[FileInsertAssignments],
+    version_id: &str,
+    lookup_scope: FilesystemProjectionScope,
+) -> Result<FileInsertPreflight, FilesystemPlanningError> {
+    let mut requested_directory_paths = BTreeSet::new();
+    let mut requested_file_paths = BTreeSet::new();
+
+    for assignments in assignments {
+        let file_path = assignments.path.normalized_path.as_str();
+        requested_file_paths.insert(file_path.to_string());
+        requested_directory_paths.insert(format!("{}/", file_path.trim_end_matches('/')));
+
+        if let Some(directory_path) = assignments.path.directory_path.as_ref() {
+            for ancestor in directory_ancestor_paths(directory_path.as_str()) {
+                requested_file_paths.insert(ancestor.trim_end_matches('/').to_string());
+                requested_directory_paths.insert(ancestor);
+            }
+            let directory_path = directory_path.as_str().to_string();
+            requested_file_paths.insert(directory_path.trim_end_matches('/').to_string());
+            requested_directory_paths.insert(directory_path);
+        }
+    }
+
+    let mut preflight = FileInsertPreflight::default();
+    preflight.existing_directory_ids_by_path = resolve_existing_directory_ids_by_path(
+        backend,
+        version_id,
+        &requested_directory_paths,
+        lookup_scope,
+    )
+    .await?;
+    preflight.existing_file_ids_by_path = resolve_existing_file_ids_by_path(
+        backend,
+        version_id,
+        &requested_file_paths,
+        &preflight.existing_directory_ids_by_path,
+        lookup_scope,
+    )
+    .await?;
+    Ok(preflight)
+}
+
+async fn resolve_existing_directory_ids_by_path(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    requested_paths: &BTreeSet<String>,
+    lookup_scope: FilesystemProjectionScope,
+) -> Result<BTreeMap<String, String>, FilesystemPlanningError> {
+    let mut resolved: BTreeMap<String, String> = BTreeMap::new();
+    let mut by_depth = BTreeMap::<usize, Vec<String>>::new();
+    for path in requested_paths {
+        by_depth
+            .entry(path.matches('/').count())
+            .or_default()
+            .push(path.clone());
+    }
+
+    for paths in by_depth.into_values() {
+        let mut requests = BTreeSet::new();
+        let mut request_paths: BTreeMap<(Option<String>, String), String> = BTreeMap::new();
+        for path in paths {
+            let parent_path = parent_directory_path(&path);
+            let Some(name) = directory_name_from_path(&path) else {
+                continue;
+            };
+            let parent_id = match parent_path.as_deref() {
+                Some(parent_path) => match resolved.get(parent_path) {
+                    Some(parent_id) => Some(parent_id.clone()),
+                    None => continue,
+                },
+                None => None,
+            };
+            requests.insert((parent_id.clone(), name.to_string()));
+            request_paths.insert((parent_id, name.to_string()), path);
+        }
+        if requests.is_empty() {
+            continue;
+        }
+        for descriptor in load_directory_descriptors_by_parent_name_pairs(
+            backend,
+            version_id,
+            &requests,
+            lookup_scope,
+        )
+        .await?
+        {
+            if let Some(path) =
+                request_paths.get(&(descriptor.parent_id.clone(), descriptor.name.clone()))
+            {
+                resolved.insert(path.clone(), descriptor.id);
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+async fn resolve_existing_file_ids_by_path(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    requested_paths: &BTreeSet<String>,
+    directory_ids_by_path: &BTreeMap<String, String>,
+    lookup_scope: FilesystemProjectionScope,
+) -> Result<BTreeMap<String, String>, FilesystemPlanningError> {
+    let mut requests = BTreeSet::new();
+    let mut request_paths = BTreeMap::new();
+    for path in requested_paths {
+        let parsed =
+            ParsedFilePath::from_normalized_path(path.clone()).map_err(filesystem_path_error)?;
+        let directory_id = match parsed.directory_path.as_deref() {
+            Some(directory_path) => match directory_ids_by_path.get(directory_path) {
+                Some(directory_id) => Some(directory_id.clone()),
+                None => continue,
+            },
+            None => None,
+        };
+        let key = (
+            directory_id,
+            parsed.name.clone(),
+            parsed.extension.clone().filter(|value| !value.is_empty()),
+        );
+        requests.insert(key.clone());
+        request_paths.insert(key, path.clone());
+    }
+
+    let mut resolved = BTreeMap::new();
+    for descriptor in load_file_descriptors_by_directory_name_extension_triplets(
+        backend,
+        version_id,
+        &requests,
+        lookup_scope,
+    )
+    .await?
+    {
+        let key = (
+            descriptor.directory_id.clone(),
+            descriptor.name.clone(),
+            descriptor
+                .extension
+                .clone()
+                .filter(|value| !value.is_empty()),
+        );
+        if let Some(path) = request_paths.get(&key) {
+            resolved.insert(path.clone(), descriptor.id);
+        }
+    }
+    Ok(resolved)
+}
+
+fn lookup_directory_id_by_path_in_preflight(
+    path: &str,
+    preflight: &FileInsertPreflight,
+    batch: &PendingFilesystemInsertBatch,
+) -> Option<String> {
+    batch
+        .pending_directory_id_by_path(path)
+        .or_else(|| preflight.existing_directory_ids_by_path.get(path).cloned())
 }
 
 async fn lookup_directory_id_by_path_in_insert_batch(
@@ -701,6 +919,39 @@ async fn ensure_no_file_at_directory_path_in_insert_batch(
     .map_err(Into::into)
 }
 
+fn ensure_no_file_at_directory_path_in_file_insert_preflight(
+    directory_path: &str,
+    preflight: &FileInsertPreflight,
+    batch: &PendingFilesystemInsertBatch,
+) -> Result<(), FilesystemPlanningError> {
+    let file_path =
+        ParsedFilePath::from_normalized_path(directory_path.trim_end_matches('/').to_string())
+            .map_err(filesystem_path_error)?;
+    if batch
+        .pending_file_id_by_path(file_path.normalized_path.as_str())
+        .is_some()
+    {
+        return Err(FilesystemPlanningError {
+            message: format!(
+                "Directory path collides with existing file path: {}",
+                file_path.normalized_path.as_str()
+            ),
+        });
+    }
+    if preflight
+        .existing_file_ids_by_path
+        .contains_key(file_path.normalized_path.as_str())
+    {
+        return Err(FilesystemPlanningError {
+            message: format!(
+                "Directory path collides with existing file path: {}",
+                file_path.normalized_path.as_str()
+            ),
+        });
+    }
+    Ok(())
+}
+
 async fn ensure_no_directory_at_file_path_in_insert_batch(
     backend: &dyn LixBackend,
     version_id: &str,
@@ -728,6 +979,42 @@ async fn ensure_no_directory_at_file_path_in_insert_batch(
     ensure_no_directory_at_file_path(backend, version_id, &file_path, lookup_scope)
         .await
         .map_err(Into::into)
+}
+
+fn ensure_no_directory_at_file_path_in_file_insert_preflight(
+    file_path: &str,
+    preflight: &FileInsertPreflight,
+    batch: &PendingFilesystemInsertBatch,
+) -> Result<(), FilesystemPlanningError> {
+    let file_path = ParsedFilePath::from_normalized_path(file_path.to_string())
+        .map_err(filesystem_path_error)?;
+    let directory_path = NormalizedDirectoryPath::from_normalized(format!(
+        "{}/",
+        file_path.normalized_path.as_str().trim_end_matches('/')
+    ));
+    if batch
+        .pending_directory_id_by_path(directory_path.as_str())
+        .is_some()
+    {
+        return Err(FilesystemPlanningError {
+            message: format!(
+                "File path collides with existing directory path: {}",
+                directory_path.as_str()
+            ),
+        });
+    }
+    if preflight
+        .existing_directory_ids_by_path
+        .contains_key(directory_path.as_str())
+    {
+        return Err(FilesystemPlanningError {
+            message: format!(
+                "File path collides with existing directory path: {}",
+                directory_path.as_str()
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn pending_directory_insert_sort_key(path: &str) -> (usize, String) {
