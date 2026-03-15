@@ -71,13 +71,13 @@ pub(crate) fn canonicalize_read(
 ) -> Result<CanonicalizedRead, CanonicalizeError> {
     if bound_statement.statement_kind != StatementKind::Query {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 canonicalizer only supports query statements",
+            "public day-1 canonicalizer only supports query statements",
         ));
     }
 
     let Statement::Query(query) = &bound_statement.statement else {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 canonicalizer requires a top-level query",
+            "public day-1 canonicalizer requires a top-level query",
         ));
     };
 
@@ -141,7 +141,7 @@ pub(crate) fn canonicalize_read(
         ReadPlan::admin_scan(scan)
     } else {
         return Err(CanonicalizeError::unsupported(format!(
-            "surface '{}' does not yet canonicalize through sql2 read planning",
+            "surface '{}' does not yet canonicalize through public read planning",
             surface_binding.descriptor.public_name
         )));
     };
@@ -199,7 +199,7 @@ pub(crate) fn canonicalize_write(
         Statement::Update(update) => canonicalize_update_write(bound_statement, &update, registry),
         Statement::Delete(delete) => canonicalize_delete_write(bound_statement, &delete, registry),
         _ => Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer only supports INSERT/UPDATE/DELETE statements",
+            "public day-1 write canonicalizer only supports INSERT/UPDATE/DELETE statements",
         )),
     }
 }
@@ -214,7 +214,7 @@ fn canonicalize_insert_write(
     validate_semantic_write_surface(&surface_binding, insert_write_surface_supported)?;
     if !insert.assignments.is_empty() || insert.returning.is_some() {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer only supports VALUES inserts without assignment targets or RETURNING",
+            "public day-1 write canonicalizer only supports VALUES inserts without assignment targets or RETURNING",
         ));
     }
 
@@ -227,7 +227,7 @@ fn canonicalize_insert_write(
             payload,
         )?,
         _ if insert.on.is_some() => return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 insert canonicalizer does not yet support ON CONFLICT on multi-row inserts",
+            "public day-1 insert canonicalizer does not yet support ON CONFLICT on multi-row inserts",
         )),
         _ => None,
     };
@@ -261,7 +261,7 @@ fn canonicalize_update_write(
         || update.or.is_some()
     {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 update canonicalizer only supports simple UPDATE statements without FROM/RETURNING/LIMIT/OR",
+            "public day-1 update canonicalizer only supports simple UPDATE statements without FROM/RETURNING/LIMIT/OR",
         ));
     }
     let surface_binding = bind_update_surface(update, registry)?;
@@ -287,7 +287,7 @@ fn canonicalize_update_write(
         },
         None => {
             return Err(CanonicalizeError::unsupported(
-                "sql2 day-1 update canonicalizer requires an explicit WHERE predicate",
+                "public day-1 update canonicalizer requires an explicit WHERE predicate",
             ))
         }
     };
@@ -322,7 +322,7 @@ fn canonicalize_delete_write(
         || delete.limit.is_some()
     {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 delete canonicalizer only supports simple DELETE statements without USING/RETURNING/ORDER BY/LIMIT",
+            "public day-1 delete canonicalizer only supports simple DELETE statements without USING/RETURNING/ORDER BY/LIMIT",
         ));
     }
     let surface_binding = bind_delete_surface(delete, registry)?;
@@ -342,7 +342,7 @@ fn canonicalize_delete_write(
         },
         None => {
             return Err(CanonicalizeError::unsupported(
-                "sql2 day-1 delete canonicalizer requires an explicit WHERE predicate",
+                "public day-1 delete canonicalizer requires an explicit WHERE predicate",
             ))
         }
     };
@@ -379,25 +379,24 @@ fn insert_on_conflict(
 
     let OnInsert::OnConflict(on_conflict) = on_insert else {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 insert canonicalizer only supports ON CONFLICT ... DO UPDATE",
+            "public day-1 insert canonicalizer only supports ON CONFLICT ... DO UPDATE",
         ));
     };
 
-    let conflict_columns =
-        match &on_conflict.conflict_target {
-            Some(ConflictTarget::Columns(columns)) if !columns.is_empty() => columns
-                .iter()
-                .map(|ident| canonical_write_column_key(surface_binding, &ident.value))
-                .collect::<Result<Vec<_>, _>>()?,
-            Some(_) => return Err(CanonicalizeError::unsupported(
-                "sql2 day-1 insert canonicalizer only supports explicit ON CONFLICT column targets",
-            )),
-            None => {
-                return Err(CanonicalizeError::unsupported(
-                    "sql2 day-1 insert canonicalizer requires explicit ON CONFLICT columns",
-                ))
-            }
-        };
+    let conflict_columns = match &on_conflict.conflict_target {
+        Some(ConflictTarget::Columns(columns)) if !columns.is_empty() => columns
+            .iter()
+            .map(|ident| canonical_write_column_key(surface_binding, &ident.value))
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(CanonicalizeError::unsupported(
+            "public day-1 insert canonicalizer only supports explicit ON CONFLICT column targets",
+        )),
+        None => {
+            return Err(CanonicalizeError::unsupported(
+                "public day-1 insert canonicalizer requires explicit ON CONFLICT columns",
+            ))
+        }
+    };
 
     match &on_conflict.action {
         OnConflictAction::DoNothing => Ok(Some(InsertOnConflict {
@@ -407,7 +406,7 @@ fn insert_on_conflict(
         OnConflictAction::DoUpdate(update) => {
             if update.selection.is_some() {
                 return Err(CanonicalizeError::unsupported(
-                    "sql2 day-1 insert canonicalizer does not support ON CONFLICT DO UPDATE WHERE",
+                    "public day-1 insert canonicalizer does not support ON CONFLICT DO UPDATE WHERE",
                 ));
             }
             let mut placeholder_state = PlaceholderState::new();
@@ -420,7 +419,7 @@ fn insert_on_conflict(
             for (key, value) in update_payload {
                 if insert_payload.get(&key) != Some(&value) {
                     return Err(CanonicalizeError::unsupported(
-                        "sql2 day-1 insert canonicalizer only supports ON CONFLICT DO UPDATE assignments that match inserted values",
+                        "public day-1 insert canonicalizer only supports ON CONFLICT DO UPDATE assignments that match inserted values",
                     ));
                 }
             }
@@ -441,13 +440,13 @@ fn extract_supported_select(query: &Query) -> Result<&Select, CanonicalizeError>
         || query.format_clause.is_some()
     {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 canonicalizer does not support WITH/FETCH/LOCK/FOR/SETTINGS/FORMAT clauses",
+            "public day-1 canonicalizer does not support WITH/FETCH/LOCK/FOR/SETTINGS/FORMAT clauses",
         ));
     }
 
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 canonicalizer only supports SELECT bodies",
+            "public day-1 canonicalizer only supports SELECT bodies",
         ));
     };
 
@@ -467,7 +466,7 @@ fn extract_supported_select(query: &Query) -> Result<&Select, CanonicalizeError>
         || !select.sort_by.is_empty()
     {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 canonicalizer only supports Scan->Filter->Project->Sort->Limit read shapes",
+            "public day-1 canonicalizer only supports Scan->Filter->Project->Sort->Limit read shapes",
         ));
     }
 
@@ -475,14 +474,14 @@ fn extract_supported_select(query: &Query) -> Result<&Select, CanonicalizeError>
         GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty() => {}
         GroupByExpr::Expressions(_, _) | GroupByExpr::All(_) => {
             return Err(CanonicalizeError::unsupported(
-                "sql2 day-1 canonicalizer does not support GROUP BY",
+                "public day-1 canonicalizer does not support GROUP BY",
             ));
         }
     }
 
     if select.from.len() != 1 || !select.from[0].joins.is_empty() {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 canonicalizer requires a single surface scan without joins",
+            "public day-1 canonicalizer requires a single surface scan without joins",
         ));
     }
     Ok(select)
@@ -495,7 +494,7 @@ fn bind_single_surface(
     let relation = &select.from[0].relation;
     let TableFactor::Table { name, .. } = relation else {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 canonicalizer only supports direct table references",
+            "public day-1 canonicalizer only supports direct table references",
         ));
     };
 
@@ -507,7 +506,7 @@ fn bind_single_surface(
             .map(|ident| ident.value.clone())
             .unwrap_or_else(|| name.to_string());
         CanonicalizeError::unsupported(format!(
-            "surface '{surface_name}' is not registered in sql2 SurfaceRegistry"
+            "surface '{surface_name}' is not registered in public SurfaceRegistry"
         ))
     })
 }
@@ -518,7 +517,7 @@ fn bind_insert_surface(
 ) -> Result<SurfaceBinding, CanonicalizeError> {
     let sqlparser::ast::TableObject::TableName(name) = &insert.table else {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer only supports direct table targets",
+            "public day-1 write canonicalizer only supports direct table targets",
         ));
     };
 
@@ -530,7 +529,7 @@ fn bind_insert_surface(
             .map(|ident| ident.value.clone())
             .unwrap_or_else(|| name.to_string());
         CanonicalizeError::unsupported(format!(
-            "surface '{surface_name}' is not registered in sql2 SurfaceRegistry"
+            "surface '{surface_name}' is not registered in public SurfaceRegistry"
         ))
     })
 }
@@ -551,7 +550,7 @@ fn bind_delete_surface(
     };
     let [table] = tables.as_slice() else {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 delete canonicalizer requires a single table target",
+            "public day-1 delete canonicalizer requires a single table target",
         ));
     };
     bind_table_with_joins_surface(table, registry)
@@ -563,12 +562,12 @@ fn bind_table_with_joins_surface(
 ) -> Result<SurfaceBinding, CanonicalizeError> {
     if !table.joins.is_empty() {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer does not support JOIN targets",
+            "public day-1 write canonicalizer does not support JOIN targets",
         ));
     }
     let TableFactor::Table { name, .. } = &table.relation else {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer only supports direct table targets",
+            "public day-1 write canonicalizer only supports direct table targets",
         ));
     };
     registry.bind_object_name(name).ok_or_else(|| {
@@ -579,7 +578,7 @@ fn bind_table_with_joins_surface(
             .map(|ident| ident.value.clone())
             .unwrap_or_else(|| name.to_string());
         CanonicalizeError::unsupported(format!(
-            "surface '{surface_name}' is not registered in sql2 SurfaceRegistry"
+            "surface '{surface_name}' is not registered in public SurfaceRegistry"
         ))
     })
 }
@@ -590,7 +589,7 @@ fn validate_semantic_write_surface(
 ) -> Result<(), CanonicalizeError> {
     if !surface_binding.resolution_capabilities.semantic_write {
         return Err(CanonicalizeError::unsupported(format!(
-            "surface '{}' is not writable in sql2",
+            "surface '{}' is not writable in public execution",
             surface_binding.descriptor.public_name
         )));
     }
@@ -602,12 +601,12 @@ fn validate_semantic_write_surface(
             | SurfaceFamily::Filesystem
     ) {
         return Err(CanonicalizeError::unsupported(
-            "sql2 write canonicalizer only supports migrated state, entity, admin, and filesystem surfaces",
+            "public write canonicalizer only supports migrated state, entity, admin, and filesystem surfaces",
         ));
     }
     if !surface_rule(surface_binding) {
         return Err(CanonicalizeError::unsupported(format!(
-            "sql2 day-1 write canonicalizer does not yet support '{}' for this operation",
+            "public day-1 write canonicalizer does not yet support '{}' for this operation",
             surface_binding.descriptor.public_name
         )));
     }
@@ -676,17 +675,17 @@ fn insert_payloads(
             return Ok(vec![BTreeMap::new()]);
         }
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer requires VALUES inserts",
+            "public day-1 write canonicalizer requires VALUES inserts",
         ));
     };
     let SetExpr::Values(values) = source.body.as_ref() else {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer requires VALUES inserts",
+            "public day-1 write canonicalizer requires VALUES inserts",
         ));
     };
     if values.rows.is_empty() {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer requires at least one insert row",
+            "public day-1 write canonicalizer requires at least one insert row",
         ));
     }
 
@@ -695,7 +694,7 @@ fn insert_payloads(
     for row in &values.rows {
         if row.len() != insert.columns.len() {
             return Err(CanonicalizeError::unsupported(
-                "sql2 day-1 write canonicalizer requires one value per inserted column",
+                "public day-1 write canonicalizer requires one value per inserted column",
             ));
         }
 
@@ -721,7 +720,7 @@ fn write_mode_request_for_insert_payloads(
 ) -> Result<WriteModeRequest, CanonicalizeError> {
     let Some(first) = payloads.first() else {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer requires at least one insert row",
+            "public day-1 write canonicalizer requires at least one insert row",
         ));
     };
     let mode = write_mode_request_for_surface_and_selector(surface_binding, first, None);
@@ -729,7 +728,7 @@ fn write_mode_request_for_insert_payloads(
         let row_mode = write_mode_request_for_surface_and_selector(surface_binding, payload, None);
         if row_mode != mode {
             return Err(CanonicalizeError::unsupported(
-                "sql2 day-1 insert canonicalizer does not support mixing tracked and untracked rows in one INSERT",
+                "public day-1 insert canonicalizer does not support mixing tracked and untracked rows in one INSERT",
             ));
         }
     }
@@ -744,7 +743,7 @@ fn assignment_payload(
 ) -> Result<BTreeMap<String, Value>, CanonicalizeError> {
     if assignments.is_empty() {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 update canonicalizer requires at least one assignment",
+            "public day-1 update canonicalizer requires at least one assignment",
         ));
     }
 
@@ -752,7 +751,7 @@ fn assignment_payload(
     for assignment in assignments {
         let AssignmentTarget::ColumnName(column_name) = &assignment.target else {
             return Err(CanonicalizeError::unsupported(
-                "sql2 day-1 update canonicalizer only supports named column assignments",
+                "public day-1 update canonicalizer only supports named column assignments",
             ));
         };
         let raw_key = column_name
@@ -762,7 +761,7 @@ fn assignment_payload(
             .map(|ident| ident.value.clone())
             .ok_or_else(|| {
                 CanonicalizeError::unsupported(
-                    "sql2 day-1 update canonicalizer requires named assignment columns",
+                    "public day-1 update canonicalizer requires named assignment columns",
                 )
             })?;
         reject_forbidden_default_state_write_column(surface_binding, &raw_key, "update")?;
@@ -1110,26 +1109,26 @@ fn canonical_write_column_key(
             "lix_version" => match canonical.as_str() {
                 "id" | "name" | "hidden" | "commit_id" => Ok(canonical.clone()),
                 _ => Err(CanonicalizeError::unsupported(format!(
-                    "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
+                    "public write canonicalizer does not support column '{raw_column}' on '{}'",
                     surface_binding.descriptor.public_name
                 ))),
             },
             "lix_active_version" => match canonical.as_str() {
                 "id" | "version_id" => Ok(canonical.clone()),
                 _ => Err(CanonicalizeError::unsupported(format!(
-                    "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
+                    "public write canonicalizer does not support column '{raw_column}' on '{}'",
                     surface_binding.descriptor.public_name
                 ))),
             },
             "lix_active_account" => match canonical.as_str() {
                 "id" | "account_id" => Ok(canonical.clone()),
                 _ => Err(CanonicalizeError::unsupported(format!(
-                    "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
+                    "public write canonicalizer does not support column '{raw_column}' on '{}'",
                     surface_binding.descriptor.public_name
                 ))),
             },
             _ => Err(CanonicalizeError::unsupported(format!(
-                "sql2 write canonicalizer does not yet support '{}' writes",
+                "public write canonicalizer does not yet support '{}' writes",
                 surface_binding.descriptor.public_name
             ))),
         },
@@ -1146,12 +1145,12 @@ fn canonical_write_column_key(
                 _ => Err(unknown_write_column_error(surface_binding, raw_column)),
             },
             _ => Err(CanonicalizeError::unsupported(format!(
-                "sql2 write canonicalizer does not yet support '{}' writes",
+                "public write canonicalizer does not yet support '{}' writes",
                 surface_binding.descriptor.public_name
             ))),
         },
         SurfaceFamily::Change => Err(CanonicalizeError::unsupported(format!(
-            "sql2 day-1 write canonicalizer does not support '{}' writes",
+            "public day-1 write canonicalizer does not support '{}' writes",
             surface_binding.descriptor.public_name
         ))),
     }
@@ -1222,7 +1221,7 @@ fn expr_to_value(
                 Value::Blob(bytes) => Ok(Value::Blob(bytes)),
                 Value::Null => Ok(Value::Null),
                 _ => Err(CanonicalizeError::unsupported(
-                    "sql2 day-1 write canonicalizer only supports string/blob/null lix_text_encode arguments",
+                    "public day-1 write canonicalizer only supports string/blob/null lix_text_encode arguments",
                 )),
             }
         }
@@ -1240,12 +1239,12 @@ fn expr_to_value(
                 Value::Integer(value) => Ok(Value::Integer(-value)),
                 Value::Real(value) => Ok(Value::Real(-value)),
                 _ => Err(CanonicalizeError::unsupported(
-                    "sql2 day-1 write canonicalizer only supports numeric unary minus literals",
+                    "public day-1 write canonicalizer only supports numeric unary minus literals",
                 )),
             }
         }
         _ => Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer only supports literal and placeholder VALUES",
+            "public day-1 write canonicalizer only supports literal and placeholder VALUES",
         )),
     }
 }
@@ -1292,18 +1291,18 @@ fn single_function_arg_expr<'a>(
         FunctionArguments::List(list) if list.clauses.is_empty() => list.args.as_slice(),
         FunctionArguments::None => {
             return Err(CanonicalizeError::unsupported(format!(
-                "sql2 day-1 write canonicalizer requires one argument for {function_name}",
+                "public day-1 write canonicalizer requires one argument for {function_name}",
             )))
         }
         _ => {
             return Err(CanonicalizeError::unsupported(format!(
-            "sql2 day-1 write canonicalizer does not support complex arguments for {function_name}",
+            "public day-1 write canonicalizer does not support complex arguments for {function_name}",
         )))
         }
     };
     if args.len() != 1 {
         return Err(CanonicalizeError::unsupported(format!(
-            "sql2 day-1 write canonicalizer requires one argument for {function_name}",
+            "public day-1 write canonicalizer requires one argument for {function_name}",
         )));
     }
     match &args[0] {
@@ -1317,7 +1316,7 @@ fn single_function_arg_expr<'a>(
             ..
         } => Ok(expr),
         _ => Err(CanonicalizeError::unsupported(format!(
-            "sql2 day-1 write canonicalizer only supports expression arguments for {function_name}",
+            "public day-1 write canonicalizer only supports expression arguments for {function_name}",
         ))),
     }
 }
@@ -1338,7 +1337,7 @@ fn sql_value_to_engine_value(
                 Ok(Value::Real(real))
             } else {
                 Err(CanonicalizeError::unsupported(format!(
-                    "sql2 day-1 write canonicalizer could not parse numeric literal '{raw}'"
+                    "public day-1 write canonicalizer could not parse numeric literal '{raw}'"
                 )))
             }
         }
@@ -1358,19 +1357,19 @@ fn sql_value_to_engine_value(
         SqlValue::Placeholder(token) => {
             let index = resolve_placeholder_index(token, params.len(), placeholder_state).map_err(
                 |err| CanonicalizeError::unsupported(format!(
-                    "sql2 day-1 write canonicalizer could not bind placeholder: {}",
+                    "public day-1 write canonicalizer could not bind placeholder: {}",
                     err.description
                 )),
             )?;
             params.get(index).cloned().ok_or_else(|| {
                 CanonicalizeError::unsupported(format!(
-                    "sql2 day-1 write canonicalizer placeholder index {} was out of bounds",
+                    "public day-1 write canonicalizer placeholder index {} was out of bounds",
                     index + 1
                 ))
             })
         }
         _ => Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer only supports string, numeric, boolean, null, blob, and placeholder VALUES",
+            "public day-1 write canonicalizer only supports string, numeric, boolean, null, blob, and placeholder VALUES",
         )),
     }
 }
@@ -1496,7 +1495,7 @@ fn projection_expressions(
         match item {
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
                 return Err(CanonicalizeError::unsupported(
-                    "mixed wildcard projections are not supported by the sql2 day-1 canonicalizer",
+                    "mixed wildcard projections are not supported by the public day-1 canonicalizer",
                 ));
             }
             SelectItem::UnnamedExpr(expr) => expressions.push(ProjectionExpr {
@@ -1519,7 +1518,7 @@ fn normalized_public_read_query(
 ) -> Result<NormalizedPublicReadQuery, CanonicalizeError> {
     let TableFactor::Table { alias, .. } = &select.from[0].relation else {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 canonicalizer only supports direct table references",
+            "public day-1 canonicalizer only supports direct table references",
         ));
     };
 
@@ -1544,7 +1543,7 @@ fn sort_keys(order_by: Option<&OrderBy>) -> Result<Option<Vec<SortKey>>, Canonic
 
     let OrderByKind::Expressions(expressions) = &order_by.kind else {
         return Err(CanonicalizeError::unsupported(
-            "ORDER BY ALL is not supported by the sql2 day-1 canonicalizer",
+            "ORDER BY ALL is not supported by the public day-1 canonicalizer",
         ));
     };
 
@@ -1574,7 +1573,7 @@ fn limit_values(
         } => {
             if !limit_by.is_empty() {
                 return Err(CanonicalizeError::unsupported(
-                    "LIMIT BY is not supported by the sql2 day-1 canonicalizer",
+                    "LIMIT BY is not supported by the public day-1 canonicalizer",
                 ));
             }
 
@@ -1628,19 +1627,19 @@ fn expr_output_name(expr: &Expr) -> String {
 fn expr_to_u64(expr: &Expr) -> Result<u64, CanonicalizeError> {
     let Expr::Value(value) = expr else {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 canonicalizer only supports literal LIMIT/OFFSET values",
+            "public day-1 canonicalizer only supports literal LIMIT/OFFSET values",
         ));
     };
 
     let sqlparser::ast::Value::Number(raw, _) = &value.value else {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 canonicalizer only supports numeric LIMIT/OFFSET values",
+            "public day-1 canonicalizer only supports numeric LIMIT/OFFSET values",
         ));
     };
 
     raw.parse::<u64>().map_err(|_| {
         CanonicalizeError::unsupported(format!(
-            "sql2 day-1 canonicalizer could not parse numeric LIMIT/OFFSET value '{raw}'"
+            "public day-1 canonicalizer could not parse numeric LIMIT/OFFSET value '{raw}'"
         ))
     })
 }
@@ -1903,7 +1902,7 @@ mod tests {
             bound_statement("INSERT INTO lix_key_value (key, value) VALUES ('k', 'v')"),
             &registry,
         )
-        .expect("entity writes should canonicalize through the sql2 shell");
+        .expect("entity writes should canonicalize through the public shell");
 
         assert_eq!(
             canonicalized.surface_binding.descriptor.public_name,

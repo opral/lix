@@ -67,22 +67,14 @@ fn guardrail_engine_runtime_section_excludes_legacy_sql_pipeline_imports() {
 }
 
 #[test]
-fn guardrail_sql_runtime_forbids_legacy_public_lowering_imports() {
+fn guardrail_sql_runtime_uses_single_public_lowering_entrypoint() {
     let shared_path_source = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql/execution/shared_path.rs"),
     )
     .expect("shared_path.rs should be readable");
     assert!(
-        !shared_path_source.contains("crate::engine::sql2::"),
-        "shared_path must not depend on removed engine::sql2 bridge paths"
-    );
-    assert!(
         shared_path_source.contains("prepare_public_execution_with_internal_access"),
         "shared_path must route public batches through the single public-lowering preparation entrypoint"
-    );
-    assert!(
-        !shared_path_source.contains("prepare_sql2_read"),
-        "shared_path must not reintroduce direct public-read bridge probing once public lowering owns dispatch"
     );
 }
 

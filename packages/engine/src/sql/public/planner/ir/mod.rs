@@ -512,8 +512,8 @@ pub(crate) enum WriteLane {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExpectedTip {
-    CurrentTip,
+pub enum ExpectedHead {
+    CurrentHead,
     CommitId(String),
     CreateIfMissing,
 }
@@ -524,7 +524,7 @@ pub(crate) struct IdempotencyKey(pub(crate) String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitPreconditions {
     pub(crate) write_lane: WriteLane,
-    pub(crate) expected_tip: ExpectedTip,
+    pub(crate) expected_head: ExpectedHead,
     pub(crate) idempotency_key: IdempotencyKey,
 }
 

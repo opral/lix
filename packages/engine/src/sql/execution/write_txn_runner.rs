@@ -6,7 +6,7 @@ use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::execute::{self, SqlExecutionOutcome};
 use crate::sql::execution::runtime_effects::build_filesystem_payload_domain_changes_insert;
 use crate::sql::execution::shared_path::{
-    empty_public_write_execution_outcome, PendingPublicAppendSession,
+    empty_public_write_execution_outcome, PendingPublicCommitSession,
 };
 use crate::sql::execution::tracked_write_runner::run_tracked_write_txn_plan_with_transaction;
 use crate::sql::execution::write_txn_plan::{
@@ -19,7 +19,7 @@ use crate::{LixError, LixTransaction, QueryResult, Value};
 pub(crate) async fn run_write_txn_plan_with_backend(
     engine: &Engine,
     plan: &WriteTxnPlan,
-    pending_append_session: Option<&mut Option<PendingPublicAppendSession>>,
+    pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
 ) -> Result<SqlExecutionOutcome, LixError> {
     let mut transaction = engine.backend.begin_transaction().await?;
     let result = run_write_txn_plan_with_transaction(
@@ -27,7 +27,7 @@ pub(crate) async fn run_write_txn_plan_with_backend(
         transaction.as_mut(),
         plan,
         WriteTxnRunMode::Owned,
-        pending_append_session,
+        pending_commit_session,
     )
     .await;
     match result {
@@ -47,7 +47,7 @@ pub(crate) async fn run_write_txn_plan_with_transaction(
     transaction: &mut dyn LixTransaction,
     plan: &WriteTxnPlan,
     mode: WriteTxnRunMode,
-    mut pending_append_session: Option<&mut Option<PendingPublicAppendSession>>,
+    mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
 ) -> Result<SqlExecutionOutcome, LixError> {
     let mut combined = None;
 
@@ -58,7 +58,7 @@ pub(crate) async fn run_write_txn_plan_with_transaction(
                     engine,
                     transaction,
                     tracked,
-                    pending_append_session.as_deref_mut(),
+                    pending_commit_session.as_deref_mut(),
                 )
                 .await?
             }

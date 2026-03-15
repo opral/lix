@@ -184,11 +184,11 @@ fn try_merge_filesystem_tracked_plans(
             .target
             .descriptor
             .public_name
-        || current.execution.append_preconditions.write_lane
-            != next.execution.append_preconditions.write_lane
-        || !append_expected_tip_compatible(
-            &current.execution.append_preconditions.expected_tip,
-            &next.execution.append_preconditions.expected_tip,
+        || current.execution.create_preconditions.write_lane
+            != next.execution.create_preconditions.write_lane
+        || !create_commit_expected_head_compatible(
+            &current.execution.create_preconditions.expected_head,
+            &next.execution.create_preconditions.expected_head,
         )
         || current.writer_key != next.writer_key
         || !tracked_plan_entity_targets_disjoint(current, next)
@@ -246,22 +246,22 @@ fn tracked_plan_is_coalescible_filesystem(plan: &TrackedWriteTxnPlan) -> bool {
     )
 }
 
-fn append_expected_tip_compatible(
-    left: &crate::state::commit::AppendExpectedTip,
-    right: &crate::state::commit::AppendExpectedTip,
+fn create_commit_expected_head_compatible(
+    left: &crate::state::commit::CreateCommitExpectedHead,
+    right: &crate::state::commit::CreateCommitExpectedHead,
 ) -> bool {
     match (left, right) {
         (
-            crate::state::commit::AppendExpectedTip::CurrentTip,
-            crate::state::commit::AppendExpectedTip::CurrentTip,
+            crate::state::commit::CreateCommitExpectedHead::CurrentHead,
+            crate::state::commit::CreateCommitExpectedHead::CurrentHead,
         ) => true,
         (
-            crate::state::commit::AppendExpectedTip::CommitId(left),
-            crate::state::commit::AppendExpectedTip::CommitId(right),
+            crate::state::commit::CreateCommitExpectedHead::CommitId(left),
+            crate::state::commit::CreateCommitExpectedHead::CommitId(right),
         ) => left == right,
         (
-            crate::state::commit::AppendExpectedTip::CreateIfMissing,
-            crate::state::commit::AppendExpectedTip::CreateIfMissing,
+            crate::state::commit::CreateCommitExpectedHead::CreateIfMissing,
+            crate::state::commit::CreateCommitExpectedHead::CreateIfMissing,
         ) => true,
         _ => false,
     }

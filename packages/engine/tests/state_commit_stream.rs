@@ -267,7 +267,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    state_commit_stream_sql2_entity_insert_emits_one_semantic_change,
+    state_commit_stream_public_entity_insert_emits_one_semantic_change,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -278,13 +278,13 @@ simulation_test!(
 
         let events = engine.state_commit_stream(StateCommitStreamFilter {
             schema_keys: vec!["lix_key_value".to_string()],
-            entity_ids: vec!["state-commit-sql2-entity".to_string()],
+            entity_ids: vec!["state-commit-public-entity".to_string()],
             ..StateCommitStreamFilter::default()
         });
 
         engine
             .execute(
-                &insert_key_value_entity_sql("state-commit-sql2-entity", "v0"),
+                &insert_key_value_entity_sql("state-commit-public-entity", "v0"),
                 &[],
             )
             .await
@@ -292,19 +292,19 @@ simulation_test!(
 
         let batch = events
             .try_next()
-            .expect("expected a state commit batch from the sql2 entity write");
+            .expect("expected a state commit batch from the public entity write");
         assert_eq!(
             batch.changes.len(),
             1,
-            "sql2 live writes should emit one semantic change batch entry"
+            "public live writes should emit one semantic change batch entry"
         );
         let change = &batch.changes[0];
         assert_eq!(change.operation, StateCommitStreamOperation::Insert);
-        assert_eq!(change.entity_id, "state-commit-sql2-entity");
+        assert_eq!(change.entity_id, "state-commit-public-entity");
         assert_eq!(change.schema_key, "lix_key_value");
         assert!(
             events.try_next().is_none(),
-            "sql2 entity insert should emit exactly one batch"
+            "public entity insert should emit exactly one batch"
         );
     }
 );

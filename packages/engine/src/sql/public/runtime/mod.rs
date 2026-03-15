@@ -37,8 +37,8 @@ use crate::sql::public::planner::semantics::effective_state_resolver::{
 use crate::sql::public::planner::semantics::write_analysis::analyze_write;
 use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan;
 use crate::state::commit::{
-    load_committed_version_head_commit_id, AppendCommitPreconditions, AppendExpectedTip,
-    AppendIdempotencyKey, AppendWriteLane, ProposedDomainChange,
+    load_committed_version_head_commit_id, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
+    CreateCommitPreconditions, CreateCommitWriteLane, ProposedDomainChange,
 };
 use crate::state::stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
@@ -94,7 +94,7 @@ pub(crate) struct PublicExecutionDebugTrace {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PublicWriteInvariantTrace {
     pub(crate) batch_local_checks: Vec<String>,
-    pub(crate) append_time_checks: Vec<String>,
+    pub(crate) commit_time_checks: Vec<String>,
     pub(crate) physical_checks: Vec<String>,
 }
 
@@ -175,7 +175,7 @@ pub(crate) struct TrackedWriteExecution {
     pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub(crate) domain_change_batch: Option<DomainChangeBatch>,
     pub(crate) lazy_exact_file_updates: Vec<crate::sql::public::planner::ir::LazyExactFileUpdate>,
-    pub(crate) append_preconditions: AppendCommitPreconditions,
+    pub(crate) create_preconditions: CreateCommitPreconditions,
     pub(crate) semantic_effects: PlanEffects,
     pub(crate) persist_filesystem_payloads_before_write: bool,
     pub(crate) filesystem_payload_changes_committed_by_write: bool,
@@ -1633,7 +1633,7 @@ fn build_public_write_execution(
                     TrackedWriteExecution {
                         schema_live_table_requirements:
                             schema_live_table_requirements_from_partition(partition),
-                        append_preconditions: append_commit_preconditions_for_public_write(
+                        create_preconditions: create_commit_preconditions_for_public_write(
                             planned_write,
                             domain_change_batch.as_ref(),
                             commit_preconditions,
@@ -1871,14 +1871,14 @@ pub(crate) fn state_commit_stream_operation(
     }
 }
 
-fn append_commit_preconditions_for_public_write(
+fn create_commit_preconditions_for_public_write(
     planned_write: &PlannedWrite,
     batch: Option<&DomainChangeBatch>,
     commit_preconditions: &CommitPreconditions,
-) -> Result<AppendCommitPreconditions, LixError> {
+) -> Result<CreateCommitPreconditions, LixError> {
     let write_lane = match &commit_preconditions.write_lane {
         crate::sql::public::planner::ir::WriteLane::SingleVersion(version_id) => {
-            AppendWriteLane::Version(version_id.clone())
+            CreateCommitWriteLane::Version(version_id.clone())
         }
         crate::sql::public::planner::ir::WriteLane::ActiveVersion => {
             let version_id = batch
@@ -1896,33 +1896,37 @@ fn append_commit_preconditions_for_public_write(
                 .ok_or_else(|| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
-                        "public append execution requires a concrete active version id",
+                        "public commit execution requires a concrete active version id",
                     )
                 })?;
-            AppendWriteLane::Version(version_id)
+            CreateCommitWriteLane::Version(version_id)
         }
-        crate::sql::public::planner::ir::WriteLane::GlobalAdmin => AppendWriteLane::GlobalAdmin,
+        crate::sql::public::planner::ir::WriteLane::GlobalAdmin => {
+            CreateCommitWriteLane::GlobalAdmin
+        }
     };
-    let expected_tip = match &commit_preconditions.expected_tip {
-        crate::sql::public::planner::ir::ExpectedTip::CurrentTip => AppendExpectedTip::CurrentTip,
-        crate::sql::public::planner::ir::ExpectedTip::CommitId(commit_id) => {
-            AppendExpectedTip::CommitId(commit_id.clone())
+    let expected_head = match &commit_preconditions.expected_head {
+        crate::sql::public::planner::ir::ExpectedHead::CurrentHead => {
+            CreateCommitExpectedHead::CurrentHead
         }
-        crate::sql::public::planner::ir::ExpectedTip::CreateIfMissing => {
-            AppendExpectedTip::CreateIfMissing
+        crate::sql::public::planner::ir::ExpectedHead::CommitId(commit_id) => {
+            CreateCommitExpectedHead::CommitId(commit_id.clone())
+        }
+        crate::sql::public::planner::ir::ExpectedHead::CreateIfMissing => {
+            CreateCommitExpectedHead::CreateIfMissing
         }
     };
 
-    Ok(AppendCommitPreconditions {
+    Ok(CreateCommitPreconditions {
         write_lane,
-        expected_tip,
-        idempotency_key: match &commit_preconditions.expected_tip {
-            crate::sql::public::planner::ir::ExpectedTip::CurrentTip => {
-                AppendIdempotencyKey::CurrentTipFingerprint(
+        expected_head,
+        idempotency_key: match &commit_preconditions.expected_head {
+            crate::sql::public::planner::ir::ExpectedHead::CurrentHead => {
+                CreateCommitIdempotencyKey::CurrentHeadFingerprint(
                     commit_preconditions.idempotency_key.0.clone(),
                 )
             }
-            _ => AppendIdempotencyKey::Exact(commit_preconditions.idempotency_key.0.clone()),
+            _ => CreateCommitIdempotencyKey::Exact(commit_preconditions.idempotency_key.0.clone()),
         },
     })
 }
@@ -2226,15 +2230,15 @@ fn public_write_phase_trace() -> Vec<String> {
         "build_domain_change_batch".to_string(),
         "derive_commit_preconditions".to_string(),
         "validate_batch_local_write".to_string(),
-        "append_time_invariant_recheck".to_string(),
-        "append_commit_if_preconditions_hold".to_string(),
+        "commit_time_invariant_recheck".to_string(),
+        "create_commit".to_string(),
     ]
 }
 
 fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWriteInvariantTrace {
     let mut batch_local_checks = Vec::new();
-    let mut append_time_checks = vec![
-        "write_lane.tip_precondition".to_string(),
+    let mut commit_time_checks = vec![
+        "write_lane.head_precondition".to_string(),
         "idempotency_key.recheck".to_string(),
     ];
     let mut physical_checks = Vec::new();
@@ -2242,7 +2246,7 @@ fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWri
     if planned_write.command.operation_kind
         == crate::sql::public::planner::ir::WriteOperationKind::Update
     {
-        append_time_checks.push("schema_mutability.recheck".to_string());
+        commit_time_checks.push("schema_mutability.recheck".to_string());
     }
 
     if let Some(resolved) = planned_write.resolved_write_plan.as_ref() {
@@ -2292,7 +2296,7 @@ fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWri
 
     PublicWriteInvariantTrace {
         batch_local_checks,
-        append_time_checks,
+        commit_time_checks,
         physical_checks,
     }
 }

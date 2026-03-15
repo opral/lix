@@ -144,7 +144,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    observe_sql2_entity_view_emits_after_live_write,
+    observe_public_entity_view_emits_after_live_write,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -158,7 +158,7 @@ simulation_test!(
                 "SELECT key, value \
                  FROM lix_key_value \
                  WHERE key = ?1",
-                vec![Value::Text("observe-sql2-entity".to_string())],
+                vec![Value::Text("observe-public-entity".to_string())],
             ))
             .expect("observe should succeed");
 
@@ -167,7 +167,7 @@ simulation_test!(
 
         engine
             .execute(
-                &insert_key_value_entity_sql("observe-sql2-entity", "v0"),
+                &insert_key_value_entity_sql("observe-public-entity", "v0"),
                 &[],
             )
             .await
@@ -179,7 +179,7 @@ simulation_test!(
         assert_eq!(
             update.rows.rows[0],
             vec![
-                Value::Text("observe-sql2-entity".to_string()),
+                Value::Text("observe-public-entity".to_string()),
                 Value::Text("v0".to_string())
             ]
         );

@@ -1,16 +1,16 @@
 #[allow(dead_code)]
-mod append_commit;
+mod create_commit;
 mod generate_commit;
 mod runtime;
 mod state_source;
 mod types;
 
 #[allow(unused_imports)]
-pub(crate) use append_commit::{
-    append_commit_if_preconditions_hold, AppendCommitArgs, AppendCommitDisposition,
-    AppendCommitError, AppendCommitErrorKind, AppendCommitInvariantChecker,
-    AppendCommitPreconditions, AppendCommitResult, AppendExpectedTip, AppendIdempotencyKey,
-    AppendWriteLane,
+pub(crate) use create_commit::{
+    create_commit, CreateCommitArgs, CreateCommitDisposition, CreateCommitError,
+    CreateCommitErrorKind, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
+    CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitResult,
+    CreateCommitWriteLane,
 };
 pub(crate) use generate_commit::generate_commit;
 pub(crate) use runtime::{

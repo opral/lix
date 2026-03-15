@@ -300,7 +300,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    transaction_path_sql2_registered_schema_write_updates_bootstrap_for_followup_dynamic_surface_use,
+    transaction_path_public_registered_schema_write_updates_bootstrap_for_followup_dynamic_surface_use,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim

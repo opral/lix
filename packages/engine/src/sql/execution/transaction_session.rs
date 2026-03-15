@@ -64,8 +64,8 @@ struct SessionTransaction {
     installed_plugins_cache_invalidation_pending: bool,
     public_surface_registry_dirty: bool,
     pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
-    pending_public_append_session:
-        Option<crate::sql::execution::shared_path::PendingPublicAppendSession>,
+    pending_public_commit_session:
+        Option<crate::sql::execution::shared_path::PendingPublicCommitSession>,
 }
 
 impl SessionTransaction {
@@ -157,7 +157,7 @@ async fn execute_transaction_control(
                 installed_plugins_cache_invalidation_pending: false,
                 public_surface_registry_dirty: false,
                 pending_state_commit_stream_changes: Vec::new(),
-                pending_public_append_session: None,
+                pending_public_commit_session: None,
             });
             sql_transaction_open.store(true, Ordering::SeqCst);
             Ok(empty_execute_result())
@@ -211,7 +211,7 @@ async fn execute_in_active_transaction(
                 &mut session_transaction.public_surface_registry_dirty,
                 &mut session_transaction.active_version_id,
                 &mut session_transaction.pending_state_commit_stream_changes,
-                &mut session_transaction.pending_public_append_session,
+                &mut session_transaction.pending_public_commit_session,
             )
             .await?
     } else {
@@ -228,7 +228,7 @@ async fn execute_in_active_transaction(
                 None,
                 false,
                 &mut session_transaction.pending_state_commit_stream_changes,
-                &mut session_transaction.pending_public_append_session,
+                &mut session_transaction.pending_public_commit_session,
             )
             .await?;
         ExecuteResult {

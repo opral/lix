@@ -472,7 +472,7 @@ async fn load_exact_untracked_state_row(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
-                "sql2 effective-state resolver requires exactly one untracked target row for '{}@{}'",
+                "public effective-state resolver requires exactly one untracked target row for '{}@{}'",
                 request.schema_key, request.version_id
             ),
         });
@@ -483,7 +483,8 @@ async fn load_exact_untracked_state_row(
     if row.len() < 8 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "sql2 effective-state resolver query returned too few columns".to_string(),
+            description: "public effective-state resolver query returned too few columns"
+                .to_string(),
         });
     }
 
@@ -564,7 +565,7 @@ fn required_text_value(value: &Value, label: &str) -> Result<String, LixError> {
         Value::Text(value) => Ok(value.clone()),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("sql2 effective-state resolver expected text for '{label}'"),
+            description: format!("public effective-state resolver expected text for '{label}'"),
         }),
     }
 }
