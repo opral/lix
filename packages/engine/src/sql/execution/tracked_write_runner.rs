@@ -129,6 +129,11 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
     }
 
     let mut invariant_checker = Sql2AppendInvariantChecker::new(&plan.public_write.planned_write);
+    let invariant_checker = if plan.is_merged_transaction_plan() {
+        None
+    } else {
+        Some(&mut invariant_checker as &mut dyn AppendCommitInvariantChecker)
+    };
     let append_result = append_commit_if_preconditions_hold(
         transaction,
         AppendCommitArgs {
@@ -145,7 +150,7 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
             observe_tick_writer_key: plan.writer_key.clone(),
         },
         &mut append_functions,
-        Some(&mut invariant_checker),
+        invariant_checker,
     )
     .await
     .map_err(append_commit_error_to_lix_error)?;

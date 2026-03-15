@@ -7,6 +7,7 @@ use super::{PreparedPublicWrite, TrackedWriteExecution};
 
 #[derive(Clone)]
 pub(crate) struct TrackedWriteTxnPlan {
+    pub(crate) public_writes: Vec<PreparedPublicWrite>,
     pub(crate) public_write: PreparedPublicWrite,
     pub(crate) execution: TrackedWriteExecution,
     pub(crate) pending_file_writes: Vec<PendingFileWrite>,
@@ -27,6 +28,10 @@ impl TrackedWriteTxnPlan {
     pub(crate) fn has_lazy_exact_file_updates(&self) -> bool {
         !self.execution.lazy_exact_file_updates.is_empty()
     }
+
+    pub(crate) fn is_merged_transaction_plan(&self) -> bool {
+        self.public_writes.len() > 1
+    }
 }
 
 pub(crate) fn build_tracked_write_txn_plan(
@@ -36,6 +41,7 @@ pub(crate) fn build_tracked_write_txn_plan(
     writer_key: Option<&str>,
 ) -> TrackedWriteTxnPlan {
     TrackedWriteTxnPlan {
+        public_writes: vec![public_write.clone()],
         public_write: public_write.clone(),
         execution: execution.clone(),
         pending_file_writes: prepared.intent.pending_file_writes.clone(),
