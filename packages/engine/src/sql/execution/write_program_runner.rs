@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
+use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
 use crate::state::internal::write_program::{
-    lower_write_program, PreparedParam, PreparedProgram, ProgramSlot, ProgramSlotId, SlotShape,
-    WriteProgram,
+    PreparedParam, PreparedProgram, ProgramSlot, ProgramSlotId, SlotShape, WriteProgram, WriteStep,
 };
 use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
 
@@ -11,11 +11,7 @@ pub(crate) async fn execute_write_program_with_backend(
     program: WriteProgram,
 ) -> Result<QueryResult, LixError> {
     let mut transaction = backend.begin_transaction().await?;
-    let result = execute_prepared_program_with_transaction(
-        transaction.as_mut(),
-        &lower_write_program(program),
-    )
-    .await;
+    let result = execute_write_program_steps_with_transaction(transaction.as_mut(), program).await;
     match result {
         Ok(result) => {
             transaction.commit().await?;
@@ -32,9 +28,26 @@ pub(crate) async fn execute_write_program_with_transaction(
     transaction: &mut dyn LixTransaction,
     program: WriteProgram,
 ) -> Result<QueryResult, LixError> {
-    execute_prepared_program_with_transaction(transaction, &lower_write_program(program)).await
+    execute_write_program_steps_with_transaction(transaction, program).await
 }
 
+async fn execute_write_program_steps_with_transaction(
+    transaction: &mut dyn LixTransaction,
+    program: WriteProgram,
+) -> Result<QueryResult, LixError> {
+    let mut batch = PreparedBatch { steps: Vec::new() };
+    for step in program.steps {
+        match step {
+            WriteStep::PreparedBatch(other) => batch.extend(other),
+            WriteStep::Statement { sql, params } => {
+                batch.push_statement(PreparedStatement { sql, params });
+            }
+        }
+    }
+    transaction.execute_batch(&batch).await
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn execute_prepared_program_with_transaction(
     transaction: &mut dyn LixTransaction,
     program: &PreparedProgram,
@@ -80,6 +93,7 @@ pub(crate) async fn execute_prepared_program_with_transaction(
     Ok(last_result)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_params(
     slot_defs: &BTreeMap<ProgramSlotId, &ProgramSlot>,
     slot_values: &BTreeMap<ProgramSlotId, QueryResult>,
@@ -99,6 +113,7 @@ fn resolve_params(
         .collect()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_scalar_slot(
     slot_defs: &BTreeMap<ProgramSlotId, &ProgramSlot>,
     slot_values: &BTreeMap<ProgramSlotId, QueryResult>,
@@ -129,6 +144,7 @@ fn resolve_scalar_slot(
     Ok(value)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_row_column(
     slot_defs: &BTreeMap<ProgramSlotId, &ProgramSlot>,
     slot_values: &BTreeMap<ProgramSlotId, QueryResult>,
@@ -195,6 +211,7 @@ fn resolve_row_column(
     Ok(row.get(index).cloned().unwrap_or(Value::Null))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_slot_capture(slot: &ProgramSlot, result: &QueryResult) -> Result<(), LixError> {
     match slot.shape {
         SlotShape::Scalar => {
@@ -243,6 +260,7 @@ fn validate_slot_capture(slot: &ProgramSlot, result: &QueryResult) -> Result<(),
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn slot_shape_error(slot: &ProgramSlot, message: &str) -> LixError {
     LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),

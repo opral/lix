@@ -21,6 +21,7 @@ pub(crate) struct SqlExecutionOutcome {
     pub(crate) plugin_changes_committed: bool,
     pub(crate) plan_effects_override: Option<PlanEffects>,
     pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
+    pub(crate) observe_tick_emitted: bool,
 }
 
 pub(crate) async fn execute_plan_sql(
@@ -63,6 +64,7 @@ pub(crate) async fn execute_plan_sql(
         plugin_changes_committed,
         plan_effects_override: None,
         state_commit_stream_changes,
+        observe_tick_emitted: false,
     })
 }
 
@@ -103,6 +105,7 @@ pub(crate) async fn execute_plan_sql_with_transaction(
         plugin_changes_committed,
         plan_effects_override: None,
         state_commit_stream_changes,
+        observe_tick_emitted: false,
     })
 }
 

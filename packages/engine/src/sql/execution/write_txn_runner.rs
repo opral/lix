@@ -169,6 +169,12 @@ async fn run_public_untracked_write_txn_with_transaction(
         plugin_changes_committed: false,
         plan_effects_override: Some(plan.execution.semantic_effects.clone()),
         state_commit_stream_changes: Vec::new(),
+        observe_tick_emitted: matches!(mode, WriteTxnRunMode::Owned)
+            && !plan
+                .execution
+                .semantic_effects
+                .state_commit_stream_changes
+                .is_empty(),
     }))
 }
 
@@ -267,6 +273,7 @@ fn merge_sql_execution_outcome(
     existing
         .state_commit_stream_changes
         .extend(outcome.state_commit_stream_changes);
+    existing.observe_tick_emitted |= outcome.observe_tick_emitted;
     merge_plan_effects_override(
         &mut existing.plan_effects_override,
         outcome.plan_effects_override,
