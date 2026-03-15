@@ -4,11 +4,12 @@ use crate::engine::{
 };
 use crate::sql::analysis::history_reads as history_plugin_inputs;
 use crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange;
+use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::sql::storage::queries::{
     filesystem as filesystem_queries, history as history_queries, state as state_queries,
 };
 use crate::sql::storage::tables;
-use crate::state::internal::write_program::{WriteProgram, WriteStep};
+use crate::state::internal::write_program::WriteProgram;
 use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
 use sqlparser::ast::Statement;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +17,56 @@ use std::collections::{BTreeMap, BTreeSet};
 const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
+const SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 32_766;
+const POSTGRES_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 65_535;
+
+pub(crate) struct BinaryBlobWriteInput<'a> {
+    pub(crate) file_id: &'a str,
+    pub(crate) version_id: &'a str,
+    pub(crate) data: &'a [u8],
+}
+
+#[derive(Debug, Clone)]
+struct BinaryBlobManifestRow {
+    blob_hash: String,
+    size_bytes: i64,
+    chunk_count: i64,
+    created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct BinaryBlobStoreRow {
+    blob_hash: String,
+    data: Vec<u8>,
+    size_bytes: i64,
+    created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct BinaryChunkStoreRow {
+    chunk_hash: String,
+    data: Vec<u8>,
+    size_bytes: i64,
+    codec: String,
+    codec_dict_id: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct BinaryBlobManifestChunkRow {
+    blob_hash: String,
+    chunk_index: i64,
+    chunk_hash: String,
+    chunk_size: i64,
+}
+
+#[derive(Debug, Default)]
+struct TrackedFilesystemPayloadBatch {
+    blob_manifest_rows: Vec<BinaryBlobManifestRow>,
+    blob_store_rows: Vec<BinaryBlobStoreRow>,
+    chunk_store_rows: Vec<BinaryChunkStoreRow>,
+    manifest_chunk_rows: Vec<BinaryBlobManifestChunkRow>,
+}
 
 async fn resolve_pending_write_file_id_in_transaction(
     transaction: &mut dyn LixTransaction,
@@ -288,6 +339,7 @@ impl Engine {
             latest_index_by_key.insert((resolved_file_id, write.version_id.clone()), index);
         }
 
+        let mut payloads = Vec::with_capacity(latest_index_by_key.len());
         for ((file_id, version_id), index) in &latest_index_by_key {
             let write = writes.get(*index).ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -296,14 +348,14 @@ impl Engine {
                     index, file_id, version_id
                 ),
             })?;
-            persist_binary_blob_with_fastcdc_in_transaction(
-                transaction,
+            payloads.push(BinaryBlobWriteInput {
                 file_id,
                 version_id,
-                &write.after_data,
-            )
-            .await?;
+                data: &write.after_data,
+            });
         }
+        let program = build_binary_blob_fastcdc_write_program(transaction.dialect(), &payloads)?;
+        execute_write_program_with_transaction(transaction, program).await?;
 
         Ok(())
     }
@@ -361,6 +413,28 @@ fn values_row_placeholders_sql(row_index: usize, values_per_row: usize) -> Strin
         .collect::<Vec<_>>()
         .join(", ");
     format!("({placeholders})")
+}
+
+fn build_bulk_insert_binary_blob_manifest_sql(rows: &[String]) -> String {
+    format!(
+        "INSERT INTO {} (blob_hash, size_bytes, chunk_count, created_at) \
+         VALUES {} \
+         ON CONFLICT (blob_hash) DO NOTHING",
+        tables::filesystem::INTERNAL_BINARY_BLOB_MANIFEST,
+        rows.join(", ")
+    )
+}
+
+fn build_bulk_upsert_binary_blob_store_sql(rows: &[String]) -> String {
+    format!(
+        "INSERT INTO {} (blob_hash, data, size_bytes, created_at) \
+         VALUES {} \
+         ON CONFLICT (blob_hash) DO UPDATE SET \
+         data = EXCLUDED.data, \
+         size_bytes = EXCLUDED.size_bytes",
+        tables::filesystem::INTERNAL_BINARY_BLOB_STORE,
+        rows.join(", ")
+    )
 }
 
 fn build_bulk_insert_binary_chunk_store_sql(rows: &[String]) -> String {
@@ -421,141 +495,239 @@ impl<'a> BinaryCasExecutor for TransactionBinaryCasExecutor<'a> {
     }
 }
 
-async fn persist_binary_blob_with_fastcdc_in_transaction(
-    transaction: &mut dyn LixTransaction,
-    file_id: &str,
-    version_id: &str,
-    data: &[u8],
-) -> Result<(), LixError> {
-    let mut executor = TransactionBinaryCasExecutor { transaction };
-    persist_binary_blob_with_fastcdc(&mut executor, file_id, version_id, data).await
-}
-
-async fn persist_binary_blob_with_fastcdc(
-    executor: &mut dyn BinaryCasExecutor,
-    file_id: &str,
-    version_id: &str,
-    data: &[u8],
-) -> Result<(), LixError> {
-    let program = build_binary_blob_fastcdc_write_program(file_id, version_id, data)?;
-    for step in program.steps {
-        match step {
-            WriteStep::PreparedBatch(batch) => {
-                executor.execute_sql(&batch.sql, &batch.params).await?;
-            }
-            WriteStep::Statement { sql, params } => {
-                executor.execute_sql(&sql, &params).await?;
-            }
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn build_binary_blob_fastcdc_write_program(
-    file_id: &str,
-    version_id: &str,
-    data: &[u8],
+    dialect: SqlDialect,
+    payloads: &[BinaryBlobWriteInput<'_>],
 ) -> Result<WriteProgram, LixError> {
-    let blob_hash = crate::plugin::runtime::binary_blob_hash_hex(data);
-    let size_bytes = i64::try_from(data.len()).map_err(|_| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "binary blob size exceeds supported range for file '{}' version '{}'",
-            file_id, version_id
-        ),
-    })?;
-    let chunk_ranges = fastcdc_chunk_ranges(data);
-    let chunk_count = i64::try_from(chunk_ranges.len()).map_err(|_| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "binary chunk count exceeds supported range for file '{}' version '{}'",
-            file_id, version_id
-        ),
-    })?;
-    let now = crate::functions::timestamp::timestamp();
-
+    let batch = build_tracked_filesystem_payload_batch(payloads)?;
     let mut program = WriteProgram::new();
-    program.push_statement(
-        filesystem_queries::insert_binary_blob_manifest_sql(),
-        vec![
-            Value::Text(blob_hash.clone()),
-            Value::Integer(size_bytes),
-            Value::Integer(chunk_count),
-            Value::Text(now.clone()),
-        ],
-    );
-    program.push_statement(
-        filesystem_queries::upsert_binary_blob_store_sql(),
-        vec![
-            Value::Text(blob_hash.clone()),
-            Value::Blob(data.to_vec()),
-            Value::Integer(size_bytes),
-            Value::Text(now.clone()),
-        ],
-    );
 
-    if !chunk_ranges.is_empty() {
-        let mut chunk_store_rows = Vec::with_capacity(chunk_ranges.len());
-        let mut chunk_store_params = Vec::with_capacity(chunk_ranges.len() * 6);
-        let mut manifest_chunk_rows = Vec::with_capacity(chunk_ranges.len());
-        let mut manifest_chunk_params = Vec::with_capacity(chunk_ranges.len() * 4);
+    push_blob_manifest_rows(&mut program, dialect, &batch.blob_manifest_rows);
+    push_blob_store_rows(&mut program, dialect, &batch.blob_store_rows);
+    push_chunk_store_rows(&mut program, dialect, &batch.chunk_store_rows);
+    push_manifest_chunk_rows(&mut program, dialect, &batch.manifest_chunk_rows);
+
+    Ok(program)
+}
+
+fn build_tracked_filesystem_payload_batch(
+    payloads: &[BinaryBlobWriteInput<'_>],
+) -> Result<TrackedFilesystemPayloadBatch, LixError> {
+    let now = crate::functions::timestamp::timestamp();
+    let mut manifest_rows = BTreeMap::<String, BinaryBlobManifestRow>::new();
+    let mut blob_store_rows = BTreeMap::<String, BinaryBlobStoreRow>::new();
+    let mut chunk_store_rows = BTreeMap::<String, BinaryChunkStoreRow>::new();
+    let mut manifest_chunk_rows = BTreeMap::<(String, i64), BinaryBlobManifestChunkRow>::new();
+
+    for payload in payloads {
+        let blob_hash = crate::plugin::runtime::binary_blob_hash_hex(payload.data);
+        let size_bytes = i64::try_from(payload.data.len()).map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "binary blob size exceeds supported range for file '{}' version '{}'",
+                payload.file_id, payload.version_id
+            ),
+        })?;
+        let chunk_ranges = fastcdc_chunk_ranges(payload.data);
+        let chunk_count = i64::try_from(chunk_ranges.len()).map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "binary chunk count exceeds supported range for file '{}' version '{}'",
+                payload.file_id, payload.version_id
+            ),
+        })?;
+
+        manifest_rows
+            .entry(blob_hash.clone())
+            .or_insert_with(|| BinaryBlobManifestRow {
+                blob_hash: blob_hash.clone(),
+                size_bytes,
+                chunk_count,
+                created_at: now.clone(),
+            });
+        blob_store_rows
+            .entry(blob_hash.clone())
+            .or_insert_with(|| BinaryBlobStoreRow {
+                blob_hash: blob_hash.clone(),
+                data: payload.data.to_vec(),
+                size_bytes,
+                created_at: now.clone(),
+            });
 
         for (chunk_index, (start, end)) in chunk_ranges.iter().copied().enumerate() {
-            let chunk_data = data[start..end].to_vec();
+            let chunk_data = payload.data[start..end].to_vec();
             let encoded_chunk = encode_binary_chunk_payload(&chunk_data)?;
             let chunk_hash = crate::plugin::runtime::binary_blob_hash_hex(&chunk_data);
             let chunk_size = i64::try_from(chunk_data.len()).map_err(|_| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
                     "binary chunk size exceeds supported range for file '{}' version '{}'",
-                    file_id, version_id
+                    payload.file_id, payload.version_id
                 ),
             })?;
             let stored_chunk_size =
                 i64::try_from(encoded_chunk.data.len()).map_err(|_| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: format!(
-                    "binary stored chunk size exceeds supported range for file '{}' version '{}'",
-                    file_id, version_id
-                ),
+                        "binary stored chunk size exceeds supported range for file '{}' version '{}'",
+                        payload.file_id, payload.version_id
+                    ),
                 })?;
             let chunk_index = i64::try_from(chunk_index).map_err(|_| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
                     "binary chunk index exceeds supported range for file '{}' version '{}'",
-                    file_id, version_id
+                    payload.file_id, payload.version_id
                 ),
             })?;
 
-            chunk_store_rows.push(values_row_placeholders_sql(chunk_store_rows.len(), 6));
-            chunk_store_params.push(Value::Text(chunk_hash.clone()));
-            chunk_store_params.push(Value::Blob(encoded_chunk.data));
-            chunk_store_params.push(Value::Integer(stored_chunk_size));
-            chunk_store_params.push(Value::Text(encoded_chunk.codec.to_string()));
-            chunk_store_params.push(match encoded_chunk.codec_dict_id {
-                Some(codec_dict_id) => Value::Text(codec_dict_id),
-                None => Value::Null,
-            });
-            chunk_store_params.push(Value::Text(now.clone()));
-
-            manifest_chunk_rows.push(values_row_placeholders_sql(manifest_chunk_rows.len(), 4));
-            manifest_chunk_params.push(Value::Text(blob_hash.clone()));
-            manifest_chunk_params.push(Value::Integer(chunk_index));
-            manifest_chunk_params.push(Value::Text(chunk_hash));
-            manifest_chunk_params.push(Value::Integer(chunk_size));
+            chunk_store_rows
+                .entry(chunk_hash.clone())
+                .or_insert_with(|| BinaryChunkStoreRow {
+                    chunk_hash: chunk_hash.clone(),
+                    data: encoded_chunk.data,
+                    size_bytes: stored_chunk_size,
+                    codec: encoded_chunk.codec.to_string(),
+                    codec_dict_id: encoded_chunk.codec_dict_id,
+                    created_at: now.clone(),
+                });
+            manifest_chunk_rows
+                .entry((blob_hash.clone(), chunk_index))
+                .or_insert_with(|| BinaryBlobManifestChunkRow {
+                    blob_hash: blob_hash.clone(),
+                    chunk_index,
+                    chunk_hash,
+                    chunk_size,
+                });
         }
-
-        program.push_statement(
-            build_bulk_insert_binary_chunk_store_sql(&chunk_store_rows),
-            chunk_store_params,
-        );
-        program.push_statement(
-            build_bulk_insert_binary_blob_manifest_chunk_sql(&manifest_chunk_rows),
-            manifest_chunk_params,
-        );
     }
 
-    Ok(program)
+    Ok(TrackedFilesystemPayloadBatch {
+        blob_manifest_rows: manifest_rows.into_values().collect(),
+        blob_store_rows: blob_store_rows.into_values().collect(),
+        chunk_store_rows: chunk_store_rows.into_values().collect(),
+        manifest_chunk_rows: manifest_chunk_rows.into_values().collect(),
+    })
+}
+
+fn push_blob_manifest_rows(
+    program: &mut WriteProgram,
+    dialect: SqlDialect,
+    rows: &[BinaryBlobManifestRow],
+) {
+    push_chunked_payload_statement(
+        program,
+        dialect,
+        rows,
+        4,
+        |rows| build_bulk_insert_binary_blob_manifest_sql(rows),
+        |row, params| {
+            params.push(Value::Text(row.blob_hash.clone()));
+            params.push(Value::Integer(row.size_bytes));
+            params.push(Value::Integer(row.chunk_count));
+            params.push(Value::Text(row.created_at.clone()));
+        },
+    );
+}
+
+fn push_blob_store_rows(
+    program: &mut WriteProgram,
+    dialect: SqlDialect,
+    rows: &[BinaryBlobStoreRow],
+) {
+    push_chunked_payload_statement(
+        program,
+        dialect,
+        rows,
+        4,
+        |rows| build_bulk_upsert_binary_blob_store_sql(rows),
+        |row, params| {
+            params.push(Value::Text(row.blob_hash.clone()));
+            params.push(Value::Blob(row.data.clone()));
+            params.push(Value::Integer(row.size_bytes));
+            params.push(Value::Text(row.created_at.clone()));
+        },
+    );
+}
+
+fn push_chunk_store_rows(
+    program: &mut WriteProgram,
+    dialect: SqlDialect,
+    rows: &[BinaryChunkStoreRow],
+) {
+    push_chunked_payload_statement(
+        program,
+        dialect,
+        rows,
+        6,
+        |rows| build_bulk_insert_binary_chunk_store_sql(rows),
+        |row, params| {
+            params.push(Value::Text(row.chunk_hash.clone()));
+            params.push(Value::Blob(row.data.clone()));
+            params.push(Value::Integer(row.size_bytes));
+            params.push(Value::Text(row.codec.clone()));
+            params.push(match &row.codec_dict_id {
+                Some(codec_dict_id) => Value::Text(codec_dict_id.clone()),
+                None => Value::Null,
+            });
+            params.push(Value::Text(row.created_at.clone()));
+        },
+    );
+}
+
+fn push_manifest_chunk_rows(
+    program: &mut WriteProgram,
+    dialect: SqlDialect,
+    rows: &[BinaryBlobManifestChunkRow],
+) {
+    push_chunked_payload_statement(
+        program,
+        dialect,
+        rows,
+        4,
+        |rows| build_bulk_insert_binary_blob_manifest_chunk_sql(rows),
+        |row, params| {
+            params.push(Value::Text(row.blob_hash.clone()));
+            params.push(Value::Integer(row.chunk_index));
+            params.push(Value::Text(row.chunk_hash.clone()));
+            params.push(Value::Integer(row.chunk_size));
+        },
+    );
+}
+
+fn push_chunked_payload_statement<Row>(
+    program: &mut WriteProgram,
+    dialect: SqlDialect,
+    rows: &[Row],
+    params_per_row: usize,
+    build_sql: impl Fn(&[String]) -> String,
+    mut bind_row: impl FnMut(&Row, &mut Vec<Value>),
+) {
+    if rows.is_empty() {
+        return;
+    }
+
+    let max_rows_per_statement = max_rows_per_statement_for_dialect(dialect, params_per_row);
+    for chunk in rows.chunks(max_rows_per_statement) {
+        let placeholders = chunk
+            .iter()
+            .enumerate()
+            .map(|(index, _)| values_row_placeholders_sql(index, params_per_row))
+            .collect::<Vec<_>>();
+        let mut params = Vec::with_capacity(chunk.len() * params_per_row);
+        for row in chunk {
+            bind_row(row, &mut params);
+        }
+        program.push_statement(build_sql(&placeholders), params);
+    }
+}
+
+fn max_rows_per_statement_for_dialect(dialect: SqlDialect, params_per_row: usize) -> usize {
+    let max_params = match dialect {
+        SqlDialect::Sqlite => SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT,
+        SqlDialect::Postgres => POSTGRES_MAX_BIND_PARAMETERS_PER_STATEMENT,
+    };
+    (max_params / params_per_row).max(1)
 }
 
 fn fastcdc_chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
