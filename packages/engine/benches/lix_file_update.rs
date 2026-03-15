@@ -333,7 +333,7 @@ fn classify_phase(operation: &SqlTraceOperation) -> &'static str {
         || sql.contains("lix_internal_live_v1_lix_change_set_element")
         || sql.contains("lix_internal_live_v1_lix_commit")
         || sql.contains("lix_internal_live_v1_lix_commit_edge")
-        || sql.contains("lix_internal_live_v1_lix_version_pointer")
+        || sql.contains("lix_internal_live_v1_lix_version_ref")
     {
         return "commit_bookkeeping";
     }

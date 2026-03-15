@@ -6,7 +6,7 @@ use crate::account::{
 };
 use crate::deterministic_mode::build_persist_sequence_highest_sql;
 use crate::functions::LixFunctionProvider;
-use crate::schema::builtin::types::LixVersionPointer;
+use crate::schema::builtin::types::LixVersionRef;
 use crate::sql::execution::runtime_effects::{
     build_binary_blob_fastcdc_write_program, BinaryBlobWriteInput,
 };
@@ -27,9 +27,9 @@ use super::types::{
 };
 
 const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
-const LIVE_VERSION_POINTER_TABLE: &str = "lix_internal_live_v1_lix_version_pointer";
+const LIVE_VERSION_REF_TABLE: &str = "lix_internal_live_v1_lix_version_ref";
 const LIVE_UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
-const VERSION_POINTER_SCHEMA_KEY: &str = "lix_version_pointer";
+const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
 const IDEMPOTENCY_KIND_EXACT: &str = "exact";
 const IDEMPOTENCY_KIND_CURRENT_TIP_FINGERPRINT: &str = "current_tip_fingerprint";
@@ -167,7 +167,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
             return Err(AppendCommitError {
                 kind: AppendCommitErrorKind::MissingWriteLane,
                 message: format!(
-                    "append precondition failed for '{}': version pointer is missing",
+                    "append precondition failed for '{}': version ref is missing",
                     lane_storage_key(&concrete_lane)
                 ),
             });
@@ -195,7 +195,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
             return Err(AppendCommitError {
                 kind: AppendCommitErrorKind::MissingWriteLane,
                 message: format!(
-                    "append precondition failed for '{}': version pointer is missing",
+                    "append precondition failed for '{}': version ref is missing",
                     lane_storage_key(&concrete_lane)
                 ),
             });
@@ -612,15 +612,15 @@ async fn load_append_preflight_state_with_active_accounts(
         ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
     };
     let current_tip_source_sql = format!(
-        "FROM {version_pointer_table} \
+        "FROM {version_ref_table} \
          WHERE schema_key = '{schema_key}' \
            AND entity_id = '{entity_id}' \
            AND file_id = 'lix' \
            AND plugin_key = 'lix' \
            AND version_id = '{version_id}' \
            AND snapshot_content IS NOT NULL",
-        version_pointer_table = LIVE_VERSION_POINTER_TABLE,
-        schema_key = VERSION_POINTER_SCHEMA_KEY,
+        version_ref_table = LIVE_VERSION_REF_TABLE,
+        schema_key = VERSION_REF_SCHEMA_KEY,
         entity_id = escape_sql_string(lane_entity_id),
         version_id = escape_sql_string(GLOBAL_VERSION_ID),
     );
@@ -755,11 +755,11 @@ async fn load_append_preflight_state_with_active_accounts(
         match (kind, value) {
             ("current_tip", Value::Text(snapshot_content)) => {
                 current_tip_snapshot = Some(snapshot_content.clone());
-                let pointer: LixVersionPointer =
+                let pointer: LixVersionRef =
                     serde_json::from_str(snapshot_content).map_err(|error| AppendCommitError {
                         kind: AppendCommitErrorKind::Internal,
                         message: format!(
-                            "append preflight version pointer snapshot could not be parsed: {error}"
+                            "append preflight version ref snapshot could not be parsed: {error}"
                         ),
                     })?;
                 if !pointer.commit_id.is_empty() {
@@ -1076,12 +1076,12 @@ fn extract_committed_tip_id(
         .changes
         .iter()
         .find(|change| {
-            change.schema_key == VERSION_POINTER_SCHEMA_KEY && change.entity_id == version_id
+            change.schema_key == VERSION_REF_SCHEMA_KEY && change.entity_id == version_id
         })
         .ok_or_else(|| AppendCommitError {
             kind: AppendCommitErrorKind::Internal,
             message: format!(
-                "generated commit result did not include a version pointer for '{}'",
+                "generated commit result did not include a version ref for '{}'",
                 version_id
             ),
         })?;
@@ -1092,15 +1092,15 @@ fn extract_committed_tip_id(
             .ok_or_else(|| AppendCommitError {
                 kind: AppendCommitErrorKind::Internal,
                 message: format!(
-                    "generated version pointer for '{}' is missing snapshot_content",
+                    "generated version ref for '{}' is missing snapshot_content",
                     version_id
                 ),
             })?;
-    let pointer: LixVersionPointer =
+    let pointer: LixVersionRef =
         serde_json::from_str(snapshot_content).map_err(|error| AppendCommitError {
             kind: AppendCommitErrorKind::Internal,
             message: format!(
-                "generated version pointer for '{}' could not be parsed: {error}",
+                "generated version ref for '{}' could not be parsed: {error}",
                 version_id
             ),
         })?;
@@ -1108,7 +1108,7 @@ fn extract_committed_tip_id(
         return Err(AppendCommitError {
             kind: AppendCommitErrorKind::Internal,
             message: format!(
-                "generated version pointer for '{}' contained an empty commit_id",
+                "generated version ref for '{}' contained an empty commit_id",
                 version_id
             ),
         });
@@ -1192,7 +1192,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeTransaction {
-        version_tips: HashMap<String, String>,
+        version_heads: HashMap<String, String>,
         idempotency_rows: HashMap<(String, String, String, String), String>,
         executed_sql: Vec<String>,
     }
@@ -1207,10 +1207,10 @@ mod tests {
             self.executed_sql.push(sql.to_string());
 
             if sql.contains("SELECT row_kind, value")
-                && sql.contains("FROM lix_internal_live_v1_lix_version_pointer")
+                && sql.contains("FROM lix_internal_live_v1_lix_version_ref")
             {
                 let mut rows = self
-                    .version_tips
+                    .version_heads
                     .iter()
                     .filter(|(version_id, _)| {
                         sql.contains(&format!("entity_id = '{}'", version_id))
@@ -1218,7 +1218,7 @@ mod tests {
                     .map(|(version_id, commit_id)| {
                         vec![
                             Value::Text("current_tip".to_string()),
-                            Value::Text(crate::version::version_pointer_snapshot_content(
+                            Value::Text(crate::version::version_ref_snapshot_content(
                                 version_id, commit_id,
                             )),
                         ]
@@ -1257,19 +1257,17 @@ mod tests {
                 });
             }
 
-            if sql.contains("FROM lix_internal_live_v1_lix_version_pointer")
+            if sql.contains("FROM lix_internal_live_v1_lix_version_ref")
                 && sql.contains("entity_id = 'global'")
             {
                 let rows = self
-                    .version_tips
+                    .version_heads
                     .get(GLOBAL_VERSION_ID)
                     .map(|commit_id| {
-                        vec![Value::Text(
-                            crate::version::version_pointer_snapshot_content(
-                                GLOBAL_VERSION_ID,
-                                commit_id,
-                            ),
-                        )]
+                        vec![Value::Text(crate::version::version_ref_snapshot_content(
+                            GLOBAL_VERSION_ID,
+                            commit_id,
+                        ))]
                     })
                     .into_iter()
                     .collect::<Vec<_>>();
@@ -1279,10 +1277,10 @@ mod tests {
                 });
             }
             if sql.contains("FROM lix_internal_change c")
-                && sql.contains("c.schema_key = 'lix_version_pointer'")
+                && sql.contains("c.schema_key = 'lix_version_ref'")
             {
                 let rows = self
-                    .version_tips
+                    .version_heads
                     .iter()
                     .filter(|(version_id, _)| {
                         sql.contains(&format!("c.entity_id = '{}'", version_id))
@@ -1435,7 +1433,7 @@ mod tests {
     async fn applies_commit_when_tip_matches_expected() {
         let mut transaction = FakeTransaction::default();
         transaction
-            .version_tips
+            .version_heads
             .insert("version-a".to_string(), "commit-123".to_string());
         let mut functions = CountingFunctionProvider::default();
         let mut checker = RecordingInvariantChecker::default();
@@ -1491,7 +1489,7 @@ mod tests {
     async fn replays_when_same_idempotency_key_already_committed() {
         let mut transaction = FakeTransaction::default();
         transaction
-            .version_tips
+            .version_heads
             .insert("version-a".to_string(), "commit-456".to_string());
         transaction.idempotency_rows.insert(
             (
@@ -1536,14 +1534,14 @@ mod tests {
     async fn replays_when_same_current_tip_fingerprint_already_committed() {
         let mut transaction = FakeTransaction::default();
         transaction
-            .version_tips
+            .version_heads
             .insert("version-a".to_string(), "commit-456".to_string());
         transaction.idempotency_rows.insert(
             (
                 "version:version-a".to_string(),
                 "current_tip_fingerprint".to_string(),
                 "fp-1".to_string(),
-                crate::version::version_pointer_snapshot_content("version-a", "commit-456"),
+                crate::version::version_ref_snapshot_content("version-a", "commit-456"),
             ),
             "commit-456".to_string(),
         );
@@ -1581,7 +1579,7 @@ mod tests {
     async fn rejects_tip_drift_without_matching_idempotency_row() {
         let mut transaction = FakeTransaction::default();
         transaction
-            .version_tips
+            .version_heads
             .insert("version-a".to_string(), "commit-456".to_string());
         let mut functions = CountingFunctionProvider::default();
         let mut checker = RecordingInvariantChecker::default();
@@ -1672,7 +1670,7 @@ mod tests {
     #[tokio::test]
     async fn applies_global_admin_lane_when_tip_matches_expected() {
         let mut transaction = FakeTransaction::default();
-        transaction.version_tips.insert(
+        transaction.version_heads.insert(
             GLOBAL_VERSION_ID.to_string(),
             "commit-global-123".to_string(),
         );
@@ -1707,7 +1705,7 @@ mod tests {
     async fn invariant_recheck_failure_aborts_append_before_commit_generation() {
         let mut transaction = FakeTransaction::default();
         transaction
-            .version_tips
+            .version_heads
             .insert("version-a".to_string(), "commit-123".to_string());
         let mut functions = CountingFunctionProvider::default();
         let mut checker = RecordingInvariantChecker {

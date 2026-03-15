@@ -107,12 +107,12 @@ simulation_test!(
             .map(|write| write.schema_key.clone())
             .collect();
         assert!(schema_keys.contains("lix_commit"));
-        assert!(schema_keys.contains("lix_version_pointer"));
+        assert!(schema_keys.contains("lix_version_ref"));
         assert!(schema_keys.contains("lix_change_set_element"));
         assert!(schema_keys.contains("lix_commit_edge"));
 
         let debug = plan.debug.as_ref().expect("expected debug trace");
-        assert!(!debug.tips_by_version.is_empty(), "expected version tips");
+        assert!(!debug.heads_by_version.is_empty(), "expected version heads");
         assert!(
             !debug.traversed_commits.is_empty(),
             "expected traversed commits"

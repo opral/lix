@@ -48,7 +48,7 @@ pub use state::materialization::{
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
     LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning, LiveStateWrite,
     LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
-    TraversedEdgeDebugRow, VersionAncestryDebugRow, VersionPointerDebugRow,
+    TraversedEdgeDebugRow, VersionAncestryDebugRow, VersionHeadDebugRow,
 };
 pub use state::stream::{
     StateCommitStream, StateCommitStreamBatch, StateCommitStreamChange, StateCommitStreamFilter,

@@ -37,7 +37,7 @@ use crate::sql::public::planner::semantics::effective_state_resolver::{
 use crate::sql::public::planner::semantics::write_analysis::analyze_write;
 use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan;
 use crate::state::commit::{
-    load_committed_version_tip_commit_id, AppendCommitPreconditions, AppendExpectedTip,
+    load_committed_version_head_commit_id, AppendCommitPreconditions, AppendExpectedTip,
     AppendIdempotencyKey, AppendWriteLane, ProposedDomainChange,
 };
 use crate::state::stream::{
@@ -1129,7 +1129,7 @@ async fn maybe_bind_active_history_root(
     }
 
     let mut executor = backend;
-    let root_commit_id = load_committed_version_tip_commit_id(&mut executor, active_version_id)
+    let root_commit_id = load_committed_version_head_commit_id(&mut executor, active_version_id)
         .await
         .ok()??;
     let root_predicate = Expr::BinaryOp {
@@ -2316,7 +2316,7 @@ mod tests {
     struct FakeBackend {
         registered_schema_rows: HashMap<String, String>,
         version_descriptor_rows: HashMap<String, String>,
-        version_pointer_rows: HashMap<String, String>,
+        version_ref_rows: HashMap<String, String>,
         active_version_rows: Vec<(String, String)>,
         active_account_rows: Vec<String>,
         change_rows: Vec<Vec<Value>>,
@@ -2473,10 +2473,10 @@ mod tests {
                 });
             }
             if sql.contains("FROM lix_internal_change c")
-                && sql.contains("c.schema_key = 'lix_version_pointer'")
+                && sql.contains("c.schema_key = 'lix_version_ref'")
             {
                 let rows = self
-                    .version_pointer_rows
+                    .version_ref_rows
                     .iter()
                     .filter(|(version_id, _)| {
                         sql.contains(&format!("c.entity_id = '{}'", version_id))
@@ -2502,9 +2502,9 @@ mod tests {
                     },
                 });
             }
-            if sql.contains("FROM lix_internal_live_v1_lix_version_pointer") {
+            if sql.contains("FROM lix_internal_live_v1_lix_version_ref") {
                 let rows = self
-                    .version_pointer_rows
+                    .version_ref_rows
                     .iter()
                     .filter(|(version_id, _)| {
                         sql.contains(&format!("entity_id = '{}'", version_id))
@@ -2530,11 +2530,11 @@ mod tests {
                     },
                 });
             }
-            if sql.contains("FROM lix_internal_live_v1_lix_version_pointer")
+            if sql.contains("FROM lix_internal_live_v1_lix_version_ref")
                 && sql.contains("entity_id = 'global'")
             {
                 let rows = self
-                    .version_pointer_rows
+                    .version_ref_rows
                     .iter()
                     .filter(|(version_id, _)| {
                         sql.contains(&format!("entity_id = '{}'", version_id))
@@ -2548,11 +2548,11 @@ mod tests {
                 });
             }
             if sql.contains("FROM lix_internal_change c")
-                && sql.contains("c.schema_key = 'lix_version_pointer'")
+                && sql.contains("c.schema_key = 'lix_version_ref'")
                 && sql.contains("c.entity_id = 'global'")
             {
                 let rows = self
-                    .version_pointer_rows
+                    .version_ref_rows
                     .iter()
                     .filter(|(version_id, _)| {
                         sql.contains(&format!("c.entity_id = '{}'", version_id))
@@ -2622,8 +2622,7 @@ mod tests {
             "change_set_id": format!("change-set-{commit_id}"),
             "change_ids": [change_id],
             "author_account_ids": [],
-            "parent_commit_ids": [],
-            "meta_change_ids": []
+            "parent_commit_ids": []
         })
         .to_string();
         let pointer_snapshot = json!({
@@ -2659,10 +2658,10 @@ mod tests {
             vec![
                 Value::Text(format!("pointer-change-{version_id}")),
                 Value::Text(version_id.to_string()),
-                Value::Text("lix_version_pointer".to_string()),
+                Value::Text("lix_version_ref".to_string()),
                 Value::Text("1".to_string()),
-                Value::Text(crate::version::version_pointer_file_id().to_string()),
-                Value::Text(crate::version::version_pointer_plugin_key().to_string()),
+                Value::Text(crate::version::version_ref_file_id().to_string()),
+                Value::Text(crate::version::version_ref_plugin_key().to_string()),
                 Value::Text(pointer_snapshot),
                 Value::Null,
                 Value::Text("2026-03-06T18:00:02Z".to_string()),
@@ -2888,9 +2887,9 @@ mod tests {
     #[tokio::test]
     async fn prepares_builtin_entity_history_reads() {
         let mut backend = FakeBackend::default();
-        backend.version_pointer_rows.insert(
+        backend.version_ref_rows.insert(
             "main".to_string(),
-            crate::version::version_pointer_snapshot_content("main", "commit-active-root"),
+            crate::version::version_ref_snapshot_content("main", "commit-active-root"),
         );
         let prepared = prepare_public_read(
             &backend,
@@ -3205,9 +3204,9 @@ mod tests {
     #[tokio::test]
     async fn binds_active_root_commit_for_filesystem_history_reads_without_explicit_root() {
         let mut backend = FakeBackend::default();
-        backend.version_pointer_rows.insert(
+        backend.version_ref_rows.insert(
             "main".to_string(),
-            crate::version::version_pointer_snapshot_content("main", "commit-active-root"),
+            crate::version::version_ref_snapshot_content("main", "commit-active-root"),
         );
 
         let prepared = prepare_public_read(
@@ -3236,9 +3235,9 @@ mod tests {
     #[tokio::test]
     async fn binds_active_root_commit_for_entity_history_reads_without_explicit_root() {
         let mut backend = FakeBackend::default();
-        backend.version_pointer_rows.insert(
+        backend.version_ref_rows.insert(
             "main".to_string(),
-            crate::version::version_pointer_snapshot_content("main", "commit-active-root"),
+            crate::version::version_ref_snapshot_content("main", "commit-active-root"),
         );
 
         let prepared = prepare_public_read(
@@ -3317,9 +3316,9 @@ mod tests {
     #[tokio::test]
     async fn classifies_public_writes_through_public_execution() {
         let mut backend = FakeBackend::default();
-        backend.version_pointer_rows.insert(
+        backend.version_ref_rows.insert(
             "main".to_string(),
-            crate::version::version_pointer_snapshot_content("main", "commit-active-root"),
+            crate::version::version_ref_snapshot_content("main", "commit-active-root"),
         );
         let prepared = prepare_public_execution(
             &backend,
@@ -3775,7 +3774,7 @@ mod tests {
             .expect("nested public-subquery read should lower");
         assert!(!lowered_sql.contains("FROM lix_active_version"));
         assert!(!lowered_sql.contains("FROM lix_version"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_pointer"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
     }
 }

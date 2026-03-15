@@ -143,7 +143,7 @@ async fn load_global_version_commit_id(tx: &mut EngineTransaction<'_>) -> Result
     let Some(row) = statement.rows.first() else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "hidden global version pointer row is missing".to_string(),
+            description: "hidden global version ref row is missing".to_string(),
         });
     };
     text_at(row, 0, "lix_version.commit_id")
