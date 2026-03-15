@@ -26,8 +26,6 @@ pub(crate) struct LixCommit {
     pub author_account_ids: Vec<String>,
     #[serde(default)]
     pub parent_commit_ids: Vec<String>,
-    #[serde(default)]
-    pub meta_change_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -46,7 +44,7 @@ pub(crate) struct LixVersionDescriptor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct LixVersionPointer {
+pub(crate) struct LixVersionRef {
     pub id: String,
     pub commit_id: String,
 }

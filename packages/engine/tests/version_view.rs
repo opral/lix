@@ -188,7 +188,7 @@ simulation_test!(
                 "SELECT DISTINCT schema_key \
              FROM lix_internal_state_vtable \
              WHERE entity_id = 'version-a' \
-               AND schema_key IN ('lix_version_descriptor', 'lix_version_pointer') \
+               AND schema_key IN ('lix_version_descriptor', 'lix_version_ref') \
                AND snapshot_content IS NOT NULL \
              ORDER BY schema_key",
                 &[],
@@ -201,7 +201,7 @@ simulation_test!(
             &vtable_rows.statements[0].rows[0][0],
             "lix_version_descriptor",
         );
-        assert_text(&vtable_rows.statements[0].rows[1][0], "lix_version_pointer");
+        assert_text(&vtable_rows.statements[0].rows[1][0], "lix_version_ref");
     }
 );
 
@@ -567,7 +567,7 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
             "SELECT DISTINCT schema_key \
              FROM lix_internal_state_vtable \
              WHERE entity_id = 'version-c' \
-               AND schema_key IN ('lix_version_descriptor', 'lix_version_pointer') \
+               AND schema_key IN ('lix_version_descriptor', 'lix_version_ref') \
                AND snapshot_content IS NULL \
              ORDER BY schema_key",
             &[],
@@ -580,10 +580,7 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
         &deleted_rows.statements[0].rows[0][0],
         "lix_version_descriptor",
     );
-    assert_text(
-        &deleted_rows.statements[0].rows[1][0],
-        "lix_version_pointer",
-    );
+    assert_text(&deleted_rows.statements[0].rows[1][0], "lix_version_ref");
 });
 
 simulation_test!(lix_version_delete_supports_placeholders, |sim| async move {

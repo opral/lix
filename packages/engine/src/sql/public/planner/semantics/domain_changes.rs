@@ -375,7 +375,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeBackend {
-        version_tip_commit_id: Option<String>,
+        version_head_commit_id: Option<String>,
         expected_version_id: Option<String>,
     }
 
@@ -387,27 +387,27 @@ mod tests {
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             if sql.contains("FROM lix_internal_change c")
-                && sql.contains("c.schema_key = 'lix_version_pointer'")
+                && sql.contains("c.schema_key = 'lix_version_ref'")
             {
                 if let Some(expected_version_id) = &self.expected_version_id {
                     assert!(
                         sql.contains(&format!("c.entity_id = '{}'", expected_version_id)),
-                        "unexpected version pointer query: {sql}"
+                        "unexpected version ref query: {sql}"
                     );
                 }
                 let rows = self
-                    .version_tip_commit_id
+                    .version_head_commit_id
                     .as_ref()
                     .map(|commit_id| {
                         vec![vec![Value::Text(
-                            to_string(&crate::schema::builtin::types::LixVersionPointer {
+                            to_string(&crate::schema::builtin::types::LixVersionRef {
                                 id: self
                                     .expected_version_id
                                     .clone()
                                     .unwrap_or_else(|| "main".to_string()),
                                 commit_id: commit_id.clone(),
                             })
-                            .expect("version pointer JSON"),
+                            .expect("version ref JSON"),
                         )]]
                     })
                     .unwrap_or_default();
@@ -501,7 +501,7 @@ mod tests {
         )
         .await;
         let backend = FakeBackend {
-            version_tip_commit_id: Some("commit-123".to_string()),
+            version_head_commit_id: Some("commit-123".to_string()),
             expected_version_id: Some("version-a".to_string()),
         };
 
@@ -541,7 +541,7 @@ mod tests {
         )
         .await;
         let backend = FakeBackend {
-            version_tip_commit_id: Some("commit-123".to_string()),
+            version_head_commit_id: Some("commit-123".to_string()),
             expected_version_id: Some("version-a".to_string()),
         };
 

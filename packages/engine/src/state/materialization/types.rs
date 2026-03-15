@@ -67,9 +67,9 @@ pub struct LiveStateRebuildWarning {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct VersionPointerDebugRow {
+pub struct VersionHeadDebugRow {
     pub version_id: String,
-    pub tip_commit_id: String,
+    pub commit_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -115,7 +115,7 @@ pub struct ScopeWinnerDebugRow {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LiveStateRebuildDebugTrace {
-    pub tips_by_version: Vec<VersionPointerDebugRow>,
+    pub heads_by_version: Vec<VersionHeadDebugRow>,
     pub traversed_commits: Vec<TraversedCommitDebugRow>,
     pub traversed_edges: Vec<TraversedEdgeDebugRow>,
     pub version_ancestry: Vec<VersionAncestryDebugRow>,

@@ -76,7 +76,7 @@ async fn rotate_working_commit(engine: &support::simulation_test::SimulationEngi
         .expect("seed checkpoint should succeed");
 }
 
-async fn active_version_pointer(engine: &support::simulation_test::SimulationEngine) -> String {
+async fn active_version_ref(engine: &support::simulation_test::SimulationEngine) -> String {
     let result = engine
         .execute(
             "SELECT v.commit_id \
@@ -87,7 +87,7 @@ async fn active_version_pointer(engine: &support::simulation_test::SimulationEng
             &[],
         )
         .await
-        .expect("active version pointer query should succeed");
+        .expect("active version ref query should succeed");
     assert_eq!(result.statements[0].rows.len(), 1);
     as_text(&result.statements[0].rows[0][0])
 }
@@ -120,7 +120,7 @@ simulation_test!(lix_working_changes_reports_added_rows, |sim| async move {
         )
         .await
         .expect("working changes query should succeed");
-    let tip_commit_id = active_version_pointer(&engine).await;
+    let head_commit_id = active_version_ref(&engine).await;
 
     assert_eq!(result.statements[0].rows.len(), 1);
     assert_eq!(as_text(&result.statements[0].rows[0][0]), "added");
@@ -128,7 +128,7 @@ simulation_test!(lix_working_changes_reports_added_rows, |sim| async move {
     assert_non_empty_text(&result.statements[0].rows[0][2]);
     assert_not_working_projection_change_id(&result.statements[0].rows[0][2]);
     assert_null(&result.statements[0].rows[0][3]);
-    assert_eq!(as_text(&result.statements[0].rows[0][4]), tip_commit_id);
+    assert_eq!(as_text(&result.statements[0].rows[0][4]), head_commit_id);
 });
 
 simulation_test!(
@@ -152,7 +152,7 @@ simulation_test!(
             .create_checkpoint()
             .await
             .expect("checkpoint should succeed");
-        let baseline_commit_id = active_version_pointer(&engine).await;
+        let baseline_commit_id = active_version_ref(&engine).await;
 
         engine
             .execute(
@@ -172,7 +172,7 @@ simulation_test!(
              LIMIT 1", &[Value::Text(key)])
             .await
             .expect("working changes query should succeed");
-        let tip_commit_id = active_version_pointer(&engine).await;
+        let head_commit_id = active_version_ref(&engine).await;
 
         assert_eq!(result.statements[0].rows.len(), 1);
         assert_eq!(as_text(&result.statements[0].rows[0][0]), "modified");
@@ -187,7 +187,7 @@ simulation_test!(
             as_text(&result.statements[0].rows[0][3]),
             baseline_commit_id
         );
-        assert_eq!(as_text(&result.statements[0].rows[0][4]), tip_commit_id);
+        assert_eq!(as_text(&result.statements[0].rows[0][4]), head_commit_id);
     }
 );
 

@@ -46,7 +46,7 @@ async fn global_version_commit_id(engine: &support::simulation_test::SimulationE
         .execute(
             "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
              FROM lix_internal_state_vtable \
-             WHERE schema_key = 'lix_version_pointer' \
+             WHERE schema_key = 'lix_version_ref' \
                AND entity_id = 'global' \
                AND file_id = 'lix' \
                AND version_id = 'global' \
@@ -60,7 +60,7 @@ async fn global_version_commit_id(engine: &support::simulation_test::SimulationE
     assert_eq!(result.statements[0].rows.len(), 1);
     text_value(
         &result.statements[0].rows[0][0],
-        "lix_version_pointer.commit_id",
+        "lix_version_ref.commit_id",
     )
 }
 
@@ -296,7 +296,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
                         );
                     };
                     assert_eq!(tip_result.rows.len(), 1);
-                    let tip_commit_id = text_value(&tip_result.rows[0][0], "commit_id");
+                    let head_commit_id = text_value(&tip_result.rows[0][0], "commit_id");
 
                     let after_rows = engine_b
                         .execute(
@@ -323,7 +323,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
 
                     assert_eq!(
                         after_count, before_count,
-                        "reopen changed working changes count (before={before_count}, after={after_count}, tip={tip_commit_id})"
+                        "reopen changed working changes count (before={before_count}, after={after_count}, tip={head_commit_id})"
                     );
                 });
             }));
@@ -505,7 +505,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
                'lix_change_author~1', \
                'lix_change_set~1', \
                'lix_commit~1', \
-               'lix_version_pointer~1', \
+               'lix_version_ref~1', \
                'lix_change_set_element~1', \
                'lix_commit_edge~1'\
              ) \
@@ -567,7 +567,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
             "lix_commit_edge".to_string(),
             "lix_key_value".to_string(),
             "lix_registered_schema".to_string(),
-            "lix_version_pointer".to_string(),
+            "lix_version_ref".to_string(),
         ])
     );
 });
@@ -713,7 +713,7 @@ simulation_test!(
                 "SELECT lix_json_extract(s.content, 'commit_id') AS commit_id \
                  FROM lix_internal_change c \
                  JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-                 WHERE c.schema_key = 'lix_version_pointer' \
+                 WHERE c.schema_key = 'lix_version_ref' \
                    AND c.entity_id = $1 \
                  ORDER BY c.created_at DESC, c.id DESC \
                  LIMIT 1",
@@ -745,7 +745,7 @@ simulation_test!(
                 "SELECT lix_json_extract(s.content, 'commit_id') AS commit_id \
                  FROM lix_internal_change c \
                  JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-                 WHERE c.schema_key = 'lix_version_pointer' \
+                 WHERE c.schema_key = 'lix_version_ref' \
                    AND c.entity_id = 'global' \
                  ORDER BY c.created_at DESC, c.id DESC \
                  LIMIT 1",

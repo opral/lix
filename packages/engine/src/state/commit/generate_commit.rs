@@ -11,7 +11,7 @@ use crate::LixError;
 const GLOBAL_VERSION: &str = "global";
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const CHANGE_SET_SCHEMA_KEY: &str = "lix_change_set";
-const VERSION_POINTER_SCHEMA_KEY: &str = "lix_version_pointer";
+const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
 const CHANGE_SET_ELEMENT_SCHEMA_KEY: &str = "lix_change_set_element";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
@@ -69,7 +69,7 @@ where
 
     let commit_schema = builtin_schema_meta(COMMIT_SCHEMA_KEY)?;
     let change_set_schema = builtin_schema_meta(CHANGE_SET_SCHEMA_KEY)?;
-    let version_pointer_schema = builtin_schema_meta(VERSION_POINTER_SCHEMA_KEY)?;
+    let version_ref_schema = builtin_schema_meta(VERSION_REF_SCHEMA_KEY)?;
     let change_set_element_schema = builtin_schema_meta(CHANGE_SET_ELEMENT_SCHEMA_KEY)?;
     let commit_edge_schema = builtin_schema_meta(COMMIT_EDGE_SCHEMA_KEY)?;
     let change_author_schema = builtin_schema_meta(CHANGE_AUTHOR_SCHEMA_KEY)?;
@@ -111,22 +111,22 @@ where
 
     let unique_active_accounts = dedupe_ordered(&args.active_accounts);
     let mut meta_changes: Vec<ChangeRow> = Vec::new();
-    let mut tip_change_id_by_version: BTreeMap<String, String> = BTreeMap::new();
+    let mut version_ref_change_id_by_version: BTreeMap<String, String> = BTreeMap::new();
     let mut change_set_change_id_by_version: BTreeMap<String, String> = BTreeMap::new();
     let mut commit_change_id_by_version: BTreeMap<String, String> = BTreeMap::new();
     let mut commit_row_index_by_version: BTreeMap<String, usize> = BTreeMap::new();
 
     for (version_id, meta) in &meta_by_version {
-        let version_pointer_change_id = generate_uuid();
-        tip_change_id_by_version.insert(version_id.clone(), version_pointer_change_id.clone());
+        let version_ref_change_id = generate_uuid();
+        version_ref_change_id_by_version.insert(version_id.clone(), version_ref_change_id.clone());
 
         meta_changes.push(ChangeRow {
-            id: version_pointer_change_id,
+            id: version_ref_change_id,
             entity_id: version_id.clone(),
-            schema_key: VERSION_POINTER_SCHEMA_KEY.to_string(),
-            schema_version: version_pointer_schema.schema_version.clone(),
-            file_id: version_pointer_schema.file_id.clone(),
-            plugin_key: version_pointer_schema.plugin_key.clone(),
+            schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
+            schema_version: version_ref_schema.schema_version.clone(),
+            file_id: version_ref_schema.file_id.clone(),
+            plugin_key: version_ref_schema.plugin_key.clone(),
             snapshot_content: Some(
                 json!({
                     "id": version_id,
@@ -319,14 +319,17 @@ where
                 ),
             })?;
 
-        let domain_change_ids: Vec<String> = domain_by_version
+        let mut member_change_ids: Vec<String> = domain_by_version
             .get(version_id)
             .into_iter()
             .flat_map(|changes| changes.iter().map(|change| change.id.clone()))
             .collect();
+        if let Some(change_id) = version_ref_change_id_by_version.get(version_id) {
+            member_change_ids.push(change_id.clone());
+        }
 
         snapshot["change_ids"] = serde_json::Value::Array(
-            domain_change_ids
+            member_change_ids
                 .iter()
                 .cloned()
                 .map(serde_json::Value::String)
@@ -339,11 +342,6 @@ where
                 .map(serde_json::Value::String)
                 .collect(),
         );
-        snapshot["meta_change_ids"] =
-            serde_json::Value::Array(match tip_change_id_by_version.get(version_id) {
-                Some(change_id) => vec![serde_json::Value::String(change_id.clone())],
-                None => Vec::new(),
-            });
         snapshot["parent_commit_ids"] = serde_json::Value::Array(
             meta.parent_commit_ids
                 .iter()
@@ -388,7 +386,7 @@ where
         commit_snapshot_by_version.insert(version_id.clone(), commit_snapshot);
     }
 
-    // Materialize commit rows and version_pointer rows so commit views can resolve immediately.
+    // Materialize commit rows and version_ref rows so commit views can resolve immediately.
     for (version_id, meta) in &meta_by_version {
         let change_set_change_id = change_set_change_id_by_version
             .get(version_id)
@@ -439,17 +437,17 @@ where
             writer_key: None,
         });
 
-        let tip_id = tip_change_id_by_version
+        let version_ref_id = version_ref_change_id_by_version
             .get(version_id)
             .cloned()
             .unwrap_or_else(|| generate_uuid());
         live_state_rows.push(MaterializedStateRow {
-            id: tip_id,
+            id: version_ref_id.clone(),
             entity_id: version_id.clone(),
-            schema_key: VERSION_POINTER_SCHEMA_KEY.to_string(),
-            schema_version: version_pointer_schema.schema_version.clone(),
-            file_id: version_pointer_schema.file_id.clone(),
-            plugin_key: version_pointer_schema.plugin_key.clone(),
+            schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
+            schema_version: version_ref_schema.schema_version.clone(),
+            file_id: version_ref_schema.file_id.clone(),
+            plugin_key: version_ref_schema.plugin_key.clone(),
             snapshot_content: Some(
                 json!({
                     "id": version_id,
@@ -463,6 +461,58 @@ where
             lixcol_commit_id: meta.commit_id.clone(),
             writer_key: None,
         });
+
+        live_state_rows.push(MaterializedStateRow {
+            id: generate_uuid(),
+            entity_id: format!("{}~{}", meta.change_set_id, version_ref_id),
+            schema_key: CHANGE_SET_ELEMENT_SCHEMA_KEY.to_string(),
+            schema_version: change_set_element_schema.schema_version.clone(),
+            file_id: change_set_element_schema.file_id.clone(),
+            plugin_key: change_set_element_schema.plugin_key.clone(),
+            snapshot_content: Some(
+                json!({
+                    "change_set_id": meta.change_set_id,
+                    "change_id": version_ref_id.clone(),
+                    "entity_id": version_id.clone(),
+                    "schema_key": VERSION_REF_SCHEMA_KEY,
+                    "file_id": version_ref_schema.file_id.clone(),
+                })
+                .to_string(),
+            ),
+            metadata: None,
+            created_at: args.timestamp.clone(),
+            lixcol_version_id: GLOBAL_VERSION.to_string(),
+            lixcol_commit_id: global_commit_id
+                .clone()
+                .unwrap_or_else(|| meta.commit_id.clone()),
+            writer_key: None,
+        });
+
+        for account_id in &unique_active_accounts {
+            live_state_rows.push(MaterializedStateRow {
+                id: commit_change_id_by_version
+                    .get(version_id)
+                    .cloned()
+                    .unwrap_or_else(|| generate_uuid()),
+                entity_id: format!("{}~{}", version_ref_id, account_id),
+                schema_key: CHANGE_AUTHOR_SCHEMA_KEY.to_string(),
+                schema_version: change_author_schema.schema_version.clone(),
+                file_id: change_author_schema.file_id.clone(),
+                plugin_key: change_author_schema.plugin_key.clone(),
+                snapshot_content: Some(
+                    json!({
+                        "change_id": version_ref_id,
+                        "account_id": account_id,
+                    })
+                    .to_string(),
+                ),
+                metadata: None,
+                created_at: args.timestamp.clone(),
+                lixcol_version_id: GLOBAL_VERSION.to_string(),
+                lixcol_commit_id: meta.commit_id.clone(),
+                writer_key: None,
+            });
+        }
     }
 
     // Materialize commit edges for commit graph topology.
@@ -646,6 +696,15 @@ mod tests {
         counts
     }
 
+    fn version_ref_change_ids(result: &GenerateCommitResult) -> Vec<String> {
+        result
+            .changes
+            .iter()
+            .filter(|row| row.schema_key == "lix_version_ref")
+            .map(|row| row.id.clone())
+            .collect()
+    }
+
     #[test]
     fn generates_commit_for_single_active_version_change() {
         let mut versions = BTreeMap::new();
@@ -697,7 +756,7 @@ mod tests {
             result
                 .changes
                 .iter()
-                .filter(|row| row.schema_key == "lix_version_pointer")
+                .filter(|row| row.schema_key == "lix_version_ref")
                 .count(),
             1
         );
@@ -710,17 +769,14 @@ mod tests {
         assert_eq!(commit_row.plugin_key, "lix");
         let commit_snapshot: serde_json::Value =
             serde_json::from_str(commit_row.snapshot_content.as_ref().unwrap()).unwrap();
+        let version_ref_ids = version_ref_change_ids(&result);
         assert_eq!(
             commit_snapshot["change_ids"],
-            serde_json::json!(["chg_active"])
+            serde_json::json!(["chg_active", version_ref_ids[0]])
         );
         assert_eq!(
             commit_snapshot["parent_commit_ids"],
             serde_json::json!(["P_active"])
-        );
-        assert_eq!(
-            commit_snapshot["meta_change_ids"].as_array().unwrap().len(),
-            1
         );
         assert_eq!(
             commit_snapshot["author_account_ids"],
@@ -739,13 +795,13 @@ mod tests {
 
         let materialized_counts = counts_by_schema(&result.live_state_rows);
         assert_eq!(materialized_counts.get("lix_key_value"), Some(&1));
-        assert_eq!(materialized_counts.get("lix_change_author"), Some(&1));
-        assert_eq!(materialized_counts.get("lix_change_set_element"), Some(&1));
+        assert_eq!(materialized_counts.get("lix_change_author"), Some(&2));
+        assert_eq!(materialized_counts.get("lix_change_set_element"), Some(&2));
         assert_eq!(materialized_counts.get("lix_change_set"), Some(&1));
         assert_eq!(materialized_counts.get("lix_commit"), Some(&1));
-        assert_eq!(materialized_counts.get("lix_version_pointer"), Some(&1));
+        assert_eq!(materialized_counts.get("lix_version_ref"), Some(&1));
         assert_eq!(materialized_counts.get("lix_commit_edge"), Some(&1));
-        assert_eq!(result.live_state_rows.len(), 7);
+        assert_eq!(result.live_state_rows.len(), 9);
 
         let domain_materialized = result
             .live_state_rows
@@ -798,7 +854,7 @@ mod tests {
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_author")
                 .count(),
-            1
+            2
         );
         assert_eq!(
             result
@@ -806,7 +862,7 @@ mod tests {
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_set_element")
                 .count(),
-            1
+            2
         );
         assert_eq!(
             result
@@ -824,7 +880,15 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(result.live_state_rows.len(), 7);
+        assert_eq!(
+            result
+                .live_state_rows
+                .iter()
+                .filter(|row| row.schema_key == "lix_version_ref")
+                .count(),
+            1
+        );
+        assert_eq!(result.live_state_rows.len(), 9);
 
         let commit_row = result
             .changes
@@ -841,15 +905,18 @@ mod tests {
             commit_snapshot["parent_commit_ids"],
             serde_json::json!(["P_global"])
         );
+        let version_ref_ids = version_ref_change_ids(&result);
         assert_eq!(
-            commit_snapshot["meta_change_ids"].as_array().unwrap().len(),
-            1
+            commit_snapshot["change_ids"],
+            serde_json::json!(["chg_global", version_ref_ids[0]])
         );
 
         let author_row = result
             .live_state_rows
             .iter()
-            .find(|row| row.schema_key == "lix_change_author")
+            .find(|row| {
+                row.schema_key == "lix_change_author" && row.entity_id == "chg_global~acct-1"
+            })
             .expect("expected change_author row");
         assert_eq!(author_row.entity_id, "chg_global~acct-1");
         let author_snapshot: serde_json::Value =
@@ -911,7 +978,7 @@ mod tests {
             result
                 .changes
                 .iter()
-                .filter(|row| row.schema_key == "lix_version_pointer")
+                .filter(|row| row.schema_key == "lix_version_ref")
                 .count(),
             2
         );
@@ -922,7 +989,7 @@ mod tests {
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_author")
                 .count(),
-            4
+            8
         );
         assert_eq!(
             result
@@ -932,7 +999,15 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(result.live_state_rows.len(), 16);
+        assert_eq!(
+            result
+                .live_state_rows
+                .iter()
+                .filter(|row| row.schema_key == "lix_change_set_element")
+                .count(),
+            4
+        );
+        assert_eq!(result.live_state_rows.len(), 22);
 
         let commit_rows: Vec<_> = result
             .changes
@@ -947,10 +1022,7 @@ mod tests {
                 commit_snapshot["author_account_ids"],
                 serde_json::json!(["acct-1", "acct-2"])
             );
-            assert_eq!(
-                commit_snapshot["meta_change_ids"].as_array().unwrap().len(),
-                1
-            );
+            assert_eq!(commit_snapshot["change_ids"].as_array().unwrap().len(), 2);
         }
 
         let change_author_entities: BTreeSet<String> = result
@@ -959,21 +1031,28 @@ mod tests {
             .filter(|row| row.schema_key == "lix_change_author")
             .map(|row| row.entity_id.clone())
             .collect();
+        for entity in [
+            "chg_global~acct-1",
+            "chg_global~acct-2",
+            "chg_main~acct-1",
+            "chg_main~acct-2",
+        ] {
+            assert!(change_author_entities.contains(entity));
+        }
         assert_eq!(
-            change_author_entities,
-            BTreeSet::from([
-                "chg_global~acct-1".to_string(),
-                "chg_global~acct-2".to_string(),
-                "chg_main~acct-1".to_string(),
-                "chg_main~acct-2".to_string(),
-            ])
+            result
+                .live_state_rows
+                .iter()
+                .filter(|row| row.schema_key == "lix_change_author")
+                .count(),
+            8
         );
 
         let global_tip = result
             .live_state_rows
             .iter()
-            .find(|row| row.schema_key == "lix_version_pointer" && row.entity_id == "global")
-            .expect("global version_pointer should exist");
+            .find(|row| row.schema_key == "lix_version_ref" && row.entity_id == "global")
+            .expect("global version_ref should exist");
         let global_tip_snapshot: serde_json::Value =
             serde_json::from_str(global_tip.snapshot_content.as_ref().unwrap()).unwrap();
         let global_commit_id = global_tip_snapshot["commit_id"]
@@ -1022,6 +1101,10 @@ mod tests {
             .map(|row| row.id.clone())
             .collect::<Vec<_>>();
         assert_eq!(domain_change_ids, vec!["chg_b1", "chg_a2"]);
+        let version_ref_id = version_ref_change_ids(&result)
+            .into_iter()
+            .next()
+            .expect("expected version ref change");
 
         let commit_row = result
             .changes
@@ -1032,7 +1115,7 @@ mod tests {
             serde_json::from_str(commit_row.snapshot_content.as_ref().unwrap()).unwrap();
         assert_eq!(
             commit_snapshot["change_ids"],
-            serde_json::json!(["chg_b1", "chg_a2"])
+            serde_json::json!(["chg_b1", "chg_a2", version_ref_id])
         );
 
         let cse_change_ids = result
@@ -1051,7 +1134,11 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             cse_change_ids,
-            BTreeSet::from(["chg_b1".to_string(), "chg_a2".to_string()])
+            BTreeSet::from([
+                "chg_b1".to_string(),
+                "chg_a2".to_string(),
+                version_ref_id.clone(),
+            ])
         );
 
         let change_author_entities = result
@@ -1062,7 +1149,11 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             change_author_entities,
-            BTreeSet::from(["chg_b1~acct-1".to_string(), "chg_a2~acct-1".to_string(),])
+            BTreeSet::from([
+                "chg_b1~acct-1".to_string(),
+                "chg_a2~acct-1".to_string(),
+                format!("{version_ref_id}~acct-1"),
+            ])
         );
     }
 

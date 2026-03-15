@@ -22,8 +22,8 @@ use crate::sql::public::planner::semantics::effective_state_resolver::{
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    version_descriptor_schema_key, version_pointer_file_id, version_pointer_schema_key,
-    version_pointer_storage_version_id, GLOBAL_VERSION_ID,
+    version_descriptor_schema_key, version_ref_file_id, version_ref_schema_key,
+    version_ref_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::LixError;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
@@ -917,11 +917,11 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
                               created_at DESC, \
                               change_id DESC \
                    ) AS rn \
-                 FROM lix_internal_live_v1_lix_version_pointer \
-                 WHERE schema_key = 'lix_version_pointer' \
+                 FROM lix_internal_live_v1_lix_version_ref \
+                 WHERE schema_key = 'lix_version_ref' \
                    AND is_tombstone = 0 \
                    AND snapshot_content IS NOT NULL \
-               ) ranked_version_pointers \
+               ) ranked_version_refs \
                WHERE rn = 1 \
              ) t \
                ON t.entity_id = d.entity_id \
@@ -1386,7 +1386,7 @@ fn build_state_history_source_sql(
                SELECT DISTINCT \
                  lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
                  vp.version_id AS root_version_id \
-               FROM lix_internal_live_v1_lix_version_pointer vp \
+               FROM lix_internal_live_v1_lix_version_ref vp \
                JOIN active_version_rows av \
                  ON av.version_id = vp.entity_id \
                WHERE vp.schema_key = '{schema_key}' \
@@ -1395,9 +1395,9 @@ fn build_state_history_source_sql(
                  AND vp.is_tombstone = 0 \
                  AND vp.snapshot_content IS NOT NULL \
              ), ",
-            schema_key = escape_sql_string(version_pointer_schema_key()),
-            file_id = escape_sql_string(version_pointer_file_id()),
-            storage_version_id = escape_sql_string(version_pointer_storage_version_id()),
+            schema_key = escape_sql_string(version_ref_schema_key()),
+            file_id = escape_sql_string(version_ref_file_id()),
+            storage_version_id = escape_sql_string(version_ref_storage_version_id()),
         )
     } else {
         format!(
@@ -1405,16 +1405,16 @@ fn build_state_history_source_sql(
                SELECT DISTINCT \
                  lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
                  vp.entity_id AS root_version_id \
-               FROM lix_internal_live_v1_lix_version_pointer vp \
+               FROM lix_internal_live_v1_lix_version_ref vp \
                WHERE vp.schema_key = '{schema_key}' \
                  AND vp.file_id = '{file_id}' \
                  AND vp.version_id = '{storage_version_id}' \
                  AND vp.is_tombstone = 0 \
                  AND vp.snapshot_content IS NOT NULL \
              ), ",
-            schema_key = escape_sql_string(version_pointer_schema_key()),
-            file_id = escape_sql_string(version_pointer_file_id()),
-            storage_version_id = escape_sql_string(version_pointer_storage_version_id()),
+            schema_key = escape_sql_string(version_ref_schema_key()),
+            file_id = escape_sql_string(version_ref_file_id()),
+            storage_version_id = escape_sql_string(version_ref_storage_version_id()),
         )
     };
 
@@ -1869,35 +1869,35 @@ fn build_working_changes_source_query() -> Result<Query, LixError> {
                     (SELECT version_id FROM active_version) AS checkpoint_version_id, \
                     ( \
                         SELECT lix_json_extract(snapshot_content, 'commit_id') \
-                        FROM lix_internal_live_v1_lix_version_pointer \
-                        WHERE schema_key = 'lix_version_pointer' \
+                        FROM lix_internal_live_v1_lix_version_ref \
+                        WHERE schema_key = 'lix_version_ref' \
                           AND entity_id = (SELECT version_id FROM active_version) \
                           AND file_id = 'lix' \
                           AND version_id = 'global' \
                           AND is_tombstone = 0 \
                           AND snapshot_content IS NOT NULL \
                         LIMIT 1 \
-                    ) AS tip_commit_id \
+                    ) AS head_commit_id \
                 UNION ALL \
                 SELECT \
                     'global' AS scope, \
                     'global' AS checkpoint_version_id, \
                     ( \
                         SELECT lix_json_extract(snapshot_content, 'commit_id') \
-                        FROM lix_internal_live_v1_lix_version_pointer \
-                        WHERE schema_key = 'lix_version_pointer' \
+                        FROM lix_internal_live_v1_lix_version_ref \
+                        WHERE schema_key = 'lix_version_ref' \
                           AND entity_id = 'global' \
                           AND file_id = 'lix' \
                           AND version_id = 'global' \
                           AND is_tombstone = 0 \
                           AND snapshot_content IS NOT NULL \
                         LIMIT 1 \
-                    ) AS tip_commit_id \
+                    ) AS head_commit_id \
             ), \
             scope_baselines AS ( \
                 SELECT \
                     scope, \
-                    tip_commit_id, \
+                    head_commit_id, \
                     COALESCE( \
                         ( \
                             SELECT checkpoint_commit_id \
@@ -1905,7 +1905,7 @@ fn build_working_changes_source_query() -> Result<Query, LixError> {
                             WHERE version_id = checkpoint_version_id \
                             LIMIT 1 \
                         ), \
-                        tip_commit_id \
+                        head_commit_id \
                     ) AS baseline_commit_id \
                 FROM scope_heads \
             ), \
@@ -1972,7 +1972,7 @@ fn build_working_changes_source_query() -> Result<Query, LixError> {
                     anc.depth AS depth \
                 FROM scope_baselines scope \
                 JOIN lix_internal_commit_ancestry anc \
-                    ON anc.commit_id = scope.tip_commit_id \
+                    ON anc.commit_id = scope.head_commit_id \
             ), \
             baseline_ancestry AS ( \
                 SELECT \
@@ -2181,7 +2181,7 @@ fn build_working_changes_source_query() -> Result<Query, LixError> {
                     CASE \
                         WHEN before_row_snapshot IS NOT NULL AND after_row_snapshot IS NULL THEN NULL \
                         ELSE ( \
-                            SELECT tip_commit_id \
+                            SELECT head_commit_id \
                             FROM scope_baselines scope \
                             WHERE scope.scope = resolved_rows.scope \
                             LIMIT 1 \
@@ -2898,7 +2898,7 @@ mod tests {
         let lowered_sql = lowered.statements[0].to_string();
 
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_pointer"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
         assert!(!lowered_sql.contains("FROM lix_version"));
         assert_eq!(
             lowered.pushdown_decision.accepted_predicates,

@@ -799,7 +799,7 @@ fn rewrite_generated_commit_result_for_pending_session(
                 "public merge rewrite requires a generated lix_change_set row",
             )
         })?;
-    let version_pointer_entity_id = pending_session_version_pointer_entity_id(&session.lane);
+    let version_ref_entity_id = pending_session_version_ref_entity_id(&session.lane);
 
     let mut live_state_rows = Vec::new();
     for mut row in generated.live_state_rows {
@@ -807,7 +807,7 @@ fn rewrite_generated_commit_result_for_pending_session(
             &row,
             &temporary_commit_id,
             &temporary_change_set_id,
-            version_pointer_entity_id,
+            version_ref_entity_id,
         )? {
             continue;
         }
@@ -862,18 +862,18 @@ fn is_pending_commit_meta_row(
     row: &MaterializedStateRow,
     temporary_commit_id: &str,
     temporary_change_set_id: &str,
-    version_pointer_entity_id: &str,
+    version_ref_entity_id: &str,
 ) -> Result<bool, LixError> {
     match row.schema_key.as_str() {
         "lix_change_set" => Ok(row.entity_id == temporary_change_set_id),
         "lix_commit" => Ok(row.entity_id == temporary_commit_id),
         "lix_commit_edge" => Ok(row.entity_id.ends_with(&format!("~{temporary_commit_id}"))),
-        "lix_version_pointer" if row.entity_id == version_pointer_entity_id => {
+        "lix_version_ref" if row.entity_id == version_ref_entity_id => {
             let snapshot = row.snapshot_content.as_deref().unwrap_or("");
             let parsed: JsonValue = serde_json::from_str(snapshot).map_err(|error| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    format!("public merge rewrite saw invalid version pointer JSON: {error}"),
+                    format!("public merge rewrite saw invalid version ref JSON: {error}"),
                 )
             })?;
             Ok(parsed
@@ -916,7 +916,7 @@ fn rewrite_change_set_element_snapshot(
     Ok((format!("{change_set_id}~{change_id}"), parsed.to_string()))
 }
 
-fn pending_session_version_pointer_entity_id(lane: &AppendWriteLane) -> &str {
+fn pending_session_version_ref_entity_id(lane: &AppendWriteLane) -> &str {
     match lane {
         AppendWriteLane::Version(version_id) => version_id.as_str(),
         AppendWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
@@ -1105,7 +1105,7 @@ fn version_checkpoint_rows(
     batch
         .changes
         .iter()
-        .filter(|change| change.schema_key == crate::version::version_pointer_schema_key())
+        .filter(|change| change.schema_key == crate::version::version_ref_schema_key())
         .filter_map(|change| {
             change.snapshot_content.as_deref().and_then(|snapshot| {
                 serde_json::from_str::<serde_json::Value>(snapshot)

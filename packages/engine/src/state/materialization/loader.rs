@@ -105,7 +105,7 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
             continue;
         }
 
-        if schema_key == "lix_version_pointer" {
+        if schema_key == "lix_version_ref" {
             continue;
         }
 
@@ -217,7 +217,6 @@ fn parse_commit_snapshot(raw: &str) -> Result<Option<LixCommit>, LixError> {
     parsed.change_ids.retain(|value| !value.is_empty());
     parsed.parent_commit_ids.retain(|value| !value.is_empty());
     parsed.author_account_ids.retain(|value| !value.is_empty());
-    parsed.meta_change_ids.retain(|value| !value.is_empty());
     Ok(Some(parsed))
 }
 

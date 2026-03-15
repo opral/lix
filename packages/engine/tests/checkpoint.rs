@@ -16,7 +16,7 @@ fn as_i64(value: &Value) -> i64 {
     }
 }
 
-async fn active_version_pointer(
+async fn active_version_ref(
     engine: &support::simulation_test::SimulationEngine,
 ) -> (String, String) {
     let result = engine
@@ -75,12 +75,12 @@ simulation_test!(
             .expect("boot_simulated_engine_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
-        let (version_id, before_commit_id) = active_version_pointer(&engine).await;
+        let (version_id, before_commit_id) = active_version_ref(&engine).await;
         let checkpoint = engine
             .create_checkpoint()
             .await
             .expect("create_checkpoint should succeed");
-        let (_version_id, after_commit_id) = active_version_pointer(&engine).await;
+        let (_version_id, after_commit_id) = active_version_ref(&engine).await;
 
         assert_eq!(checkpoint.id, before_commit_id);
         assert_eq!(after_commit_id, before_commit_id);
@@ -117,7 +117,7 @@ simulation_test!(checkpoint_labels_current_commit, |sim| async move {
         .await
         .expect("tracked write should succeed");
 
-    let (_version_id, commit_id) = active_version_pointer(&engine).await;
+    let (_version_id, commit_id) = active_version_ref(&engine).await;
     engine
         .create_checkpoint()
         .await
@@ -157,7 +157,7 @@ simulation_test!(
             .await
             .expect("tracked write should succeed");
 
-        let (version_id, tip_commit_id) = active_version_pointer(&engine).await;
+        let (version_id, head_commit_id) = active_version_ref(&engine).await;
         engine
             .create_checkpoint()
             .await
@@ -173,7 +173,7 @@ simulation_test!(
             .await
             .expect("baseline query should succeed");
         assert_eq!(baseline.statements[0].rows.len(), 1);
-        assert_eq!(as_text(&baseline.statements[0].rows[0][0]), tip_commit_id);
+        assert_eq!(as_text(&baseline.statements[0].rows[0][0]), head_commit_id);
     }
 );
 
@@ -228,13 +228,13 @@ simulation_test!(
             .execute("SELECT COUNT(*) FROM lix_commit_edge", &[])
             .await
             .expect("edge count should succeed");
-        let (_version_id, commit_before) = active_version_pointer(&engine).await;
+        let (_version_id, commit_before) = active_version_ref(&engine).await;
 
         let checkpoint = engine
             .create_checkpoint()
             .await
             .expect("create_checkpoint should succeed");
-        let (_version_id, commit_after) = active_version_pointer(&engine).await;
+        let (_version_id, commit_after) = active_version_ref(&engine).await;
 
         let commits_after = engine
             .execute("SELECT COUNT(*) FROM lix_commit", &[])

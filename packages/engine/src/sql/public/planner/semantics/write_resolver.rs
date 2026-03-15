@@ -23,9 +23,9 @@ use crate::version::{
     active_version_storage_version_id, parse_active_version_snapshot, version_descriptor_file_id,
     version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content,
-    version_descriptor_storage_version_id, version_pointer_file_id, version_pointer_plugin_key,
-    version_pointer_schema_key, version_pointer_schema_version, version_pointer_snapshot_content,
-    version_pointer_storage_version_id, GLOBAL_VERSION_ID,
+    version_descriptor_storage_version_id, version_ref_file_id, version_ref_plugin_key,
+    version_ref_schema_key, version_ref_schema_version, version_ref_snapshot_content,
+    version_ref_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, Value};
 use serde_json::Value as JsonValue;
@@ -626,7 +626,7 @@ async fn resolve_version_insert_write_plan(
             authoritative_pre_state.extend(version_admin_pre_state_refs(existing));
         }
         intended_post_state.push(version_descriptor_row(&version_id, &name, hidden));
-        intended_post_state.push(version_pointer_row(&version_id, &commit_id));
+        intended_post_state.push(version_ref_row(&version_id, &commit_id));
         lineage.push(RowLineage {
             entity_id: version_id,
             source_change_id: None,
@@ -733,7 +733,7 @@ async fn resolve_existing_version_write(
                     ));
                 }
                 if payload.contains_key("commit_id") {
-                    intended_post_state.push(version_pointer_row(&current_row.id, &next_commit_id));
+                    intended_post_state.push(version_ref_row(&current_row.id, &next_commit_id));
                 }
             }
 
@@ -753,7 +753,7 @@ async fn resolve_existing_version_write(
             for current_row in current_rows {
                 authoritative_pre_state.extend(version_admin_pre_state_refs(&current_row));
                 intended_post_state.push(version_descriptor_tombstone_row(&current_row.id));
-                intended_post_state.push(version_pointer_tombstone_row(&current_row.id));
+                intended_post_state.push(version_ref_tombstone_row(&current_row.id));
                 tombstones.extend(version_admin_tombstone_refs(&current_row));
                 lineage.push(RowLineage {
                     entity_id: current_row.id.clone(),
@@ -805,7 +805,7 @@ async fn load_version_admin_row(
     };
     let pointer_sql = format!(
         "SELECT snapshot_content, change_id \
-         FROM lix_internal_live_v1_lix_version_pointer \
+         FROM lix_internal_live_v1_lix_version_ref \
          WHERE schema_key = '{schema_key}' \
            AND entity_id = '{entity_id}' \
            AND file_id = '{file_id}' \
@@ -814,11 +814,11 @@ async fn load_version_admin_row(
            AND is_tombstone = 0 \
            AND snapshot_content IS NOT NULL \
          LIMIT 1",
-        schema_key = version_pointer_schema_key(),
+        schema_key = version_ref_schema_key(),
         entity_id = version_id.replace('\'', "''"),
-        file_id = version_pointer_file_id(),
-        plugin_key = version_pointer_plugin_key(),
-        storage_version_id = version_pointer_storage_version_id(),
+        file_id = version_ref_file_id(),
+        plugin_key = version_ref_plugin_key(),
+        storage_version_id = version_ref_storage_version_id(),
     );
     let pointer_result = backend.execute(&pointer_sql, &[]).await?;
     let pointer_row = pointer_result.rows.first();
@@ -847,7 +847,7 @@ fn version_admin_pre_state_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
         },
         ResolvedRowRef {
             entity_id: row.id.clone(),
-            schema_key: version_pointer_schema_key().to_string(),
+            schema_key: version_ref_schema_key().to_string(),
             version_id: Some(GLOBAL_VERSION_ID.to_string()),
             source_change_id: row.pointer_change_id.clone(),
             source_commit_id: None,
@@ -933,28 +933,28 @@ fn version_descriptor_row(id: &str, name: &str, hidden: bool) -> PlannedStateRow
     }
 }
 
-fn version_pointer_row(id: &str, commit_id: &str) -> PlannedStateRow {
+fn version_ref_row(id: &str, commit_id: &str) -> PlannedStateRow {
     let mut values = BTreeMap::new();
     values.insert("entity_id".to_string(), Value::Text(id.to_string()));
     values.insert(
         "schema_key".to_string(),
-        Value::Text(version_pointer_schema_key().to_string()),
+        Value::Text(version_ref_schema_key().to_string()),
     );
     values.insert(
         "file_id".to_string(),
-        Value::Text(version_pointer_file_id().to_string()),
+        Value::Text(version_ref_file_id().to_string()),
     );
     values.insert(
         "plugin_key".to_string(),
-        Value::Text(version_pointer_plugin_key().to_string()),
+        Value::Text(version_ref_plugin_key().to_string()),
     );
     values.insert(
         "schema_version".to_string(),
-        Value::Text(version_pointer_schema_version().to_string()),
+        Value::Text(version_ref_schema_version().to_string()),
     );
     values.insert(
         "snapshot_content".to_string(),
-        Value::Text(version_pointer_snapshot_content(id, commit_id)),
+        Value::Text(version_ref_snapshot_content(id, commit_id)),
     );
     values.insert(
         "version_id".to_string(),
@@ -962,7 +962,7 @@ fn version_pointer_row(id: &str, commit_id: &str) -> PlannedStateRow {
     );
     PlannedStateRow {
         entity_id: id.to_string(),
-        schema_key: version_pointer_schema_key().to_string(),
+        schema_key: version_ref_schema_key().to_string(),
         version_id: Some(GLOBAL_VERSION_ID.to_string()),
         values,
         tombstone: false,
@@ -976,8 +976,8 @@ fn version_descriptor_tombstone_row(id: &str) -> PlannedStateRow {
     row
 }
 
-fn version_pointer_tombstone_row(id: &str) -> PlannedStateRow {
-    let mut row = version_pointer_row(id, "deleted");
+fn version_ref_tombstone_row(id: &str) -> PlannedStateRow {
+    let mut row = version_ref_row(id, "deleted");
     row.values.remove("snapshot_content");
     row.tombstone = true;
     row
