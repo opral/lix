@@ -1,3 +1,7 @@
+---
+description: See when to use Git, when to use Lix, and how semantic change tracking differs from snapshot-based source control.
+---
+
 # Comparison to Git
 
 > [!TIP]
@@ -108,4 +112,3 @@ Lix uses SQL databases as query engine and persistence layer.
 ### Why not Git + diff drivers?
 
 Git diff drivers can improve display for some formats, but Git remains snapshot-first and toolchain-oriented. Lix is a library: semantic deltas, approvals, and queryable history as data.
-

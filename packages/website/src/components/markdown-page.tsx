@@ -1,50 +1,8 @@
 import { useEffect, useState } from "react";
+import { splitTitleFromHtml } from "../lib/seo";
 
 type CopyStatus = "idle" | "copied";
 
-/**
- * Extracts the first H1 title and returns the remaining HTML content.
- *
- * @example
- * splitTitleFromHtml("<h1>Hello</h1><p>Body</p>") // { title: "Hello", body: "<p>Body</p>" }
- */
-function splitTitleFromHtml(html: string): { title?: string; body: string } {
-  const match = html.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i);
-  if (!match) {
-    return { body: html };
-  }
-
-  const title = decodeHtmlEntities(stripHtml(match[1])).trim();
-  const body = html.replace(match[0], "").trimStart();
-  return { title: title || undefined, body };
-}
-
-/**
- * Removes HTML tags from a string.
- *
- * @example
- * stripHtml("<strong>Title</strong>") // "Title"
- */
-function stripHtml(input: string): string {
-  return input.replace(/<[^>]*>/g, "");
-}
-
-/**
- * Decodes a minimal set of HTML entities.
- *
- * @example
- * decodeHtmlEntities("Foo &amp; Bar") // "Foo & Bar"
- */
-function decodeHtmlEntities(input: string): string {
-  return input
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
-}
-
-/**
 /**
  * Copy icon used for the markdown copy button.
  *

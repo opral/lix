@@ -1,3 +1,7 @@
+---
+description: Implement reliable undo and redo in Lix by replaying tracked changes instead of rebuilding editing history from scratch.
+---
+
 # Undo/Redo
 
 Undo and redo are fundamental features for any application that involves editing. Lix provides simple `undo()` and `redo()` commands that are built on top of its robust history and restore capabilities.

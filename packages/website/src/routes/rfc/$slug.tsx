@@ -5,7 +5,17 @@ import markdownPageCss from "../../components/markdown-page.style.css?url";
 import { Footer } from "../../components/footer";
 import { Header } from "../../components/header";
 import { PrevNextNav } from "../../components/prev-next-nav";
-import { buildCanonicalUrl } from "../../lib/seo";
+import {
+  buildBreadcrumbJsonLd,
+  buildCanonicalUrl,
+  buildWebPageJsonLd,
+  extractOgMeta,
+  extractTwitterMeta,
+  getMarkdownDescription,
+  getMarkdownTitle,
+  resolveOgImage,
+  splitTitleFromHtml,
+} from "../../lib/seo";
 
 const rfcMarkdownFiles = import.meta.glob<string>(
   "../../../../../rfcs/**/index.md",
@@ -30,14 +40,12 @@ async function getTitleForSlug(slug: string): Promise<string> {
   const rawMarkdown = await loader();
   const parsed = await parse(rawMarkdown);
 
-  if (parsed.frontmatter?.title) {
-    return parsed.frontmatter.title as string;
-  }
-  const h1Match = rawMarkdown.match(/^#\s+(.+)$/m);
-  if (h1Match) {
-    return h1Match[1];
-  }
-  return slug;
+  return (
+    getMarkdownTitle({
+      rawMarkdown,
+      frontmatter: parsed.frontmatter,
+    }) ?? slug
+  );
 }
 
 /**
@@ -93,26 +101,136 @@ async function loadRfc(slug: string) {
     assetBaseUrl: `/rfc/${slug}/`,
   });
 
-  // Rewrite relative RFC links to absolute paths
-  const html = rewriteRfcLinks(parsed.html);
-
-  // Extract title from frontmatter or first h1
-  let title = slug;
-  if (parsed.frontmatter?.title) {
-    title = parsed.frontmatter.title as string;
-  } else {
-    const h1Match = rawMarkdown.match(/^#\s+(.+)$/m);
-    if (h1Match) {
-      title = h1Match[1];
-    }
-  }
+  const rendered = splitTitleFromHtml(rewriteRfcLinks(parsed.html));
+  const title =
+    getMarkdownTitle({
+      rawMarkdown,
+      frontmatter: parsed.frontmatter,
+    }) ?? rendered.title ?? slug;
+  const description =
+    getMarkdownDescription({
+      rawMarkdown,
+      frontmatter: parsed.frontmatter,
+    }) ?? `Design proposal for ${title}.`;
+  const date = parsed.frontmatter?.date as string | undefined;
 
   return {
     slug,
     title,
-    html,
+    description,
+    date,
+    html: rendered.body,
+    rawMarkdown,
+    frontmatter: parsed.frontmatter,
     prevRfc,
     nextRfc,
+  };
+}
+
+type RfcLoaderData = Awaited<ReturnType<typeof loadRfc>>;
+
+export function buildRfcHead(loaderData?: RfcLoaderData) {
+  const title = loaderData?.title;
+  const description = loaderData?.description;
+  const slug = loaderData?.slug;
+  const canonicalUrl = slug
+    ? buildCanonicalUrl(`/rfc/${slug}`)
+    : buildCanonicalUrl("/rfc");
+  const ogImage = resolveOgImage(loaderData?.frontmatter);
+  const ogMeta = extractOgMeta(loaderData?.frontmatter);
+  const twitterMeta = extractTwitterMeta(loaderData?.frontmatter);
+  const pageTitle = title ? `${title} | Lix RFCs` : "Lix RFCs";
+
+  const links: Array<{ rel: string; href: string }> = [
+    { rel: "stylesheet", href: markdownPageCss },
+    { rel: "canonical", href: canonicalUrl },
+  ];
+
+  if (loaderData?.prevRfc?.slug) {
+    links.push({
+      rel: "prev",
+      href: buildCanonicalUrl(`/rfc/${loaderData.prevRfc.slug}`),
+    });
+  }
+
+  if (loaderData?.nextRfc?.slug) {
+    links.push({
+      rel: "next",
+      href: buildCanonicalUrl(`/rfc/${loaderData.nextRfc.slug}`),
+    });
+  }
+
+  const meta: Array<
+    | { title: string }
+    | { name: string; content: string }
+    | { property: string; content: string }
+  > = [
+    { title: pageTitle },
+    { property: "og:title", content: pageTitle },
+    { property: "og:description", content: description ?? "Lix RFC" },
+    { property: "og:url", content: canonicalUrl },
+    { property: "og:type", content: "article" },
+    { property: "og:site_name", content: "Lix" },
+    { property: "og:locale", content: "en_US" },
+    { property: "og:image", content: ogImage.url },
+    { property: "og:image:alt", content: ogImage.alt },
+    { name: "twitter:card", content: "summary_large_image" },
+    { name: "twitter:title", content: pageTitle },
+    { name: "twitter:description", content: description ?? "Lix RFC" },
+    { name: "twitter:image", content: ogImage.url },
+    { name: "twitter:image:alt", content: ogImage.alt },
+  ];
+
+  if (description) {
+    meta.push({ name: "description", content: description });
+  }
+
+  if (loaderData?.date) {
+    meta.push({
+      property: "article:published_time",
+      content: loaderData.date,
+    });
+  }
+
+  const webPageJsonLd = buildWebPageJsonLd({
+    title: pageTitle,
+    description,
+    canonicalUrl,
+    image: ogImage.url,
+  });
+  const breadcrumbJsonLd = buildBreadcrumbJsonLd([
+    { name: "Lix", item: buildCanonicalUrl("/") },
+    { name: "RFCs", item: buildCanonicalUrl("/rfc") },
+    ...(title ? [{ name: title, item: canonicalUrl }] : []),
+  ]);
+
+  const scripts = [
+    {
+      type: "application/ld+json",
+      children: JSON.stringify({
+        "@context": "https://schema.org",
+        "@type": "TechArticle",
+        headline: title ?? "Lix RFC",
+        description,
+        url: canonicalUrl,
+        image: ogImage.url,
+        ...(loaderData?.date ? { datePublished: loaderData.date } : {}),
+      }),
+    },
+    {
+      type: "application/ld+json",
+      children: JSON.stringify(webPageJsonLd),
+    },
+    {
+      type: "application/ld+json",
+      children: JSON.stringify(breadcrumbJsonLd),
+    },
+  ];
+
+  return {
+    meta: [...meta, ...ogMeta, ...twitterMeta],
+    links,
+    scripts,
   };
 }
 
@@ -124,40 +242,7 @@ export const Route = createFileRoute("/rfc/$slug")({
       throw redirect({ to: "/rfc" });
     }
   },
-  head: ({ loaderData }) => {
-    const title = loaderData?.title;
-    const slug = loaderData?.slug;
-
-    const links: Array<{ rel: string; href: string }> = [
-      { rel: "stylesheet", href: markdownPageCss },
-    ];
-
-    if (slug) {
-      links.push({ rel: "canonical", href: buildCanonicalUrl(`/rfc/${slug}`) });
-    }
-
-    if (loaderData?.prevRfc?.slug) {
-      links.push({
-        rel: "prev",
-        href: buildCanonicalUrl(`/rfc/${loaderData.prevRfc.slug}`),
-      });
-    }
-
-    if (loaderData?.nextRfc?.slug) {
-      links.push({
-        rel: "next",
-        href: buildCanonicalUrl(`/rfc/${loaderData.nextRfc.slug}`),
-      });
-    }
-
-    return {
-      meta: [
-        { title: title ? `${title} | Lix RFCs` : "RFC | Lix" },
-        { name: "description", content: title ?? "Lix RFC" },
-      ],
-      links,
-    };
-  },
+  head: ({ loaderData }) => buildRfcHead(loaderData),
   component: RfcPage,
 });
 
@@ -199,7 +284,7 @@ function RfcPage() {
           </h1>
 
           <article
-            className="markdown-wc-body [&>h1:first-child]:hidden"
+            className="markdown-wc-body"
             dangerouslySetInnerHTML={{ __html: html }}
           />
 

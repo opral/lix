@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "vite dev --port 3000",
     "build": "vite build",
+    "postbuild": "node ./scripts/post-build-seo.js",
     "preview": "vite preview",
     "test": "vitest run && tsc --noEmit",
     "format": "prettier --write ."
