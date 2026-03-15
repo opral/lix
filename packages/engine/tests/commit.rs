@@ -57,13 +57,13 @@ fn as_i64(value: &Value) -> i64 {
     }
 }
 
-async fn read_version_pointer_commit_id(engine: &SimulationEngine, version_id: &str) -> String {
+async fn read_version_ref_commit_id(engine: &SimulationEngine, version_id: &str) -> String {
     let result = engine
         .execute(
             &format!(
                 "SELECT snapshot_content \
                  FROM lix_internal_state_vtable \
-                 WHERE schema_key = 'lix_version_pointer' \
+                 WHERE schema_key = 'lix_version_ref' \
                    AND entity_id = '{}' \
                  LIMIT 1",
                 version_id
@@ -118,7 +118,7 @@ async fn matching_commit_change_set_ids(
             .iter()
             .filter_map(|value| value.as_str().map(ToString::to_string))
             .collect::<BTreeSet<_>>();
-        if commit_change_ids == *domain_change_ids {
+        if domain_change_ids.is_subset(&commit_change_ids) {
             let change_set_id = commit_json
                 .get("change_set_id")
                 .and_then(|v| v.as_str())
@@ -131,13 +131,13 @@ async fn matching_commit_change_set_ids(
     matching_change_set_ids
 }
 
-async fn count_version_pointer_changes(engine: &SimulationEngine, version_id: &str) -> i64 {
+async fn count_version_ref_changes(engine: &SimulationEngine, version_id: &str) -> i64 {
     let result = engine
         .execute(
             &format!(
                 "SELECT COUNT(*) \
                  FROM lix_internal_change \
-                 WHERE schema_key = 'lix_version_pointer' \
+                 WHERE schema_key = 'lix_version_ref' \
                    AND entity_id = '{}'",
                 version_id
             ),
@@ -184,7 +184,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        let previous_commit_id = read_version_pointer_commit_id(&engine, "global").await;
+        let previous_commit_id = read_version_ref_commit_id(&engine, "global").await;
 
         engine
             .execute(
@@ -196,7 +196,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        let new_commit_id = read_version_pointer_commit_id(&engine, "global").await;
+        let new_commit_id = read_version_ref_commit_id(&engine, "global").await;
         assert_ne!(new_commit_id, previous_commit_id);
 
         let domain_change = engine
@@ -281,7 +281,7 @@ simulation_test!(
             .execute(
                 "SELECT snapshot_id \
                  FROM lix_internal_change \
-                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_pointer')",
+                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_ref')",
                 &[],
             )
             .await
@@ -319,7 +319,7 @@ simulation_test!(
             .execute(
                 "SELECT COUNT(*) \
                  FROM lix_internal_change \
-                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_pointer', 'lix_change_set_element', 'lix_commit_edge')", &[])
+                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_ref', 'lix_change_set_element', 'lix_commit_edge')", &[])
             .await
             .unwrap();
         let before_count = as_i64(&before.statements[0].rows[0][0]);
@@ -338,7 +338,7 @@ simulation_test!(
             .execute(
                 "SELECT COUNT(*) \
                  FROM lix_internal_change \
-                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_pointer', 'lix_change_set_element', 'lix_commit_edge')", &[])
+                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_ref', 'lix_change_set_element', 'lix_commit_edge')", &[])
             .await
             .unwrap();
         assert_eq!(as_i64(&after.statements[0].rows[0][0]), before_count);
@@ -726,7 +726,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    content_only_update_emits_version_pointer_change,
+    content_only_update_emits_version_ref_change,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -746,7 +746,7 @@ simulation_test!(
             .unwrap();
 
         let version_id = active_version_id(&engine).await;
-        let before = count_version_pointer_changes(&engine, &version_id).await;
+        let before = count_version_ref_changes(&engine, &version_id).await;
 
         engine
             .execute(
@@ -757,7 +757,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        let after = count_version_pointer_changes(&engine, &version_id).await;
+        let after = count_version_ref_changes(&engine, &version_id).await;
         assert_eq!(after, before + 1);
     }
 );

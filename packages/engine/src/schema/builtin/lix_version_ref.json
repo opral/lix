@@ -1,5 +1,5 @@
 {
-  "x-lix-key": "lix_version_pointer",
+  "x-lix-key": "lix_version_ref",
   "x-lix-version": "1",
   "x-lix-primary-key": [
     "/id"
