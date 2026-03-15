@@ -20,9 +20,9 @@ use crate::version::{
     active_version_storage_version_id, parse_active_version_snapshot, version_descriptor_file_id,
     version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content,
-    version_descriptor_storage_version_id, version_pointer_file_id, version_pointer_plugin_key,
-    version_pointer_schema_key, version_pointer_schema_version, version_pointer_snapshot_content,
-    version_pointer_storage_version_id, GLOBAL_VERSION_ID,
+    version_descriptor_storage_version_id, version_ref_file_id, version_ref_plugin_key,
+    version_ref_schema_key, version_ref_schema_version, version_ref_snapshot_content,
+    version_ref_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixError, Value};
 use serde_json::Value as JsonValue;
@@ -276,7 +276,7 @@ impl Engine {
             .execute_internal(
                 "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
                  FROM lix_internal_state_vtable \
-                 WHERE schema_key = 'lix_version_pointer' \
+                 WHERE schema_key = 'lix_version_ref' \
                    AND entity_id = 'global' \
                    AND file_id = 'lix' \
                    AND version_id = 'global' \
@@ -297,11 +297,11 @@ impl Engine {
         let Some(first) = statement.rows.first() else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "init invariant violation: hidden global version pointer is missing"
+                description: "init invariant violation: hidden global version ref is missing"
                     .to_string(),
             });
         };
-        text_value(first.first(), "lix_version_pointer.commit_id")
+        text_value(first.first(), "lix_version_ref.commit_id")
     }
 
     async fn ensure_checkpoint_label_on_bootstrap_commit(
@@ -396,9 +396,9 @@ impl Engine {
             .await?;
         self.seed_materialized_version_descriptor(GLOBAL_VERSION_ID, GLOBAL_VERSION_ID)
             .await?;
-        self.seed_materialized_version_pointer(GLOBAL_VERSION_ID, &bootstrap_commit_id)
+        self.seed_materialized_version_ref(GLOBAL_VERSION_ID, &bootstrap_commit_id)
             .await?;
-        self.seed_materialized_version_pointer(&main_version_id, &bootstrap_commit_id)
+        self.seed_materialized_version_ref(&main_version_id, &bootstrap_commit_id)
             .await?;
 
         Ok(main_version_id)
@@ -667,14 +667,14 @@ impl Engine {
         Ok(None)
     }
 
-    pub(crate) async fn seed_materialized_version_pointer(
+    pub(crate) async fn seed_materialized_version_ref(
         &self,
         entity_id: &str,
         commit_id: &str,
     ) -> Result<(), LixError> {
-        let snapshot_content = version_pointer_snapshot_content(entity_id, commit_id);
-        let change_id = format!("seed~{}~{}", version_pointer_schema_key(), entity_id);
-        let table = format!("lix_internal_live_v1_{}", version_pointer_schema_key());
+        let snapshot_content = version_ref_snapshot_content(entity_id, commit_id);
+        let change_id = format!("seed~{}~{}", version_ref_schema_key(), entity_id);
+        let table = format!("lix_internal_live_v1_{}", version_ref_schema_key());
         let check_sql = format!(
             "SELECT 1 \
              FROM {table} \
@@ -686,10 +686,10 @@ impl Engine {
                AND snapshot_content IS NOT NULL \
              LIMIT 1",
             table = table,
-            schema_key = escape_sql_string(version_pointer_schema_key()),
+            schema_key = escape_sql_string(version_ref_schema_key()),
             entity_id = escape_sql_string(entity_id),
-            file_id = escape_sql_string(version_pointer_file_id()),
-            version_id = escape_sql_string(version_pointer_storage_version_id()),
+            file_id = escape_sql_string(version_ref_file_id()),
+            version_id = escape_sql_string(version_ref_storage_version_id()),
         );
         let existing = self.backend.execute(&check_sql, &[]).await?;
         if existing.rows.is_empty() {
@@ -701,11 +701,11 @@ impl Engine {
                  )",
                 table = table,
                 entity_id = escape_sql_string(entity_id),
-                schema_key = escape_sql_string(version_pointer_schema_key()),
-                schema_version = escape_sql_string(version_pointer_schema_version()),
-                file_id = escape_sql_string(version_pointer_file_id()),
-                version_id = escape_sql_string(version_pointer_storage_version_id()),
-                plugin_key = escape_sql_string(version_pointer_plugin_key()),
+                schema_key = escape_sql_string(version_ref_schema_key()),
+                schema_version = escape_sql_string(version_ref_schema_version()),
+                file_id = escape_sql_string(version_ref_file_id()),
+                version_id = escape_sql_string(version_ref_storage_version_id()),
+                plugin_key = escape_sql_string(version_ref_plugin_key()),
                 snapshot_content = escape_sql_string(&snapshot_content),
                 change_id = escape_sql_string(&change_id),
             );
@@ -714,10 +714,10 @@ impl Engine {
 
         self.seed_committed_pointer_change(
             entity_id,
-            version_pointer_schema_key(),
-            version_pointer_schema_version(),
-            version_pointer_file_id(),
-            version_pointer_plugin_key(),
+            version_ref_schema_key(),
+            version_ref_schema_version(),
+            version_ref_file_id(),
+            version_ref_plugin_key(),
             &snapshot_content,
             &change_id,
         )
@@ -834,7 +834,7 @@ impl Engine {
 
     async fn resolve_last_checkpoint_commit_id_for_tip(
         &self,
-        tip_commit_id: &str,
+        head_commit_id: &str,
     ) -> Result<Option<String>, LixError> {
         let rows = self
             .execute_internal(
@@ -879,7 +879,7 @@ impl Engine {
                    c.created_at DESC, \
                    anc.ancestor_id DESC \
                  LIMIT 1",
-                &[Value::Text(tip_commit_id.to_string())],
+                &[Value::Text(head_commit_id.to_string())],
                 ExecuteOptions::default(),
             )
             .await?;

@@ -1002,8 +1002,8 @@ fn active_version_commit_id_sql() -> String {
     format!(
         "(\
          SELECT lix_json_extract(vp.snapshot_content, 'commit_id') \
-         FROM lix_internal_live_v1_lix_version_pointer vp \
-         WHERE vp.schema_key = 'lix_version_pointer' \
+         FROM lix_internal_live_v1_lix_version_ref vp \
+         WHERE vp.schema_key = 'lix_version_ref' \
            AND vp.version_id = '{global_version}' \
            AND vp.snapshot_content IS NOT NULL \
            AND vp.entity_id = (\
@@ -1054,10 +1054,10 @@ pub(crate) fn build_filesystem_state_history_source_sql(
            SELECT DISTINCT \
              lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
              vp.entity_id AS root_version_id \
-           FROM lix_internal_live_v1_lix_version_pointer vp \
+           FROM lix_internal_live_v1_lix_version_ref vp \
            JOIN active_version_rows av \
              ON av.version_id = vp.entity_id \
-           WHERE vp.schema_key = 'lix_version_pointer' \
+           WHERE vp.schema_key = 'lix_version_ref' \
              AND vp.version_id = '{global_version}' \
              AND vp.is_tombstone = 0 \
              AND vp.snapshot_content IS NOT NULL \
@@ -1082,8 +1082,8 @@ pub(crate) fn build_filesystem_state_history_source_sql(
            SELECT DISTINCT \
              lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
              vp.entity_id AS root_version_id \
-           FROM lix_internal_live_v1_lix_version_pointer vp \
-           WHERE vp.schema_key = 'lix_version_pointer' \
+           FROM lix_internal_live_v1_lix_version_ref vp \
+           WHERE vp.schema_key = 'lix_version_ref' \
              AND vp.version_id = '{global_version}' \
              AND vp.is_tombstone = 0 \
              AND vp.snapshot_content IS NOT NULL \

@@ -1,6 +1,7 @@
 {
   "x-lix-key": "lix_commit",
   "x-lix-version": "1",
+  "description": "Commit header change. Canonical commit membership is stored in change_ids as the ordered list of non-header member changes for this commit. Derived projections such as lix_change_set_element must be rebuildable from this header plus the referenced change rows.",
   "x-lix-primary-key": [
     "/id"
   ],
@@ -26,46 +27,36 @@
   "properties": {
     "id": {
       "type": "string",
-      "x-lix-default": "lix_uuid_v7()"
+      "x-lix-default": "lix_uuid_v7()",
+      "description": "Stable commit identifier."
     },
     "change_set_id": {
-      "type": "string"
+      "type": "string",
+      "description": "Commit-local grouping identifier used by derived relational indexes and projections such as lix_change_set_element."
     },
     "change_ids": {
-      "type": [
-        "array",
-        "null"
-      ],
+      "type": "array",
+      "default": [],
       "items": {
         "type": "string"
-      }
+      },
+      "description": "Canonical ordered membership list of tracked non-header change IDs that belong to this commit. This includes version-ref changes when a commit moves a version. Derived indexes such as lix_change_set_element must be rebuildable from this list."
     },
     "author_account_ids": {
-      "type": [
-        "array",
-        "null"
-      ],
+      "type": "array",
+      "default": [],
       "items": {
         "type": "string"
-      }
+      },
+      "description": "Ordered set of author account IDs associated with this commit."
     },
     "parent_commit_ids": {
-      "type": [
-        "array",
-        "null"
-      ],
+      "type": "array",
+      "default": [],
       "items": {
         "type": "string"
-      }
-    },
-    "meta_change_ids": {
-      "type": [
-        "array",
-        "null"
-      ],
-      "items": {
-        "type": "string"
-      }
+      },
+      "description": "Parent commit IDs for commit graph topology."
     }
   },
   "required": [

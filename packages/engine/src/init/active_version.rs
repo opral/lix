@@ -1,8 +1,8 @@
 use crate::engine::Engine;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot, version_pointer_file_id, version_pointer_schema_key,
-    version_pointer_storage_version_id, GLOBAL_VERSION_ID,
+    parse_active_version_snapshot, version_ref_file_id, version_ref_schema_key,
+    version_ref_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixError, Value};
 
@@ -12,7 +12,7 @@ impl Engine {
             .backend
             .execute(
                 "SELECT snapshot_content \
-                 FROM lix_internal_live_v1_lix_version_pointer \
+                 FROM lix_internal_live_v1_lix_version_ref \
                  WHERE schema_key = $1 \
                    AND entity_id = $2 \
                    AND file_id = $3 \
@@ -22,18 +22,18 @@ impl Engine {
                  ORDER BY updated_at DESC, created_at DESC, change_id DESC \
                  LIMIT 1",
                 &[
-                    Value::Text(version_pointer_schema_key().to_string()),
+                    Value::Text(version_ref_schema_key().to_string()),
                     Value::Text(GLOBAL_VERSION_ID.to_string()),
-                    Value::Text(version_pointer_file_id().to_string()),
-                    Value::Text(version_pointer_storage_version_id().to_string()),
+                    Value::Text(version_ref_file_id().to_string()),
+                    Value::Text(version_ref_storage_version_id().to_string()),
                 ],
             )
             .await?;
         if let Some(row) = pointer_result.rows.first() {
             if let Some(Value::Text(snapshot_content)) = row.first() {
-                let snapshot: crate::schema::builtin::types::LixVersionPointer =
+                let snapshot: crate::schema::builtin::types::LixVersionRef =
                     serde_json::from_str(snapshot_content).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                            "global version pointer snapshot_content invalid JSON while loading latest commit id: {error}"
+                            "global version ref snapshot_content invalid JSON while loading latest commit id: {error}"
                         ),
                     })?;
                 if !snapshot.commit_id.is_empty() {
@@ -62,7 +62,7 @@ impl Engine {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description:
-                    "init invariant violation: commits exist but hidden global version pointer is missing"
+                    "init invariant violation: commits exist but hidden global version ref is missing"
                         .to_string(),
             });
         }

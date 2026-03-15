@@ -3,16 +3,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 
 use crate::errors::classification::is_missing_relation_error;
-use crate::schema::builtin::types::LixVersionPointer;
+use crate::schema::builtin::types::LixVersionRef;
 use crate::version::{
-    version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key,
-    version_pointer_storage_version_id,
+    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
+    version_ref_storage_version_id,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 use super::types::{VersionInfo, VersionSnapshot};
 
-const VERSION_POINTER_TABLE: &str = "lix_internal_live_v1_lix_version_pointer";
+const VERSION_REF_TABLE: &str = "lix_internal_live_v1_lix_version_ref";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ExactCommittedStateRow {
@@ -47,18 +47,18 @@ where
     }
 }
 
-pub(crate) async fn load_committed_version_tip_commit_id(
+pub(crate) async fn load_committed_version_head_commit_id(
     executor: &mut dyn CommitQueryExecutor,
     version_id: &str,
 ) -> Result<Option<String>, LixError> {
     let snapshot_content = match load_current_pointer_snapshot_content(
         executor,
-        VERSION_POINTER_TABLE,
-        version_pointer_schema_key(),
+        VERSION_REF_TABLE,
+        version_ref_schema_key(),
         version_id,
-        version_pointer_file_id(),
-        version_pointer_plugin_key(),
-        version_pointer_storage_version_id(),
+        version_ref_file_id(),
+        version_ref_plugin_key(),
+        version_ref_storage_version_id(),
     )
     .await?
     {
@@ -66,7 +66,7 @@ pub(crate) async fn load_committed_version_tip_commit_id(
         None => None,
     };
     if let Some(snapshot_content) = snapshot_content {
-        let Some(pointer) = parse_version_pointer_snapshot(&snapshot_content)? else {
+        let Some(pointer) = parse_version_ref_snapshot(&snapshot_content)? else {
             return Ok(None);
         };
         if pointer.commit_id.is_empty() {
@@ -75,14 +75,7 @@ pub(crate) async fn load_committed_version_tip_commit_id(
         return Ok(Some(pointer.commit_id));
     }
 
-    load_pointer_tip_commit_id_from_change_log(
-        executor,
-        version_pointer_schema_key(),
-        version_id,
-        version_pointer_file_id(),
-        version_pointer_plugin_key(),
-    )
-    .await
+    Ok(None)
 }
 
 pub(crate) async fn load_version_info_for_versions(
@@ -106,7 +99,8 @@ pub(crate) async fn load_version_info_for_versions(
         );
     }
     for version_id in version_ids {
-        if let Some(commit_id) = load_committed_version_tip_commit_id(executor, version_id).await? {
+        if let Some(commit_id) = load_committed_version_head_commit_id(executor, version_id).await?
+        {
             versions.insert(
                 version_id.clone(),
                 VersionInfo {
@@ -155,108 +149,6 @@ async fn load_current_pointer_snapshot_content(
         Err(err) if is_missing_relation_error(&err) => Ok(None),
         Err(err) => Err(err),
     }
-}
-
-async fn load_pointer_tip_commit_id_from_change_log(
-    executor: &mut dyn CommitQueryExecutor,
-    schema_key: &str,
-    entity_id: &str,
-    file_id: &str,
-    plugin_key: &str,
-) -> Result<Option<String>, LixError> {
-    let sql = format!(
-        "SELECT s.content AS snapshot_content \
-         FROM lix_internal_change c \
-         LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-         WHERE c.schema_key = '{schema_key}' \
-           AND c.entity_id = '{entity_id}' \
-           AND c.file_id = '{file_id}' \
-           AND c.plugin_key = '{plugin_key}' \
-           AND s.content IS NOT NULL",
-        schema_key = escape_sql_string(schema_key),
-        entity_id = escape_sql_string(entity_id),
-        file_id = escape_sql_string(file_id),
-        plugin_key = escape_sql_string(plugin_key),
-    );
-    let result = executor.execute(&sql, &[]).await?;
-    let mut candidate_commit_ids = BTreeSet::new();
-    for row in &result.rows {
-        let Some(value) = row.first() else {
-            continue;
-        };
-        let Some(pointer) = parse_version_pointer_snapshot(value)? else {
-            continue;
-        };
-        if !pointer.commit_id.is_empty() {
-            candidate_commit_ids.insert(pointer.commit_id);
-        }
-    }
-
-    if candidate_commit_ids.is_empty() {
-        return Ok(None);
-    }
-    if candidate_commit_ids.len() == 1 {
-        return Ok(candidate_commit_ids.pop_first());
-    }
-
-    select_tip_commit_from_ancestry(executor, &candidate_commit_ids).await
-}
-
-async fn select_tip_commit_from_ancestry(
-    executor: &mut dyn CommitQueryExecutor,
-    candidate_commit_ids: &BTreeSet<String>,
-) -> Result<Option<String>, LixError> {
-    let in_list = candidate_commit_ids
-        .iter()
-        .map(|commit_id| format!("'{}'", escape_sql_string(commit_id)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT commit_id, ancestor_id \
-         FROM lix_internal_commit_ancestry \
-         WHERE commit_id IN ({in_list}) \
-           AND ancestor_id IN ({in_list})",
-    );
-    let result = executor.execute(&sql, &[]).await?;
-    let ancestry_pairs = result
-        .rows
-        .iter()
-        .filter_map(|row| match (row.first(), row.get(1)) {
-            (Some(commit_id), Some(ancestor_id)) => {
-                Some((text_from_value(commit_id)?, text_from_value(ancestor_id)?))
-            }
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-
-    let mut resolved_tip = None;
-    for candidate in candidate_commit_ids {
-        let dominates_all = candidate_commit_ids.iter().all(|other| {
-            candidate == other || ancestry_pairs.contains(&(candidate.clone(), other.clone()))
-        });
-        if dominates_all {
-            if resolved_tip.is_some() {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description:
-                        "pointer tip fallback found multiple candidate tips in commit ancestry"
-                            .to_string(),
-                });
-            }
-            resolved_tip = Some(candidate.clone());
-        }
-    }
-
-    if resolved_tip.is_none() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description:
-                "pointer tip fallback could not resolve a current tip from commit ancestry"
-                    .to_string(),
-        });
-    }
-
-    Ok(resolved_tip)
 }
 
 pub(crate) async fn load_exact_committed_state_row(
@@ -362,23 +254,22 @@ fn exact_committed_state_row_from_live_table_row(
     }))
 }
 
-fn parse_version_pointer_snapshot(value: &Value) -> Result<Option<LixVersionPointer>, LixError> {
+fn parse_version_ref_snapshot(value: &Value) -> Result<Option<LixVersionRef>, LixError> {
     let raw_snapshot = match value {
         Value::Text(value) => value,
         Value::Null => return Ok(None),
         _ => {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "version tip snapshot_content must be text".to_string(),
+                description: "version ref snapshot_content must be text".to_string(),
             });
         }
     };
 
-    let snapshot: LixVersionPointer =
-        serde_json::from_str(raw_snapshot).map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("version tip snapshot_content invalid JSON: {error}"),
-        })?;
+    let snapshot: LixVersionRef = serde_json::from_str(raw_snapshot).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!("version ref snapshot_content invalid JSON: {error}"),
+    })?;
     Ok(Some(snapshot))
 }
 

@@ -1,8 +1,7 @@
 use crate::engine::Engine;
 use crate::init::init_backend;
 use crate::version::{
-    version_pointer_file_id, version_pointer_schema_key, version_pointer_storage_version_id,
-    GLOBAL_VERSION_ID,
+    version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixError, SqlDialect, Value};
 use std::time::Duration;
@@ -76,7 +75,7 @@ impl Engine {
                         "SELECT 1 \
                          FROM sqlite_master \
                          WHERE type = 'table' \
-                           AND name = 'lix_internal_live_v1_lix_version_pointer' \
+                           AND name = 'lix_internal_live_v1_lix_version_ref' \
                          LIMIT 1",
                         &[],
                     )
@@ -90,7 +89,7 @@ impl Engine {
                         "SELECT 1 \
                          FROM information_schema.tables \
                          WHERE table_schema = current_schema() \
-                           AND table_name = 'lix_internal_live_v1_lix_version_pointer' \
+                           AND table_name = 'lix_internal_live_v1_lix_version_ref' \
                          LIMIT 1",
                         &[],
                     )
@@ -106,7 +105,7 @@ impl Engine {
             .backend
             .execute(
                 "SELECT 1 \
-                 FROM lix_internal_live_v1_lix_version_pointer \
+                 FROM lix_internal_live_v1_lix_version_ref \
                  WHERE schema_key = $1 \
                    AND entity_id = $2 \
                    AND file_id = $3 \
@@ -114,10 +113,10 @@ impl Engine {
                    AND snapshot_content IS NOT NULL \
                  LIMIT 1",
                 &[
-                    Value::Text(version_pointer_schema_key().to_string()),
+                    Value::Text(version_ref_schema_key().to_string()),
                     Value::Text(GLOBAL_VERSION_ID.to_string()),
-                    Value::Text(version_pointer_file_id().to_string()),
-                    Value::Text(version_pointer_storage_version_id().to_string()),
+                    Value::Text(version_ref_file_id().to_string()),
+                    Value::Text(version_ref_storage_version_id().to_string()),
                 ],
             )
             .await?;

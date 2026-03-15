@@ -177,7 +177,7 @@ fn dependency_spec_for_admin_scan(kind: CanonicalAdminKind) -> DependencySpec {
             spec.relations.insert("lix_version".to_string());
             spec.schema_keys
                 .insert("lix_version_descriptor".to_string());
-            spec.schema_keys.insert("lix_version_pointer".to_string());
+            spec.schema_keys.insert("lix_version_ref".to_string());
         }
     }
     spec
