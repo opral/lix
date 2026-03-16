@@ -1,6 +1,8 @@
 package lix:plugin@0.1.0;
 
 interface api {
+  type canonical-json = string;
+
   /// Current materialized file payload. Plugins should treat this as an
   /// implementation detail cache and must not rely on mutation order.
   record file {
@@ -21,7 +23,8 @@ interface api {
     entity-id: string,
     schema-key: string,
     schema-version: string,
-    snapshot-content: option<string>,
+    /// Deterministically encoded JSON text.
+    snapshot-content: option<canonical-json>,
   }
 
   /// Optional active-state row payload passed to detect-changes when requested
@@ -32,12 +35,14 @@ interface api {
     entity-id: string,
     schema-key: option<string>,
     schema-version: option<string>,
-    snapshot-content: option<string>,
+    /// Deterministically encoded JSON text.
+    snapshot-content: option<canonical-json>,
     file-id: option<string>,
     plugin-key: option<string>,
     version-id: option<string>,
     change-id: option<string>,
-    metadata: option<string>,
+    /// Deterministically encoded JSON text.
+    metadata: option<canonical-json>,
     created-at: option<string>,
     updated-at: option<string>,
   }

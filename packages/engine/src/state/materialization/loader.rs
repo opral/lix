@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::schema::builtin::types::{LixCommit, LixCommitEdge, LixVersionDescriptor};
 
-use crate::{LixBackend, LixError, Value};
+use crate::{CanonicalJson, LixBackend, LixError, Value};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ChangeRecord {
@@ -12,8 +12,8 @@ pub(crate) struct ChangeRecord {
     pub schema_version: String,
     pub file_id: String,
     pub plugin_key: String,
-    pub snapshot_content: Option<String>,
-    pub metadata: Option<String>,
+    pub snapshot_content: Option<CanonicalJson>,
+    pub metadata: Option<CanonicalJson>,
     pub created_at: String,
 }
 
@@ -32,8 +32,8 @@ pub(crate) struct VersionDescriptorRecord {
     pub schema_version: String,
     pub file_id: String,
     pub plugin_key: String,
-    pub snapshot_content: String,
-    pub metadata: Option<String>,
+    pub snapshot_content: CanonicalJson,
+    pub metadata: Option<CanonicalJson>,
     pub created_at: String,
 }
 
@@ -70,8 +70,8 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
         let schema_version = text_required(&row, 3, "schema_version")?;
         let file_id = text_required(&row, 4, "file_id")?;
         let plugin_key = text_required(&row, 5, "plugin_key")?;
-        let snapshot_content = text_optional(&row, 6, "snapshot_content")?;
-        let metadata = text_optional(&row, 7, "metadata")?;
+        let snapshot_content = json_text_optional(&row, 6, "snapshot_content")?;
+        let metadata = json_text_optional(&row, 7, "metadata")?;
         let created_at = text_required(&row, 8, "created_at")?;
 
         let change = ChangeRecord {
@@ -205,10 +205,13 @@ impl HasOrder for VersionDescriptorRecord {
     }
 }
 
-fn parse_commit_snapshot(raw: &str) -> Result<Option<LixCommit>, LixError> {
-    let mut parsed: LixCommit = serde_json::from_str(raw).map_err(|error| LixError {
+fn parse_commit_snapshot(raw: &CanonicalJson) -> Result<Option<LixCommit>, LixError> {
+    let mut parsed: LixCommit = raw.parse().map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("materialization: invalid lix_commit snapshot JSON: {error}"),
+        description: format!(
+            "materialization: invalid lix_commit snapshot JSON: {}",
+            error.description
+        ),
     })?;
 
     if parsed.id.is_empty() {
@@ -220,11 +223,14 @@ fn parse_commit_snapshot(raw: &str) -> Result<Option<LixCommit>, LixError> {
     Ok(Some(parsed))
 }
 
-fn parse_version_descriptor_snapshot(raw: &str) -> Result<Option<LixVersionDescriptor>, LixError> {
-    let parsed: LixVersionDescriptor = serde_json::from_str(raw).map_err(|error| LixError {
+fn parse_version_descriptor_snapshot(
+    raw: &CanonicalJson,
+) -> Result<Option<LixVersionDescriptor>, LixError> {
+    let parsed: LixVersionDescriptor = raw.parse().map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!(
-            "materialization: invalid lix_version_descriptor snapshot JSON: {error}"
+            "materialization: invalid lix_version_descriptor snapshot JSON: {}",
+            error.description
         ),
     })?;
 
@@ -234,10 +240,13 @@ fn parse_version_descriptor_snapshot(raw: &str) -> Result<Option<LixVersionDescr
     Ok(Some(parsed))
 }
 
-fn parse_commit_edge_snapshot(raw: &str) -> Result<Option<LixCommitEdge>, LixError> {
-    let parsed: LixCommitEdge = serde_json::from_str(raw).map_err(|error| LixError {
+fn parse_commit_edge_snapshot(raw: &CanonicalJson) -> Result<Option<LixCommitEdge>, LixError> {
+    let parsed: LixCommitEdge = raw.parse().map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("materialization: invalid lix_commit_edge snapshot JSON: {error}"),
+        description: format!(
+            "materialization: invalid lix_commit_edge snapshot JSON: {}",
+            error.description
+        ),
     })?;
 
     if parsed.parent_id.is_empty() || parsed.child_id.is_empty() {
@@ -282,4 +291,23 @@ fn text_optional(row: &[Value], index: usize, label: &str) -> Result<Option<Stri
             ),
         }),
     }
+}
+
+fn json_text_optional(
+    row: &[Value],
+    index: usize,
+    label: &str,
+) -> Result<Option<CanonicalJson>, LixError> {
+    let Some(text) = text_optional(row, index, label)? else {
+        return Ok(None);
+    };
+    CanonicalJson::from_text(text).map(Some).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "materialization: invalid canonical JSON in '{label}': {}",
+                error.description
+            ),
+        )
+    })
 }

@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use crate::CanonicalJson;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LiveStateRebuildScope {
     Full,
@@ -44,8 +46,8 @@ pub struct LiveStateWrite {
     pub version_id: String,
     pub global: bool,
     pub op: LiveStateWriteOp,
-    pub snapshot_content: Option<String>,
-    pub metadata: Option<String>,
+    pub snapshot_content: Option<CanonicalJson>,
+    pub metadata: Option<CanonicalJson>,
     pub schema_version: String,
     pub plugin_key: String,
     pub change_id: String,

@@ -4,14 +4,19 @@ import type {
 	LixValue as LixCanonicalValue,
 	QueryResult as LixCanonicalQueryResult,
 } from "./engine-wasm/index.js";
+import type { CanonicalJsonText, LixJsonValue } from "./canonical-json.js";
 
 export type {
+	CanonicalJsonText,
 	LixCanonicalExecuteResult,
 	LixCanonicalValue,
 	LixCanonicalQueryResult,
+	LixJsonValue,
 };
 
-export type LixRuntimeValue = JsonValue | Uint8Array;
+export type { JsonValue };
+
+export type LixRuntimeValue = LixJsonValue | Uint8Array;
 
 export type LixRuntimeQueryResult = {
 	rows: LixRuntimeValue[][];

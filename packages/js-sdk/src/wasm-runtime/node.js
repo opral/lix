@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { transpile as transpileComponent } from "@bytecodealliance/jco";
 import { WASIShim } from "@bytecodealliance/preview2-shim/instantiation";
+import {
+	encodeCanonicalJson,
+	parseCanonicalJson,
+} from "../canonical-json.js";
 
 const COMPONENT_API_KEY = "lix:plugin/api@0.1.0";
 const DETECT_EXPORTS = new Set(["detect-changes", "api#detect-changes"]);
@@ -32,24 +36,18 @@ function toUint8Array(value) {
 	return new Uint8Array();
 }
 
-function toSnapshotString(value) {
+function decodeCanonicalJsonField(value, context) {
 	if (value === null || value === undefined) {
 		return undefined;
 	}
-	if (typeof value === "string") {
-		return value;
+	return parseCanonicalJson(String(value), context);
+}
+
+function encodeCanonicalJsonField(value, context) {
+	if (value === null || value === undefined) {
+		return undefined;
 	}
-	if (value instanceof Uint8Array) {
-		return textDecoder.decode(value);
-	}
-	if (value instanceof ArrayBuffer) {
-		return textDecoder.decode(new Uint8Array(value));
-	}
-	try {
-		return JSON.stringify(value);
-	} catch {
-		return String(value);
-	}
+	return encodeCanonicalJson(value, context);
 }
 
 function decodeJsonBytes(input) {
@@ -70,10 +68,14 @@ function normalizeWireFile(file) {
 }
 
 function normalizeWireEntityChange(change) {
-	const snapshot =
+	const snapshotText =
 		change?.snapshotContent !== undefined
 			? change.snapshotContent
 			: change?.snapshot_content;
+	const snapshotValue = decodeCanonicalJsonField(
+		snapshotText,
+		"plugin detect-changes response snapshot_content",
+	);
 
 	return {
 		entity_id: String(change?.entityId ?? change?.entity_id ?? ""),
@@ -81,7 +83,13 @@ function normalizeWireEntityChange(change) {
 		schema_version: String(
 			change?.schemaVersion ?? change?.schema_version ?? "",
 		),
-		snapshot_content: snapshot === undefined ? null : snapshot,
+		snapshot_content:
+			snapshotValue === undefined
+				? null
+				: encodeCanonicalJsonField(
+						snapshotValue,
+						"plugin detect-changes response snapshot_content",
+					),
 	};
 }
 
@@ -94,11 +102,18 @@ function toPluginEntityChange(change) {
 		),
 	};
 
-	const snapshot =
+	const snapshotText =
 		change?.snapshot_content !== undefined
 			? change.snapshot_content
 			: change?.snapshotContent;
-	const snapshotString = toSnapshotString(snapshot);
+	const snapshotValue = decodeCanonicalJsonField(
+		snapshotText,
+		"plugin apply-changes request snapshot_content",
+	);
+	const snapshotString = encodeCanonicalJsonField(
+		snapshotValue,
+		"plugin apply-changes request snapshot_content",
+	);
 	if (snapshotString !== undefined) {
 		normalized.snapshotContent = snapshotString;
 	}
@@ -123,11 +138,18 @@ function toPluginActiveStateRow(row) {
 		normalized.schemaVersion = String(schemaVersion);
 	}
 
-	const snapshotContent =
+	const snapshotContentText =
 		row?.snapshot_content !== undefined
 			? row.snapshot_content
 			: row?.snapshotContent;
-	const snapshotString = toSnapshotString(snapshotContent);
+	const snapshotValue = decodeCanonicalJsonField(
+		snapshotContentText,
+		"plugin detect-changes active_state snapshot_content",
+	);
+	const snapshotString = encodeCanonicalJsonField(
+		snapshotValue,
+		"plugin detect-changes active_state snapshot_content",
+	);
 	if (snapshotString !== undefined) {
 		normalized.snapshotContent = snapshotString;
 	}
@@ -155,7 +177,17 @@ function toPluginActiveStateRow(row) {
 	}
 
 	if (row?.metadata !== null && row?.metadata !== undefined) {
-		normalized.metadata = String(row.metadata);
+		const metadataValue = decodeCanonicalJsonField(
+			row.metadata,
+			"plugin detect-changes active_state metadata",
+		);
+		const metadataText = encodeCanonicalJsonField(
+			metadataValue,
+			"plugin detect-changes active_state metadata",
+		);
+		if (metadataText !== undefined) {
+			normalized.metadata = metadataText;
+		}
 	}
 
 	const createdAt =
