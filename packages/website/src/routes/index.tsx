@@ -19,9 +19,10 @@ export const Route = createFileRoute("/")({
     return await loadReadmeContent();
   },
   head: () => {
-    const title = "Lix - The version control system for AI agents";
+    const title =
+      "Lix | Version control as a library for AI agents and structured data";
     const description =
-      "Lix lets you branch, track, and review every change an AI agent does on the filesystem.";
+      "Lix gives AI agents and applications branchable, reviewable change control for structured files, binary formats, and SQL-backed workflows.";
     const canonicalUrl = buildCanonicalUrl("/");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({

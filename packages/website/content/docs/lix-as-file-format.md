@@ -1,3 +1,7 @@
+---
+description: Use Lix as the foundation for portable file formats with built-in history, collaboration, syncing, and embedded assets.
+---
+
 # Lix as File Format
 
 Lix is designed to be used as the foundation for application-specific file formats. Instead of building change control, versioning, and collaboration from scratch, you can build your file format on top of lix and inherit these capabilities automatically.

@@ -1,3 +1,7 @@
+---
+description: Install Lix, open an in-memory repository, write files, and query semantic changes in a minimal JavaScript quickstart.
+---
+
 # Getting Started
 
 ## Install
