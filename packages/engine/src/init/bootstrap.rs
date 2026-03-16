@@ -1,9 +1,10 @@
 use crate::engine::Engine;
 use crate::init::init_backend;
-use crate::version::{
-    version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id, GLOBAL_VERSION_ID,
+use crate::state::live_state::{
+    canonical_state_exists, ensure_live_state_ready, load_latest_canonical_watermark,
+    mark_live_state_mode_with_backend, mark_live_state_ready_with_backend, LiveStateMode,
 };
-use crate::{LixError, SqlDialect, Value};
+use crate::LixError;
 use std::time::Duration;
 
 impl Engine {
@@ -27,8 +28,19 @@ impl Engine {
             self.rebuild_internal_last_checkpoint().await?;
             self.seed_boot_key_values().await?;
             self.seed_boot_account().await?;
+            mark_live_state_mode_with_backend(self.backend.as_ref(), LiveStateMode::Rebuilding)
+                .await?;
             self.load_and_cache_active_version().await?;
-            self.refresh_public_surface_registry().await
+            self.refresh_public_surface_registry().await?;
+            let watermark = load_latest_canonical_watermark(self.backend.as_ref())
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "initialize expected canonical watermark after bootstrap seeding",
+                    )
+                })?;
+            mark_live_state_ready_with_backend(self.backend.as_ref(), &watermark).await
         }
         .await;
 
@@ -54,6 +66,9 @@ impl Engine {
         match self.initialize().await {
             Ok(()) => Ok(true),
             Err(error) if error.code == crate::errors::ErrorCode::AlreadyInitialized.as_str() => {
+                if !self.wait_for_concurrent_init_resolution().await? {
+                    ensure_live_state_ready(self.backend.as_ref()).await?;
+                }
                 self.load_and_cache_active_version().await?;
                 self.refresh_public_surface_registry().await?;
                 Ok(false)
@@ -67,60 +82,7 @@ impl Engine {
     }
 
     async fn backend_has_been_initialized(&self) -> Result<bool, LixError> {
-        let table_exists = match self.backend.dialect() {
-            SqlDialect::Sqlite => {
-                let exists = self
-                    .backend
-                    .execute(
-                        "SELECT 1 \
-                         FROM sqlite_master \
-                         WHERE type = 'table' \
-                           AND name = 'lix_internal_live_v1_lix_version_ref' \
-                         LIMIT 1",
-                        &[],
-                    )
-                    .await?;
-                !exists.rows.is_empty()
-            }
-            SqlDialect::Postgres => {
-                let exists = self
-                    .backend
-                    .execute(
-                        "SELECT 1 \
-                         FROM information_schema.tables \
-                         WHERE table_schema = current_schema() \
-                           AND table_name = 'lix_internal_live_v1_lix_version_ref' \
-                         LIMIT 1",
-                        &[],
-                    )
-                    .await?;
-                !exists.rows.is_empty()
-            }
-        };
-        if !table_exists {
-            return Ok(false);
-        }
-
-        let result = self
-            .backend
-            .execute(
-                "SELECT 1 \
-                 FROM lix_internal_live_v1_lix_version_ref \
-                 WHERE schema_key = $1 \
-                   AND entity_id = $2 \
-                   AND file_id = $3 \
-                   AND version_id = $4 \
-                   AND snapshot_content IS NOT NULL \
-                 LIMIT 1",
-                &[
-                    Value::Text(version_ref_schema_key().to_string()),
-                    Value::Text(GLOBAL_VERSION_ID.to_string()),
-                    Value::Text(version_ref_file_id().to_string()),
-                    Value::Text(version_ref_storage_version_id().to_string()),
-                ],
-            )
-            .await?;
-        Ok(!result.rows.is_empty())
+        canonical_state_exists(self.backend.as_ref()).await
     }
 
     async fn normalize_init_error(&self, error: LixError) -> LixError {
@@ -136,11 +98,17 @@ impl Engine {
                 .await
                 .unwrap_or(false)
         {
-            return crate::errors::already_initialized_error();
+            return match ensure_live_state_ready(self.backend.as_ref()).await {
+                Ok(()) => crate::errors::already_initialized_error(),
+                Err(error) => error,
+            };
         }
 
         match self.backend_has_been_initialized().await {
-            Ok(true) => crate::errors::already_initialized_error(),
+            Ok(true) => match ensure_live_state_ready(self.backend.as_ref()).await {
+                Ok(()) => crate::errors::already_initialized_error(),
+                Err(error) => error,
+            },
             _ => error,
         }
     }
@@ -150,14 +118,13 @@ impl Engine {
         const DELAY_MS: u64 = 50;
 
         for attempt in 0..ATTEMPTS {
-            match self.backend_has_been_initialized().await {
-                Ok(true) => return Ok(true),
-                Ok(false) => {
-                    if attempt + 1 == ATTEMPTS {
-                        return Ok(false);
-                    }
-                }
-                Err(error) if is_init_locked_error(&error.description) => {
+            match ensure_live_state_ready(self.backend.as_ref()).await {
+                Ok(()) => return Ok(true),
+                Err(error)
+                    if error.code == crate::errors::ErrorCode::NotInitialized.as_str()
+                        || error.code == crate::errors::ErrorCode::LiveStateNotReady.as_str()
+                        || is_init_locked_error(&error.description) =>
+                {
                     if attempt + 1 == ATTEMPTS {
                         return Ok(false);
                     }

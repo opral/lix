@@ -142,6 +142,11 @@ struct TransactionCommitExecutor<'a> {
 
 #[async_trait::async_trait(?Send)]
 impl CommitQueryExecutor for TransactionCommitExecutor<'_> {
+    #[cfg(test)]
+    fn dialect(&self) -> crate::SqlDialect {
+        self.transaction.dialect()
+    }
+
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         self.transaction.execute(sql, params).await
     }
@@ -575,6 +580,7 @@ pub(crate) async fn build_pending_public_commit_session(
     commit_result: &GenerateCommitResult,
 ) -> Result<PendingPublicCommitSession, LixError> {
     let commit_row = commit_result
+        .derived_apply_input
         .live_state_rows
         .iter()
         .find(|row| row.schema_key == "lix_commit")
@@ -608,6 +614,7 @@ pub(crate) async fn build_pending_public_commit_session(
         })?
         .to_string();
     let commit_change_id = commit_result
+        .canonical_output
         .changes
         .iter()
         .find(|row| row.schema_key == "lix_commit" && row.entity_id == commit_row.entity_id)
@@ -778,6 +785,7 @@ fn rewrite_generated_commit_result_for_pending_session(
     timestamp: &str,
 ) -> Result<GenerateCommitResult, LixError> {
     let temporary_commit_id = generated
+        .derived_apply_input
         .live_state_rows
         .iter()
         .find(|row| row.schema_key == "lix_commit")
@@ -789,6 +797,7 @@ fn rewrite_generated_commit_result_for_pending_session(
             )
         })?;
     let temporary_change_set_id = generated
+        .derived_apply_input
         .live_state_rows
         .iter()
         .find(|row| row.schema_key == "lix_change_set")
@@ -802,7 +811,7 @@ fn rewrite_generated_commit_result_for_pending_session(
     let version_ref_entity_id = pending_session_version_ref_entity_id(&session.lane);
 
     let mut live_state_rows = Vec::new();
-    for mut row in generated.live_state_rows {
+    for mut row in generated.derived_apply_input.live_state_rows {
         if is_pending_commit_meta_row(
             &row,
             &temporary_commit_id,
@@ -849,12 +858,15 @@ fn rewrite_generated_commit_result_for_pending_session(
     });
 
     Ok(GenerateCommitResult {
-        changes: generated
-            .changes
-            .into_iter()
-            .take(domain_change_count)
-            .collect(),
-        live_state_rows,
+        canonical_output: crate::state::commit::CanonicalCommitOutput {
+            changes: generated
+                .canonical_output
+                .changes
+                .into_iter()
+                .take(domain_change_count)
+                .collect(),
+        },
+        derived_apply_input: crate::state::commit::DerivedCommitApplyInput { live_state_rows },
     })
 }
 
@@ -1003,7 +1015,7 @@ pub(crate) async fn mirror_public_registered_schema_bootstrap_rows(
     transaction: &mut dyn LixTransaction,
     commit_result: &crate::state::commit::GenerateCommitResult,
 ) -> Result<(), LixError> {
-    for row in &commit_result.live_state_rows {
+    for row in &commit_result.derived_apply_input.live_state_rows {
         if row.schema_key != REGISTERED_SCHEMA_KEY || row.lixcol_version_id != GLOBAL_VERSION_ID {
             continue;
         }

@@ -187,16 +187,22 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
     .await
     .map_err(create_commit_error_to_lix_error)?;
 
-    if let Some(commit_result) = create_result.commit_result.as_ref() {
-        mirror_public_registered_schema_bootstrap_rows(transaction, commit_result)
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "public tracked write registered-schema bootstrap mirroring failed: {}",
-                    error.description
-                ),
-            })?;
+    if let Some(applied_output) = create_result.applied_output.as_ref() {
+        mirror_public_registered_schema_bootstrap_rows(
+            transaction,
+            &crate::state::commit::GenerateCommitResult {
+                canonical_output: applied_output.canonical_output.clone(),
+                derived_apply_input: applied_output.derived_apply_input.clone(),
+            },
+        )
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "public tracked write registered-schema bootstrap mirroring failed: {}",
+                error.description
+            ),
+        })?;
     }
 
     let applied_domain_change_batch =
@@ -252,12 +258,15 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
         matches!(create_result.disposition, CreateCommitDisposition::Applied);
     if let Some(session_slot) = pending_commit_session.as_mut() {
         **session_slot = if plugin_changes_committed {
-            if let Some(commit_result) = create_result.commit_result.as_ref() {
+            if let Some(applied_output) = create_result.applied_output.as_ref() {
                 Some(
                     build_pending_public_commit_session(
                         transaction,
                         plan.execution.create_preconditions.write_lane.clone(),
-                        commit_result,
+                        &crate::state::commit::GenerateCommitResult {
+                            canonical_output: applied_output.canonical_output.clone(),
+                            derived_apply_input: applied_output.derived_apply_input.clone(),
+                        },
                     )
                     .await?,
                 )

@@ -52,6 +52,11 @@ struct BackendExecutor<'a> {
 
 #[async_trait::async_trait(?Send)]
 impl CommitQueryExecutor for BackendExecutor<'_> {
+    #[cfg(test)]
+    fn dialect(&self) -> crate::SqlDialect {
+        self.backend.dialect()
+    }
+
     async fn execute(
         &mut self,
         sql: &str,
@@ -1195,7 +1200,7 @@ async fn rewrite_tracked_rows_with_backend(
         || functions.uuid_v7(),
     )?;
 
-    for row in &commit_result.live_state_rows {
+    for row in &commit_result.derived_apply_input.live_state_rows {
         ensure_live_table_requirement(live_table_requirements, &row.schema_key);
     }
 

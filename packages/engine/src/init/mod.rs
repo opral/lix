@@ -39,6 +39,8 @@ const INIT_STATEMENTS: &[&str] = &[
      ON lix_internal_commit_idempotency (commit_id)",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_commit_idempotency_legacy \
      ON lix_internal_commit_idempotency (write_lane, idempotency_key)",
+    crate::state::live_state::LIVE_STATE_STATUS_CREATE_TABLE_SQL,
+    crate::state::live_state::LIVE_STATE_STATUS_SEED_ROW_SQL,
     "CREATE TABLE IF NOT EXISTS lix_internal_registered_schema_bootstrap (\
      entity_id TEXT NOT NULL,\
      schema_key TEXT NOT NULL,\

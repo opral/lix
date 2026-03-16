@@ -579,6 +579,10 @@ fn entity_descriptors_from_spec(
     let history_visible = entity_visible_columns(&spec.visible_columns, true, true);
     let hidden_columns = entity_hidden_columns();
     let column_types = entity_column_types(&spec.column_types);
+    let default_capability = entity_surface_capability(&spec.schema_key, SurfaceVariant::Default);
+    let by_version_capability =
+        entity_surface_capability(&spec.schema_key, SurfaceVariant::ByVersion);
+    let history_capability = entity_surface_capability(&spec.schema_key, SurfaceVariant::History);
 
     vec![
         SurfaceDescriptor {
@@ -588,7 +592,7 @@ fn entity_descriptors_from_spec(
             visible_columns: default_visible,
             hidden_columns: hidden_columns.clone(),
             column_types: column_types.clone(),
-            capability: SurfaceCapability::ReadWrite,
+            capability: default_capability,
             default_scope: DefaultScopeSemantics::ActiveVersion,
             surface_traits: SurfaceTraits {
                 state_backed: true,
@@ -598,7 +602,7 @@ fn entity_descriptors_from_spec(
             resolution_capabilities: SurfaceResolutionCapabilities {
                 canonical_state_scan: true,
                 entity_projection: true,
-                semantic_write: true,
+                semantic_write: default_capability == SurfaceCapability::ReadWrite,
                 ..SurfaceResolutionCapabilities::default()
             },
             implicit_overrides: SurfaceImplicitOverrides {
@@ -618,7 +622,7 @@ fn entity_descriptors_from_spec(
             visible_columns: by_version_visible,
             hidden_columns: hidden_columns.clone(),
             column_types: column_types.clone(),
-            capability: SurfaceCapability::ReadWrite,
+            capability: by_version_capability,
             default_scope: DefaultScopeSemantics::ExplicitVersion,
             surface_traits: SurfaceTraits {
                 state_backed: true,
@@ -629,7 +633,7 @@ fn entity_descriptors_from_spec(
             resolution_capabilities: SurfaceResolutionCapabilities {
                 canonical_state_scan: true,
                 entity_projection: true,
-                semantic_write: true,
+                semantic_write: by_version_capability == SurfaceCapability::ReadWrite,
                 ..SurfaceResolutionCapabilities::default()
             },
             implicit_overrides: SurfaceImplicitOverrides {
@@ -649,7 +653,7 @@ fn entity_descriptors_from_spec(
             visible_columns: history_visible,
             hidden_columns,
             column_types,
-            capability: SurfaceCapability::ReadOnly,
+            capability: history_capability,
             default_scope: DefaultScopeSemantics::History,
             surface_traits: SurfaceTraits {
                 state_backed: true,
@@ -660,7 +664,7 @@ fn entity_descriptors_from_spec(
             resolution_capabilities: SurfaceResolutionCapabilities {
                 canonical_state_scan: true,
                 entity_projection: true,
-                semantic_write: false,
+                semantic_write: history_capability == SurfaceCapability::ReadWrite,
                 ..SurfaceResolutionCapabilities::default()
             },
             implicit_overrides: SurfaceImplicitOverrides {
@@ -674,6 +678,19 @@ fn entity_descriptors_from_spec(
             catalog_source,
         },
     ]
+}
+
+fn entity_surface_capability(schema_key: &str, variant: SurfaceVariant) -> SurfaceCapability {
+    if matches!(variant, SurfaceVariant::History) {
+        return SurfaceCapability::ReadOnly;
+    }
+
+    match schema_key {
+        "lix_commit_edge" | "lix_change_set_element" | "lix_change_author" => {
+            SurfaceCapability::ReadOnly
+        }
+        _ => SurfaceCapability::ReadWrite,
+    }
 }
 
 fn entity_surface_spec_from_schema(
@@ -1172,8 +1189,8 @@ mod tests {
     use super::{
         builtin_public_surface_columns, builtin_public_surface_names,
         entity_surface_spec_from_schema, CatalogEpoch, DefaultScopeSemantics,
-        DynamicEntitySurfaceSpec, SurfaceFamily, SurfaceOverrideValue, SurfaceRegistry,
-        SurfaceVariant,
+        DynamicEntitySurfaceSpec, SurfaceCapability, SurfaceFamily, SurfaceOverrideValue,
+        SurfaceRegistry, SurfaceVariant,
     };
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
@@ -1268,6 +1285,28 @@ mod tests {
             binding.implicit_overrides.fixed_schema_key.as_deref(),
             Some("lix_registered_schema")
         );
+    }
+
+    #[test]
+    fn derived_builtin_entity_surfaces_are_read_only() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        for surface in [
+            "lix_change_author",
+            "lix_change_author_by_version",
+            "lix_change_set_element",
+            "lix_change_set_element_by_version",
+            "lix_commit_edge",
+            "lix_commit_edge_by_version",
+        ] {
+            let binding = registry
+                .bind_relation_name(surface)
+                .expect("derived builtin surface should bind");
+            assert_eq!(binding.capability, SurfaceCapability::ReadOnly);
+            assert!(
+                !binding.resolution_capabilities.semantic_write,
+                "derived builtin surface should not permit semantic writes: {surface}"
+            );
+        }
     }
 
     #[test]

@@ -1,45 +1,19 @@
 use crate::engine::Engine;
+use crate::state::commit::load_committed_version_head_commit_id_from_live_state;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot, version_ref_file_id, version_ref_schema_key,
-    version_ref_storage_version_id, GLOBAL_VERSION_ID,
+    parse_active_version_snapshot, GLOBAL_VERSION_ID,
 };
 use crate::{LixError, Value};
 
 impl Engine {
     pub(crate) async fn load_latest_commit_id(&self) -> Result<Option<String>, LixError> {
-        let pointer_result = self
-            .backend
-            .execute(
-                "SELECT snapshot_content \
-                 FROM lix_internal_live_v1_lix_version_ref \
-                 WHERE schema_key = $1 \
-                   AND entity_id = $2 \
-                   AND file_id = $3 \
-                   AND version_id = $4 \
-                   AND is_tombstone = 0 \
-                   AND snapshot_content IS NOT NULL \
-                 ORDER BY updated_at DESC, created_at DESC, change_id DESC \
-                 LIMIT 1",
-                &[
-                    Value::Text(version_ref_schema_key().to_string()),
-                    Value::Text(GLOBAL_VERSION_ID.to_string()),
-                    Value::Text(version_ref_file_id().to_string()),
-                    Value::Text(version_ref_storage_version_id().to_string()),
-                ],
-            )
-            .await?;
-        if let Some(row) = pointer_result.rows.first() {
-            if let Some(Value::Text(snapshot_content)) = row.first() {
-                let snapshot: crate::schema::builtin::types::LixVersionRef =
-                    serde_json::from_str(snapshot_content).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                            "global version ref snapshot_content invalid JSON while loading latest commit id: {error}"
-                        ),
-                    })?;
-                if !snapshot.commit_id.is_empty() {
-                    return Ok(Some(snapshot.commit_id));
-                }
-            }
+        let mut executor = &*self.backend;
+        if let Some(commit_id) =
+            load_committed_version_head_commit_id_from_live_state(&mut executor, GLOBAL_VERSION_ID)
+                .await?
+        {
+            return Ok(Some(commit_id));
         }
 
         let has_commits = self

@@ -1,16 +1,27 @@
 use std::collections::BTreeSet;
 
-use crate::schema::registry::ensure_schema_live_table;
+use crate::schema::registry::ensure_schema_live_table_in_transaction;
 use crate::sql::storage::sql_text::escape_sql_string;
+use crate::state::live_state::{
+    build_mark_live_state_ready_sql, build_set_live_state_mode_sql,
+    load_latest_canonical_watermark_in_transaction, LiveStateMode,
+};
 use crate::state::materialization::types::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildScope, LiveStateWriteOp,
 };
-use crate::{LixBackend, LixError, Value};
+use crate::{LixBackend, LixError, LixTransaction, Value};
 
 pub(crate) async fn apply_live_state_rebuild_plan_internal(
     backend: &dyn LixBackend,
     plan: &LiveStateRebuildPlan,
 ) -> Result<LiveStateApplyReport, LixError> {
+    let mut transaction = backend.begin_transaction().await?;
+    transaction
+        .execute(
+            &build_set_live_state_mode_sql(LiveStateMode::Rebuilding),
+            &[],
+        )
+        .await?;
     let mut tables_touched = BTreeSet::new();
 
     let mut schema_keys = BTreeSet::new();
@@ -18,8 +29,13 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
         schema_keys.insert(write.schema_key.clone());
     }
 
-    let rows_deleted =
-        clear_scope_rows(backend, &schema_keys, &plan.scope, &mut tables_touched).await?;
+    let rows_deleted = clear_scope_rows(
+        transaction.as_mut(),
+        &schema_keys,
+        &plan.scope,
+        &mut tables_touched,
+    )
+    .await?;
 
     for write in &plan.writes {
         let table_name = live_state_table_name(&write.schema_key);
@@ -73,8 +89,32 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
             updated_at = escape_sql_string(&write.updated_at),
         );
 
-        backend.execute(&sql, &[]).await?;
+        transaction.execute(&sql, &[]).await?;
     }
+
+    if matches!(plan.scope, LiveStateRebuildScope::Full) {
+        let Some(watermark) =
+            load_latest_canonical_watermark_in_transaction(transaction.as_mut()).await?
+        else {
+            transaction.rollback().await?;
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "live-state rebuild expected canonical watermark for full rebuild",
+            ));
+        };
+        transaction
+            .execute(&build_mark_live_state_ready_sql(&watermark), &[])
+            .await?;
+    } else {
+        transaction
+            .execute(
+                &build_set_live_state_mode_sql(LiveStateMode::NeedsRebuild),
+                &[],
+            )
+            .await?;
+    }
+
+    transaction.commit().await?;
 
     Ok(LiveStateApplyReport {
         run_id: plan.run_id.clone(),
@@ -85,7 +125,7 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
 }
 
 async fn clear_scope_rows(
-    backend: &dyn LixBackend,
+    transaction: &mut dyn LixTransaction,
     schema_keys: &BTreeSet<String>,
     scope: &LiveStateRebuildScope,
     tables_touched: &mut BTreeSet<String>,
@@ -102,7 +142,7 @@ async fn clear_scope_rows(
     let mut rows_deleted = 0usize;
 
     for schema_key in schema_keys {
-        ensure_schema_live_table(backend, schema_key).await?;
+        ensure_schema_live_table_in_transaction(transaction, schema_key).await?;
         let table_name = live_state_table_name(schema_key);
         tables_touched.insert(table_name.clone());
 
@@ -132,10 +172,10 @@ async fn clear_scope_rows(
             )
         };
 
-        let count_result = backend.execute(&count_sql, &[]).await?;
+        let count_result = transaction.execute(&count_sql, &[]).await?;
         rows_deleted += parse_count_result(&count_result.rows)?;
 
-        backend.execute(&delete_sql, &[]).await?;
+        transaction.execute(&delete_sql, &[]).await?;
     }
 
     Ok(rows_deleted)

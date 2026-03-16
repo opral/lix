@@ -4,7 +4,8 @@ use serde_json::json;
 
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
 use crate::state::commit::types::{
-    ChangeRow, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow,
+    CanonicalCommitOutput, ChangeRow, DerivedCommitApplyInput, DomainChangeInput,
+    GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow,
 };
 use crate::LixError;
 
@@ -547,8 +548,10 @@ where
     output_changes.extend(meta_changes);
 
     Ok(GenerateCommitResult {
-        changes: output_changes,
-        live_state_rows,
+        canonical_output: CanonicalCommitOutput {
+            changes: output_changes,
+        },
+        derived_apply_input: DerivedCommitApplyInput { live_state_rows },
     })
 }
 
@@ -698,6 +701,7 @@ mod tests {
 
     fn version_ref_change_ids(result: &GenerateCommitResult) -> Vec<String> {
         result
+            .canonical_output
             .changes
             .iter()
             .filter(|row| row.schema_key == "lix_version_ref")
@@ -735,9 +739,10 @@ mod tests {
         })
         .expect("generate_commit should succeed");
 
-        assert_eq!(result.changes.len(), 4);
+        assert_eq!(result.canonical_output.changes.len(), 4);
         assert_eq!(
             result
+                .canonical_output
                 .changes
                 .iter()
                 .filter(|row| row.schema_key == "lix_commit")
@@ -746,6 +751,7 @@ mod tests {
         );
         assert_eq!(
             result
+                .canonical_output
                 .changes
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_set")
@@ -754,6 +760,7 @@ mod tests {
         );
         assert_eq!(
             result
+                .canonical_output
                 .changes
                 .iter()
                 .filter(|row| row.schema_key == "lix_version_ref")
@@ -762,6 +769,7 @@ mod tests {
         );
 
         let commit_row = result
+            .canonical_output
             .changes
             .iter()
             .find(|row| row.schema_key == "lix_commit")
@@ -784,6 +792,7 @@ mod tests {
         );
 
         let materialized_commit_row = result
+            .derived_apply_input
             .live_state_rows
             .iter()
             .find(|row| row.schema_key == "lix_commit")
@@ -793,7 +802,7 @@ mod tests {
                 .unwrap();
         assert_eq!(materialized_commit_snapshot, commit_snapshot);
 
-        let materialized_counts = counts_by_schema(&result.live_state_rows);
+        let materialized_counts = counts_by_schema(&result.derived_apply_input.live_state_rows);
         assert_eq!(materialized_counts.get("lix_key_value"), Some(&1));
         assert_eq!(materialized_counts.get("lix_change_author"), Some(&2));
         assert_eq!(materialized_counts.get("lix_change_set_element"), Some(&2));
@@ -801,9 +810,10 @@ mod tests {
         assert_eq!(materialized_counts.get("lix_commit"), Some(&1));
         assert_eq!(materialized_counts.get("lix_version_ref"), Some(&1));
         assert_eq!(materialized_counts.get("lix_commit_edge"), Some(&1));
-        assert_eq!(result.live_state_rows.len(), 9);
+        assert_eq!(result.derived_apply_input.live_state_rows.len(), 9);
 
         let domain_materialized = result
+            .derived_apply_input
             .live_state_rows
             .iter()
             .find(|row| row.schema_key == "lix_key_value")
@@ -842,6 +852,7 @@ mod tests {
 
         assert_eq!(
             result
+                .canonical_output
                 .changes
                 .iter()
                 .filter(|row| row.schema_key == "lix_commit")
@@ -850,6 +861,7 @@ mod tests {
         );
         assert_eq!(
             result
+                .derived_apply_input
                 .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_author")
@@ -858,6 +870,7 @@ mod tests {
         );
         assert_eq!(
             result
+                .derived_apply_input
                 .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_set_element")
@@ -866,6 +879,7 @@ mod tests {
         );
         assert_eq!(
             result
+                .derived_apply_input
                 .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_commit_edge")
@@ -874,6 +888,7 @@ mod tests {
         );
         assert_eq!(
             result
+                .derived_apply_input
                 .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_set")
@@ -882,15 +897,17 @@ mod tests {
         );
         assert_eq!(
             result
+                .derived_apply_input
                 .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_version_ref")
                 .count(),
             1
         );
-        assert_eq!(result.live_state_rows.len(), 9);
+        assert_eq!(result.derived_apply_input.live_state_rows.len(), 9);
 
         let commit_row = result
+            .canonical_output
             .changes
             .iter()
             .find(|row| row.schema_key == "lix_commit")
@@ -912,6 +929,7 @@ mod tests {
         );
 
         let author_row = result
+            .derived_apply_input
             .live_state_rows
             .iter()
             .find(|row| {
@@ -957,9 +975,10 @@ mod tests {
         })
         .expect("generate_commit should succeed");
 
-        assert_eq!(result.changes.len(), 8);
+        assert_eq!(result.canonical_output.changes.len(), 8);
         assert_eq!(
             result
+                .canonical_output
                 .changes
                 .iter()
                 .filter(|row| row.schema_key == "lix_commit")
@@ -968,6 +987,7 @@ mod tests {
         );
         assert_eq!(
             result
+                .canonical_output
                 .changes
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_set")
@@ -976,6 +996,7 @@ mod tests {
         );
         assert_eq!(
             result
+                .canonical_output
                 .changes
                 .iter()
                 .filter(|row| row.schema_key == "lix_version_ref")
@@ -985,6 +1006,7 @@ mod tests {
 
         assert_eq!(
             result
+                .derived_apply_input
                 .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_author")
@@ -993,6 +1015,7 @@ mod tests {
         );
         assert_eq!(
             result
+                .derived_apply_input
                 .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_set")
@@ -1001,15 +1024,17 @@ mod tests {
         );
         assert_eq!(
             result
+                .derived_apply_input
                 .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_set_element")
                 .count(),
             4
         );
-        assert_eq!(result.live_state_rows.len(), 22);
+        assert_eq!(result.derived_apply_input.live_state_rows.len(), 22);
 
         let commit_rows: Vec<_> = result
+            .canonical_output
             .changes
             .iter()
             .filter(|row| row.schema_key == "lix_commit")
@@ -1026,6 +1051,7 @@ mod tests {
         }
 
         let change_author_entities: BTreeSet<String> = result
+            .derived_apply_input
             .live_state_rows
             .iter()
             .filter(|row| row.schema_key == "lix_change_author")
@@ -1041,6 +1067,7 @@ mod tests {
         }
         assert_eq!(
             result
+                .derived_apply_input
                 .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_author")
@@ -1049,6 +1076,7 @@ mod tests {
         );
 
         let global_tip = result
+            .derived_apply_input
             .live_state_rows
             .iter()
             .find(|row| row.schema_key == "lix_version_ref" && row.entity_id == "global")
@@ -1061,6 +1089,7 @@ mod tests {
             .to_string();
 
         for cse in result
+            .derived_apply_input
             .live_state_rows
             .iter()
             .filter(|row| row.schema_key == "lix_change_set_element")
@@ -1095,6 +1124,7 @@ mod tests {
         .expect("generate_commit should succeed");
 
         let domain_change_ids = result
+            .canonical_output
             .changes
             .iter()
             .filter(|row| row.schema_key == "lix_key_value")
@@ -1107,6 +1137,7 @@ mod tests {
             .expect("expected version ref change");
 
         let commit_row = result
+            .canonical_output
             .changes
             .iter()
             .find(|row| row.schema_key == "lix_commit")
@@ -1119,6 +1150,7 @@ mod tests {
         );
 
         let cse_change_ids = result
+            .derived_apply_input
             .live_state_rows
             .iter()
             .filter(|row| row.schema_key == "lix_change_set_element")
@@ -1142,6 +1174,7 @@ mod tests {
         );
 
         let change_author_entities = result
+            .derived_apply_input
             .live_state_rows
             .iter()
             .filter(|row| row.schema_key == "lix_change_author")
@@ -1239,6 +1272,7 @@ mod tests {
         .expect("generate_commit should succeed");
 
         let domain_row = result
+            .derived_apply_input
             .live_state_rows
             .iter()
             .find(|row| row.schema_key == "mock_schema")
@@ -1246,6 +1280,7 @@ mod tests {
         assert_eq!(domain_row.writer_key.as_deref(), Some("writer:test"));
 
         for row in result
+            .derived_apply_input
             .live_state_rows
             .iter()
             .filter(|row| row.schema_key != "mock_schema")

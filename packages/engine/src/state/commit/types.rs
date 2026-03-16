@@ -77,7 +77,17 @@ pub struct MaterializedStateRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GenerateCommitResult {
+pub struct CanonicalCommitOutput {
     pub changes: Vec<ChangeRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedCommitApplyInput {
     pub live_state_rows: Vec<MaterializedStateRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerateCommitResult {
+    pub canonical_output: CanonicalCommitOutput,
+    pub derived_apply_input: DerivedCommitApplyInput,
 }

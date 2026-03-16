@@ -37,8 +37,9 @@ use crate::sql::public::planner::semantics::effective_state_resolver::{
 use crate::sql::public::planner::semantics::write_analysis::analyze_write;
 use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan;
 use crate::state::commit::{
-    load_committed_version_head_commit_id, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
-    CreateCommitPreconditions, CreateCommitWriteLane, ProposedDomainChange,
+    load_committed_version_head_commit_id_from_live_state, CreateCommitExpectedHead,
+    CreateCommitIdempotencyKey, CreateCommitPreconditions, CreateCommitWriteLane,
+    ProposedDomainChange,
 };
 use crate::state::stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
@@ -1129,9 +1130,10 @@ async fn maybe_bind_active_history_root(
     }
 
     let mut executor = backend;
-    let root_commit_id = load_committed_version_head_commit_id(&mut executor, active_version_id)
-        .await
-        .ok()??;
+    let root_commit_id =
+        load_committed_version_head_commit_id_from_live_state(&mut executor, active_version_id)
+            .await
+            .ok()??;
     let root_predicate = Expr::BinaryOp {
         left: Box::new(Expr::Identifier(Ident::new("lixcol_root_commit_id"))),
         op: BinaryOperator::Eq,

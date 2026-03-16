@@ -7,7 +7,7 @@ use crate::sql::public::planner::semantics::surface_semantics::{
     overlay_lanes_for_version, OverlayLane,
 };
 use crate::state::commit::{
-    load_exact_committed_state_row, CommitQueryExecutor, ExactCommittedStateRow,
+    load_exact_committed_state_row_from_live_state, CommitQueryExecutor, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
 use crate::version::GLOBAL_VERSION_ID;
@@ -328,7 +328,7 @@ async fn load_exact_tracked_effective_row(
     internal_version_id: &str,
     overlay_lane: OverlayLane,
 ) -> Result<Option<ExactEffectiveStateRow>, LixError> {
-    let row = load_exact_committed_state_row(
+    let row = load_exact_committed_state_row_from_live_state(
         backend,
         &ExactCommittedStateRowRequest {
             entity_id: request.row_key.entity_id.clone(),
