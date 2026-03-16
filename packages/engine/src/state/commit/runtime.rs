@@ -25,7 +25,10 @@ use crate::{LixError, SqlDialect, Value as EngineValue};
 
 use super::graph_index::append_commit_graph_node_statements;
 use super::state_source::CommitQueryExecutor;
-use super::types::{DomainChangeInput, GenerateCommitResult, MaterializedStateRow};
+use super::types::{
+    CanonicalCommitOutput, DerivedCommitApplyInput, DomainChangeInput, GenerateCommitResult,
+    MaterializedStateRow,
+};
 
 const UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
 const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
@@ -211,6 +214,22 @@ pub(crate) fn build_statement_batch_from_generate_commit_result(
     placeholder_offset: usize,
     dialect: SqlDialect,
 ) -> Result<StatementBatch, LixError> {
+    build_statement_batch_from_commit_apply_input(
+        &commit_result.canonical_output,
+        &commit_result.derived_apply_input,
+        functions,
+        placeholder_offset,
+        dialect,
+    )
+}
+
+pub(crate) fn build_statement_batch_from_commit_apply_input(
+    canonical_output: &CanonicalCommitOutput,
+    derived_apply_input: &DerivedCommitApplyInput,
+    functions: &mut dyn LixFunctionProvider,
+    placeholder_offset: usize,
+    dialect: SqlDialect,
+) -> Result<StatementBatch, LixError> {
     let mut ensure_no_content = false;
     let mut snapshot_rows = Vec::new();
     let mut statement_params = Vec::new();
@@ -218,7 +237,7 @@ pub(crate) fn build_statement_batch_from_generate_commit_result(
     let mut change_rows = Vec::new();
     let mut materialized_by_schema: BTreeMap<String, Vec<Vec<Expr>>> = BTreeMap::new();
 
-    for change in &commit_result.changes {
+    for change in &canonical_output.changes {
         let snapshot_id = match &change.snapshot_content {
             Some(content) => {
                 let id = functions.uuid_v7();
@@ -281,7 +300,7 @@ pub(crate) fn build_statement_batch_from_generate_commit_result(
         ]);
     }
 
-    for row in &commit_result.live_state_rows {
+    for row in &derived_apply_input.live_state_rows {
         let entry = materialized_by_schema
             .entry(row.schema_key.clone())
             .or_default();
@@ -366,7 +385,7 @@ pub(crate) fn build_statement_batch_from_generate_commit_result(
         &mut statements,
         &mut statement_params,
         &mut next_placeholder,
-        &commit_result.live_state_rows,
+        &derived_apply_input.live_state_rows,
     )?;
 
     Ok(StatementBatch {

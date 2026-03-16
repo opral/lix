@@ -3,6 +3,7 @@ use crate::engine::{
     ExecuteOptions,
 };
 use crate::errors;
+use crate::init::init_backend;
 use crate::sql::ast::utils::bind_sql;
 use crate::sql::ast::walk::object_name_matches;
 use crate::sql::common::ast::lower_statement;
@@ -23,6 +24,7 @@ use crate::state::internal::inline_functions::inline_lix_functions_with_provider
 use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
 use crate::state::internal::statement_references_internal_state_vtable;
 use crate::state::internal::write_program::WriteProgram;
+use crate::state::live_state::ensure_live_state_ready;
 use crate::state::materialization::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
 };
@@ -47,9 +49,11 @@ impl Engine {
 
     #[doc(hidden)]
     pub async fn open_existing(&self) -> Result<(), LixError> {
+        init_backend(self.backend.as_ref()).await?;
         if !self.is_initialized().await? {
             return Err(errors::not_initialized_error());
         }
+        ensure_live_state_ready(self.backend.as_ref()).await?;
         self.load_and_cache_active_version().await?;
         self.refresh_public_surface_registry().await?;
         Ok(())
@@ -303,6 +307,8 @@ impl Engine {
         reader: &mut dyn crate::ImageChunkReader,
     ) -> Result<(), LixError> {
         self.backend.restore_from_image(reader).await?;
+        init_backend(self.backend.as_ref()).await?;
+        ensure_live_state_ready(self.backend.as_ref()).await?;
         self.load_and_cache_active_version().await?;
         self.refresh_public_surface_registry().await?;
         self.invalidate_installed_plugins_cache()?;
@@ -337,12 +343,20 @@ impl Engine {
         )
         .await?;
 
-        crate::plugin::runtime::materialize_file_data_with_plugins(
+        if let Err(error) = crate::plugin::runtime::materialize_file_data_with_plugins(
             self.backend.as_ref(),
             self.wasm_runtime_ref(),
             &plan,
         )
-        .await?;
+        .await
+        {
+            let _ = crate::state::live_state::mark_live_state_mode_with_backend(
+                self.backend.as_ref(),
+                crate::state::live_state::LiveStateMode::NeedsRebuild,
+            )
+            .await;
+            return Err(error);
+        }
 
         Ok(LiveStateRebuildReport { plan, apply })
     }

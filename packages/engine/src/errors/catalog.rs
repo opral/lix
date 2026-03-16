@@ -5,6 +5,7 @@ use crate::LixError;
 pub(crate) enum ErrorCode {
     AlreadyInitialized,
     NotInitialized,
+    LiveStateNotReady,
     TableNotFound,
     SchemaNotRegistered,
     SqlUnknownTable,
@@ -26,6 +27,7 @@ impl ErrorCode {
         match self {
             Self::AlreadyInitialized => "LIX_ERROR_ALREADY_INITIALIZED",
             Self::NotInitialized => "LIX_ERROR_NOT_INITIALIZED",
+            Self::LiveStateNotReady => "LIX_ERROR_LIVE_STATE_NOT_READY",
             Self::TableNotFound => "LIX_ERROR_TABLE_NOT_FOUND",
             Self::SchemaNotRegistered => "LIX_ERROR_SCHEMA_NOT_REGISTERED",
             Self::SqlUnknownTable => "LIX_ERROR_SQL_UNKNOWN_TABLE",
@@ -52,6 +54,7 @@ impl ErrorCode {
         &[
             Self::AlreadyInitialized,
             Self::NotInitialized,
+            Self::LiveStateNotReady,
             Self::TableNotFound,
             Self::SchemaNotRegistered,
             Self::SqlUnknownTable,
@@ -85,6 +88,13 @@ pub(crate) fn not_initialized_error() -> LixError {
     build_error(
         ErrorCode::NotInitialized,
         "Lix is not initialized in this backend target. Initialize it before opening.",
+    )
+}
+
+pub(crate) fn live_state_not_ready_error() -> LixError {
+    build_error(
+        ErrorCode::LiveStateNotReady,
+        "Lix live state is not ready. Rebuild live state before opening or executing tracked operations.",
     )
 }
 

@@ -2087,6 +2087,7 @@ dependencies = [
  "jsonschema",
  "paste",
  "postgresql_embedded",
+ "rusqlite",
  "ruzstd",
  "serde",
  "serde_json",

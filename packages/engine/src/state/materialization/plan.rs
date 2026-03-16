@@ -132,7 +132,10 @@ fn resolved_scope(
     target_versions: BTreeSet<String>,
 ) -> LiveStateRebuildScope {
     match &req.scope {
-        LiveStateRebuildScope::Full => LiveStateRebuildScope::Versions(target_versions),
+        LiveStateRebuildScope::Full => {
+            let _ = target_versions;
+            LiveStateRebuildScope::Full
+        }
         LiveStateRebuildScope::Versions(_) => LiveStateRebuildScope::Versions(target_versions),
     }
 }

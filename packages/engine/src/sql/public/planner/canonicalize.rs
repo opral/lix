@@ -1918,6 +1918,44 @@ mod tests {
         );
     }
 
+    fn assert_surface_write_is_rejected(surface: &str, sql: &str) {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let error = canonicalize_write(bound_statement(sql), &registry)
+            .expect_err("derived builtin surface should not be writable");
+        assert!(
+            error
+                .message
+                .contains(&format!("surface '{surface}' is not writable")),
+            "unexpected error for {surface}: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn rejects_insert_update_and_delete_for_derived_builtin_entity_surfaces() {
+        for surface in [
+            "lix_change_author",
+            "lix_change_author_by_version",
+            "lix_change_set_element",
+            "lix_change_set_element_by_version",
+            "lix_commit_edge",
+            "lix_commit_edge_by_version",
+        ] {
+            assert_surface_write_is_rejected(
+                surface,
+                &format!("INSERT INTO {surface} (id) VALUES ('x')"),
+            );
+            assert_surface_write_is_rejected(
+                surface,
+                &format!("UPDATE {surface} SET id = 'x' WHERE id = 'y'"),
+            );
+            assert_surface_write_is_rejected(
+                surface,
+                &format!("DELETE FROM {surface} WHERE id = 'y'"),
+            );
+        }
+    }
+
     #[test]
     fn canonicalizes_singleton_in_selector_as_exact_filesystem_delete() {
         let registry = SurfaceRegistry::with_builtin_surfaces();

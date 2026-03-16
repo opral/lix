@@ -12,7 +12,13 @@ use crate::sql::execution::runtime_effects::{
 };
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::sql::public::planner::ir::LazyExactFileUpdate;
+use crate::state::live_state::{
+    build_mark_live_state_ready_sql, ensure_live_state_ready_in_transaction, CanonicalWatermark,
+};
+use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
+#[cfg(test)]
+use crate::SqlDialect;
 use crate::{LixError, LixTransaction, QueryResult, Value};
 use async_trait::async_trait;
 
@@ -20,14 +26,17 @@ use super::generate_commit::generate_commit;
 use super::runtime::{
     bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
 };
-use super::state_source::{load_version_info_for_versions, CommitQueryExecutor};
+use super::state_source::{
+    load_committed_version_head_commit_id_from_live_state,
+    load_exact_committed_state_row_from_live_state_with_executor, load_version_info_for_versions,
+    CommitQueryExecutor, ExactCommittedStateRowRequest,
+};
 use super::types::{
-    DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange, VersionInfo,
-    VersionSnapshot,
+    CanonicalCommitOutput, DerivedCommitApplyInput, DomainChangeInput, GenerateCommitArgs,
+    GenerateCommitResult, ProposedDomainChange, VersionInfo, VersionSnapshot,
 };
 
 const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
-const LIVE_VERSION_REF_TABLE: &str = "lix_internal_live_v1_lix_version_ref";
 const LIVE_UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
 const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
@@ -85,8 +94,38 @@ pub(crate) enum CreateCommitDisposition {
 pub(crate) struct CreateCommitResult {
     pub(crate) disposition: CreateCommitDisposition,
     pub(crate) committed_head: String,
-    pub(crate) commit_result: Option<GenerateCommitResult>,
+    pub(crate) applied_output: Option<CreateCommitAppliedOutput>,
     pub(crate) applied_domain_changes: Vec<ProposedDomainChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitIdempotencyWrite {
+    pub(crate) write_lane: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) idempotency_kind: String,
+    pub(crate) idempotency_value: String,
+    pub(crate) parent_head_snapshot_content: String,
+    pub(crate) commit_id: String,
+    pub(crate) created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObserveTickWrite {
+    pub(crate) writer_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OperationalCommitApplyInput {
+    pub(crate) idempotency_write: CommitIdempotencyWrite,
+    pub(crate) deterministic_sequence_highest_seen: Option<i64>,
+    pub(crate) observe_tick: Option<ObserveTickWrite>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreateCommitAppliedOutput {
+    pub(crate) canonical_output: CanonicalCommitOutput,
+    pub(crate) derived_apply_input: DerivedCommitApplyInput,
+    pub(crate) operational_apply_input: OperationalCommitApplyInput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +169,9 @@ pub(crate) async fn create_commit(
 
     let concrete_lane = concrete_lane(&args.preconditions)?;
     validate_change_versions(&args.changes, &args.lazy_exact_file_updates, &concrete_lane)?;
+    ensure_live_state_ready_in_transaction(transaction)
+        .await
+        .map_err(backend_error)?;
 
     let needs_active_accounts = !args
         .changes
@@ -176,7 +218,7 @@ pub(crate) async fn create_commit(
                 return Ok(CreateCommitResult {
                     disposition: CreateCommitDisposition::Replay,
                     committed_head: current.to_string(),
-                    commit_result: None,
+                    applied_output: None,
                     applied_domain_changes: Vec::new(),
                 });
             }
@@ -204,7 +246,7 @@ pub(crate) async fn create_commit(
                 return Ok(CreateCommitResult {
                     disposition: CreateCommitDisposition::Replay,
                     committed_head: current.to_string(),
-                    commit_result: None,
+                    applied_output: None,
                     applied_domain_changes: Vec::new(),
                 });
             }
@@ -225,7 +267,7 @@ pub(crate) async fn create_commit(
         return Ok(CreateCommitResult {
             disposition: CreateCommitDisposition::Replay,
             committed_head: commit_id,
-            commit_result: None,
+            applied_output: None,
             applied_domain_changes: Vec::new(),
         });
     }
@@ -240,7 +282,7 @@ pub(crate) async fn create_commit(
         return Ok(CreateCommitResult {
             disposition: CreateCommitDisposition::Replay,
             committed_head: current_head.unwrap_or_default(),
-            commit_result: None,
+            applied_output: None,
             applied_domain_changes: Vec::new(),
         });
     }
@@ -287,7 +329,7 @@ pub(crate) async fn create_commit(
             });
         global_version.parent_commit_ids = current_head.clone().into_iter().collect();
     }
-    let commit_result = generate_commit(
+    let generated_commit = generate_commit(
         GenerateCommitArgs {
             timestamp: timestamp.clone(),
             active_accounts: preflight.active_accounts,
@@ -297,11 +339,40 @@ pub(crate) async fn create_commit(
         || functions.uuid_v7(),
     )
     .map_err(backend_error)?;
-    let committed_head = extract_committed_head_id(&commit_result, &concrete_lane)?;
+    let committed_head = extract_committed_head_id(&generated_commit, &concrete_lane)?;
+    let operational_apply_input = OperationalCommitApplyInput {
+        idempotency_write: CommitIdempotencyWrite {
+            write_lane: lane_storage_key(&concrete_lane),
+            idempotency_key: resolved_idempotency.legacy_key.clone(),
+            idempotency_kind: resolved_idempotency.kind.to_string(),
+            idempotency_value: resolved_idempotency.value.clone(),
+            parent_head_snapshot_content: resolved_idempotency.parent_head_snapshot_content.clone(),
+            commit_id: committed_head.clone(),
+            created_at: timestamp.clone(),
+        },
+        deterministic_sequence_highest_seen: functions
+            .deterministic_sequence_persist_highest_seen(),
+        observe_tick: args.should_emit_observe_tick.then(|| ObserveTickWrite {
+            writer_key: args.observe_tick_writer_key.clone(),
+        }),
+    };
+    let applied_output = CreateCommitAppliedOutput {
+        canonical_output: generated_commit.canonical_output.clone(),
+        derived_apply_input: generated_commit.derived_apply_input.clone(),
+        operational_apply_input,
+    };
+    let live_state_watermark =
+        canonical_watermark(&applied_output.canonical_output).ok_or_else(|| CreateCommitError {
+            kind: CreateCommitErrorKind::Internal,
+            message: "generated commit did not produce a canonical watermark".to_string(),
+        })?;
 
     let mut prepared_batch = bind_statement_batch_for_dialect(
         build_statement_batch_from_generate_commit_result(
-            commit_result.clone(),
+            GenerateCommitResult {
+                canonical_output: applied_output.canonical_output.clone(),
+                derived_apply_input: applied_output.derived_apply_input.clone(),
+            },
             functions,
             0,
             transaction.dialect(),
@@ -311,19 +382,20 @@ pub(crate) async fn create_commit(
     )
     .map_err(backend_error)?;
     prepared_batch.append_sql(insert_idempotency_row_sql(
-        &concrete_lane,
-        &resolved_idempotency,
-        &committed_head,
-        &timestamp,
+        &applied_output.operational_apply_input.idempotency_write,
     ));
-    if let Some(highest_seen) = functions.deterministic_sequence_persist_highest_seen() {
+    if let Some(highest_seen) = applied_output
+        .operational_apply_input
+        .deterministic_sequence_highest_seen
+    {
         prepared_batch.append_sql(build_persist_sequence_highest_sql(highest_seen));
     }
-    if args.should_emit_observe_tick {
+    if let Some(observe_tick) = applied_output.operational_apply_input.observe_tick.as_ref() {
         prepared_batch.append_sql(build_observe_tick_insert_sql(
-            args.observe_tick_writer_key.as_deref(),
+            observe_tick.writer_key.as_deref(),
         ));
     }
+    prepared_batch.append_sql(build_mark_live_state_ready_sql(&live_state_watermark));
 
     let payloads = args
         .lazy_exact_file_updates
@@ -357,7 +429,7 @@ pub(crate) async fn create_commit(
     Ok(CreateCommitResult {
         disposition: CreateCommitDisposition::Applied,
         committed_head,
-        commit_result: Some(commit_result),
+        applied_output: Some(applied_output),
         applied_domain_changes,
     })
 }
@@ -387,6 +459,11 @@ struct TransactionCommitExecutor<'a> {
 
 #[async_trait(?Send)]
 impl CommitQueryExecutor for TransactionCommitExecutor<'_> {
+    #[cfg(test)]
+    fn dialect(&self) -> SqlDialect {
+        self.transaction.dialect()
+    }
+
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         self.transaction.execute(sql, params).await
     }
@@ -611,225 +688,40 @@ async fn load_create_commit_preflight_state_with_active_accounts(
         ConcreteWriteLane::Version { version_id } => version_id.as_str(),
         ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
     };
-    let current_head_source_sql = format!(
-        "FROM {version_ref_table} \
-         WHERE schema_key = '{schema_key}' \
-           AND entity_id = '{entity_id}' \
-           AND file_id = 'lix' \
-           AND plugin_key = 'lix' \
-           AND version_id = '{version_id}' \
-           AND snapshot_content IS NOT NULL",
-        version_ref_table = LIVE_VERSION_REF_TABLE,
-        schema_key = VERSION_REF_SCHEMA_KEY,
-        entity_id = escape_sql_string(lane_entity_id),
-        version_id = escape_sql_string(GLOBAL_VERSION_ID),
-    );
-    let existing_replay_sql = match &preconditions.idempotency_key {
-        CreateCommitIdempotencyKey::Exact(value) => format!(
-            " UNION ALL \
-              SELECT CAST('existing_replay' AS TEXT) AS row_kind, CAST(commit_id AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value, CAST(NULL AS TEXT) AS entity_id \
-              FROM {table_name} \
-              WHERE write_lane = '{write_lane}' \
-                AND idempotency_kind = '{kind}' \
-                AND idempotency_value = '{value}' \
-                AND parent_head_snapshot_content = ''",
-            table_name = COMMIT_IDEMPOTENCY_TABLE,
-            write_lane = escape_sql_string(&lane_storage_key(concrete_lane)),
-            kind = IDEMPOTENCY_KIND_EXACT,
-            value = escape_sql_string(value),
-        ),
-        CreateCommitIdempotencyKey::CurrentHeadFingerprint(fingerprint) => format!(
-            " UNION ALL \
-              SELECT CAST('existing_replay' AS TEXT) AS row_kind, CAST(idempotency.commit_id AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value, CAST(NULL AS TEXT) AS entity_id \
-              FROM (SELECT snapshot_content {current_head_source_sql}) current_head \
-              JOIN {table_name} idempotency \
-                ON idempotency.write_lane = '{write_lane}' \
-               AND idempotency.idempotency_kind = '{kind}' \
-               AND idempotency.idempotency_value = '{value}' \
-               AND idempotency.parent_head_snapshot_content = current_head.snapshot_content",
-            current_head_source_sql = current_head_source_sql,
-            table_name = COMMIT_IDEMPOTENCY_TABLE,
-            write_lane = escape_sql_string(&lane_storage_key(concrete_lane)),
-            kind = IDEMPOTENCY_KIND_CURRENT_HEAD_FINGERPRINT,
-            value = escape_sql_string(fingerprint),
-        ),
-    };
-    let active_account_sql = if include_active_accounts {
-        format!(
-            " UNION ALL \
-              SELECT CAST('active_account' AS TEXT) AS row_kind, CAST(snapshot_content AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value, CAST(NULL AS TEXT) AS entity_id \
-              FROM {untracked_table} \
-              WHERE schema_key = '{schema_key}' \
-                AND file_id = '{file_id}' \
-                AND version_id = '{version_id}' \
-                AND snapshot_content IS NOT NULL",
-            untracked_table = LIVE_UNTRACKED_TABLE,
-            schema_key = escape_sql_string(active_account_schema_key()),
-            file_id = escape_sql_string(active_account_file_id()),
-            version_id = escape_sql_string(active_account_storage_version_id()),
-        )
+    let current_head =
+        load_committed_version_head_commit_id_from_live_state(executor, lane_entity_id)
+            .await
+            .map_err(backend_error)?;
+    let current_head_snapshot = current_head
+        .as_ref()
+        .map(|commit_id| version_ref_snapshot_content(lane_entity_id, commit_id));
+    let existing_replay = load_create_commit_existing_replay(
+        executor,
+        concrete_lane,
+        preconditions,
+        current_head_snapshot.as_deref(),
+    )
+    .await?;
+    let deterministic_sequence_start = if include_deterministic_sequence {
+        load_create_commit_deterministic_sequence_start(executor).await?
     } else {
-        String::new()
+        None
     };
-    let deterministic_sequence_sql = if include_deterministic_sequence {
-        " UNION ALL \
-           SELECT CAST('deterministic_sequence' AS TEXT) AS row_kind, CAST(deterministic_sequence.value AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value, CAST(NULL AS TEXT) AS entity_id \
-           FROM (\
-             SELECT value \
-             FROM (\
-               SELECT CAST(snapshot_content AS TEXT) AS value, 0 AS precedence \
-               FROM lix_internal_live_untracked_v1 \
-               WHERE schema_key = 'lix_key_value' \
-                 AND entity_id = 'lix_deterministic_sequence_number' \
-                 AND version_id = 'global' \
-                 AND snapshot_content IS NOT NULL \
-               UNION ALL \
-               SELECT CAST(snapshot_content AS TEXT) AS value, 1 AS precedence \
-               FROM lix_internal_live_v1_lix_key_value \
-               WHERE entity_id = 'lix_deterministic_sequence_number' \
-                 AND version_id = 'global' \
-                 AND snapshot_content IS NOT NULL \
-                 AND is_tombstone = 0\
-             ) deterministic_sequence_candidates \
-             ORDER BY precedence ASC \
-             LIMIT 1\
-           ) deterministic_sequence \
-"
-            .to_string()
+    let active_accounts = if include_active_accounts {
+        load_create_commit_active_accounts(executor).await?
     } else {
-        String::new()
+        Vec::new()
     };
-    let exact_file_ids = lazy_exact_file_updates
-        .iter()
-        .flat_map(LazyExactFileUpdate::file_ids)
-        .collect::<BTreeSet<_>>();
-    let file_descriptor_sql = if exact_file_ids.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " UNION ALL \
-              SELECT CAST('file_descriptor' AS TEXT) AS row_kind, CAST(snapshot_content AS TEXT) AS value, CAST(metadata AS TEXT) AS metadata_value, CAST(untracked AS INTEGER) AS untracked_value, CAST(entity_id AS TEXT) AS entity_id \
-              FROM ({descriptor_sql}) file_descriptor",
-            descriptor_sql = exact_file_descriptor_preflight_sql(
-                &exact_file_ids.into_iter().map(str::to_string).collect::<Vec<_>>(),
-                lane_entity_id,
-            ),
-        )
-    };
-    let sql = format!(
-        "SELECT row_kind, value, metadata_value, untracked_value, entity_id \
-         FROM (\
-           SELECT CAST('current_head' AS TEXT) AS row_kind, CAST(snapshot_content AS TEXT) AS value, CAST(NULL AS TEXT) AS metadata_value, CAST(NULL AS INTEGER) AS untracked_value, CAST(NULL AS TEXT) AS entity_id \
-           {current_head_source_sql}{existing_replay_sql}{deterministic_sequence_sql}{active_account_sql}{file_descriptor_sql}\
-         ) create_commit_preflight",
-        current_head_source_sql = current_head_source_sql,
-        existing_replay_sql = existing_replay_sql,
-        deterministic_sequence_sql = deterministic_sequence_sql,
-        active_account_sql = active_account_sql,
-        file_descriptor_sql = file_descriptor_sql,
-    );
-    let result = executor.execute(&sql, &[]).await.map_err(backend_error)?;
-    let mut current_head = None;
-    let mut current_head_snapshot = None;
-    let mut existing_replay = None;
-    let mut deterministic_sequence_start = None;
-    let mut active_accounts = BTreeSet::new();
-    let mut file_descriptors = BTreeMap::new();
-    for row in result.rows {
-        let Some(kind) = row.first() else {
-            continue;
-        };
-        let Some(value) = row.get(1) else {
-            continue;
-        };
-        let kind = match kind {
-            Value::Text(text) => text.as_str(),
-            Value::Null => continue,
-            other => {
-                return Err(CreateCommitError {
-                    kind: CreateCommitErrorKind::Internal,
-                    message: format!(
-                        "create commit preflight returned unexpected kind value {other:?}"
-                    ),
-                })
-            }
-        };
-        match (kind, value) {
-            ("current_head", Value::Text(snapshot_content)) => {
-                current_head_snapshot = Some(snapshot_content.clone());
-                let pointer: LixVersionRef =
-                    serde_json::from_str(snapshot_content).map_err(|error| CreateCommitError {
-                        kind: CreateCommitErrorKind::Internal,
-                        message: format!(
-                            "create commit preflight version ref snapshot could not be parsed: {error}"
-                        ),
-                    })?;
-                if !pointer.commit_id.is_empty() {
-                    current_head = Some(pointer.commit_id);
-                }
-            }
-            ("existing_replay", Value::Text(commit_id)) => {
-                if !commit_id.is_empty() {
-                    existing_replay = Some(commit_id.clone());
-                }
-            }
-            ("deterministic_sequence", Value::Text(snapshot_content)) => {
-                deterministic_sequence_start =
-                    parse_deterministic_sequence_snapshot(snapshot_content).map(Some)?;
-            }
-            ("active_account", Value::Text(snapshot_content)) => {
-                let account_id =
-                    parse_active_account_snapshot(snapshot_content).map_err(backend_error)?;
-                active_accounts.insert(account_id);
-            }
-            ("file_descriptor", Value::Text(snapshot_content)) => {
-                let Some(entity_id) = row.get(4).and_then(create_commit_preflight_text_from_value)
-                else {
-                    return Err(CreateCommitError {
-                        kind: CreateCommitErrorKind::Internal,
-                        message:
-                            "create commit preflight returned a file descriptor row without entity_id"
-                                .to_string(),
-                    });
-                };
-                file_descriptors.insert(
-                    entity_id,
-                    parse_file_descriptor_preflight_row(
-                        snapshot_content,
-                        row.get(2).and_then(create_commit_preflight_text_from_value),
-                        row.get(3)
-                            .and_then(create_commit_preflight_value_as_bool)
-                            .unwrap_or(false),
-                    )?,
-                );
-            }
-            (_, Value::Null) => {}
-            ("current_head", other)
-            | ("existing_replay", other)
-            | ("deterministic_sequence", other)
-            | ("active_account", other)
-            | ("file_descriptor", other) => {
-                return Err(CreateCommitError {
-                    kind: CreateCommitErrorKind::Internal,
-                    message: format!(
-                        "create commit preflight returned unexpected '{kind}' value {other:?}"
-                    ),
-                })
-            }
-            _ => {}
-        }
-    }
-
-    if include_deterministic_sequence && deterministic_sequence_start.is_none() {
-        deterministic_sequence_start = Some(0);
-    }
+    let file_descriptors =
+        load_create_commit_file_descriptors(executor, lazy_exact_file_updates, lane_entity_id)
+            .await?;
 
     Ok(CreateCommitPreflightState {
         current_head,
         current_head_snapshot,
         existing_replay,
         deterministic_sequence_start,
-        active_accounts: active_accounts.into_iter().collect(),
+        active_accounts,
         file_descriptors,
     })
 }
@@ -872,61 +764,243 @@ fn parse_file_descriptor_preflight_row(
     })
 }
 
-fn exact_file_descriptor_preflight_sql(file_ids: &[String], version_id: &str) -> String {
-    let requested_rows = file_ids
-        .iter()
-        .map(|file_id| format!("('{}')", escape_sql_string(file_id)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "WITH requested(entity_id) AS (VALUES {requested_rows}), \
-         descriptor_candidates AS (\
-           SELECT requested.entity_id, CAST(untracked.snapshot_content AS TEXT) AS snapshot_content, CAST(untracked.metadata AS TEXT) AS metadata, CAST(1 AS INTEGER) AS untracked, CAST(1 AS INTEGER) AS precedence \
-           FROM requested \
-           JOIN {untracked_table} untracked \
-             ON untracked.entity_id = requested.entity_id \
-            AND untracked.version_id = '{version_id}' \
-            AND untracked.schema_key = '{schema_key}' \
-            AND untracked.file_id = '{file_id_value}' \
-           UNION ALL \
-           SELECT requested.entity_id, CAST(tracked.snapshot_content AS TEXT) AS snapshot_content, CAST(tracked.metadata AS TEXT) AS metadata, CAST(0 AS INTEGER) AS untracked, CAST(2 AS INTEGER) AS precedence \
-           FROM requested \
-           JOIN {tracked_table} tracked \
-             ON tracked.entity_id = requested.entity_id \
-            AND tracked.version_id = '{version_id}' \
-            AND tracked.file_id = '{file_id_value}' \
-           UNION ALL \
-           SELECT requested.entity_id, CAST(untracked.snapshot_content AS TEXT) AS snapshot_content, CAST(untracked.metadata AS TEXT) AS metadata, CAST(1 AS INTEGER) AS untracked, CAST(3 AS INTEGER) AS precedence \
-           FROM requested \
-           JOIN {untracked_table} untracked \
-             ON untracked.entity_id = requested.entity_id \
-            AND untracked.version_id = '{global_version_id}' \
-            AND untracked.schema_key = '{schema_key}' \
-            AND untracked.file_id = '{file_id_value}' \
-           UNION ALL \
-           SELECT requested.entity_id, CAST(tracked.snapshot_content AS TEXT) AS snapshot_content, CAST(tracked.metadata AS TEXT) AS metadata, CAST(0 AS INTEGER) AS untracked, CAST(4 AS INTEGER) AS precedence \
-           FROM requested \
-           JOIN {tracked_table} tracked \
-             ON tracked.entity_id = requested.entity_id \
-            AND tracked.version_id = '{global_version_id}' \
-            AND tracked.file_id = '{file_id_value}' \
-         ), ranked AS (\
-           SELECT entity_id, snapshot_content, metadata, untracked, precedence, \
-                  ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY precedence ASC) AS rn \
-           FROM descriptor_candidates \
-           WHERE snapshot_content IS NOT NULL\
-         ) \
-         SELECT entity_id, snapshot_content, metadata, untracked \
-         FROM ranked \
-         WHERE rn = 1",
-        requested_rows = requested_rows,
-        tracked_table = "lix_internal_live_v1_lix_file_descriptor",
-        untracked_table = LIVE_UNTRACKED_TABLE,
-        version_id = escape_sql_string(version_id),
-        global_version_id = escape_sql_string(GLOBAL_VERSION_ID),
-        schema_key = escape_sql_string(FILESYSTEM_FILE_SCHEMA_KEY),
-        file_id_value = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
+async fn load_create_commit_existing_replay(
+    executor: &mut dyn CommitQueryExecutor,
+    concrete_lane: &ConcreteWriteLane,
+    preconditions: &CreateCommitPreconditions,
+    current_head_snapshot: Option<&str>,
+) -> Result<Option<String>, CreateCommitError> {
+    let (kind, value, parent_head_snapshot_content) = match &preconditions.idempotency_key {
+        CreateCommitIdempotencyKey::Exact(value) => (IDEMPOTENCY_KIND_EXACT, value.as_str(), ""),
+        CreateCommitIdempotencyKey::CurrentHeadFingerprint(fingerprint) => {
+            let Some(current_head_snapshot) = current_head_snapshot else {
+                return Ok(None);
+            };
+            (
+                IDEMPOTENCY_KIND_CURRENT_HEAD_FINGERPRINT,
+                fingerprint.as_str(),
+                current_head_snapshot,
+            )
+        }
+    };
+    let sql = format!(
+        "SELECT commit_id \
+         FROM {table_name} \
+         WHERE write_lane = '{write_lane}' \
+           AND idempotency_kind = '{kind}' \
+           AND idempotency_value = '{value}' \
+           AND parent_head_snapshot_content = '{parent_head_snapshot_content}' \
+         LIMIT 1",
+        table_name = COMMIT_IDEMPOTENCY_TABLE,
+        write_lane = escape_sql_string(&lane_storage_key(concrete_lane)),
+        kind = escape_sql_string(kind),
+        value = escape_sql_string(value),
+        parent_head_snapshot_content = escape_sql_string(parent_head_snapshot_content),
+    );
+    let result = executor.execute(&sql, &[]).await.map_err(backend_error)?;
+    Ok(result
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(value_as_text)
+        .filter(|commit_id| !commit_id.is_empty()))
+}
+
+async fn load_create_commit_deterministic_sequence_start(
+    executor: &mut dyn CommitQueryExecutor,
+) -> Result<Option<i64>, CreateCommitError> {
+    let sql = format!(
+        "SELECT snapshot_content \
+         FROM {table_name} \
+         WHERE schema_key = 'lix_key_value' \
+           AND entity_id = 'lix_deterministic_sequence_number' \
+           AND version_id = '{version_id}' \
+           AND snapshot_content IS NOT NULL \
+         ORDER BY updated_at DESC \
+         LIMIT 1",
+        table_name = LIVE_UNTRACKED_TABLE,
+        version_id = GLOBAL_VERSION_ID,
+    );
+    let result = executor.execute(&sql, &[]).await.map_err(backend_error)?;
+    if let Some(snapshot_content) = result
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(value_as_text)
+    {
+        return parse_deterministic_sequence_snapshot(&snapshot_content).map(Some);
+    }
+
+    let tracked = load_exact_committed_state_row_from_live_state_with_executor(
+        executor,
+        &ExactCommittedStateRowRequest {
+            entity_id: "lix_deterministic_sequence_number".to_string(),
+            schema_key: "lix_key_value".to_string(),
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            exact_filters: BTreeMap::from([
+                (
+                    "file_id".to_string(),
+                    Value::Text(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
+                ),
+                (
+                    "plugin_key".to_string(),
+                    Value::Text(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
+                ),
+            ]),
+        },
     )
+    .await
+    .map_err(backend_error)?;
+    let Some(snapshot_content) = tracked
+        .as_ref()
+        .and_then(|row| row.values.get("snapshot_content"))
+        .and_then(value_as_text)
+    else {
+        return Ok(Some(0));
+    };
+    parse_deterministic_sequence_snapshot(&snapshot_content).map(Some)
+}
+
+async fn load_create_commit_active_accounts(
+    executor: &mut dyn CommitQueryExecutor,
+) -> Result<Vec<String>, CreateCommitError> {
+    let sql = format!(
+        "SELECT snapshot_content \
+         FROM {table_name} \
+         WHERE schema_key = '{schema_key}' \
+           AND file_id = '{file_id}' \
+           AND version_id = '{version_id}' \
+           AND snapshot_content IS NOT NULL",
+        table_name = LIVE_UNTRACKED_TABLE,
+        schema_key = escape_sql_string(active_account_schema_key()),
+        file_id = escape_sql_string(active_account_file_id()),
+        version_id = escape_sql_string(active_account_storage_version_id()),
+    );
+    let result = executor.execute(&sql, &[]).await.map_err(backend_error)?;
+    let mut active_accounts = BTreeSet::new();
+    for row in result.rows {
+        let Some(snapshot_content) = row.first().and_then(value_as_text) else {
+            continue;
+        };
+        let account_id = parse_active_account_snapshot(&snapshot_content).map_err(backend_error)?;
+        active_accounts.insert(account_id);
+    }
+    Ok(active_accounts.into_iter().collect())
+}
+
+async fn load_create_commit_file_descriptors(
+    executor: &mut dyn CommitQueryExecutor,
+    lazy_exact_file_updates: &[LazyExactFileUpdate],
+    lane_entity_id: &str,
+) -> Result<BTreeMap<String, CreateCommitPreflightFileDescriptor>, CreateCommitError> {
+    let exact_file_ids = lazy_exact_file_updates
+        .iter()
+        .flat_map(LazyExactFileUpdate::file_ids)
+        .collect::<BTreeSet<_>>();
+    let mut file_descriptors = BTreeMap::new();
+    for file_id in exact_file_ids {
+        let Some(descriptor) =
+            load_create_commit_file_descriptor(executor, file_id, lane_entity_id).await?
+        else {
+            continue;
+        };
+        file_descriptors.insert(file_id.to_string(), descriptor);
+    }
+    Ok(file_descriptors)
+}
+
+async fn load_create_commit_file_descriptor(
+    executor: &mut dyn CommitQueryExecutor,
+    file_id: &str,
+    lane_entity_id: &str,
+) -> Result<Option<CreateCommitPreflightFileDescriptor>, CreateCommitError> {
+    if let Some(descriptor) =
+        load_untracked_file_descriptor(executor, file_id, lane_entity_id).await?
+    {
+        return Ok(Some(descriptor));
+    }
+    if let Some(descriptor) =
+        load_tracked_file_descriptor(executor, file_id, lane_entity_id).await?
+    {
+        return Ok(Some(descriptor));
+    }
+    if let Some(descriptor) =
+        load_untracked_file_descriptor(executor, file_id, GLOBAL_VERSION_ID).await?
+    {
+        return Ok(Some(descriptor));
+    }
+    load_tracked_file_descriptor(executor, file_id, GLOBAL_VERSION_ID).await
+}
+
+async fn load_untracked_file_descriptor(
+    executor: &mut dyn CommitQueryExecutor,
+    file_id: &str,
+    version_id: &str,
+) -> Result<Option<CreateCommitPreflightFileDescriptor>, CreateCommitError> {
+    let sql = format!(
+        "SELECT snapshot_content, metadata \
+         FROM {table_name} \
+         WHERE entity_id = '{entity_id}' \
+           AND schema_key = '{schema_key}' \
+           AND file_id = '{file_id}' \
+           AND version_id = '{version_id}' \
+           AND snapshot_content IS NOT NULL \
+         ORDER BY updated_at DESC \
+         LIMIT 1",
+        table_name = LIVE_UNTRACKED_TABLE,
+        entity_id = escape_sql_string(file_id),
+        schema_key = escape_sql_string(FILESYSTEM_FILE_SCHEMA_KEY),
+        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
+        version_id = escape_sql_string(version_id),
+    );
+    let result = executor.execute(&sql, &[]).await.map_err(backend_error)?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    let Some(snapshot_content) = row.first().and_then(value_as_text) else {
+        return Ok(None);
+    };
+    let metadata = row.get(1).and_then(value_as_text);
+    parse_file_descriptor_preflight_row(&snapshot_content, metadata, true).map(Some)
+}
+
+async fn load_tracked_file_descriptor(
+    executor: &mut dyn CommitQueryExecutor,
+    file_id: &str,
+    version_id: &str,
+) -> Result<Option<CreateCommitPreflightFileDescriptor>, CreateCommitError> {
+    let row = load_exact_committed_state_row_from_live_state_with_executor(
+        executor,
+        &ExactCommittedStateRowRequest {
+            entity_id: file_id.to_string(),
+            schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
+            version_id: version_id.to_string(),
+            exact_filters: BTreeMap::from([
+                (
+                    "file_id".to_string(),
+                    Value::Text(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
+                ),
+                (
+                    "plugin_key".to_string(),
+                    Value::Text(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
+                ),
+                (
+                    "schema_version".to_string(),
+                    Value::Text(FILESYSTEM_FILE_SCHEMA_VERSION.to_string()),
+                ),
+            ]),
+        },
+    )
+    .await
+    .map_err(backend_error)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let Some(snapshot_content) = row.values.get("snapshot_content").and_then(value_as_text) else {
+        return Ok(None);
+    };
+    let metadata = row.values.get("metadata").and_then(value_as_text);
+    parse_file_descriptor_preflight_row(&snapshot_content, metadata, false).map(Some)
 }
 
 fn parse_deterministic_sequence_snapshot(snapshot_content: &str) -> Result<i64, CreateCommitError> {
@@ -946,21 +1020,6 @@ fn parse_deterministic_sequence_snapshot(snapshot_content: &str) -> Result<i64, 
         })
         .unwrap_or(-1);
     Ok(value + 1)
-}
-
-fn create_commit_preflight_text_from_value(value: &Value) -> Option<String> {
-    match value {
-        Value::Text(text) => Some(text.clone()),
-        _ => None,
-    }
-}
-
-fn create_commit_preflight_value_as_bool(value: &Value) -> Option<bool> {
-    match value {
-        Value::Boolean(flag) => Some(*flag),
-        Value::Integer(integer) => Some(*integer != 0),
-        _ => None,
-    }
 }
 
 fn validate_change_versions(
@@ -1082,6 +1141,7 @@ fn extract_committed_head_id(
         ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
     };
     let pointer_change = commit_result
+        .canonical_output
         .changes
         .iter()
         .find(|change| {
@@ -1125,26 +1185,36 @@ fn extract_committed_head_id(
     Ok(pointer.commit_id)
 }
 
-fn insert_idempotency_row_sql(
-    concrete_lane: &ConcreteWriteLane,
-    idempotency: &ResolvedIdempotencyState,
-    commit_id: &str,
-    created_at: &str,
-) -> String {
+fn insert_idempotency_row_sql(idempotency: &CommitIdempotencyWrite) -> String {
     format!(
         "INSERT INTO {table_name} \
          (write_lane, idempotency_key, idempotency_kind, idempotency_value, parent_head_snapshot_content, commit_id, created_at) \
          VALUES ('{write_lane}', '{idempotency_key}', '{idempotency_kind}', '{idempotency_value}', '{parent_head_snapshot_content}', '{commit_id}', '{created_at}')",
         table_name = COMMIT_IDEMPOTENCY_TABLE,
-        write_lane = escape_sql_string(&lane_storage_key(concrete_lane)),
-        idempotency_key = escape_sql_string(&idempotency.legacy_key),
-        idempotency_kind = escape_sql_string(idempotency.kind),
-        idempotency_value = escape_sql_string(&idempotency.value),
+        write_lane = escape_sql_string(&idempotency.write_lane),
+        idempotency_key = escape_sql_string(&idempotency.idempotency_key),
+        idempotency_kind = escape_sql_string(&idempotency.idempotency_kind),
+        idempotency_value = escape_sql_string(&idempotency.idempotency_value),
         parent_head_snapshot_content =
             escape_sql_string(&idempotency.parent_head_snapshot_content),
-        commit_id = escape_sql_string(commit_id),
-        created_at = escape_sql_string(created_at),
+        commit_id = escape_sql_string(&idempotency.commit_id),
+        created_at = escape_sql_string(&idempotency.created_at),
     )
+}
+
+fn canonical_watermark(canonical_output: &CanonicalCommitOutput) -> Option<CanonicalWatermark> {
+    canonical_output
+        .changes
+        .iter()
+        .max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        })
+        .map(|change| CanonicalWatermark {
+            change_id: change.id.clone(),
+            created_at: change.created_at.clone(),
+        })
 }
 
 fn lane_storage_key(concrete_lane: &ConcreteWriteLane) -> String {
@@ -1161,6 +1231,16 @@ fn backend_error(error: LixError) -> CreateCommitError {
     }
 }
 
+fn value_as_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Text(text) => Some(text.clone()),
+        Value::Integer(integer) => Some(integer.to_string()),
+        Value::Boolean(boolean) => Some(boolean.to_string()),
+        Value::Real(real) => Some(real.to_string()),
+        _ => None,
+    }
+}
+
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -1173,6 +1253,7 @@ mod tests {
         CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
     };
     use crate::functions::LixFunctionProvider;
+    use crate::sql::public::planner::ir::{LazyExactFileDataUpdate, LazyExactFileUpdate};
     use crate::version::GLOBAL_VERSION_ID;
     use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
@@ -1205,6 +1286,7 @@ mod tests {
         version_heads: HashMap<String, String>,
         idempotency_rows: HashMap<(String, String, String, String), String>,
         executed_sql: Vec<String>,
+        live_state_mode: Option<String>,
     }
 
     #[async_trait(?Send)]
@@ -1216,74 +1298,79 @@ mod tests {
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             self.executed_sql.push(sql.to_string());
 
-            if sql.contains("SELECT row_kind, value")
-                && sql.contains("FROM lix_internal_live_v1_lix_version_ref")
-            {
-                let mut rows = self
+            if sql.contains("FROM lix_internal_live_state_status") {
+                return Ok(QueryResult {
+                    rows: vec![vec![
+                        Value::Text(
+                            self.live_state_mode
+                                .clone()
+                                .unwrap_or_else(|| "ready".to_string()),
+                        ),
+                        Value::Null,
+                        Value::Null,
+                        Value::Text(crate::state::live_state::LIVE_STATE_SCHEMA_EPOCH.to_string()),
+                    ]],
+                    columns: vec![
+                        "mode".to_string(),
+                        "latest_change_id".to_string(),
+                        "latest_change_created_at".to_string(),
+                        "schema_epoch".to_string(),
+                    ],
+                });
+            }
+
+            if sql.contains("FROM lix_internal_live_v1_lix_version_ref") {
+                let rows = self
                     .version_heads
                     .iter()
                     .filter(|(version_id, _)| {
                         sql.contains(&format!("entity_id = '{}'", version_id))
                     })
                     .map(|(version_id, commit_id)| {
-                        vec![
-                            Value::Text("current_head".to_string()),
-                            Value::Text(crate::version::version_ref_snapshot_content(
-                                version_id, commit_id,
-                            )),
-                        ]
-                    })
-                    .collect::<Vec<_>>();
-                if sql.contains("lix_internal_commit_idempotency") {
-                    rows.extend(
-                        self.idempotency_rows
-                            .iter()
-                            .filter(|((lane, kind, value, parent_head_snapshot_content), _)| {
-                                sql.contains(&format!("write_lane = '{}'", lane))
-                                    && sql.contains(&format!("idempotency_kind = '{}'", kind))
-                                    && sql.contains(&format!("idempotency_value = '{}'", value))
-                                    && if sql.contains(
-                                        "parent_head_snapshot_content = current_head.snapshot_content",
-                                    ) {
-                                        !parent_head_snapshot_content.is_empty()
-                                    } else {
-                                        sql.contains(&format!(
-                                            "parent_head_snapshot_content = '{}'",
-                                            parent_head_snapshot_content
-                                        ))
-                                    }
-                            })
-                            .map(|(_, commit_id)| {
-                                vec![
-                                    Value::Text("existing_replay".to_string()),
-                                    Value::Text(commit_id.clone()),
-                                ]
-                            }),
-                    );
-                }
-                return Ok(QueryResult {
-                    rows,
-                    columns: vec!["row_kind".to_string(), "value".to_string()],
-                });
-            }
-
-            if sql.contains("FROM lix_internal_live_v1_lix_version_ref")
-                && sql.contains("entity_id = 'global'")
-            {
-                let rows = self
-                    .version_heads
-                    .get(GLOBAL_VERSION_ID)
-                    .map(|commit_id| {
                         vec![Value::Text(crate::version::version_ref_snapshot_content(
-                            GLOBAL_VERSION_ID,
-                            commit_id,
+                            version_id, commit_id,
                         ))]
                     })
-                    .into_iter()
                     .collect::<Vec<_>>();
                 return Ok(QueryResult {
                     rows,
                     columns: vec!["snapshot_content".to_string()],
+                });
+            }
+            if sql.contains("FROM \"lix_internal_live_v1_lix_file_descriptor\"") {
+                return Ok(QueryResult {
+                    rows: vec![vec![
+                        Value::Text("file-1".to_string()),
+                        Value::Text("lix_file_descriptor".to_string()),
+                        Value::Text("1".to_string()),
+                        Value::Text("lix".to_string()),
+                        Value::Text("version-a".to_string()),
+                        Value::Text("lix".to_string()),
+                        Value::Text(
+                            serde_json::json!({
+                                "id": "file-1",
+                                "directory_id": serde_json::Value::Null,
+                                "name": "contract",
+                                "extension": "txt",
+                                "hidden": false,
+                                "metadata": serde_json::Value::Null,
+                            })
+                            .to_string(),
+                        ),
+                        Value::Null,
+                        Value::Text("change-file-1".to_string()),
+                    ]],
+                    columns: vec![
+                        "entity_id".to_string(),
+                        "schema_key".to_string(),
+                        "schema_version".to_string(),
+                        "file_id".to_string(),
+                        "version_id".to_string(),
+                        "plugin_key".to_string(),
+                        "snapshot_content".to_string(),
+                        "metadata".to_string(),
+                        "change_id".to_string(),
+                    ],
                 });
             }
             if sql.contains("FROM lix_internal_change c")
@@ -1358,6 +1445,13 @@ mod tests {
                     .expect("commit id should be present");
                 self.idempotency_rows
                     .insert((lane, kind, value, parent_head_snapshot_content), commit_id);
+            }
+            if let Some(status_sql) =
+                extract_statement_from_batch(sql, "INSERT INTO lix_internal_live_state_status ")
+            {
+                let mode = extract_nth_single_quoted_value(status_sql, 0)
+                    .expect("live state mode should be present");
+                self.live_state_mode = Some(mode);
             }
 
             Ok(QueryResult {
@@ -1470,7 +1564,7 @@ mod tests {
         .expect("create_commit should succeed");
 
         assert_eq!(result.disposition, CreateCommitDisposition::Applied);
-        assert!(result.commit_result.is_some());
+        assert!(result.applied_output.is_some());
         assert_eq!(checker.calls, 1);
         let generated_commit_batches = transaction
             .executed_sql
@@ -1492,6 +1586,13 @@ mod tests {
                 .iter()
                 .any(|sql| sql.contains("INSERT INTO lix_internal_commit_idempotency ")),
             "create_commit should persist idempotency state in the executed batch"
+        );
+        assert!(
+            transaction
+                .executed_sql
+                .iter()
+                .any(|sql| sql.contains("INSERT INTO lix_internal_live_state_status ")),
+            "create_commit should update live-state readiness in the executed batch"
         );
     }
 
@@ -1536,7 +1637,7 @@ mod tests {
 
         assert_eq!(result.disposition, CreateCommitDisposition::Replay);
         assert_eq!(result.committed_head, "commit-456");
-        assert!(result.commit_result.is_none());
+        assert!(result.applied_output.is_none());
         assert_eq!(checker.calls, 0);
     }
 
@@ -1582,7 +1683,7 @@ mod tests {
 
         assert_eq!(result.disposition, CreateCommitDisposition::Replay);
         assert_eq!(result.committed_head, "commit-456");
-        assert!(result.commit_result.is_none());
+        assert!(result.applied_output.is_none());
     }
 
     #[tokio::test]
@@ -1710,7 +1811,89 @@ mod tests {
         .expect("global admin create_commit should succeed");
 
         assert_eq!(result.disposition, CreateCommitDisposition::Applied);
-        assert!(result.commit_result.is_some());
+        assert!(result.applied_output.is_some());
+    }
+
+    #[tokio::test]
+    async fn lazy_exact_file_update_uses_live_descriptor_lookup() {
+        let mut transaction = FakeTransaction::default();
+        transaction
+            .version_heads
+            .insert("version-a".to_string(), "commit-123".to_string());
+        let mut functions = CountingFunctionProvider::default();
+
+        let result = create_commit(
+            &mut transaction,
+            CreateCommitArgs {
+                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
+                changes: Vec::new(),
+                lazy_exact_file_updates: vec![LazyExactFileUpdate::Data(LazyExactFileDataUpdate {
+                    file_id: "file-1".to_string(),
+                    version_id: "version-a".to_string(),
+                    data: vec![1, 2, 3],
+                })],
+                additional_binary_blob_payloads: Vec::new(),
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
+                    idempotency_key: CreateCommitIdempotencyKey::Exact(
+                        "idem-file-data".to_string(),
+                    ),
+                },
+                should_emit_observe_tick: false,
+                observe_tick_writer_key: None,
+            },
+            &mut functions,
+            None,
+        )
+        .await
+        .expect("lazy exact file update should succeed");
+
+        assert_eq!(result.disposition, CreateCommitDisposition::Applied);
+        assert!(
+            transaction
+                .executed_sql
+                .iter()
+                .any(|sql| { sql.contains("FROM \"lix_internal_live_v1_lix_file_descriptor\"") }),
+            "create_commit should read lazy exact file descriptors from live state"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_create_commit_when_live_state_is_not_ready() {
+        let mut transaction = FakeTransaction {
+            live_state_mode: Some("needs_rebuild".to_string()),
+            ..FakeTransaction::default()
+        };
+        let mut functions = CountingFunctionProvider::default();
+
+        let error = create_commit(
+            &mut transaction,
+            CreateCommitArgs {
+                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
+                changes: vec![sample_change()],
+                lazy_exact_file_updates: Vec::new(),
+                additional_binary_blob_payloads: Vec::new(),
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
+                    idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
+                },
+                should_emit_observe_tick: false,
+                observe_tick_writer_key: None,
+            },
+            &mut functions,
+            None,
+        )
+        .await
+        .expect_err("live-state readiness should gate create_commit");
+
+        assert_eq!(error.kind, CreateCommitErrorKind::Internal);
+        assert!(
+            error.message.contains("live state is not ready"),
+            "unexpected error: {}",
+            error.message
+        );
     }
 
     #[tokio::test]

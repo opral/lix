@@ -236,6 +236,11 @@ struct CommitExecutorAdapter<'a> {
 
 #[async_trait::async_trait(?Send)]
 impl CommitQueryExecutor for CommitExecutorAdapter<'_> {
+    #[cfg(test)]
+    fn dialect(&self) -> crate::SqlDialect {
+        self.executor.dialect()
+    }
+
     async fn execute(
         &mut self,
         sql: &str,
