@@ -1,7 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { parse } from "@opral/markdown-wc";
 import { getBlogDescription, getBlogTitle } from "../../blog/blogMetadata";
-import { resolveOgImageUrl } from "../../blog/og-image";
+import { resolveBlogAssetPath } from "../../blog/og-image";
 import { Footer } from "../../components/footer";
 import { Header } from "../../components/header";
 import { buildCanonicalUrl, resolveOgImage } from "../../lib/seo";
@@ -65,7 +65,7 @@ async function loadBlogIndex() {
           ? parsed.frontmatter["og:image"]
           : undefined;
       const ogImage = ogImageRaw
-        ? resolveOgImageUrl(ogImageRaw, folderName)
+        ? resolveBlogAssetPath(ogImageRaw, folderName)
         : undefined;
       const ogImageAlt =
         (typeof parsed.frontmatter?.["og:image:alt"] === "string"
