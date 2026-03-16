@@ -120,7 +120,6 @@ async function loadRfc(slug: string) {
     description,
     date,
     html: rendered.body,
-    rawMarkdown,
     frontmatter: parsed.frontmatter,
     prevRfc,
     nextRfc,

@@ -153,7 +153,6 @@ describe("SEO route smoke tests", () => {
       description: description ?? `Design proposal for ${title ?? slug}.`,
       date: parsed.frontmatter?.date as string | undefined,
       html: rendered.body,
-      rawMarkdown,
       frontmatter: parsed.frontmatter,
       prevRfc: null,
       nextRfc: null,
