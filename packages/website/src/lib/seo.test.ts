@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { resolveOgImageUrl } from "../blog/og-image";
+import { resolveBlogAssetPath, resolveOgImageUrl } from "../blog/og-image";
 import {
   buildCanonicalUrl,
   getMarkdownDescription,
@@ -140,5 +140,16 @@ describe("resolveOgImageUrl", () => {
     ).toBe(
       "https://lix.dev/blog/002-modeling-a-company-as-a-repository/cover.jpg",
     );
+  });
+});
+
+describe("resolveBlogAssetPath", () => {
+  test("keeps visible blog card images deployment-relative", () => {
+    expect(
+      resolveBlogAssetPath(
+        "./cover.jpg",
+        "002-modeling-a-company-as-a-repository",
+      ),
+    ).toBe("/blog/002-modeling-a-company-as-a-repository/cover.jpg");
   });
 });
