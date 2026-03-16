@@ -27,7 +27,7 @@ use crate::state::internal::{
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::Value as EngineValue;
-use crate::{LixBackend, LixError, QueryResult};
+use crate::{CanonicalJson, LixBackend, LixError, QueryResult};
 
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
 const UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
@@ -1153,6 +1153,15 @@ async fn rewrite_tracked_rows_with_backend(
 
         let change_id = functions.uuid_v7();
         affected_versions.insert(version_id.clone());
+        let snapshot_content = snapshot_json
+            .as_ref()
+            .map(|value| CanonicalJson::from_value(value.clone()))
+            .transpose()?;
+        let metadata = metadata_json
+            .as_ref()
+            .map(|value| CanonicalJson::from_value(value.clone()))
+            .transpose()?;
+
         domain_changes.push(DomainChangeInput {
             id: change_id.clone(),
             entity_id: entity_id.clone(),
@@ -1160,8 +1169,8 @@ async fn rewrite_tracked_rows_with_backend(
             schema_version: schema_version.clone(),
             file_id: file_id.clone(),
             plugin_key: plugin_key.clone(),
-            snapshot_content: snapshot_json.as_ref().map(JsonValue::to_string),
-            metadata: metadata_json.as_ref().map(JsonValue::to_string),
+            snapshot_content,
+            metadata,
             created_at: timestamp.clone(),
             version_id: version_id.clone(),
             writer_key: domain_writer_key,

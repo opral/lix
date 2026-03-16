@@ -3,7 +3,7 @@ mod support;
 use std::collections::BTreeSet;
 
 use lix_engine::{
-    LiveStateRebuildDebugMode, LiveStateRebuildPlan, LiveStateRebuildRequest,
+    CanonicalJson, LiveStateRebuildDebugMode, LiveStateRebuildPlan, LiveStateRebuildRequest,
     LiveStateRebuildScope, LiveStateWrite, LiveStateWriteOp, Value,
 };
 
@@ -238,7 +238,10 @@ simulation_test!(
                 version_id: main_version_id.clone(),
                 global: false,
                 op: LiveStateWriteOp::Upsert,
-                snapshot_content: Some("{\"value\":\"old\"}".to_string()),
+                snapshot_content: Some(
+                    CanonicalJson::from_text("{\"value\":\"old\"}")
+                        .expect("test payload should be valid canonical json"),
+                ),
                 metadata: None,
                 schema_version: "1".to_string(),
                 plugin_key: "lix".to_string(),
@@ -265,7 +268,10 @@ simulation_test!(
                 version_id: main_version_id.clone(),
                 global: false,
                 op: LiveStateWriteOp::Upsert,
-                snapshot_content: Some("{\"value\":\"new\"}".to_string()),
+                snapshot_content: Some(
+                    CanonicalJson::from_text("{\"value\":\"new\"}")
+                        .expect("test payload should be valid canonical json"),
+                ),
                 metadata: None,
                 schema_version: "1".to_string(),
                 plugin_key: "lix".to_string(),

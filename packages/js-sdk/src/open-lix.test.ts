@@ -176,7 +176,7 @@ test("createVersion forwards hidden option", async () => {
 	expect(rowValues.length).toBe(1);
 	expect(rowValues[0]?.[0]).toBe("branch-options");
 	expect(rowValues[0]?.[1]).toBe("Branch Options");
-	expect(rowValues[0]?.[2]).toBe("true");
+	expect(rowValues[0]?.[2]).toBe(true);
 
 	await lix.close();
 });

@@ -12,7 +12,7 @@ use crate::state::materialization::types::{
     TraversedEdgeDebugRow, VersionAncestryDebugRow, VersionHeadDebugRow,
 };
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{LixBackend, LixError};
+use crate::{CanonicalJson, LixBackend, LixError};
 
 #[derive(Debug, Clone)]
 struct VisibleRow {
@@ -24,8 +24,8 @@ struct VisibleRow {
     schema_version: String,
     file_id: String,
     plugin_key: String,
-    snapshot_content: Option<String>,
-    metadata: Option<String>,
+    snapshot_content: Option<CanonicalJson>,
+    metadata: Option<CanonicalJson>,
     created_at: String,
     updated_at: String,
 }
@@ -573,13 +573,10 @@ fn build_global_projection_rows(
                         Ok(snapshot)
                             if !snapshot.id.is_empty() && !snapshot.commit_id.is_empty() =>
                         {
-                            Some(
-                                json!({
-                                    "id": snapshot.id,
-                                    "commit_id": snapshot.commit_id,
-                                })
-                                .to_string(),
-                            )
+                            Some(canonical_json_value(json!({
+                                "id": snapshot.id,
+                                "commit_id": snapshot.commit_id,
+                            })))
                         }
                         Ok(_) => None,
                         Err(error) => {
@@ -646,13 +643,10 @@ fn build_global_projection_rows(
                 schema_version: version_ref_schema.schema_version.clone(),
                 file_id: version_ref_schema.file_id.clone(),
                 plugin_key: version_ref_schema.plugin_key.clone(),
-                snapshot_content: Some(
-                    json!({
-                        "id": version_id,
-                        "commit_id": head_commit_id,
-                    })
-                    .to_string(),
-                ),
+                snapshot_content: Some(canonical_json_value(json!({
+                    "id": version_id,
+                    "commit_id": head_commit_id,
+                }))),
                 metadata: None,
                 created_at: fallback_created_at.clone(),
                 updated_at: fallback_created_at,
@@ -750,16 +744,13 @@ fn build_global_projection_rows(
                     schema_version: change_set_element_schema.schema_version.clone(),
                     file_id: change_set_element_schema.file_id.clone(),
                     plugin_key: change_set_element_schema.plugin_key.clone(),
-                    snapshot_content: Some(
-                        json!({
-                            "change_set_id": change_set_id,
-                            "change_id": change.id,
-                            "entity_id": change.entity_id,
-                            "schema_key": change.schema_key,
-                            "file_id": change.file_id,
-                        })
-                        .to_string(),
-                    ),
+                    snapshot_content: Some(canonical_json_value(json!({
+                        "change_set_id": change_set_id,
+                        "change_id": change.id,
+                        "entity_id": change.entity_id,
+                        "schema_key": change.schema_key,
+                        "file_id": change.file_id,
+                    }))),
                     metadata: change.metadata.clone(),
                     created_at: change.created_at.clone(),
                     updated_at: change.created_at.clone(),
@@ -791,13 +782,10 @@ fn build_global_projection_rows(
                         schema_version: change_author_schema.schema_version.clone(),
                         file_id: change_author_schema.file_id.clone(),
                         plugin_key: change_author_schema.plugin_key.clone(),
-                        snapshot_content: Some(
-                            json!({
-                                "change_id": change.id,
-                                "account_id": account_id,
-                            })
-                            .to_string(),
-                        ),
+                        snapshot_content: Some(canonical_json_value(json!({
+                            "change_id": change.id,
+                            "account_id": account_id,
+                        }))),
                         metadata: commit_change.metadata.clone(),
                         created_at: commit_change.created_at.clone(),
                         updated_at: commit_change.created_at.clone(),
@@ -832,13 +820,10 @@ fn build_global_projection_rows(
                 schema_version: commit_edge_schema.schema_version.clone(),
                 file_id: commit_edge_schema.file_id.clone(),
                 plugin_key: commit_edge_schema.plugin_key.clone(),
-                snapshot_content: Some(
-                    json!({
-                        "parent_id": parent_id,
-                        "child_id": commit.entity_id,
-                    })
-                    .to_string(),
-                ),
+                snapshot_content: Some(canonical_json_value(json!({
+                    "parent_id": parent_id,
+                    "child_id": commit.entity_id,
+                }))),
                 metadata: commit_change.metadata.clone(),
                 created_at: commit_change.created_at.clone(),
                 updated_at: commit_change.created_at.clone(),
@@ -895,6 +880,10 @@ fn min_depth_by_commit(
             .or_insert(*depth);
     }
     min_depth
+}
+
+fn canonical_json_value(value: serde_json::Value) -> CanonicalJson {
+    CanonicalJson::from_value(value).expect("materialization plan should emit valid canonical JSON")
 }
 
 fn parents_by_child(
@@ -1361,7 +1350,7 @@ mod tests {
         id: &str,
         entity_id: &str,
         schema_key: &str,
-        snapshot_content: Option<String>,
+        snapshot_content: Option<CanonicalJson>,
     ) -> ChangeRecord {
         ChangeRecord {
             id: id.to_string(),
@@ -1404,7 +1393,9 @@ mod tests {
                         "ref-child",
                         "main",
                         "lix_version_ref",
-                        Some(json!({ "id": "main", "commit_id": "commit-child" }).to_string()),
+                        Some(canonical_json_value(
+                            json!({ "id": "main", "commit_id": "commit-child" }),
+                        )),
                     ),
                 ),
                 (
@@ -1413,7 +1404,9 @@ mod tests {
                         "ref-reset",
                         "main",
                         "lix_version_ref",
-                        Some(json!({ "id": "main", "commit_id": "commit-root" }).to_string()),
+                        Some(canonical_json_value(
+                            json!({ "id": "main", "commit_id": "commit-root" }),
+                        )),
                     ),
                 ),
             ]),
