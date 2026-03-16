@@ -62,10 +62,16 @@ async function loadRegistry(registryPath: string): Promise<PluginRegistry> {
   return JSON.parse(raw) as PluginRegistry;
 }
 
-function buildSeoFrontmatter(plugin: NonNullable<PluginRegistry["plugins"]>[number]) {
+function ensureTrailingSentence(value: string) {
+  return /[.!?]$/.test(value) ? value : `${value}.`;
+}
+
+export function buildSeoFrontmatter(
+  plugin: NonNullable<PluginRegistry["plugins"]>[number],
+) {
   const title = plugin.name ?? plugin.key;
   const description = plugin.description
-    ? `${plugin.description}. Learn how to install it, supported file types, and how it fits into Lix workflows.`
+    ? `${ensureTrailingSentence(plugin.description.trim())} Learn how to install it, supported file types, and how it fits into Lix workflows.`
     : `Learn how to install ${title}, supported file types, and how it fits into Lix workflows.`;
 
   return [
