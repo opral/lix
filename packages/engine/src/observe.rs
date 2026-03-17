@@ -379,8 +379,8 @@ impl ObserveState {
 
         let outcome = match work {
             PollWork::Initial { query } => {
-                let rows = execute_observe_query(engine, &query).await?;
                 let latest_tick_seq = latest_observe_tick_seq(engine).await?;
+                let rows = execute_observe_query(engine, &query).await?;
                 PollOutcome {
                     maybe_rows: Some((rows, None)),
                     update_last_seen_tick_seq: Some(latest_tick_seq),

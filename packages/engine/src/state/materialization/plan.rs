@@ -556,6 +556,39 @@ fn build_global_projection_rows(
             .push(ProjectionCandidate { depth, row });
     }
 
+    // Emit tombstone writes for version_descriptors that are not in the descriptor map
+    // (the descriptor map only contains upserts with valid snapshot_content).
+    for change in data.changes.values() {
+        if change.schema_key != "lix_version_descriptor" || change.snapshot_content.is_some() {
+            continue;
+        }
+        let key = (
+            GLOBAL_VERSION_ID.to_string(),
+            change.entity_id.clone(),
+            version_descriptor_schema.schema_key.clone(),
+            change.file_id.clone(),
+        );
+        let depth = usize::MAX / 4;
+        let row = VisibleRow {
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            commit_id: GLOBAL_VERSION_ID.to_string(),
+            change_id: change.id.clone(),
+            entity_id: change.entity_id.clone(),
+            schema_key: version_descriptor_schema.schema_key.clone(),
+            schema_version: change.schema_version.clone(),
+            file_id: change.file_id.clone(),
+            plugin_key: change.plugin_key.clone(),
+            snapshot_content: None,
+            metadata: change.metadata.clone(),
+            created_at: change.created_at.clone(),
+            updated_at: change.created_at.clone(),
+        };
+        candidates
+            .entry(key)
+            .or_default()
+            .push(ProjectionCandidate { depth, row });
+    }
+
     for resolved_rows in resolved_version_refs.values() {
         for resolved in resolved_rows {
             let effective_commit_id = resolved
