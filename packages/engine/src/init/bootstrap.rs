@@ -39,6 +39,9 @@ impl Engine {
             self.seed_default_active_version(&default_active_version_id)
                 .await
                 .map_err(|error| init_step_error("seed_default_active_version", error))?;
+            self.seed_lix_id()
+                .await
+                .map_err(|error| init_step_error("seed_lix_id", error))?;
             self.seed_default_checkpoint_label()
                 .await
                 .map_err(|error| init_step_error("seed_default_checkpoint_label", error))?;
