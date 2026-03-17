@@ -52,7 +52,7 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
         let metadata_sql = write
             .metadata
             .as_ref()
-            .map(|value| format!("'{}'", escape_sql_string(value)))
+            .map(|value| format!("'{}'", escape_sql_string(value.as_str())))
             .unwrap_or_else(|| "NULL".to_string());
         let layout =
             load_live_table_layout_in_transaction(transaction.as_mut(), &write.schema_key).await?;

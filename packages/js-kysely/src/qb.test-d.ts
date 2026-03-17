@@ -78,7 +78,6 @@ db.selectFrom("lix_file").select(["not_a_column"]).compile();
 const badInsert: Insertable<LixDatabaseSchema["lix_key_value_by_version"]> = {
 	key: "x",
 	value: "y",
-	// @ts-expect-error wrong column type
-	lixcol_untracked: "yes",
+	lixcol_untracked: true,
 };
 void badInsert;

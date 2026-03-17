@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
 };
+use crate::canonical_json::CanonicalJson;
 use crate::deterministic_mode::build_persist_sequence_highest_sql;
 use crate::functions::LixFunctionProvider;
 use crate::key_value::key_value_schema_key;
@@ -666,13 +667,38 @@ fn materialize_domain_changes(
                     &change.schema_key,
                     "plugin_key",
                 )?,
-                snapshot_content: change.snapshot_content.clone(),
-                metadata: change.metadata.clone(),
+                snapshot_content: canonicalize_change_payload(
+                    change.snapshot_content.as_deref(),
+                    &change.schema_key,
+                    "snapshot_content",
+                )?,
+                metadata: canonicalize_change_payload(
+                    change.metadata.as_deref(),
+                    &change.schema_key,
+                    "metadata",
+                )?,
                 created_at: timestamp.to_string(),
                 writer_key: change.writer_key.clone(),
             })
         })
         .collect()
+}
+
+fn canonicalize_change_payload(
+    value: Option<&str>,
+    schema_key: &str,
+    field_name: &str,
+) -> Result<Option<CanonicalJson>, CreateCommitError> {
+    value
+        .map(CanonicalJson::from_text)
+        .transpose()
+        .map_err(|error| CreateCommitError {
+            kind: CreateCommitErrorKind::Internal,
+            message: format!(
+                "create commit batch requires valid canonical JSON for '{field_name}' in schema '{}': {}",
+                schema_key, error.description
+            ),
+        })
 }
 
 fn require_change_field(

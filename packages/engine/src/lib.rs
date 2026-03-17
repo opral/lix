@@ -2,6 +2,7 @@ mod account;
 mod api;
 mod backend;
 mod boot;
+mod canonical_json;
 mod cel;
 mod deterministic_mode;
 mod engine;
@@ -31,6 +32,7 @@ pub use backend::execute_statement_with_backend;
 pub use backend::LixBackend;
 pub use backend::LixTransaction;
 pub use backend::SqlDialect;
+pub use canonical_json::CanonicalJson;
 #[doc(hidden)]
 pub use engine::{boot, BootArgs};
 pub use engine::{BootAccount, BootKeyValue, Engine, EngineTransaction, ExecuteOptions};

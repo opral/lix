@@ -244,7 +244,7 @@ pub(crate) fn build_statement_batch_from_commit_apply_input(
                 statement_params.push(EngineValue::Text(id.clone()));
                 let content_placeholder = next_placeholder;
                 next_placeholder += 1;
-                statement_params.push(EngineValue::Text(content.clone()));
+                statement_params.push(EngineValue::Text(content.as_str().to_string()));
                 snapshot_rows.push(vec![
                     placeholder_expr(id_placeholder),
                     placeholder_expr(content_placeholder),
@@ -286,7 +286,7 @@ pub(crate) fn build_statement_batch_from_commit_apply_input(
             ),
             text_param_expr(&snapshot_id, &mut next_placeholder, &mut statement_params),
             optional_text_param_expr(
-                change.metadata.as_deref(),
+                change.metadata.as_ref().map(|value| value.as_str()),
                 &mut next_placeholder,
                 &mut statement_params,
             ),
@@ -532,7 +532,11 @@ fn live_state_row_values_parameterized(
         boolean_expr(row.lixcol_version_id == GLOBAL_VERSION),
         text_param_expr(&row.plugin_key, next_placeholder, params),
         text_param_expr(&row.id, next_placeholder, params),
-        optional_text_param_expr(row.metadata.as_deref(), next_placeholder, params),
+        optional_text_param_expr(
+            row.metadata.as_ref().map(|value| value.as_str()),
+            next_placeholder,
+            params,
+        ),
         optional_text_param_expr(row.writer_key.as_deref(), next_placeholder, params),
         number_expr(if row.snapshot_content.is_some() {
             "0"

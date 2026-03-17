@@ -204,7 +204,10 @@ pub(crate) async fn materialize_file_data_with_plugins(
                 snapshot_content: if write.op == LiveStateWriteOp::Tombstone {
                     None
                 } else {
-                    write.snapshot_content.clone()
+                    write
+                        .snapshot_content
+                        .as_ref()
+                        .map(|value| value.to_string())
                 },
             });
         }
