@@ -818,49 +818,27 @@ async fn load_scoped_descriptor_row(
     version_id: &str,
     _scope: FilesystemProjectionScope,
 ) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
-    if let Some(local_row) = load_visible_descriptor_row_for_version(
-        backend,
-        tracked_table,
-        schema_key,
-        tracked_base_predicate,
-        untracked_base_predicate,
-        version_id,
-    )
-    .await?
-    {
-        return Ok(Some(local_row));
-    }
-
     if version_id == GLOBAL_VERSION_ID {
-        return Ok(None);
+        return load_visible_descriptor_row_for_version(
+            backend,
+            tracked_table,
+            schema_key,
+            tracked_base_predicate,
+            untracked_base_predicate,
+            version_id,
+        )
+        .await;
     }
 
-    let Some(global_row) = load_visible_descriptor_row_for_version(
-        backend,
+    let sql = merged_visible_descriptor_sql(
+        backend.dialect(),
         tracked_table,
         schema_key,
         tracked_base_predicate,
         untracked_base_predicate,
-        GLOBAL_VERSION_ID,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-
-    if version_has_tombstone_for_entity(
-        backend,
-        tracked_table,
-        schema_key,
         version_id,
-        &global_row.id,
-    )
-    .await?
-    {
-        return Ok(None);
-    }
-
-    Ok(Some(global_row))
+    );
+    load_effective_descriptor_row(backend, &sql).await
 }
 
 async fn load_scoped_descriptor_rows_for_keys<K, F>(
@@ -877,41 +855,92 @@ where
     K: Ord + Clone,
     F: Fn(&EffectiveDescriptorRow) -> K,
 {
-    let mut resolved_by_key = BTreeMap::<K, EffectiveDescriptorRow>::new();
-
-    for row in load_effective_descriptor_rows(backend, local_rows_sql).await? {
-        resolved_by_key.entry(key_fn(&row)).or_insert(row);
-    }
-
     if version_id == GLOBAL_VERSION_ID {
+        let rows = load_effective_descriptor_rows(backend, local_rows_sql).await?;
+        let mut resolved_by_key = BTreeMap::<K, EffectiveDescriptorRow>::new();
+        for row in rows {
+            resolved_by_key.entry(key_fn(&row)).or_insert(row);
+        }
         return Ok(resolved_by_key.into_values().collect());
     }
 
-    let global_rows = load_effective_descriptor_rows(backend, global_rows_sql).await?;
+    // Merge local and global into a single query. Local rows get version_rank=0,
+    // global rows get version_rank=1. ROW_NUMBER picks the best row per entity
+    // (local wins over global, untracked wins over tracked via precedence).
+    let merged_sql = format!(
+        "SELECT entity_id, parent_id, directory_id, name, extension, hidden, \
+                metadata, change_id, is_tombstone, precedence, untracked, version_rank \
+         FROM ( \
+           SELECT *, ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY version_rank ASC, precedence ASC) AS rn \
+           FROM ( \
+             SELECT *, 0 AS version_rank FROM ({local_sql}) \
+             UNION ALL \
+             SELECT *, 1 AS version_rank FROM ({global_sql}) \
+           ) \
+         ) WHERE rn = 1",
+        local_sql = local_rows_sql,
+        global_sql = global_rows_sql,
+    );
 
-    let unresolved_global_rows = global_rows
-        .into_iter()
-        .filter(|row| !resolved_by_key.contains_key(&key_fn(row)))
-        .collect::<Vec<_>>();
+    let result = backend
+        .execute(&merged_sql, &[])
+        .await
+        .map_err(filesystem_query_backend_error)?;
 
-    let candidate_entity_ids = unresolved_global_rows
-        .iter()
-        .map(|row| row.id.clone())
-        .collect::<BTreeSet<_>>();
-    let shadowed_entity_ids = entity_ids_with_version_tombstones(
-        backend,
-        tracked_table,
-        schema_key,
-        version_id,
-        &candidate_entity_ids,
-    )
-    .await?;
+    let mut resolved_by_key = BTreeMap::<K, EffectiveDescriptorRow>::new();
+    let mut global_entity_ids = BTreeSet::new();
 
-    for row in unresolved_global_rows {
-        if shadowed_entity_ids.contains(&row.id) {
+    for row in &result.rows {
+        let id = required_text_value(row, "entity_id")?;
+        // Column 8 = is_tombstone, column 11 = version_rank
+        let is_tombstone = row.get(8).and_then(value_as_bool).unwrap_or(false);
+        if is_tombstone {
             continue;
         }
-        resolved_by_key.entry(key_fn(&row)).or_insert(row);
+        let version_rank = row
+            .get(11)
+            .and_then(|v| match v {
+                Value::Integer(n) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let descriptor = EffectiveDescriptorRow {
+            id: id.clone(),
+            parent_id: optional_text_value(row.get(1)),
+            directory_id: optional_text_value(row.get(2)),
+            name: required_text_value_index(row, 3, "name")?,
+            extension: optional_text_value(row.get(4)),
+            hidden: row.get(5).and_then(value_as_bool).unwrap_or(false),
+            metadata: row.get(6).and_then(text_from_value),
+            change_id: row.get(7).and_then(text_from_value),
+            untracked: row.get(10).and_then(value_as_bool).unwrap_or(false),
+        };
+        if version_rank > 0 {
+            global_entity_ids.insert(id);
+        }
+        resolved_by_key.entry(key_fn(&descriptor)).or_insert(descriptor);
+    }
+
+    // For rows that came from global, check if the local version has a tombstone
+    // that shadows them.
+    if !global_entity_ids.is_empty() {
+        let shadowed_entity_ids = entity_ids_with_version_tombstones(
+            backend,
+            tracked_table,
+            schema_key,
+            version_id,
+            &global_entity_ids,
+        )
+        .await?;
+        for shadowed_id in &shadowed_entity_ids {
+            let key_to_remove = resolved_by_key
+                .iter()
+                .find(|(_, row)| row.id == *shadowed_id)
+                .map(|(k, _)| k.clone());
+            if let Some(key) = key_to_remove {
+                resolved_by_key.remove(&key);
+            }
+        }
     }
 
     Ok(resolved_by_key.into_values().collect())
@@ -1260,6 +1289,112 @@ fn visible_descriptor_sql(
         untracked_table = untracked_table,
         tracked_table = tracked_table,
         version_id = escape_sql_string(version_id),
+        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
+        tracked_base = tracked_base,
+        untracked_base_predicate = untracked_base_predicate,
+        untracked_parent_expr = untracked_parent_expr,
+        untracked_directory_expr = untracked_directory_expr,
+        untracked_name_expr = untracked_name_expr,
+        untracked_extension_expr = untracked_extension_expr,
+        untracked_hidden_expr = untracked_hidden_expr,
+        tracked_parent_expr = tracked_parent_expr,
+        tracked_directory_expr = tracked_directory_expr,
+        tracked_name_expr = tracked_name_expr,
+        tracked_extension_expr = tracked_extension_expr,
+        tracked_hidden_expr = tracked_hidden_expr,
+    )
+}
+
+/// Builds a single SQL query that checks both the local version and global version,
+/// preferring the local version. If a global row exists but the local version has a
+/// tombstone for the same entity, the global row is excluded.
+///
+/// This replaces two separate queries (local + global fallback) with one round-trip.
+fn merged_visible_descriptor_sql(
+    _dialect: SqlDialect,
+    tracked_table: &str,
+    schema_key: &str,
+    tracked_base_predicate: &str,
+    untracked_base_predicate: &str,
+    version_id: &str,
+) -> String {
+    let tracked_base = format!(
+        "file_id = '{file_id}' AND {tracked_base_predicate}",
+        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
+        tracked_base_predicate = tracked_base_predicate,
+    );
+    let untracked_table = quote_ident(&untracked_live_table_name(schema_key));
+    let tracked_parent_expr = normalized_descriptor_select_expr(schema_key, "parent_id");
+    let tracked_directory_expr = normalized_descriptor_select_expr(schema_key, "directory_id");
+    let tracked_name_expr = normalized_descriptor_select_expr(schema_key, "name");
+    let tracked_extension_expr = normalized_descriptor_select_expr(schema_key, "extension");
+    let tracked_hidden_expr = normalized_hidden_select_expr(schema_key);
+    let untracked_parent_expr = normalized_descriptor_select_expr(schema_key, "parent_id");
+    let untracked_directory_expr = normalized_descriptor_select_expr(schema_key, "directory_id");
+    let untracked_name_expr = normalized_descriptor_select_expr(schema_key, "name");
+    let untracked_extension_expr = normalized_descriptor_select_expr(schema_key, "extension");
+    let untracked_hidden_expr = normalized_hidden_select_expr(schema_key);
+    let global = escape_sql_string(GLOBAL_VERSION_ID);
+    // version_rank: 0 = local untracked, 1 = local tracked, 2 = global untracked, 3 = global tracked
+    // Within the same entity, the lowest version_rank wins (local over global, untracked over tracked).
+    // Global tracked rows with is_tombstone=1 are excluded before ranking.
+    // After ranking, if the best row for an entity is a tombstone or comes from a global row that is
+    // shadowed by a local tombstone, it should be invisible — we filter is_tombstone != 0 at the end.
+    format!(
+        "SELECT entity_id, parent_id, directory_id, name, extension, hidden, \
+                metadata, change_id, is_tombstone, precedence, untracked \
+         FROM ( \
+           SELECT *, ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY version_rank ASC, precedence ASC) AS rn \
+           FROM ( \
+             SELECT entity_id, \
+                    {untracked_parent_expr} AS parent_id, \
+                    {untracked_directory_expr} AS directory_id, \
+                    {untracked_name_expr} AS name, \
+                    {untracked_extension_expr} AS extension, \
+                    {untracked_hidden_expr} AS hidden, \
+                    metadata, NULL AS change_id, 0 AS is_tombstone, \
+                    1 AS precedence, 1 AS untracked, 0 AS version_rank \
+             FROM {untracked_table} \
+             WHERE version_id = '{version_id}' AND file_id = '{file_id}' AND {untracked_base_predicate} \
+             UNION ALL \
+             SELECT entity_id, \
+                    {tracked_parent_expr} AS parent_id, \
+                    {tracked_directory_expr} AS directory_id, \
+                    {tracked_name_expr} AS name, \
+                    {tracked_extension_expr} AS extension, \
+                    {tracked_hidden_expr} AS hidden, \
+                    metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked, 1 AS version_rank \
+             FROM {tracked_table} \
+             WHERE version_id = '{version_id}' AND {tracked_base} \
+             UNION ALL \
+             SELECT entity_id, \
+                    {untracked_parent_expr} AS parent_id, \
+                    {untracked_directory_expr} AS directory_id, \
+                    {untracked_name_expr} AS name, \
+                    {untracked_extension_expr} AS extension, \
+                    {untracked_hidden_expr} AS hidden, \
+                    metadata, NULL AS change_id, 0 AS is_tombstone, \
+                    1 AS precedence, 1 AS untracked, 2 AS version_rank \
+             FROM {untracked_table} \
+             WHERE version_id = '{global}' AND file_id = '{file_id}' AND {untracked_base_predicate} \
+             UNION ALL \
+             SELECT entity_id, \
+                    {tracked_parent_expr} AS parent_id, \
+                    {tracked_directory_expr} AS directory_id, \
+                    {tracked_name_expr} AS name, \
+                    {tracked_extension_expr} AS extension, \
+                    {tracked_hidden_expr} AS hidden, \
+                    metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked, 3 AS version_rank \
+             FROM {tracked_table} \
+             WHERE version_id = '{global}' AND {tracked_base} \
+           ) candidates \
+         ) ranked \
+         WHERE rn = 1 AND is_tombstone = 0 \
+         LIMIT 1",
+        untracked_table = untracked_table,
+        tracked_table = tracked_table,
+        version_id = escape_sql_string(version_id),
+        global = global,
         file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
         tracked_base = tracked_base,
         untracked_base_predicate = untracked_base_predicate,
