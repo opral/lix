@@ -17,6 +17,13 @@ pub(crate) fn lower_lix_json_extract(call: &LixJsonExtractCall, dialect: SqlDial
     }
 }
 
+pub(crate) fn lower_lix_json_extract_json(call: &LixJsonExtractCall, dialect: SqlDialect) -> Expr {
+    match dialect {
+        SqlDialect::Sqlite => lower_sqlite_json_value_text(call),
+        SqlDialect::Postgres => lower_postgres_json_value_text(call),
+    }
+}
+
 pub(crate) fn lower_lix_json_extract_boolean(
     call: &LixJsonExtractCall,
     dialect: SqlDialect,
@@ -143,6 +150,100 @@ fn lower_postgres_json_text(call: &LixJsonExtractCall) -> Expr {
     args.extend(call.path.iter().map(postgres_json_path_segment_expr));
 
     function_expr("jsonb_extract_path_text", args)
+}
+
+fn lower_sqlite_json_value_text(call: &LixJsonExtractCall) -> Expr {
+    let json_path = sqlite_json_path_literal(&call.path);
+    let json_path_expr = string_literal_expr(json_path);
+    let json_type_expr = function_expr(
+        "json_type",
+        vec![call.json_expr.clone(), json_path_expr.clone()],
+    );
+    let json_extract_expr = function_expr(
+        "json_extract",
+        vec![call.json_expr.clone(), json_path_expr.clone()],
+    );
+    let json_text_expr = Expr::BinaryOp {
+        left: Box::new(json_extract_expr.clone()),
+        op: sqlparser::ast::BinaryOperator::StringConcat,
+        right: Box::new(string_literal_expr("".to_string())),
+    };
+
+    Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: Some(Box::new(json_type_expr)),
+        conditions: vec![
+            sqlparser::ast::CaseWhen {
+                condition: Expr::Value(AstValue::Null.into()),
+                result: Expr::Value(AstValue::Null.into()),
+            },
+            sqlparser::ast::CaseWhen {
+                condition: string_literal_expr("null".to_string()),
+                result: Expr::Value(AstValue::Null.into()),
+            },
+            sqlparser::ast::CaseWhen {
+                condition: string_literal_expr("true".to_string()),
+                result: string_literal_expr("true".to_string()),
+            },
+            sqlparser::ast::CaseWhen {
+                condition: string_literal_expr("false".to_string()),
+                result: string_literal_expr("false".to_string()),
+            },
+            sqlparser::ast::CaseWhen {
+                condition: string_literal_expr("object".to_string()),
+                result: json_text_expr.clone(),
+            },
+            sqlparser::ast::CaseWhen {
+                condition: string_literal_expr("array".to_string()),
+                result: json_text_expr,
+            },
+        ],
+        else_result: Some(Box::new(function_expr(
+            "json_quote",
+            vec![json_extract_expr],
+        ))),
+    }
+}
+
+fn lower_postgres_json_value_text(call: &LixJsonExtractCall) -> Expr {
+    let jsonb_cast_expr = Expr::Cast {
+        kind: CastKind::Cast,
+        expr: Box::new(call.json_expr.clone()),
+        data_type: DataType::JSONB,
+        format: None,
+    };
+    let mut jsonb_extract_args = Vec::with_capacity(call.path.len() + 1);
+    jsonb_extract_args.push(jsonb_cast_expr.clone());
+    jsonb_extract_args.extend(call.path.iter().map(postgres_json_path_segment_expr));
+    let jsonb_extract_expr = function_expr("jsonb_extract_path", jsonb_extract_args);
+    let jsonb_typeof_expr = function_expr("jsonb_typeof", vec![jsonb_extract_expr.clone()]);
+
+    Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![
+            sqlparser::ast::CaseWhen {
+                condition: Expr::IsNull(Box::new(jsonb_extract_expr.clone())),
+                result: Expr::Value(AstValue::Null.into()),
+            },
+            sqlparser::ast::CaseWhen {
+                condition: Expr::BinaryOp {
+                    left: Box::new(jsonb_typeof_expr),
+                    op: sqlparser::ast::BinaryOperator::Eq,
+                    right: Box::new(string_literal_expr("null".to_string())),
+                },
+                result: Expr::Value(AstValue::Null.into()),
+            },
+        ],
+        else_result: Some(Box::new(Expr::Cast {
+            kind: CastKind::Cast,
+            expr: Box::new(jsonb_extract_expr),
+            data_type: DataType::Text,
+            format: None,
+        })),
+    }
 }
 
 fn lower_sqlite_json_boolean(call: &LixJsonExtractCall) -> Expr {

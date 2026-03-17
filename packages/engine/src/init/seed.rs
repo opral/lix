@@ -10,20 +10,24 @@ use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
 };
-use crate::schema::builtin::types::LixVersionDescriptor;
 use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
+use crate::schema::live_layout::{
+    builtin_live_table_layout, live_column_name_for_property, normalized_live_column_values,
+    tracked_live_table_name, untracked_live_table_name,
+};
+use crate::schema::registry::ensure_schema_live_table;
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{build_commit_generation_seed_sql, COMMIT_GRAPH_NODE_TABLE};
 use crate::version::DEFAULT_ACTIVE_VERSION_NAME;
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
     active_version_schema_version, active_version_snapshot_content,
-    active_version_storage_version_id, parse_active_version_snapshot, version_descriptor_file_id,
-    version_descriptor_plugin_key, version_descriptor_schema_key,
-    version_descriptor_schema_version, version_descriptor_snapshot_content,
-    version_descriptor_storage_version_id, version_ref_file_id, version_ref_plugin_key,
-    version_ref_schema_key, version_ref_schema_version, version_ref_snapshot_content,
-    version_ref_storage_version_id, GLOBAL_VERSION_ID,
+    active_version_storage_version_id, version_descriptor_file_id, version_descriptor_plugin_key,
+    version_descriptor_schema_key, version_descriptor_schema_version,
+    version_descriptor_snapshot_content, version_descriptor_storage_version_id,
+    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
+    version_ref_schema_version, version_ref_snapshot_content, version_ref_storage_version_id,
+    GLOBAL_VERSION_ID,
 };
 use crate::{LixError, Value};
 use serde_json::Value as JsonValue;
@@ -36,6 +40,10 @@ const BOOTSTRAP_COMMIT_ID: &str = "00000000-0000-7000-8000-000000000002";
 
 impl Engine {
     pub(crate) async fn ensure_builtin_schemas_installed(&self) -> Result<(), LixError> {
+        for schema_key in builtin_schema_keys() {
+            ensure_schema_live_table(self.backend.as_ref(), schema_key).await?;
+        }
+
         for schema_key in builtin_schema_keys() {
             let schema = builtin_schema_definition(schema_key).ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -123,19 +131,35 @@ impl Engine {
     }
 
     async fn load_boot_active_version_id(&self) -> Result<String, LixError> {
+        let layout = builtin_live_table_layout(active_version_schema_key())?.ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "builtin active version schema must compile to a live layout",
+            )
+        })?;
+        let payload_version_column = live_column_name_for_property(&layout, "version_id")
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "active version live layout is missing version_id",
+                )
+            })?;
         let result = self
             .backend
             .execute(
-                "SELECT snapshot_content \
-                 FROM lix_internal_live_untracked_v1 \
-                 WHERE schema_key = $1 \
-                   AND file_id = $2 \
-                   AND version_id = $3 \
-                   AND snapshot_content IS NOT NULL \
-                 ORDER BY updated_at DESC \
-                 LIMIT 1",
+                &format!(
+                    "SELECT {payload_version_column} \
+                     FROM {table_name} \
+                     WHERE file_id = $1 \
+                       AND version_id = $2 \
+                       AND {payload_version_column} IS NOT NULL \
+                     ORDER BY updated_at DESC \
+                     LIMIT 1",
+                    payload_version_column = quote_ident(payload_version_column),
+                    table_name =
+                        quote_ident(&untracked_live_table_name(active_version_schema_key())),
+                ),
                 &[
-                    Value::Text(active_version_schema_key().to_string()),
                     Value::Text(active_version_file_id().to_string()),
                     Value::Text(active_version_storage_version_id().to_string()),
                 ],
@@ -146,26 +170,22 @@ impl Engine {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "boot key-value seeding requires an active version".to_string(),
         })?;
-        let snapshot_content = row.first().ok_or_else(|| LixError {
+        let version_id = row.first().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "active version query row is missing snapshot_content".to_string(),
+            description: "active version query row is missing version_id".to_string(),
         })?;
-        let snapshot_content = match snapshot_content {
-            Value::Text(value) => value.as_str(),
-            other => {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
-                        "active version snapshot_content must be text, got {other:?}"
-                    ),
-                })
-            }
-        };
-
-        parse_active_version_snapshot(snapshot_content)
+        match version_id {
+            Value::Text(value) => Ok(value.clone()),
+            other => Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!("active version id must be text, got {other:?}"),
+            }),
+        }
     }
 
     pub(crate) async fn seed_global_system_directories(&self) -> Result<(), LixError> {
+        ensure_schema_live_table(self.backend.as_ref(), "lix_directory_descriptor").await?;
+        let table_name = quote_ident(&untracked_live_table_name("lix_directory_descriptor"));
         let directories = [
             SYSTEM_ROOT_DIRECTORY_PATH,
             SYSTEM_APP_DATA_DIRECTORY_PATH,
@@ -173,36 +193,48 @@ impl Engine {
         ];
 
         for path in directories {
+            let (entity_id, parent_id, name) = system_directory_descriptor_parts(path);
             let existing = self
-                .execute_internal(
-                    "SELECT 1 \
-                     FROM lix_directory_by_version \
-                     WHERE path = $1 \
-                       AND lixcol_version_id = 'global' \
-                     LIMIT 1",
-                    &[Value::Text(path.to_string())],
-                    ExecuteOptions::default(),
+                .backend
+                .execute(
+                    &format!(
+                        "SELECT 1 \
+                         FROM {table_name} \
+                         WHERE entity_id = '{entity_id}' \
+                           AND file_id = 'lix' \
+                           AND version_id = 'global' \
+                         LIMIT 1",
+                        table_name = table_name,
+                        entity_id = escape_sql_string(&entity_id),
+                    ),
+                    &[],
                 )
                 .await?;
-            let [statement] = existing.statements.as_slice() else {
-                return Err(errors::unexpected_statement_count_error(
-                    "global system directory existence query",
-                    1,
-                    existing.statements.len(),
-                ));
-            };
-            if !statement.rows.is_empty() {
+            if !existing.rows.is_empty() {
                 continue;
             }
 
-            self.execute_internal(
-                "INSERT INTO lix_directory_by_version (\
-                 path, hidden, lixcol_version_id, lixcol_untracked\
-                 ) VALUES ($1, true, 'global', true)",
-                &[Value::Text(path.to_string())],
-                ExecuteOptions::default(),
-            )
-            .await?;
+            let snapshot_content = serde_json::json!({
+                "id": entity_id,
+                "parent_id": parent_id,
+                "name": name,
+                "hidden": true,
+            })
+            .to_string();
+            let normalized_values =
+                normalized_seed_values("lix_directory_descriptor", Some(&snapshot_content))?;
+            let insert_sql = format!(
+                "INSERT INTO {table_name} (\
+                 entity_id, schema_key, file_id, version_id, global, plugin_key, schema_version, created_at, updated_at{normalized_columns}\
+                 ) VALUES (\
+                 '{entity_id}', 'lix_directory_descriptor', 'lix', 'global', true, 'lix', '1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'{normalized_literals}\
+                 )",
+                table_name = table_name,
+                entity_id = escape_sql_string(&entity_id),
+                normalized_columns = normalized_insert_columns_sql(&normalized_values),
+                normalized_literals = normalized_insert_literals_sql(&normalized_values),
+            );
+            self.backend.execute(&insert_sql, &[]).await?;
         }
 
         Ok(())
@@ -374,6 +406,11 @@ impl Engine {
             Some(version_id) => version_id,
             None => {
                 let generated_main_id = self.generate_runtime_uuid().await?;
+                self.seed_canonical_version_descriptor(
+                    &generated_main_id,
+                    DEFAULT_ACTIVE_VERSION_NAME,
+                )
+                .await?;
                 self.seed_materialized_version_descriptor(
                     &generated_main_id,
                     DEFAULT_ACTIVE_VERSION_NAME,
@@ -395,9 +432,15 @@ impl Engine {
         }
         self.assert_commit_change_set_integrity(&bootstrap_commit_id)
             .await?;
+        self.seed_canonical_version_descriptor(GLOBAL_VERSION_ID, GLOBAL_VERSION_ID)
+            .await?;
         self.seed_materialized_version_descriptor(GLOBAL_VERSION_ID, GLOBAL_VERSION_ID)
             .await?;
+        self.seed_canonical_version_ref(GLOBAL_VERSION_ID, &bootstrap_commit_id)
+            .await?;
         self.seed_materialized_version_ref(GLOBAL_VERSION_ID, &bootstrap_commit_id)
+            .await?;
+        self.seed_canonical_version_ref(&main_version_id, &bootstrap_commit_id)
             .await?;
         self.seed_materialized_version_ref(&main_version_id, &bootstrap_commit_id)
             .await?;
@@ -419,15 +462,17 @@ impl Engine {
             return Ok(());
         }
 
+        let commit_table = tracked_live_table_name("lix_commit");
         let commit_count_result = self
             .backend
             .execute(
-                "SELECT COUNT(*) \
-                 FROM lix_internal_live_v1_lix_commit \
-                 WHERE schema_key = 'lix_commit' \
-                   AND version_id = 'global' \
-                   AND is_tombstone = 0 \
-                   AND snapshot_content IS NOT NULL",
+                &format!(
+                    "SELECT COUNT(*) \
+                     FROM {commit_table} \
+                     WHERE schema_key = 'lix_commit' \
+                       AND version_id = 'global' \
+                       AND is_tombstone = 0"
+                ),
                 &[],
             )
             .await?;
@@ -533,7 +578,8 @@ impl Engine {
         entity_id: &str,
         name: &str,
     ) -> Result<(), LixError> {
-        let table = format!("lix_internal_live_v1_{}", version_descriptor_schema_key());
+        ensure_schema_live_table(self.backend.as_ref(), version_descriptor_schema_key()).await?;
+        let table = tracked_live_table_name(version_descriptor_schema_key());
         let check_sql = format!(
             "SELECT 1 \
              FROM {table} \
@@ -542,7 +588,6 @@ impl Engine {
                AND file_id = '{file_id}' \
                AND version_id = '{version_id}' \
                AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
              LIMIT 1",
             table = table,
             schema_key = escape_sql_string(version_descriptor_schema_key()),
@@ -557,25 +602,97 @@ impl Engine {
 
         let snapshot_content =
             version_descriptor_snapshot_content(entity_id, name, entity_id == GLOBAL_VERSION_ID);
+        builtin_live_table_layout(version_descriptor_schema_key())?.ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "builtin version descriptor schema must compile to a live layout",
+            )
+        })?;
+        let normalized_values =
+            normalized_seed_values(version_descriptor_schema_key(), Some(&snapshot_content))?;
         let change_id = format!("seed~{}~{}", version_descriptor_schema_key(), entity_id);
         let insert_sql = format!(
             "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, writer_key, is_tombstone, created_at, updated_at{normalized_columns}\
              ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', '{snapshot_content}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'{normalized_literals}\
              )",
-            table = table,
+            table = quote_ident(&table),
             entity_id = escape_sql_string(entity_id),
             schema_key = escape_sql_string(version_descriptor_schema_key()),
             schema_version = escape_sql_string(version_descriptor_schema_version()),
             file_id = escape_sql_string(version_descriptor_file_id()),
             version_id = escape_sql_string(version_descriptor_storage_version_id()),
             plugin_key = escape_sql_string(version_descriptor_plugin_key()),
-            snapshot_content = escape_sql_string(&snapshot_content),
             change_id = escape_sql_string(&change_id),
+            normalized_columns = normalized_insert_columns_sql(&normalized_values),
+            normalized_literals = normalized_insert_literals_sql(&normalized_values),
         );
         self.backend.execute(&insert_sql, &[]).await?;
 
+        Ok(())
+    }
+
+    pub(crate) async fn seed_canonical_version_descriptor(
+        &self,
+        entity_id: &str,
+        name: &str,
+    ) -> Result<(), LixError> {
+        let snapshot_content =
+            version_descriptor_snapshot_content(entity_id, name, entity_id == GLOBAL_VERSION_ID);
+        let change_id = format!("seed~{}~{}", version_descriptor_schema_key(), entity_id);
+        self.insert_change_row_for_snapshot(
+            entity_id,
+            version_descriptor_schema_key(),
+            version_descriptor_schema_version(),
+            version_descriptor_file_id(),
+            version_descriptor_plugin_key(),
+            &snapshot_content,
+            &change_id,
+        )
+        .await
+    }
+
+    async fn insert_change_row_for_snapshot(
+        &self,
+        entity_id: &str,
+        schema_key: &str,
+        schema_version: &str,
+        file_id: &str,
+        plugin_key: &str,
+        snapshot_content: &str,
+        change_id: &str,
+    ) -> Result<(), LixError> {
+        let snapshot_id = format!("{change_id}~snapshot");
+        self.backend
+            .execute(
+                "INSERT INTO lix_internal_snapshot (id, content) \
+                 SELECT $1, $2 \
+                 WHERE NOT EXISTS (SELECT 1 FROM lix_internal_snapshot WHERE id = $1)",
+                &[
+                    Value::Text(snapshot_id.clone()),
+                    Value::Text(snapshot_content.to_string()),
+                ],
+            )
+            .await?;
+        self.backend
+            .execute(
+                "INSERT INTO lix_internal_change (\
+                 id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
+                 ) \
+                 SELECT $1, $2, $3, $4, $5, $6, $7, NULL, '1970-01-01T00:00:00Z' \
+                 WHERE NOT EXISTS (SELECT 1 FROM lix_internal_change WHERE id = $1)",
+                &[
+                    Value::Text(change_id.to_string()),
+                    Value::Text(entity_id.to_string()),
+                    Value::Text(schema_key.to_string()),
+                    Value::Text(schema_version.to_string()),
+                    Value::Text(file_id.to_string()),
+                    Value::Text(plugin_key.to_string()),
+                    Value::Text(snapshot_id),
+                ],
+            )
+            .await?;
         Ok(())
     }
 
@@ -583,15 +700,20 @@ impl Engine {
         &self,
         name: &str,
     ) -> Result<Option<String>, LixError> {
-        let table = format!("lix_internal_live_v1_{}", version_descriptor_schema_key());
+        let table = tracked_live_table_name(version_descriptor_schema_key());
+        let name_column = quote_ident(&live_payload_column_name(
+            version_descriptor_schema_key(),
+            "name",
+        ));
         let sql = format!(
-            "SELECT entity_id, snapshot_content \
+            "SELECT entity_id, {name_column} \
              FROM {table} \
              WHERE schema_key = '{schema_key}' \
                AND file_id = '{file_id}' \
                AND version_id = '{version_id}' \
                AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL",
+               AND {name_column} IS NOT NULL",
+            name_column = name_column,
             table = table,
             schema_key = escape_sql_string(version_descriptor_schema_key()),
             file_id = escape_sql_string(version_descriptor_file_id()),
@@ -607,29 +729,14 @@ impl Engine {
                 Value::Text(value) => value,
                 _ => continue,
             };
-            let snapshot_content = match &row[1] {
+            let snapshot_name = match &row[1] {
                 Value::Text(value) => value,
                 _ => continue,
-            };
-            let snapshot: LixVersionDescriptor =
-                serde_json::from_str(snapshot_content).map_err(|error| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
-                        "version descriptor snapshot_content invalid JSON: {error}"
-                    ),
-                })?;
-            let Some(snapshot_name) = snapshot.name.as_deref() else {
-                continue;
             };
             if snapshot_name != name {
                 continue;
             }
-            let snapshot_id = if snapshot.id.is_empty() {
-                entity_id.as_str()
-            } else {
-                snapshot.id.as_str()
-            };
-            return Ok(Some(snapshot_id.to_string()));
+            return Ok(Some(entity_id.to_string()));
         }
 
         Ok(None)
@@ -640,9 +747,16 @@ impl Engine {
         entity_id: &str,
         commit_id: &str,
     ) -> Result<(), LixError> {
+        ensure_schema_live_table(self.backend.as_ref(), version_ref_schema_key()).await?;
         let snapshot_content = version_ref_snapshot_content(entity_id, commit_id);
         let change_id = format!("seed~{}~{}", version_ref_schema_key(), entity_id);
-        let table = format!("lix_internal_live_v1_{}", version_ref_schema_key());
+        let table = tracked_live_table_name(version_ref_schema_key());
+        builtin_live_table_layout(version_ref_schema_key())?.ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "builtin version ref schema must compile to a live layout",
+            )
+        })?;
         let check_sql = format!(
             "SELECT 1 \
              FROM {table} \
@@ -651,7 +765,6 @@ impl Engine {
                AND file_id = '{file_id}' \
                AND version_id = '{version_id}' \
                AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
              LIMIT 1",
             table = table,
             schema_key = escape_sql_string(version_ref_schema_key()),
@@ -661,21 +774,24 @@ impl Engine {
         );
         let existing = self.backend.execute(&check_sql, &[]).await?;
         if existing.rows.is_empty() {
+            let normalized_values =
+                normalized_seed_values(version_ref_schema_key(), Some(&snapshot_content))?;
             let insert_sql = format!(
                 "INSERT INTO {table} (\
-                 entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
+                 entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, writer_key, is_tombstone, created_at, updated_at{normalized_columns}\
                  ) VALUES (\
-                 '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', '{snapshot_content}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+                 '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'{normalized_literals}\
                  )",
-                table = table,
+                table = quote_ident(&table),
                 entity_id = escape_sql_string(entity_id),
                 schema_key = escape_sql_string(version_ref_schema_key()),
                 schema_version = escape_sql_string(version_ref_schema_version()),
                 file_id = escape_sql_string(version_ref_file_id()),
                 version_id = escape_sql_string(version_ref_storage_version_id()),
                 plugin_key = escape_sql_string(version_ref_plugin_key()),
-                snapshot_content = escape_sql_string(&snapshot_content),
                 change_id = escape_sql_string(&change_id),
+                normalized_columns = normalized_insert_columns_sql(&normalized_values),
+                normalized_literals = normalized_insert_literals_sql(&normalized_values),
             );
             self.backend.execute(&insert_sql, &[]).await?;
         }
@@ -733,6 +849,25 @@ impl Engine {
             )
             .await?;
         Ok(())
+    }
+
+    pub(crate) async fn seed_canonical_version_ref(
+        &self,
+        entity_id: &str,
+        commit_id: &str,
+    ) -> Result<(), LixError> {
+        let snapshot_content = version_ref_snapshot_content(entity_id, commit_id);
+        let change_id = format!("seed~{}~{}", version_ref_schema_key(), entity_id);
+        self.insert_change_row_for_snapshot(
+            entity_id,
+            version_ref_schema_key(),
+            version_ref_schema_version(),
+            version_ref_file_id(),
+            version_ref_plugin_key(),
+            &snapshot_content,
+            &change_id,
+        )
+        .await
     }
 
     pub(crate) async fn insert_last_checkpoint_for_version(
@@ -804,63 +939,88 @@ impl Engine {
         &self,
         head_commit_id: &str,
     ) -> Result<Option<String>, LixError> {
+        let commit_edge_layout =
+            builtin_live_table_layout("lix_commit_edge")?.ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "builtin schema layout missing for lix_commit_edge",
+                )
+            })?;
+        let commit_edge_parent = live_column_name_for_property(&commit_edge_layout, "parent_id")
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "normalized live layout missing parent_id for lix_commit_edge",
+                )
+            })?;
+        let commit_edge_child = live_column_name_for_property(&commit_edge_layout, "child_id")
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "normalized live layout missing child_id for lix_commit_edge",
+                )
+            })?;
+        let commit_edge_table = tracked_live_table_name("lix_commit_edge");
         let rows = self
             .execute_internal(
-                "WITH RECURSIVE reachable(commit_id, depth) AS ( \
-                   SELECT $1 AS commit_id, 0 AS depth \
-                   UNION ALL \
-                   SELECT \
-                     lix_json_extract(edge.snapshot_content, 'parent_id') AS commit_id, \
-                     reachable.depth + 1 AS depth \
-                   FROM reachable \
-                   JOIN lix_internal_live_v1_lix_commit_edge edge \
-                     ON lix_json_extract(edge.snapshot_content, 'child_id') = reachable.commit_id \
-                   WHERE edge.schema_key = 'lix_commit_edge' \
-                     AND edge.version_id = 'global' \
-                     AND edge.is_tombstone = 0 \
-                     AND edge.snapshot_content IS NOT NULL \
-                     AND lix_json_extract(edge.snapshot_content, 'parent_id') IS NOT NULL \
-                 ) \
-                 SELECT reachable.commit_id \
-                 FROM reachable \
-                 JOIN ( \
-                   SELECT \
-                     lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
-                     lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
-                     lix_json_extract(snapshot_content, 'label_id') AS label_id \
-                   FROM lix_internal_state_vtable \
-                   WHERE schema_key = 'lix_entity_label' \
-                     AND file_id = 'lix' \
-                     AND version_id = 'global' \
-                     AND snapshot_content IS NOT NULL \
-                 ) el \
-                   ON el.entity_id = reachable.commit_id \
-                  AND el.schema_key = 'lix_commit' \
-                 JOIN ( \
-                   SELECT \
-                     entity_id AS id, \
-                     lix_json_extract(snapshot_content, 'name') AS name \
-                   FROM lix_internal_state_vtable \
-                   WHERE schema_key = 'lix_label' \
-                     AND file_id = 'lix' \
-                     AND version_id = 'global' \
-                     AND snapshot_content IS NOT NULL \
-                 ) l \
-                   ON l.id = el.label_id \
-                  AND l.name = 'checkpoint' \
-                 LEFT JOIN ( \
-                   SELECT entity_id AS id, created_at \
-                   FROM lix_internal_state_vtable \
-                   WHERE schema_key = 'lix_commit' \
-                     AND file_id = 'lix' \
-                     AND version_id = 'global' \
-                     AND snapshot_content IS NOT NULL \
-                 ) c ON c.id = reachable.commit_id \
-                 ORDER BY \
-                   reachable.depth ASC, \
-                   c.created_at DESC, \
-                   reachable.commit_id DESC \
-                 LIMIT 1",
+                &format!(
+                    "WITH RECURSIVE reachable(commit_id, depth) AS ( \
+                       SELECT $1 AS commit_id, 0 AS depth \
+                       UNION ALL \
+                       SELECT \
+                         edge.__PARENT_ID__ AS commit_id, \
+                         reachable.depth + 1 AS depth \
+                       FROM reachable \
+                       JOIN {commit_edge_table} edge \
+                         ON edge.__CHILD_ID__ = reachable.commit_id \
+                       WHERE edge.schema_key = 'lix_commit_edge' \
+                         AND edge.version_id = 'global' \
+                         AND edge.is_tombstone = 0 \
+                         AND edge.__PARENT_ID__ IS NOT NULL \
+                     ) \
+                     SELECT reachable.commit_id \
+                     FROM reachable \
+                     JOIN ( \
+                       SELECT \
+                         lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
+                         lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
+                         lix_json_extract(snapshot_content, 'label_id') AS label_id \
+                       FROM lix_internal_state_vtable \
+                       WHERE schema_key = 'lix_entity_label' \
+                         AND file_id = 'lix' \
+                         AND version_id = 'global' \
+                         AND snapshot_content IS NOT NULL \
+                     ) el \
+                       ON el.entity_id = reachable.commit_id \
+                      AND el.schema_key = 'lix_commit' \
+                     JOIN ( \
+                       SELECT \
+                         entity_id AS id, \
+                         lix_json_extract(snapshot_content, 'name') AS name \
+                       FROM lix_internal_state_vtable \
+                       WHERE schema_key = 'lix_label' \
+                         AND file_id = 'lix' \
+                         AND version_id = 'global' \
+                         AND snapshot_content IS NOT NULL \
+                     ) l \
+                       ON l.id = el.label_id \
+                      AND l.name = 'checkpoint' \
+                     LEFT JOIN ( \
+                       SELECT entity_id AS id, created_at \
+                       FROM lix_internal_state_vtable \
+                       WHERE schema_key = 'lix_commit' \
+                         AND file_id = 'lix' \
+                         AND version_id = 'global' \
+                         AND snapshot_content IS NOT NULL \
+                     ) c ON c.id = reachable.commit_id \
+                     ORDER BY \
+                       reachable.depth ASC, \
+                       c.created_at DESC, \
+                       reachable.commit_id DESC \
+                     LIMIT 1"
+                )
+                .replace("__PARENT_ID__", commit_edge_parent)
+                .replace("__CHILD_ID__", commit_edge_child),
                 &[Value::Text(head_commit_id.to_string())],
                 ExecuteOptions::default(),
             )
@@ -1062,17 +1222,32 @@ impl Engine {
         &self,
         version_id: &str,
     ) -> Result<(), LixError> {
+        ensure_schema_live_table(self.backend.as_ref(), active_version_schema_key()).await?;
+        let layout = builtin_live_table_layout(active_version_schema_key())?.ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "builtin active version schema must compile to a live layout",
+            )
+        })?;
+        let payload_version_column = live_column_name_for_property(&layout, "version_id")
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "active version live layout is missing version_id",
+                )
+            })?;
         let check_sql = format!(
             "SELECT 1 \
-             FROM lix_internal_live_untracked_v1 \
-             WHERE schema_key = '{schema_key}' \
+             FROM {table_name} \
+             WHERE file_id = '{file_id}' \
                AND file_id = '{file_id}' \
                AND version_id = '{storage_version_id}' \
-               AND snapshot_content IS NOT NULL \
+               AND {payload_version_column} IS NOT NULL \
              LIMIT 1",
-            schema_key = escape_sql_string(active_version_schema_key()),
+            table_name = quote_ident(&untracked_live_table_name(active_version_schema_key())),
             file_id = escape_sql_string(active_version_file_id()),
             storage_version_id = escape_sql_string(active_version_storage_version_id()),
+            payload_version_column = quote_ident(payload_version_column),
         );
         let existing = self.backend.execute(&check_sql, &[]).await?;
         if !existing.rows.is_empty() {
@@ -1081,19 +1256,29 @@ impl Engine {
 
         let entity_id = self.generate_runtime_uuid().await?;
         let snapshot_content = active_version_snapshot_content(&entity_id, version_id);
+        builtin_live_table_layout(active_version_schema_key())?.ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "builtin active version schema must compile to a live layout",
+            )
+        })?;
+        let normalized_values =
+            normalized_seed_values(active_version_schema_key(), Some(&snapshot_content))?;
         let insert_sql = format!(
-            "INSERT INTO lix_internal_live_untracked_v1 (\
-             entity_id, schema_key, file_id, version_id, global, plugin_key, snapshot_content, schema_version, created_at, updated_at\
+            "INSERT INTO {table_name} (\
+             entity_id, schema_key, file_id, version_id, global, plugin_key, schema_version, created_at, updated_at{normalized_columns}\
              ) VALUES (\
-             '{entity_id}', '{schema_key}', '{file_id}', '{storage_version_id}', true, '{plugin_key}', '{snapshot_content}', '{schema_version}', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z'\
+             '{entity_id}', '{schema_key}', '{file_id}', '{storage_version_id}', true, '{plugin_key}', '{schema_version}', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z'{normalized_literals}\
              )",
+            table_name = quote_ident(&untracked_live_table_name(active_version_schema_key())),
             entity_id = escape_sql_string(&entity_id),
             schema_key = escape_sql_string(active_version_schema_key()),
             file_id = escape_sql_string(active_version_file_id()),
             storage_version_id = escape_sql_string(active_version_storage_version_id()),
             plugin_key = escape_sql_string(active_version_plugin_key()),
-            snapshot_content = escape_sql_string(&snapshot_content),
             schema_version = escape_sql_string(active_version_schema_version()),
+            normalized_columns = normalized_insert_columns_sql(&normalized_values),
+            normalized_literals = normalized_insert_literals_sql(&normalized_values),
         );
         self.backend.execute(&insert_sql, &[]).await?;
         Ok(())
@@ -1139,4 +1324,89 @@ fn text_value(value: Option<&Value>, label: &str) -> Result<String, LixError> {
             description: format!("missing {label}"),
         }),
     }
+}
+
+fn normalized_seed_values(
+    schema_key: &str,
+    snapshot_content: Option<&str>,
+) -> Result<Vec<(String, Value)>, LixError> {
+    let layout = builtin_live_table_layout(schema_key)?;
+    let Some(layout) = layout.as_ref() else {
+        return Ok(Vec::new());
+    };
+    Ok(normalized_live_column_values(layout, snapshot_content)?
+        .into_iter()
+        .collect())
+}
+
+fn normalized_insert_columns_sql(values: &[(String, Value)]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    values
+        .iter()
+        .map(|(column, _)| format!(", {}", quote_ident(column)))
+        .collect::<String>()
+}
+
+fn normalized_insert_literals_sql(values: &[(String, Value)]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    values
+        .iter()
+        .map(|(_, value)| format!(", {}", sql_literal(value)))
+        .collect::<String>()
+}
+
+fn sql_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Boolean(value) => {
+            if *value {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        Value::Integer(value) => value.to_string(),
+        Value::Real(value) => value.to_string(),
+        Value::Text(value) => format!("'{}'", escape_sql_string(value)),
+        Value::Json(value) => format!("'{}'", escape_sql_string(&value.to_string())),
+        Value::Blob(_) => "NULL".to_string(),
+    }
+}
+
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn live_payload_column_name(schema_key: &str, property_name: &str) -> String {
+    let layout = builtin_live_table_layout(schema_key)
+        .expect("builtin live layout lookup should succeed")
+        .expect("builtin live layout should exist");
+    live_column_name_for_property(&layout, property_name)
+        .unwrap_or_else(|| {
+            panic!("builtin live layout '{schema_key}' must include '{property_name}'")
+        })
+        .to_string()
+}
+
+fn system_directory_descriptor_parts(path: &str) -> (String, Option<String>, String) {
+    let entity_id = format!("dir:auto::{path}");
+    let trimmed = path.trim_end_matches('/');
+    let name = trimmed
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(".lix")
+        .to_string();
+    let parent_id = match path {
+        SYSTEM_ROOT_DIRECTORY_PATH => None,
+        SYSTEM_APP_DATA_DIRECTORY_PATH | SYSTEM_PLUGIN_DIRECTORY_PATH => {
+            Some(format!("dir:auto::{SYSTEM_ROOT_DIRECTORY_PATH}"))
+        }
+        _ => None,
+    };
+    (entity_id, parent_id, name)
 }

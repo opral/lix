@@ -1,3 +1,4 @@
+use crate::schema::live_layout::{logical_live_snapshot_from_row_with_layout, LiveTableLayout};
 use crate::sql::execution::contracts::planned_statement::{MutationOperation, MutationRow};
 use crate::state::commit::ProposedDomainChange;
 use crate::{LixError, Value};
@@ -488,6 +489,7 @@ pub(crate) fn state_commit_stream_changes_from_mutations(
 pub(crate) fn state_commit_stream_changes_from_postprocess_rows(
     rows: &[Vec<Value>],
     schema_key: &str,
+    layout: Option<&LiveTableLayout>,
     operation: StateCommitStreamOperation,
     writer_key: Option<&str>,
 ) -> Result<Vec<StateCommitStreamChange>, LixError> {
@@ -504,7 +506,8 @@ pub(crate) fn state_commit_stream_changes_from_postprocess_rows(
         let version_id = row_text(row, 2, "version_id")?;
         let plugin_key = row_text(row, 3, "plugin_key")?;
         let schema_version = row_text(row, 4, "schema_version")?;
-        let snapshot_content = row_snapshot_content(row, 5)?;
+        let snapshot_content =
+            logical_live_snapshot_from_row_with_layout(layout, schema_key, row, 5, 9)?;
 
         changes.push(StateCommitStreamChange {
             operation,
@@ -676,33 +679,6 @@ fn planned_row_snapshot_content(
     }
 }
 
-fn row_snapshot_content(row: &[Value], index: usize) -> Result<Option<JsonValue>, LixError> {
-    let value = row.get(index).ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "postprocess state commit stream rows expected snapshot_content column at index {index}"
-        ),
-    })?;
-    match value {
-        Value::Null => Ok(None),
-        Value::Text(text) => {
-            let parsed = serde_json::from_str(text).map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "postprocess state commit stream expected JSON snapshot_content text: {error}"
-                ),
-            })?;
-            Ok(Some(parsed))
-        }
-        other => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "postprocess state commit stream expected null/text snapshot_content, got {other:?}"
-            ),
-        }),
-    }
-}
-
 fn map_mutation_operation(operation: &MutationOperation) -> StateCommitStreamOperation {
     match operation {
         MutationOperation::Insert => StateCommitStreamOperation::Insert,
@@ -738,6 +714,7 @@ mod tests {
         let changes = state_commit_stream_changes_from_postprocess_rows(
             &rows,
             "lix_entity",
+            None,
             StateCommitStreamOperation::Update,
             Some("writer-a"),
         )
@@ -767,6 +744,7 @@ mod tests {
         let changes = state_commit_stream_changes_from_postprocess_rows(
             &rows,
             "lix_entity",
+            None,
             StateCommitStreamOperation::Delete,
             None,
         )

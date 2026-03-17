@@ -4,6 +4,7 @@ use crate::filesystem::live_projection::{
     build_live_file_prefetch_projection_sql, LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN,
 };
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::schema::live_layout::{tracked_live_table_name, untracked_live_table_name};
 use crate::sql::ast::utils::parse_sql_statements;
 use crate::sql::ast::utils::{
     bind_sql_with_state, insert_values_rows_mut, resolve_expr_cell_with_state, resolve_values_rows,
@@ -383,7 +384,7 @@ async fn collect_delete_writes(
     let mut query_sql = format!(
         "SELECT id, path, data, lixcol_version_id \
          FROM ({}) AS live_files",
-        build_live_file_prefetch_projection_sql()
+        build_live_file_prefetch_projection_sql(backend.dialect())
     );
     if matches!(target, FileWriteTarget::ActiveVersion) {
         query_sql.push_str(&format!(
@@ -641,7 +642,7 @@ async fn collect_update_writes(
         }
     }
 
-    let live_projection_sql = build_live_file_prefetch_projection_sql();
+    let live_projection_sql = build_live_file_prefetch_projection_sql(backend.dialect());
     let mut query_sql = format!(
         "SELECT id, path, data, lixcol_version_id, {blob_hash_column}, lixcol_untracked \
          FROM ({live_projection_sql}) AS live_files",
@@ -869,13 +870,13 @@ async fn collect_delete_targets(
             "SELECT id, lixcol_version_id \
              FROM ({live_projection_sql}) AS live_files \
              WHERE lixcol_version_id = '{active_version_id}'",
-            live_projection_sql = build_live_file_prefetch_projection_sql(),
+            live_projection_sql = build_live_file_prefetch_projection_sql(backend.dialect()),
             active_version_id = escape_sql_string(active_version_id),
         ),
         (FileWriteTarget::ExplicitVersion, false) => format!(
             "SELECT id, lixcol_version_id \
              FROM ({}) AS live_files",
-            build_live_file_prefetch_projection_sql()
+            build_live_file_prefetch_projection_sql(backend.dialect())
         ),
     };
     if let Some(selection) = delete.selection.as_ref() {
@@ -962,10 +963,6 @@ struct OverlayWriteState {
 
 const ACTIVE_VERSION_VIEW: &str = "lix_active_version";
 const INTERNAL_STATE_VTABLE: &str = "lix_internal_state_vtable";
-const INTERNAL_STATE_UNTRACKED: &str = "lix_internal_live_untracked_v1";
-const LIVE_FILE_DESCRIPTOR_TABLE: &str = "lix_internal_live_v1_lix_file_descriptor";
-const LIVE_DIRECTORY_DESCRIPTOR_TABLE: &str = "lix_internal_live_v1_lix_directory_descriptor";
-const LIVE_BLOB_REF_TABLE: &str = "lix_internal_live_v1_lix_binary_blob_ref";
 
 fn apply_statement_writes_to_overlay(
     statement_writes: &[PendingFileWrite],
@@ -997,12 +994,14 @@ async fn next_active_version_id_from_statement(
             let Some(table_name) = update_target_table_name(update) else {
                 return Ok(None);
             };
+            let active_version_untracked_table =
+                untracked_live_table_name(active_version_schema_key());
             if table_name.eq_ignore_ascii_case(ACTIVE_VERSION_VIEW) {
                 return active_version_id_from_lix_active_version_update(backend, update, params)
                     .await;
             }
             if table_name.eq_ignore_ascii_case(INTERNAL_STATE_VTABLE)
-                || table_name.eq_ignore_ascii_case(INTERNAL_STATE_UNTRACKED)
+                || table_name.eq_ignore_ascii_case(&active_version_untracked_table)
             {
                 return active_version_id_from_internal_state_update(backend, update, params).await;
             }
@@ -1103,6 +1102,7 @@ async fn active_version_id_from_internal_state_update(
     let Some(table_name) = update_target_table_name(update) else {
         return Ok(None);
     };
+    let active_version_untracked_table = untracked_live_table_name(active_version_schema_key());
     let mut placeholder_state = PlaceholderState::new();
     let mut next_active_version_id: Option<String> = None;
     for assignment in &update.assignments {
@@ -1129,10 +1129,9 @@ async fn active_version_id_from_internal_state_update(
             escape_sql_string(active_version_file_id()),
             escape_sql_string(active_version_storage_version_id()),
         )
-    } else if table_name.eq_ignore_ascii_case(INTERNAL_STATE_UNTRACKED) {
+    } else if table_name.eq_ignore_ascii_case(&active_version_untracked_table) {
         format!(
-            "schema_key = '{}' AND file_id = '{}' AND version_id = '{}'",
-            escape_sql_string(active_version_schema_key()),
+            "file_id = '{}' AND version_id = '{}'",
             escape_sql_string(active_version_file_id()),
             escape_sql_string(active_version_storage_version_id()),
         )
@@ -1182,7 +1181,8 @@ fn active_version_id_from_internal_state_insert(
         return Ok(None);
     };
     let is_vtable = table_name.eq_ignore_ascii_case(INTERNAL_STATE_VTABLE);
-    let is_untracked = table_name.eq_ignore_ascii_case(INTERNAL_STATE_UNTRACKED);
+    let is_untracked =
+        table_name.eq_ignore_ascii_case(&untracked_live_table_name(active_version_schema_key()));
     if !is_vtable && !is_untracked {
         return Ok(None);
     }
@@ -1635,13 +1635,13 @@ async fn load_exact_live_file_prefetch_row(
     version_id: &str,
     include_path: bool,
 ) -> Result<Option<LiveFilePrefetchRow>, LixError> {
-    let descriptor_directory_expr = coalesced_json_field_sql(
+    let descriptor_directory_expr = coalesced_live_column_sql(
         ["fdu_local", "fd_local", "fdu_global", "fd_global"],
         "directory_id",
     );
     let descriptor_name_expr =
-        coalesced_json_field_sql(["fdu_local", "fd_local", "fdu_global", "fd_global"], "name");
-    let descriptor_extension_expr = coalesced_json_field_sql(
+        coalesced_live_column_sql(["fdu_local", "fd_local", "fdu_global", "fd_global"], "name");
+    let descriptor_extension_expr = coalesced_live_column_sql(
         ["fdu_local", "fd_local", "fdu_global", "fd_global"],
         "extension",
     );
@@ -1653,7 +1653,7 @@ async fn load_exact_live_file_prefetch_row(
             WHEN fd_global.snapshot_content IS NOT NULL THEN 0 \
             ELSE 0 \
         END";
-    let blob_hash_expr = coalesced_json_field_sql(
+    let blob_hash_expr = coalesced_live_column_sql(
         ["bru_local", "br_local", "bru_global", "br_global"],
         "blob_hash",
     );
@@ -1666,36 +1666,32 @@ async fn load_exact_live_file_prefetch_row(
              {descriptor_untracked_expr} AS lixcol_untracked, \
              {blob_hash_expr} AS {blob_hash_column} \
            FROM (SELECT $1 AS file_id, $2 AS version_id) input \
-           LEFT JOIN {untracked_table} fdu_local \
-             ON fdu_local.schema_key = 'lix_file_descriptor' \
-            AND fdu_local.entity_id = input.file_id \
+           LEFT JOIN {file_descriptor_untracked_table} fdu_local \
+             ON fdu_local.entity_id = input.file_id \
             AND fdu_local.version_id = input.version_id \
             AND fdu_local.snapshot_content IS NOT NULL \
            LEFT JOIN {file_descriptor_table} fd_local \
              ON fd_local.entity_id = input.file_id \
             AND fd_local.version_id = input.version_id \
             AND fd_local.snapshot_content IS NOT NULL \
-           LEFT JOIN {untracked_table} fdu_global \
-             ON fdu_global.schema_key = 'lix_file_descriptor' \
-            AND fdu_global.entity_id = input.file_id \
+           LEFT JOIN {file_descriptor_untracked_table} fdu_global \
+             ON fdu_global.entity_id = input.file_id \
             AND fdu_global.version_id = '{global_version_id}' \
             AND fdu_global.snapshot_content IS NOT NULL \
            LEFT JOIN {file_descriptor_table} fd_global \
              ON fd_global.entity_id = input.file_id \
             AND fd_global.version_id = '{global_version_id}' \
             AND fd_global.snapshot_content IS NOT NULL \
-           LEFT JOIN {untracked_table} bru_local \
-             ON bru_local.schema_key = 'lix_binary_blob_ref' \
-            AND bru_local.entity_id = input.file_id \
+           LEFT JOIN {blob_ref_untracked_table} bru_local \
+             ON bru_local.entity_id = input.file_id \
             AND bru_local.version_id = input.version_id \
             AND bru_local.snapshot_content IS NOT NULL \
            LEFT JOIN {blob_ref_table} br_local \
              ON br_local.entity_id = input.file_id \
             AND br_local.version_id = input.version_id \
             AND br_local.snapshot_content IS NOT NULL \
-           LEFT JOIN {untracked_table} bru_global \
-             ON bru_global.schema_key = 'lix_binary_blob_ref' \
-            AND bru_global.entity_id = input.file_id \
+           LEFT JOIN {blob_ref_untracked_table} bru_global \
+             ON bru_global.entity_id = input.file_id \
             AND bru_global.version_id = '{global_version_id}' \
             AND bru_global.snapshot_content IS NOT NULL \
            LEFT JOIN {blob_ref_table} br_global \
@@ -1709,15 +1705,16 @@ async fn load_exact_live_file_prefetch_row(
            ON bbs.blob_hash = rf.{blob_hash_column} \
          WHERE rf.name IS NOT NULL \
          LIMIT 1",
+        file_descriptor_untracked_table = untracked_live_table_name("lix_file_descriptor"),
+        blob_ref_untracked_table = untracked_live_table_name("lix_binary_blob_ref"),
         descriptor_directory_expr = descriptor_directory_expr,
         descriptor_name_expr = descriptor_name_expr,
         descriptor_extension_expr = descriptor_extension_expr,
         descriptor_untracked_expr = descriptor_untracked_expr,
         blob_hash_expr = blob_hash_expr,
         blob_hash_column = LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN,
-        untracked_table = INTERNAL_STATE_UNTRACKED,
-        file_descriptor_table = LIVE_FILE_DESCRIPTOR_TABLE,
-        blob_ref_table = LIVE_BLOB_REF_TABLE,
+        file_descriptor_table = tracked_live_table_name("lix_file_descriptor"),
+        blob_ref_table = tracked_live_table_name("lix_binary_blob_ref"),
         global_version_id = escape_sql_string(GLOBAL_VERSION_ID),
     );
     let result = execute_prefetch_query(
@@ -1772,18 +1769,18 @@ async fn load_live_directory_path_by_id(
     version_id: &str,
     directory_id: &str,
 ) -> Result<Option<String>, LixError> {
-    let anchor_parent_expr = coalesced_json_field_sql(
+    let anchor_parent_expr = coalesced_live_column_sql(
         ["du_local", "d_local", "du_global", "d_global"],
         "parent_id",
     );
     let anchor_name_expr =
-        coalesced_json_field_sql(["du_local", "d_local", "du_global", "d_global"], "name");
-    let recursive_parent_expr = coalesced_json_field_sql(
+        coalesced_live_column_sql(["du_local", "d_local", "du_global", "d_global"], "name");
+    let recursive_parent_expr = coalesced_live_column_sql(
         ["rdu_local", "rd_local", "rdu_global", "rd_global"],
         "parent_id",
     );
     let recursive_name_expr =
-        coalesced_json_field_sql(["rdu_local", "rd_local", "rdu_global", "rd_global"], "name");
+        coalesced_live_column_sql(["rdu_local", "rd_local", "rdu_global", "rd_global"], "name");
     let sql = format!(
         "WITH RECURSIVE directory_path(version_id, id, parent_id, path, depth) AS (\
            SELECT \
@@ -1793,18 +1790,16 @@ async fn load_live_directory_path_by_id(
              '/' || {anchor_name_expr} || '/' AS path, \
              0 AS depth \
            FROM (SELECT $1 AS directory_id, $2 AS version_id) input \
-           LEFT JOIN {untracked_table} du_local \
-             ON du_local.schema_key = 'lix_directory_descriptor' \
-            AND du_local.entity_id = input.directory_id \
+           LEFT JOIN {directory_descriptor_untracked_table} du_local \
+             ON du_local.entity_id = input.directory_id \
             AND du_local.version_id = input.version_id \
             AND du_local.snapshot_content IS NOT NULL \
            LEFT JOIN {directory_descriptor_table} d_local \
              ON d_local.entity_id = input.directory_id \
             AND d_local.version_id = input.version_id \
             AND d_local.snapshot_content IS NOT NULL \
-           LEFT JOIN {untracked_table} du_global \
-             ON du_global.schema_key = 'lix_directory_descriptor' \
-            AND du_global.entity_id = input.directory_id \
+           LEFT JOIN {directory_descriptor_untracked_table} du_global \
+             ON du_global.entity_id = input.directory_id \
             AND du_global.version_id = '{global_version_id}' \
             AND du_global.snapshot_content IS NOT NULL \
            LEFT JOIN {directory_descriptor_table} d_global \
@@ -1820,18 +1815,16 @@ async fn load_live_directory_path_by_id(
              '/' || {recursive_name_expr} || dp.path AS path, \
              dp.depth + 1 \
            FROM directory_path dp \
-           LEFT JOIN {untracked_table} rdu_local \
-             ON rdu_local.schema_key = 'lix_directory_descriptor' \
-            AND rdu_local.entity_id = dp.parent_id \
+           LEFT JOIN {directory_descriptor_untracked_table} rdu_local \
+             ON rdu_local.entity_id = dp.parent_id \
             AND rdu_local.version_id = dp.version_id \
             AND rdu_local.snapshot_content IS NOT NULL \
            LEFT JOIN {directory_descriptor_table} rd_local \
              ON rd_local.entity_id = dp.parent_id \
             AND rd_local.version_id = dp.version_id \
             AND rd_local.snapshot_content IS NOT NULL \
-           LEFT JOIN {untracked_table} rdu_global \
-             ON rdu_global.schema_key = 'lix_directory_descriptor' \
-            AND rdu_global.entity_id = dp.parent_id \
+           LEFT JOIN {directory_descriptor_untracked_table} rdu_global \
+             ON rdu_global.entity_id = dp.parent_id \
             AND rdu_global.version_id = '{global_version_id}' \
             AND rdu_global.snapshot_content IS NOT NULL \
            LEFT JOIN {directory_descriptor_table} rd_global \
@@ -1851,8 +1844,9 @@ async fn load_live_directory_path_by_id(
         anchor_name_expr = anchor_name_expr,
         recursive_parent_expr = recursive_parent_expr,
         recursive_name_expr = recursive_name_expr,
-        untracked_table = INTERNAL_STATE_UNTRACKED,
-        directory_descriptor_table = LIVE_DIRECTORY_DESCRIPTOR_TABLE,
+        directory_descriptor_untracked_table =
+            untracked_live_table_name("lix_directory_descriptor"),
+        directory_descriptor_table = tracked_live_table_name("lix_directory_descriptor"),
         global_version_id = escape_sql_string(GLOBAL_VERSION_ID),
     );
     let result = execute_prefetch_query(
@@ -1872,19 +1866,14 @@ async fn load_live_directory_path_by_id(
         .and_then(value_as_text))
 }
 
-fn coalesced_json_field_sql(aliases: [&str; 4], field: &str) -> String {
+fn coalesced_live_column_sql(aliases: [&str; 4], column: &str) -> String {
     format!(
-        "COALESCE(\
-            lix_json_extract({a0}.snapshot_content, '{field}'), \
-            lix_json_extract({a1}.snapshot_content, '{field}'), \
-            lix_json_extract({a2}.snapshot_content, '{field}'), \
-            lix_json_extract({a3}.snapshot_content, '{field}')\
-         )",
+        "COALESCE({a0}.{column}, {a1}.{column}, {a2}.{column}, {a3}.{column})",
         a0 = aliases[0],
         a1 = aliases[1],
         a2 = aliases[2],
         a3 = aliases[3],
-        field = escape_sql_string(field),
+        column = column,
     )
 }
 

@@ -2,22 +2,27 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
-    parse_active_account_snapshot,
 };
 use crate::deterministic_mode::build_persist_sequence_highest_sql;
 use crate::functions::LixFunctionProvider;
+use crate::key_value::key_value_schema_key;
 use crate::schema::builtin::types::LixVersionRef;
+use crate::schema::live_layout::{
+    builtin_live_table_layout, live_column_name_for_property, untracked_live_table_name,
+    LiveTableLayout,
+};
+use crate::schema::registry::load_live_table_layout_in_transaction;
 use crate::sql::execution::runtime_effects::{
     build_binary_blob_fastcdc_write_program, BinaryBlobWriteInput,
 };
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
+use crate::sql::live_snapshot::live_snapshot_select_expr_for_schema;
 use crate::sql::public::planner::ir::LazyExactFileUpdate;
 use crate::state::live_state::{
     build_mark_live_state_ready_sql, ensure_live_state_ready_in_transaction, CanonicalWatermark,
 };
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
-#[cfg(test)]
 use crate::SqlDialect;
 use crate::{LixError, LixTransaction, QueryResult, Value};
 use async_trait::async_trait;
@@ -37,7 +42,6 @@ use super::types::{
 };
 
 const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
-const LIVE_UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
 const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
 const IDEMPOTENCY_KIND_EXACT: &str = "exact";
@@ -329,7 +333,7 @@ pub(crate) async fn create_commit(
             });
         global_version.parent_commit_ids = current_head.clone().into_iter().collect();
     }
-    let generated_commit = generate_commit(
+    let mut generated_commit = generate_commit(
         GenerateCommitArgs {
             timestamp: timestamp.clone(),
             active_accounts: preflight.active_accounts,
@@ -338,6 +342,12 @@ pub(crate) async fn create_commit(
         },
         || functions.uuid_v7(),
     )
+    .map_err(backend_error)?;
+    generated_commit.derived_apply_input.live_layouts = load_live_layouts_for_rows_in_transaction(
+        transaction,
+        &generated_commit.derived_apply_input.live_state_rows,
+    )
+    .await
     .map_err(backend_error)?;
     let committed_head = extract_committed_head_id(&generated_commit, &concrete_lane)?;
     let operational_apply_input = OperationalCommitApplyInput {
@@ -434,6 +444,28 @@ pub(crate) async fn create_commit(
     })
 }
 
+async fn load_live_layouts_for_rows_in_transaction(
+    transaction: &mut dyn LixTransaction,
+    rows: &[crate::state::commit::MaterializedStateRow],
+) -> Result<BTreeMap<String, LiveTableLayout>, LixError> {
+    let mut layouts = BTreeMap::new();
+    let schema_keys = rows
+        .iter()
+        .map(|row| row.schema_key.clone())
+        .collect::<BTreeSet<_>>();
+    for schema_key in schema_keys {
+        if let Some(layout) = builtin_live_table_layout(&schema_key)? {
+            layouts.insert(schema_key, layout);
+            continue;
+        }
+        layouts.insert(
+            schema_key.clone(),
+            load_live_table_layout_in_transaction(transaction, &schema_key).await?,
+        );
+    }
+    Ok(layouts)
+}
+
 fn build_observe_tick_insert_sql(writer_key: Option<&str>) -> String {
     match writer_key {
         Some(writer_key) => format!(
@@ -459,7 +491,6 @@ struct TransactionCommitExecutor<'a> {
 
 #[async_trait(?Send)]
 impl CommitQueryExecutor for TransactionCommitExecutor<'_> {
-    #[cfg(test)]
     fn dialect(&self) -> SqlDialect {
         self.transaction.dialect()
     }
@@ -809,25 +840,43 @@ async fn load_create_commit_existing_replay(
 async fn load_create_commit_deterministic_sequence_start(
     executor: &mut dyn CommitQueryExecutor,
 ) -> Result<Option<i64>, CreateCommitError> {
+    let layout = builtin_live_table_layout(key_value_schema_key())
+        .map_err(backend_error)?
+        .ok_or_else(|| {
+            backend_error(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "builtin key-value schema must compile to a live layout",
+            ))
+        })?;
+    let value_column = live_column_name_for_property(&layout, "value").ok_or_else(|| {
+        backend_error(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "key-value live layout is missing value",
+        ))
+    })?;
     let sql = format!(
-        "SELECT snapshot_content \
+        "SELECT {value_column} \
          FROM {table_name} \
-         WHERE schema_key = 'lix_key_value' \
+         WHERE file_id = '{file_id}' \
            AND entity_id = 'lix_deterministic_sequence_number' \
            AND version_id = '{version_id}' \
-           AND snapshot_content IS NOT NULL \
+           AND {value_column} IS NOT NULL \
          ORDER BY updated_at DESC \
          LIMIT 1",
-        table_name = LIVE_UNTRACKED_TABLE,
+        value_column = quote_ident(value_column),
+        table_name = quote_ident(&untracked_live_table_name(key_value_schema_key())),
+        file_id = FILESYSTEM_DESCRIPTOR_FILE_ID,
         version_id = GLOBAL_VERSION_ID,
     );
     let result = executor.execute(&sql, &[]).await.map_err(backend_error)?;
-    if let Some(snapshot_content) = result
+    if let Some(value_json) = result
         .rows
         .first()
         .and_then(|row| row.first())
         .and_then(value_as_text)
     {
+        let snapshot_content =
+            format!("{{\"key\":\"lix_deterministic_sequence_number\",\"value\":{value_json}}}");
         return parse_deterministic_sequence_snapshot(&snapshot_content).map(Some);
     }
 
@@ -864,25 +913,38 @@ async fn load_create_commit_deterministic_sequence_start(
 async fn load_create_commit_active_accounts(
     executor: &mut dyn CommitQueryExecutor,
 ) -> Result<Vec<String>, CreateCommitError> {
+    let layout = builtin_live_table_layout(active_account_schema_key())
+        .map_err(backend_error)?
+        .ok_or_else(|| {
+            backend_error(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "builtin active account schema must compile to a live layout",
+            ))
+        })?;
+    let account_id_column =
+        live_column_name_for_property(&layout, "account_id").ok_or_else(|| {
+            backend_error(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "active account live layout is missing account_id",
+            ))
+        })?;
     let sql = format!(
-        "SELECT snapshot_content \
+        "SELECT {account_id_column} \
          FROM {table_name} \
-         WHERE schema_key = '{schema_key}' \
-           AND file_id = '{file_id}' \
+         WHERE file_id = '{file_id}' \
            AND version_id = '{version_id}' \
-           AND snapshot_content IS NOT NULL",
-        table_name = LIVE_UNTRACKED_TABLE,
-        schema_key = escape_sql_string(active_account_schema_key()),
+           AND {account_id_column} IS NOT NULL",
+        account_id_column = quote_ident(account_id_column),
+        table_name = quote_ident(&untracked_live_table_name(active_account_schema_key())),
         file_id = escape_sql_string(active_account_file_id()),
         version_id = escape_sql_string(active_account_storage_version_id()),
     );
     let result = executor.execute(&sql, &[]).await.map_err(backend_error)?;
     let mut active_accounts = BTreeSet::new();
     for row in result.rows {
-        let Some(snapshot_content) = row.first().and_then(value_as_text) else {
+        let Some(account_id) = row.first().and_then(value_as_text) else {
             continue;
         };
-        let account_id = parse_active_account_snapshot(&snapshot_content).map_err(backend_error)?;
         active_accounts.insert(account_id);
     }
     Ok(active_accounts.into_iter().collect())
@@ -937,19 +999,24 @@ async fn load_untracked_file_descriptor(
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<CreateCommitPreflightFileDescriptor>, CreateCommitError> {
+    let snapshot_expr =
+        live_snapshot_select_expr_for_schema(FILESYSTEM_FILE_SCHEMA_KEY, executor.dialect(), None)
+            .map_err(|error| CreateCommitError {
+                kind: CreateCommitErrorKind::Internal,
+                message: error.description,
+            })?;
     let sql = format!(
-        "SELECT snapshot_content, metadata \
+        "SELECT {snapshot_expr} AS snapshot_content, metadata \
          FROM {table_name} \
          WHERE entity_id = '{entity_id}' \
-           AND schema_key = '{schema_key}' \
            AND file_id = '{file_id}' \
            AND version_id = '{version_id}' \
-           AND snapshot_content IS NOT NULL \
+           AND {snapshot_expr} IS NOT NULL \
          ORDER BY updated_at DESC \
          LIMIT 1",
-        table_name = LIVE_UNTRACKED_TABLE,
+        snapshot_expr = snapshot_expr,
+        table_name = quote_ident(&untracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY)),
         entity_id = escape_sql_string(file_id),
-        schema_key = escape_sql_string(FILESYSTEM_FILE_SCHEMA_KEY),
         file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
         version_id = escape_sql_string(version_id),
     );
@@ -1241,6 +1308,10 @@ fn value_as_text(value: &Value) -> Option<String> {
     }
 }
 
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -1253,11 +1324,66 @@ mod tests {
         CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
     };
     use crate::functions::LixFunctionProvider;
+    use crate::schema::live_layout::{builtin_live_table_layout, normalized_live_column_values};
     use crate::sql::public::planner::ir::{LazyExactFileDataUpdate, LazyExactFileUpdate};
     use crate::version::GLOBAL_VERSION_ID;
     use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
+    use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
     use std::collections::HashMap;
+
+    fn fake_version_ref_live_row(version_id: &str, commit_id: &str) -> Vec<Value> {
+        vec![
+            Value::Text(version_id.to_string()),
+            Value::Text(crate::version::version_ref_schema_key().to_string()),
+            Value::Text(crate::version::version_ref_schema_version().to_string()),
+            Value::Text(crate::version::version_ref_file_id().to_string()),
+            Value::Text(crate::version::version_ref_storage_version_id().to_string()),
+            Value::Text(crate::version::version_ref_plugin_key().to_string()),
+            Value::Null,
+            Value::Text(format!("pointer-change-{version_id}")),
+            Value::Text(commit_id.to_string()),
+            Value::Text(version_id.to_string()),
+        ]
+    }
+
+    fn fake_file_descriptor_live_row() -> Vec<Value> {
+        let snapshot = serde_json::json!({
+            "id": "file-1",
+            "directory_id": serde_json::Value::Null,
+            "name": "contract",
+            "extension": "txt",
+            "hidden": false,
+            "metadata": serde_json::Value::Null,
+        })
+        .to_string();
+        let layout = builtin_live_table_layout("lix_file_descriptor")
+            .expect("builtin layout should load")
+            .expect("file descriptor layout should exist");
+        let normalized = normalized_live_column_values(&layout, Some(&snapshot))
+            .expect("snapshot should normalize");
+        let mut row = vec![
+            Value::Text("file-1".to_string()),
+            Value::Text("lix_file_descriptor".to_string()),
+            Value::Text("1".to_string()),
+            Value::Text("lix".to_string()),
+            Value::Text("version-a".to_string()),
+            Value::Text("lix".to_string()),
+            Value::Null,
+            Value::Text("change-file-1".to_string()),
+        ];
+        for column in &layout.columns {
+            row.push(
+                normalized
+                    .get(&column.column_name)
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+        }
+        row
+    }
 
     struct CountingFunctionProvider {
         next_uuid: usize,
@@ -1319,47 +1445,15 @@ mod tests {
                 });
             }
 
-            if sql.contains("FROM lix_internal_live_v1_lix_version_ref") {
+            if query_targets_table(sql, "lix_internal_live_v1_lix_version_ref") {
                 let rows = self
                     .version_heads
                     .iter()
-                    .filter(|(version_id, _)| {
-                        sql.contains(&format!("entity_id = '{}'", version_id))
-                    })
-                    .map(|(version_id, commit_id)| {
-                        vec![Value::Text(crate::version::version_ref_snapshot_content(
-                            version_id, commit_id,
-                        ))]
-                    })
+                    .filter(|(version_id, _)| query_has_text_equality(sql, "entity_id", version_id))
+                    .map(|(version_id, commit_id)| fake_version_ref_live_row(version_id, commit_id))
                     .collect::<Vec<_>>();
                 return Ok(QueryResult {
                     rows,
-                    columns: vec!["snapshot_content".to_string()],
-                });
-            }
-            if sql.contains("FROM \"lix_internal_live_v1_lix_file_descriptor\"") {
-                return Ok(QueryResult {
-                    rows: vec![vec![
-                        Value::Text("file-1".to_string()),
-                        Value::Text("lix_file_descriptor".to_string()),
-                        Value::Text("1".to_string()),
-                        Value::Text("lix".to_string()),
-                        Value::Text("version-a".to_string()),
-                        Value::Text("lix".to_string()),
-                        Value::Text(
-                            serde_json::json!({
-                                "id": "file-1",
-                                "directory_id": serde_json::Value::Null,
-                                "name": "contract",
-                                "extension": "txt",
-                                "hidden": false,
-                                "metadata": serde_json::Value::Null,
-                            })
-                            .to_string(),
-                        ),
-                        Value::Null,
-                        Value::Text("change-file-1".to_string()),
-                    ]],
                     columns: vec![
                         "entity_id".to_string(),
                         "schema_key".to_string(),
@@ -1367,9 +1461,31 @@ mod tests {
                         "file_id".to_string(),
                         "version_id".to_string(),
                         "plugin_key".to_string(),
-                        "snapshot_content".to_string(),
                         "metadata".to_string(),
                         "change_id".to_string(),
+                        "commit_id".to_string(),
+                        "id".to_string(),
+                    ],
+                });
+            }
+            if query_targets_table(sql, "lix_internal_live_v1_lix_file_descriptor") {
+                return Ok(QueryResult {
+                    rows: vec![fake_file_descriptor_live_row()],
+                    columns: vec![
+                        "entity_id".to_string(),
+                        "schema_key".to_string(),
+                        "schema_version".to_string(),
+                        "file_id".to_string(),
+                        "version_id".to_string(),
+                        "plugin_key".to_string(),
+                        "metadata".to_string(),
+                        "change_id".to_string(),
+                        "directory_id".to_string(),
+                        "extension".to_string(),
+                        "hidden".to_string(),
+                        "id".to_string(),
+                        "metadata_json".to_string(),
+                        "name".to_string(),
                     ],
                 });
             }
@@ -1968,5 +2084,116 @@ mod tests {
             remaining = &remaining[end + 1..];
         }
         None
+    }
+
+    fn query_targets_table(sql: &str, table_name: &str) -> bool {
+        let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
+            return false;
+        };
+        statements
+            .iter()
+            .any(|statement| statement_targets_table(statement, table_name))
+    }
+
+    fn statement_targets_table(statement: &Statement, table_name: &str) -> bool {
+        match statement {
+            Statement::Query(query) => query_targets_table_name(query, table_name),
+            _ => false,
+        }
+    }
+
+    fn query_targets_table_name(query: &Query, table_name: &str) -> bool {
+        match query.body.as_ref() {
+            SetExpr::Select(select) => select.from.iter().any(|table_with_joins| {
+                table_factor_targets_table(&table_with_joins.relation, table_name)
+                    || table_with_joins
+                        .joins
+                        .iter()
+                        .any(|join| table_factor_targets_table(&join.relation, table_name))
+            }),
+            SetExpr::Query(query) => query_targets_table_name(query, table_name),
+            _ => false,
+        }
+    }
+
+    fn table_factor_targets_table(table_factor: &TableFactor, table_name: &str) -> bool {
+        match table_factor {
+            TableFactor::Table { name, .. } => name
+                .0
+                .last()
+                .and_then(|part| part.as_ident())
+                .map(|ident| ident.value.eq_ignore_ascii_case(table_name))
+                .unwrap_or(false),
+            TableFactor::Derived { subquery, .. } => query_targets_table_name(subquery, table_name),
+            _ => false,
+        }
+    }
+
+    fn query_has_text_equality(sql: &str, column_name: &str, expected: &str) -> bool {
+        let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
+            return false;
+        };
+        statements
+            .iter()
+            .any(|statement| statement_has_text_equality(statement, column_name, expected))
+    }
+
+    fn statement_has_text_equality(
+        statement: &Statement,
+        column_name: &str,
+        expected: &str,
+    ) -> bool {
+        match statement {
+            Statement::Query(query) => query_has_where_text_equality(query, column_name, expected),
+            _ => false,
+        }
+    }
+
+    fn query_has_where_text_equality(query: &Query, column_name: &str, expected: &str) -> bool {
+        match query.body.as_ref() {
+            SetExpr::Select(select) => select
+                .selection
+                .as_ref()
+                .is_some_and(|expr| expr_has_text_equality(expr, column_name, expected)),
+            SetExpr::Query(query) => query_has_where_text_equality(query, column_name, expected),
+            _ => false,
+        }
+    }
+
+    fn expr_has_text_equality(expr: &Expr, column_name: &str, expected: &str) -> bool {
+        match expr {
+            Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => {
+                expr_identifier_name(left)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+                    && expr_single_quoted_text(right).is_some_and(|value| value == expected)
+                    || expr_identifier_name(right)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+                        && expr_single_quoted_text(left).is_some_and(|value| value == expected)
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                expr_has_text_equality(left, column_name, expected)
+                    || expr_has_text_equality(right, column_name, expected)
+            }
+            Expr::Nested(inner) => expr_has_text_equality(inner, column_name, expected),
+            _ => false,
+        }
+    }
+
+    fn expr_identifier_name(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Identifier(ident) => Some(ident.value.as_str()),
+            Expr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.as_str()),
+            _ => None,
+        }
+    }
+
+    fn expr_single_quoted_text(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Value(sqlparser::ast::ValueWithSpan {
+                value: sqlparser::ast::Value::SingleQuotedString(text),
+                ..
+            }) => Some(text.as_str()),
+            _ => None,
+        }
     }
 }

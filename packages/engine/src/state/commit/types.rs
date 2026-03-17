@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::schema::live_layout::LiveTableLayout;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProposedDomainChange {
     pub(crate) entity_id: String,
@@ -84,6 +86,7 @@ pub struct CanonicalCommitOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedCommitApplyInput {
     pub live_state_rows: Vec<MaterializedStateRow>,
+    pub live_layouts: BTreeMap<String, LiveTableLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

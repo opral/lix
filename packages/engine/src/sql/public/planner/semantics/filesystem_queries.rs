@@ -3,15 +3,13 @@ use crate::filesystem::live_projection::{
     FilesystemProjectionScope,
 };
 use crate::filesystem::path::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
+use crate::schema::live_layout::{tracked_live_table_name, untracked_live_table_name};
 use crate::sql::common::ast::{lower_statement, parse_sql_statements};
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, SqlDialect, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
-const LIVE_FILE_DESCRIPTOR_TABLE: &str = "lix_internal_live_v1_lix_file_descriptor";
-const LIVE_DIRECTORY_DESCRIPTOR_TABLE: &str = "lix_internal_live_v1_lix_directory_descriptor";
-const LIVE_UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
 const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
 const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
 const FILESYSTEM_DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -326,8 +324,10 @@ pub(crate) async fn load_directory_rows_under_path(
          WHERE lixcol_version_id = '{version_id}' \
            AND substr(path, 1, {prefix_length}) = '{root_path}' \
          ORDER BY path ASC, id ASC",
-        projection_sql =
-            build_filesystem_directory_projection_sql(FilesystemProjectionScope::ExplicitVersion),
+        projection_sql = build_filesystem_directory_projection_sql(
+            FilesystemProjectionScope::ExplicitVersion,
+            backend.dialect(),
+        ),
         version_id = escape_sql_string(version_id),
         prefix_length = prefix_length,
         root_path = escape_sql_string(root_path),
@@ -347,8 +347,11 @@ pub(crate) async fn load_file_rows_under_path(
          WHERE lixcol_version_id = '{version_id}' \
            AND substr(path, 1, {prefix_length}) = '{root_path}' \
          ORDER BY path ASC, id ASC",
-        projection_sql =
-            build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, false),
+        projection_sql = build_filesystem_file_projection_sql(
+            FilesystemProjectionScope::ExplicitVersion,
+            false,
+            backend.dialect(),
+        ),
         version_id = escape_sql_string(version_id),
         prefix_length = prefix_length,
         root_path = escape_sql_string(root_path),
@@ -372,7 +375,7 @@ pub(crate) async fn load_directory_rows_by_paths(
          WHERE lixcol_version_id = '{version_id}' \
            AND path IN ({path_list}) \
          ORDER BY path ASC, id ASC",
-        projection_sql = build_filesystem_directory_projection_sql(scope),
+        projection_sql = build_filesystem_directory_projection_sql(scope, backend.dialect()),
         version_id = escape_sql_string(version_id),
         path_list = path_list,
     );
@@ -395,7 +398,7 @@ pub(crate) async fn load_file_rows_by_paths(
          WHERE lixcol_version_id = '{version_id}' \
            AND path IN ({path_list}) \
          ORDER BY path ASC, id ASC",
-        projection_sql = build_filesystem_file_projection_sql(scope, false),
+        projection_sql = build_filesystem_file_projection_sql(scope, false, backend.dialect()),
         version_id = escape_sql_string(version_id),
         path_list = path_list,
     );
@@ -520,138 +523,58 @@ pub(crate) async fn load_directory_descriptors_by_parent_name_pairs(
     backend: &dyn LixBackend,
     version_id: &str,
     pairs: &BTreeSet<(Option<String>, String)>,
-    _scope: FilesystemProjectionScope,
+    scope: FilesystemProjectionScope,
 ) -> Result<Vec<EffectiveDescriptorRow>, FilesystemQueryError> {
     if pairs.is_empty() {
         return Ok(Vec::new());
     }
-
-    let local_rows = load_visible_descriptor_rows_for_version(
+    load_scoped_descriptor_rows_for_keys(
         backend,
-        LIVE_DIRECTORY_DESCRIPTOR_TABLE,
+        &tracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
         FILESYSTEM_DIRECTORY_SCHEMA_KEY,
-        &directory_pair_predicate(backend.dialect(), pairs),
+        &visible_directory_descriptor_rows_for_pairs_sql(backend.dialect(), version_id, pairs),
+        &visible_directory_descriptor_rows_for_pairs_sql(
+            backend.dialect(),
+            GLOBAL_VERSION_ID,
+            pairs,
+        ),
         version_id,
+        scope,
+        |row| (row.parent_id.clone(), row.name.clone()),
     )
-    .await?;
-    let mut rows_by_key = BTreeMap::new();
-    for row in local_rows {
-        rows_by_key
-            .entry((row.parent_id.clone(), row.name.clone()))
-            .or_insert(row);
-    }
-
-    if version_id == GLOBAL_VERSION_ID || rows_by_key.len() == pairs.len() {
-        return Ok(rows_by_key.into_values().collect());
-    }
-
-    let unresolved = pairs
-        .iter()
-        .filter(|pair| !rows_by_key.contains_key(*pair))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let global_rows = load_visible_descriptor_rows_for_version(
-        backend,
-        LIVE_DIRECTORY_DESCRIPTOR_TABLE,
-        FILESYSTEM_DIRECTORY_SCHEMA_KEY,
-        &directory_pair_predicate(backend.dialect(), &unresolved),
-        GLOBAL_VERSION_ID,
-    )
-    .await?;
-    let shadowed = entity_ids_with_version_tombstones(
-        backend,
-        LIVE_DIRECTORY_DESCRIPTOR_TABLE,
-        FILESYSTEM_DIRECTORY_SCHEMA_KEY,
-        version_id,
-        &global_rows
-            .iter()
-            .map(|row| row.id.clone())
-            .collect::<BTreeSet<_>>(),
-    )
-    .await?;
-    for row in global_rows {
-        if shadowed.contains(&row.id) {
-            continue;
-        }
-        rows_by_key
-            .entry((row.parent_id.clone(), row.name.clone()))
-            .or_insert(row);
-    }
-
-    Ok(rows_by_key.into_values().collect())
+    .await
 }
 
 pub(crate) async fn load_file_descriptors_by_directory_name_extension_triplets(
     backend: &dyn LixBackend,
     version_id: &str,
     triplets: &BTreeSet<(Option<String>, String, Option<String>)>,
-    _scope: FilesystemProjectionScope,
+    scope: FilesystemProjectionScope,
 ) -> Result<Vec<EffectiveDescriptorRow>, FilesystemQueryError> {
     if triplets.is_empty() {
         return Ok(Vec::new());
     }
-
-    let local_rows = load_visible_descriptor_rows_for_version(
+    load_scoped_descriptor_rows_for_keys(
         backend,
-        LIVE_FILE_DESCRIPTOR_TABLE,
+        &tracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY),
         FILESYSTEM_FILE_SCHEMA_KEY,
-        &file_triplet_predicate(backend.dialect(), triplets),
+        &visible_file_descriptor_rows_for_triplets_sql(backend.dialect(), version_id, triplets),
+        &visible_file_descriptor_rows_for_triplets_sql(
+            backend.dialect(),
+            GLOBAL_VERSION_ID,
+            triplets,
+        ),
         version_id,
-    )
-    .await?;
-    let mut rows_by_key = BTreeMap::new();
-    for row in local_rows {
-        rows_by_key
-            .entry((
+        scope,
+        |row| {
+            (
                 row.directory_id.clone(),
                 row.name.clone(),
                 row.extension.clone().filter(|value| !value.is_empty()),
-            ))
-            .or_insert(row);
-    }
-
-    if version_id == GLOBAL_VERSION_ID || rows_by_key.len() == triplets.len() {
-        return Ok(rows_by_key.into_values().collect());
-    }
-
-    let unresolved = triplets
-        .iter()
-        .filter(|triplet| !rows_by_key.contains_key(*triplet))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let global_rows = load_visible_descriptor_rows_for_version(
-        backend,
-        LIVE_FILE_DESCRIPTOR_TABLE,
-        FILESYSTEM_FILE_SCHEMA_KEY,
-        &file_triplet_predicate(backend.dialect(), &unresolved),
-        GLOBAL_VERSION_ID,
+            )
+        },
     )
-    .await?;
-    let shadowed = entity_ids_with_version_tombstones(
-        backend,
-        LIVE_FILE_DESCRIPTOR_TABLE,
-        FILESYSTEM_FILE_SCHEMA_KEY,
-        version_id,
-        &global_rows
-            .iter()
-            .map(|row| row.id.clone())
-            .collect::<BTreeSet<_>>(),
-    )
-    .await?;
-    for row in global_rows {
-        if shadowed.contains(&row.id) {
-            continue;
-        }
-        rows_by_key
-            .entry((
-                row.directory_id.clone(),
-                row.name.clone(),
-                row.extension.clone().filter(|value| !value.is_empty()),
-            ))
-            .or_insert(row);
-    }
-
-    Ok(rows_by_key.into_values().collect())
+    .await
 }
 
 async fn load_directory_descriptor_by_id(
@@ -662,6 +585,7 @@ async fn load_directory_descriptor_by_id(
 ) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
     let sql = effective_directory_descriptor_sql(
         backend.dialect(),
+        &format!("entity_id = '{}'", escape_sql_string(directory_id)),
         &format!("entity_id = '{}'", escape_sql_string(directory_id)),
         version_id,
         scope,
@@ -676,27 +600,22 @@ async fn load_directory_descriptor_by_parent_and_name(
     name: &str,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
-    let parent_predicate = match parent_id {
-        Some(parent_id) => format!(
-            "{} = '{}'",
-            json_text_extract_expr(backend.dialect(), "snapshot_content", "parent_id"),
-            escape_sql_string(parent_id)
-        ),
-        None => format!(
-            "{} IS NULL",
-            json_text_extract_expr(backend.dialect(), "snapshot_content", "parent_id")
-        ),
+    let parent_predicate_tracked = match parent_id {
+        Some(parent_id) => format!("parent_id = '{}'", escape_sql_string(parent_id)),
+        None => "parent_id IS NULL".to_string(),
     };
-    let name_predicate = format!(
-        "{} = '{}'",
-        json_text_extract_expr(backend.dialect(), "snapshot_content", "name"),
-        escape_sql_string(name)
-    );
+    let parent_predicate_untracked = match parent_id {
+        Some(parent_id) => format!("parent_id = '{}'", escape_sql_string(parent_id)),
+        None => "parent_id IS NULL".to_string(),
+    };
+    let name_predicate_tracked = format!("name = '{}'", escape_sql_string(name));
+    let name_predicate_untracked = format!("name = '{}'", escape_sql_string(name));
     load_scoped_descriptor_row(
         backend,
-        LIVE_DIRECTORY_DESCRIPTOR_TABLE,
+        &tracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
         FILESYSTEM_DIRECTORY_SCHEMA_KEY,
-        &format!("{parent_predicate} AND {name_predicate}"),
+        &format!("{parent_predicate_tracked} AND {name_predicate_tracked}"),
+        &format!("{parent_predicate_untracked} AND {name_predicate_untracked}"),
         version_id,
         scope,
     )
@@ -712,6 +631,7 @@ async fn load_file_descriptor_by_id(
     let sql = effective_file_descriptor_sql(
         backend.dialect(),
         &format!("entity_id = '{}'", escape_sql_string(file_id)),
+        &format!("entity_id = '{}'", escape_sql_string(file_id)),
         version_id,
         scope,
     );
@@ -726,38 +646,34 @@ async fn load_file_descriptor_by_path_components(
     extension: Option<&str>,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
-    let directory_predicate = match directory_id {
-        Some(directory_id) => format!(
-            "{} = '{}'",
-            json_text_extract_expr(backend.dialect(), "snapshot_content", "directory_id"),
-            escape_sql_string(directory_id)
-        ),
-        None => format!(
-            "{} IS NULL",
-            json_text_extract_expr(backend.dialect(), "snapshot_content", "directory_id")
-        ),
+    let directory_predicate_tracked = match directory_id {
+        Some(directory_id) => format!("directory_id = '{}'", escape_sql_string(directory_id)),
+        None => "directory_id IS NULL".to_string(),
     };
-    let name_predicate = format!(
-        "{} = '{}'",
-        json_text_extract_expr(backend.dialect(), "snapshot_content", "name"),
-        escape_sql_string(name)
-    );
-    let extension_predicate = match extension {
-        Some(extension) => format!(
-            "{} = '{}'",
-            json_text_extract_expr(backend.dialect(), "snapshot_content", "extension"),
-            escape_sql_string(extension)
-        ),
-        None => format!(
-            "({expr} IS NULL OR {expr} = '')",
-            expr = json_text_extract_expr(backend.dialect(), "snapshot_content", "extension")
-        ),
+    let directory_predicate_untracked = match directory_id {
+        Some(directory_id) => format!("directory_id = '{}'", escape_sql_string(directory_id)),
+        None => "directory_id IS NULL".to_string(),
+    };
+    let name_predicate_tracked = format!("name = '{}'", escape_sql_string(name));
+    let name_predicate_untracked = format!("name = '{}'", escape_sql_string(name));
+    let extension_predicate_tracked = match extension {
+        Some(extension) => format!("extension = '{}'", escape_sql_string(extension)),
+        None => "(extension IS NULL OR extension = '')".to_string(),
+    };
+    let extension_predicate_untracked = match extension {
+        Some(extension) => format!("extension = '{}'", escape_sql_string(extension)),
+        None => "(extension IS NULL OR extension = '')".to_string(),
     };
     load_scoped_descriptor_row(
         backend,
-        LIVE_FILE_DESCRIPTOR_TABLE,
+        &tracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY),
         FILESYSTEM_FILE_SCHEMA_KEY,
-        &format!("{directory_predicate} AND {name_predicate} AND {extension_predicate}"),
+        &format!(
+            "{directory_predicate_tracked} AND {name_predicate_tracked} AND {extension_predicate_tracked}"
+        ),
+        &format!(
+            "{directory_predicate_untracked} AND {name_predicate_untracked} AND {extension_predicate_untracked}"
+        ),
         version_id,
         scope,
     )
@@ -766,15 +682,17 @@ async fn load_file_descriptor_by_path_components(
 
 fn effective_directory_descriptor_sql(
     dialect: SqlDialect,
-    base_predicate: &str,
+    tracked_base_predicate: &str,
+    untracked_base_predicate: &str,
     version_id: &str,
     scope: FilesystemProjectionScope,
 ) -> String {
     effective_descriptor_sql(
         dialect,
-        LIVE_DIRECTORY_DESCRIPTOR_TABLE,
+        &tracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
         FILESYSTEM_DIRECTORY_SCHEMA_KEY,
-        base_predicate,
+        tracked_base_predicate,
+        untracked_base_predicate,
         version_id,
         scope,
     )
@@ -782,15 +700,17 @@ fn effective_directory_descriptor_sql(
 
 fn effective_file_descriptor_sql(
     dialect: SqlDialect,
-    base_predicate: &str,
+    tracked_base_predicate: &str,
+    untracked_base_predicate: &str,
     version_id: &str,
     scope: FilesystemProjectionScope,
 ) -> String {
     effective_descriptor_sql(
         dialect,
-        LIVE_FILE_DESCRIPTOR_TABLE,
+        &tracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY),
         FILESYSTEM_FILE_SCHEMA_KEY,
-        base_predicate,
+        tracked_base_predicate,
+        untracked_base_predicate,
         version_id,
         scope,
     )
@@ -800,53 +720,92 @@ fn effective_descriptor_sql(
     _dialect: SqlDialect,
     tracked_table: &str,
     schema_key: &str,
-    base_predicate: &str,
+    tracked_base_predicate: &str,
+    untracked_base_predicate: &str,
     version_id: &str,
     _scope: FilesystemProjectionScope,
 ) -> String {
     let tracked_base = format!(
-        "file_id = '{file_id}' AND {base_predicate}",
+        "file_id = '{file_id}' AND {tracked_base_predicate}",
         file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
-        base_predicate = base_predicate,
+        tracked_base_predicate = tracked_base_predicate,
     );
-    let untracked_base = format!(
-        "schema_key = '{schema_key}' AND file_id = '{file_id}' AND {base_predicate}",
-        schema_key = escape_sql_string(schema_key),
-        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
-        base_predicate = base_predicate,
-    );
+    let untracked_table = quote_ident(&untracked_live_table_name(schema_key));
+    let tracked_parent_expr = normalized_descriptor_select_expr(schema_key, "parent_id");
+    let tracked_directory_expr = normalized_descriptor_select_expr(schema_key, "directory_id");
+    let tracked_name_expr = normalized_descriptor_select_expr(schema_key, "name");
+    let tracked_extension_expr = normalized_descriptor_select_expr(schema_key, "extension");
+    let tracked_hidden_expr = normalized_hidden_select_expr(schema_key);
+    let untracked_parent_expr = normalized_descriptor_select_expr(schema_key, "parent_id");
+    let untracked_directory_expr = normalized_descriptor_select_expr(schema_key, "directory_id");
+    let untracked_name_expr = normalized_descriptor_select_expr(schema_key, "name");
+    let untracked_extension_expr = normalized_descriptor_select_expr(schema_key, "extension");
+    let untracked_hidden_expr = normalized_hidden_select_expr(schema_key);
     format!(
-        "SELECT entity_id, snapshot_content, metadata, NULL AS change_id, \
-                CASE WHEN snapshot_content IS NULL THEN 1 ELSE 0 END AS is_tombstone, \
+        "SELECT entity_id, \
+                {untracked_parent_expr} AS parent_id, \
+                {untracked_directory_expr} AS directory_id, \
+                {untracked_name_expr} AS name, \
+                {untracked_extension_expr} AS extension, \
+                {untracked_hidden_expr} AS hidden, \
+                metadata, NULL AS change_id, 0 AS is_tombstone, \
                 1 AS precedence, 1 AS untracked \
          FROM {untracked_table} \
          WHERE version_id = '{version_id}' \
-           AND {untracked_base} \
+           AND file_id = '{file_id}' AND {untracked_base_predicate} \
          UNION ALL \
-         SELECT entity_id, snapshot_content, metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
+         SELECT entity_id, \
+                {tracked_parent_expr} AS parent_id, \
+                {tracked_directory_expr} AS directory_id, \
+                {tracked_name_expr} AS name, \
+                {tracked_extension_expr} AS extension, \
+                {tracked_hidden_expr} AS hidden, \
+                metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
          FROM {tracked_table} \
          WHERE version_id = '{version_id}' \
            AND {tracked_base} \
          UNION ALL \
-         SELECT entity_id, snapshot_content, metadata, NULL AS change_id, \
-                CASE WHEN snapshot_content IS NULL THEN 1 ELSE 0 END AS is_tombstone, \
+         SELECT entity_id, \
+                {untracked_parent_expr} AS parent_id, \
+                {untracked_directory_expr} AS directory_id, \
+                {untracked_name_expr} AS name, \
+                {untracked_extension_expr} AS extension, \
+                {untracked_hidden_expr} AS hidden, \
+                metadata, NULL AS change_id, 0 AS is_tombstone, \
                 3 AS precedence, 1 AS untracked \
          FROM {untracked_table} \
          WHERE version_id = '{global_version_id}' \
-           AND {untracked_base} \
+           AND file_id = '{file_id}' AND {untracked_base_predicate} \
          UNION ALL \
-         SELECT entity_id, snapshot_content, metadata, change_id, is_tombstone, 4 AS precedence, 0 AS untracked \
+         SELECT entity_id, \
+                {tracked_parent_expr} AS parent_id, \
+                {tracked_directory_expr} AS directory_id, \
+                {tracked_name_expr} AS name, \
+                {tracked_extension_expr} AS extension, \
+                {tracked_hidden_expr} AS hidden, \
+                metadata, change_id, is_tombstone, 4 AS precedence, 0 AS untracked \
          FROM {tracked_table} \
          WHERE version_id = '{global_version_id}' \
            AND {tracked_base} \
          ORDER BY precedence ASC \
          LIMIT 1",
-        untracked_table = LIVE_UNTRACKED_TABLE,
+        untracked_table = untracked_table,
         tracked_table = tracked_table,
         version_id = escape_sql_string(version_id),
         global_version_id = escape_sql_string(GLOBAL_VERSION_ID),
+        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
         tracked_base = tracked_base,
-        untracked_base = untracked_base,
+        untracked_base_predicate = untracked_base_predicate,
+        untracked_parent_expr = untracked_parent_expr,
+        untracked_directory_expr = untracked_directory_expr,
+        untracked_name_expr = untracked_name_expr,
+        untracked_extension_expr = untracked_extension_expr,
+        untracked_hidden_expr = untracked_hidden_expr,
+        tracked_parent_expr = tracked_parent_expr,
+        tracked_directory_expr = tracked_directory_expr,
+        tracked_name_expr = tracked_name_expr,
+        tracked_extension_expr = tracked_extension_expr,
+        tracked_hidden_expr = tracked_hidden_expr,
     )
 }
 
@@ -854,7 +813,8 @@ async fn load_scoped_descriptor_row(
     backend: &dyn LixBackend,
     tracked_table: &str,
     schema_key: &str,
-    base_predicate: &str,
+    tracked_base_predicate: &str,
+    untracked_base_predicate: &str,
     version_id: &str,
     _scope: FilesystemProjectionScope,
 ) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
@@ -862,7 +822,8 @@ async fn load_scoped_descriptor_row(
         backend,
         tracked_table,
         schema_key,
-        base_predicate,
+        tracked_base_predicate,
+        untracked_base_predicate,
         version_id,
     )
     .await?
@@ -878,7 +839,8 @@ async fn load_scoped_descriptor_row(
         backend,
         tracked_table,
         schema_key,
-        base_predicate,
+        tracked_base_predicate,
+        untracked_base_predicate,
         GLOBAL_VERSION_ID,
     )
     .await?
@@ -901,14 +863,281 @@ async fn load_scoped_descriptor_row(
     Ok(Some(global_row))
 }
 
+async fn load_scoped_descriptor_rows_for_keys<K, F>(
+    backend: &dyn LixBackend,
+    tracked_table: &str,
+    schema_key: &str,
+    local_rows_sql: &str,
+    global_rows_sql: &str,
+    version_id: &str,
+    _scope: FilesystemProjectionScope,
+    key_fn: F,
+) -> Result<Vec<EffectiveDescriptorRow>, FilesystemQueryError>
+where
+    K: Ord + Clone,
+    F: Fn(&EffectiveDescriptorRow) -> K,
+{
+    let mut resolved_by_key = BTreeMap::<K, EffectiveDescriptorRow>::new();
+
+    for row in load_effective_descriptor_rows(backend, local_rows_sql).await? {
+        resolved_by_key.entry(key_fn(&row)).or_insert(row);
+    }
+
+    if version_id == GLOBAL_VERSION_ID {
+        return Ok(resolved_by_key.into_values().collect());
+    }
+
+    let global_rows = load_effective_descriptor_rows(backend, global_rows_sql).await?;
+
+    let unresolved_global_rows = global_rows
+        .into_iter()
+        .filter(|row| !resolved_by_key.contains_key(&key_fn(row)))
+        .collect::<Vec<_>>();
+
+    let candidate_entity_ids = unresolved_global_rows
+        .iter()
+        .map(|row| row.id.clone())
+        .collect::<BTreeSet<_>>();
+    let shadowed_entity_ids = entity_ids_with_version_tombstones(
+        backend,
+        tracked_table,
+        schema_key,
+        version_id,
+        &candidate_entity_ids,
+    )
+    .await?;
+
+    for row in unresolved_global_rows {
+        if shadowed_entity_ids.contains(&row.id) {
+            continue;
+        }
+        resolved_by_key.entry(key_fn(&row)).or_insert(row);
+    }
+
+    Ok(resolved_by_key.into_values().collect())
+}
+
+fn visible_directory_descriptor_rows_for_pairs_sql(
+    _dialect: SqlDialect,
+    version_id: &str,
+    pairs: &BTreeSet<(Option<String>, String)>,
+) -> String {
+    let requested_rows = pairs
+        .iter()
+        .map(|(parent_id, name)| {
+            format!(
+                "({}, '{}')",
+                sql_optional_text_literal(parent_id.as_deref()),
+                escape_sql_string(name),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let untracked_table = quote_ident(&untracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY));
+    let tracked_parent_expr =
+        normalized_descriptor_select_expr(FILESYSTEM_DIRECTORY_SCHEMA_KEY, "parent_id");
+    let tracked_name_expr =
+        normalized_descriptor_select_expr(FILESYSTEM_DIRECTORY_SCHEMA_KEY, "name");
+    let tracked_hidden_expr = normalized_hidden_select_expr(FILESYSTEM_DIRECTORY_SCHEMA_KEY);
+    let untracked_parent_expr =
+        normalized_descriptor_select_expr(FILESYSTEM_DIRECTORY_SCHEMA_KEY, "parent_id");
+    let untracked_name_expr =
+        normalized_descriptor_select_expr(FILESYSTEM_DIRECTORY_SCHEMA_KEY, "name");
+    let untracked_hidden_expr = normalized_hidden_select_expr(FILESYSTEM_DIRECTORY_SCHEMA_KEY);
+    format!(
+        "WITH requested(lookup_parent_id, lookup_name) AS (VALUES {requested_rows}) \
+         SELECT entity_id, parent_id, directory_id, name, extension, hidden, metadata, change_id, is_tombstone, precedence, untracked \
+         FROM ( \
+           SELECT candidates.*, \
+                  ROW_NUMBER() OVER (PARTITION BY candidates.lookup_parent_id, candidates.lookup_name ORDER BY candidates.precedence ASC) AS rn \
+           FROM ( \
+             SELECT \
+               r.lookup_parent_id, \
+               r.lookup_name, \
+               u.entity_id, \
+               {untracked_parent_expr} AS parent_id, \
+               NULL AS directory_id, \
+               {untracked_name_expr} AS name, \
+               NULL AS extension, \
+               {untracked_hidden_expr} AS hidden, \
+               u.metadata AS metadata, \
+               NULL AS change_id, \
+               0 AS is_tombstone, \
+               1 AS precedence, \
+               1 AS untracked \
+             FROM requested r \
+             JOIN {untracked_table} u \
+               ON u.version_id = '{version_id}' \
+              AND u.file_id = '{file_id}' \
+              AND ((u.parent_id = r.lookup_parent_id) OR (u.parent_id IS NULL AND r.lookup_parent_id IS NULL)) \
+              AND u.name = r.lookup_name \
+             UNION ALL \
+             SELECT \
+               r.lookup_parent_id, \
+               r.lookup_name, \
+               t.entity_id, \
+               {tracked_parent_expr} AS parent_id, \
+               NULL AS directory_id, \
+               {tracked_name_expr} AS name, \
+               NULL AS extension, \
+               {tracked_hidden_expr} AS hidden, \
+               t.metadata AS metadata, \
+               t.change_id AS change_id, \
+               t.is_tombstone AS is_tombstone, \
+               2 AS precedence, \
+               0 AS untracked \
+             FROM requested r \
+             JOIN {tracked_table} t \
+               ON t.version_id = '{version_id}' \
+              AND t.file_id = '{file_id}' \
+              AND ((t.parent_id = r.lookup_parent_id) OR (t.parent_id IS NULL AND r.lookup_parent_id IS NULL)) \
+              AND t.name = r.lookup_name \
+           ) AS candidates \
+         ) AS ranked \
+         WHERE rn = 1",
+        requested_rows = requested_rows,
+        untracked_parent_expr = untracked_parent_expr,
+        untracked_name_expr = untracked_name_expr,
+        untracked_hidden_expr = untracked_hidden_expr,
+        tracked_parent_expr = tracked_parent_expr,
+        tracked_name_expr = tracked_name_expr,
+        tracked_hidden_expr = tracked_hidden_expr,
+        untracked_table = untracked_table,
+        tracked_table = tracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
+        version_id = escape_sql_string(version_id),
+        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
+    )
+}
+
+fn visible_file_descriptor_rows_for_triplets_sql(
+    _dialect: SqlDialect,
+    version_id: &str,
+    triplets: &BTreeSet<(Option<String>, String, Option<String>)>,
+) -> String {
+    let requested_rows = triplets
+        .iter()
+        .map(|(directory_id, name, extension)| {
+            format!(
+                "({}, '{}', {})",
+                sql_optional_text_literal(directory_id.as_deref()),
+                escape_sql_string(name),
+                sql_optional_text_literal(extension.as_deref()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let untracked_table = quote_ident(&untracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY));
+    let tracked_directory_expr =
+        normalized_descriptor_select_expr(FILESYSTEM_FILE_SCHEMA_KEY, "directory_id");
+    let tracked_name_expr = normalized_descriptor_select_expr(FILESYSTEM_FILE_SCHEMA_KEY, "name");
+    let tracked_extension_expr =
+        normalized_descriptor_select_expr(FILESYSTEM_FILE_SCHEMA_KEY, "extension");
+    let tracked_hidden_expr = normalized_hidden_select_expr(FILESYSTEM_FILE_SCHEMA_KEY);
+    let untracked_directory_expr =
+        normalized_descriptor_select_expr(FILESYSTEM_FILE_SCHEMA_KEY, "directory_id");
+    let untracked_name_expr = normalized_descriptor_select_expr(FILESYSTEM_FILE_SCHEMA_KEY, "name");
+    let untracked_extension_expr =
+        normalized_descriptor_select_expr(FILESYSTEM_FILE_SCHEMA_KEY, "extension");
+    let untracked_hidden_expr = normalized_hidden_select_expr(FILESYSTEM_FILE_SCHEMA_KEY);
+    let extension_match = "(r.lookup_extension = extension_value OR ((r.lookup_extension IS NULL OR r.lookup_extension = '') AND (extension_value IS NULL OR extension_value = '')))";
+    format!(
+        "WITH requested(lookup_directory_id, lookup_name, lookup_extension) AS (VALUES {requested_rows}) \
+         SELECT entity_id, parent_id, directory_id, name, extension, hidden, metadata, change_id, is_tombstone, precedence, untracked \
+         FROM ( \
+           SELECT candidates.*, \
+                  ROW_NUMBER() OVER (PARTITION BY candidates.lookup_directory_id, candidates.lookup_name, candidates.lookup_extension ORDER BY candidates.precedence ASC) AS rn \
+           FROM ( \
+             SELECT \
+               r.lookup_directory_id, \
+               r.lookup_name, \
+               r.lookup_extension, \
+               u.entity_id, \
+               NULL AS parent_id, \
+               {untracked_directory_expr} AS directory_id, \
+               {untracked_name_expr} AS name, \
+               {untracked_extension_expr} AS extension, \
+               {untracked_hidden_expr} AS hidden, \
+               u.metadata AS metadata, \
+               NULL AS change_id, \
+               0 AS is_tombstone, \
+               1 AS precedence, \
+               1 AS untracked \
+             FROM requested r \
+             JOIN {untracked_table} u \
+               ON u.version_id = '{version_id}' \
+              AND u.file_id = '{file_id}' \
+              AND ((u.directory_id = r.lookup_directory_id) OR (u.directory_id IS NULL AND r.lookup_directory_id IS NULL)) \
+              AND u.name = r.lookup_name \
+              AND {extension_match_untracked} \
+             UNION ALL \
+             SELECT \
+               r.lookup_directory_id, \
+               r.lookup_name, \
+               r.lookup_extension, \
+               t.entity_id, \
+               NULL AS parent_id, \
+               {tracked_directory_expr} AS directory_id, \
+               {tracked_name_expr} AS name, \
+               {tracked_extension_expr} AS extension, \
+               {tracked_hidden_expr} AS hidden, \
+               t.metadata AS metadata, \
+               t.change_id AS change_id, \
+               t.is_tombstone AS is_tombstone, \
+               2 AS precedence, \
+               0 AS untracked \
+             FROM requested r \
+             JOIN {tracked_table} t \
+               ON t.version_id = '{version_id}' \
+              AND t.file_id = '{file_id}' \
+              AND ((t.directory_id = r.lookup_directory_id) OR (t.directory_id IS NULL AND r.lookup_directory_id IS NULL)) \
+              AND t.name = r.lookup_name \
+              AND {extension_match_tracked} \
+           ) AS candidates \
+         ) AS ranked \
+         WHERE rn = 1",
+        requested_rows = requested_rows,
+        untracked_directory_expr = untracked_directory_expr,
+        untracked_name_expr = untracked_name_expr,
+        untracked_extension_expr = untracked_extension_expr,
+        untracked_hidden_expr = untracked_hidden_expr,
+        tracked_directory_expr = tracked_directory_expr,
+        tracked_name_expr = tracked_name_expr,
+        tracked_extension_expr = tracked_extension_expr,
+        tracked_hidden_expr = tracked_hidden_expr,
+        untracked_table = untracked_table,
+        tracked_table = tracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY),
+        version_id = escape_sql_string(version_id),
+        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
+        extension_match_untracked =
+            extension_match.replace("extension_value", untracked_extension_expr),
+        extension_match_tracked =
+            extension_match.replace("extension_value", tracked_extension_expr),
+    )
+}
+
+fn sql_optional_text_literal(value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("'{}'", escape_sql_string(value)),
+        None => "NULL".to_string(),
+    }
+}
+
 async fn load_visible_descriptor_row_for_version(
     backend: &dyn LixBackend,
     tracked_table: &str,
     schema_key: &str,
-    base_predicate: &str,
+    tracked_base_predicate: &str,
+    untracked_base_predicate: &str,
     version_id: &str,
 ) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
-    let sql = visible_descriptor_sql(tracked_table, schema_key, base_predicate, version_id);
+    let sql = visible_descriptor_sql(
+        backend.dialect(),
+        tracked_table,
+        schema_key,
+        tracked_base_predicate,
+        untracked_base_predicate,
+        version_id,
+    );
     load_effective_descriptor_row(backend, &sql).await
 }
 
@@ -916,10 +1145,18 @@ async fn load_visible_descriptor_rows_for_version(
     backend: &dyn LixBackend,
     tracked_table: &str,
     schema_key: &str,
-    base_predicate: &str,
+    tracked_base_predicate: &str,
+    untracked_base_predicate: &str,
     version_id: &str,
 ) -> Result<Vec<EffectiveDescriptorRow>, FilesystemQueryError> {
-    let sql = visible_descriptor_rows_sql(tracked_table, schema_key, base_predicate, version_id);
+    let sql = visible_descriptor_rows_sql(
+        backend.dialect(),
+        tracked_table,
+        schema_key,
+        tracked_base_predicate,
+        untracked_base_predicate,
+        version_id,
+    );
     load_effective_descriptor_rows(backend, &sql).await
 }
 
@@ -973,80 +1210,157 @@ async fn entity_ids_with_version_tombstones(
 }
 
 fn visible_descriptor_sql(
+    _dialect: SqlDialect,
     tracked_table: &str,
     schema_key: &str,
-    base_predicate: &str,
+    tracked_base_predicate: &str,
+    untracked_base_predicate: &str,
     version_id: &str,
 ) -> String {
     let tracked_base = format!(
-        "file_id = '{file_id}' AND {base_predicate}",
+        "file_id = '{file_id}' AND {tracked_base_predicate}",
         file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
-        base_predicate = base_predicate,
+        tracked_base_predicate = tracked_base_predicate,
     );
-    let untracked_base = format!(
-        "schema_key = '{schema_key}' AND file_id = '{file_id}' AND {base_predicate}",
-        schema_key = escape_sql_string(schema_key),
-        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
-        base_predicate = base_predicate,
-    );
+    let untracked_table = quote_ident(&untracked_live_table_name(schema_key));
+    let tracked_parent_expr = normalized_descriptor_select_expr(schema_key, "parent_id");
+    let tracked_directory_expr = normalized_descriptor_select_expr(schema_key, "directory_id");
+    let tracked_name_expr = normalized_descriptor_select_expr(schema_key, "name");
+    let tracked_extension_expr = normalized_descriptor_select_expr(schema_key, "extension");
+    let tracked_hidden_expr = normalized_hidden_select_expr(schema_key);
+    let untracked_parent_expr = normalized_descriptor_select_expr(schema_key, "parent_id");
+    let untracked_directory_expr = normalized_descriptor_select_expr(schema_key, "directory_id");
+    let untracked_name_expr = normalized_descriptor_select_expr(schema_key, "name");
+    let untracked_extension_expr = normalized_descriptor_select_expr(schema_key, "extension");
+    let untracked_hidden_expr = normalized_hidden_select_expr(schema_key);
     format!(
-        "SELECT entity_id, snapshot_content, metadata, NULL AS change_id, \
-                CASE WHEN snapshot_content IS NULL THEN 1 ELSE 0 END AS is_tombstone, \
+        "SELECT entity_id, \
+                {untracked_parent_expr} AS parent_id, \
+                {untracked_directory_expr} AS directory_id, \
+                {untracked_name_expr} AS name, \
+                {untracked_extension_expr} AS extension, \
+                {untracked_hidden_expr} AS hidden, \
+                metadata, NULL AS change_id, 0 AS is_tombstone, \
                 1 AS precedence, 1 AS untracked \
          FROM {untracked_table} \
-         WHERE version_id = '{version_id}' \
-           AND {untracked_base} \
+         WHERE version_id = '{version_id}' AND file_id = '{file_id}' AND {untracked_base_predicate} \
          UNION ALL \
-         SELECT entity_id, snapshot_content, metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
+         SELECT entity_id, \
+                {tracked_parent_expr} AS parent_id, \
+                {tracked_directory_expr} AS directory_id, \
+                {tracked_name_expr} AS name, \
+                {tracked_extension_expr} AS extension, \
+                {tracked_hidden_expr} AS hidden, \
+                metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
          FROM {tracked_table} \
          WHERE version_id = '{version_id}' \
            AND {tracked_base} \
          ORDER BY precedence ASC \
          LIMIT 1",
-        untracked_table = LIVE_UNTRACKED_TABLE,
+        untracked_table = untracked_table,
         tracked_table = tracked_table,
         version_id = escape_sql_string(version_id),
+        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
         tracked_base = tracked_base,
-        untracked_base = untracked_base,
+        untracked_base_predicate = untracked_base_predicate,
+        untracked_parent_expr = untracked_parent_expr,
+        untracked_directory_expr = untracked_directory_expr,
+        untracked_name_expr = untracked_name_expr,
+        untracked_extension_expr = untracked_extension_expr,
+        untracked_hidden_expr = untracked_hidden_expr,
+        tracked_parent_expr = tracked_parent_expr,
+        tracked_directory_expr = tracked_directory_expr,
+        tracked_name_expr = tracked_name_expr,
+        tracked_extension_expr = tracked_extension_expr,
+        tracked_hidden_expr = tracked_hidden_expr,
     )
 }
 
 fn visible_descriptor_rows_sql(
+    _dialect: SqlDialect,
     tracked_table: &str,
     schema_key: &str,
-    base_predicate: &str,
+    tracked_base_predicate: &str,
+    untracked_base_predicate: &str,
     version_id: &str,
 ) -> String {
     let tracked_base = format!(
-        "file_id = '{file_id}' AND ({base_predicate})",
+        "file_id = '{file_id}' AND ({tracked_base_predicate})",
         file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
-        base_predicate = base_predicate,
+        tracked_base_predicate = tracked_base_predicate,
     );
-    let untracked_base = format!(
-        "schema_key = '{schema_key}' AND file_id = '{file_id}' AND ({base_predicate})",
-        schema_key = escape_sql_string(schema_key),
-        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
-        base_predicate = base_predicate,
-    );
+    let untracked_table = quote_ident(&untracked_live_table_name(schema_key));
+    let tracked_parent_expr = normalized_descriptor_select_expr(schema_key, "parent_id");
+    let tracked_directory_expr = normalized_descriptor_select_expr(schema_key, "directory_id");
+    let tracked_name_expr = normalized_descriptor_select_expr(schema_key, "name");
+    let tracked_extension_expr = normalized_descriptor_select_expr(schema_key, "extension");
+    let tracked_hidden_expr = normalized_hidden_select_expr(schema_key);
+    let untracked_parent_expr = normalized_descriptor_select_expr(schema_key, "parent_id");
+    let untracked_directory_expr = normalized_descriptor_select_expr(schema_key, "directory_id");
+    let untracked_name_expr = normalized_descriptor_select_expr(schema_key, "name");
+    let untracked_extension_expr = normalized_descriptor_select_expr(schema_key, "extension");
+    let untracked_hidden_expr = normalized_hidden_select_expr(schema_key);
     format!(
-        "SELECT entity_id, snapshot_content, metadata, NULL AS change_id, \
-                CASE WHEN snapshot_content IS NULL THEN 1 ELSE 0 END AS is_tombstone, \
+        "SELECT entity_id, \
+                {untracked_parent_expr} AS parent_id, \
+                {untracked_directory_expr} AS directory_id, \
+                {untracked_name_expr} AS name, \
+                {untracked_extension_expr} AS extension, \
+                {untracked_hidden_expr} AS hidden, \
+                metadata, NULL AS change_id, 0 AS is_tombstone, \
                 1 AS precedence, 1 AS untracked \
          FROM {untracked_table} \
-         WHERE version_id = '{version_id}' \
-           AND {untracked_base} \
+         WHERE version_id = '{version_id}' AND file_id = '{file_id}' AND ({untracked_base_predicate}) \
          UNION ALL \
-         SELECT entity_id, snapshot_content, metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
+         SELECT entity_id, \
+                {tracked_parent_expr} AS parent_id, \
+                {tracked_directory_expr} AS directory_id, \
+                {tracked_name_expr} AS name, \
+                {tracked_extension_expr} AS extension, \
+                {tracked_hidden_expr} AS hidden, \
+                metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
          FROM {tracked_table} \
          WHERE version_id = '{version_id}' \
            AND {tracked_base} \
          ORDER BY precedence ASC",
-        untracked_table = LIVE_UNTRACKED_TABLE,
+        untracked_table = untracked_table,
         tracked_table = tracked_table,
         version_id = escape_sql_string(version_id),
+        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
         tracked_base = tracked_base,
-        untracked_base = untracked_base,
+        untracked_base_predicate = untracked_base_predicate,
+        untracked_parent_expr = untracked_parent_expr,
+        untracked_directory_expr = untracked_directory_expr,
+        untracked_name_expr = untracked_name_expr,
+        untracked_extension_expr = untracked_extension_expr,
+        untracked_hidden_expr = untracked_hidden_expr,
+        tracked_parent_expr = tracked_parent_expr,
+        tracked_directory_expr = tracked_directory_expr,
+        tracked_name_expr = tracked_name_expr,
+        tracked_extension_expr = tracked_extension_expr,
+        tracked_hidden_expr = tracked_hidden_expr,
     )
+}
+
+fn normalized_descriptor_select_expr(schema_key: &str, column: &str) -> &'static str {
+    match (schema_key, column) {
+        (FILESYSTEM_DIRECTORY_SCHEMA_KEY, "parent_id") => "parent_id",
+        (FILESYSTEM_DIRECTORY_SCHEMA_KEY, "name") => "name",
+        (FILESYSTEM_DIRECTORY_SCHEMA_KEY, "directory_id") => "NULL",
+        (FILESYSTEM_DIRECTORY_SCHEMA_KEY, "extension") => "NULL",
+        (FILESYSTEM_FILE_SCHEMA_KEY, "parent_id") => "NULL",
+        (FILESYSTEM_FILE_SCHEMA_KEY, "directory_id") => "directory_id",
+        (FILESYSTEM_FILE_SCHEMA_KEY, "name") => "name",
+        (FILESYSTEM_FILE_SCHEMA_KEY, "extension") => "extension",
+        _ => "NULL",
+    }
+}
+
+fn normalized_hidden_select_expr(schema_key: &str) -> &'static str {
+    match schema_key {
+        FILESYSTEM_DIRECTORY_SCHEMA_KEY | FILESYSTEM_FILE_SCHEMA_KEY => "COALESCE(hidden, false)",
+        _ => "false",
+    }
 }
 
 fn version_shadow_sql(
@@ -1061,26 +1375,25 @@ fn version_shadow_sql(
         entity_id = escape_sql_string(entity_id),
     );
     let untracked_base = format!(
-        "schema_key = '{schema_key}' AND file_id = '{file_id}' AND entity_id = '{entity_id}'",
-        schema_key = escape_sql_string(schema_key),
+        "file_id = '{file_id}' AND entity_id = '{entity_id}'",
         file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
         entity_id = escape_sql_string(entity_id),
     );
     format!(
-        "SELECT entity_id, snapshot_content, metadata, NULL AS change_id, \
-                CASE WHEN snapshot_content IS NULL THEN 1 ELSE 0 END AS is_tombstone, \
+        "SELECT entity_id, NULL AS snapshot_content, metadata, NULL AS change_id, \
+                0 AS is_tombstone, \
                 1 AS precedence, 1 AS untracked \
          FROM {untracked_table} \
          WHERE version_id = '{version_id}' \
            AND {untracked_base} \
          UNION ALL \
-         SELECT entity_id, snapshot_content, metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
+         SELECT entity_id, NULL AS snapshot_content, metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
          FROM {tracked_table} \
          WHERE version_id = '{version_id}' \
            AND {tracked_base} \
          ORDER BY precedence ASC \
          LIMIT 1",
-        untracked_table = LIVE_UNTRACKED_TABLE,
+        untracked_table = quote_ident(&untracked_live_table_name(schema_key)),
         tracked_table = tracked_table,
         version_id = escape_sql_string(version_id),
         tracked_base = tracked_base,
@@ -1104,25 +1417,24 @@ fn version_shadow_rows_sql(
         entity_predicate = entity_predicate,
     );
     let untracked_base = format!(
-        "schema_key = '{schema_key}' AND file_id = '{file_id}' AND {entity_predicate}",
-        schema_key = escape_sql_string(schema_key),
+        "file_id = '{file_id}' AND {entity_predicate}",
         file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
         entity_predicate = entity_predicate,
     );
     format!(
-        "SELECT entity_id, snapshot_content, metadata, NULL AS change_id, \
-                CASE WHEN snapshot_content IS NULL THEN 1 ELSE 0 END AS is_tombstone, \
+        "SELECT entity_id, NULL AS snapshot_content, metadata, NULL AS change_id, \
+                0 AS is_tombstone, \
                 1 AS precedence, 1 AS untracked \
          FROM {untracked_table} \
          WHERE version_id = '{version_id}' \
            AND {untracked_base} \
          UNION ALL \
-         SELECT entity_id, snapshot_content, metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
+         SELECT entity_id, NULL AS snapshot_content, metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
          FROM {tracked_table} \
          WHERE version_id = '{version_id}' \
            AND {tracked_base} \
          ORDER BY entity_id ASC, precedence ASC",
-        untracked_table = LIVE_UNTRACKED_TABLE,
+        untracked_table = quote_ident(&untracked_live_table_name(schema_key)),
         tracked_table = tracked_table,
         version_id = escape_sql_string(version_id),
         tracked_base = tracked_base,
@@ -1149,33 +1461,32 @@ async fn load_effective_descriptor_rows(
         .await
         .map_err(filesystem_query_backend_error)?;
     let mut rows = Vec::new();
+    let mut seen_ids = BTreeSet::new();
     for row in &result.rows {
-        if row.get(4).and_then(value_as_bool).unwrap_or(false) || row.get(1).is_none() {
+        let id = required_text_value(row, "entity_id")?;
+        if !seen_ids.insert(id.clone()) {
             continue;
         }
-        let Some(snapshot_content) = row.get(1).and_then(text_from_value) else {
+        if row.get(8).and_then(value_as_bool).unwrap_or(false) {
             continue;
-        };
-        let id = required_text_value(row, "entity_id")?;
+        }
+        let untracked = row.get(10).and_then(value_as_bool).unwrap_or(false);
+        let name = row.get(3).and_then(text_from_value);
+        if name.is_none() && untracked {
+            continue;
+        }
         rows.push(EffectiveDescriptorRow {
             id,
-            parent_id: extract_json_text(&snapshot_content, "parent_id")
-                .map_err(filesystem_query_backend_error)?,
-            directory_id: extract_json_text(&snapshot_content, "directory_id")
-                .map_err(filesystem_query_backend_error)?,
-            name: extract_json_text(&snapshot_content, "name")
-                .map_err(filesystem_query_backend_error)?
-                .ok_or_else(|| FilesystemQueryError {
-                    message: "filesystem descriptor snapshot missing name".to_string(),
-                })?,
-            extension: extract_json_text(&snapshot_content, "extension")
-                .map_err(filesystem_query_backend_error)?,
-            hidden: extract_json_bool(&snapshot_content, "hidden")
-                .map_err(filesystem_query_backend_error)?
-                .unwrap_or(false),
-            untracked: row.get(6).and_then(value_as_bool).unwrap_or(false),
-            metadata: row.get(2).and_then(text_from_value),
-            change_id: row.get(3).and_then(text_from_value),
+            parent_id: row.get(1).and_then(text_from_value),
+            directory_id: row.get(2).and_then(text_from_value),
+            name: name.ok_or_else(|| FilesystemQueryError {
+                message: "filesystem descriptor row missing name".to_string(),
+            })?,
+            extension: row.get(4).and_then(text_from_value),
+            hidden: row.get(5).and_then(value_as_bool).unwrap_or(false),
+            untracked,
+            metadata: row.get(6).and_then(text_from_value),
+            change_id: row.get(7).and_then(text_from_value),
         });
     }
     Ok(rows)
@@ -1233,21 +1544,37 @@ fn json_text_extract_expr(dialect: SqlDialect, column: &str, key: &str) -> Strin
     }
 }
 
-fn directory_pair_predicate(
-    dialect: SqlDialect,
+fn json_bool_extract_expr(dialect: SqlDialect, column: &str, key: &str) -> String {
+    match dialect {
+        SqlDialect::Sqlite => format!(
+            "CASE json_type({column}, '$.{key}') \
+             WHEN 'true' THEN 1 \
+             WHEN 'false' THEN 0 \
+             ELSE NULL END"
+        ),
+        SqlDialect::Postgres => format!(
+            "CASE \
+               WHEN jsonb_typeof(jsonb_extract_path(CAST({column} AS JSONB), '{key}')) = 'boolean' \
+               THEN CAST(jsonb_extract_path_text(CAST({column} AS JSONB), '{key}') AS BOOLEAN) \
+               ELSE NULL \
+             END"
+        ),
+    }
+}
+
+fn directory_pair_predicate_untracked(
+    _dialect: SqlDialect,
     pairs: &BTreeSet<(Option<String>, String)>,
 ) -> String {
-    let parent_expr = json_text_extract_expr(dialect, "snapshot_content", "parent_id");
-    let name_expr = json_text_extract_expr(dialect, "snapshot_content", "name");
     pairs
         .iter()
         .map(|(parent_id, name)| {
             let parent_predicate = match parent_id {
-                Some(parent_id) => format!("{parent_expr} = '{}'", escape_sql_string(parent_id)),
-                None => format!("{parent_expr} IS NULL"),
+                Some(parent_id) => format!("parent_id = '{}'", escape_sql_string(parent_id)),
+                None => "parent_id IS NULL".to_string(),
             };
             format!(
-                "({parent_predicate} AND {name_expr} = '{}')",
+                "({parent_predicate} AND name = '{}')",
                 escape_sql_string(name)
             )
         })
@@ -1255,28 +1582,67 @@ fn directory_pair_predicate(
         .join(" OR ")
 }
 
-fn file_triplet_predicate(
-    dialect: SqlDialect,
+fn directory_pair_predicate_tracked(pairs: &BTreeSet<(Option<String>, String)>) -> String {
+    pairs
+        .iter()
+        .map(|(parent_id, name)| {
+            let parent_predicate = match parent_id {
+                Some(parent_id) => format!("parent_id = '{}'", escape_sql_string(parent_id)),
+                None => "parent_id IS NULL".to_string(),
+            };
+            format!(
+                "({parent_predicate} AND name = '{}')",
+                escape_sql_string(name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn file_triplet_predicate_untracked(
+    _dialect: SqlDialect,
     triplets: &BTreeSet<(Option<String>, String, Option<String>)>,
 ) -> String {
-    let directory_expr = json_text_extract_expr(dialect, "snapshot_content", "directory_id");
-    let name_expr = json_text_extract_expr(dialect, "snapshot_content", "name");
-    let extension_expr = json_text_extract_expr(dialect, "snapshot_content", "extension");
     triplets
         .iter()
         .map(|(directory_id, name, extension)| {
             let directory_predicate = match directory_id {
                 Some(directory_id) => {
-                    format!("{directory_expr} = '{}'", escape_sql_string(directory_id))
+                    format!("directory_id = '{}'", escape_sql_string(directory_id))
                 }
-                None => format!("{directory_expr} IS NULL"),
+                None => "directory_id IS NULL".to_string(),
             };
             let extension_predicate = match extension {
-                Some(extension) => format!("{extension_expr} = '{}'", escape_sql_string(extension)),
-                None => format!("({extension_expr} IS NULL OR {extension_expr} = '')"),
+                Some(extension) => format!("extension = '{}'", escape_sql_string(extension)),
+                None => "(extension IS NULL OR extension = '')".to_string(),
             };
             format!(
-                "({directory_predicate} AND {name_expr} = '{}' AND {extension_predicate})",
+                "({directory_predicate} AND name = '{}' AND {extension_predicate})",
+                escape_sql_string(name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn file_triplet_predicate_tracked(
+    triplets: &BTreeSet<(Option<String>, String, Option<String>)>,
+) -> String {
+    triplets
+        .iter()
+        .map(|(directory_id, name, extension)| {
+            let directory_predicate = match directory_id {
+                Some(directory_id) => {
+                    format!("directory_id = '{}'", escape_sql_string(directory_id))
+                }
+                None => "directory_id IS NULL".to_string(),
+            };
+            let extension_predicate = match extension {
+                Some(extension) => format!("extension = '{}'", escape_sql_string(extension)),
+                None => "(extension IS NULL OR extension = '')".to_string(),
+            };
+            format!(
+                "({directory_predicate} AND name = '{}' AND {extension_predicate})",
                 escape_sql_string(name)
             )
         })
@@ -1304,6 +1670,11 @@ fn extract_json_bool(snapshot_content: &str, key: &str) -> Result<Option<bool>, 
         }
     })?;
     Ok(parsed.get(key).and_then(|value| value.as_bool()))
+}
+
+fn quote_ident(value: &str) -> String {
+    let escaped = value.replace('"', "\"\"");
+    format!("\"{}\"", escaped)
 }
 
 fn required_text_value(row: &[Value], label: &str) -> Result<String, FilesystemQueryError> {
@@ -1385,54 +1756,62 @@ mod tests {
             {
                 self.projection_seen.store(true, Ordering::SeqCst);
             }
-            if sql.contains(LIVE_FILE_DESCRIPTOR_TABLE) && sql.contains("entity_id = 'file-1'") {
+            if sql.contains(&tracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY))
+                && sql.contains("entity_id = 'file-1'")
+            {
                 return Ok(crate::QueryResult {
                     rows: vec![vec![
                         Value::Text("file-1".to_string()),
-                        Value::Text(
-                            "{\"id\":\"file-1\",\"directory_id\":\"dir-nested\",\"name\":\"file\",\"extension\":\"json\",\"hidden\":false}".to_string(),
-                        ),
+                        Value::Null,
+                        Value::Text("dir-nested".to_string()),
+                        Value::Text("file".to_string()),
+                        Value::Text("json".to_string()),
+                        Value::Boolean(false),
                         Value::Null,
                         Value::Text("change-file".to_string()),
-                        Value::Integer(0),
+                        Value::Boolean(false),
                         Value::Integer(2),
-                        Value::Integer(0),
+                        Value::Boolean(false),
                     ]],
                     columns: Vec::new(),
                 });
             }
-            if sql.contains(LIVE_DIRECTORY_DESCRIPTOR_TABLE)
+            if sql.contains(&tracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY))
                 && sql.contains("entity_id = 'dir-nested'")
             {
                 return Ok(crate::QueryResult {
                     rows: vec![vec![
                         Value::Text("dir-nested".to_string()),
-                        Value::Text(
-                            "{\"id\":\"dir-nested\",\"parent_id\":\"dir-bench\",\"name\":\"nested\",\"hidden\":false}".to_string(),
-                        ),
+                        Value::Text("dir-bench".to_string()),
+                        Value::Null,
+                        Value::Text("nested".to_string()),
+                        Value::Null,
+                        Value::Boolean(false),
                         Value::Null,
                         Value::Text("change-dir-2".to_string()),
-                        Value::Integer(0),
+                        Value::Boolean(false),
                         Value::Integer(2),
-                        Value::Integer(0),
+                        Value::Boolean(false),
                     ]],
                     columns: Vec::new(),
                 });
             }
-            if sql.contains(LIVE_DIRECTORY_DESCRIPTOR_TABLE)
+            if sql.contains(&tracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY))
                 && sql.contains("entity_id = 'dir-bench'")
             {
                 return Ok(crate::QueryResult {
                     rows: vec![vec![
                         Value::Text("dir-bench".to_string()),
-                        Value::Text(
-                            "{\"id\":\"dir-bench\",\"parent_id\":null,\"name\":\"bench\",\"hidden\":false}".to_string(),
-                        ),
+                        Value::Null,
+                        Value::Null,
+                        Value::Text("bench".to_string()),
+                        Value::Null,
+                        Value::Boolean(false),
                         Value::Null,
                         Value::Text("change-dir-1".to_string()),
-                        Value::Integer(0),
+                        Value::Boolean(false),
                         Value::Integer(2),
-                        Value::Integer(0),
+                        Value::Boolean(false),
                     ]],
                     columns: Vec::new(),
                 });

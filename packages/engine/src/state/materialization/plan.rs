@@ -539,7 +539,7 @@ fn build_global_projection_rows(
             schema_version: descriptor.schema_version.clone(),
             file_id: descriptor.file_id.clone(),
             plugin_key: descriptor.plugin_key.clone(),
-            snapshot_content: Some(descriptor.snapshot_content.clone()),
+            snapshot_content: descriptor.snapshot_content.clone(),
             metadata: descriptor.metadata.clone(),
             created_at: descriptor.created_at.clone(),
             updated_at: descriptor.created_at.clone(),

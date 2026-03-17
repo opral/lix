@@ -1,4 +1,7 @@
 use crate::backend::SqlDialect;
+use crate::schema::live_layout::{
+    builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
+};
 use crate::state::commit::build_reachable_commits_for_root_cte_sql;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, QueryResult, Value};
@@ -72,12 +75,29 @@ fn build_phase1_source_query_sql(
     start_depth: i64,
     end_depth: i64,
 ) -> String {
-    let change_set_id_sql = json_text_expr_sql(dialect, "snapshot_content", "change_set_id");
-    let cse_change_set_id_sql = json_text_expr_sql(dialect, "snapshot_content", "change_set_id");
-    let cse_change_id_sql = json_text_expr_sql(dialect, "snapshot_content", "change_id");
-    let cse_entity_id_sql = json_text_expr_sql(dialect, "snapshot_content", "entity_id");
-    let cse_schema_key_sql = json_text_expr_sql(dialect, "snapshot_content", "schema_key");
-    let cse_file_id_sql = json_text_expr_sql(dialect, "snapshot_content", "file_id");
+    let commit_table = tracked_live_table_name("lix_commit");
+    let cse_table = tracked_live_table_name("lix_change_set_element");
+    let change_set_id_sql = quote_ident(&live_payload_column_name("lix_commit", "change_set_id"));
+    let cse_change_set_id_sql = quote_ident(&live_payload_column_name(
+        "lix_change_set_element",
+        "change_set_id",
+    ));
+    let cse_change_id_sql = quote_ident(&live_payload_column_name(
+        "lix_change_set_element",
+        "change_id",
+    ));
+    let cse_entity_id_sql = quote_ident(&live_payload_column_name(
+        "lix_change_set_element",
+        "entity_id",
+    ));
+    let cse_schema_key_sql = quote_ident(&live_payload_column_name(
+        "lix_change_set_element",
+        "schema_key",
+    ));
+    let cse_file_id_sql = quote_ident(&live_payload_column_name(
+        "lix_change_set_element",
+        "file_id",
+    ));
     let reachable_commits_cte_sql =
         build_reachable_commits_for_root_cte_sql(dialect, root_commit_id, start_depth, end_depth);
     format!(
@@ -87,11 +107,10 @@ fn build_phase1_source_query_sql(
                entity_id AS id, \
                {change_set_id_sql} AS change_set_id, \
                version_id AS lixcol_version_id \
-             FROM lix_internal_live_v1_lix_commit \
+             FROM {commit_table} \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
            ), \
            change_set_element_by_version AS ( \
              SELECT \
@@ -101,11 +120,10 @@ fn build_phase1_source_query_sql(
                {cse_schema_key_sql} AS schema_key, \
                {cse_file_id_sql} AS file_id, \
                version_id AS lixcol_version_id \
-             FROM lix_internal_live_v1_lix_change_set_element \
+             FROM {cse_table} \
              WHERE schema_key = 'lix_change_set_element' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
            ), \
            all_changes AS ( \
              SELECT \
@@ -185,13 +203,20 @@ fn build_phase1_source_query_sql(
     )
 }
 
-fn json_text_expr_sql(dialect: SqlDialect, column: &str, field: &str) -> String {
-    match dialect {
-        SqlDialect::Sqlite => format!("json_extract({column}, '$.\"{field}\"')"),
-        SqlDialect::Postgres => {
-            format!("jsonb_extract_path_text(CAST({column} AS JSONB), '{field}')")
-        }
-    }
+fn quote_ident(value: &str) -> String {
+    let escaped = value.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
+fn live_payload_column_name(schema_key: &str, property_name: &str) -> String {
+    let layout = builtin_live_table_layout(schema_key)
+        .expect("builtin live layout lookup should succeed")
+        .expect("builtin live layout should exist");
+    live_column_name_for_property(&layout, property_name)
+        .unwrap_or_else(|| {
+            panic!("builtin live layout '{schema_key}' must include '{property_name}'")
+        })
+        .to_string()
 }
 
 fn parse_timeline_source_rows(result: QueryResult) -> Result<Vec<TimelineSourceRow>, LixError> {

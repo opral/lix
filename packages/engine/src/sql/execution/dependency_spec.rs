@@ -7,6 +7,7 @@ use sqlparser::ast::{
 };
 use sqlparser::ast::{Visit, Visitor};
 
+use crate::schema::live_layout::is_untracked_live_table;
 use crate::sql::ast::utils::{bind_sql_with_state, parse_sql_statements, PlaceholderState};
 use crate::sql::execution::contracts::dependency_spec::{DependencyPrecision, DependencySpec};
 use crate::state::stream::StateCommitStreamFilter;
@@ -95,8 +96,7 @@ fn finalize_dependency_spec(mut spec: DependencySpec) -> DependencySpec {
             "lix_state_by_version"
             | "lix_state_history"
             | "lix_state_history_by_version"
-            | "lix_internal_state_vtable"
-            | "lix_internal_live_untracked_v1" => {
+            | "lix_internal_state_vtable" => {
                 uses_dynamic_state_relations = true;
             }
             "lix_working_changes" => {
@@ -132,6 +132,10 @@ fn finalize_dependency_spec(mut spec: DependencySpec) -> DependencySpec {
                 compiled_schema_keys.insert("lix_change".to_string());
             }
             _ => {
+                if is_untracked_live_table(relation) {
+                    uses_dynamic_state_relations = true;
+                    continue;
+                }
                 if relation.starts_with("lix_") && !relation.starts_with("lix_internal_") {
                     compiled_schema_keys.insert(normalize_relation_schema_key(relation));
                 }

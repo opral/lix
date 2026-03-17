@@ -6,8 +6,6 @@ use crate::schema::builtin::{
     builtin_schema_definition, builtin_schema_json, decode_lixcol_literal,
 };
 use crate::version::GLOBAL_VERSION_ID;
-use crate::LixError;
-
 pub(crate) const ACCOUNT_STORAGE_VERSION_ID: &str = "global";
 
 static ACCOUNT_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
@@ -96,23 +94,6 @@ pub(crate) fn active_account_snapshot_content(account_id: &str) -> String {
         account_id: account_id.to_string(),
     })
     .expect("lix_active_account snapshot serialization must succeed")
-}
-
-pub(crate) fn parse_active_account_snapshot(snapshot_content: &str) -> Result<String, LixError> {
-    let parsed: LixActiveAccount =
-        serde_json::from_str(snapshot_content).map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("active account snapshot_content invalid JSON: {error}"),
-        })?;
-
-    if parsed.account_id.is_empty() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "active account id must not be empty".to_string(),
-        });
-    }
-
-    Ok(parsed.account_id)
 }
 
 fn account_schema_metadata() -> &'static SchemaMetadata {

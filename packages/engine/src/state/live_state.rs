@@ -19,13 +19,15 @@ pub(crate) const LIVE_STATE_STATUS_SEED_ROW_SQL: &str =
     "INSERT INTO lix_internal_live_state_status (\
      singleton_id, mode, latest_change_id, latest_change_created_at, schema_epoch, updated_at\
      ) \
-     SELECT 1, 'needs_rebuild', NULL, NULL, '1', '1970-01-01T00:00:00Z' \
+     SELECT 1, 'uninitialized', NULL, NULL, '1', '1970-01-01T00:00:00Z' \
      WHERE NOT EXISTS (\
        SELECT 1 FROM lix_internal_live_state_status WHERE singleton_id = 1\
      )";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveStateMode {
+    Uninitialized,
+    Bootstrapping,
     Ready,
     NeedsRebuild,
     Rebuilding,
@@ -34,6 +36,8 @@ pub(crate) enum LiveStateMode {
 impl LiveStateMode {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Uninitialized => "uninitialized",
+            Self::Bootstrapping => "bootstrapping",
             Self::Ready => "ready",
             Self::NeedsRebuild => "needs_rebuild",
             Self::Rebuilding => "rebuilding",
@@ -42,6 +46,8 @@ impl LiveStateMode {
 
     fn parse(value: &str) -> Option<Self> {
         match value {
+            "uninitialized" => Some(Self::Uninitialized),
+            "bootstrapping" => Some(Self::Bootstrapping),
             "ready" => Some(Self::Ready),
             "needs_rebuild" => Some(Self::NeedsRebuild),
             "rebuilding" => Some(Self::Rebuilding),
@@ -70,34 +76,25 @@ pub(crate) enum LiveStateReadiness {
     NeedsRebuild,
 }
 
-pub(crate) async fn canonical_state_exists(backend: &dyn LixBackend) -> Result<bool, LixError> {
-    match backend
-        .execute("SELECT 1 FROM lix_internal_change LIMIT 1", &[])
-        .await
-    {
-        Ok(result) => Ok(result.rows.first().is_some()),
-        Err(error) if is_missing_relation_error(&error) => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
 pub(crate) async fn refresh_live_state_readiness(
     backend: &dyn LixBackend,
 ) -> Result<LiveStateReadiness, LixError> {
-    if !canonical_state_exists(backend).await? {
+    let status = load_live_state_status_row_with_backend(backend).await?;
+    if status.mode == LiveStateMode::Uninitialized {
         return Ok(LiveStateReadiness::Uninitialized);
     }
-
-    let status = load_live_state_status_row_with_backend(backend).await?;
+    if matches!(
+        status.mode,
+        LiveStateMode::Bootstrapping | LiveStateMode::Rebuilding | LiveStateMode::NeedsRebuild
+    ) {
+        return Ok(LiveStateReadiness::NeedsRebuild);
+    }
     let latest = load_latest_canonical_watermark(backend).await?;
     let ready = status.mode == LiveStateMode::Ready
         && status.schema_epoch == LIVE_STATE_SCHEMA_EPOCH
         && status.watermark == latest;
     if ready {
         return Ok(LiveStateReadiness::Ready);
-    }
-    if status.mode == LiveStateMode::Rebuilding {
-        return Ok(LiveStateReadiness::NeedsRebuild);
     }
 
     mark_live_state_mode_with_backend(backend, LiveStateMode::NeedsRebuild).await?;
@@ -142,6 +139,32 @@ pub(crate) async fn mark_live_state_ready_with_backend(
         .execute(&build_mark_live_state_ready_sql(watermark), &[])
         .await?;
     Ok(())
+}
+
+pub(crate) async fn load_live_state_mode_with_backend(
+    backend: &dyn LixBackend,
+) -> Result<LiveStateMode, LixError> {
+    Ok(load_live_state_status_row_with_backend(backend).await?.mode)
+}
+
+pub(crate) async fn try_claim_live_state_bootstrap_with_backend(
+    backend: &dyn LixBackend,
+) -> Result<bool, LixError> {
+    let result = backend
+        .execute(
+            "UPDATE lix_internal_live_state_status \
+             SET mode = 'bootstrapping', \
+                 latest_change_id = NULL, \
+                 latest_change_created_at = NULL, \
+                 schema_epoch = $1, \
+                 updated_at = CURRENT_TIMESTAMP \
+             WHERE singleton_id = 1 \
+               AND mode = 'uninitialized' \
+             RETURNING singleton_id",
+            &[Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string())],
+        )
+        .await?;
+    Ok(result.rows.first().is_some())
 }
 
 pub(crate) async fn load_latest_canonical_watermark(
@@ -302,7 +325,7 @@ fn live_state_status_row_from_values(row: &[Value]) -> Result<LiveStateStatusRow
 
 fn default_live_state_status() -> LiveStateStatusRow {
     LiveStateStatusRow {
-        mode: LiveStateMode::NeedsRebuild,
+        mode: LiveStateMode::Uninitialized,
         schema_epoch: LIVE_STATE_SCHEMA_EPOCH.to_string(),
         watermark: None,
     }
@@ -351,7 +374,6 @@ mod tests {
 
     #[derive(Default)]
     struct FakeBackend {
-        canonical_exists: bool,
         status_row: Option<Vec<Value>>,
         latest_watermark: Option<(String, String)>,
         executed_sql: std::sync::Mutex<Vec<String>>,
@@ -365,16 +387,6 @@ mod tests {
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             self.executed_sql.lock().unwrap().push(sql.to_string());
-            if sql.contains("SELECT 1 FROM lix_internal_change") {
-                return Ok(QueryResult {
-                    rows: if self.canonical_exists {
-                        vec![vec![Value::Integer(1)]]
-                    } else {
-                        Vec::new()
-                    },
-                    columns: vec!["1".to_string()],
-                });
-            }
             if sql.contains("FROM lix_internal_live_state_status") {
                 return Ok(QueryResult {
                     rows: self.status_row.clone().into_iter().collect(),
@@ -462,7 +474,6 @@ mod tests {
     #[tokio::test]
     async fn readiness_is_ready_when_status_matches_latest_canonical_change() {
         let backend = FakeBackend {
-            canonical_exists: true,
             status_row: Some(vec![
                 Value::Text("ready".to_string()),
                 Value::Text("change-2".to_string()),

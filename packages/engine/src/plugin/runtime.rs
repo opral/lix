@@ -7,6 +7,7 @@ use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::matching::select_best_glob_match;
 use crate::plugin::storage::plugin_key_from_archive_path;
 use crate::plugin::types::{InstalledPlugin, PluginContentType};
+use crate::schema::live_layout::tracked_live_table_name;
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::preprocess::preprocess_sql_to_plan as preprocess_sql;
@@ -459,8 +460,11 @@ async fn load_file_paths_for_descriptors(
         return Ok(BTreeMap::new());
     }
 
-    let file_projection_sql =
-        build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, false);
+    let file_projection_sql = build_filesystem_file_projection_sql(
+        FilesystemProjectionScope::ExplicitVersion,
+        false,
+        backend.dialect(),
+    );
     let mut sql = String::from("WITH requested(file_id, version_id) AS (VALUES ");
     let mut params = Vec::with_capacity(targets.len() * 2);
     for (index, (version_id, file_id)) in targets.iter().enumerate() {
@@ -509,6 +513,7 @@ async fn load_file_paths_for_descriptors(
 async fn load_missing_file_history_descriptors(
     backend: &dyn LixBackend,
 ) -> Result<BTreeMap<(String, String, i64), FileHistoryDescriptorRow>, LixError> {
+    let commit_table = tracked_live_table_name("lix_commit");
     let history_source_sql =
         build_filesystem_state_history_source_sql(backend.dialect(), "", "", "", false);
     let history_projection_sql = build_filesystem_file_history_projection_sql(&history_source_sql);
@@ -523,11 +528,10 @@ async fn load_missing_file_history_descriptors(
            WHERE history.path IS NOT NULL \
              AND history.lixcol_root_commit_id IN (\
                SELECT entity_id \
-               FROM lix_internal_live_v1_lix_commit \
+               FROM {commit_table} \
                WHERE schema_key = 'lix_commit' \
                  AND version_id = 'global' \
-                 AND is_tombstone = 0 \
-                 AND snapshot_content IS NOT NULL\
+                 AND is_tombstone = 0\
              ) \
              AND NOT EXISTS (\
                SELECT 1 \

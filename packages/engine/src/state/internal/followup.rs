@@ -6,6 +6,9 @@ use sqlparser::parser::Parser;
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::engine::collect_postprocess_file_cache_targets;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::schema::live_layout::{
+    logical_live_snapshot_from_row_with_layout, tracked_live_table_name, untracked_live_table_name,
+};
 use crate::state::commit::{generate_commit, DomainChangeInput, GenerateCommitArgs};
 use crate::state::stream::{
     state_commit_stream_changes_from_postprocess_rows, StateCommitStreamChange,
@@ -36,8 +39,6 @@ use crate::state::internal::{
 };
 use crate::LixBackend;
 
-const LIVE_STATE_PREFIX: &str = "lix_internal_live_v1_";
-const UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "entity_id",
     "file_id",
@@ -148,6 +149,7 @@ pub(crate) async fn execute_postprocess_with_transaction(
             let changes = state_commit_stream_changes_from_postprocess_rows(
                 &internal_result.rows,
                 &update_plan.schema_key,
+                update_plan.layout.as_ref(),
                 StateCommitStreamOperation::Update,
                 writer_key,
             )?;
@@ -157,6 +159,7 @@ pub(crate) async fn execute_postprocess_with_transaction(
             let changes = state_commit_stream_changes_from_postprocess_rows(
                 &internal_result.rows,
                 &delete_plan.schema_key,
+                delete_plan.layout.as_ref(),
                 StateCommitStreamOperation::Delete,
                 writer_key,
             )?;
@@ -236,7 +239,6 @@ struct CommitExecutorAdapter<'a> {
 
 #[async_trait::async_trait(?Send)]
 impl CommitQueryExecutor for CommitExecutorAdapter<'_> {
-    #[cfg(test)]
     fn dialect(&self) -> crate::SqlDialect {
         self.executor.dialect()
     }
@@ -316,7 +318,14 @@ async fn build_update_followup_statement_batch(
         let version_id = value_to_string(&row[2], "version_id")?;
         let plugin_key = value_to_string(&row[3], "plugin_key")?;
         let schema_version = value_to_string(&row[4], "schema_version")?;
-        let snapshot_content = value_to_optional_text(&row[5], "snapshot_content")?;
+        let snapshot_content = logical_live_snapshot_from_row_with_layout(
+            plan.layout.as_ref(),
+            &plan.schema_key,
+            row,
+            5,
+            UPDATE_RETURNING_COLUMNS.len(),
+        )?
+        .map(|snapshot| snapshot.to_string());
         let metadata = value_to_optional_text(&row[6], "metadata")?;
         let row_writer_key = match (
             &plan.explicit_writer_key,
@@ -390,7 +399,13 @@ async fn build_delete_followup_statement_batch(
         let version_id = value_to_string(&row[2], "version_id")?;
         let plugin_key = value_to_string(&row[3], "plugin_key")?;
         let schema_version = value_to_string(&row[4], "schema_version")?;
-        let _snapshot_content = value_to_optional_text(&row[5], "snapshot_content")?;
+        let _snapshot_content = logical_live_snapshot_from_row_with_layout(
+            plan.layout.as_ref(),
+            &plan.schema_key,
+            row,
+            5,
+            UPDATE_RETURNING_COLUMNS.len(),
+        )?;
         let metadata = value_to_optional_text(&row[6], "metadata")?;
         let row_writer_key = writer_key.map(ToString::to_string);
         tombstoned_keys.insert((entity_id.clone(), file_id.clone(), version_id.clone()));
@@ -411,7 +426,8 @@ async fn build_delete_followup_statement_batch(
     }
 
     if let Some(selection_sql) = plan.effective_scope_untracked_selection_sql.as_deref() {
-        delete_effective_scope_untracked_rows(executor, selection_sql, params).await?;
+        delete_effective_scope_untracked_rows(executor, &plan.schema_key, selection_sql, params)
+            .await?;
     }
 
     if plan.effective_scope_fallback {
@@ -472,10 +488,14 @@ async fn build_delete_followup_statement_batch(
 
 async fn delete_effective_scope_untracked_rows(
     executor: &mut dyn SqlExecutor,
+    schema_key: &str,
     selection_sql: &str,
     params: &[EngineValue],
 ) -> Result<(), LixError> {
-    let sql = format!("DELETE FROM {UNTRACKED_TABLE} WHERE {selection_sql}");
+    let sql = format!(
+        "DELETE FROM {table} WHERE {selection_sql}",
+        table = quote_ident(&untracked_live_table_name(schema_key)),
+    );
     let bound = bind_sql_with_state(&sql, params, executor.dialect(), PlaceholderState::new())?;
     executor.execute(&bound.sql, &bound.params).await?;
     Ok(())
@@ -499,11 +519,8 @@ async fn load_effective_scope_delete_rows(
         return Ok(Vec::new());
     };
 
-    let schema_table = quote_ident(&format!("{LIVE_STATE_PREFIX}{}", plan.schema_key));
-    let descriptor_table = quote_ident(&format!(
-        "{LIVE_STATE_PREFIX}{}",
-        version_descriptor_schema_key()
-    ));
+    let schema_table = quote_ident(&tracked_live_table_name(&plan.schema_key));
+    let descriptor_table = quote_ident(&tracked_live_table_name(version_descriptor_schema_key()));
     let sql = format!(
         "WITH \
            all_real_versions AS ( \

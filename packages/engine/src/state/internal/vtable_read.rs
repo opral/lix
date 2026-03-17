@@ -1,38 +1,75 @@
 use sqlparser::ast::{
-    BinaryOperator, Expr, Ident, Query, Select, SetExpr, Statement, TableAlias, TableFactor,
-    TableWithJoins, UnaryOperator,
+    BinaryOperator, Expr, Ident, Query, Select, SetExpr, TableAlias, TableFactor, TableWithJoins,
+    UnaryOperator,
 };
 use sqlparser::ast::{VisitMut, VisitorMut};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::ops::ControlFlow;
 
+use crate::schema::builtin::builtin_schema_keys;
+use crate::schema::live_layout::{
+    builtin_live_table_layout, live_schema_key_for_table_name, load_live_row_access_with_backend,
+    tracked_live_table_name, untracked_live_table_name, LiveRowAccess, TRACKED_LIVE_TABLE_PREFIX,
+    UNTRACKED_LIVE_TABLE_PREFIX,
+};
+use crate::sql::live_snapshot::{live_snapshot_select_expr, live_snapshot_select_expr_for_schema};
 use crate::state::internal::param_context::{
     expr_last_identifier_eq, extract_string_column_values_from_expr, normalize_query_placeholders,
     PlaceholderOrdinalState,
 };
 use crate::state::internal::{object_name_matches, quote_ident};
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{errors, LixBackend, LixError, Value as LixValue};
+use crate::{errors, LixBackend, LixError, SqlDialect, Value as LixValue};
 
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
-const UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
-const LIVE_STATE_PREFIX: &str = "lix_internal_live_v1_";
 
-pub fn rewrite_query(query: Query, params: &[LixValue]) -> Result<Option<Query>, LixError> {
+pub fn rewrite_query(
+    query: Query,
+    params: &[LixValue],
+    dialect: SqlDialect,
+) -> Result<Option<Query>, LixError> {
     let mut query = query;
     normalize_query_placeholders(&mut query, &mut PlaceholderOrdinalState::new())?;
 
     let schema_keys = extract_schema_keys_from_query(&query, params).unwrap_or_default();
+    let live_accesses = load_builtin_live_accesses(&schema_keys)?;
     let mut changed = false;
     let mut new_query = query.clone();
-    rewrite_query_inner(&mut new_query, &schema_keys, params, &mut changed, None)?;
+    rewrite_query_inner_with_live_accesses(
+        &mut new_query,
+        &schema_keys,
+        &live_accesses,
+        params,
+        &mut changed,
+        None,
+        dialect,
+    )?;
 
     if changed {
         Ok(Some(new_query))
     } else {
         Ok(None)
     }
+}
+
+fn load_builtin_live_accesses(
+    schema_keys: &[String],
+) -> Result<std::collections::BTreeMap<String, LiveRowAccess>, LixError> {
+    let mut live_accesses = std::collections::BTreeMap::<String, LiveRowAccess>::new();
+    for key in schema_keys {
+        let Some(layout) = builtin_live_table_layout(key)? else {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "internal state vtable rewrite requires backend-loaded live layout for non-builtin schema '{}'",
+                    key
+                ),
+            });
+        };
+        live_accesses.insert(key.clone(), LiveRowAccess::new(layout));
+    }
+    Ok(live_accesses)
 }
 
 pub async fn rewrite_query_with_backend(
@@ -43,6 +80,7 @@ pub async fn rewrite_query_with_backend(
     let mut query = query;
     normalize_query_placeholders(&mut query, &mut PlaceholderOrdinalState::new())?;
     let available_schema_keys = fetch_registered_schema_keys(backend).await?;
+    let materialized_schema_keys = fetch_materialized_state_schema_keys(backend).await?;
 
     let mut schema_keys = extract_schema_keys_from_query(&query, params).unwrap_or_default();
     if !schema_keys.is_empty() {
@@ -56,21 +94,33 @@ pub async fn rewrite_query_with_backend(
             .or_else(|| extract_plugin_keys_from_top_level_derived_subquery(&query, params))
             .unwrap_or_default();
         if !plugin_keys.is_empty() {
-            schema_keys = fetch_schema_keys_for_plugins(backend, &plugin_keys).await?;
+            schema_keys =
+                fetch_schema_keys_for_plugins(backend, &plugin_keys, &materialized_schema_keys)
+                    .await?;
         }
     }
     if schema_keys.is_empty() {
-        schema_keys = available_schema_keys.clone();
+        schema_keys = materialized_schema_keys.clone();
+    }
+
+    let mut live_accesses = std::collections::BTreeMap::<String, LiveRowAccess>::new();
+    for schema_key in &schema_keys {
+        live_accesses.insert(
+            schema_key.clone(),
+            load_live_row_access_with_backend(backend, schema_key).await?,
+        );
     }
 
     let mut changed = false;
     let mut new_query = query.clone();
-    rewrite_query_inner(
+    rewrite_query_inner_with_live_accesses(
         &mut new_query,
         &schema_keys,
+        &live_accesses,
         params,
         &mut changed,
         Some(&available_schema_keys),
+        backend.dialect(),
     )?;
 
     if changed {
@@ -80,18 +130,22 @@ pub async fn rewrite_query_with_backend(
     }
 }
 
-fn rewrite_query_inner(
+fn rewrite_query_inner_with_live_accesses(
     query: &mut Query,
     schema_keys: &[String],
+    live_accesses: &std::collections::BTreeMap<String, LiveRowAccess>,
     params: &[LixValue],
     changed: &mut bool,
     available_schema_keys: Option<&[String]>,
+    dialect: SqlDialect,
 ) -> Result<(), LixError> {
     let query_schema_keys = resolve_schema_keys_for_query(query, schema_keys, params);
     if let Some(available) = available_schema_keys {
         validate_schema_keys_against_available(&query_schema_keys, available)?;
     }
     let top_level_targets_vtable = query_targets_vtable(&query);
+    let requires_snapshot_content =
+        top_level_targets_vtable && query_requires_snapshot_content(query);
     let pushdown_predicate = if top_level_targets_vtable {
         extract_pushdown_predicate(&query)
     } else {
@@ -100,192 +154,115 @@ fn rewrite_query_inner(
 
     if let Some(with) = query.with.as_mut() {
         for cte in &mut with.cte_tables {
-            rewrite_query_inner(
+            rewrite_query_inner_with_live_accesses(
                 &mut cte.query,
-                &query_schema_keys,
+                schema_keys,
+                live_accesses,
                 params,
                 changed,
                 available_schema_keys,
+                dialect,
             )?;
         }
     }
-    query.body = Box::new(rewrite_set_expr(
-        (*query.body).clone(),
+
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return Ok(());
+    };
+    rewrite_select_with_live_accesses(
+        select,
         &query_schema_keys,
+        live_accesses,
+        requires_snapshot_content,
         pushdown_predicate.as_ref(),
         params,
         changed,
-        available_schema_keys,
-    )?);
-    Ok(())
+        dialect,
+    )
 }
 
-fn rewrite_set_expr(
-    expr: SetExpr,
+fn rewrite_select_with_live_accesses(
+    select: &mut Box<Select>,
     schema_keys: &[String],
+    live_accesses: &std::collections::BTreeMap<String, LiveRowAccess>,
+    requires_snapshot_content: bool,
     pushdown_predicate: Option<&Expr>,
     params: &[LixValue],
     changed: &mut bool,
-    available_schema_keys: Option<&[String]>,
-) -> Result<SetExpr, LixError> {
-    Ok(match expr {
-        SetExpr::Select(select) => {
-            let mut select = *select;
-            rewrite_select(
-                &mut select,
-                schema_keys,
-                pushdown_predicate,
-                params,
-                changed,
-                available_schema_keys,
-            )?;
-            SetExpr::Select(Box::new(select))
-        }
-        SetExpr::Query(query) => {
-            let mut query = *query;
-            rewrite_query_inner(
-                &mut query,
-                schema_keys,
-                params,
-                changed,
-                available_schema_keys,
-            )?;
-            SetExpr::Query(Box::new(query))
-        }
-        SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left,
-            right,
-        } => {
-            let left = Box::new(rewrite_set_expr(
-                *left,
-                schema_keys,
-                pushdown_predicate,
-                params,
-                changed,
-                available_schema_keys,
-            )?);
-            let right = Box::new(rewrite_set_expr(
-                *right,
-                schema_keys,
-                pushdown_predicate,
-                params,
-                changed,
-                available_schema_keys,
-            )?);
-            SetExpr::SetOperation {
-                op,
-                set_quantifier,
-                left,
-                right,
-            }
-        }
-        other => other,
-    })
-}
-
-fn rewrite_select(
-    select: &mut Select,
-    schema_keys: &[String],
-    pushdown_predicate: Option<&Expr>,
-    params: &[LixValue],
-    changed: &mut bool,
-    available_schema_keys: Option<&[String]>,
+    dialect: SqlDialect,
 ) -> Result<(), LixError> {
     for table in &mut select.from {
-        rewrite_table_with_joins(table, schema_keys, pushdown_predicate, params, changed)?;
-    }
-    rewrite_subqueries_in_select(select, schema_keys, params, changed, available_schema_keys)?;
-    Ok(())
-}
-
-fn rewrite_subqueries_in_select(
-    select: &mut Select,
-    schema_keys: &[String],
-    params: &[LixValue],
-    changed: &mut bool,
-    available_schema_keys: Option<&[String]>,
-) -> Result<(), LixError> {
-    struct NestedQueryRewriter<'a> {
-        schema_keys: &'a [String],
-        params: &'a [LixValue],
-        changed: &'a mut bool,
-        available_schema_keys: Option<&'a [String]>,
-    }
-
-    impl VisitorMut for NestedQueryRewriter<'_> {
-        type Break = LixError;
-
-        fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-            let mut nested_changed = false;
-            if let Err(error) = rewrite_query_inner(
-                query,
-                self.schema_keys,
-                self.params,
-                &mut nested_changed,
-                self.available_schema_keys,
-            ) {
-                return ControlFlow::Break(error);
-            }
-            if nested_changed {
-                *self.changed = true;
-            }
-            ControlFlow::Continue(())
-        }
-    }
-
-    let mut visitor = NestedQueryRewriter {
-        schema_keys,
-        params,
-        changed,
-        available_schema_keys,
-    };
-    if let ControlFlow::Break(error) = VisitMut::visit(select, &mut visitor) {
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn rewrite_table_with_joins(
-    table: &mut TableWithJoins,
-    schema_keys: &[String],
-    pushdown_predicate: Option<&Expr>,
-    params: &[LixValue],
-    changed: &mut bool,
-) -> Result<(), LixError> {
-    rewrite_table_factor(
-        &mut table.relation,
-        schema_keys,
-        pushdown_predicate,
-        params,
-        changed,
-    )?;
-    for join in &mut table.joins {
-        rewrite_table_factor(
-            &mut join.relation,
+        rewrite_table_with_joins_with_live_accesses(
+            table,
             schema_keys,
+            live_accesses,
+            requires_snapshot_content,
             pushdown_predicate,
             params,
             changed,
+            dialect,
         )?;
     }
     Ok(())
 }
 
-fn rewrite_table_factor(
-    relation: &mut TableFactor,
+fn rewrite_table_with_joins_with_live_accesses(
+    table: &mut TableWithJoins,
     schema_keys: &[String],
+    live_accesses: &std::collections::BTreeMap<String, LiveRowAccess>,
+    requires_snapshot_content: bool,
     pushdown_predicate: Option<&Expr>,
     params: &[LixValue],
     changed: &mut bool,
+    dialect: SqlDialect,
+) -> Result<(), LixError> {
+    rewrite_table_factor_with_live_accesses(
+        &mut table.relation,
+        schema_keys,
+        live_accesses,
+        requires_snapshot_content,
+        pushdown_predicate,
+        params,
+        changed,
+        dialect,
+    )?;
+    for join in &mut table.joins {
+        rewrite_table_factor_with_live_accesses(
+            &mut join.relation,
+            schema_keys,
+            live_accesses,
+            requires_snapshot_content,
+            pushdown_predicate,
+            params,
+            changed,
+            dialect,
+        )?;
+    }
+    Ok(())
+}
+
+fn rewrite_table_factor_with_live_accesses(
+    relation: &mut TableFactor,
+    schema_keys: &[String],
+    live_accesses: &std::collections::BTreeMap<String, LiveRowAccess>,
+    requires_snapshot_content: bool,
+    pushdown_predicate: Option<&Expr>,
+    params: &[LixValue],
+    changed: &mut bool,
+    dialect: SqlDialect,
 ) -> Result<(), LixError> {
     match relation {
         TableFactor::Table { name, alias, .. }
             if !schema_keys.is_empty() && object_name_matches(name, VTABLE_NAME) =>
         {
-            let derived_query =
-                build_untracked_union_query(schema_keys, pushdown_predicate, params)?;
+            let derived_query = build_untracked_union_query_with_accesses(
+                schema_keys,
+                live_accesses,
+                requires_snapshot_content,
+                pushdown_predicate,
+                params,
+                dialect,
+            )?;
             let derived_alias = alias.clone().or_else(|| Some(default_vtable_alias()));
             *relation = TableFactor::Derived {
                 lateral: false,
@@ -297,12 +274,26 @@ fn rewrite_table_factor(
         TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
-            rewrite_table_with_joins(
+            rewrite_table_with_joins_with_live_accesses(
                 table_with_joins,
                 schema_keys,
+                live_accesses,
+                requires_snapshot_content,
                 pushdown_predicate,
                 params,
                 changed,
+                dialect,
+            )?;
+        }
+        TableFactor::Derived { subquery, .. } => {
+            rewrite_query_inner_with_live_accesses(
+                subquery,
+                schema_keys,
+                live_accesses,
+                params,
+                changed,
+                None,
+                dialect,
             )?;
         }
         _ => {}
@@ -310,67 +301,121 @@ fn rewrite_table_factor(
     Ok(())
 }
 
-fn build_untracked_union_query(
+fn build_untracked_union_query_with_accesses(
     schema_keys: &[String],
+    live_accesses: &std::collections::BTreeMap<String, LiveRowAccess>,
+    include_snapshot_content: bool,
     pushdown_predicate: Option<&Expr>,
     params: &[LixValue],
+    dialect: SqlDialect,
 ) -> Result<Query, LixError> {
-    let dialect = GenericDialect {};
+    let parser_dialect = GenericDialect {};
     let stripped_predicate = pushdown_predicate.and_then(|expr| strip_qualifiers(expr.clone()));
     let has_version_predicate = stripped_predicate
         .as_ref()
         .is_some_and(|expr| expr_references_column(expr, "version_id"));
-    let predicate_sql = stripped_predicate.as_ref().map(ToString::to_string);
     let predicate_schema_keys = stripped_predicate
         .as_ref()
         .and_then(|expr| extract_column_keys_from_expr(expr, expr_is_schema_key_column, params));
     let effective_schema_keys = narrow_schema_keys(schema_keys, predicate_schema_keys.as_deref());
-
-    let schema_list = effective_schema_keys
-        .iter()
-        .map(|key| format!("'{}'", escape_string_literal(key)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let schema_filter = if effective_schema_keys.is_empty() {
-        None
+    let effective_schema_keys = if effective_schema_keys.is_empty() {
+        builtin_schema_keys()
+            .iter()
+            .map(|schema_key| (*schema_key).to_string())
+            .collect::<Vec<_>>()
     } else {
-        Some(format!("schema_key IN ({schema_list})"))
-    };
-    let untracked_where = match (schema_filter.as_ref(), predicate_sql.as_ref()) {
-        (Some(schema_filter), Some(predicate)) => {
-            format!("{schema_filter} AND ({predicate})")
-        }
-        (Some(schema_filter), None) => schema_filter.clone(),
-        (None, Some(predicate)) => format!("({predicate})"),
-        (None, None) => "1=1".to_string(),
+        effective_schema_keys
     };
 
-    let mut union_parts = Vec::new();
-    union_parts.push(format!(
-        "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
-                created_at, updated_at, global, 'untracked' AS change_id, writer_key, true AS untracked, 1 AS priority \
-         FROM {untracked} \
-         WHERE {untracked_where}",
-        untracked = UNTRACKED_TABLE
-    ));
-
+    let mut schema_winner_queries = Vec::new();
     for key in &effective_schema_keys {
-        let materialized_table = format!("{LIVE_STATE_PREFIX}{key}");
-        let materialized_ident = quote_ident(&materialized_table);
-        let materialized_where = predicate_sql
-            .as_ref()
-            .map(|predicate| format!(" WHERE ({predicate})"))
-            .unwrap_or_default();
-        union_parts.push(format!(
-            "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
-                    created_at, updated_at, global, change_id, writer_key, false AS untracked, 2 AS priority \
-             FROM {materialized}{materialized_where}",
-            materialized = materialized_ident,
-            materialized_where = materialized_where
-        ));
+        let Some(access) = live_accesses.get(key) else {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "internal state vtable rewrite missing live-row access for schema '{}'",
+                    key
+                ),
+            });
+        };
+        schema_winner_queries.push(build_schema_winner_query(
+            key,
+            access,
+            include_snapshot_content,
+            stripped_predicate.as_ref(),
+            dialect,
+            has_version_predicate,
+        )?);
     }
 
-    let union_sql = union_parts.join(" UNION ALL ");
+    let sql = schema_winner_queries.join(" UNION ALL ");
+    Parser::new(&parser_dialect)
+        .try_with_sql(&sql)
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: error.to_string(),
+        })?
+        .parse_query()
+        .map(|query| *query)
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: error.to_string(),
+        })
+}
+
+fn build_schema_winner_query(
+    schema_key: &str,
+    access: &LiveRowAccess,
+    include_snapshot_content: bool,
+    stripped_predicate: Option<&Expr>,
+    dialect: SqlDialect,
+    has_version_predicate: bool,
+) -> Result<String, LixError> {
+    let untracked_table = quote_ident(&untracked_live_table_name(schema_key));
+    let tracked_table = quote_ident(&tracked_live_table_name(schema_key));
+    let tracked_full_projection = access.normalized_projection_sql(Some("t"));
+    let untracked_full_projection = access.normalized_projection_sql(Some("u"));
+    let ranked_payload_projection = if include_snapshot_content {
+        access.normalized_projection_sql(Some("schema_union"))
+    } else {
+        String::new()
+    };
+
+    let untracked_where = stripped_predicate
+        .map(|expr| {
+            if include_snapshot_content {
+                render_pushdown_predicate_for_schema_with_snapshot_expr(
+                    expr,
+                    &live_snapshot_select_expr(access.layout(), dialect, Some("u")),
+                )
+            } else {
+                render_pushdown_predicate_for_schema(expr, schema_key, dialect)
+            }
+        })
+        .transpose()?
+        .map(|predicate| format!(" WHERE ({predicate})"))
+        .unwrap_or_default();
+
+    let tracked_where = stripped_predicate
+        .map(|expr| {
+            if include_snapshot_content {
+                let tracked_snapshot_expr = format!(
+                    "CASE WHEN {} THEN NULL ELSE {} END",
+                    format!("{} = 1", qualified_column_ref(Some("t"), "is_tombstone")),
+                    live_snapshot_select_expr(access.layout(), dialect, Some("t"))
+                );
+                render_pushdown_predicate_for_schema_with_snapshot_expr(
+                    expr,
+                    &tracked_snapshot_expr,
+                )
+            } else {
+                render_pushdown_predicate_for_schema(expr, schema_key, dialect)
+            }
+        })
+        .transpose()?
+        .map(|predicate| format!(" WHERE ({predicate})"))
+        .unwrap_or_default();
+
     let partition_version_expr = if has_version_predicate {
         "version_id".to_string()
     } else {
@@ -390,42 +435,47 @@ fn build_untracked_union_query(
         )
     };
 
-    let sql = format!(
-        "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
+    let snapshot_projection = if include_snapshot_content {
+        format!(
+            "CASE WHEN ranked.is_tombstone = 1 THEN NULL ELSE {} END AS snapshot_content, ",
+            live_snapshot_select_expr(access.layout(), dialect, Some("ranked"))
+        )
+    } else {
+        String::new()
+    };
+
+    Ok(format!(
+        "SELECT entity_id, schema_key, file_id, version_id, plugin_key, {snapshot_projection}metadata, schema_version, \
                 created_at, updated_at, global, change_id, writer_key, untracked \
          FROM (\
-             SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
-                    created_at, updated_at, global, change_id, writer_key, untracked, \
-                    ROW_NUMBER() OVER (\
-                        PARTITION BY entity_id, schema_key, file_id, {partition_version_expr} \
-                        ORDER BY {presentation_rank_expr}, priority\
-                    ) AS rn \
-             FROM ({union_sql}) AS lix_state_union\
-         ) AS lix_state_ranked \
+            SELECT entity_id, schema_key, file_id, version_id, plugin_key, metadata, schema_version, \
+                   created_at, updated_at, global, change_id, writer_key, untracked, is_tombstone{ranked_payload_projection}, \
+                   ROW_NUMBER() OVER (\
+                       PARTITION BY entity_id, schema_key, file_id, {partition_version_expr} \
+                       ORDER BY {presentation_rank_expr}, priority\
+                   ) AS rn \
+            FROM (\
+                SELECT entity_id, schema_key, file_id, version_id, plugin_key, metadata, schema_version, \
+                       created_at, updated_at, global, 'untracked' AS change_id, writer_key, true AS untracked, 0 AS is_tombstone{untracked_full_projection}, 1 AS priority \
+                FROM {untracked_table} u{untracked_where} \
+                UNION ALL \
+                SELECT entity_id, schema_key, file_id, version_id, plugin_key, metadata, schema_version, \
+                       created_at, updated_at, global, change_id, writer_key, false AS untracked, is_tombstone{tracked_full_projection}, 2 AS priority \
+                FROM {tracked_table} t{tracked_where} \
+            ) AS schema_union\
+         ) AS ranked \
          WHERE rn = 1",
+        snapshot_projection = snapshot_projection,
+        ranked_payload_projection = ranked_payload_projection,
         partition_version_expr = partition_version_expr,
         presentation_rank_expr = presentation_rank_expr,
-    );
-
-    let mut statements = Parser::parse_sql(&dialect, &sql).map_err(|err| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: err.to_string(),
-    })?;
-
-    if statements.len() != 1 {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "expected single derived query statement".to_string(),
-        });
-    }
-
-    match statements.remove(0) {
-        Statement::Query(query) => Ok(*query),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "derived query did not parse as SELECT".to_string(),
-        }),
-    }
+        untracked_table = untracked_table,
+        untracked_where = untracked_where,
+        untracked_full_projection = untracked_full_projection,
+        tracked_table = tracked_table,
+        tracked_where = tracked_where,
+        tracked_full_projection = tracked_full_projection,
+    ))
 }
 
 fn query_targets_vtable(query: &Query) -> bool {
@@ -433,6 +483,45 @@ fn query_targets_vtable(query: &Query) -> bool {
         return false;
     };
     select.from.iter().any(table_with_joins_targets_vtable)
+}
+
+fn query_requires_snapshot_content(query: &Query) -> bool {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+
+    select
+        .projection
+        .iter()
+        .any(select_item_requires_snapshot_content)
+        || select
+            .selection
+            .as_ref()
+            .is_some_and(|expr| expr_references_column(expr, "snapshot_content"))
+        || query
+            .order_by
+            .as_ref()
+            .is_some_and(order_by_requires_snapshot_content)
+}
+
+fn select_item_requires_snapshot_content(item: &sqlparser::ast::SelectItem) -> bool {
+    match item {
+        sqlparser::ast::SelectItem::Wildcard(_)
+        | sqlparser::ast::SelectItem::QualifiedWildcard(_, _) => true,
+        sqlparser::ast::SelectItem::UnnamedExpr(expr)
+        | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+            expr_references_column(expr, "snapshot_content")
+        }
+    }
+}
+
+fn order_by_requires_snapshot_content(order_by: &sqlparser::ast::OrderBy) -> bool {
+    match &order_by.kind {
+        sqlparser::ast::OrderByKind::Expressions(ordering) => ordering
+            .iter()
+            .any(|item| expr_references_column(&item.expr, "snapshot_content")),
+        _ => false,
+    }
 }
 
 fn table_with_joins_targets_vtable(table: &TableWithJoins) -> bool {
@@ -601,6 +690,24 @@ fn expr_references_column(expr: &Expr, column_name: &str) -> bool {
         Expr::Tuple(items) => items
             .iter()
             .any(|item| expr_references_column(item, column_name)),
+        Expr::Function(function) => match &function.args {
+            sqlparser::ast::FunctionArguments::List(list) => {
+                list.args.iter().any(|arg| match arg {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(expr),
+                    ) => expr_references_column(expr, column_name),
+                    sqlparser::ast::FunctionArg::Named { arg, .. }
+                    | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => match arg {
+                        sqlparser::ast::FunctionArgExpr::Expr(expr) => {
+                            expr_references_column(expr, column_name)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                })
+            }
+            _ => false,
+        },
         Expr::Case {
             operand,
             conditions,
@@ -817,6 +924,84 @@ fn escape_string_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+fn qualified_column_ref(table_alias: Option<&str>, column_name: &str) -> String {
+    match table_alias {
+        Some(alias) => format!(
+            "\"{}\".\"{}\"",
+            alias.replace('"', "\"\""),
+            column_name.replace('"', "\"\"")
+        ),
+        None => format!("\"{}\"", column_name.replace('"', "\"\"")),
+    }
+}
+
+fn render_pushdown_predicate_for_schema(
+    predicate: &Expr,
+    schema_key: &str,
+    dialect: SqlDialect,
+) -> Result<String, LixError> {
+    let mut rewritten = predicate.clone();
+    let replacement_sql = live_snapshot_select_expr_for_schema(schema_key, dialect, None)?;
+    let replacement_expr = Parser::new(&GenericDialect {})
+        .try_with_sql(&replacement_sql)
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: error.to_string(),
+        })?
+        .parse_expr()
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: error.to_string(),
+        })?;
+    let mut replacer = SnapshotContentPredicateRewriter {
+        replacement: replacement_expr.clone(),
+    };
+    if let ControlFlow::Break(error) = rewritten.visit(&mut replacer) {
+        return Err(error);
+    }
+    Ok(rewritten.to_string())
+}
+
+fn render_pushdown_predicate_for_schema_with_snapshot_expr(
+    predicate: &Expr,
+    replacement_sql: &str,
+) -> Result<String, LixError> {
+    let mut rewritten = predicate.clone();
+    let replacement_expr = Parser::new(&GenericDialect {})
+        .try_with_sql(replacement_sql)
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: error.to_string(),
+        })?
+        .parse_expr()
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: error.to_string(),
+        })?;
+    let mut replacer = SnapshotContentPredicateRewriter {
+        replacement: replacement_expr.clone(),
+    };
+    if let ControlFlow::Break(error) = rewritten.visit(&mut replacer) {
+        return Err(error);
+    }
+    Ok(rewritten.to_string())
+}
+
+struct SnapshotContentPredicateRewriter {
+    replacement: Expr,
+}
+
+impl VisitorMut for SnapshotContentPredicateRewriter {
+    type Break = LixError;
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        if expr_last_identifier_eq(expr, "snapshot_content") {
+            *expr = self.replacement.clone();
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 async fn fetch_registered_schema_keys(backend: &dyn LixBackend) -> Result<Vec<String>, LixError> {
     let result = backend
         .execute(
@@ -873,28 +1058,31 @@ fn validate_schema_keys_against_available(
 async fn fetch_schema_keys_for_plugins(
     backend: &dyn LixBackend,
     plugin_keys: &[String],
+    materialized_schema_keys: &[String],
 ) -> Result<Vec<String>, LixError> {
     if plugin_keys.is_empty() {
         return Ok(Vec::new());
     }
 
     let changes_placeholders = numbered_placeholders(1, plugin_keys.len());
-    let untracked_placeholders = numbered_placeholders(plugin_keys.len() + 1, plugin_keys.len());
-    let sql = format!(
+    let mut union_parts = vec![format!(
         "SELECT DISTINCT schema_key \
          FROM lix_internal_change \
-         WHERE plugin_key IN ({changes_placeholders}) \
-         UNION \
-         SELECT DISTINCT schema_key \
-         FROM {untracked_table} \
-         WHERE plugin_key IN ({untracked_placeholders})",
-        untracked_table = UNTRACKED_TABLE,
-    );
-
-    let mut params = Vec::with_capacity(plugin_keys.len() * 2);
-    for key in plugin_keys {
-        params.push(LixValue::Text(key.clone()));
+         WHERE plugin_key IN ({changes_placeholders})"
+    )];
+    for schema_key in materialized_schema_keys {
+        let untracked_table = quote_ident(&untracked_live_table_name(schema_key));
+        union_parts.push(format!(
+            "SELECT DISTINCT schema_key \
+             FROM {untracked_table} \
+             WHERE plugin_key IN ({plugin_placeholders})",
+            untracked_table = untracked_table,
+            plugin_placeholders = changes_placeholders,
+        ));
     }
+    let sql = union_parts.join(" UNION ");
+
+    let mut params = Vec::with_capacity(plugin_keys.len());
     for key in plugin_keys {
         params.push(LixValue::Text(key.clone()));
     }
@@ -914,6 +1102,57 @@ async fn fetch_schema_keys_for_plugins(
         }
     }
 
+    keys.sort();
+    Ok(keys)
+}
+
+async fn fetch_materialized_state_schema_keys(
+    backend: &dyn LixBackend,
+) -> Result<Vec<String>, LixError> {
+    let tracked_like = format!("{TRACKED_LIVE_TABLE_PREFIX}%");
+    let untracked_like = format!("{UNTRACKED_LIVE_TABLE_PREFIX}%");
+    let table_rows = match backend.dialect() {
+        crate::SqlDialect::Sqlite => {
+            backend
+                .execute(
+                    &format!(
+                        "SELECT name \
+                         FROM sqlite_master \
+                         WHERE type = 'table' \
+                           AND (name LIKE '{tracked_like}' OR name LIKE '{untracked_like}')"
+                    ),
+                    &[],
+                )
+                .await?
+        }
+        crate::SqlDialect::Postgres => {
+            backend
+                .execute(
+                    &format!(
+                        "SELECT table_name \
+                         FROM information_schema.tables \
+                         WHERE table_schema = current_schema() \
+                           AND (table_name LIKE '{tracked_like}' OR table_name LIKE '{untracked_like}')"
+                    ),
+                    &[],
+                )
+                .await?
+        }
+    };
+
+    let mut keys = Vec::new();
+    for row in &table_rows.rows {
+        let Some(LixValue::Text(table_name)) = row.first() else {
+            continue;
+        };
+        let schema_key = live_schema_key_for_table_name(table_name);
+        let Some(schema_key) = schema_key else {
+            continue;
+        };
+        if !schema_key.is_empty() && !keys.iter().any(|existing| existing == schema_key) {
+            keys.push(schema_key.to_string());
+        }
+    }
     keys.sort();
     Ok(keys)
 }

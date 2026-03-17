@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use crate::schema::registry::ensure_schema_live_table_in_transaction;
+use crate::schema::live_layout::{normalized_live_column_values, tracked_live_table_name};
+use crate::schema::registry::{
+    ensure_schema_live_table_in_transaction, load_live_table_layout_in_transaction,
+};
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::live_state::{
     build_mark_live_state_ready_sql, build_set_live_state_mode_sql,
@@ -38,41 +41,44 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
     .await?;
 
     for write in &plan.writes {
-        let table_name = live_state_table_name(&write.schema_key);
+        let table_name = tracked_live_table_name(&write.schema_key);
         tables_touched.insert(table_name.clone());
 
         let is_tombstone = match write.op {
             LiveStateWriteOp::Upsert => 0,
             LiveStateWriteOp::Tombstone => 1,
         };
-        let snapshot_sql = write
-            .snapshot_content
-            .as_ref()
-            .map(|value| format!("'{}'", escape_sql_string(value)))
-            .unwrap_or_else(|| "NULL".to_string());
         let global_sql = if write.global { "true" } else { "false" };
         let metadata_sql = write
             .metadata
             .as_ref()
             .map(|value| format!("'{}'", escape_sql_string(value)))
             .unwrap_or_else(|| "NULL".to_string());
+        let layout =
+            load_live_table_layout_in_transaction(transaction.as_mut(), &write.schema_key).await?;
+        let normalized_values = normalized_live_column_values_for_write(
+            Some(&layout),
+            write.snapshot_content.as_deref(),
+        )?;
+        let normalized_columns_sql = normalized_insert_columns_sql(&normalized_values);
+        let normalized_values_sql = normalized_insert_values_sql(&normalized_values);
+        let normalized_update_sql = normalized_update_assignments_sql(&normalized_values);
 
         let sql = format!(
             "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, is_tombstone, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, is_tombstone, created_at, updated_at{normalized_columns}\
              ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', {snapshot_content}, '{change_id}', {metadata}, {is_tombstone}, '{created_at}', '{updated_at}'\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{change_id}', {metadata}, {is_tombstone}, '{created_at}', '{updated_at}'{normalized_values}\
              ) ON CONFLICT (entity_id, file_id, version_id) DO UPDATE SET \
              schema_key = excluded.schema_key, \
              schema_version = excluded.schema_version, \
              global = excluded.global, \
              plugin_key = excluded.plugin_key, \
-             snapshot_content = excluded.snapshot_content, \
              change_id = excluded.change_id, \
              metadata = excluded.metadata, \
              is_tombstone = excluded.is_tombstone, \
              created_at = excluded.created_at, \
-             updated_at = excluded.updated_at",
+             updated_at = excluded.updated_at{normalized_updates}",
             table = quote_ident(&table_name),
             entity_id = escape_sql_string(&write.entity_id),
             schema_key = escape_sql_string(&write.schema_key),
@@ -81,12 +87,14 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
             version_id = escape_sql_string(&write.version_id),
             global = global_sql,
             plugin_key = escape_sql_string(&write.plugin_key),
-            snapshot_content = snapshot_sql,
             change_id = escape_sql_string(&write.change_id),
             metadata = metadata_sql,
             is_tombstone = is_tombstone,
             created_at = escape_sql_string(&write.created_at),
             updated_at = escape_sql_string(&write.updated_at),
+            normalized_columns = normalized_columns_sql,
+            normalized_values = normalized_values_sql,
+            normalized_updates = normalized_update_sql,
         );
 
         transaction.execute(&sql, &[]).await?;
@@ -143,7 +151,7 @@ async fn clear_scope_rows(
 
     for schema_key in schema_keys {
         ensure_schema_live_table_in_transaction(transaction, schema_key).await?;
-        let table_name = live_state_table_name(schema_key);
+        let table_name = tracked_live_table_name(schema_key);
         tables_touched.insert(table_name.clone());
 
         let (count_sql, delete_sql) = if let Some(in_list) = version_filter.as_ref() {
@@ -214,8 +222,76 @@ fn in_clause_values(values: &BTreeSet<String>) -> String {
         .join(", ")
 }
 
-fn live_state_table_name(schema_key: &str) -> String {
-    format!("lix_internal_live_v1_{}", schema_key)
+fn normalized_live_column_values_for_write(
+    layout: Option<&crate::schema::live_layout::LiveTableLayout>,
+    snapshot_content: Option<&str>,
+) -> Result<Vec<(String, crate::Value)>, LixError> {
+    let Some(layout) = layout else {
+        return Ok(Vec::new());
+    };
+    Ok(normalized_live_column_values(layout, snapshot_content)?
+        .into_iter()
+        .collect())
+}
+
+fn normalized_insert_columns_sql(values: &[(String, crate::Value)]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    values
+        .iter()
+        .map(|(column, _)| format!(", {}", quote_ident(column)))
+        .collect::<String>()
+}
+
+fn normalized_insert_values_sql(values: &[(String, crate::Value)]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    values
+        .iter()
+        .map(|(_, value)| format!(", {}", sql_literal(value)))
+        .collect::<String>()
+}
+
+fn normalized_update_assignments_sql(values: &[(String, crate::Value)]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    values
+        .iter()
+        .map(|(column, _)| {
+            format!(
+                ", {} = excluded.{}",
+                quote_ident(column),
+                quote_ident(column)
+            )
+        })
+        .collect::<String>()
+}
+
+fn sql_literal(value: &crate::Value) -> String {
+    match value {
+        crate::Value::Null => "NULL".to_string(),
+        crate::Value::Boolean(value) => {
+            if *value {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        crate::Value::Integer(value) => value.to_string(),
+        crate::Value::Real(value) => value.to_string(),
+        crate::Value::Text(value) => format!("'{}'", escape_sql_string(value)),
+        crate::Value::Json(value) => format!("'{}'", escape_sql_string(&value.to_string())),
+        crate::Value::Blob(value) => {
+            let hex = value
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>();
+            format!("X'{hex}'")
+        }
+    }
 }
 
 fn quote_ident(value: &str) -> String {

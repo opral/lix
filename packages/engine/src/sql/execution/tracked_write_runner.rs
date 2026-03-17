@@ -3,12 +3,11 @@ use std::collections::BTreeSet;
 use crate::deterministic_mode::DeterministicSettings;
 use crate::engine::Engine;
 use crate::functions::LixFunctionProvider;
-use crate::schema::registry::ensure_schema_live_table_in_transaction;
+use crate::schema::registry::{
+    coalesce_live_table_requirements, ensure_schema_live_table_with_requirement_in_transaction,
+};
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::execute::SqlExecutionOutcome;
-use crate::sql::execution::runtime_effects::{
-    build_binary_blob_fastcdc_write_program, BinaryBlobWriteInput,
-};
 use crate::sql::execution::shared_path::{
     apply_public_version_last_checkpoint_side_effects, build_pending_public_commit_session,
     create_commit_error_to_lix_error, empty_public_write_execution_outcome,
@@ -16,7 +15,6 @@ use crate::sql::execution::shared_path::{
     mirror_public_registered_schema_bootstrap_rows, pending_session_matches_create_commit,
     PendingPublicCommitSession, PublicCommitInvariantChecker,
 };
-use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::sql::public::planner::ir::WriteLane;
 use crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch;
 use crate::sql::public::runtime::{
@@ -34,23 +32,10 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
     plan: &TrackedWriteTxnPlan,
     mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    if plan.execution.persist_filesystem_payloads_before_write {
-        engine
-            .persist_pending_file_data_updates_in_transaction(
-                transaction,
-                &plan.pending_file_writes,
-            )
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "public tracked filesystem payload persistence failed before commit creation: {}",
-                    error.description
-                ),
-            })?;
-    }
-    for requirement in &plan.execution.schema_live_table_requirements {
-        ensure_schema_live_table_in_transaction(transaction, &requirement.schema_key)
+    for requirement in
+        coalesce_live_table_requirements(&plan.execution.schema_live_table_requirements)
+    {
+        ensure_schema_live_table_with_requirement_in_transaction(transaction, &requirement)
             .await
             .map_err(|error| LixError {
                 code: error.code,
@@ -72,16 +57,12 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
     }
 
     let mut create_commit_functions = plan.functions.clone();
-    let additional_binary_blob_payloads = if plan.execution.persist_filesystem_payloads_before_write
-    {
-        plan.pending_file_writes
-            .iter()
-            .filter(|write| write.data_is_authoritative)
-            .map(|write| write.after_data.clone())
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let additional_binary_blob_payloads = plan
+        .pending_file_writes
+        .iter()
+        .filter(|write| write.data_is_authoritative)
+        .map(|write| write.after_data.clone())
+        .collect::<Vec<_>>();
     if let Some(session_slot) = pending_commit_session.as_mut() {
         let can_merge = !plan.has_lazy_exact_file_updates()
             && session_slot.as_ref().is_some_and(|session| {
@@ -111,24 +92,11 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
                     .domain_change_batch
                     .as_ref()
                     .expect("merged tracked writes should have a domain change batch"),
+                &additional_binary_blob_payloads,
                 &mut create_commit_functions,
                 &timestamp,
             )
             .await?;
-            if !additional_binary_blob_payloads.is_empty() {
-                let payloads = additional_binary_blob_payloads
-                    .iter()
-                    .map(|data| BinaryBlobWriteInput {
-                        file_id: "",
-                        version_id: "",
-                        data,
-                    })
-                    .collect::<Vec<_>>();
-                let program =
-                    build_binary_blob_fastcdc_write_program(transaction.dialect(), &payloads)
-                        .map_err(LixError::from)?;
-                execute_write_program_with_transaction(transaction, program).await?;
-            }
             if create_commit_functions
                 .deterministic_sequence_persist_highest_seen()
                 .is_some()

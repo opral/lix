@@ -1,16 +1,23 @@
 use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, ConflictTarget, Delete, DoUpdate, Expr, Function,
-    FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, OnConflict,
-    OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject,
-    TableWithJoins, Update, Value, ValueWithSpan, Values, Visit, VisitMut, Visitor, VisitorMut,
+    Assignment, AssignmentTarget, BinaryOperator, CastKind, ConflictTarget, DataType, Delete,
+    DoUpdate, Expr, Function, FunctionArgumentList, FunctionArguments, Ident, ObjectName,
+    ObjectNamePart, OnConflict, OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement,
+    TableFactor, TableObject, TableWithJoins, Update, Value, ValueWithSpan, Values, Visit,
+    VisitMut, Visitor, VisitorMut,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
 use crate::errors;
 use crate::functions::LixFunctionProvider;
+use crate::schema::live_layout::{
+    builtin_live_table_layout, live_schema_key_for_table_name, normalized_live_column_values,
+    normalized_live_returning_columns, normalized_live_returning_columns_for_layout,
+    tracked_live_table_name, untracked_live_table_name, LiveColumnKind, LiveTableLayout,
+};
+use crate::schema::registry::load_live_table_layout_with_backend;
 use crate::sql::execution::contracts::planned_statement::UpdateValidationKind;
 use crate::state::commit::{
     build_statement_batch_from_generate_commit_result, load_commit_active_accounts,
@@ -30,10 +37,8 @@ use crate::Value as EngineValue;
 use crate::{LixBackend, LixError, QueryResult};
 
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
-const UNTRACKED_TABLE: &str = "lix_internal_live_untracked_v1";
 const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
 const CHANGE_TABLE: &str = "lix_internal_change";
-const LIVE_STATE_PREFIX: &str = "lix_internal_live_v1_";
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "entity_id",
     "file_id",
@@ -52,7 +57,6 @@ struct BackendExecutor<'a> {
 
 #[async_trait::async_trait(?Send)]
 impl CommitQueryExecutor for BackendExecutor<'_> {
-    #[cfg(test)]
     fn dialect(&self) -> crate::SqlDialect {
         self.backend.dialect()
     }
@@ -168,11 +172,12 @@ pub fn rewrite_insert_with_writer_key(
         let untracked = build_untracked_insert(
             &insert,
             untracked_rows,
+            &mut live_table_requirements,
             &mut mutations,
             writer_key,
             functions,
         )?;
-        statements.push(untracked);
+        statements.extend(untracked);
     }
 
     Ok(Some(VtableWriteRewrite {
@@ -186,6 +191,7 @@ pub fn rewrite_insert_with_writer_key(
 pub async fn rewrite_insert_with_backend(
     backend: &dyn LixBackend,
     mut insert: sqlparser::ast::Insert,
+    known_live_layouts: &BTreeMap<String, crate::schema::live_layout::LiveTableLayout>,
     params: &[EngineValue],
     generated_param_offset: usize,
     writer_key: Option<&str>,
@@ -232,6 +238,7 @@ pub async fn rewrite_insert_with_backend(
             tracked_rows,
             &mut live_table_requirements,
             &mut mutations,
+            known_live_layouts,
             params.len() + generated_param_offset,
             writer_key,
             functions,
@@ -242,14 +249,18 @@ pub async fn rewrite_insert_with_backend(
     }
 
     if !untracked_rows.is_empty() {
-        let untracked = build_untracked_insert(
+        let untracked = build_untracked_insert_with_backend(
+            backend,
             &insert,
             untracked_rows,
+            &mut live_table_requirements,
             &mut mutations,
+            known_live_layouts,
             writer_key,
             functions,
-        )?;
-        statements.push(untracked);
+        )
+        .await?;
+        statements.extend(untracked);
     }
 
     Ok(Some(VtableWriteRewrite {
@@ -347,6 +358,7 @@ pub fn rewrite_update(
     }
 
     if has_untracked_true {
+        let schema_key = extract_single_schema_key(selection, params)?;
         if !can_strip_untracked_predicate(selection, params) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -354,12 +366,16 @@ pub fn rewrite_update(
             });
         }
         let mut new_update = update.clone();
-        replace_table_with_untracked(&mut new_update.table);
+        replace_table_with_schema_untracked(&mut new_update.table, &schema_key);
         new_update.assignments = filter_update_assignments(original_assignments.clone());
-        ensure_updated_at_assignment(&mut new_update.assignments);
         new_update.selection = try_strip_untracked_predicate(selection, params).unwrap_or(None);
-        let validation =
-            build_update_validation_plan(&new_update, Some(UNTRACKED_TABLE.to_string()), params)?;
+        let validation = build_update_validation_plan(
+            &new_update,
+            Some(untracked_live_table_name(&schema_key)),
+            params,
+        )?;
+        append_normalized_update_assignments(&mut new_update.assignments, &schema_key)?;
+        ensure_updated_at_assignment(&mut new_update.assignments);
         return Ok(Some(UpdateRewrite::Statement(VtableUpdateStatement {
             statement: Statement::Update(new_update),
             validation,
@@ -399,6 +415,7 @@ pub fn rewrite_update(
 
     let effective_scope_without_untracked_predicate = !has_untracked_false;
     let schema_key = extract_single_schema_key(&stripped_selection, params)?;
+    let builtin_layout = builtin_live_table_layout(&schema_key)?;
     let writer_key_assignment_present = update
         .assignments
         .iter()
@@ -409,24 +426,24 @@ pub fn rewrite_update(
     let mut validations = Vec::new();
     if effective_scope_without_untracked_predicate {
         let mut untracked_update = update.clone();
-        replace_table_with_untracked(&mut untracked_update.table);
+        replace_table_with_schema_untracked(&mut untracked_update.table, &schema_key);
         untracked_update.assignments = filter_update_assignments(original_assignments.clone());
-        ensure_updated_at_assignment(&mut untracked_update.assignments);
         untracked_update.selection = Some(stripped_selection.clone());
         if let Some(validation) = build_update_validation_plan(
             &untracked_update,
-            Some(UNTRACKED_TABLE.to_string()),
+            Some(untracked_live_table_name(&schema_key)),
             params,
         )? {
             validations.push(validation);
         }
+        append_normalized_update_assignments(&mut untracked_update.assignments, &schema_key)?;
+        ensure_updated_at_assignment(&mut untracked_update.assignments);
         pre_statements.push(Statement::Update(untracked_update));
     }
 
     let mut new_update = update.clone();
     replace_table_with_materialized(&mut new_update.table, &schema_key);
     new_update.assignments = filter_update_assignments(original_assignments);
-    ensure_updated_at_assignment(&mut new_update.assignments);
     let tracked_selection = if effective_scope_without_untracked_predicate {
         let materialized_table_ref = update_target_table_reference(&new_update.table)?;
         let entity_id_expr_sql = assignment_or_materialized_key_sql(
@@ -445,6 +462,7 @@ pub fn rewrite_update(
             &materialized_table_ref,
         );
         let effective_scope_predicate = build_not_exists_untracked_shadow_predicate(
+            &schema_key,
             &materialized_table_ref,
             &entity_id_expr_sql,
             &file_id_expr_sql,
@@ -459,21 +477,24 @@ pub fn rewrite_update(
         stripped_selection
     };
     new_update.selection = Some(tracked_selection);
-    new_update.returning = Some(build_update_returning());
+    new_update.returning = Some(build_update_returning(&schema_key)?);
 
     if let Some(validation) = build_update_validation_plan(
         &new_update,
-        Some(format!("{}{}", LIVE_STATE_PREFIX, schema_key)),
+        Some(tracked_live_table_name(&schema_key)),
         params,
     )? {
         validations.push(validation);
     }
+    append_normalized_update_assignments(&mut new_update.assignments, &schema_key)?;
+    ensure_updated_at_assignment(&mut new_update.assignments);
 
     Ok(Some(UpdateRewrite::Planned(VtableUpdateRewrite {
         pre_statements,
         statement: Statement::Update(new_update),
         plan: VtableUpdatePlan {
             schema_key,
+            layout: builtin_layout,
             explicit_writer_key,
             writer_key_assignment_present,
         },
@@ -519,12 +540,13 @@ pub fn rewrite_delete_with_options(
                 description: "vtable delete could not strip untracked predicate".to_string(),
             });
         }
+        let schema_key = extract_single_schema_key(selection, params)?;
         let mut new_delete = delete.clone();
-        replace_delete_from_untracked(&mut new_delete);
+        replace_delete_from_schema_untracked(&mut new_delete, &schema_key);
         new_delete.selection = try_strip_untracked_predicate(selection, params).unwrap_or(None);
         return Ok(Some(DeleteRewrite::Statement(VtableDeleteStatement {
             validation: build_delete_validation_plan(
-                Some(UNTRACKED_TABLE.to_string()),
+                Some(untracked_live_table_name(&schema_key)),
                 new_delete.selection.clone(),
             ),
             statement: Statement::Delete(new_delete),
@@ -569,6 +591,7 @@ pub fn rewrite_delete_with_options(
 
     let effective_scope_without_untracked_predicate = !has_untracked_false;
     let schema_key = extract_single_schema_key(&stripped_selection, params)?;
+    let builtin_layout = builtin_live_table_layout(&schema_key)?;
     let effective_scope_selection_sql =
         if effective_scope_fallback || effective_scope_without_untracked_predicate {
             Some(stripped_selection.to_string())
@@ -582,11 +605,12 @@ pub fn rewrite_delete_with_options(
     };
 
     let tracked_selection = if effective_scope_without_untracked_predicate {
-        let materialized_table_ref = format!("{}{}", LIVE_STATE_PREFIX, schema_key);
+        let materialized_table_ref = tracked_live_table_name(&schema_key);
         let default_entity_sql = materialized_column_sql(&materialized_table_ref, "entity_id");
         let default_file_sql = materialized_column_sql(&materialized_table_ref, "file_id");
         let default_version_sql = materialized_column_sql(&materialized_table_ref, "version_id");
         let effective_scope_predicate = build_not_exists_untracked_shadow_predicate(
+            &schema_key,
             &materialized_table_ref,
             &default_entity_sql,
             &default_file_sql,
@@ -603,7 +627,7 @@ pub fn rewrite_delete_with_options(
 
     let update = Update {
         update_token: AttachedToken::empty(),
-        table: table_with_joins_for(&format!("{}{}", LIVE_STATE_PREFIX, schema_key)),
+        table: table_with_joins_for(&tracked_live_table_name(&schema_key)),
         assignments: vec![
             Assignment {
                 target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
@@ -620,7 +644,7 @@ pub fn rewrite_delete_with_options(
         ],
         from: None,
         selection: Some(tracked_selection),
-        returning: Some(build_update_returning()),
+        returning: Some(build_update_returning(&schema_key)?),
         or: None,
         limit: None,
     };
@@ -629,97 +653,203 @@ pub fn rewrite_delete_with_options(
         statement: Statement::Update(update),
         plan: VtableDeletePlan {
             schema_key: schema_key.clone(),
+            layout: builtin_layout,
             effective_scope_fallback,
             effective_scope_selection_sql,
             effective_scope_untracked_selection_sql,
         },
         validation: build_delete_validation_plan(
-            Some(format!("{}{}", LIVE_STATE_PREFIX, schema_key)),
+            Some(tracked_live_table_name(&schema_key)),
             Some(stripped_selection),
         ),
     })))
 }
 
-fn build_untracked_on_conflict() -> OnInsert {
+fn build_normalized_untracked_on_conflict(
+    columns: &[Ident],
+    normalized_columns: &[Ident],
+) -> OnInsert {
+    let mut assignments = vec![
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("global"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), Ident::new("global")]),
+        },
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("plugin_key"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), Ident::new("plugin_key")]),
+        },
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("schema_version"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![
+                Ident::new("excluded"),
+                Ident::new("schema_version"),
+            ]),
+        },
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("metadata"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), Ident::new("metadata")]),
+        },
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("writer_key"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), Ident::new("writer_key")]),
+        },
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("updated_at"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), Ident::new("updated_at")]),
+        },
+    ];
+    if columns
+        .iter()
+        .any(|column| column.value == "snapshot_content")
+    {
+        assignments.insert(
+            1,
+            Assignment {
+                target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                    Ident::new("snapshot_content"),
+                )])),
+                value: Expr::CompoundIdentifier(vec![
+                    Ident::new("excluded"),
+                    Ident::new("snapshot_content"),
+                ]),
+            },
+        );
+    }
+    for column in normalized_columns {
+        assignments.push(Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                column.clone(),
+            )])),
+            value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), column.clone()]),
+        });
+    }
     OnInsert::OnConflict(OnConflict {
         conflict_target: Some(ConflictTarget::Columns(vec![
             Ident::new("entity_id"),
-            Ident::new("schema_key"),
             Ident::new("file_id"),
             Ident::new("version_id"),
         ])),
         action: OnConflictAction::DoUpdate(DoUpdate {
-            assignments: vec![
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("global")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("global"),
-                    ]),
-                },
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("snapshot_content")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("snapshot_content"),
-                    ]),
-                },
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("plugin_key")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("plugin_key"),
-                    ]),
-                },
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("schema_version")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("schema_version"),
-                    ]),
-                },
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("metadata")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("metadata"),
-                    ]),
-                },
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("writer_key")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("writer_key"),
-                    ]),
-                },
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("updated_at")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("updated_at"),
-                    ]),
-                },
-            ],
+            assignments,
             selection: None,
         }),
     })
 }
 
-fn build_live_state_on_conflict() -> OnInsert {
+fn build_live_state_on_conflict(columns: &[Ident]) -> OnInsert {
+    let mut assignments = vec![
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("global"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), Ident::new("global")]),
+        },
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("schema_version"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![
+                Ident::new("excluded"),
+                Ident::new("schema_version"),
+            ]),
+        },
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("plugin_key"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), Ident::new("plugin_key")]),
+        },
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("change_id"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), Ident::new("change_id")]),
+        },
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("metadata"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), Ident::new("metadata")]),
+        },
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("writer_key"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), Ident::new("writer_key")]),
+        },
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("updated_at"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), Ident::new("updated_at")]),
+        },
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("is_tombstone"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![
+                Ident::new("excluded"),
+                Ident::new("is_tombstone"),
+            ]),
+        },
+    ];
+    if columns
+        .iter()
+        .any(|column| column.value == "snapshot_content")
+    {
+        assignments.insert(
+            1,
+            Assignment {
+                target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                    Ident::new("snapshot_content"),
+                )])),
+                value: Expr::CompoundIdentifier(vec![
+                    Ident::new("excluded"),
+                    Ident::new("snapshot_content"),
+                ]),
+            },
+        );
+    }
+    for column in columns {
+        let name = column.value.as_str();
+        if matches!(
+            name,
+            "entity_id"
+                | "schema_key"
+                | "schema_version"
+                | "file_id"
+                | "version_id"
+                | "global"
+                | "plugin_key"
+                | "snapshot_content"
+                | "change_id"
+                | "metadata"
+                | "writer_key"
+                | "is_tombstone"
+                | "created_at"
+                | "updated_at"
+        ) {
+            continue;
+        }
+        assignments.push(Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new(name),
+            )])),
+            value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), Ident::new(name)]),
+        });
+    }
     OnInsert::OnConflict(OnConflict {
         conflict_target: Some(ConflictTarget::Columns(vec![
             Ident::new("entity_id"),
@@ -727,80 +857,7 @@ fn build_live_state_on_conflict() -> OnInsert {
             Ident::new("version_id"),
         ])),
         action: OnConflictAction::DoUpdate(DoUpdate {
-            assignments: vec![
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("global")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("global"),
-                    ]),
-                },
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("snapshot_content")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("snapshot_content"),
-                    ]),
-                },
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("schema_version")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("schema_version"),
-                    ]),
-                },
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("plugin_key")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("plugin_key"),
-                    ]),
-                },
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("change_id")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("change_id"),
-                    ]),
-                },
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("metadata")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("metadata"),
-                    ]),
-                },
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("writer_key")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("writer_key"),
-                    ]),
-                },
-                Assignment {
-                    target: AssignmentTarget::ColumnName(ObjectName(vec![
-                        ObjectNamePart::Identifier(Ident::new("updated_at")),
-                    ])),
-                    value: Expr::CompoundIdentifier(vec![
-                        Ident::new("excluded"),
-                        Ident::new("updated_at"),
-                    ]),
-                },
-            ],
+            assignments,
             selection: None,
         }),
     })
@@ -879,6 +936,8 @@ fn rewrite_tracked_rows(
     let mut change_rows = Vec::new();
     let mut materialized_by_schema: std::collections::BTreeMap<String, Vec<Vec<Expr>>> =
         std::collections::BTreeMap::new();
+    let mut materialized_columns_by_schema: std::collections::BTreeMap<String, Vec<Ident>> =
+        std::collections::BTreeMap::new();
 
     for (row, materialized) in rows {
         let schema_key_expr = row.get(schema_idx).ok_or_else(|| LixError {
@@ -891,14 +950,8 @@ fn rewrite_tracked_rows(
             "schema_key",
         )?;
 
-        if !live_table_requirements
-            .iter()
-            .any(|reg| reg.schema_key == schema_key)
-        {
-            live_table_requirements.push(SchemaLiveTableRequirement {
-                schema_key: schema_key.clone(),
-            });
-        }
+        let layout = required_live_table_layout_for_schema(&schema_key, None)?;
+        ensure_live_table_requirement(live_table_requirements, &schema_key, Some(layout.clone()));
 
         let snapshot_content =
             resolved_expr_or_original(materialized.get(snapshot_idx), row.get(snapshot_idx))?;
@@ -919,7 +972,6 @@ fn rewrite_tracked_rows(
             row.get(version_idx),
             "version_id",
         )?;
-
         let metadata_expr = match metadata_idx {
             Some(index) => resolved_expr_or_original(materialized.get(index), row.get(index))?,
             None => null_expr(),
@@ -952,7 +1004,7 @@ fn rewrite_tracked_rows(
             string_expr(&created_at),
         ]);
 
-        let resolved_row = vec![
+        let mut resolved_row = vec![
             resolved_expr_or_original(materialized.get(entity_idx), row.get(entity_idx))?,
             resolved_expr_or_original(materialized.get(schema_idx), row.get(schema_idx))?,
             resolved_expr_or_original(
@@ -963,7 +1015,6 @@ fn rewrite_tracked_rows(
             string_expr(&version_id),
             boolean_expr(version_id == GLOBAL_VERSION_ID),
             resolved_expr_or_original(materialized.get(plugin_idx), row.get(plugin_idx))?,
-            snapshot_content,
             string_expr(&change_id),
             metadata_expr,
             writer_key_expr,
@@ -971,6 +1022,30 @@ fn rewrite_tracked_rows(
             string_expr(&created_at),
             string_expr(&updated_at),
         ];
+        let normalized_columns = materialized_columns_by_schema
+            .entry(schema_key.clone())
+            .or_insert_with(|| {
+                layout
+                    .columns
+                    .iter()
+                    .map(|column| Ident::new(column.column_name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .clone();
+        let normalized_values = normalized_live_column_values(
+            &layout,
+            resolved_snapshot_json(materialized.get(snapshot_idx), row.get(snapshot_idx))?
+                .as_ref()
+                .map(JsonValue::to_string)
+                .as_deref(),
+        )?;
+        for column in &normalized_columns {
+            let value = normalized_values
+                .get(&column.value)
+                .cloned()
+                .unwrap_or(EngineValue::Null);
+            resolved_row.push(value_to_expr(&value)?);
+        }
 
         materialized_by_schema
             .entry(schema_key.clone())
@@ -1053,27 +1128,31 @@ fn rewrite_tracked_rows(
     }
 
     for (schema_key, rows) in materialized_by_schema {
-        let table_name = format!("{}{}", LIVE_STATE_PREFIX, schema_key);
+        let table_name = tracked_live_table_name(&schema_key);
+        let normalized_columns = materialized_columns_by_schema
+            .remove(&schema_key)
+            .unwrap_or_default();
+        let mut columns = vec![
+            Ident::new("entity_id"),
+            Ident::new("schema_key"),
+            Ident::new("schema_version"),
+            Ident::new("file_id"),
+            Ident::new("version_id"),
+            Ident::new("global"),
+            Ident::new("plugin_key"),
+            Ident::new("change_id"),
+            Ident::new("metadata"),
+            Ident::new("writer_key"),
+            Ident::new("is_tombstone"),
+            Ident::new("created_at"),
+            Ident::new("updated_at"),
+        ];
+        columns.extend(normalized_columns.clone());
         statements.push(make_insert_statement(
             &table_name,
-            vec![
-                Ident::new("entity_id"),
-                Ident::new("schema_key"),
-                Ident::new("schema_version"),
-                Ident::new("file_id"),
-                Ident::new("version_id"),
-                Ident::new("global"),
-                Ident::new("plugin_key"),
-                Ident::new("snapshot_content"),
-                Ident::new("change_id"),
-                Ident::new("metadata"),
-                Ident::new("writer_key"),
-                Ident::new("is_tombstone"),
-                Ident::new("created_at"),
-                Ident::new("updated_at"),
-            ],
+            columns.clone(),
             rows,
-            Some(build_live_state_on_conflict()),
+            Some(build_live_state_on_conflict(&columns)),
         ));
     }
 
@@ -1086,6 +1165,7 @@ async fn rewrite_tracked_rows_with_backend(
     rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
     live_table_requirements: &mut Vec<SchemaLiveTableRequirement>,
     mutations: &mut Vec<MutationRow>,
+    known_live_layouts: &BTreeMap<String, crate::schema::live_layout::LiveTableLayout>,
     placeholder_offset: usize,
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
@@ -1149,7 +1229,8 @@ async fn rewrite_tracked_rows_with_backend(
         };
         let domain_writer_key = explicit_writer_key.or_else(|| writer_key.map(ToString::to_string));
 
-        ensure_live_table_requirement(live_table_requirements, &schema_key);
+        let layout = known_live_layouts.get(&schema_key).cloned();
+        ensure_live_table_requirement(live_table_requirements, &schema_key, layout);
 
         let change_id = functions.uuid_v7();
         affected_versions.insert(version_id.clone());
@@ -1190,7 +1271,7 @@ async fn rewrite_tracked_rows_with_backend(
     let mut executor = BackendExecutor { backend };
     let versions = load_version_info_for_versions(&mut executor, &affected_versions).await?;
     let active_accounts = load_commit_active_accounts(&mut executor, &domain_changes).await?;
-    let commit_result = generate_commit(
+    let mut commit_result = generate_commit(
         GenerateCommitArgs {
             timestamp: timestamp.clone(),
             active_accounts,
@@ -1199,9 +1280,20 @@ async fn rewrite_tracked_rows_with_backend(
         },
         || functions.uuid_v7(),
     )?;
+    commit_result.derived_apply_input.live_layouts = load_live_layouts_for_rows_with_backend(
+        backend,
+        known_live_layouts,
+        &commit_result.derived_apply_input.live_state_rows,
+    )
+    .await?;
 
     for row in &commit_result.derived_apply_input.live_state_rows {
-        ensure_live_table_requirement(live_table_requirements, &row.schema_key);
+        let layout = commit_result
+            .derived_apply_input
+            .live_layouts
+            .get(&row.schema_key)
+            .cloned();
+        ensure_live_table_requirement(live_table_requirements, &row.schema_key, layout);
     }
 
     build_statement_batch_from_generate_commit_result(
@@ -1215,16 +1307,81 @@ async fn rewrite_tracked_rows_with_backend(
 fn ensure_live_table_requirement(
     live_table_requirements: &mut Vec<SchemaLiveTableRequirement>,
     schema_key: &str,
+    layout: Option<LiveTableLayout>,
 ) {
-    if live_table_requirements
-        .iter()
-        .any(|registration| registration.schema_key == schema_key)
+    if let Some(existing) = live_table_requirements
+        .iter_mut()
+        .find(|registration| registration.schema_key == schema_key)
     {
+        if existing.layout.is_none() && layout.is_some() {
+            existing.layout = layout;
+        }
         return;
     }
     live_table_requirements.push(SchemaLiveTableRequirement {
         schema_key: schema_key.to_string(),
+        layout,
     });
+}
+
+fn required_live_table_layout_for_schema(
+    schema_key: &str,
+    known_live_layouts: Option<&BTreeMap<String, LiveTableLayout>>,
+) -> Result<LiveTableLayout, LixError> {
+    if let Some(layout) = known_live_layouts.and_then(|layouts| layouts.get(schema_key)) {
+        return Ok(layout.clone());
+    }
+    if let Some(layout) = builtin_live_table_layout(schema_key)? {
+        return Ok(layout);
+    }
+    Err(LixError::new(
+        "LIX_ERROR_UNKNOWN",
+        &format!(
+            "normalized live-table rewrite requires a compiled live layout for schema '{}'",
+            schema_key
+        ),
+    ))
+}
+
+async fn required_live_table_layout_for_schema_with_backend(
+    backend: &dyn LixBackend,
+    schema_key: &str,
+    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
+) -> Result<LiveTableLayout, LixError> {
+    if let Some(layout) = known_live_layouts.get(schema_key) {
+        return Ok(layout.clone());
+    }
+    if let Some(layout) = builtin_live_table_layout(schema_key)? {
+        return Ok(layout);
+    }
+    load_live_table_layout_with_backend(backend, schema_key).await
+}
+
+async fn load_live_layouts_for_rows_with_backend(
+    backend: &dyn LixBackend,
+    known_live_layouts: &BTreeMap<String, crate::schema::live_layout::LiveTableLayout>,
+    rows: &[crate::state::commit::MaterializedStateRow],
+) -> Result<BTreeMap<String, crate::schema::live_layout::LiveTableLayout>, LixError> {
+    let schema_keys = rows
+        .iter()
+        .map(|row| row.schema_key.clone())
+        .collect::<BTreeSet<_>>();
+    let mut layouts = BTreeMap::new();
+    for schema_key in schema_keys {
+        if let Some(layout) = known_live_layouts.get(&schema_key) {
+            layouts.insert(schema_key, layout.clone());
+            continue;
+        }
+        if let Some(layout) = builtin_live_table_layout(&schema_key)? {
+            layouts.insert(schema_key, layout);
+            continue;
+        }
+        layouts.insert(
+            schema_key.clone(),
+            load_live_table_layout_with_backend(backend, &schema_key).await?,
+        );
+    }
+    Ok(layouts)
 }
 
 fn build_snapshot_on_conflict() -> OnInsert {
@@ -1237,10 +1394,11 @@ fn build_snapshot_on_conflict() -> OnInsert {
 fn build_untracked_insert(
     insert: &sqlparser::ast::Insert,
     rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
+    live_table_requirements: &mut Vec<SchemaLiveTableRequirement>,
     mutations: &mut Vec<MutationRow>,
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
-) -> Result<Statement, LixError> {
+) -> Result<Vec<Statement>, LixError> {
     let entity_idx = required_column_index(&insert.columns, "entity_id")?;
     let schema_idx = required_column_index(&insert.columns, "schema_key")?;
     let file_idx = required_column_index(&insert.columns, "file_id")?;
@@ -1251,107 +1409,310 @@ fn build_untracked_insert(
     let metadata_idx = find_column_index(&insert.columns, "metadata");
     let writer_key_idx = find_column_index(&insert.columns, "writer_key");
 
-    let mut mapped_rows = Vec::new();
+    let mut rows_by_schema: BTreeMap<String, Vec<Vec<Expr>>> = BTreeMap::new();
+    let mut normalized_columns_by_schema: BTreeMap<String, Vec<Ident>> = BTreeMap::new();
     for (row, materialized) in rows {
         let now = functions.timestamp();
+        let entity_id = resolved_string_required(
+            materialized.get(entity_idx),
+            row.get(entity_idx),
+            "entity_id",
+        )?;
+        let schema_key = resolved_string_required(
+            materialized.get(schema_idx),
+            row.get(schema_idx),
+            "schema_key",
+        )?;
+        let file_id =
+            resolved_string_required(materialized.get(file_idx), row.get(file_idx), "file_id")?;
         let version_id = resolved_string_required(
             materialized.get(version_idx),
             row.get(version_idx),
             "version_id",
         )?;
-        mapped_rows.push(vec![
-            resolved_expr_or_original(materialized.get(entity_idx), row.get(entity_idx))?,
-            resolved_expr_or_original(materialized.get(schema_idx), row.get(schema_idx))?,
-            resolved_expr_or_original(materialized.get(file_idx), row.get(file_idx))?,
+        let plugin_key = resolved_string_required(
+            materialized.get(plugin_idx),
+            row.get(plugin_idx),
+            "plugin_key",
+        )?;
+        let schema_version = resolved_string_required(
+            materialized.get(schema_version_idx),
+            row.get(schema_version_idx),
+            "schema_version",
+        )?;
+        let metadata_expr = match metadata_idx {
+            Some(index) => resolved_expr_or_original(materialized.get(index), row.get(index))?,
+            None => null_expr(),
+        };
+        let writer_key_expr = match writer_key_idx {
+            Some(index) => {
+                let explicit = resolved_optional_string(
+                    materialized.get(index),
+                    row.get(index),
+                    "writer_key",
+                )?;
+                explicit
+                    .or_else(|| writer_key.map(ToString::to_string))
+                    .map(|value| string_expr(&value))
+                    .unwrap_or_else(null_expr)
+            }
+            None => writer_key.map(string_expr).unwrap_or_else(null_expr),
+        };
+        let snapshot_json =
+            resolved_snapshot_json(materialized.get(snapshot_idx), row.get(snapshot_idx))?;
+        let global = version_id == GLOBAL_VERSION_ID;
+
+        let layout = required_live_table_layout_for_schema(&schema_key, None)?;
+        ensure_live_table_requirement(live_table_requirements, &schema_key, Some(layout.clone()));
+        let normalized_columns = normalized_columns_by_schema
+            .entry(schema_key.clone())
+            .or_insert_with(|| {
+                layout
+                    .columns
+                    .iter()
+                    .map(|column| Ident::new(column.column_name.clone()))
+                    .collect()
+            })
+            .clone();
+        let normalized_values = normalized_live_column_values(
+            &layout,
+            snapshot_json.as_ref().map(JsonValue::to_string).as_deref(),
+        )?;
+        let mut normalized_row = vec![
+            string_expr(&entity_id),
+            string_expr(&schema_key),
+            string_expr(&file_id),
             string_expr(&version_id),
-            boolean_expr(version_id == GLOBAL_VERSION_ID),
-            resolved_expr_or_original(materialized.get(plugin_idx), row.get(plugin_idx))?,
-            resolved_expr_or_original(materialized.get(snapshot_idx), row.get(snapshot_idx))?,
-            match metadata_idx {
-                Some(index) => resolved_expr_or_original(materialized.get(index), row.get(index))?,
-                None => null_expr(),
-            },
-            match writer_key_idx {
-                Some(index) => {
-                    let explicit = resolved_optional_string(
-                        materialized.get(index),
-                        row.get(index),
-                        "writer_key",
-                    )?;
-                    explicit
-                        .or_else(|| writer_key.map(ToString::to_string))
-                        .map(|value| string_expr(&value))
-                        .unwrap_or_else(null_expr)
-                }
-                None => writer_key.map(string_expr).unwrap_or_else(null_expr),
-            },
-            resolved_expr_or_original(
-                materialized.get(schema_version_idx),
-                row.get(schema_version_idx),
-            )?,
+            boolean_expr(global),
+            string_expr(&plugin_key),
+            metadata_expr.clone(),
+            writer_key_expr.clone(),
+            string_expr(&schema_version),
             string_expr(&now),
             string_expr(&now),
-        ]);
+        ];
+        for column in &normalized_columns {
+            let value = normalized_values
+                .get(&column.value)
+                .cloned()
+                .unwrap_or(EngineValue::Null);
+            normalized_row.push(value_to_expr(&value)?);
+        }
+        rows_by_schema
+            .entry(schema_key.clone())
+            .or_default()
+            .push(normalized_row);
 
         mutations.push(MutationRow {
             operation: MutationOperation::Insert,
-            entity_id: resolved_string_required(
-                materialized.get(entity_idx),
-                row.get(entity_idx),
-                "entity_id",
-            )?,
-            schema_key: resolved_string_required(
-                materialized.get(schema_idx),
-                row.get(schema_idx),
-                "schema_key",
-            )?,
-            schema_version: resolved_string_required(
-                materialized.get(schema_version_idx),
-                row.get(schema_version_idx),
-                "schema_version",
-            )?,
-            file_id: resolved_string_required(
-                materialized.get(file_idx),
-                row.get(file_idx),
-                "file_id",
-            )?,
-            version_id: resolved_string_required(
-                materialized.get(version_idx),
-                row.get(version_idx),
-                "version_id",
-            )?,
-            plugin_key: resolved_string_required(
-                materialized.get(plugin_idx),
-                row.get(plugin_idx),
-                "plugin_key",
-            )?,
-            snapshot_content: resolved_snapshot_json(
-                materialized.get(snapshot_idx),
-                row.get(snapshot_idx),
-            )?,
+            entity_id,
+            schema_key,
+            schema_version,
+            file_id,
+            version_id,
+            plugin_key,
+            snapshot_content: snapshot_json,
             untracked: true,
         });
     }
 
-    Ok(make_insert_statement(
-        UNTRACKED_TABLE,
-        vec![
+    let mut statements = Vec::new();
+    for (schema_key, rows) in rows_by_schema {
+        let normalized_columns = normalized_columns_by_schema
+            .remove(&schema_key)
+            .unwrap_or_default();
+        let mut columns = vec![
             Ident::new("entity_id"),
             Ident::new("schema_key"),
             Ident::new("file_id"),
             Ident::new("version_id"),
             Ident::new("global"),
             Ident::new("plugin_key"),
-            Ident::new("snapshot_content"),
             Ident::new("metadata"),
             Ident::new("writer_key"),
             Ident::new("schema_version"),
             Ident::new("created_at"),
             Ident::new("updated_at"),
-        ],
-        mapped_rows,
-        Some(build_untracked_on_conflict()),
-    ))
+        ];
+        columns.extend(normalized_columns.clone());
+        statements.push(make_insert_statement(
+            &untracked_live_table_name(&schema_key),
+            columns.clone(),
+            rows,
+            Some(build_normalized_untracked_on_conflict(
+                &columns,
+                &normalized_columns,
+            )),
+        ));
+    }
+
+    Ok(statements)
+}
+
+async fn build_untracked_insert_with_backend(
+    backend: &dyn LixBackend,
+    insert: &sqlparser::ast::Insert,
+    rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
+    live_table_requirements: &mut Vec<SchemaLiveTableRequirement>,
+    mutations: &mut Vec<MutationRow>,
+    known_live_layouts: &BTreeMap<String, crate::schema::live_layout::LiveTableLayout>,
+    writer_key: Option<&str>,
+    functions: &mut dyn LixFunctionProvider,
+) -> Result<Vec<Statement>, LixError> {
+    let entity_idx = required_column_index(&insert.columns, "entity_id")?;
+    let schema_idx = required_column_index(&insert.columns, "schema_key")?;
+    let file_idx = required_column_index(&insert.columns, "file_id")?;
+    let version_idx = required_column_index(&insert.columns, "version_id")?;
+    let plugin_idx = required_column_index(&insert.columns, "plugin_key")?;
+    let snapshot_idx = required_column_index(&insert.columns, "snapshot_content")?;
+    let schema_version_idx = required_column_index(&insert.columns, "schema_version")?;
+    let metadata_idx = find_column_index(&insert.columns, "metadata");
+    let writer_key_idx = find_column_index(&insert.columns, "writer_key");
+
+    let mut rows_by_schema: BTreeMap<String, Vec<Vec<Expr>>> = BTreeMap::new();
+    let mut normalized_columns_by_schema: BTreeMap<String, Vec<Ident>> = BTreeMap::new();
+    for (row, materialized) in rows {
+        let now = functions.timestamp();
+        let entity_id = resolved_string_required(
+            materialized.get(entity_idx),
+            row.get(entity_idx),
+            "entity_id",
+        )?;
+        let schema_key = resolved_string_required(
+            materialized.get(schema_idx),
+            row.get(schema_idx),
+            "schema_key",
+        )?;
+        let file_id =
+            resolved_string_required(materialized.get(file_idx), row.get(file_idx), "file_id")?;
+        let version_id = resolved_string_required(
+            materialized.get(version_idx),
+            row.get(version_idx),
+            "version_id",
+        )?;
+        let plugin_key = resolved_string_required(
+            materialized.get(plugin_idx),
+            row.get(plugin_idx),
+            "plugin_key",
+        )?;
+        let schema_version = resolved_string_required(
+            materialized.get(schema_version_idx),
+            row.get(schema_version_idx),
+            "schema_version",
+        )?;
+        let metadata_expr = match metadata_idx {
+            Some(index) => resolved_expr_or_original(materialized.get(index), row.get(index))?,
+            None => null_expr(),
+        };
+        let writer_key_expr = match writer_key_idx {
+            Some(index) => {
+                let explicit = resolved_optional_string(
+                    materialized.get(index),
+                    row.get(index),
+                    "writer_key",
+                )?;
+                explicit
+                    .or_else(|| writer_key.map(ToString::to_string))
+                    .map(|value| string_expr(&value))
+                    .unwrap_or_else(null_expr)
+            }
+            None => writer_key.map(string_expr).unwrap_or_else(null_expr),
+        };
+        let snapshot_json =
+            resolved_snapshot_json(materialized.get(snapshot_idx), row.get(snapshot_idx))?;
+        let global = version_id == GLOBAL_VERSION_ID;
+
+        let layout = if let Some(layout) = known_live_layouts.get(&schema_key) {
+            layout.clone()
+        } else if let Some(layout) = builtin_live_table_layout(&schema_key)? {
+            layout
+        } else {
+            load_live_table_layout_with_backend(backend, &schema_key).await?
+        };
+        ensure_live_table_requirement(live_table_requirements, &schema_key, Some(layout.clone()));
+        let normalized_columns = normalized_columns_by_schema
+            .entry(schema_key.clone())
+            .or_insert_with(|| {
+                layout
+                    .columns
+                    .iter()
+                    .map(|column| Ident::new(column.column_name.clone()))
+                    .collect()
+            })
+            .clone();
+        let normalized_values = normalized_live_column_values(
+            &layout,
+            snapshot_json.as_ref().map(JsonValue::to_string).as_deref(),
+        )?;
+        let mut normalized_row = vec![
+            string_expr(&entity_id),
+            string_expr(&schema_key),
+            string_expr(&file_id),
+            string_expr(&version_id),
+            boolean_expr(global),
+            string_expr(&plugin_key),
+            metadata_expr.clone(),
+            writer_key_expr.clone(),
+            string_expr(&schema_version),
+            string_expr(&now),
+            string_expr(&now),
+        ];
+        for column in &normalized_columns {
+            let value = normalized_values
+                .get(&column.value)
+                .cloned()
+                .unwrap_or(EngineValue::Null);
+            normalized_row.push(value_to_expr(&value)?);
+        }
+        rows_by_schema
+            .entry(schema_key.clone())
+            .or_default()
+            .push(normalized_row);
+
+        mutations.push(MutationRow {
+            operation: MutationOperation::Insert,
+            entity_id,
+            schema_key,
+            schema_version,
+            file_id,
+            version_id,
+            plugin_key,
+            snapshot_content: snapshot_json,
+            untracked: true,
+        });
+    }
+
+    let mut statements = Vec::new();
+    for (schema_key, rows) in rows_by_schema {
+        let normalized_columns = normalized_columns_by_schema
+            .remove(&schema_key)
+            .unwrap_or_default();
+        let mut columns = vec![
+            Ident::new("entity_id"),
+            Ident::new("schema_key"),
+            Ident::new("file_id"),
+            Ident::new("version_id"),
+            Ident::new("global"),
+            Ident::new("plugin_key"),
+            Ident::new("metadata"),
+            Ident::new("writer_key"),
+            Ident::new("schema_version"),
+            Ident::new("created_at"),
+            Ident::new("updated_at"),
+        ];
+        columns.extend(normalized_columns.clone());
+        statements.push(make_insert_statement(
+            &untracked_live_table_name(&schema_key),
+            columns.clone(),
+            rows,
+            Some(build_normalized_untracked_on_conflict(
+                &columns,
+                &normalized_columns,
+            )),
+        ));
+    }
+
+    Ok(statements)
 }
 
 fn filter_update_assignments(assignments: Vec<Assignment>) -> Vec<Assignment> {
@@ -1361,6 +1722,22 @@ fn filter_update_assignments(assignments: Vec<Assignment>) -> Vec<Assignment> {
         .filter(|assignment| !assignment_target_is_column(&assignment.target, "updated_at"))
         .filter(|assignment| !assignment_target_is_column(&assignment.target, "change_id"))
         .collect()
+}
+
+fn schema_key_from_rewritten_update_statement(
+    statement: &Statement,
+) -> Result<Option<String>, LixError> {
+    let Statement::Update(update) = statement else {
+        return Ok(None);
+    };
+    let TableFactor::Table { name, .. } = &update.table.relation else {
+        return Ok(None);
+    };
+    let relation_name = name.to_string();
+    if let Some(schema_key) = live_schema_key_for_table_name(&relation_name) {
+        return Ok(Some(schema_key.to_string()));
+    }
+    Ok(None)
 }
 
 fn validate_update_assignment_targets(assignments: &[Assignment]) -> Result<(), LixError> {
@@ -1433,11 +1810,138 @@ fn ensure_updated_at_assignment(assignments: &mut Vec<Assignment>) {
     });
 }
 
-fn build_update_returning() -> Vec<SelectItem> {
-    UPDATE_RETURNING_COLUMNS
+fn append_normalized_update_assignments(
+    assignments: &mut Vec<Assignment>,
+    schema_key: &str,
+) -> Result<(), LixError> {
+    let Some(layout) = builtin_live_table_layout(schema_key)? else {
+        return Ok(());
+    };
+    append_normalized_update_assignments_for_layout(assignments, &layout);
+    Ok(())
+}
+
+fn append_normalized_update_assignments_for_layout(
+    assignments: &mut Vec<Assignment>,
+    layout: &LiveTableLayout,
+) {
+    let Some(snapshot_expr) = assignments
         .iter()
-        .map(|column| SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(*column))))
-        .collect()
+        .find(|assignment| assignment_target_is_column(&assignment.target, "snapshot_content"))
+        .map(|assignment| assignment.value.clone())
+    else {
+        return;
+    };
+
+    for column in &layout.columns {
+        assignments.push(Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new(column.column_name.clone()),
+            )])),
+            value: normalized_live_update_expr(snapshot_expr.clone(), column),
+        });
+    }
+
+    assignments
+        .retain(|assignment| !assignment_target_is_column(&assignment.target, "snapshot_content"));
+}
+
+fn normalized_live_update_expr(
+    snapshot_expr: Expr,
+    column: &crate::schema::live_layout::LiveColumnSpec,
+) -> Expr {
+    match column.kind {
+        LiveColumnKind::String => lix_json_extract_expr(snapshot_expr, &column.property_name),
+        LiveColumnKind::JsonText => {
+            lix_json_extract_json_expr(snapshot_expr, &column.property_name)
+        }
+        LiveColumnKind::Integer => Expr::Cast {
+            kind: CastKind::Cast,
+            expr: Box::new(lix_json_extract_expr(snapshot_expr, &column.property_name)),
+            data_type: DataType::BigInt(None),
+            format: None,
+        },
+        LiveColumnKind::Number => Expr::Cast {
+            kind: CastKind::Cast,
+            expr: Box::new(lix_json_extract_expr(snapshot_expr, &column.property_name)),
+            data_type: DataType::DoublePrecision,
+            format: None,
+        },
+        LiveColumnKind::Boolean => Expr::Cast {
+            kind: CastKind::Cast,
+            expr: Box::new(lix_json_extract_expr(snapshot_expr, &column.property_name)),
+            data_type: DataType::Boolean,
+            format: None,
+        },
+    }
+}
+
+fn lix_json_extract_expr(json_expr: Expr, property_name: &str) -> Expr {
+    lix_json_extract_named_expr("lix_json_extract", json_expr, property_name)
+}
+
+fn lix_json_extract_json_expr(json_expr: Expr, property_name: &str) -> Expr {
+    lix_json_extract_named_expr("lix_json_extract_json", json_expr, property_name)
+}
+
+fn lix_json_extract_named_expr(function_name: &str, json_expr: Expr, property_name: &str) -> Expr {
+    Expr::Function(Function {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(function_name))]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    json_expr,
+                )),
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    string_expr(property_name),
+                )),
+            ],
+            clauses: Vec::new(),
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: Vec::new(),
+    })
+}
+
+fn build_update_returning(schema_key: &str) -> Result<Vec<SelectItem>, LixError> {
+    let layout = builtin_live_table_layout(schema_key)?;
+    build_update_returning_with_layout(schema_key, layout.as_ref())
+}
+
+fn build_update_returning_with_layout(
+    schema_key: &str,
+    layout: Option<&LiveTableLayout>,
+) -> Result<Vec<SelectItem>, LixError> {
+    let mut items = UPDATE_RETURNING_COLUMNS
+        .iter()
+        .map(|column| {
+            if *column == "snapshot_content" {
+                Ok(SelectItem::ExprWithAlias {
+                    expr: Expr::Value(Value::Null.into()),
+                    alias: Ident::new("snapshot_content"),
+                })
+            } else {
+                Ok(SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(
+                    *column,
+                ))))
+            }
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let normalized_columns = match layout {
+        Some(layout) => normalized_live_returning_columns_for_layout(layout),
+        None => normalized_live_returning_columns(schema_key)?,
+    };
+    items.extend(
+        normalized_columns
+            .into_iter()
+            .map(|column| SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(column)))),
+    );
+    Ok(items)
 }
 
 fn extract_explicit_writer_key_assignment(
@@ -1864,17 +2368,16 @@ fn delete_from_is_vtable(delete: &Delete) -> bool {
     }
 }
 
-fn replace_table_with_untracked(table: &mut TableWithJoins) {
+fn replace_table_with_schema_untracked(table: &mut TableWithJoins, schema_key: &str) {
     if let TableFactor::Table { name, .. } = &mut table.relation {
-        *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
-            UNTRACKED_TABLE,
-        ))]);
+        let table_name = untracked_live_table_name(schema_key);
+        *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(table_name))]);
     }
 }
 
 fn replace_table_with_materialized(table: &mut TableWithJoins, schema_key: &str) {
     if let TableFactor::Table { name, .. } = &mut table.relation {
-        let table_name = format!("{}{}", LIVE_STATE_PREFIX, schema_key);
+        let table_name = tracked_live_table_name(&schema_key);
         *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(table_name))]);
     }
 }
@@ -1895,27 +2398,25 @@ fn update_target_table_reference(table: &TableWithJoins) -> Result<String, LixEr
 }
 
 fn build_not_exists_untracked_shadow_predicate(
-    materialized_table_ref: &str,
+    schema_key: &str,
+    _materialized_table_ref: &str,
     entity_id_expr_sql: &str,
     file_id_expr_sql: &str,
     version_id_expr_sql: &str,
 ) -> Result<Expr, LixError> {
     let untracked_alias = "__lix_untracked";
-    let untracked_table = quote_ident(UNTRACKED_TABLE);
+    let untracked_table = quote_ident(&untracked_live_table_name(schema_key));
     let untracked_alias_quoted = quote_ident(untracked_alias);
-    let schema_key_expr_sql = materialized_column_sql(materialized_table_ref, "schema_key");
 
     let not_exists_sql = format!(
         "SELECT 1 WHERE NOT EXISTS (\
          SELECT 1 FROM {untracked_table} AS {untracked_alias} \
-         WHERE {untracked_alias}.schema_key = {schema_key_expr} \
-           AND {untracked_alias}.entity_id = {entity_id_expr} \
+         WHERE {untracked_alias}.entity_id = {entity_id_expr} \
            AND {untracked_alias}.file_id = {file_id_expr} \
            AND {untracked_alias}.version_id = {version_id_expr}\
          )",
         untracked_table = untracked_table,
         untracked_alias = untracked_alias_quoted,
-        schema_key_expr = schema_key_expr_sql,
         entity_id_expr = entity_id_expr_sql,
         file_id_expr = file_id_expr_sql,
         version_id_expr = version_id_expr_sql,
@@ -1934,14 +2435,14 @@ fn build_not_exists_untracked_shadow_predicate(
     })
 }
 
-fn replace_delete_from_untracked(delete: &mut Delete) {
+fn replace_delete_from_schema_untracked(delete: &mut Delete, schema_key: &str) {
     let tables = match &mut delete.from {
         sqlparser::ast::FromTable::WithFromKeyword(tables)
         | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
     };
 
     if let Some(table) = tables.first_mut() {
-        replace_table_with_untracked(table);
+        replace_table_with_schema_untracked(table, schema_key);
     }
 }
 
@@ -2203,6 +2704,91 @@ fn build_update_validation_plan(
         snapshot_content,
         snapshot_patch,
     }))
+}
+
+pub async fn enrich_update_rewrite_with_backend(
+    backend: &dyn LixBackend,
+    mut rewrite: UpdateRewrite,
+    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
+) -> Result<UpdateRewrite, LixError> {
+    match &mut rewrite {
+        UpdateRewrite::Statement(statement) => {
+            let Some(schema_key) =
+                schema_key_from_rewritten_update_statement(&statement.statement)?
+            else {
+                return Ok(rewrite);
+            };
+            if builtin_live_table_layout(&schema_key)?.is_some() {
+                return Ok(rewrite);
+            }
+            let layout = required_live_table_layout_for_schema_with_backend(
+                backend,
+                &schema_key,
+                known_live_layouts,
+            )
+            .await?;
+            let Statement::Update(update) = &mut statement.statement else {
+                return Ok(rewrite);
+            };
+            append_normalized_update_assignments_for_layout(&mut update.assignments, &layout);
+        }
+        UpdateRewrite::Planned(planned) => {
+            if builtin_live_table_layout(&planned.plan.schema_key)?.is_some() {
+                return Ok(rewrite);
+            }
+            let layout = required_live_table_layout_for_schema_with_backend(
+                backend,
+                &planned.plan.schema_key,
+                known_live_layouts,
+            )
+            .await?;
+            planned.plan.layout = Some(layout.clone());
+            for statement in &mut planned.pre_statements {
+                if let Statement::Update(update) = statement {
+                    append_normalized_update_assignments_for_layout(
+                        &mut update.assignments,
+                        &layout,
+                    );
+                }
+            }
+            if let Statement::Update(update) = &mut planned.statement {
+                append_normalized_update_assignments_for_layout(&mut update.assignments, &layout);
+                update.returning = Some(build_update_returning_with_layout(
+                    &planned.plan.schema_key,
+                    Some(&layout),
+                )?);
+            }
+        }
+    }
+
+    Ok(rewrite)
+}
+
+pub async fn enrich_delete_rewrite_with_backend(
+    backend: &dyn LixBackend,
+    mut rewrite: DeleteRewrite,
+    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
+) -> Result<DeleteRewrite, LixError> {
+    let DeleteRewrite::Planned(planned) = &mut rewrite else {
+        return Ok(rewrite);
+    };
+    if builtin_live_table_layout(&planned.plan.schema_key)?.is_some() {
+        return Ok(rewrite);
+    }
+    let layout = required_live_table_layout_for_schema_with_backend(
+        backend,
+        &planned.plan.schema_key,
+        known_live_layouts,
+    )
+    .await?;
+    planned.plan.layout = Some(layout.clone());
+    if let Statement::Update(update) = &mut planned.statement {
+        update.returning = Some(build_update_returning_with_layout(
+            &planned.plan.schema_key,
+            Some(&layout),
+        )?);
+    }
+    Ok(rewrite)
 }
 
 fn build_delete_validation_plan(

@@ -3,7 +3,10 @@ use std::collections::BTreeSet;
 use crate::deterministic_mode::DeterministicSettings;
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::functions::SharedFunctionProvider;
-use crate::schema::registry::ensure_schema_live_table_in_transaction;
+use crate::schema::registry::{
+    coalesce_live_table_requirements, ensure_schema_live_table_with_requirement,
+    ensure_schema_live_table_with_requirement_in_transaction,
+};
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::contracts::execution_plan::ExecutionPlan;
 use crate::sql::execution::contracts::executor_error::ExecutorError;
@@ -33,13 +36,10 @@ pub(crate) async fn execute_plan_sql(
 ) -> Result<SqlExecutionOutcome, ExecutorError> {
     let prepared_statements = lower_to_prepared_statements(plan);
 
-    for registration in &plan.preprocess.live_table_requirements {
-        crate::schema::registry::ensure_schema_live_table(
-            engine.backend_ref(),
-            &registration.schema_key,
-        )
-        .await
-        .map_err(ExecutorError::execute)?;
+    for registration in coalesce_live_table_requirements(&plan.preprocess.live_table_requirements) {
+        ensure_schema_live_table_with_requirement(engine.backend_ref(), &registration)
+            .await
+            .map_err(ExecutorError::execute)?;
     }
 
     let outcome = execute_internal_state_plan_with_backend(
@@ -77,8 +77,8 @@ pub(crate) async fn execute_plan_sql_with_transaction(
 ) -> Result<SqlExecutionOutcome, ExecutorError> {
     let prepared_statements = lower_to_prepared_statements(plan);
 
-    for registration in &plan.preprocess.live_table_requirements {
-        ensure_schema_live_table_in_transaction(transaction, &registration.schema_key)
+    for registration in coalesce_live_table_requirements(&plan.preprocess.live_table_requirements) {
+        ensure_schema_live_table_with_requirement_in_transaction(transaction, &registration)
             .await
             .map_err(ExecutorError::execute)?;
     }

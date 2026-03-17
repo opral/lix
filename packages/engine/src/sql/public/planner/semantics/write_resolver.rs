@@ -1,7 +1,11 @@
 use crate::account::{
     active_account_file_id, active_account_plugin_key, active_account_schema_key,
     active_account_schema_version, active_account_snapshot_content,
-    active_account_storage_version_id, parse_active_account_snapshot,
+    active_account_storage_version_id,
+};
+use crate::schema::live_store::{
+    load_exact_live_row_with_executor, load_untracked_live_rows_by_property_with_executor,
+    LiveRowScope,
 };
 use crate::sql::public::catalog::SurfaceFamily;
 use crate::sql::public::planner::ir::{
@@ -20,12 +24,12 @@ use crate::sql::public::planner::semantics::surface_semantics::OverlayLane;
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
     active_version_schema_version, active_version_snapshot_content,
-    active_version_storage_version_id, parse_active_version_snapshot, version_descriptor_file_id,
-    version_descriptor_plugin_key, version_descriptor_schema_key,
-    version_descriptor_schema_version, version_descriptor_snapshot_content,
-    version_descriptor_storage_version_id, version_ref_file_id, version_ref_plugin_key,
-    version_ref_schema_key, version_ref_schema_version, version_ref_snapshot_content,
-    version_ref_storage_version_id, GLOBAL_VERSION_ID,
+    active_version_storage_version_id, version_descriptor_file_id, version_descriptor_plugin_key,
+    version_descriptor_schema_key, version_descriptor_schema_version,
+    version_descriptor_snapshot_content, version_descriptor_storage_version_id,
+    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
+    version_ref_schema_version, version_ref_snapshot_content, version_ref_storage_version_id,
+    GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, Value};
 use serde_json::Value as JsonValue;
@@ -449,31 +453,33 @@ async fn resolve_active_account_delete_write_plan(
 async fn load_active_version_admin_rows(
     backend: &dyn LixBackend,
 ) -> Result<Vec<ActiveVersionAdminRow>, crate::LixError> {
-    let sql = format!(
-        "SELECT entity_id, snapshot_content \
-         FROM lix_internal_live_untracked_v1 \
-         WHERE schema_key = '{schema_key}' \
-           AND file_id = '{file_id}' \
-           AND version_id = '{storage_version_id}' \
-           AND snapshot_content IS NOT NULL \
-         ORDER BY updated_at DESC, entity_id ASC",
-        schema_key = active_version_schema_key(),
-        file_id = active_version_file_id(),
-        storage_version_id = active_version_storage_version_id(),
-    );
-    let result = backend.execute(&sql, &[]).await?;
-    let mut rows = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
-        let Some(id) = row.first().and_then(text_from_value) else {
-            continue;
-        };
-        let Some(snapshot_content) = row.get(1).and_then(text_from_value) else {
-            continue;
-        };
-        let version_id = parse_active_version_snapshot(&snapshot_content)?;
-        rows.push(ActiveVersionAdminRow { id, version_id });
-    }
-    Ok(rows)
+    let mut executor = backend;
+    let filters = BTreeMap::from([
+        ("file_id", active_version_file_id().to_string()),
+        (
+            "version_id",
+            active_version_storage_version_id().to_string(),
+        ),
+    ]);
+    let rows = load_untracked_live_rows_by_property_with_executor(
+        &mut executor,
+        active_version_schema_key(),
+        "version_id",
+        &filters,
+        true,
+        &["updated_at", "entity_id"],
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            row.property_text("version_id")
+                .map(|version_id| ActiveVersionAdminRow {
+                    id: row.entity_id,
+                    version_id,
+                })
+        })
+        .collect())
 }
 
 fn active_version_admin_pre_state_ref(row: &ActiveVersionAdminRow) -> ResolvedRowRef {
@@ -526,28 +532,30 @@ fn active_version_admin_row(id: &str, version_id: &str) -> PlannedStateRow {
 async fn load_active_account_admin_rows(
     backend: &dyn LixBackend,
 ) -> Result<Vec<ActiveAccountAdminRow>, crate::LixError> {
-    let sql = format!(
-        "SELECT entity_id, snapshot_content \
-         FROM lix_internal_live_untracked_v1 \
-         WHERE schema_key = '{schema_key}' \
-           AND file_id = '{file_id}' \
-           AND version_id = '{storage_version_id}' \
-           AND snapshot_content IS NOT NULL \
-         ORDER BY updated_at DESC, entity_id ASC",
-        schema_key = active_account_schema_key(),
-        file_id = active_account_file_id(),
-        storage_version_id = active_account_storage_version_id(),
-    );
-    let result = backend.execute(&sql, &[]).await?;
-    let mut rows = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
-        let Some(snapshot_content) = row.get(1).and_then(text_from_value) else {
-            continue;
-        };
-        let account_id = parse_active_account_snapshot(&snapshot_content)?;
-        rows.push(ActiveAccountAdminRow { account_id });
-    }
-    Ok(rows)
+    let mut executor = backend;
+    let filters = BTreeMap::from([
+        ("file_id", active_account_file_id().to_string()),
+        (
+            "version_id",
+            active_account_storage_version_id().to_string(),
+        ),
+    ]);
+    let rows = load_untracked_live_rows_by_property_with_executor(
+        &mut executor,
+        active_account_schema_key(),
+        "account_id",
+        &filters,
+        true,
+        &["updated_at", "entity_id"],
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            row.property_text("account_id")
+                .map(|account_id| ActiveAccountAdminRow { account_id })
+        })
+        .collect())
 }
 
 fn active_account_admin_pre_state_ref(row: &ActiveAccountAdminRow) -> ResolvedRowRef {
@@ -602,6 +610,10 @@ fn active_account_admin_tombstone_row(account_id: &str) -> PlannedStateRow {
     row.values.remove("snapshot_content");
     row.tombstone = true;
     row
+}
+
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 async fn resolve_version_insert_write_plan(
@@ -782,57 +794,53 @@ async fn load_version_admin_row(
     backend: &dyn LixBackend,
     version_id: &str,
 ) -> Result<Option<VersionAdminRow>, crate::LixError> {
-    let descriptor_sql = format!(
-        "SELECT snapshot_content, change_id \
-         FROM lix_internal_live_v1_lix_version_descriptor \
-         WHERE schema_key = '{schema_key}' \
-           AND entity_id = '{entity_id}' \
-           AND file_id = '{file_id}' \
-           AND plugin_key = '{plugin_key}' \
-           AND version_id = '{storage_version_id}' \
-           AND is_tombstone = 0 \
-           AND snapshot_content IS NOT NULL \
-         LIMIT 1",
-        schema_key = version_descriptor_schema_key(),
-        entity_id = version_id.replace('\'', "''"),
-        file_id = version_descriptor_file_id(),
-        plugin_key = version_descriptor_plugin_key(),
-        storage_version_id = version_descriptor_storage_version_id(),
-    );
-    let descriptor_result = backend.execute(&descriptor_sql, &[]).await?;
-    let Some(descriptor_row) = descriptor_result.rows.first() else {
+    let mut executor = backend;
+    let descriptor_filters = BTreeMap::from([
+        ("entity_id", version_id.to_string()),
+        ("file_id", version_descriptor_file_id().to_string()),
+        ("plugin_key", version_descriptor_plugin_key().to_string()),
+        (
+            "version_id",
+            version_descriptor_storage_version_id().to_string(),
+        ),
+    ]);
+    let Some(descriptor_row) = load_exact_live_row_with_executor(
+        &mut executor,
+        LiveRowScope::Tracked,
+        version_descriptor_schema_key(),
+        &descriptor_filters,
+    )
+    .await?
+    else {
         return Ok(None);
     };
-    let pointer_sql = format!(
-        "SELECT snapshot_content, change_id \
-         FROM lix_internal_live_v1_lix_version_ref \
-         WHERE schema_key = '{schema_key}' \
-           AND entity_id = '{entity_id}' \
-           AND file_id = '{file_id}' \
-           AND plugin_key = '{plugin_key}' \
-           AND version_id = '{storage_version_id}' \
-           AND is_tombstone = 0 \
-           AND snapshot_content IS NOT NULL \
-         LIMIT 1",
-        schema_key = version_ref_schema_key(),
-        entity_id = version_id.replace('\'', "''"),
-        file_id = version_ref_file_id(),
-        plugin_key = version_ref_plugin_key(),
-        storage_version_id = version_ref_storage_version_id(),
-    );
-    let pointer_result = backend.execute(&pointer_sql, &[]).await?;
-    let pointer_row = pointer_result.rows.first();
+    let pointer_filters = BTreeMap::from([
+        ("entity_id", version_id.to_string()),
+        ("file_id", version_ref_file_id().to_string()),
+        ("plugin_key", version_ref_plugin_key().to_string()),
+        ("version_id", version_ref_storage_version_id().to_string()),
+    ]);
+    let pointer_row = load_exact_live_row_with_executor(
+        &mut executor,
+        LiveRowScope::Tracked,
+        version_ref_schema_key(),
+        &pointer_filters,
+    )
+    .await?;
     Ok(Some(VersionAdminRow {
         id: version_id.to_string(),
-        name: row_snapshot_name(descriptor_row).unwrap_or_default(),
-        hidden: row_snapshot_hidden(descriptor_row).unwrap_or(false),
+        name: descriptor_row.property_text("name").unwrap_or_default(),
+        hidden: descriptor_row
+            .values
+            .get("hidden")
+            .and_then(value_as_bool)
+            .unwrap_or(false),
         commit_id: pointer_row
-            .and_then(|row| row_snapshot_commit_id(row))
+            .as_ref()
+            .and_then(|row| row.property_text("commit_id"))
             .unwrap_or_default(),
-        descriptor_change_id: descriptor_row.get(1).and_then(text_from_value),
-        pointer_change_id: pointer_row
-            .and_then(|row| row.get(1))
-            .and_then(text_from_value),
+        descriptor_change_id: descriptor_row.change_id,
+        pointer_change_id: pointer_row.and_then(|row| row.change_id),
     }))
 }
 

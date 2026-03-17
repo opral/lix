@@ -1070,7 +1070,7 @@ simulation_test!(
 
         let tracked = engine
             .execute(
-                "SELECT snapshot_content \
+                "SELECT value \
                  FROM lix_internal_live_v1_test_state_schema \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'effective-entity-u' \
@@ -1083,10 +1083,7 @@ simulation_test!(
             .unwrap();
 
         assert_eq!(tracked.statements[0].rows.len(), 1);
-        assert_text(
-            &tracked.statements[0].rows[0][0],
-            "{\"value\":\"tracked-initial\"}",
-        );
+        assert_text(&tracked.statements[0].rows[0][0], "tracked-initial");
     }
 );
 

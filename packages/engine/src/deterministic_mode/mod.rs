@@ -6,6 +6,10 @@ use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
 };
+use crate::schema::live_layout::{
+    builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
+    untracked_live_table_name,
+};
 use crate::sql::ast::utils::parse_sql_statements;
 use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
 use crate::sql::execution::preprocess::preprocess_statements_with_provider_to_plan as preprocess_statements_with_provider;
@@ -250,31 +254,40 @@ pub(crate) fn build_persist_sequence_highest_batch(
 }
 
 pub(crate) fn build_persist_sequence_highest_sql(highest_seen: i64) -> String {
-    let snapshot_content = serde_json::json!({
-        "key": SEQUENCE_KEY,
-        "value": highest_seen
-    })
-    .to_string();
+    let layout = builtin_live_table_layout(key_value_schema_key())
+        .expect("builtin key-value schema layout should compile")
+        .expect("builtin key-value schema layout should exist");
+    let key_column = live_column_name_for_property(&layout, "key")
+        .expect("key-value live layout should include key");
+    let value_column = live_column_name_for_property(&layout, "value")
+        .expect("key-value live layout should include value");
+    let value_json = serde_json::to_string(&serde_json::Value::from(highest_seen))
+        .expect("deterministic highest-seen JSON serialization should succeed");
 
     format!(
-        "INSERT INTO lix_internal_live_untracked_v1 \
-         (entity_id, schema_key, file_id, version_id, global, plugin_key, snapshot_content, metadata, writer_key, schema_version, created_at, updated_at) \
-         VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', FALSE, '{plugin_key}', '{snapshot_content}', NULL, NULL, '{schema_version}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) \
-         ON CONFLICT (entity_id, schema_key, file_id, version_id) DO UPDATE SET \
+        "INSERT INTO {table_name} \
+         (entity_id, schema_key, file_id, version_id, global, plugin_key, metadata, writer_key, schema_version, created_at, updated_at, {key_column}, {value_column}) \
+         VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', FALSE, '{plugin_key}', NULL, NULL, '{schema_version}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{key_value}', '{value_json}') \
+         ON CONFLICT (entity_id, file_id, version_id) DO UPDATE SET \
            global = excluded.global, \
            plugin_key = excluded.plugin_key, \
-           snapshot_content = excluded.snapshot_content, \
            metadata = excluded.metadata, \
            writer_key = excluded.writer_key, \
            schema_version = excluded.schema_version, \
+           {key_column} = excluded.{key_column}, \
+           {value_column} = excluded.{value_column}, \
            updated_at = CURRENT_TIMESTAMP",
+        table_name = untracked_live_table_name(key_value_schema_key()),
+        key_column = key_column,
+        value_column = value_column,
         entity_id = escape_sql_string(SEQUENCE_KEY),
+        key_value = escape_sql_string(SEQUENCE_KEY),
+        value_json = escape_sql_string(&value_json),
         schema_key = escape_sql_string(key_value_schema_key()),
         file_id = escape_sql_string(key_value_file_id()),
         version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
         plugin_key = escape_sql_string(key_value_plugin_key()),
         schema_version = escape_sql_string(key_value_schema_version()),
-        snapshot_content = escape_sql_string(&snapshot_content),
     )
 }
 
@@ -286,34 +299,37 @@ async fn load_key_value_payloads(
         return Ok(std::collections::BTreeMap::new());
     }
 
-    let table_name = format!("lix_internal_live_v1_{}", key_value_schema_key());
+    let table_name = tracked_live_table_name(key_value_schema_key());
+    let untracked_value_expr = "\"u\".\"value_json\"";
+    let tracked_value_expr = "\"t\".\"value_json\"";
     let in_list = entity_ids
         .iter()
         .map(|entity_id| format!("'{}'", escape_sql_string(entity_id)))
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT entity_id, snapshot_content, precedence \
+        "SELECT entity_id, value_json, precedence \
          FROM (\
-           SELECT entity_id, snapshot_content, 0 AS precedence \
-           FROM lix_internal_live_untracked_v1 \
-           WHERE schema_key = '{schema_key}' \
-             AND entity_id IN ({in_list}) \
-             AND version_id = '{version_id}' \
-             AND snapshot_content IS NOT NULL \
-           UNION ALL \
-           SELECT entity_id, snapshot_content, 1 AS precedence \
-           FROM {table_name} \
+           SELECT u.entity_id, {untracked_value_expr} AS value_json, 0 AS precedence \
+           FROM {untracked_table} u \
            WHERE entity_id IN ({in_list}) \
              AND version_id = '{version_id}' \
-             AND snapshot_content IS NOT NULL \
+             AND {untracked_value_expr} IS NOT NULL \
+           UNION ALL \
+           SELECT t.entity_id, {tracked_value_expr} AS value_json, 1 AS precedence \
+           FROM {table_name} t \
+           WHERE entity_id IN ({in_list}) \
+             AND version_id = '{version_id}' \
+             AND {tracked_value_expr} IS NOT NULL \
              AND is_tombstone = 0\
          ) visible_key_values \
          ORDER BY entity_id ASC, precedence ASC",
-        schema_key = escape_sql_string(key_value_schema_key()),
+        untracked_table = untracked_live_table_name(key_value_schema_key()),
+        untracked_value_expr = untracked_value_expr,
         in_list = in_list,
         version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
         table_name = table_name,
+        tracked_value_expr = tracked_value_expr,
     );
     let result = backend.execute(&sql, &[]).await?;
     let mut values = std::collections::BTreeMap::new();
@@ -325,17 +341,15 @@ async fn load_key_value_payloads(
         if values.contains_key(&entity_id) {
             continue;
         }
-        let Some(snapshot_value) = row.get(1) else {
+        let Some(value_json) = row.get(1) else {
             continue;
         };
-        let raw = value_to_string(snapshot_value, "snapshot_content")?;
+        let raw = value_to_string(value_json, "value_json")?;
         let parsed: JsonValue = serde_json::from_str(&raw).map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("deterministic mode snapshot_content invalid JSON: {err}"),
+            description: format!("deterministic mode value_json invalid JSON: {err}"),
         })?;
-        if let Some(value) = parsed.get("value") {
-            values.insert(entity_id, value.clone());
-        }
+        values.insert(entity_id, parsed);
     }
 
     Ok(values)
