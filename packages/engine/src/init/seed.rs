@@ -37,6 +37,7 @@ const SYSTEM_APP_DATA_DIRECTORY_PATH: &str = "/.lix/app_data/";
 const SYSTEM_PLUGIN_DIRECTORY_PATH: &str = "/.lix/plugins/";
 const BOOTSTRAP_CHANGE_SET_ID: &str = "00000000-0000-7000-8000-000000000001";
 const BOOTSTRAP_COMMIT_ID: &str = "00000000-0000-7000-8000-000000000002";
+const LIX_ID_KEY: &str = "lix_id";
 
 impl Engine {
     pub(crate) async fn ensure_builtin_schemas_installed(&self) -> Result<(), LixError> {
@@ -235,6 +236,18 @@ impl Engine {
                 normalized_literals = normalized_insert_literals_sql(&normalized_values),
             );
             self.backend.execute(&insert_sql, &[]).await?;
+
+            let change_id = self.generate_runtime_uuid().await?;
+            self.insert_change_row_for_snapshot(
+                &entity_id,
+                "lix_directory_descriptor",
+                "1",
+                "lix",
+                "lix",
+                &snapshot_content,
+                &change_id,
+            )
+            .await?;
         }
 
         Ok(())
@@ -295,10 +308,26 @@ impl Engine {
             "INSERT INTO lix_internal_state_vtable (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES ($1, 'lix_label', 'lix', 'global', 'lix', $2, '1', true)",
-            &[Value::Text(label_id.clone()), Value::Text(snapshot_content)],
+            &[
+                Value::Text(label_id.clone()),
+                Value::Text(snapshot_content.clone()),
+            ],
             ExecuteOptions::default(),
         )
         .await?;
+
+        let change_id = self.generate_runtime_uuid().await?;
+        self.insert_change_row_for_snapshot(
+            &label_id,
+            "lix_label",
+            "1",
+            "lix",
+            "lix",
+            &snapshot_content,
+            &change_id,
+        )
+        .await?;
+
         self.ensure_checkpoint_label_on_bootstrap_commit(&bootstrap_commit_id, &label_id)
             .await?;
         Ok(())
@@ -390,7 +419,137 @@ impl Engine {
             "INSERT INTO lix_internal_state_vtable (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES ($1, 'lix_entity_label', 'lix', 'global', 'lix', $2, '1', true)",
-            &[Value::Text(entity_label_id), Value::Text(snapshot_content)],
+            &[
+                Value::Text(entity_label_id.clone()),
+                Value::Text(snapshot_content.clone()),
+            ],
+            ExecuteOptions::default(),
+        )
+        .await?;
+
+        let change_id = self.generate_runtime_uuid().await?;
+        self.insert_change_row_for_snapshot(
+            &entity_label_id,
+            "lix_entity_label",
+            "1",
+            "lix",
+            "lix",
+            &snapshot_content,
+            &change_id,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn add_change_id_to_bootstrap_commit(
+        &self,
+        change_id: &str,
+    ) -> Result<(), LixError> {
+        let snapshot_row = self
+            .backend
+            .execute(
+                "SELECT s.content \
+                 FROM lix_internal_change c \
+                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+                 WHERE c.entity_id = $1 \
+                   AND c.schema_key = 'lix_commit' \
+                   AND c.file_id = 'lix' \
+                 ORDER BY c.created_at DESC \
+                 LIMIT 1",
+                &[Value::Text(BOOTSTRAP_COMMIT_ID.to_string())],
+            )
+            .await?;
+
+        let current_snapshot = snapshot_row
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|value| match value {
+                Value::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "add_change_id_to_bootstrap_commit: bootstrap commit canonical snapshot not found",
+                )
+            })?;
+
+        let mut parsed: JsonValue =
+            serde_json::from_str(current_snapshot).map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "add_change_id_to_bootstrap_commit: invalid JSON in bootstrap commit snapshot: {error}"
+                    ),
+                )
+            })?;
+
+        let change_ids = parsed
+            .get_mut("change_ids")
+            .and_then(JsonValue::as_array_mut)
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "add_change_id_to_bootstrap_commit: bootstrap commit snapshot missing change_ids array",
+                )
+            })?;
+        change_ids.push(JsonValue::String(change_id.to_string()));
+
+        let updated_snapshot = parsed.to_string();
+
+        // Update the canonical snapshot
+        let snapshot_id_row = self
+            .backend
+            .execute(
+                "SELECT c.snapshot_id \
+                 FROM lix_internal_change c \
+                 WHERE c.entity_id = $1 \
+                   AND c.schema_key = 'lix_commit' \
+                   AND c.file_id = 'lix' \
+                 ORDER BY c.created_at DESC \
+                 LIMIT 1",
+                &[Value::Text(BOOTSTRAP_COMMIT_ID.to_string())],
+            )
+            .await?;
+        let snapshot_id = snapshot_id_row
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|value| match value {
+                Value::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "add_change_id_to_bootstrap_commit: could not find snapshot_id for bootstrap commit change",
+                )
+            })?;
+
+        self.backend
+            .execute(
+                "UPDATE lix_internal_snapshot SET content = $1 WHERE id = $2",
+                &[
+                    Value::Text(updated_snapshot.clone()),
+                    Value::Text(snapshot_id),
+                ],
+            )
+            .await?;
+
+        // Update the live table row (state vtable)
+        self.execute_internal(
+            "UPDATE lix_internal_state_vtable \
+             SET snapshot_content = $1 \
+             WHERE schema_key = 'lix_commit' \
+               AND entity_id = $2 \
+               AND file_id = 'lix' \
+               AND version_id = 'global'",
+            &[
+                Value::Text(updated_snapshot),
+                Value::Text(BOOTSTRAP_COMMIT_ID.to_string()),
+            ],
             ExecuteOptions::default(),
         )
         .await?;
@@ -398,7 +557,91 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) async fn seed_lix_id(&self) -> Result<(), LixError> {
+        ensure_schema_live_table(self.backend.as_ref(), key_value_schema_key()).await?;
+        let table = tracked_live_table_name(key_value_schema_key());
+        let check_sql = format!(
+            "SELECT 1 \
+             FROM {table} \
+             WHERE schema_key = '{schema_key}' \
+               AND entity_id = '{entity_id}' \
+               AND file_id = '{file_id}' \
+               AND is_tombstone = 0 \
+             LIMIT 1",
+            table = quote_ident(&table),
+            schema_key = escape_sql_string(key_value_schema_key()),
+            entity_id = escape_sql_string(LIX_ID_KEY),
+            file_id = escape_sql_string(key_value_file_id()),
+        );
+        let existing = self.backend.execute(&check_sql, &[]).await?;
+        if !existing.rows.is_empty() {
+            return Ok(());
+        }
+
+        let lix_id_value = self.generate_runtime_uuid().await?;
+        let version_id = KEY_VALUE_GLOBAL_VERSION;
+        let snapshot_content = serde_json::json!({
+            "key": LIX_ID_KEY,
+            "value": lix_id_value,
+        })
+        .to_string();
+
+        let change_id = self.generate_runtime_uuid().await?;
+        let normalized_values =
+            normalized_seed_values(key_value_schema_key(), Some(&snapshot_content))?;
+        let insert_sql = format!(
+            "INSERT INTO {table} (\
+             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, writer_key, is_tombstone, created_at, updated_at{normalized_columns}\
+             ) VALUES (\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'{normalized_literals}\
+             )",
+            table = quote_ident(&table),
+            entity_id = escape_sql_string(LIX_ID_KEY),
+            schema_key = escape_sql_string(key_value_schema_key()),
+            schema_version = escape_sql_string(key_value_schema_version()),
+            file_id = escape_sql_string(key_value_file_id()),
+            version_id = escape_sql_string(version_id),
+            plugin_key = escape_sql_string(key_value_plugin_key()),
+            change_id = escape_sql_string(&change_id),
+            normalized_columns = normalized_insert_columns_sql(&normalized_values),
+            normalized_literals = normalized_insert_literals_sql(&normalized_values),
+        );
+        self.backend.execute(&insert_sql, &[]).await?;
+
+        self.insert_change_row_for_snapshot(
+            LIX_ID_KEY,
+            key_value_schema_key(),
+            key_value_schema_version(),
+            key_value_file_id(),
+            key_value_plugin_key(),
+            &snapshot_content,
+            &change_id,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub(crate) async fn seed_default_versions(&self) -> Result<String, LixError> {
+        // Bootstrap commit + change set must be seeded first so that
+        // `add_change_id_to_bootstrap_commit` can find the canonical snapshot.
+        let bootstrap_commit_id = self
+            .load_latest_commit_id()
+            .await?
+            .unwrap_or_else(|| BOOTSTRAP_COMMIT_ID.to_string());
+        if bootstrap_commit_id == BOOTSTRAP_COMMIT_ID {
+            let change_set_change_id = self
+                .seed_bootstrap_change_set(BOOTSTRAP_CHANGE_SET_ID)
+                .await?;
+            self.seed_bootstrap_commit(BOOTSTRAP_COMMIT_ID, BOOTSTRAP_CHANGE_SET_ID)
+                .await?;
+            // Change set canonical storage does not need a change_ids entry
+            // because lix_change_set is discovered via the commit snapshot's
+            // change_set_id property, not through change_ids membership.
+            let _ = change_set_change_id;
+        }
+        self.assert_commit_change_set_integrity(&bootstrap_commit_id)
+            .await?;
+
         let main_version_id = match self
             .find_version_id_by_name(DEFAULT_ACTIVE_VERSION_NAME)
             .await?
@@ -406,44 +649,49 @@ impl Engine {
             Some(version_id) => version_id,
             None => {
                 let generated_main_id = self.generate_runtime_uuid().await?;
-                self.seed_canonical_version_descriptor(
-                    &generated_main_id,
-                    DEFAULT_ACTIVE_VERSION_NAME,
-                )
-                .await?;
+                let desc_change_id = self
+                    .seed_canonical_version_descriptor(
+                        &generated_main_id,
+                        DEFAULT_ACTIVE_VERSION_NAME,
+                    )
+                    .await?;
                 self.seed_materialized_version_descriptor(
                     &generated_main_id,
                     DEFAULT_ACTIVE_VERSION_NAME,
+                    &desc_change_id,
                 )
                 .await?;
                 generated_main_id
             }
         };
 
-        let bootstrap_commit_id = self
-            .load_latest_commit_id()
-            .await?
-            .unwrap_or_else(|| BOOTSTRAP_COMMIT_ID.to_string());
-        if bootstrap_commit_id == BOOTSTRAP_COMMIT_ID {
-            self.seed_bootstrap_change_set(BOOTSTRAP_CHANGE_SET_ID)
-                .await?;
-            self.seed_bootstrap_commit(BOOTSTRAP_COMMIT_ID, BOOTSTRAP_CHANGE_SET_ID)
-                .await?;
-        }
-        self.assert_commit_change_set_integrity(&bootstrap_commit_id)
+        let global_desc_change_id = self
+            .seed_canonical_version_descriptor(GLOBAL_VERSION_ID, GLOBAL_VERSION_ID)
             .await?;
-        self.seed_canonical_version_descriptor(GLOBAL_VERSION_ID, GLOBAL_VERSION_ID)
+        self.seed_materialized_version_descriptor(
+            GLOBAL_VERSION_ID,
+            GLOBAL_VERSION_ID,
+            &global_desc_change_id,
+        )
+        .await?;
+        let global_ref_change_id = self
+            .seed_canonical_version_ref(GLOBAL_VERSION_ID, &bootstrap_commit_id)
             .await?;
-        self.seed_materialized_version_descriptor(GLOBAL_VERSION_ID, GLOBAL_VERSION_ID)
+        self.seed_materialized_version_ref(
+            GLOBAL_VERSION_ID,
+            &bootstrap_commit_id,
+            &global_ref_change_id,
+        )
+        .await?;
+        let main_ref_change_id = self
+            .seed_canonical_version_ref(&main_version_id, &bootstrap_commit_id)
             .await?;
-        self.seed_canonical_version_ref(GLOBAL_VERSION_ID, &bootstrap_commit_id)
-            .await?;
-        self.seed_materialized_version_ref(GLOBAL_VERSION_ID, &bootstrap_commit_id)
-            .await?;
-        self.seed_canonical_version_ref(&main_version_id, &bootstrap_commit_id)
-            .await?;
-        self.seed_materialized_version_ref(&main_version_id, &bootstrap_commit_id)
-            .await?;
+        self.seed_materialized_version_ref(
+            &main_version_id,
+            &bootstrap_commit_id,
+            &main_ref_change_id,
+        )
+        .await?;
 
         Ok(main_version_id)
     }
@@ -577,6 +825,7 @@ impl Engine {
         &self,
         entity_id: &str,
         name: &str,
+        change_id: &str,
     ) -> Result<(), LixError> {
         ensure_schema_live_table(self.backend.as_ref(), version_descriptor_schema_key()).await?;
         let table = tracked_live_table_name(version_descriptor_schema_key());
@@ -610,7 +859,6 @@ impl Engine {
         })?;
         let normalized_values =
             normalized_seed_values(version_descriptor_schema_key(), Some(&snapshot_content))?;
-        let change_id = format!("seed~{}~{}", version_descriptor_schema_key(), entity_id);
         let insert_sql = format!(
             "INSERT INTO {table} (\
              entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, writer_key, is_tombstone, created_at, updated_at{normalized_columns}\
@@ -637,10 +885,10 @@ impl Engine {
         &self,
         entity_id: &str,
         name: &str,
-    ) -> Result<(), LixError> {
+    ) -> Result<String, LixError> {
         let snapshot_content =
             version_descriptor_snapshot_content(entity_id, name, entity_id == GLOBAL_VERSION_ID);
-        let change_id = format!("seed~{}~{}", version_descriptor_schema_key(), entity_id);
+        let change_id = self.generate_runtime_uuid().await?;
         self.insert_change_row_for_snapshot(
             entity_id,
             version_descriptor_schema_key(),
@@ -650,7 +898,9 @@ impl Engine {
             &snapshot_content,
             &change_id,
         )
-        .await
+        .await?;
+        self.add_change_id_to_bootstrap_commit(&change_id).await?;
+        Ok(change_id)
     }
 
     async fn insert_change_row_for_snapshot(
@@ -746,10 +996,10 @@ impl Engine {
         &self,
         entity_id: &str,
         commit_id: &str,
+        change_id: &str,
     ) -> Result<(), LixError> {
         ensure_schema_live_table(self.backend.as_ref(), version_ref_schema_key()).await?;
         let snapshot_content = version_ref_snapshot_content(entity_id, commit_id);
-        let change_id = format!("seed~{}~{}", version_ref_schema_key(), entity_id);
         let table = tracked_live_table_name(version_ref_schema_key());
         builtin_live_table_layout(version_ref_schema_key())?.ok_or_else(|| {
             LixError::new(
@@ -855,9 +1105,9 @@ impl Engine {
         &self,
         entity_id: &str,
         commit_id: &str,
-    ) -> Result<(), LixError> {
+    ) -> Result<String, LixError> {
         let snapshot_content = version_ref_snapshot_content(entity_id, commit_id);
-        let change_id = format!("seed~{}~{}", version_ref_schema_key(), entity_id);
+        let change_id = self.generate_runtime_uuid().await?;
         self.insert_change_row_for_snapshot(
             entity_id,
             version_ref_schema_key(),
@@ -867,7 +1117,9 @@ impl Engine {
             &snapshot_content,
             &change_id,
         )
-        .await
+        .await?;
+        self.add_change_id_to_bootstrap_commit(&change_id).await?;
+        Ok(change_id)
     }
 
     pub(crate) async fn insert_last_checkpoint_for_version(
@@ -1081,9 +1333,21 @@ impl Engine {
              ) VALUES ($1, 'lix_commit', 'lix', 'global', 'lix', $2, '1', true)",
             &[
                 Value::Text(commit_id.to_string()),
-                Value::Text(snapshot_content),
+                Value::Text(snapshot_content.clone()),
             ],
             ExecuteOptions::default(),
+        )
+        .await?;
+
+        let change_id = self.generate_runtime_uuid().await?;
+        self.insert_change_row_for_snapshot(
+            commit_id,
+            "lix_commit",
+            "1",
+            "lix",
+            "lix",
+            &snapshot_content,
+            &change_id,
         )
         .await?;
         Ok(())
@@ -1092,7 +1356,7 @@ impl Engine {
     pub(crate) async fn seed_bootstrap_change_set(
         &self,
         change_set_id: &str,
-    ) -> Result<(), LixError> {
+    ) -> Result<String, LixError> {
         let existing = self
             .execute_internal(
                 "SELECT 1 \
@@ -1115,7 +1379,7 @@ impl Engine {
             ));
         };
         if !statement.rows.is_empty() {
-            return Ok(());
+            return Ok(String::new());
         }
 
         let snapshot_content = serde_json::json!({
@@ -1128,12 +1392,24 @@ impl Engine {
              ) VALUES ($1, 'lix_change_set', 'lix', 'global', 'lix', $2, '1', true)",
             &[
                 Value::Text(change_set_id.to_string()),
-                Value::Text(snapshot_content),
+                Value::Text(snapshot_content.clone()),
             ],
             ExecuteOptions::default(),
         )
         .await?;
-        Ok(())
+
+        let change_id = self.generate_runtime_uuid().await?;
+        self.insert_change_row_for_snapshot(
+            change_set_id,
+            "lix_change_set",
+            "1",
+            "lix",
+            "lix",
+            &snapshot_content,
+            &change_id,
+        )
+        .await?;
+        Ok(change_id)
     }
 
     pub(crate) async fn assert_commit_change_set_integrity(
