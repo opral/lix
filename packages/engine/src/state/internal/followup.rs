@@ -18,7 +18,9 @@ use crate::version::{
     version_descriptor_file_id, version_descriptor_schema_key,
     version_descriptor_storage_version_id, GLOBAL_VERSION_ID,
 };
-use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value as EngineValue};
+use crate::{
+    CanonicalJson, LixError, LixTransaction, QueryResult, SqlDialect, Value as EngineValue,
+};
 
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
@@ -325,8 +327,10 @@ async fn build_update_followup_statement_batch(
             5,
             UPDATE_RETURNING_COLUMNS.len(),
         )?
-        .map(|snapshot| snapshot.to_string());
-        let metadata = value_to_optional_text(&row[6], "metadata")?;
+        .map(|snapshot| CanonicalJson::from_text(snapshot.to_string()))
+        .transpose()?;
+        let metadata =
+            canonical_json_from_optional_text(value_to_optional_text(&row[6], "metadata")?)?;
         let row_writer_key = match (
             &plan.explicit_writer_key,
             plan.writer_key_assignment_present,
@@ -406,7 +410,8 @@ async fn build_delete_followup_statement_batch(
             5,
             UPDATE_RETURNING_COLUMNS.len(),
         )?;
-        let metadata = value_to_optional_text(&row[6], "metadata")?;
+        let metadata =
+            canonical_json_from_optional_text(value_to_optional_text(&row[6], "metadata")?)?;
         let row_writer_key = writer_key.map(ToString::to_string);
         tombstoned_keys.insert((entity_id.clone(), file_id.clone(), version_id.clone()));
         affected_versions.insert(version_id.clone());
@@ -507,7 +512,7 @@ struct EffectiveScopeDeleteRow {
     version_id: String,
     plugin_key: String,
     schema_version: String,
-    metadata: Option<String>,
+    metadata: Option<CanonicalJson>,
 }
 
 async fn load_effective_scope_delete_rows(
@@ -608,10 +613,18 @@ async fn load_effective_scope_delete_rows(
             version_id: value_to_string(&row[2], "version_id")?,
             plugin_key: value_to_string(&row[3], "plugin_key")?,
             schema_version: value_to_string(&row[4], "schema_version")?,
-            metadata: value_to_optional_text(&row[5], "metadata")?,
+            metadata: canonical_json_from_optional_text(value_to_optional_text(
+                &row[5], "metadata",
+            )?)?,
         });
     }
     Ok(resolved)
+}
+
+fn canonical_json_from_optional_text(
+    value: Option<String>,
+) -> Result<Option<CanonicalJson>, LixError> {
+    value.map(CanonicalJson::from_text).transpose()
 }
 
 fn lower_single_statement_for_dialect(sql: &str, dialect: SqlDialect) -> Result<String, LixError> {

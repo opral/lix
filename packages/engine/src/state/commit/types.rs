@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::schema::live_layout::LiveTableLayout;
+use crate::CanonicalJson;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProposedDomainChange {
@@ -23,8 +24,8 @@ pub struct DomainChangeInput {
     pub schema_version: String,
     pub file_id: String,
     pub plugin_key: String,
-    pub snapshot_content: Option<String>,
-    pub metadata: Option<String>,
+    pub snapshot_content: Option<CanonicalJson>,
+    pub metadata: Option<CanonicalJson>,
     pub created_at: String,
     pub version_id: String,
     pub writer_key: Option<String>,
@@ -57,8 +58,8 @@ pub struct ChangeRow {
     pub schema_version: String,
     pub file_id: String,
     pub plugin_key: String,
-    pub snapshot_content: Option<String>,
-    pub metadata: Option<String>,
+    pub snapshot_content: Option<CanonicalJson>,
+    pub metadata: Option<CanonicalJson>,
     pub created_at: String,
 }
 
@@ -70,8 +71,8 @@ pub struct MaterializedStateRow {
     pub schema_version: String,
     pub file_id: String,
     pub plugin_key: String,
-    pub snapshot_content: Option<String>,
-    pub metadata: Option<String>,
+    pub snapshot_content: Option<CanonicalJson>,
+    pub metadata: Option<CanonicalJson>,
     pub created_at: String,
     pub lixcol_version_id: String,
     pub lixcol_commit_id: String,

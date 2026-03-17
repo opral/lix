@@ -1,14 +1,9 @@
 export { default } from "./wasm/lix_engine_wasm_bindgen.js";
 export * from "./wasm/lix_engine_wasm_bindgen.js";
 import type { InitInput } from "./wasm/lix_engine_wasm_bindgen.js";
+import type { LixJsonValue } from "../canonical-json.js";
 
-export type JsonValue =
-	| null
-	| boolean
-	| number
-	| string
-	| JsonValue[]
-	| { [key: string]: JsonValue };
+export type JsonValue = LixJsonValue;
 
 export type ValueKind =
 	| "null"

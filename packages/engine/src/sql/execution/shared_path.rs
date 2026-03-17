@@ -43,6 +43,7 @@ use crate::sql::execution::runtime_effects::{
 };
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::state::internal::write_program::WriteProgram;
+use crate::CanonicalJson;
 use serde_json::{json, Value as JsonValue};
 use sqlparser::ast::Statement;
 
@@ -715,8 +716,18 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
                         ),
                     )
                 })?,
-                snapshot_content: change.snapshot_content.clone(),
-                metadata: change.metadata.clone(),
+                snapshot_content: canonicalize_optional_json_text(
+                    change.snapshot_content.as_deref(),
+                    "snapshot_content",
+                    &change.schema_key,
+                    &change.entity_id,
+                )?,
+                metadata: canonicalize_optional_json_text(
+                    change.metadata.as_deref(),
+                    "metadata",
+                    &change.schema_key,
+                    &change.entity_id,
+                )?,
                 created_at: timestamp.to_string(),
                 version_id: change.version_id.clone(),
                 writer_key: change.writer_key.clone(),
@@ -775,6 +786,26 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
         functions,
     )
     .await
+}
+
+fn canonicalize_optional_json_text(
+    value: Option<&str>,
+    field_name: &str,
+    schema_key: &str,
+    entity_id: &str,
+) -> Result<Option<CanonicalJson>, LixError> {
+    value
+        .map(CanonicalJson::from_text)
+        .transpose()
+        .map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "public merge requires valid JSON {field_name} for '{schema_key}:{entity_id}': {}",
+                    error.description
+                ),
+            )
+        })
 }
 
 async fn load_version_info_for_domain_changes(
@@ -860,7 +891,7 @@ fn rewrite_generated_commit_result_for_pending_session(
         schema_version: session.commit_schema_version.clone(),
         file_id: session.commit_file_id.clone(),
         plugin_key: session.commit_plugin_key.clone(),
-        snapshot_content: Some(session.commit_snapshot.to_string()),
+        snapshot_content: Some(CanonicalJson::from_value(session.commit_snapshot.clone())?),
         metadata: None,
         created_at: timestamp.to_string(),
         lixcol_version_id: GLOBAL_VERSION_ID.to_string(),
@@ -914,7 +945,7 @@ fn is_pending_commit_meta_row(
 fn rewrite_change_set_element_snapshot(
     snapshot: Option<&str>,
     change_set_id: &str,
-) -> Result<(String, String), LixError> {
+) -> Result<(String, CanonicalJson), LixError> {
     let snapshot = snapshot.ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -939,7 +970,10 @@ fn rewrite_change_set_element_snapshot(
         })?
         .to_string();
     parsed["change_set_id"] = JsonValue::String(change_set_id.to_string());
-    Ok((format!("{change_set_id}~{change_id}"), parsed.to_string()))
+    Ok((
+        format!("{change_set_id}~{change_id}"),
+        CanonicalJson::from_value(parsed)?,
+    ))
 }
 
 fn pending_session_version_ref_entity_id(lane: &CreateCommitWriteLane) -> &str {

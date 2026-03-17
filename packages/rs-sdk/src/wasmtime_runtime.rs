@@ -3,7 +3,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use lix_engine::{LixError, WasmComponentInstance, WasmLimits, WasmRuntime};
+use lix_engine::{CanonicalJson, LixError, WasmComponentInstance, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
@@ -40,12 +40,12 @@ struct WireActiveStateRow {
     entity_id: String,
     schema_key: Option<String>,
     schema_version: Option<String>,
-    snapshot_content: Option<String>,
+    snapshot_content: Option<CanonicalJson>,
     file_id: Option<String>,
     plugin_key: Option<String>,
     version_id: Option<String>,
     change_id: Option<String>,
-    metadata: Option<String>,
+    metadata: Option<CanonicalJson>,
     created_at: Option<String>,
     updated_at: Option<String>,
 }
@@ -55,7 +55,7 @@ struct WirePluginEntityChange {
     entity_id: String,
     schema_key: String,
     schema_version: String,
-    snapshot_content: Option<String>,
+    snapshot_content: Option<CanonicalJson>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,7 +69,7 @@ struct WirePluginEntityChangeOutput {
     entity_id: String,
     schema_key: String,
     schema_version: String,
-    snapshot_content: Option<String>,
+    snapshot_content: Option<CanonicalJson>,
 }
 
 pub struct WasmtimeRuntime {
@@ -240,13 +240,8 @@ impl WasmComponentInstance for WasmtimeInstance {
                     Ok(changes) => {
                         let wire = changes
                             .into_iter()
-                            .map(|change| WirePluginEntityChangeOutput {
-                                entity_id: change.entity_id,
-                                schema_key: change.schema_key,
-                                schema_version: change.schema_version,
-                                snapshot_content: change.snapshot_content,
-                            })
-                            .collect::<Vec<_>>();
+                            .map(binding_change_to_wire)
+                            .collect::<Result<Vec<_>, _>>()?;
                         serde_json::to_vec(&wire).map_err(|error| LixError {
                             code: "LIX_ERROR_UNKNOWN".to_string(),
                             description: format!(
@@ -315,7 +310,7 @@ fn wire_change_to_binding(
         entity_id: change.entity_id,
         schema_key: change.schema_key,
         schema_version: change.schema_version,
-        snapshot_content: change.snapshot_content,
+        snapshot_content: change.snapshot_content.map(Into::into),
     }
 }
 
@@ -338,15 +333,29 @@ fn wire_active_state_row_to_binding(
         entity_id: row.entity_id,
         schema_key: row.schema_key,
         schema_version: row.schema_version,
-        snapshot_content: row.snapshot_content,
+        snapshot_content: row.snapshot_content.map(Into::into),
         file_id: row.file_id,
         plugin_key: row.plugin_key,
         version_id: row.version_id,
         change_id: row.change_id,
-        metadata: row.metadata,
+        metadata: row.metadata.map(Into::into),
         created_at: row.created_at,
         updated_at: row.updated_at,
     }
+}
+
+fn binding_change_to_wire(
+    change: plugin_bindings::exports::lix::plugin::api::EntityChange,
+) -> Result<WirePluginEntityChangeOutput, LixError> {
+    Ok(WirePluginEntityChangeOutput {
+        entity_id: change.entity_id,
+        schema_key: change.schema_key,
+        schema_version: change.schema_version,
+        snapshot_content: change
+            .snapshot_content
+            .map(CanonicalJson::from_text)
+            .transpose()?,
+    })
 }
 
 fn map_plugin_error(error: plugin_bindings::exports::lix::plugin::api::PluginError) -> LixError {

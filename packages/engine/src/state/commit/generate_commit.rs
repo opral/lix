@@ -7,6 +7,7 @@ use crate::state::commit::types::{
     CanonicalCommitOutput, ChangeRow, DerivedCommitApplyInput, DomainChangeInput,
     GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow,
 };
+use crate::CanonicalJson;
 use crate::LixError;
 
 const GLOBAL_VERSION: &str = "global";
@@ -128,13 +129,10 @@ where
             schema_version: version_ref_schema.schema_version.clone(),
             file_id: version_ref_schema.file_id.clone(),
             plugin_key: version_ref_schema.plugin_key.clone(),
-            snapshot_content: Some(
-                json!({
-                    "id": version_id,
-                    "commit_id": meta.commit_id,
-                })
-                .to_string(),
-            ),
+            snapshot_content: Some(canonical_json(json!({
+                "id": version_id,
+                "commit_id": meta.commit_id,
+            }))?),
             metadata: None,
             created_at: args.timestamp.clone(),
         });
@@ -148,12 +146,9 @@ where
             schema_version: change_set_schema.schema_version.clone(),
             file_id: change_set_schema.file_id.clone(),
             plugin_key: change_set_schema.plugin_key.clone(),
-            snapshot_content: Some(
-                json!({
-                    "id": meta.change_set_id,
-                })
-                .to_string(),
-            ),
+            snapshot_content: Some(canonical_json(json!({
+                "id": meta.change_set_id,
+            }))?),
             metadata: None,
             created_at: args.timestamp.clone(),
         });
@@ -169,13 +164,10 @@ where
             schema_version: commit_schema.schema_version.clone(),
             file_id: commit_schema.file_id.clone(),
             plugin_key: commit_schema.plugin_key.clone(),
-            snapshot_content: Some(
-                json!({
-                    "id": meta.commit_id,
-                    "change_set_id": meta.change_set_id,
-                })
-                .to_string(),
-            ),
+            snapshot_content: Some(canonical_json(json!({
+                "id": meta.commit_id,
+                "change_set_id": meta.change_set_id,
+            }))?),
             metadata: None,
             created_at: args.timestamp.clone(),
         });
@@ -217,16 +209,13 @@ where
                 schema_version: change_set_element_schema.schema_version.clone(),
                 file_id: change_set_element_schema.file_id.clone(),
                 plugin_key: change_set_element_schema.plugin_key.clone(),
-                snapshot_content: Some(
-                    json!({
-                        "change_set_id": meta.change_set_id,
-                        "change_id": change.id,
-                        "entity_id": change.entity_id,
-                        "schema_key": change.schema_key,
-                        "file_id": change.file_id,
-                    })
-                    .to_string(),
-                ),
+                snapshot_content: Some(canonical_json(json!({
+                    "change_set_id": meta.change_set_id,
+                    "change_id": change.id,
+                    "entity_id": change.entity_id,
+                    "schema_key": change.schema_key,
+                    "file_id": change.file_id,
+                }))?),
                 metadata: None,
                 created_at: args.timestamp.clone(),
                 lixcol_version_id: GLOBAL_VERSION.to_string(),
@@ -262,13 +251,10 @@ where
                     schema_version: change_author_schema.schema_version.clone(),
                     file_id: change_author_schema.file_id.clone(),
                     plugin_key: change_author_schema.plugin_key.clone(),
-                    snapshot_content: Some(
-                        json!({
-                            "change_id": change.id,
-                            "account_id": account_id,
-                        })
-                        .to_string(),
-                    ),
+                    snapshot_content: Some(canonical_json(json!({
+                        "change_id": change.id,
+                        "account_id": account_id,
+                    }))?),
                     metadata: None,
                     created_at: args.timestamp.clone(),
                     lixcol_version_id: GLOBAL_VERSION.to_string(),
@@ -312,11 +298,11 @@ where
                 ),
             })?;
         let mut snapshot: serde_json::Value =
-            serde_json::from_str(raw_snapshot).map_err(|error| LixError {
+            raw_snapshot.to_value().map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
                     "generate_commit: commit snapshot for version '{}' is invalid JSON: {}",
-                    version_id, error
+                    version_id, error.description
                 ),
             })?;
 
@@ -351,10 +337,10 @@ where
                 .collect(),
         );
 
-        commit_row.snapshot_content = Some(snapshot.to_string());
+        commit_row.snapshot_content = Some(canonical_json(snapshot)?);
     }
 
-    let mut commit_snapshot_by_version: BTreeMap<String, String> = BTreeMap::new();
+    let mut commit_snapshot_by_version: BTreeMap<String, CanonicalJson> = BTreeMap::new();
     for version_id in meta_by_version.keys() {
         let commit_row_idx =
             *commit_row_index_by_version
@@ -400,12 +386,9 @@ where
             schema_version: change_set_schema.schema_version.clone(),
             file_id: change_set_schema.file_id.clone(),
             plugin_key: change_set_schema.plugin_key.clone(),
-            snapshot_content: Some(
-                json!({
-                    "id": meta.change_set_id,
-                })
-                .to_string(),
-            ),
+            snapshot_content: Some(canonical_json(json!({
+                "id": meta.change_set_id,
+            }))?),
             metadata: None,
             created_at: args.timestamp.clone(),
             lixcol_version_id: GLOBAL_VERSION.to_string(),
@@ -449,13 +432,10 @@ where
             schema_version: version_ref_schema.schema_version.clone(),
             file_id: version_ref_schema.file_id.clone(),
             plugin_key: version_ref_schema.plugin_key.clone(),
-            snapshot_content: Some(
-                json!({
-                    "id": version_id,
-                    "commit_id": meta.commit_id,
-                })
-                .to_string(),
-            ),
+            snapshot_content: Some(canonical_json(json!({
+                "id": version_id,
+                "commit_id": meta.commit_id,
+            }))?),
             metadata: None,
             created_at: args.timestamp.clone(),
             lixcol_version_id: GLOBAL_VERSION.to_string(),
@@ -470,16 +450,13 @@ where
             schema_version: change_set_element_schema.schema_version.clone(),
             file_id: change_set_element_schema.file_id.clone(),
             plugin_key: change_set_element_schema.plugin_key.clone(),
-            snapshot_content: Some(
-                json!({
-                    "change_set_id": meta.change_set_id,
-                    "change_id": version_ref_id.clone(),
-                    "entity_id": version_id.clone(),
-                    "schema_key": VERSION_REF_SCHEMA_KEY,
-                    "file_id": version_ref_schema.file_id.clone(),
-                })
-                .to_string(),
-            ),
+            snapshot_content: Some(canonical_json(json!({
+                "change_set_id": meta.change_set_id,
+                "change_id": version_ref_id.clone(),
+                "entity_id": version_id.clone(),
+                "schema_key": VERSION_REF_SCHEMA_KEY,
+                "file_id": version_ref_schema.file_id.clone(),
+            }))?),
             metadata: None,
             created_at: args.timestamp.clone(),
             lixcol_version_id: GLOBAL_VERSION.to_string(),
@@ -500,13 +477,10 @@ where
                 schema_version: change_author_schema.schema_version.clone(),
                 file_id: change_author_schema.file_id.clone(),
                 plugin_key: change_author_schema.plugin_key.clone(),
-                snapshot_content: Some(
-                    json!({
-                        "change_id": version_ref_id,
-                        "account_id": account_id,
-                    })
-                    .to_string(),
-                ),
+                snapshot_content: Some(canonical_json(json!({
+                    "change_id": version_ref_id,
+                    "account_id": account_id,
+                }))?),
                 metadata: None,
                 created_at: args.timestamp.clone(),
                 lixcol_version_id: GLOBAL_VERSION.to_string(),
@@ -529,13 +503,10 @@ where
                 schema_version: commit_edge_schema.schema_version.clone(),
                 file_id: commit_edge_schema.file_id.clone(),
                 plugin_key: commit_edge_schema.plugin_key.clone(),
-                snapshot_content: Some(
-                    json!({
-                        "parent_id": parent_id,
-                        "child_id": meta.commit_id,
-                    })
-                    .to_string(),
-                ),
+                snapshot_content: Some(canonical_json(json!({
+                    "parent_id": parent_id,
+                    "child_id": meta.commit_id,
+                }))?),
                 metadata: None,
                 created_at: args.timestamp.clone(),
                 lixcol_version_id: GLOBAL_VERSION.to_string(),
@@ -570,6 +541,16 @@ fn sanitize_domain_change(change: &DomainChangeInput) -> ChangeRow {
         metadata: change.metadata.clone(),
         created_at: change.created_at.clone(),
     }
+}
+
+fn canonical_json(value: serde_json::Value) -> Result<CanonicalJson, LixError> {
+    CanonicalJson::from_value(value).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!(
+            "generate_commit: failed to encode canonical JSON payload: {}",
+            error.description
+        ),
+    })
 }
 
 fn builtin_schema_meta(schema_key: &str) -> Result<BuiltinSchemaMeta, LixError> {
@@ -679,7 +660,10 @@ mod tests {
             schema_version: "1".to_string(),
             file_id: "lix".to_string(),
             plugin_key: "lix".to_string(),
-            snapshot_content: Some(format!(r#"{{"id":"{id}"}}"#)),
+            snapshot_content: Some(
+                CanonicalJson::from_text(format!(r#"{{"id":"{id}"}}"#))
+                    .expect("test snapshot should be valid canonical json"),
+            ),
             metadata: None,
             created_at: "2025-01-01T00:00:00.000Z".to_string(),
             version_id: version_id.to_string(),
