@@ -326,6 +326,7 @@ simulation_test!(
                 "SELECT entity_id \
                  FROM lix_state \
                  WHERE schema_key = 'lix_key_value' \
+                   AND entity_id != 'lix_id' \
                  ORDER BY entity_id",
                 vec![],
             ))
@@ -373,6 +374,7 @@ simulation_test!(
                 "SELECT entity_id \
                  FROM lix_state \
                  WHERE schema_key = 'lix_key_value' \
+                   AND entity_id != 'lix_id' \
                  ORDER BY entity_id",
                 vec![],
             ))
