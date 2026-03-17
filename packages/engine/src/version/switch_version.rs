@@ -1,4 +1,11 @@
-use crate::{errors, Engine, EngineTransaction, ExecuteOptions, LixError, Value};
+use std::collections::BTreeMap;
+
+use crate::schema::live_store::{load_exact_live_row_with_executor, LiveRowScope};
+use crate::version::{
+    version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
+    version_descriptor_storage_version_id,
+};
+use crate::{Engine, EngineTransaction, ExecuteOptions, LixError, Value};
 
 pub async fn switch_version(engine: &Engine, version_id: String) -> Result<(), LixError> {
     if version_id.trim().is_empty() {
@@ -33,23 +40,29 @@ async fn ensure_version_exists(
     tx: &mut EngineTransaction<'_>,
     version_id: &str,
 ) -> Result<(), LixError> {
-    let result = tx
-        .execute(
-            "SELECT 1 \
-             FROM lix_version \
-             WHERE id = $1 \
-             LIMIT 1",
-            &[Value::Text(version_id.to_string())],
+    let transaction = tx.transaction.as_mut().ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "switch_version expected an open transaction",
         )
-        .await?;
-    let [statement] = result.statements.as_slice() else {
-        return Err(errors::unexpected_statement_count_error(
-            "version existence query",
-            1,
-            result.statements.len(),
-        ));
-    };
-    if statement.rows.is_empty() {
+    })?;
+    let filters = BTreeMap::from([
+        ("entity_id", version_id.to_string()),
+        ("file_id", version_descriptor_file_id().to_string()),
+        ("plugin_key", version_descriptor_plugin_key().to_string()),
+        (
+            "version_id",
+            version_descriptor_storage_version_id().to_string(),
+        ),
+    ]);
+    let row = load_exact_live_row_with_executor(
+        transaction,
+        LiveRowScope::Tracked,
+        version_descriptor_schema_key(),
+        &filters,
+    )
+    .await?;
+    if row.is_none() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("version '{version_id}' does not exist"),

@@ -1,8 +1,12 @@
 use crate::engine::Engine;
+use crate::schema::live_layout::{
+    builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
+    untracked_live_table_name,
+};
 use crate::state::commit::load_committed_version_head_commit_id_from_live_state;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot, GLOBAL_VERSION_ID,
+    GLOBAL_VERSION_ID,
 };
 use crate::{LixError, Value};
 
@@ -16,16 +20,18 @@ impl Engine {
             return Ok(Some(commit_id));
         }
 
+        let commit_table = tracked_live_table_name("lix_commit");
         let has_commits = self
             .backend
             .execute(
-                "SELECT 1 \
-                 FROM lix_internal_live_v1_lix_commit \
-                 WHERE schema_key = 'lix_commit' \
-                   AND version_id = 'global' \
-                   AND is_tombstone = 0 \
-                   AND snapshot_content IS NOT NULL \
-                 LIMIT 1",
+                &format!(
+                    "SELECT 1 \
+                     FROM {commit_table} \
+                     WHERE schema_key = 'lix_commit' \
+                       AND version_id = 'global' \
+                       AND is_tombstone = 0 \
+                     LIMIT 1"
+                ),
                 &[],
             )
             .await?
@@ -60,19 +66,34 @@ impl Engine {
     }
 
     pub(crate) async fn load_and_cache_active_version(&self) -> Result<(), LixError> {
+        let layout = builtin_live_table_layout(active_version_schema_key())?.ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "builtin active version schema must compile to a live layout",
+            )
+        })?;
+        let payload_version_column = live_column_name_for_property(&layout, "version_id")
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "active version live layout is missing version_id",
+                )
+            })?;
         let result = self
             .backend
             .execute(
-                "SELECT snapshot_content \
-                 FROM lix_internal_live_untracked_v1 \
-                 WHERE schema_key = $1 \
-                   AND file_id = $2 \
-                   AND version_id = $3 \
-                   AND snapshot_content IS NOT NULL \
-                 ORDER BY updated_at DESC \
-                 LIMIT 1",
+                &format!(
+                    "SELECT {payload_version_column} \
+                     FROM {table_name} \
+                     WHERE file_id = $1 \
+                       AND version_id = $2 \
+                       AND {payload_version_column} IS NOT NULL \
+                     ORDER BY updated_at DESC \
+                     LIMIT 1",
+                    payload_version_column = payload_version_column,
+                    table_name = untracked_live_table_name(active_version_schema_key()),
+                ),
                 &[
-                    Value::Text(active_version_schema_key().to_string()),
                     Value::Text(active_version_file_id().to_string()),
                     Value::Text(active_version_storage_version_id().to_string()),
                 ],
@@ -80,22 +101,19 @@ impl Engine {
             .await?;
 
         if let Some(row) = result.rows.first() {
-            let snapshot_content = row.first().ok_or_else(|| LixError {
+            let active_version_id = row.first().ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "active version query row is missing snapshot_content".to_string(),
+                description: "active version query row is missing version_id".to_string(),
             })?;
-            let snapshot_content = match snapshot_content {
-                Value::Text(value) => value.as_str(),
+            let active_version_id = match active_version_id {
+                Value::Text(value) => value.clone(),
                 other => {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        description: format!(
-                            "active version snapshot_content must be text, got {other:?}"
-                        ),
+                        description: format!("active version id must be text, got {other:?}"),
                     })
                 }
             };
-            let active_version_id = parse_active_version_snapshot(snapshot_content)?;
             self.set_active_version_id(active_version_id);
             return Ok(());
         }

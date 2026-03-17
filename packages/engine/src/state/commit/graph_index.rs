@@ -3,6 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::Statement;
 
+use crate::schema::live_layout::{
+    builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
+};
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, SqlDialect};
@@ -67,14 +70,14 @@ pub(crate) fn append_commit_graph_node_statements(
 }
 
 pub(crate) fn build_reachable_commits_for_root_cte_sql(
-    dialect: SqlDialect,
+    _dialect: SqlDialect,
     root_commit_id: &str,
     start_depth: i64,
     end_depth: i64,
 ) -> String {
-    let edge_parent_expr =
-        commit_edge_json_text_expr(dialect, "edge.snapshot_content", "parent_id");
-    let edge_child_expr = commit_edge_json_text_expr(dialect, "edge.snapshot_content", "child_id");
+    let commit_edge_table = tracked_live_table_name("lix_commit_edge");
+    let edge_parent_expr = quote_ident(&live_payload_column_name("lix_commit_edge", "parent_id"));
+    let edge_child_expr = quote_ident(&live_payload_column_name("lix_commit_edge", "child_id"));
     format!(
         "reachable_commit_walk AS ( \
            SELECT '{root_commit_id}' AS commit_id, 0 AS commit_depth \
@@ -83,12 +86,11 @@ pub(crate) fn build_reachable_commits_for_root_cte_sql(
              {edge_parent_expr} AS commit_id, \
              walk.commit_depth + 1 AS commit_depth \
            FROM reachable_commit_walk walk \
-           JOIN lix_internal_live_v1_lix_commit_edge edge \
+           JOIN {commit_edge_table} edge \
              ON {edge_child_expr} = walk.commit_id \
            WHERE edge.schema_key = 'lix_commit_edge' \
              AND edge.version_id = '{global_version}' \
              AND edge.is_tombstone = 0 \
-             AND edge.snapshot_content IS NOT NULL \
              AND {edge_parent_expr} IS NOT NULL \
              AND walk.commit_depth < {end_depth} \
          ), \
@@ -112,8 +114,9 @@ pub(crate) fn build_reachable_commits_from_requested_cte_sql(
     requested_commits_cte_name: &str,
     max_depth: i64,
 ) -> String {
-    let edge_parent_expr = "lix_json_extract(edge.snapshot_content, 'parent_id')";
-    let edge_child_expr = "lix_json_extract(edge.snapshot_content, 'child_id')";
+    let commit_edge_table = tracked_live_table_name("lix_commit_edge");
+    let edge_parent_expr = quote_ident(&live_payload_column_name("lix_commit_edge", "parent_id"));
+    let edge_child_expr = quote_ident(&live_payload_column_name("lix_commit_edge", "child_id"));
     format!(
         "reachable_commit_walk AS ( \
            SELECT \
@@ -129,12 +132,11 @@ pub(crate) fn build_reachable_commits_from_requested_cte_sql(
              walk.root_version_id AS root_version_id, \
              walk.commit_depth + 1 AS commit_depth \
            FROM reachable_commit_walk walk \
-           JOIN lix_internal_live_v1_lix_commit_edge edge \
+           JOIN {commit_edge_table} edge \
              ON {edge_child_expr} = walk.commit_id \
            WHERE edge.schema_key = 'lix_commit_edge' \
              AND edge.version_id = '{global_version}' \
              AND edge.is_tombstone = 0 \
-             AND edge.snapshot_content IS NOT NULL \
              AND {edge_parent_expr} IS NOT NULL \
              AND walk.commit_depth < {max_depth} \
          ), \
@@ -161,8 +163,9 @@ pub(crate) fn build_exact_commit_depth_cte_sql(
     target_placeholder: &str,
     fallback_depth_placeholder: &str,
 ) -> String {
-    let edge_parent_expr = "lix_json_extract(edge.snapshot_content, 'parent_id')";
-    let edge_child_expr = "lix_json_extract(edge.snapshot_content, 'child_id')";
+    let commit_edge_table = tracked_live_table_name("lix_commit_edge");
+    let edge_parent_expr = quote_ident(&live_payload_column_name("lix_commit_edge", "parent_id"));
+    let edge_child_expr = quote_ident(&live_payload_column_name("lix_commit_edge", "child_id"));
     format!(
         "target_commit_depth AS ( \
            WITH RECURSIVE reachable(commit_id, depth) AS ( \
@@ -172,12 +175,11 @@ pub(crate) fn build_exact_commit_depth_cte_sql(
                {edge_parent_expr} AS commit_id, \
                reachable.depth + 1 AS depth \
              FROM reachable \
-             JOIN lix_internal_live_v1_lix_commit_edge edge \
+             JOIN {commit_edge_table} edge \
                ON {edge_child_expr} = reachable.commit_id \
              WHERE edge.schema_key = 'lix_commit_edge' \
                AND edge.version_id = '{global_version}' \
                AND edge.is_tombstone = 0 \
-               AND edge.snapshot_content IS NOT NULL \
                AND {edge_parent_expr} IS NOT NULL \
                AND reachable.depth < {fallback_depth_placeholder} \
            ) \
@@ -194,15 +196,6 @@ pub(crate) fn build_exact_commit_depth_cte_sql(
         edge_parent_expr = edge_parent_expr,
         edge_child_expr = edge_child_expr,
     )
-}
-
-fn commit_edge_json_text_expr(dialect: SqlDialect, column: &str, field: &str) -> String {
-    match dialect {
-        SqlDialect::Sqlite => format!("json_extract({column}, '$.{field}')"),
-        SqlDialect::Postgres => {
-            format!("jsonb_extract_path_text(CAST({column} AS JSONB), '{field}')")
-        }
-    }
 }
 
 fn collect_commit_parent_map(
@@ -254,27 +247,31 @@ fn parse_commit_edge_snapshot(raw: &str) -> Result<Option<(String, String)>, Lix
 }
 
 pub(crate) fn build_commit_generation_seed_sql() -> String {
+    let commit_table = tracked_live_table_name("lix_commit");
+    let commit_edge_table = tracked_live_table_name("lix_commit_edge");
+    let commit_edge_parent_id_column =
+        quote_ident(&live_payload_column_name("lix_commit_edge", "parent_id"));
+    let commit_edge_child_id_column =
+        quote_ident(&live_payload_column_name("lix_commit_edge", "child_id"));
     format!(
         "WITH RECURSIVE \
            commits AS ( \
              SELECT entity_id AS commit_id \
-             FROM lix_internal_live_v1_lix_commit \
+             FROM {commit_table} \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
            ), \
            edges AS ( \
              SELECT \
-               lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
-               lix_json_extract(snapshot_content, 'child_id') AS child_id \
-             FROM lix_internal_live_v1_lix_commit_edge \
+               {commit_edge_parent_id_column} AS parent_id, \
+               {commit_edge_child_id_column} AS child_id \
+             FROM {commit_edge_table} \
              WHERE schema_key = 'lix_commit_edge' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
-               AND lix_json_extract(snapshot_content, 'parent_id') IS NOT NULL \
-               AND lix_json_extract(snapshot_content, 'child_id') IS NOT NULL \
+               AND {commit_edge_parent_id_column} IS NOT NULL \
+               AND {commit_edge_child_id_column} IS NOT NULL \
            ), \
            roots AS ( \
              SELECT c.commit_id \
@@ -301,5 +298,23 @@ pub(crate) fn build_commit_generation_seed_sql() -> String {
          END",
         table = COMMIT_GRAPH_NODE_TABLE,
         global_version = GLOBAL_VERSION_ID,
+        commit_edge_parent_id_column = commit_edge_parent_id_column,
+        commit_edge_child_id_column = commit_edge_child_id_column,
     )
+}
+
+fn quote_ident(value: &str) -> String {
+    let escaped = value.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
+fn live_payload_column_name(schema_key: &str, property_name: &str) -> String {
+    let layout = builtin_live_table_layout(schema_key)
+        .expect("builtin live layout lookup should succeed")
+        .expect("builtin live layout should exist");
+    live_column_name_for_property(&layout, property_name)
+        .unwrap_or_else(|| {
+            panic!("builtin live layout '{schema_key}' must include '{property_name}'")
+        })
+        .to_string()
 }

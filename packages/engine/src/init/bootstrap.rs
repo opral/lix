@@ -1,8 +1,9 @@
 use crate::engine::Engine;
 use crate::init::init_backend;
 use crate::state::live_state::{
-    canonical_state_exists, ensure_live_state_ready, load_latest_canonical_watermark,
-    mark_live_state_mode_with_backend, mark_live_state_ready_with_backend, LiveStateMode,
+    load_latest_canonical_watermark, load_live_state_mode_with_backend,
+    mark_live_state_mode_with_backend, mark_live_state_ready_with_backend,
+    try_claim_live_state_bootstrap_with_backend, LiveStateMode, LIVE_STATE_STATUS_SEED_ROW_SQL,
 };
 use crate::LixError;
 use std::time::Duration;
@@ -12,26 +13,53 @@ impl Engine {
     pub async fn initialize(&self) -> Result<(), LixError> {
         self.try_mark_init_in_progress()?;
 
+        let mut claimed_bootstrap = false;
         let init_result = async {
-            init_backend(self.backend.as_ref()).await?;
-            if self.backend_has_been_initialized().await? {
+            init_backend(self.backend.as_ref())
+                .await
+                .map_err(|error| init_step_error("init_backend", error))?;
+            if !self.claim_live_state_bootstrap_with_repair().await? {
                 return Err(crate::errors::already_initialized_error());
             }
+            claimed_bootstrap = true;
 
-            self.ensure_builtin_schemas_installed().await?;
-            let default_active_version_id = self.seed_default_versions().await?;
-            self.seed_global_system_directories().await?;
-            self.seed_commit_graph_nodes().await?;
+            self.ensure_builtin_schemas_installed()
+                .await
+                .map_err(|error| init_step_error("ensure_builtin_schemas_installed", error))?;
+            let default_active_version_id = self
+                .seed_default_versions()
+                .await
+                .map_err(|error| init_step_error("seed_default_versions", error))?;
+            self.seed_global_system_directories()
+                .await
+                .map_err(|error| init_step_error("seed_global_system_directories", error))?;
+            self.seed_commit_graph_nodes()
+                .await
+                .map_err(|error| init_step_error("seed_commit_graph_nodes", error))?;
             self.seed_default_active_version(&default_active_version_id)
-                .await?;
-            self.seed_default_checkpoint_label().await?;
-            self.rebuild_internal_last_checkpoint().await?;
-            self.seed_boot_key_values().await?;
-            self.seed_boot_account().await?;
+                .await
+                .map_err(|error| init_step_error("seed_default_active_version", error))?;
+            self.seed_default_checkpoint_label()
+                .await
+                .map_err(|error| init_step_error("seed_default_checkpoint_label", error))?;
+            self.rebuild_internal_last_checkpoint()
+                .await
+                .map_err(|error| init_step_error("rebuild_internal_last_checkpoint", error))?;
+            self.seed_boot_key_values()
+                .await
+                .map_err(|error| init_step_error("seed_boot_key_values", error))?;
+            self.seed_boot_account()
+                .await
+                .map_err(|error| init_step_error("seed_boot_account", error))?;
             mark_live_state_mode_with_backend(self.backend.as_ref(), LiveStateMode::Rebuilding)
-                .await?;
-            self.load_and_cache_active_version().await?;
-            self.refresh_public_surface_registry().await?;
+                .await
+                .map_err(|error| init_step_error("mark_live_state_rebuilding", error))?;
+            self.load_and_cache_active_version()
+                .await
+                .map_err(|error| init_step_error("load_and_cache_active_version", error))?;
+            self.refresh_public_surface_registry()
+                .await
+                .map_err(|error| init_step_error("refresh_public_surface_registry", error))?;
             let watermark = load_latest_canonical_watermark(self.backend.as_ref())
                 .await?
                 .ok_or_else(|| {
@@ -55,6 +83,9 @@ impl Engine {
             }
             self.mark_init_completed();
         } else {
+            if claimed_bootstrap {
+                let _ = self.reset_failed_live_state_bootstrap().await;
+            }
             self.reset_init_state();
         }
 
@@ -66,9 +97,7 @@ impl Engine {
         match self.initialize().await {
             Ok(()) => Ok(true),
             Err(error) if error.code == crate::errors::ErrorCode::AlreadyInitialized.as_str() => {
-                if !self.wait_for_concurrent_init_resolution().await? {
-                    ensure_live_state_ready(self.backend.as_ref()).await?;
-                }
+                self.wait_for_concurrent_init_ready().await?;
                 self.load_and_cache_active_version().await?;
                 self.refresh_public_surface_registry().await?;
                 Ok(false)
@@ -82,7 +111,10 @@ impl Engine {
     }
 
     async fn backend_has_been_initialized(&self) -> Result<bool, LixError> {
-        canonical_state_exists(self.backend.as_ref()).await
+        Ok(
+            load_live_state_mode_with_backend(self.backend.as_ref()).await?
+                != LiveStateMode::Uninitialized,
+        )
     }
 
     async fn normalize_init_error(&self, error: LixError) -> LixError {
@@ -92,49 +124,76 @@ impl Engine {
         if is_init_conflict_error(&error.description) {
             return crate::errors::already_initialized_error();
         }
-        if is_init_locked_error(&error.description)
-            && self
-                .wait_for_concurrent_init_resolution()
-                .await
-                .unwrap_or(false)
-        {
-            return match ensure_live_state_ready(self.backend.as_ref()).await {
-                Ok(()) => crate::errors::already_initialized_error(),
-                Err(error) => error,
+        if is_init_locked_error(&error.description) {
+            return match load_live_state_mode_with_backend(self.backend.as_ref()).await {
+                Ok(LiveStateMode::Bootstrapping)
+                | Ok(
+                    LiveStateMode::Ready | LiveStateMode::NeedsRebuild | LiveStateMode::Rebuilding,
+                ) => crate::errors::already_initialized_error(),
+                _ => error,
             };
         }
-
-        match self.backend_has_been_initialized().await {
-            Ok(true) => match ensure_live_state_ready(self.backend.as_ref()).await {
-                Ok(()) => crate::errors::already_initialized_error(),
-                Err(error) => error,
-            },
-            _ => error,
-        }
+        error
     }
 
-    async fn wait_for_concurrent_init_resolution(&self) -> Result<bool, LixError> {
-        const ATTEMPTS: usize = 60;
+    async fn wait_for_concurrent_init_ready(&self) -> Result<(), LixError> {
+        const ATTEMPTS: usize = 2400;
         const DELAY_MS: u64 = 50;
 
         for attempt in 0..ATTEMPTS {
-            match ensure_live_state_ready(self.backend.as_ref()).await {
-                Ok(()) => return Ok(true),
-                Err(error)
-                    if error.code == crate::errors::ErrorCode::NotInitialized.as_str()
-                        || error.code == crate::errors::ErrorCode::LiveStateNotReady.as_str()
-                        || is_init_locked_error(&error.description) =>
-                {
+            match load_live_state_mode_with_backend(self.backend.as_ref()).await? {
+                LiveStateMode::Ready => return Ok(()),
+                LiveStateMode::Bootstrapping => {
                     if attempt + 1 == ATTEMPTS {
-                        return Ok(false);
+                        return Err(crate::errors::live_state_not_ready_error());
                     }
                 }
-                Err(error) => return Err(error),
+                LiveStateMode::Uninitialized => {
+                    if attempt + 1 == ATTEMPTS {
+                        return Err(crate::errors::not_initialized_error());
+                    }
+                }
+                LiveStateMode::NeedsRebuild | LiveStateMode::Rebuilding => {
+                    return Err(crate::errors::live_state_not_ready_error())
+                }
             }
             std::thread::sleep(Duration::from_millis(DELAY_MS));
         }
-        Ok(false)
+        Err(crate::errors::live_state_not_ready_error())
     }
+
+    async fn claim_live_state_bootstrap_with_repair(&self) -> Result<bool, LixError> {
+        if try_claim_live_state_bootstrap_with_backend(self.backend.as_ref()).await? {
+            return Ok(true);
+        }
+        let mode = load_live_state_mode_with_backend(self.backend.as_ref()).await?;
+        if mode != LiveStateMode::Uninitialized {
+            return Ok(false);
+        }
+        self.backend
+            .execute(LIVE_STATE_STATUS_SEED_ROW_SQL, &[])
+            .await?;
+        try_claim_live_state_bootstrap_with_backend(self.backend.as_ref()).await
+    }
+
+    async fn reset_failed_live_state_bootstrap(&self) -> Result<(), LixError> {
+        let mode = if load_latest_canonical_watermark(self.backend.as_ref())
+            .await?
+            .is_some()
+        {
+            LiveStateMode::NeedsRebuild
+        } else {
+            LiveStateMode::Uninitialized
+        };
+        mark_live_state_mode_with_backend(self.backend.as_ref(), mode).await
+    }
+}
+
+fn init_step_error(step: &str, error: LixError) -> LixError {
+    LixError::new(
+        &error.code,
+        &format!("initialize step `{step}` failed: {}", error.description),
+    )
 }
 
 fn is_init_conflict_error(description: &str) -> bool {

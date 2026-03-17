@@ -22,6 +22,8 @@ use crate::state::validation::{
 };
 use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
 
+use crate::schema::live_layout::{builtin_live_table_layout, LiveTableLayout};
+use crate::schema::registry::load_live_table_layout_in_transaction;
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::contracts::execution_plan::ExecutionPlan;
 use crate::sql::execution::contracts::planned_statement::{
@@ -36,6 +38,9 @@ use crate::sql::execution::intent::{
     ExecutionIntent, IntentCollectionPolicy,
 };
 use crate::sql::execution::plan::build_execution_plan;
+use crate::sql::execution::runtime_effects::{
+    build_binary_blob_fastcdc_write_program, BinaryBlobWriteInput,
+};
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::state::internal::write_program::WriteProgram;
 use serde_json::{json, Value as JsonValue};
@@ -142,7 +147,6 @@ struct TransactionCommitExecutor<'a> {
 
 #[async_trait::async_trait(?Send)]
 impl CommitQueryExecutor for TransactionCommitExecutor<'_> {
-    #[cfg(test)]
     fn dialect(&self) -> crate::SqlDialect {
         self.transaction.dialect()
     }
@@ -672,6 +676,7 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
     transaction: &mut dyn LixTransaction,
     session: &mut PendingPublicCommitSession,
     batch: &crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch,
+    additional_binary_blob_payloads: &[Vec<u8>],
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
     timestamp: &str,
 ) -> Result<(), LixError> {
@@ -763,7 +768,13 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
         domain_changes.len(),
         timestamp,
     )?;
-    execute_generated_commit_result(transaction, rewritten, functions).await
+    execute_generated_commit_result(
+        transaction,
+        rewritten,
+        additional_binary_blob_payloads,
+        functions,
+    )
+    .await
 }
 
 async fn load_version_info_for_domain_changes(
@@ -866,7 +877,10 @@ fn rewrite_generated_commit_result_for_pending_session(
                 .take(domain_change_count)
                 .collect(),
         },
-        derived_apply_input: crate::state::commit::DerivedCommitApplyInput { live_state_rows },
+        derived_apply_input: crate::state::commit::DerivedCommitApplyInput {
+            live_state_rows,
+            live_layouts: generated.derived_apply_input.live_layouts,
+        },
     })
 }
 
@@ -967,9 +981,15 @@ where
 
 async fn execute_generated_commit_result(
     transaction: &mut dyn LixTransaction,
-    result: GenerateCommitResult,
+    mut result: GenerateCommitResult,
+    additional_binary_blob_payloads: &[Vec<u8>],
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
 ) -> Result<(), LixError> {
+    result.derived_apply_input.live_layouts = load_live_layouts_for_rows_in_transaction(
+        transaction,
+        &result.derived_apply_input.live_state_rows,
+    )
+    .await?;
     let prepared = bind_statement_batch_for_dialect(
         build_statement_batch_from_generate_commit_result(
             result,
@@ -980,9 +1000,45 @@ async fn execute_generated_commit_result(
         transaction.dialect(),
     )?;
     let mut program = WriteProgram::new();
+    if !additional_binary_blob_payloads.is_empty() {
+        let payloads = additional_binary_blob_payloads
+            .iter()
+            .map(|data| BinaryBlobWriteInput {
+                file_id: "",
+                version_id: "",
+                data,
+            })
+            .collect::<Vec<_>>();
+        program.extend(build_binary_blob_fastcdc_write_program(
+            transaction.dialect(),
+            &payloads,
+        )?);
+    }
     program.push_batch(prepared);
     execute_write_program_with_transaction(transaction, program).await?;
     Ok(())
+}
+
+async fn load_live_layouts_for_rows_in_transaction(
+    transaction: &mut dyn LixTransaction,
+    rows: &[MaterializedStateRow],
+) -> Result<BTreeMap<String, LiveTableLayout>, LixError> {
+    let mut layouts = BTreeMap::new();
+    let schema_keys = rows
+        .iter()
+        .map(|row| row.schema_key.clone())
+        .collect::<BTreeSet<_>>();
+    for schema_key in schema_keys {
+        if let Some(layout) = builtin_live_table_layout(&schema_key)? {
+            layouts.insert(schema_key, layout);
+            continue;
+        }
+        layouts.insert(
+            schema_key.clone(),
+            load_live_table_layout_in_transaction(transaction, &schema_key).await?,
+        );
+    }
+    Ok(layouts)
 }
 
 pub(crate) fn public_write_filesystem_payload_changes_already_committed(

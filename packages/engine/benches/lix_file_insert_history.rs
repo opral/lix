@@ -1,10 +1,9 @@
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use lix_engine::{
-    boot, BootArgs, BootKeyValue, Engine, LixBackend, LixError, LixTransaction, NoopWasmRuntime,
-    PreparedBatch, QueryResult, SqlDialect, Value,
+    boot, BootArgs, Engine, LixBackend, LixError, LixTransaction, NoopWasmRuntime, PreparedBatch,
+    QueryResult, SqlDialect, Value,
 };
-use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -164,15 +163,7 @@ fn build_template_with_trace(
         None => Box::new(backend),
     };
 
-    let mut boot_args = BootArgs::new(backend, Arc::new(NoopWasmRuntime));
-    boot_args.key_values.push(BootKeyValue {
-        key: "lix_deterministic_mode".to_string(),
-        value: json!({ "enabled": true }),
-        lixcol_global: Some(true),
-        lixcol_untracked: None,
-    });
-
-    let engine = boot(boot_args);
+    let engine = boot(BootArgs::new(backend, Arc::new(NoopWasmRuntime)));
     runtime
         .block_on(engine.initialize())
         .expect("engine initialization should succeed");
@@ -220,15 +211,7 @@ fn build_fixture_from_template_with_trace(
         None => Box::new(backend),
     };
 
-    let mut boot_args = BootArgs::new(backend, Arc::new(NoopWasmRuntime));
-    boot_args.key_values.push(BootKeyValue {
-        key: "lix_deterministic_mode".to_string(),
-        value: json!({ "enabled": true }),
-        lixcol_global: Some(true),
-        lixcol_untracked: None,
-    });
-
-    let engine = boot(boot_args);
+    let engine = boot(BootArgs::new(backend, Arc::new(NoopWasmRuntime)));
     runtime
         .block_on(engine.open_existing())
         .expect("existing template db should open");

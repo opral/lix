@@ -1,6 +1,10 @@
 use super::bind::bind_public_query;
 use super::*;
+use crate::schema::live_layout::LiveTableLayout;
+use crate::schema::registry::load_live_table_layout_with_backend;
 use crate::sql::public::planner::backend::lowerer::{
+    lower_read_for_execution_with_layouts,
+    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_dialect,
     LoweredReadProgram, LoweredResultColumn, LoweredResultColumns,
 };
 use crate::sql::public::planner::canonicalize::canonicalize_read;
@@ -9,7 +13,7 @@ use sqlparser::ast::{
     JoinOperator, LimitClause, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem,
     SetExpr, Statement, TableFactor, TableWithJoins,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LoweredPublicReadQuery {
@@ -953,11 +957,18 @@ async fn lower_public_read_query_with_details(
             derive_dependency_spec_from_structured_public_read(&structured_read),
         );
         let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
-        let lowered = lower_read_for_execution(
+        let known_live_layouts = load_known_live_layouts_for_public_read(
+            backend,
+            dependency_spec.as_ref(),
+            effective_state.as_ref().map(|(request, _)| request),
+        )
+        .await?;
+        let lowered = lower_read_for_execution_with_layouts(
             backend.dialect(),
             &structured_read,
             effective_state.as_ref().map(|(request, _)| request),
             effective_state.as_ref().map(|(_, plan)| plan),
+            &known_live_layouts,
         )?
         .ok_or_else(|| {
             LixError::new(
@@ -1002,6 +1013,45 @@ fn required_schema_keys_from_dependency_spec(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+async fn load_known_live_layouts_for_dependency_spec(
+    backend: &dyn LixBackend,
+    dependency_spec: Option<&DependencySpec>,
+) -> Result<BTreeMap<String, LiveTableLayout>, LixError> {
+    let mut layouts = BTreeMap::new();
+    for schema_key in required_schema_keys_from_dependency_spec(dependency_spec) {
+        if let Some(layout) = crate::schema::live_layout::builtin_live_table_layout(&schema_key)? {
+            layouts.insert(schema_key, layout);
+            continue;
+        }
+        let layout = load_live_table_layout_with_backend(backend, &schema_key).await?;
+        layouts.insert(schema_key, layout);
+    }
+    Ok(layouts)
+}
+
+async fn load_known_live_layouts_for_public_read(
+    backend: &dyn LixBackend,
+    dependency_spec: Option<&DependencySpec>,
+    effective_state_request: Option<&EffectiveStateRequest>,
+) -> Result<BTreeMap<String, LiveTableLayout>, LixError> {
+    let mut layouts = load_known_live_layouts_for_dependency_spec(backend, dependency_spec).await?;
+    if let Some(request) = effective_state_request {
+        for schema_key in &request.schema_set {
+            if layouts.contains_key(schema_key) {
+                continue;
+            }
+            if let Some(layout) = crate::schema::live_layout::builtin_live_table_layout(schema_key)?
+            {
+                layouts.insert(schema_key.clone(), layout);
+                continue;
+            }
+            let layout = load_live_table_layout_with_backend(backend, schema_key).await?;
+            layouts.insert(schema_key.clone(), layout);
+        }
+    }
+    Ok(layouts)
 }
 
 enum SpecializedPublicReadPreparation {
@@ -1050,11 +1100,18 @@ async fn try_prepare_public_read_via_specialized_optimization(
         }
     }
     let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
-    let lowered_read = match lower_read_for_execution(
+    let known_live_layouts = load_known_live_layouts_for_public_read(
+        backend,
+        dependency_spec.as_ref(),
+        effective_state.as_ref().map(|(request, _)| request),
+    )
+    .await?;
+    let lowered_read = match lower_read_for_execution_with_layouts(
         backend.dialect(),
         &structured_read,
         effective_state.as_ref().map(|(request, _)| request),
         effective_state.as_ref().map(|(_, plan)| plan),
+        &known_live_layouts,
     ) {
         Ok(Some(program)) => wrap_lowered_read_for_explain(program, explain_envelope),
         Ok(None) => {
@@ -1267,9 +1324,10 @@ async fn prepare_public_read_via_surface_lowering(
     }
 
     let mut rewritten_statement = bound_statement.statement.clone();
-    rewrite_supported_public_read_surfaces_in_statement_with_registry(
+    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_dialect(
         &mut rewritten_statement,
         registry,
+        backend.dialect(),
     )?;
     if statement_references_public_surface(registry, &rewritten_statement) {
         return Ok(None);

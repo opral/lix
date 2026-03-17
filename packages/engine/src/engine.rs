@@ -532,6 +532,7 @@ mod tests {
         boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
+    use crate::schema::live_layout::{untracked_live_table_name, UNTRACKED_LIVE_TABLE_PREFIX};
     use crate::sql::analysis::history_reads::file_history_read_materialization_required_for_statements;
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
     use crate::sql::analysis::state_resolution::effects::active_version_from_update_validations;
@@ -631,7 +632,7 @@ mod tests {
                 .expect("executed_sql lock")
                 .push(sql.to_string());
             if sql.contains("lix_deterministic_mode")
-                || sql.contains("lix_internal_live_untracked_v1")
+                || sql.contains(UNTRACKED_LIVE_TABLE_PREFIX)
                 || sql.contains("lix_internal_registered_schema_bootstrap")
             {
                 return Err(LixError::new(
@@ -661,8 +662,9 @@ mod tests {
 
     #[test]
     fn detects_active_version_update_with_single_quoted_schema_key() {
+        let table = untracked_live_table_name("lix_active_version");
         let where_clause = parse_update_where_clause(&format!(
-            "UPDATE lix_internal_live_untracked_v1 SET snapshot_content = 'x' WHERE schema_key = '{}' AND entity_id = 'main'",
+            "UPDATE {table} SET writer_key = NULL WHERE schema_key = '{}' AND entity_id = 'main'",
             active_version_schema_key()
         ));
         let plan = update_validation_plan(where_clause, "v-single");
@@ -673,8 +675,9 @@ mod tests {
 
     #[test]
     fn detects_active_version_update_with_double_quoted_schema_key() {
+        let table = untracked_live_table_name("lix_active_version");
         let where_clause = parse_update_where_clause(&format!(
-            "UPDATE lix_internal_live_untracked_v1 SET snapshot_content = 'x' WHERE schema_key = \"{}\" AND entity_id = 'main'",
+            "UPDATE {table} SET writer_key = NULL WHERE schema_key = \"{}\" AND entity_id = 'main'",
             active_version_schema_key()
         ));
         let plan = update_validation_plan(where_clause, "v-double");
@@ -685,9 +688,10 @@ mod tests {
 
     #[test]
     fn ignores_non_active_version_schema_key() {
-        let where_clause = parse_update_where_clause(
-            "UPDATE lix_internal_live_untracked_v1 SET snapshot_content = 'x' WHERE schema_key = 'other_schema' AND entity_id = 'main'",
-        );
+        let table = untracked_live_table_name("lix_active_version");
+        let where_clause = parse_update_where_clause(&format!(
+            "UPDATE {table} SET writer_key = NULL WHERE schema_key = 'other_schema' AND entity_id = 'main'",
+        ));
         let plan = update_validation_plan(where_clause, "v-other");
 
         let detected = active_version_from_update_validations(&[plan]).expect("detect version");
@@ -738,43 +742,71 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn unknown_read_query_returns_unknown_table_error() {
-        let commit_called = Arc::new(AtomicBool::new(false));
-        let rollback_called = Arc::new(AtomicBool::new(false));
-        let engine = boot(BootArgs::new(
-            Box::new(TestBackend {
-                commit_called,
-                rollback_called,
-            }),
-            Arc::new(NoopWasmRuntime),
-        ));
-        engine.set_active_version_id("version-test".to_string());
+    #[test]
+    fn unknown_read_query_returns_unknown_table_error() {
+        std::thread::Builder::new()
+            .name("unknown-read-query-test".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build tokio runtime");
+                runtime.block_on(async {
+                    let commit_called = Arc::new(AtomicBool::new(false));
+                    let rollback_called = Arc::new(AtomicBool::new(false));
+                    let engine = boot(BootArgs::new(
+                        Box::new(TestBackend {
+                            commit_called,
+                            rollback_called,
+                        }),
+                        Arc::new(NoopWasmRuntime),
+                    ));
+                    engine.set_active_version_id("version-test".to_string());
 
-        let error = engine
-            .execute("SELECT * FROM unknown_table", &[])
-            .await
-            .expect_err("unknown relation query should fail");
+                    let error = engine
+                        .execute("SELECT * FROM unknown_table", &[])
+                        .await
+                        .expect_err("unknown relation query should fail");
 
-        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
+                    assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
+                });
+            })
+            .expect("spawn unknown read query test thread")
+            .join()
+            .expect("unknown read query test thread should succeed");
     }
 
-    #[tokio::test]
-    async fn plain_backend_read_bypasses_public_preparation() {
-        let backend = PlainReadBackend::default();
-        let executed_sql = Arc::clone(&backend.executed_sql);
-        let engine = boot(BootArgs::new(Box::new(backend), Arc::new(NoopWasmRuntime)));
-        engine.set_active_version_id("version-test".to_string());
+    #[test]
+    fn plain_backend_read_bypasses_public_preparation() {
+        std::thread::Builder::new()
+            .name("plain-backend-read-test".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build tokio runtime");
+                runtime.block_on(async {
+                    let backend = PlainReadBackend::default();
+                    let executed_sql = Arc::clone(&backend.executed_sql);
+                    let engine = boot(BootArgs::new(Box::new(backend), Arc::new(NoopWasmRuntime)));
+                    engine.set_active_version_id("version-test".to_string());
 
-        let result = engine
-            .execute("SELECT 1 + 1", &[])
-            .await
-            .expect("plain backend read should succeed");
+                    let result = engine
+                        .execute("SELECT 1 + 1", &[])
+                        .await
+                        .expect("plain backend read should succeed");
 
-        assert_eq!(result.statements[0].rows, vec![vec![Value::Integer(2)]]);
-        let executed = executed_sql.lock().expect("executed_sql lock");
-        assert_eq!(executed.len(), 1);
-        assert_eq!(executed[0], "SELECT 1 + 1");
+                    assert_eq!(result.statements[0].rows, vec![vec![Value::Integer(2)]]);
+                    let executed = executed_sql.lock().expect("executed_sql lock");
+                    assert_eq!(executed.len(), 1);
+                    assert_eq!(executed[0], "SELECT 1 + 1");
+                });
+            })
+            .expect("spawn plain backend read test thread")
+            .join()
+            .expect("plain backend read test thread should succeed");
     }
 
     #[test]
@@ -995,7 +1027,7 @@ mod tests {
     fn update_validation_plan(where_clause: Expr, version_id: &str) -> UpdateValidationPlan {
         UpdateValidationPlan {
             kind: crate::sql::execution::contracts::planned_statement::UpdateValidationKind::Update,
-            table: "lix_internal_live_untracked_v1".to_string(),
+            table: untracked_live_table_name("lix_active_version"),
             where_clause: Some(where_clause),
             snapshot_content: Some(json!({
                 "id": "main",

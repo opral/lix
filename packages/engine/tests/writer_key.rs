@@ -119,7 +119,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT writer_key \
-                     FROM lix_internal_live_untracked_v1 \
+                     FROM lix_internal_live_untracked_v1_wk_writer_key_schema \
                      WHERE entity_id = 'wk-untracked' \
                        AND version_id = '{version_id}' \
                      LIMIT 1"

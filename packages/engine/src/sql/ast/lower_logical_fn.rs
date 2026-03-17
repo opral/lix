@@ -34,6 +34,12 @@ pub(crate) fn parse_lix_json_extract(
     parse_lix_json_extract_named(function, "lix_json_extract")
 }
 
+pub(crate) fn parse_lix_json_extract_json(
+    function: &Function,
+) -> Result<Option<LixJsonExtractCall>, LixError> {
+    parse_lix_json_extract_named(function, "lix_json_extract_json")
+}
+
 pub(crate) fn parse_lix_json_extract_boolean(
     function: &Function,
 ) -> Result<Option<LixJsonExtractCall>, LixError> {

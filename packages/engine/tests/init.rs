@@ -364,7 +364,10 @@ simulation_test!(init_creates_untracked_table, |sim| async move {
     engine.initialize().await.unwrap();
 
     let result = engine
-        .execute("SELECT 1 FROM lix_internal_live_untracked_v1 LIMIT 1", &[])
+        .execute(
+            "SELECT 1 FROM lix_internal_live_untracked_v1_lix_active_version LIMIT 1",
+            &[],
+        )
         .await
         .unwrap();
 

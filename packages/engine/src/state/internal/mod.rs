@@ -25,7 +25,7 @@ use crate::state::internal::inline_functions::inline_lix_functions_with_provider
 use crate::state::internal::param_context::normalize_statement_placeholders_in_batch;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use sqlparser::ast::{ObjectNamePart, Query, Statement, TableFactor, Visit, Visitor};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -134,9 +134,10 @@ pub(crate) fn quote_ident(value: &str) -> String {
 pub(crate) fn rewrite_internal_state_query_read(
     query: Query,
     params: &[Value],
+    dialect: SqlDialect,
 ) -> Result<Query, LixError> {
     let original = query.clone();
-    Ok(vtable_read::rewrite_query(query, params)?.unwrap_or(original))
+    Ok(vtable_read::rewrite_query(query, params, dialect)?.unwrap_or(original))
 }
 
 pub(crate) async fn rewrite_internal_state_query_read_with_backend(
@@ -256,6 +257,7 @@ pub(crate) async fn rewrite_statement_with_backend<P>(
     statement: Statement,
     params: &[Value],
     writer_key: Option<&str>,
+    known_live_layouts: &BTreeMap<String, crate::schema::live_layout::LiveTableLayout>,
     provider: &mut P,
 ) -> Result<RewriteOutput, LixError>
 where
@@ -266,6 +268,7 @@ where
         statement.clone(),
         params,
         writer_key,
+        known_live_layouts,
         provider,
     )
     .await?
@@ -494,6 +497,8 @@ where
 {
     let mut rewritten = Vec::with_capacity(statements.len());
     let mut live_table_requirements: Vec<SchemaLiveTableRequirement> = Vec::new();
+    let mut known_live_layouts =
+        BTreeMap::<String, crate::schema::live_layout::LiveTableLayout>::new();
     let mut internal_state: Option<InternalStatePlan> = None;
     let mut mutations: Vec<MutationRow> = Vec::new();
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
@@ -509,7 +514,12 @@ where
             output
         } else {
             Box::pin(rewrite_statement_with_backend(
-                backend, statement, params, writer_key, provider,
+                backend,
+                statement,
+                params,
+                writer_key,
+                &known_live_layouts,
+                provider,
             ))
             .await
             .map_err(|error| LixError {
@@ -531,6 +541,11 @@ where
             &mut mutations,
             &mut update_validations,
         )?;
+        for requirement in &live_table_requirements {
+            if let Some(layout) = requirement.layout.as_ref() {
+                known_live_layouts.insert(requirement.schema_key.clone(), layout.clone());
+            }
+        }
     }
 
     if requires_single_statement_postprocess(
@@ -759,11 +774,11 @@ async fn rewrite_top_level_internal_state_read_statement_backend(
 
 fn rewrite_internal_state_query_read_sync(
     query: Query,
-    _dialect: SqlDialect,
+    dialect: SqlDialect,
 ) -> Result<Option<RewriteOutput>, LixError> {
     let statement = Statement::Query(Box::new(query.clone()));
     if statement_references_internal_state_vtable(&statement) {
-        let rewritten = rewrite_internal_state_query_read(query, &[])?;
+        let rewritten = rewrite_internal_state_query_read(query, &[], dialect)?;
         return Ok(Some(rewrite_output_from_statement(Statement::Query(
             Box::new(rewritten),
         ))));

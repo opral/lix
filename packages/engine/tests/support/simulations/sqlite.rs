@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Column, Executor, Row, SqlitePool, ValueRef};
@@ -11,15 +12,22 @@ use lix_engine::{
 
 use crate::support::simulation_test::{Simulation, SimulationBehavior};
 
+static SQLITE_MEMORY_DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 pub fn sqlite_simulation() -> Simulation {
     Simulation {
         name: "sqlite",
         setup: None,
         behavior: SimulationBehavior::Base,
         backend_factory: Box::new(|| {
-            Box::new(SqliteBackend::new(SqliteConfig {
-                filename: ":memory:".to_string(),
-            })) as Box<dyn LixBackend + Send + Sync>
+            let db_index = SQLITE_MEMORY_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let filename = format!(
+                "sqlite:file:lix_sim_{process_id}_{db_index}?mode=memory&cache=shared",
+                process_id = std::process::id(),
+                db_index = db_index,
+            );
+            Box::new(SqliteBackend::new(SqliteConfig { filename }))
+                as Box<dyn LixBackend + Send + Sync>
         }),
     }
 }
@@ -55,7 +63,9 @@ impl SqliteBackend {
             .get_or_try_init(|| async {
                 let conn = if self.config.filename == ":memory:" {
                     "sqlite::memory:".to_string()
-                } else if self.config.filename.starts_with("sqlite:") {
+                } else if self.config.filename.starts_with("sqlite:")
+                    || self.config.filename.starts_with("file:")
+                {
                     self.config.filename.clone()
                 } else {
                     format!("sqlite://{}", self.config.filename)
@@ -70,6 +80,7 @@ impl SqliteBackend {
                     .busy_timeout(std::time::Duration::from_secs(30));
 
                 SqlitePoolOptions::new()
+                    .max_connections(1)
                     .connect_with(options)
                     .await
                     .map_err(|err| LixError {

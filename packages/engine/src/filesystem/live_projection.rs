@@ -1,4 +1,8 @@
 use crate::filesystem::path::ParsedFilePath;
+use crate::schema::live_layout::{
+    builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
+    untracked_live_table_name,
+};
 use crate::sql::public::planner::semantics::filesystem_queries::lookup_file_id_by_path;
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::build_reachable_commits_from_requested_cte_sql;
@@ -19,8 +23,8 @@ pub(crate) enum FilesystemProjectionScope {
     ExplicitVersion,
 }
 
-pub(crate) fn build_live_file_prefetch_projection_sql() -> String {
-    build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, true)
+pub(crate) fn build_live_file_prefetch_projection_sql(dialect: SqlDialect) -> String {
+    build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, true, dialect)
 }
 
 pub(crate) async fn resolve_file_id_by_path_in_version(
@@ -45,7 +49,18 @@ pub(crate) async fn resolve_file_id_by_path_in_version(
 pub(crate) fn build_filesystem_file_projection_sql(
     scope: FilesystemProjectionScope,
     include_blob_hash: bool,
+    dialect: SqlDialect,
 ) -> String {
+    let commit_change_set_id_column =
+        quote_ident(&live_payload_column_name("lix_commit", "change_set_id"));
+    let cse_change_set_id_column = quote_ident(&live_payload_column_name(
+        "lix_change_set_element",
+        "change_set_id",
+    ));
+    let cse_change_id_column = quote_ident(&live_payload_column_name(
+        "lix_change_set_element",
+        "change_id",
+    ));
     let commit_id_projection = match scope {
         FilesystemProjectionScope::ActiveVersion => active_version_commit_id_sql(),
         FilesystemProjectionScope::ExplicitVersion => "f.lixcol_commit_id".to_string(),
@@ -55,6 +70,8 @@ pub(crate) fn build_filesystem_file_projection_sql(
     } else {
         String::new()
     };
+    let live_commit_table = tracked_live_table_name("lix_commit");
+    let live_cse_table = tracked_live_table_name("lix_change_set_element");
 
     format!(
         "WITH RECURSIVE \
@@ -62,22 +79,20 @@ pub(crate) fn build_filesystem_file_projection_sql(
            commit_by_version AS ( \
              SELECT \
                entity_id AS commit_id, \
-               lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id \
-             FROM lix_internal_live_v1_lix_commit \
+               {commit_change_set_id_column} AS change_set_id \
+             FROM {live_commit_table} \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
            ), \
            change_set_element_by_version AS ( \
              SELECT \
-               lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
-               lix_json_extract(snapshot_content, 'change_id') AS change_id \
-             FROM lix_internal_live_v1_lix_change_set_element \
+               {cse_change_set_id_column} AS change_set_id, \
+               {cse_change_id_column} AS change_id \
+             FROM {live_cse_table} \
              WHERE schema_key = 'lix_change_set_element' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
            ), \
            change_commit_by_change_id AS ( \
              SELECT \
@@ -99,7 +114,9 @@ pub(crate) fn build_filesystem_file_projection_sql(
                c.file_id AS file_id, \
                c.version_id AS version_id, \
                c.plugin_key AS plugin_key, \
-               c.snapshot_content AS snapshot_content, \
+               c.payload_id AS payload_id, \
+               c.payload_parent_id AS payload_parent_id, \
+               c.payload_name AS payload_name, \
                c.schema_version AS schema_version, \
                c.created_at AS created_at, \
                c.updated_at AS updated_at, \
@@ -121,13 +138,13 @@ pub(crate) fn build_filesystem_file_projection_sql(
            ), \
            directory_descriptor_rows AS ( \
              SELECT \
-               lix_json_extract(snapshot_content, 'id') AS id, \
-               lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
-               lix_json_extract(snapshot_content, 'name') AS name, \
+               payload_id AS id, \
+               payload_parent_id AS parent_id, \
+               payload_name AS name, \
                version_id AS lixcol_version_id \
              FROM directory_descriptor_ranked \
              WHERE rn = 1 \
-               AND snapshot_content IS NOT NULL \
+               AND payload_id IS NOT NULL \
            ), \
            directory_paths AS (\
              SELECT \
@@ -156,7 +173,12 @@ pub(crate) fn build_filesystem_file_projection_sql(
                c.file_id AS file_id, \
                c.version_id AS version_id, \
                c.plugin_key AS plugin_key, \
-               c.snapshot_content AS snapshot_content, \
+               c.payload_id AS payload_id, \
+               c.payload_directory_id AS payload_directory_id, \
+               c.payload_name AS payload_name, \
+               c.payload_extension AS payload_extension, \
+               c.payload_metadata AS payload_metadata, \
+               c.payload_hidden AS payload_hidden, \
                c.schema_version AS schema_version, \
                c.created_at AS created_at, \
                c.updated_at AS updated_at, \
@@ -178,12 +200,12 @@ pub(crate) fn build_filesystem_file_projection_sql(
            ), \
            file_descriptor_rows AS ( \
              SELECT \
-               lix_json_extract(snapshot_content, 'id') AS id, \
-               lix_json_extract(snapshot_content, 'directory_id') AS directory_id, \
-               lix_json_extract(snapshot_content, 'name') AS name, \
-               lix_json_extract(snapshot_content, 'extension') AS extension, \
-               lix_json_extract(snapshot_content, 'metadata') AS metadata, \
-               lix_json_extract(snapshot_content, 'hidden') AS hidden, \
+               payload_id AS id, \
+               payload_directory_id AS directory_id, \
+               payload_name AS name, \
+               payload_extension AS extension, \
+               payload_metadata AS metadata, \
+               payload_hidden AS hidden, \
                entity_id AS lixcol_entity_id, \
                schema_key AS lixcol_schema_key, \
                file_id AS lixcol_file_id, \
@@ -200,7 +222,7 @@ pub(crate) fn build_filesystem_file_projection_sql(
                metadata AS lixcol_metadata \
              FROM file_descriptor_ranked \
              WHERE rn = 1 \
-               AND snapshot_content IS NOT NULL \
+               AND payload_id IS NOT NULL \
            ), \
            binary_blob_ref_candidates AS ( \
              {blob_candidates_sql} \
@@ -209,7 +231,9 @@ pub(crate) fn build_filesystem_file_projection_sql(
              SELECT \
                c.entity_id AS entity_id, \
                c.version_id AS version_id, \
-               c.snapshot_content AS snapshot_content, \
+               c.payload_id AS payload_id, \
+               c.payload_blob_hash AS payload_blob_hash, \
+               c.payload_size_bytes AS payload_size_bytes, \
                c.updated_at AS updated_at, \
                c.created_at AS created_at, \
                c.change_id AS change_id, \
@@ -225,13 +249,13 @@ pub(crate) fn build_filesystem_file_projection_sql(
            ), \
            binary_blob_ref_rows AS ( \
              SELECT \
-               lix_json_extract(snapshot_content, 'id') AS id, \
+               payload_id AS id, \
                version_id AS lixcol_version_id, \
-               lix_json_extract(snapshot_content, 'blob_hash') AS blob_hash, \
-               lix_json_extract(snapshot_content, 'size_bytes') AS size_bytes \
+               payload_blob_hash AS blob_hash, \
+               payload_size_bytes AS size_bytes \
              FROM binary_blob_ref_ranked \
              WHERE rn = 1 \
-               AND snapshot_content IS NOT NULL \
+               AND payload_id IS NOT NULL \
            ) \
          SELECT \
            f.id, \
@@ -285,44 +309,58 @@ pub(crate) fn build_filesystem_file_projection_sql(
                 BINARY_BLOB_REF_SCHEMA_KEY
             ]
         ),
-        directory_candidates_sql = effective_state_candidates_sql(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
-        file_candidates_sql = effective_state_candidates_sql(FILE_DESCRIPTOR_SCHEMA_KEY),
-        blob_candidates_sql = effective_state_candidates_sql(BINARY_BLOB_REF_SCHEMA_KEY),
+        directory_candidates_sql = effective_directory_descriptor_candidates_sql(),
+        file_candidates_sql = effective_file_descriptor_candidates_sql(dialect),
+        blob_candidates_sql = effective_binary_blob_ref_candidates_sql(),
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
         blob_hash_projection = blob_hash_projection,
         commit_id_projection = commit_id_projection,
+        commit_change_set_id_column = commit_change_set_id_column,
+        cse_change_set_id_column = cse_change_set_id_column,
+        cse_change_id_column = cse_change_id_column,
     )
 }
 
 pub(crate) fn build_filesystem_directory_projection_sql(
     scope: FilesystemProjectionScope,
+    _dialect: SqlDialect,
 ) -> String {
+    let commit_change_set_id_column =
+        quote_ident(&live_payload_column_name("lix_commit", "change_set_id"));
+    let cse_change_set_id_column = quote_ident(&live_payload_column_name(
+        "lix_change_set_element",
+        "change_set_id",
+    ));
+    let cse_change_id_column = quote_ident(&live_payload_column_name(
+        "lix_change_set_element",
+        "change_id",
+    ));
     let commit_id_projection = match scope {
         FilesystemProjectionScope::ActiveVersion => active_version_commit_id_sql(),
         FilesystemProjectionScope::ExplicitVersion => "d.lixcol_commit_id".to_string(),
     };
+    let live_commit_table = tracked_live_table_name("lix_commit");
+    let live_cse_table = tracked_live_table_name("lix_change_set_element");
     format!(
         "WITH RECURSIVE \
            {target_versions_cte}, \
            commit_by_version AS ( \
              SELECT \
                entity_id AS commit_id, \
-               lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id \
-             FROM lix_internal_live_v1_lix_commit \
+               {commit_change_set_id_column} AS change_set_id \
+             FROM {live_commit_table} \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
            ), \
            change_set_element_by_version AS ( \
              SELECT \
-               lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
-               lix_json_extract(snapshot_content, 'change_id') AS change_id \
-             FROM lix_internal_live_v1_lix_change_set_element \
+               {cse_change_set_id_column} AS change_set_id, \
+               {cse_change_id_column} AS change_id \
+             FROM {live_cse_table} \
              WHERE schema_key = 'lix_change_set_element' \
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
            ), \
            change_commit_by_change_id AS ( \
              SELECT \
@@ -344,7 +382,10 @@ pub(crate) fn build_filesystem_directory_projection_sql(
                c.file_id AS file_id, \
                c.version_id AS version_id, \
                c.plugin_key AS plugin_key, \
-               c.snapshot_content AS snapshot_content, \
+               c.payload_id AS payload_id, \
+               c.payload_parent_id AS payload_parent_id, \
+               c.payload_name AS payload_name, \
+               c.payload_hidden AS payload_hidden, \
                c.schema_version AS schema_version, \
                c.created_at AS created_at, \
                c.updated_at AS updated_at, \
@@ -366,10 +407,10 @@ pub(crate) fn build_filesystem_directory_projection_sql(
            ), \
            directory_descriptor_rows AS ( \
              SELECT \
-               lix_json_extract(snapshot_content, 'id') AS id, \
-               lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
-               lix_json_extract(snapshot_content, 'name') AS name, \
-               lix_json_extract(snapshot_content, 'hidden') AS hidden, \
+               payload_id AS id, \
+               payload_parent_id AS parent_id, \
+               payload_name AS name, \
+               payload_hidden AS hidden, \
                entity_id AS lixcol_entity_id, \
                schema_key AS lixcol_schema_key, \
                schema_version AS lixcol_schema_version, \
@@ -383,7 +424,7 @@ pub(crate) fn build_filesystem_directory_projection_sql(
                metadata AS lixcol_metadata \
              FROM directory_descriptor_ranked \
              WHERE rn = 1 \
-               AND snapshot_content IS NOT NULL \
+               AND payload_id IS NOT NULL \
            ), \
            directory_paths AS (\
              SELECT \
@@ -424,9 +465,12 @@ pub(crate) fn build_filesystem_directory_projection_sql(
            ON dp.id = d.id \
           AND dp.lixcol_version_id = d.lixcol_version_id",
         target_versions_cte = target_versions_cte_sql(scope, &[DIRECTORY_DESCRIPTOR_SCHEMA_KEY]),
-        directory_candidates_sql = effective_state_candidates_sql(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+        directory_candidates_sql = effective_directory_descriptor_candidates_sql(),
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
         commit_id_projection = commit_id_projection,
+        commit_change_set_id_column = commit_change_set_id_column,
+        cse_change_set_id_column = cse_change_set_id_column,
+        cse_change_id_column = cse_change_id_column,
     )
 }
 
@@ -824,18 +868,23 @@ pub(crate) fn build_filesystem_directory_history_projection_sql(
 }
 
 fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str]) -> String {
+    let active_version_layout = builtin_live_table_layout(active_version_schema_key())
+        .expect("active version layout lookup should succeed")
+        .expect("builtin active version schema should exist");
+    let active_version_column = live_column_name_for_property(&active_version_layout, "version_id")
+        .expect("active version live layout must include version_id");
     match scope {
         FilesystemProjectionScope::ActiveVersion => format!(
             "target_versions AS ( \
                SELECT DISTINCT \
-                 lix_json_extract(snapshot_content, 'version_id') AS version_id \
-               FROM lix_internal_live_untracked_v1 \
-               WHERE schema_key = '{schema_key}' \
-                 AND file_id = '{file_id}' \
+                 {active_version_column} AS version_id \
+               FROM {table_name} \
+               WHERE file_id = '{file_id}' \
                  AND version_id = '{storage_version_id}' \
-                 AND snapshot_content IS NOT NULL \
+                 AND {active_version_column} IS NOT NULL \
              )",
-            schema_key = escape_sql_string(active_version_schema_key()),
+            active_version_column = quote_ident(active_version_column),
+            table_name = quote_ident(&untracked_live_table_name(active_version_schema_key())),
             file_id = escape_sql_string(active_version_file_id()),
             storage_version_id = escape_sql_string(active_version_storage_version_id()),
         ),
@@ -843,7 +892,7 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
             let union_rows = schema_keys
                 .iter()
                 .flat_map(|schema_key| {
-                    let quoted = quote_ident(&format!("lix_internal_live_v1_{schema_key}"));
+                    let quoted = quote_ident(&tracked_live_table_name(schema_key));
                     [
                         format!(
                             "SELECT DISTINCT version_id \
@@ -854,10 +903,9 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
                         ),
                         format!(
                             "SELECT DISTINCT version_id \
-                             FROM lix_internal_live_untracked_v1 \
-                             WHERE schema_key = '{schema_key}' \
-                               AND version_id <> '{global_version}'",
-                            schema_key = escape_sql_string(schema_key),
+                             FROM {untracked_table} \
+                    WHERE version_id <> '{global_version}'",
+                            untracked_table = quote_ident(&untracked_live_table_name(schema_key)),
                             global_version = escape_sql_string(GLOBAL_VERSION_ID),
                         ),
                     ]
@@ -868,21 +916,22 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
             } else {
                 format!(" UNION {}", union_rows.join(" UNION "))
             };
+            let live_version_descriptor_table = tracked_live_table_name("lix_version_descriptor");
             format!(
                 "all_target_versions AS ( \
                    SELECT '{global_version}' AS version_id \
                    UNION \
                    SELECT DISTINCT entity_id AS version_id \
-                   FROM lix_internal_live_v1_lix_version_descriptor \
+                   FROM {live_version_descriptor_table} \
                    WHERE schema_key = '{version_descriptor_schema_key}' \
                      AND version_id = '{global_version}' \
-                     AND is_tombstone = 0 \
-                     AND snapshot_content IS NOT NULL{union_sql} \
+                     AND is_tombstone = 0{union_sql} \
                  ), \
                  target_versions AS ( \
                    SELECT version_id \
                    FROM all_target_versions \
                  )",
+                live_version_descriptor_table = live_version_descriptor_table,
                 version_descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
                 global_version = escape_sql_string(GLOBAL_VERSION_ID),
                 union_sql = union_sql,
@@ -891,9 +940,22 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
     }
 }
 
-fn effective_state_candidates_sql(schema_key: &str) -> String {
-    let table_name = quote_ident(&format!("lix_internal_live_v1_{schema_key}"));
-    let schema_filter = format!("u.schema_key = '{}'", escape_sql_string(schema_key));
+fn effective_state_candidates_sql(
+    schema_key: &str,
+    payload_columns: &[(&str, String, String)],
+) -> String {
+    let table_name = quote_ident(&tracked_live_table_name(schema_key));
+    let untracked_table = quote_ident(&untracked_live_table_name(schema_key));
+    let tracked_payload_projection = payload_columns
+        .iter()
+        .map(|(alias, tracked_expr, _)| format!("{tracked_expr} AS {alias}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let untracked_payload_projection = payload_columns
+        .iter()
+        .map(|(alias, _, untracked_expr)| format!("{untracked_expr} AS {alias}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "SELECT \
            t.entity_id AS entity_id, \
@@ -901,7 +963,7 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            t.file_id AS file_id, \
            tv.version_id AS version_id, \
            t.plugin_key AS plugin_key, \
-           t.snapshot_content AS snapshot_content, \
+           {tracked_payload_projection}, \
            t.schema_version AS schema_version, \
            t.created_at AS created_at, \
            t.updated_at AS updated_at, \
@@ -925,7 +987,7 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            t.file_id AS file_id, \
            tv.version_id AS version_id, \
            t.plugin_key AS plugin_key, \
-           t.snapshot_content AS snapshot_content, \
+           {tracked_payload_projection}, \
            t.schema_version AS schema_version, \
            t.created_at AS created_at, \
            t.updated_at AS updated_at, \
@@ -950,7 +1012,7 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            u.file_id AS file_id, \
            tv.version_id AS version_id, \
            u.plugin_key AS plugin_key, \
-           u.snapshot_content AS snapshot_content, \
+           {untracked_payload_projection}, \
            u.schema_version AS schema_version, \
            u.created_at AS created_at, \
            u.updated_at AS updated_at, \
@@ -961,10 +1023,9 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            u.writer_key AS writer_key, \
            u.metadata AS metadata, \
            1 AS precedence \
-         FROM lix_internal_live_untracked_v1 u \
+         FROM {untracked_table} u \
          JOIN target_versions tv \
            ON tv.version_id = u.version_id \
-         WHERE {schema_filter} \
          UNION ALL \
          SELECT \
            u.entity_id AS entity_id, \
@@ -972,7 +1033,7 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            u.file_id AS file_id, \
            tv.version_id AS version_id, \
            u.plugin_key AS plugin_key, \
-           u.snapshot_content AS snapshot_content, \
+           {untracked_payload_projection}, \
            u.schema_version AS schema_version, \
            u.created_at AS created_at, \
            u.updated_at AS updated_at, \
@@ -983,15 +1044,124 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            u.writer_key AS writer_key, \
            u.metadata AS metadata, \
            3 AS precedence \
-         FROM lix_internal_live_untracked_v1 u \
+         FROM {untracked_table} u \
          JOIN target_versions tv \
            ON tv.version_id <> '{global_version}' \
           AND u.version_id = '{global_version}' \
-         WHERE {schema_filter} \
-           AND u.version_id = '{global_version}'",
+         WHERE u.version_id = '{global_version}'",
         table_name = table_name,
+        untracked_table = untracked_table,
+        tracked_payload_projection = tracked_payload_projection,
+        untracked_payload_projection = untracked_payload_projection,
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
-        schema_filter = schema_filter,
+    )
+}
+
+fn effective_directory_descriptor_candidates_sql() -> String {
+    let id_column = live_payload_column_name(DIRECTORY_DESCRIPTOR_SCHEMA_KEY, "id");
+    let parent_id_column = live_payload_column_name(DIRECTORY_DESCRIPTOR_SCHEMA_KEY, "parent_id");
+    let name_column = live_payload_column_name(DIRECTORY_DESCRIPTOR_SCHEMA_KEY, "name");
+    let hidden_column = live_payload_column_name(DIRECTORY_DESCRIPTOR_SCHEMA_KEY, "hidden");
+    effective_state_candidates_sql(
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+        &[
+            (
+                "payload_id",
+                format!("t.{}", quote_ident(&id_column)),
+                format!("u.{}", quote_ident(&id_column)),
+            ),
+            (
+                "payload_parent_id",
+                format!("t.{}", quote_ident(&parent_id_column)),
+                format!("u.{}", quote_ident(&parent_id_column)),
+            ),
+            (
+                "payload_name",
+                format!("t.{}", quote_ident(&name_column)),
+                format!("u.{}", quote_ident(&name_column)),
+            ),
+            (
+                "payload_hidden",
+                format!("COALESCE(t.{}, false)", quote_ident(&hidden_column)),
+                format!("COALESCE(u.{}, false)", quote_ident(&hidden_column)),
+            ),
+        ],
+    )
+}
+
+fn effective_file_descriptor_candidates_sql(dialect: SqlDialect) -> String {
+    let id_column = live_payload_column_name(FILE_DESCRIPTOR_SCHEMA_KEY, "id");
+    let directory_id_column = live_payload_column_name(FILE_DESCRIPTOR_SCHEMA_KEY, "directory_id");
+    let name_column = live_payload_column_name(FILE_DESCRIPTOR_SCHEMA_KEY, "name");
+    let extension_column = live_payload_column_name(FILE_DESCRIPTOR_SCHEMA_KEY, "extension");
+    let metadata_column = live_payload_column_name(FILE_DESCRIPTOR_SCHEMA_KEY, "metadata");
+    let hidden_column = live_payload_column_name(FILE_DESCRIPTOR_SCHEMA_KEY, "hidden");
+    effective_state_candidates_sql(
+        FILE_DESCRIPTOR_SCHEMA_KEY,
+        &[
+            (
+                "payload_id",
+                format!("t.{}", quote_ident(&id_column)),
+                format!("u.{}", quote_ident(&id_column)),
+            ),
+            (
+                "payload_directory_id",
+                format!("t.{}", quote_ident(&directory_id_column)),
+                format!("u.{}", quote_ident(&directory_id_column)),
+            ),
+            (
+                "payload_name",
+                format!("t.{}", quote_ident(&name_column)),
+                format!("u.{}", quote_ident(&name_column)),
+            ),
+            (
+                "payload_extension",
+                format!("t.{}", quote_ident(&extension_column)),
+                format!("u.{}", quote_ident(&extension_column)),
+            ),
+            (
+                "payload_metadata",
+                normalized_json_text_projection(
+                    dialect,
+                    &qualified_column_ref("t", &metadata_column),
+                ),
+                normalized_json_text_projection(
+                    dialect,
+                    &qualified_column_ref("u", &metadata_column),
+                ),
+            ),
+            (
+                "payload_hidden",
+                format!("COALESCE(t.{}, false)", quote_ident(&hidden_column)),
+                format!("COALESCE(u.{}, false)", quote_ident(&hidden_column)),
+            ),
+        ],
+    )
+}
+
+fn effective_binary_blob_ref_candidates_sql() -> String {
+    let id_column = live_payload_column_name(BINARY_BLOB_REF_SCHEMA_KEY, "id");
+    let blob_hash_column = live_payload_column_name(BINARY_BLOB_REF_SCHEMA_KEY, "blob_hash");
+    let size_bytes_column = live_payload_column_name(BINARY_BLOB_REF_SCHEMA_KEY, "size_bytes");
+    effective_state_candidates_sql(
+        BINARY_BLOB_REF_SCHEMA_KEY,
+        &[
+            (
+                "payload_id",
+                format!("t.{}", quote_ident(&id_column)),
+                format!("u.{}", quote_ident(&id_column)),
+            ),
+            (
+                "payload_blob_hash",
+                format!("t.{}", quote_ident(&blob_hash_column)),
+                format!("u.{}", quote_ident(&blob_hash_column)),
+            ),
+            (
+                "payload_size_bytes",
+                format!("t.{}", quote_ident(&size_bytes_column)),
+                format!("u.{}", quote_ident(&size_bytes_column)),
+            ),
+        ],
     )
 }
 
@@ -1000,26 +1170,36 @@ fn quote_ident(identifier: &str) -> String {
 }
 
 fn active_version_commit_id_sql() -> String {
+    let active_version_layout = builtin_live_table_layout(active_version_schema_key())
+        .expect("active version layout lookup should succeed")
+        .expect("builtin active version schema should exist");
+    let active_version_column = live_column_name_for_property(&active_version_layout, "version_id")
+        .expect("active version live layout must include version_id");
+    let version_ref_commit_id_column =
+        quote_ident(&live_payload_column_name("lix_version_ref", "commit_id"));
+    let live_version_ref_table = tracked_live_table_name("lix_version_ref");
     format!(
         "(\
-         SELECT lix_json_extract(vp.snapshot_content, 'commit_id') \
-         FROM lix_internal_live_v1_lix_version_ref vp \
+         SELECT {version_ref_commit_id_column} \
+         FROM {live_version_ref_table} vp \
          WHERE vp.schema_key = 'lix_version_ref' \
            AND vp.version_id = '{global_version}' \
-           AND vp.snapshot_content IS NOT NULL \
+           AND vp.is_tombstone = 0 \
+           AND {version_ref_commit_id_column} IS NOT NULL \
            AND vp.entity_id = (\
-               SELECT lix_json_extract(snapshot_content, 'version_id') \
-               FROM lix_internal_live_untracked_v1 \
-               WHERE schema_key = '{schema_key}' \
-                 AND file_id = '{file_id}' \
+               SELECT {active_version_column} \
+               FROM {active_version_table} \
+               WHERE file_id = '{file_id}' \
                  AND version_id = '{storage_version_id}' \
-                 AND snapshot_content IS NOT NULL \
+                 AND {active_version_column} IS NOT NULL \
                LIMIT 1\
            ) \
          LIMIT 1\
         )",
+        active_version_column = quote_ident(active_version_column),
+        version_ref_commit_id_column = version_ref_commit_id_column,
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
-        schema_key = escape_sql_string(active_version_schema_key()),
+        active_version_table = quote_ident(&untracked_live_table_name(active_version_schema_key())),
         file_id = escape_sql_string(active_version_file_id()),
         storage_version_id = escape_sql_string(active_version_storage_version_id()),
     )
@@ -1032,18 +1212,69 @@ pub(crate) fn build_filesystem_state_history_source_sql(
     default_root_scope: &str,
     force_active_scope: bool,
 ) -> String {
+    let active_version_layout = builtin_live_table_layout(active_version_schema_key())
+        .expect("active version layout lookup should succeed")
+        .expect("builtin active version schema should exist");
+    let active_version_column = live_column_name_for_property(&active_version_layout, "version_id")
+        .expect("active version live layout must include version_id");
+    let version_ref_commit_id_column = format!(
+        "vp.{}",
+        quote_ident(&live_payload_column_name("lix_version_ref", "commit_id"))
+    );
+    let commit_change_set_id_column = format!(
+        "c.{}",
+        quote_ident(&live_payload_column_name("lix_commit", "change_set_id"))
+    );
+    let cse_entity_id_column = format!(
+        "cse.{}",
+        quote_ident(&live_payload_column_name(
+            "lix_change_set_element",
+            "entity_id"
+        ))
+    );
+    let cse_file_id_column = format!(
+        "cse.{}",
+        quote_ident(&live_payload_column_name(
+            "lix_change_set_element",
+            "file_id"
+        ))
+    );
+    let cse_schema_key_column = format!(
+        "cse.{}",
+        quote_ident(&live_payload_column_name(
+            "lix_change_set_element",
+            "schema_key"
+        ))
+    );
+    let cse_change_id_column = format!(
+        "cse.{}",
+        quote_ident(&live_payload_column_name(
+            "lix_change_set_element",
+            "change_id"
+        ))
+    );
+    let cse_change_set_id_column = format!(
+        "cse.{}",
+        quote_ident(&live_payload_column_name(
+            "lix_change_set_element",
+            "change_set_id"
+        ))
+    );
+    let live_version_ref_table = tracked_live_table_name("lix_version_ref");
+    let live_commit_table = tracked_live_table_name("lix_commit");
+    let live_cse_table = tracked_live_table_name("lix_change_set_element");
     let active_version_rows_sql = if force_active_scope {
         format!(
             "active_version_rows AS ( \
                SELECT DISTINCT \
-                 lix_json_extract(snapshot_content, 'version_id') AS version_id \
-               FROM lix_internal_live_untracked_v1 \
-               WHERE schema_key = '{active_schema_key}' \
-                 AND file_id = '{active_file_id}' \
+                 {active_version_column} AS version_id \
+               FROM {active_table} \
+               WHERE file_id = '{active_file_id}' \
                  AND version_id = '{active_storage_version_id}' \
-                 AND snapshot_content IS NOT NULL \
+                 AND {active_version_column} IS NOT NULL \
              ), ",
-            active_schema_key = escape_sql_string(active_version_schema_key()),
+            active_version_column = quote_ident(active_version_column),
+            active_table = quote_ident(&untracked_live_table_name(active_version_schema_key())),
             active_file_id = escape_sql_string(active_version_file_id()),
             active_storage_version_id = escape_sql_string(active_version_storage_version_id()),
         )
@@ -1054,52 +1285,34 @@ pub(crate) fn build_filesystem_state_history_source_sql(
         format!(
             "default_root_commits AS ( \
            SELECT DISTINCT \
-             lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
+             {version_ref_commit_id_column} AS root_commit_id, \
              vp.entity_id AS root_version_id \
-           FROM lix_internal_live_v1_lix_version_ref vp \
+           FROM {live_version_ref_table} vp \
            JOIN active_version_rows av \
              ON av.version_id = vp.entity_id \
            WHERE vp.schema_key = 'lix_version_ref' \
              AND vp.version_id = '{global_version}' \
              AND vp.is_tombstone = 0 \
-             AND vp.snapshot_content IS NOT NULL \
-           UNION \
-           SELECT DISTINCT \
-             lix_json_extract(vd.snapshot_content, 'commit_id') AS root_commit_id, \
-             vd.entity_id AS root_version_id \
-           FROM lix_internal_live_v1_lix_version_descriptor vd \
-           JOIN active_version_rows av \
-             ON av.version_id = vd.entity_id \
-           WHERE vd.schema_key = '{version_descriptor_schema_key}' \
-             AND vd.version_id = '{global_version}' \
-             AND vd.is_tombstone = 0 \
-             AND vd.snapshot_content IS NOT NULL \
+             AND {version_ref_commit_id_column} IS NOT NULL \
          ), ",
-            version_descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
+            live_version_ref_table = live_version_ref_table,
+            version_ref_commit_id_column = version_ref_commit_id_column,
             global_version = escape_sql_string(GLOBAL_VERSION_ID),
         )
     } else {
         format!(
             "default_root_commits AS ( \
            SELECT DISTINCT \
-             lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
+             {version_ref_commit_id_column} AS root_commit_id, \
              vp.entity_id AS root_version_id \
-           FROM lix_internal_live_v1_lix_version_ref vp \
+           FROM {live_version_ref_table} vp \
            WHERE vp.schema_key = 'lix_version_ref' \
              AND vp.version_id = '{global_version}' \
              AND vp.is_tombstone = 0 \
-             AND vp.snapshot_content IS NOT NULL \
-           UNION \
-           SELECT DISTINCT \
-             lix_json_extract(vd.snapshot_content, 'commit_id') AS root_commit_id, \
-             vd.entity_id AS root_version_id \
-           FROM lix_internal_live_v1_lix_version_descriptor vd \
-           WHERE vd.schema_key = '{version_descriptor_schema_key}' \
-             AND vd.version_id = '{global_version}' \
-             AND vd.is_tombstone = 0 \
-             AND vd.snapshot_content IS NOT NULL \
+             AND {version_ref_commit_id_column} IS NOT NULL \
          ), ",
-            version_descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
+            live_version_ref_table = live_version_ref_table,
+            version_ref_commit_id_column = version_ref_commit_id_column,
             global_version = escape_sql_string(GLOBAL_VERSION_ID),
         )
     };
@@ -1113,50 +1326,47 @@ pub(crate) fn build_filesystem_state_history_source_sql(
              SELECT DISTINCT \
                c.entity_id AS commit_id, \
                COALESCE(d.root_version_id, c.version_id) AS root_version_id \
-             FROM lix_internal_live_v1_lix_commit c \
+             FROM {live_commit_table} c \
              LEFT JOIN default_root_commits d \
                ON d.root_commit_id = c.entity_id \
              WHERE c.schema_key = 'lix_commit' \
                AND c.version_id = '{global_version}' \
-               AND c.is_tombstone = 0 \
-               AND c.snapshot_content IS NOT NULL{requested_roots_where}{requested_versions_where} \
+               AND c.is_tombstone = 0{requested_roots_where}{requested_versions_where} \
                {default_root_scope} \
            ), \
            {reachable_commits_cte_sql}\
            commit_changesets AS ( \
              SELECT \
                c.entity_id AS commit_id, \
-               lix_json_extract(c.snapshot_content, 'change_set_id') AS change_set_id, \
+               {commit_change_set_id_column} AS change_set_id, \
                c.created_at AS commit_created_at, \
                rc.root_commit_id AS root_commit_id, \
                rc.root_version_id AS root_version_id, \
                rc.commit_depth AS commit_depth \
-             FROM lix_internal_live_v1_lix_commit c \
+             FROM {live_commit_table} c \
              JOIN reachable_commits rc \
                ON rc.commit_id = c.entity_id \
              WHERE c.schema_key = 'lix_commit' \
                AND c.version_id = '{global_version}' \
                AND c.is_tombstone = 0 \
-               AND c.snapshot_content IS NOT NULL \
            ), \
            cse_in_reachable_commits AS ( \
              SELECT \
-               lix_json_extract(cse.snapshot_content, 'entity_id') AS target_entity_id, \
-               lix_json_extract(cse.snapshot_content, 'file_id') AS target_file_id, \
-               lix_json_extract(cse.snapshot_content, 'schema_key') AS target_schema_key, \
-               lix_json_extract(cse.snapshot_content, 'change_id') AS target_change_id, \
+               {cse_entity_id_column} AS target_entity_id, \
+               {cse_file_id_column} AS target_file_id, \
+               {cse_schema_key_column} AS target_schema_key, \
+               {cse_change_id_column} AS target_change_id, \
                cc.commit_id AS origin_commit_id, \
                cc.commit_created_at AS commit_created_at, \
                cc.root_commit_id AS root_commit_id, \
                cc.root_version_id AS root_version_id, \
                cc.commit_depth AS commit_depth \
-             FROM lix_internal_live_v1_lix_change_set_element cse \
+             FROM {live_cse_table} cse \
              JOIN commit_changesets cc \
-               ON lix_json_extract(cse.snapshot_content, 'change_set_id') = cc.change_set_id \
+               ON {cse_change_set_id_column} = cc.change_set_id \
              WHERE cse.schema_key = 'lix_change_set_element' \
                AND cse.version_id = '{global_version}' \
                AND cse.is_tombstone = 0 \
-               AND cse.snapshot_content IS NOT NULL \
            ), \
            ranked AS ( \
              SELECT \
@@ -1215,5 +1425,45 @@ pub(crate) fn build_filesystem_state_history_source_sql(
         requested_roots_where = requested_roots_where,
         requested_versions_where = requested_versions_where,
         default_root_scope = default_root_scope,
+        commit_change_set_id_column = commit_change_set_id_column,
+        cse_entity_id_column = cse_entity_id_column,
+        cse_file_id_column = cse_file_id_column,
+        cse_schema_key_column = cse_schema_key_column,
+        cse_change_id_column = cse_change_id_column,
+        cse_change_set_id_column = cse_change_set_id_column,
+        live_commit_table = live_commit_table,
+        live_cse_table = live_cse_table,
     )
+}
+
+fn live_payload_column_name(schema_key: &str, property_name: &str) -> String {
+    let layout = builtin_live_table_layout(schema_key)
+        .expect("builtin live layout lookup should succeed")
+        .expect("builtin live layout should exist");
+    live_column_name_for_property(&layout, property_name)
+        .unwrap_or_else(|| {
+            panic!("builtin live layout '{schema_key}' must include '{property_name}'")
+        })
+        .to_string()
+}
+
+fn qualified_column_ref(table_alias: &str, column_name: &str) -> String {
+    format!("{}.{}", quote_ident(table_alias), quote_ident(column_name))
+}
+
+fn normalized_json_text_projection(dialect: SqlDialect, column_ref: &str) -> String {
+    match dialect {
+        SqlDialect::Sqlite => format!(
+            "CASE \
+               WHEN {column_ref} IS NULL THEN NULL \
+               ELSE json_extract({column_ref}, '$') || '' \
+             END",
+        ),
+        SqlDialect::Postgres => format!(
+            "CASE \
+               WHEN {column_ref} IS NULL THEN NULL \
+               ELSE (CAST({column_ref} AS JSONB) #>> '{{}}') \
+             END",
+        ),
+    }
 }

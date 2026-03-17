@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
 
+use crate::schema::live_layout::LiveTableLayout;
 use crate::state::internal::InternalStatePlan;
 use crate::{LixError, Value};
 use sqlparser::ast::Expr;
@@ -11,6 +12,7 @@ use super::prepared_statement::PreparedStatement;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SchemaLiveTableRequirement {
     pub(crate) schema_key: String,
+    pub(crate) layout: Option<LiveTableLayout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +63,13 @@ impl PlannedStatementSet {
         match self.prepared_statements.as_slice() {
             [statement] => Ok(statement.params.as_slice()),
             [] => Ok(&[]),
+            statements
+                if statements
+                    .iter()
+                    .all(|statement| statement.params.is_empty()) =>
+            {
+                Ok(&[])
+            }
             _ => Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "preprocess output expected a single prepared statement".to_string(),

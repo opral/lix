@@ -67,16 +67,18 @@ pub struct SimulationEngine {
 impl SimulationEngine {
     #[allow(dead_code)]
     pub async fn init(&self) -> Result<(), LixError> {
-        let result = self.engine.initialize().await;
-        if result.is_ok() {
-            self.initialized.store(true, Ordering::SeqCst);
-            if self.behavior == SimulationBehavior::Rematerialization {
-                // Re-materialize on first read after init, mirroring "cache cleared then repopulated"
-                // simulation semantics from the JS test harness.
-                self.rematerialization_pending.store(true, Ordering::SeqCst);
-            }
+        self.initialize().await
+    }
+
+    pub async fn initialize(&self) -> Result<(), LixError> {
+        self.engine.initialize().await?;
+        self.initialized.store(true, Ordering::SeqCst);
+        if self.behavior == SimulationBehavior::Rematerialization {
+            // Re-materialize on first read after init, mirroring "cache cleared then repopulated"
+            // simulation semantics from the JS test harness.
+            self.rematerialization_pending.store(true, Ordering::SeqCst);
         }
-        result
+        Ok(())
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {

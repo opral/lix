@@ -288,7 +288,8 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT entity_id, snapshot_content \
-                 FROM lix_internal_live_v1_materialization_test_schema \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'materialization_test_schema' \
                  ORDER BY entity_id",
                 &[],
             )

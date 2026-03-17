@@ -51,6 +51,37 @@ pub trait LixBackend: Send + Sync {
 }
 
 #[async_trait(?Send)]
+pub(crate) trait QueryExecutor {
+    fn dialect(&self) -> SqlDialect;
+    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
+}
+
+#[async_trait(?Send)]
+impl<T> QueryExecutor for &T
+where
+    T: LixBackend + ?Sized,
+{
+    fn dialect(&self) -> SqlDialect {
+        (*self).dialect()
+    }
+
+    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        (*self).execute(sql, params).await
+    }
+}
+
+#[async_trait(?Send)]
+impl QueryExecutor for Box<dyn LixTransaction + '_> {
+    fn dialect(&self) -> SqlDialect {
+        self.as_ref().dialect()
+    }
+
+    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        self.as_mut().execute(sql, params).await
+    }
+}
+
+#[async_trait(?Send)]
 pub trait LixTransaction {
     fn dialect(&self) -> SqlDialect;
 

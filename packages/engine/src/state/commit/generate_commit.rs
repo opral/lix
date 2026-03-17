@@ -551,7 +551,10 @@ where
         canonical_output: CanonicalCommitOutput {
             changes: output_changes,
         },
-        derived_apply_input: DerivedCommitApplyInput { live_state_rows },
+        derived_apply_input: DerivedCommitApplyInput {
+            live_state_rows,
+            live_layouts: BTreeMap::new(),
+        },
     })
 }
 

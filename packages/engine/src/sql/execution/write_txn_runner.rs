@@ -2,6 +2,10 @@ use std::collections::BTreeSet;
 
 use crate::engine::{dedupe_filesystem_payload_domain_changes, should_run_binary_cas_gc, Engine};
 use crate::functions::LixFunctionProvider;
+use crate::schema::live_layout::{normalized_live_column_values, untracked_live_table_name};
+use crate::schema::registry::{
+    ensure_schema_live_table_in_transaction, load_live_table_layout_in_transaction,
+};
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::execute::{self, SqlExecutionOutcome};
 use crate::sql::execution::runtime_effects::build_filesystem_payload_domain_changes_insert;
@@ -122,9 +126,9 @@ async fn run_public_untracked_write_txn_with_transaction(
             )
             .await?,
     );
-    // Public untracked writes already materialize their intended post-state directly into
-    // lix_internal_live_untracked_v1 via apply_public_untracked_rows(). Re-persisting the
-    // derived payload-domain changes here is both redundant and unsafe, because the legacy
+    // Public untracked writes already materialize their intended post-state directly into the
+    // normalized per-schema untracked live tables via apply_public_untracked_rows(). Re-persisting
+    // the derived payload-domain changes here is both redundant and unsafe, because the legacy
     // vtable-based insertion path is not part of the unified runner contract anymore.
     if should_run_binary_cas_gc(&[], &filesystem_payload_domain_changes) {
         engine
@@ -320,6 +324,8 @@ async fn apply_public_untracked_upsert(
     row: &crate::sql::public::planner::ir::PlannedStateRow,
     timestamp: &str,
 ) -> Result<(), LixError> {
+    ensure_schema_live_table_in_transaction(transaction, &row.schema_key).await?;
+
     let file_id = planned_row_text_value(row, "file_id")?;
     let plugin_key = planned_row_text_value(row, "plugin_key")?;
     let schema_version = planned_row_text_value(row, "schema_version")?;
@@ -336,31 +342,40 @@ async fn apply_public_untracked_upsert(
         .and_then(value_as_bool)
         .unwrap_or_else(|| row.version_id.as_deref() == Some(GLOBAL_VERSION_ID));
 
+    let layout = load_live_table_layout_in_transaction(transaction, &row.schema_key).await?;
+    let normalized_values = normalized_untracked_live_column_values_for_row(
+        Some(&layout),
+        Some(snapshot_content.as_str()),
+    )?;
+    let normalized_columns_sql = normalized_insert_columns_sql(&normalized_values);
+    let normalized_values_sql = normalized_insert_values_sql(&normalized_values);
+    let normalized_update_sql = normalized_update_assignments_sql(&normalized_values);
     let sql = format!(
         "INSERT INTO {table} (\
-         entity_id, schema_key, file_id, version_id, global, plugin_key, snapshot_content, metadata, writer_key, schema_version, created_at, updated_at\
+         entity_id, schema_key, file_id, version_id, global, plugin_key, metadata, writer_key, schema_version, created_at, updated_at{normalized_columns}\
          ) VALUES (\
-         '{entity_id}', '{schema_key}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{snapshot_content}', {metadata}, {writer_key}, '{schema_version}', '{timestamp}', '{timestamp}'\
-         ) ON CONFLICT (entity_id, schema_key, file_id, version_id) DO UPDATE SET \
+         '{entity_id}', '{schema_key}', '{file_id}', '{version_id}', {global}, '{plugin_key}', {metadata}, {writer_key}, '{schema_version}', '{timestamp}', '{timestamp}'{normalized_values}\
+         ) ON CONFLICT (entity_id, file_id, version_id) DO UPDATE SET \
          global = excluded.global, \
          plugin_key = excluded.plugin_key, \
-         snapshot_content = excluded.snapshot_content, \
          metadata = excluded.metadata, \
          writer_key = excluded.writer_key, \
          schema_version = excluded.schema_version, \
-         updated_at = excluded.updated_at",
-        table = "lix_internal_live_untracked_v1",
+         updated_at = excluded.updated_at{normalized_updates}",
+        table = quote_ident(&untracked_live_table_name(&row.schema_key)),
         entity_id = escape_sql_string(&row.entity_id),
         schema_key = escape_sql_string(&row.schema_key),
         file_id = escape_sql_string(file_id),
         version_id = escape_sql_string(row.version_id.as_deref().unwrap_or(GLOBAL_VERSION_ID)),
         global = if global { "true" } else { "false" },
         plugin_key = escape_sql_string(plugin_key),
-        snapshot_content = escape_sql_string(&snapshot_content),
         metadata = metadata_sql,
         writer_key = writer_key_sql,
         schema_version = escape_sql_string(schema_version),
         timestamp = escape_sql_string(timestamp),
+        normalized_columns = normalized_columns_sql,
+        normalized_values = normalized_values_sql,
+        normalized_updates = normalized_update_sql,
     );
     transaction.execute(&sql, &[]).await?;
     Ok(())
@@ -370,16 +385,16 @@ async fn apply_public_untracked_delete(
     transaction: &mut dyn LixTransaction,
     row: &crate::sql::public::planner::ir::PlannedStateRow,
 ) -> Result<(), LixError> {
+    ensure_schema_live_table_in_transaction(transaction, &row.schema_key).await?;
+
     let file_id = planned_row_text_value(row, "file_id")?;
     let sql = format!(
         "DELETE FROM {table} \
          WHERE entity_id = '{entity_id}' \
-           AND schema_key = '{schema_key}' \
            AND file_id = '{file_id}' \
            AND version_id = '{version_id}'",
-        table = "lix_internal_live_untracked_v1",
+        table = quote_ident(&untracked_live_table_name(&row.schema_key)),
         entity_id = escape_sql_string(&row.entity_id),
-        schema_key = escape_sql_string(&row.schema_key),
         file_id = escape_sql_string(file_id),
         version_id = escape_sql_string(row.version_id.as_deref().unwrap_or(GLOBAL_VERSION_ID)),
     );
@@ -429,6 +444,83 @@ fn value_as_bool(value: &Value) -> Option<bool> {
         Value::Boolean(value) => Some(*value),
         _ => None,
     }
+}
+
+fn normalized_untracked_live_column_values_for_row(
+    layout: Option<&crate::schema::live_layout::LiveTableLayout>,
+    snapshot_content: Option<&str>,
+) -> Result<Vec<(String, Value)>, LixError> {
+    let Some(layout) = layout else {
+        return Ok(Vec::new());
+    };
+    Ok(normalized_live_column_values(layout, snapshot_content)?
+        .into_iter()
+        .collect())
+}
+
+fn normalized_insert_columns_sql(values: &[(String, Value)]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    values
+        .iter()
+        .map(|(column, _)| format!(", {}", quote_ident(column)))
+        .collect::<String>()
+}
+
+fn normalized_insert_values_sql(values: &[(String, Value)]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    values
+        .iter()
+        .map(|(_, value)| format!(", {}", sql_literal(value)))
+        .collect::<String>()
+}
+
+fn normalized_update_assignments_sql(values: &[(String, Value)]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    values
+        .iter()
+        .map(|(column, _)| {
+            format!(
+                ", {} = excluded.{}",
+                quote_ident(column),
+                quote_ident(column)
+            )
+        })
+        .collect::<String>()
+}
+
+fn sql_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Boolean(value) => {
+            if *value {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        Value::Integer(value) => value.to_string(),
+        Value::Real(value) => value.to_string(),
+        Value::Text(value) => format!("'{}'", escape_sql_string(value)),
+        Value::Json(value) => format!("'{}'", escape_sql_string(&value.to_string())),
+        Value::Blob(value) => {
+            let mut out = String::from("X'");
+            for byte in value {
+                out.push_str(&format!("{byte:02X}"));
+            }
+            out.push('\'');
+            out
+        }
+    }
+}
+
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 async fn persist_filesystem_payload_domain_changes_direct(

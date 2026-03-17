@@ -1,8 +1,9 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use sqlparser::ast::{Delete, Statement, Update};
 
 use crate::functions::LixFunctionProvider;
+use crate::schema::live_layout::LiveTableLayout;
 use crate::state::internal::{registered_schema, vtable_write};
 use crate::state::internal::{PostprocessPlan, RewriteOutput};
 use crate::{LixBackend, LixError, Value};
@@ -13,6 +14,7 @@ struct StatementContext<'a> {
     params: &'a [Value],
     writer_key: Option<&'a str>,
     backend: Option<&'a dyn LixBackend>,
+    known_live_layouts: Option<&'a BTreeMap<String, LiveTableLayout>>,
     side_effects: Vec<Statement>,
     live_table_requirements: Vec<crate::state::internal::SchemaLiveTableRequirement>,
     generated_params: Vec<Value>,
@@ -27,6 +29,7 @@ impl<'a> StatementContext<'a> {
             params,
             writer_key,
             backend: None,
+            known_live_layouts: None,
             side_effects: Vec::new(),
             live_table_requirements: Vec::new(),
             generated_params: Vec::new(),
@@ -40,11 +43,13 @@ impl<'a> StatementContext<'a> {
         backend: &'a dyn LixBackend,
         params: &'a [Value],
         writer_key: Option<&'a str>,
+        known_live_layouts: &'a BTreeMap<String, LiveTableLayout>,
     ) -> Self {
         Self {
             params,
             writer_key,
             backend: Some(backend),
+            known_live_layouts: Some(known_live_layouts),
             side_effects: Vec::new(),
             live_table_requirements: Vec::new(),
             generated_params: Vec::new(),
@@ -156,6 +161,13 @@ fn rewrite_vtable_delete_output(
         vtable_write::rewrite_delete(delete.clone(), params)?
     };
 
+    rewrite_vtable_delete_output_from_rewrite(delete, rewritten)
+}
+
+fn rewrite_vtable_delete_output_from_rewrite(
+    delete: Delete,
+    rewritten: Option<vtable_write::DeleteRewrite>,
+) -> Result<RewriteOutput, LixError> {
     match rewritten {
         Some(vtable_write::DeleteRewrite::Statement(statement)) => Ok(RewriteOutput {
             statements: vec![statement.statement],
@@ -224,6 +236,7 @@ pub(crate) async fn rewrite_backend_statement<P>(
     statement: Statement,
     params: &[Value],
     writer_key: Option<&str>,
+    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
     functions: &mut P,
 ) -> Result<Option<RewriteOutput>, LixError>
 where
@@ -251,7 +264,8 @@ where
                 merge_rewrite_output(&mut final_output, output)?;
             }
             Pending::Statement(statement) => {
-                let mut context = StatementContext::new_backend(backend, params, writer_key);
+                let mut context =
+                    StatementContext::new_backend(backend, params, writer_key, known_live_layouts);
                 let outcome = rewrite_backend_loop(statement, &mut context, functions).await?;
                 let side_effects = std::mem::take(&mut context.side_effects);
 
@@ -426,6 +440,7 @@ where
                 if let Some(rewritten) = vtable_write::rewrite_insert_with_backend(
                     backend,
                     current_insert.clone(),
+                    context.known_live_layouts.unwrap_or(&BTreeMap::new()),
                     context.params,
                     context.generated_params.len(),
                     context.writer_key,
@@ -464,14 +479,35 @@ where
                 return Ok(StatementRuleOutcome::Emit(context.take_output(statements)));
             }
             Statement::Update(update) => {
-                let output = rewrite_vtable_update_output(
-                    update.clone(),
-                    vtable_write::rewrite_update(update, context.params)?,
-                )?;
+                let rewritten = vtable_write::rewrite_update(update.clone(), context.params)?;
+                let rewritten = match rewritten {
+                    Some(rewritten) => Some(
+                        vtable_write::enrich_update_rewrite_with_backend(
+                            backend,
+                            rewritten,
+                            context.known_live_layouts.unwrap_or(&BTreeMap::new()),
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                };
+                let output = rewrite_vtable_update_output(update.clone(), rewritten)?;
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             Statement::Delete(delete) => {
-                let output = rewrite_vtable_delete_output(delete, false, context.params)?;
+                let rewritten = vtable_write::rewrite_delete(delete.clone(), context.params)?;
+                let rewritten = match rewritten {
+                    Some(rewritten) => Some(
+                        vtable_write::enrich_delete_rewrite_with_backend(
+                            backend,
+                            rewritten,
+                            context.known_live_layouts.unwrap_or(&BTreeMap::new()),
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                };
+                let output = rewrite_vtable_delete_output_from_rewrite(delete, rewritten)?;
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             other => {

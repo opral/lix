@@ -32,7 +32,7 @@ pub(crate) struct VersionDescriptorRecord {
     pub schema_version: String,
     pub file_id: String,
     pub plugin_key: String,
-    pub snapshot_content: String,
+    pub snapshot_content: Option<String>,
     pub metadata: Option<String>,
     pub created_at: String,
 }
@@ -110,23 +110,24 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
         }
 
         if schema_key == "lix_version_descriptor" {
-            if let Some(snapshot_raw) = snapshot_content {
-                if parse_version_descriptor_snapshot(&snapshot_raw)?.is_some() {
-                    let candidate = VersionDescriptorRecord {
-                        id: id.clone(),
-                        entity_id: entity_id.clone(),
-                        schema_version: schema_version.clone(),
-                        file_id: file_id.clone(),
-                        plugin_key: plugin_key.clone(),
-                        snapshot_content: snapshot_raw,
-                        metadata: metadata.clone(),
-                        created_at,
-                    };
-                    upsert_latest_by_entity(&mut version_descriptors, candidate, |record| {
-                        record.entity_id.clone()
-                    });
+            if let Some(snapshot_raw) = snapshot_content.as_deref() {
+                if parse_version_descriptor_snapshot(snapshot_raw)?.is_none() {
+                    continue;
                 }
             }
+            let candidate = VersionDescriptorRecord {
+                id: id.clone(),
+                entity_id: entity_id.clone(),
+                schema_version: schema_version.clone(),
+                file_id: file_id.clone(),
+                plugin_key: plugin_key.clone(),
+                snapshot_content: snapshot_content.clone(),
+                metadata: metadata.clone(),
+                created_at,
+            };
+            upsert_latest_by_entity(&mut version_descriptors, candidate, |record| {
+                record.entity_id.clone()
+            });
             continue;
         }
 

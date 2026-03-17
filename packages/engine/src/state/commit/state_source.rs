@@ -1,20 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use async_trait::async_trait;
-
-#[cfg(test)]
-use crate::backend::SqlDialect;
-use crate::errors::classification::is_missing_relation_error;
 use crate::schema::builtin::types::LixVersionRef;
+use crate::schema::live_store::{
+    load_exact_live_row_with_executor, logical_snapshot_text, LiveRowScope,
+};
 use crate::version::{
     version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
     version_ref_storage_version_id,
 };
-use crate::{LixBackend, LixError, QueryResult, Value};
+use crate::{LixBackend, LixError, Value};
 
 use super::types::{VersionInfo, VersionSnapshot};
 
-const VERSION_REF_TABLE: &str = "lix_internal_live_v1_lix_version_ref";
+#[cfg(test)]
+use crate::errors::classification::is_missing_relation_error;
+#[cfg(test)]
+use crate::schema::live_layout::{logical_snapshot_text_from_projected_row, LiveRowAccess};
+
 #[cfg(test)]
 const CANONICAL_FALLBACK_MAX_COMMIT_DEPTH: usize = 2048;
 
@@ -36,27 +38,7 @@ pub(crate) struct ExactCommittedStateRowRequest {
     pub(crate) exact_filters: BTreeMap<String, Value>,
 }
 
-#[async_trait(?Send)]
-pub(crate) trait CommitQueryExecutor {
-    #[cfg(test)]
-    fn dialect(&self) -> SqlDialect;
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
-}
-
-#[async_trait(?Send)]
-impl<T> CommitQueryExecutor for &T
-where
-    T: LixBackend + ?Sized,
-{
-    #[cfg(test)]
-    fn dialect(&self) -> SqlDialect {
-        (*self).dialect()
-    }
-
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        (*self).execute(sql, params).await
-    }
-}
+pub(crate) use crate::backend::QueryExecutor as CommitQueryExecutor;
 
 pub(crate) async fn load_committed_version_head_commit_id_from_live_state(
     executor: &mut dyn CommitQueryExecutor,
@@ -64,7 +46,6 @@ pub(crate) async fn load_committed_version_head_commit_id_from_live_state(
 ) -> Result<Option<String>, LixError> {
     let snapshot_content = match load_current_pointer_snapshot_content(
         executor,
-        VERSION_REF_TABLE,
         version_ref_schema_key(),
         version_id,
         version_ref_file_id(),
@@ -149,37 +130,28 @@ pub(crate) async fn load_version_info_for_versions(
 
 async fn load_current_pointer_snapshot_content(
     executor: &mut dyn CommitQueryExecutor,
-    table: &str,
     schema_key: &str,
     entity_id: &str,
     file_id: &str,
     plugin_key: &str,
     storage_version_id: &str,
 ) -> Result<Option<Value>, LixError> {
-    let sql = format!(
-        "SELECT snapshot_content \
-         FROM {table} \
-         WHERE schema_key = '{schema_key}' \
-           AND entity_id = '{entity_id}' \
-           AND file_id = '{file_id}' \
-           AND plugin_key = '{plugin_key}' \
-           AND version_id = '{storage_version_id}' \
-           AND is_tombstone = 0 \
-           AND snapshot_content IS NOT NULL \
-         LIMIT 1",
-        table = table,
-        schema_key = escape_sql_string(schema_key),
-        entity_id = escape_sql_string(entity_id),
-        file_id = escape_sql_string(file_id),
-        plugin_key = escape_sql_string(plugin_key),
-        storage_version_id = escape_sql_string(storage_version_id),
-    );
-
-    match executor.execute(&sql, &[]).await {
-        Ok(result) => Ok(result.rows.first().and_then(|row| row.first()).cloned()),
-        Err(err) if is_missing_relation_error(&err) => Ok(None),
-        Err(err) => Err(err),
-    }
+    let filters = BTreeMap::from([
+        ("entity_id", entity_id.to_string()),
+        ("file_id", file_id.to_string()),
+        ("plugin_key", plugin_key.to_string()),
+        ("version_id", storage_version_id.to_string()),
+    ]);
+    let Some(row) =
+        load_exact_live_row_with_executor(executor, LiveRowScope::Tracked, schema_key, &filters)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let access =
+        crate::schema::live_layout::load_live_row_access_with_executor(executor, schema_key)
+            .await?;
+    logical_snapshot_text(&access, &row).map(|snapshot| snapshot.map(Value::Text))
 }
 
 pub(crate) async fn load_exact_committed_state_row_from_live_state(
@@ -194,51 +166,68 @@ pub(crate) async fn load_exact_committed_state_row_from_live_state_with_executor
     executor: &mut dyn CommitQueryExecutor,
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    let table_name = quote_ident(&format!("lix_internal_live_v1_{}", request.schema_key));
-    let mut sql = format!(
-        "SELECT entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, metadata, change_id \
-         FROM {table_name} \
-         WHERE entity_id = '{entity_id}' \
-           AND schema_key = '{schema_key}' \
-           AND version_id = '{version_id}' \
-           AND is_tombstone = 0 \
-           AND snapshot_content IS NOT NULL",
-        table_name = table_name,
-        entity_id = escape_sql_string(&request.entity_id),
-        schema_key = escape_sql_string(&request.schema_key),
-        version_id = escape_sql_string(&request.version_id),
-    );
+    let mut filters = BTreeMap::from([
+        ("entity_id", request.entity_id.clone()),
+        ("version_id", request.version_id.clone()),
+    ]);
     for column in ["file_id", "plugin_key", "schema_version"] {
         let Some(expected) = request.exact_filters.get(column).and_then(text_from_value) else {
             continue;
         };
-        sql.push_str(&format!(
-            " AND {column} = '{expected}'",
-            column = column,
-            expected = escape_sql_string(&expected),
-        ));
+        filters.insert(column, expected);
     }
-    sql.push_str(" LIMIT 2");
-
-    let result = match executor.execute(&sql, &[]).await {
-        Ok(result) => result,
-        Err(err) if is_missing_relation_error(&err) => return Ok(None),
-        Err(err) => return Err(err),
-    };
-
-    if result.rows.len() > 1 {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "tracked write state source requires exactly one committed target row for '{}:{}@{}'",
-                request.schema_key, request.entity_id, request.version_id
-            ),
-        });
-    }
-    let Some(row) = result.rows.first() else {
+    let Some(row) = load_exact_live_row_with_executor(
+        executor,
+        LiveRowScope::Tracked,
+        &request.schema_key,
+        &filters,
+    )
+    .await?
+    else {
         return Ok(None);
     };
-    exact_committed_state_row_from_live_table_row(row)
+    let access = crate::schema::live_layout::load_live_row_access_with_executor(
+        executor,
+        &request.schema_key,
+    )
+    .await?;
+    let Some(snapshot_content) = logical_snapshot_text(&access, &row)? else {
+        return Ok(None);
+    };
+    let mut values = BTreeMap::new();
+    values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
+    values.insert(
+        "schema_key".to_string(),
+        Value::Text(row.schema_key.clone()),
+    );
+    values.insert(
+        "schema_version".to_string(),
+        Value::Text(row.schema_version.clone()),
+    );
+    values.insert("file_id".to_string(), Value::Text(row.file_id.clone()));
+    values.insert(
+        "version_id".to_string(),
+        Value::Text(row.version_id.clone()),
+    );
+    values.insert(
+        "plugin_key".to_string(),
+        Value::Text(row.plugin_key.clone()),
+    );
+    values.insert(
+        "snapshot_content".to_string(),
+        Value::Text(snapshot_content),
+    );
+    if let Some(metadata) = row.metadata.clone() {
+        values.insert("metadata".to_string(), Value::Text(metadata));
+    }
+    Ok(Some(ExactCommittedStateRow {
+        entity_id: row.entity_id,
+        schema_key: row.schema_key,
+        file_id: row.file_id,
+        version_id: row.version_id,
+        values,
+        source_change_id: row.change_id,
+    }))
 }
 
 #[cfg(test)]
@@ -372,11 +361,15 @@ pub(crate) async fn reconstruct_exact_committed_state_row_from_canonical(
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
-    exact_committed_state_row_from_live_table_row(row)
+    exact_committed_state_row_from_row(row, None, 6, 0)
 }
 
-fn exact_committed_state_row_from_live_table_row(
+#[cfg(test)]
+fn exact_committed_state_row_from_row(
     row: &[Value],
+    access: Option<&LiveRowAccess>,
+    snapshot_index: usize,
+    normalized_start_index: usize,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
     let Some(entity_id) = row.first().and_then(text_from_value) else {
         return Ok(None);
@@ -396,11 +389,20 @@ fn exact_committed_state_row_from_live_table_row(
     let Some(plugin_key) = row.get(5).and_then(text_from_value) else {
         return Ok(None);
     };
-    let Some(snapshot_content) = row.get(6).and_then(text_from_value) else {
+    let Some(snapshot_content) = logical_snapshot_text_from_projected_row(
+        access,
+        &schema_key,
+        row,
+        snapshot_index,
+        normalized_start_index,
+    )?
+    else {
         return Ok(None);
     };
-    let metadata = row.get(7).and_then(text_from_value);
-    let source_change_id = row.get(8).and_then(text_from_value);
+    let metadata_index = if access.is_some() { 6 } else { 7 };
+    let source_change_id_index = if access.is_some() { 7 } else { 8 };
+    let metadata = row.get(metadata_index).and_then(text_from_value);
+    let source_change_id = row.get(source_change_id_index).and_then(text_from_value);
 
     let mut values = BTreeMap::new();
     values.insert("entity_id".to_string(), Value::Text(entity_id.clone()));
@@ -456,28 +458,26 @@ fn text_from_value(value: &Value) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn quote_ident(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
+#[cfg(test)]
 #[cfg(test)]
 fn json_array_text_join_sql(
-    dialect: SqlDialect,
+    dialect: crate::SqlDialect,
     json_column: &str,
     field: &str,
     alias: &str,
     value_column: &str,
 ) -> (String, String) {
     match dialect {
-        SqlDialect::Sqlite => (
+        crate::SqlDialect::Sqlite => (
             format!("JOIN json_each({json_column}, '$.{field}') AS {alias}"),
             format!("{alias}.value"),
         ),
-        SqlDialect::Postgres => (
+        crate::SqlDialect::Postgres => (
             format!(
                 "JOIN LATERAL jsonb_array_elements_text(CAST({json_column} AS JSONB) -> '{field}') AS {alias}({value_column}) ON TRUE"
             ),
@@ -489,10 +489,42 @@ fn json_array_text_join_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{LixTransaction, SqlDialect};
+    use crate::backend::LixTransaction;
+    use crate::schema::live_layout::builtin_live_table_layout;
+    use crate::QueryResult;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    fn mock_normalized_live_row(schema_key: &str) -> (Vec<Value>, String) {
+        let layout = builtin_live_table_layout(schema_key)
+            .expect("builtin live layout should compile")
+            .expect("builtin schema should exist");
+        let access = LiveRowAccess::new(layout.clone());
+        let mut row = vec![
+            Value::Text("file-1".to_string()),
+            Value::Text(schema_key.to_string()),
+            Value::Text("1".to_string()),
+            Value::Text("lix".to_string()),
+            Value::Text("v1".to_string()),
+            Value::Text("lix".to_string()),
+            Value::Text("{\"k\":\"v\"}".to_string()),
+            Value::Text("change-1".to_string()),
+        ];
+        for column in &layout.columns {
+            let value = if column.property_name == "id" {
+                Value::Text("file-1".to_string())
+            } else {
+                Value::Null
+            };
+            row.push(value);
+        }
+        let snapshot = access
+            .logical_snapshot_text_from_row(&row, 8)
+            .expect("live snapshot reconstruction should succeed")
+            .expect("live snapshot should be present");
+        (row, snapshot)
+    }
 
     struct ExactCommittedStateBackend {
         live_table_query_seen: Arc<AtomicBool>,
@@ -502,36 +534,17 @@ mod tests {
 
     #[async_trait(?Send)]
     impl LixBackend for ExactCommittedStateBackend {
-        fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
+        fn dialect(&self) -> crate::SqlDialect {
+            crate::SqlDialect::Sqlite
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             if sql.contains("FROM \"lix_internal_live_v1_lix_file_descriptor\"") {
                 self.live_table_query_seen.store(true, Ordering::SeqCst);
+                let (row, _) = mock_normalized_live_row("lix_file_descriptor");
                 return Ok(QueryResult {
-                    rows: vec![vec![
-                        Value::Text("file-1".to_string()),
-                        Value::Text("lix_file_descriptor".to_string()),
-                        Value::Text("1".to_string()),
-                        Value::Text("lix".to_string()),
-                        Value::Text("v1".to_string()),
-                        Value::Text("lix".to_string()),
-                        Value::Text("{\"id\":\"file-1\"}".to_string()),
-                        Value::Text("{\"k\":\"v\"}".to_string()),
-                        Value::Text("change-1".to_string()),
-                    ]],
-                    columns: vec![
-                        "entity_id".to_string(),
-                        "schema_key".to_string(),
-                        "schema_version".to_string(),
-                        "file_id".to_string(),
-                        "version_id".to_string(),
-                        "plugin_key".to_string(),
-                        "snapshot_content".to_string(),
-                        "metadata".to_string(),
-                        "change_id".to_string(),
-                    ],
+                    rows: vec![row],
+                    columns: Vec::new(),
                 });
             }
             Ok(QueryResult {
@@ -547,8 +560,8 @@ mod tests {
 
     #[async_trait(?Send)]
     impl LixTransaction for UnusedTransaction {
-        fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
+        fn dialect(&self) -> crate::SqlDialect {
+            crate::SqlDialect::Sqlite
         }
 
         async fn execute(
@@ -604,9 +617,10 @@ mod tests {
         assert_eq!(row.file_id, "lix");
         assert_eq!(row.version_id, "v1");
         assert_eq!(row.source_change_id.as_deref(), Some("change-1"));
+        let (_, expected_snapshot) = mock_normalized_live_row("lix_file_descriptor");
         assert_eq!(
             row.values.get("snapshot_content"),
-            Some(&Value::Text("{\"id\":\"file-1\"}".to_string()))
+            Some(&Value::Text(expected_snapshot))
         );
     }
 
@@ -616,8 +630,8 @@ mod tests {
 
     #[async_trait(?Send)]
     impl LixBackend for CanonicalFallbackBackend {
-        fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
+        fn dialect(&self) -> crate::SqlDialect {
+            crate::SqlDialect::Sqlite
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {

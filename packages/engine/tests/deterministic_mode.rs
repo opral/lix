@@ -70,9 +70,8 @@ simulation_test!(
         let mode_metadata = engine
             .execute(
                 "SELECT created_at, updated_at \
-                 FROM lix_internal_live_untracked_v1 \
-                 WHERE schema_key = 'lix_key_value' \
-                   AND entity_id = 'lix_deterministic_mode' \
+                 FROM lix_internal_live_untracked_v1_lix_key_value \
+                 WHERE entity_id = 'lix_deterministic_mode' \
                    AND version_id = 'global' \
                  LIMIT 1",
                 &[],

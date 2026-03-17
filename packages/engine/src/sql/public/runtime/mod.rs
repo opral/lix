@@ -4,6 +4,10 @@ use crate::errors::{
 };
 use crate::filesystem::pending_file_writes::PendingFileWrite;
 use crate::schema::builtin::builtin_schema_definition;
+use crate::schema::live_layout::{
+    builtin_live_table_layout, live_column_name_for_property, live_table_layout_from_schema,
+    untracked_live_table_name,
+};
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::common::dependency_spec::DependencySpec;
@@ -16,7 +20,7 @@ use crate::sql::public::catalog::{
 };
 use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
 use crate::sql::public::planner::backend::lowerer::{
-    lower_read_for_execution, rewrite_supported_public_read_surfaces_in_statement_with_registry,
+    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_dialect,
     summarize_bound_public_read_statement_with_registry, LoweredReadProgram,
 };
 use crate::sql::public::planner::canonicalize::{canonicalize_write, CanonicalizedWrite};
@@ -57,7 +61,7 @@ use sqlparser::ast::{
     JoinConstraint, JoinOperator, LimitClause, ObjectNamePart, OrderBy, OrderByExpr, Query, Select,
     SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value as SqlValue, Visit, Visitor,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -371,7 +375,9 @@ fn rewrite_public_read_statement_to_lowered_sql_with_registry(
     dialect: crate::SqlDialect,
     registry: &SurfaceRegistry,
 ) -> Result<Statement, LixError> {
-    rewrite_supported_public_read_surfaces_in_statement_with_registry(statement, registry)?;
+    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_dialect(
+        statement, registry, dialect,
+    )?;
     lower_statement(statement.clone(), dialect)
 }
 
@@ -1070,18 +1076,32 @@ impl Visitor for PublicRelationCollectorVisitor<'_> {
 async fn load_active_version_id_for_public_read(
     backend: &dyn LixBackend,
 ) -> Result<String, LixError> {
+    let layout = builtin_live_table_layout(active_version_schema_key())?.ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "builtin active version schema must compile to a live layout",
+        )
+    })?;
+    let payload_version_column =
+        live_column_name_for_property(&layout, "version_id").ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "active version live layout is missing version_id",
+            )
+        })?;
     let result = backend
         .execute(
-            "SELECT snapshot_content \
-             FROM lix_internal_live_untracked_v1 \
-             WHERE schema_key = $1 \
-               AND file_id = $2 \
-               AND version_id = $3 \
-               AND snapshot_content IS NOT NULL \
-             ORDER BY updated_at DESC \
-             LIMIT 1",
+            &format!(
+                "SELECT {payload_version_column} \
+                 FROM {} \
+                 WHERE file_id = $1 \
+                   AND version_id = $2 \
+                   AND {payload_version_column} IS NOT NULL \
+                 ORDER BY updated_at DESC \
+                 LIMIT 1",
+                untracked_live_table_name(crate::version::active_version_schema_key())
+            ),
             &[
-                Value::Text(crate::version::active_version_schema_key().to_string()),
                 Value::Text(crate::version::active_version_file_id().to_string()),
                 Value::Text(crate::version::active_version_storage_version_id().to_string()),
             ],
@@ -1091,22 +1111,19 @@ async fn load_active_version_id_for_public_read(
     let Some(row) = result.rows.first() else {
         return Ok(crate::version::DEFAULT_ACTIVE_VERSION_NAME.to_string());
     };
-    let snapshot_content = row.first().ok_or_else(|| {
+    let version_id = row.first().ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "active version query row is missing snapshot_content",
+            "active version query row is missing version_id",
         )
     })?;
-    let snapshot_content = match snapshot_content {
-        Value::Text(value) => value.as_str(),
-        other => {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("active version snapshot_content must be text, got {other:?}"),
-            ))
-        }
-    };
-    crate::version::parse_active_version_snapshot(snapshot_content)
+    match version_id {
+        Value::Text(value) => Ok(value.clone()),
+        other => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("active version id must be text, got {other:?}"),
+        )),
+    }
 }
 
 async fn maybe_bind_active_history_root(
@@ -1708,10 +1725,15 @@ pub(crate) fn finalize_public_write_execution(
 fn schema_live_table_requirements_from_partition(
     partition: &crate::sql::public::planner::ir::ResolvedWritePartition,
 ) -> Vec<SchemaLiveTableRequirement> {
-    let mut schema_keys = BTreeSet::new();
+    let mut requirements = BTreeMap::<String, SchemaLiveTableRequirement>::new();
     for row in &partition.intended_post_state {
         if row.schema_key != "lix_registered_schema" {
-            schema_keys.insert(row.schema_key.clone());
+            requirements
+                .entry(row.schema_key.clone())
+                .or_insert(SchemaLiveTableRequirement {
+                    schema_key: row.schema_key.clone(),
+                    layout: None,
+                });
         }
 
         if row.schema_key != "lix_registered_schema" || row.tombstone {
@@ -1725,16 +1747,25 @@ fn schema_live_table_requirements_from_partition(
         let Ok(snapshot) = serde_json::from_str(&snapshot_content) else {
             continue;
         };
-        let Ok((schema_key, _)) = crate::schema::schema_from_registered_snapshot(&snapshot) else {
+        let Ok((schema_key, schema)) = crate::schema::schema_from_registered_snapshot(&snapshot)
+        else {
             continue;
         };
-        schema_keys.insert(schema_key.schema_key);
+        let Ok(layout) = live_table_layout_from_schema(&schema) else {
+            continue;
+        };
+        requirements.insert(
+            schema_key.schema_key.clone(),
+            SchemaLiveTableRequirement {
+                schema_key: schema_key.schema_key,
+                layout: Some(layout),
+            },
+        );
     }
 
-    schema_keys
-        .into_iter()
-        .filter(|schema_key| builtin_schema_definition(schema_key).is_none())
-        .map(|schema_key| SchemaLiveTableRequirement { schema_key })
+    requirements
+        .into_values()
+        .filter(|requirement| builtin_schema_definition(&requirement.schema_key).is_none())
         .collect()
 }
 
@@ -2313,7 +2344,7 @@ mod tests {
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::json;
-    use sqlparser::ast::Statement;
+    use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
     use std::collections::HashMap;
@@ -2375,9 +2406,7 @@ mod tests {
                     },
                 });
             }
-            if sql.contains("FROM lix_internal_live_untracked_v1")
-                && sql.contains("schema_key = 'lix_active_version'")
-            {
+            if sql.contains("FROM lix_internal_live_untracked_v1_lix_active_version") {
                 let rows = self
                     .active_version_rows
                     .iter()
@@ -2393,9 +2422,7 @@ mod tests {
                     columns: vec!["entity_id".to_string(), "snapshot_content".to_string()],
                 });
             }
-            if sql.contains("FROM lix_internal_live_untracked_v1")
-                && sql.contains("schema_key = 'lix_active_account'")
-            {
+            if sql.contains("FROM lix_internal_live_untracked_v1_lix_active_account") {
                 let rows = self
                     .active_account_rows
                     .iter()
@@ -2413,7 +2440,7 @@ mod tests {
                     columns: vec!["entity_id".to_string(), "snapshot_content".to_string()],
                 });
             }
-            if sql.contains("FROM lix_internal_live_untracked_v1") {
+            if sql.contains("FROM lix_internal_live_untracked_v1_") {
                 return Ok(QueryResult {
                     rows: self.untracked_rows.clone(),
                     columns: vec![
@@ -2508,49 +2535,30 @@ mod tests {
                     },
                 });
             }
-            if sql.contains("FROM lix_internal_live_v1_lix_version_ref") {
+            if query_targets_table(sql, "lix_internal_live_v1_lix_version_ref") {
                 let rows = self
                     .version_ref_rows
                     .iter()
                     .filter(|(version_id, _)| {
-                        sql.contains(&format!("entity_id = '{}'", version_id))
+                        query_has_text_equality(sql, "entity_id", version_id)
                             || sql.contains(&format!("'{}'", version_id))
                     })
-                    .map(|(_, snapshot)| {
-                        if sql.contains("change_id") {
-                            vec![
-                                Value::Text(snapshot.clone()),
-                                Value::Text("pointer-change".to_string()),
-                            ]
-                        } else {
-                            vec![Value::Text(snapshot.clone())]
-                        }
-                    })
+                    .map(|(version_id, snapshot)| build_version_ref_live_row(version_id, snapshot))
                     .collect::<Vec<_>>();
                 return Ok(QueryResult {
                     rows,
-                    columns: if sql.contains("change_id") {
-                        vec!["snapshot_content".to_string(), "change_id".to_string()]
-                    } else {
-                        vec!["snapshot_content".to_string()]
-                    },
-                });
-            }
-            if sql.contains("FROM lix_internal_live_v1_lix_version_ref")
-                && sql.contains("entity_id = 'global'")
-            {
-                let rows = self
-                    .version_ref_rows
-                    .iter()
-                    .filter(|(version_id, _)| {
-                        sql.contains(&format!("entity_id = '{}'", version_id))
-                            || sql.contains(&format!("'{}'", version_id))
-                    })
-                    .map(|(_, snapshot)| vec![Value::Text(snapshot.clone())])
-                    .collect::<Vec<_>>();
-                return Ok(QueryResult {
-                    rows,
-                    columns: vec!["snapshot_content".to_string()],
+                    columns: vec![
+                        "entity_id".to_string(),
+                        "schema_key".to_string(),
+                        "schema_version".to_string(),
+                        "file_id".to_string(),
+                        "version_id".to_string(),
+                        "plugin_key".to_string(),
+                        "metadata".to_string(),
+                        "change_id".to_string(),
+                        "commit_id".to_string(),
+                        "id".to_string(),
+                    ],
                 });
             }
             if sql.contains("FROM lix_internal_change c")
@@ -2605,6 +2613,117 @@ mod tests {
 
     fn parse_one(sql: &str) -> Vec<Statement> {
         Parser::parse_sql(&GenericDialect {}, sql).expect("SQL should parse")
+    }
+
+    fn query_targets_table(sql: &str, table_name: &str) -> bool {
+        let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
+            return false;
+        };
+        statements
+            .iter()
+            .any(|statement| statement_targets_table(statement, table_name))
+    }
+
+    fn statement_targets_table(statement: &Statement, table_name: &str) -> bool {
+        match statement {
+            Statement::Query(query) => query_targets_table_name(query, table_name),
+            _ => false,
+        }
+    }
+
+    fn query_targets_table_name(query: &Query, table_name: &str) -> bool {
+        match query.body.as_ref() {
+            SetExpr::Select(select) => select.from.iter().any(|table_with_joins| {
+                table_factor_targets_table(&table_with_joins.relation, table_name)
+                    || table_with_joins
+                        .joins
+                        .iter()
+                        .any(|join| table_factor_targets_table(&join.relation, table_name))
+            }),
+            SetExpr::Query(query) => query_targets_table_name(query, table_name),
+            _ => false,
+        }
+    }
+
+    fn table_factor_targets_table(table_factor: &TableFactor, table_name: &str) -> bool {
+        match table_factor {
+            TableFactor::Table { name, .. } => name
+                .0
+                .last()
+                .and_then(|part| part.as_ident())
+                .map(|ident| ident.value.eq_ignore_ascii_case(table_name))
+                .unwrap_or(false),
+            TableFactor::Derived { subquery, .. } => query_targets_table_name(subquery, table_name),
+            _ => false,
+        }
+    }
+
+    fn query_has_text_equality(sql: &str, column_name: &str, expected: &str) -> bool {
+        let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
+            return false;
+        };
+        statements
+            .iter()
+            .any(|statement| statement_has_text_equality(statement, column_name, expected))
+    }
+
+    fn statement_has_text_equality(
+        statement: &Statement,
+        column_name: &str,
+        expected: &str,
+    ) -> bool {
+        match statement {
+            Statement::Query(query) => query_has_where_text_equality(query, column_name, expected),
+            _ => false,
+        }
+    }
+
+    fn query_has_where_text_equality(query: &Query, column_name: &str, expected: &str) -> bool {
+        match query.body.as_ref() {
+            SetExpr::Select(select) => select
+                .selection
+                .as_ref()
+                .is_some_and(|expr| expr_has_text_equality(expr, column_name, expected)),
+            SetExpr::Query(query) => query_has_where_text_equality(query, column_name, expected),
+            _ => false,
+        }
+    }
+
+    fn expr_has_text_equality(expr: &Expr, column_name: &str, expected: &str) -> bool {
+        match expr {
+            Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => {
+                expr_identifier_name(left)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+                    && expr_single_quoted_text(right).is_some_and(|value| value == expected)
+                    || expr_identifier_name(right)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+                        && expr_single_quoted_text(left).is_some_and(|value| value == expected)
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                expr_has_text_equality(left, column_name, expected)
+                    || expr_has_text_equality(right, column_name, expected)
+            }
+            Expr::Nested(inner) => expr_has_text_equality(inner, column_name, expected),
+            _ => false,
+        }
+    }
+
+    fn expr_identifier_name(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Identifier(ident) => Some(ident.value.as_str()),
+            Expr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.as_str()),
+            _ => None,
+        }
+    }
+
+    fn expr_single_quoted_text(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Value(sqlparser::ast::ValueWithSpan {
+                value: sqlparser::ast::Value::SingleQuotedString(text),
+                ..
+            }) => Some(text.as_str()),
+            _ => None,
+        }
     }
 
     fn extract_sql_string_filter(sql: &str, column: &str) -> Option<String> {
@@ -2695,6 +2814,27 @@ mod tests {
                 .map(|value| Value::Text(value.to_string()))
                 .unwrap_or(Value::Null),
         ]]
+    }
+
+    fn build_version_ref_live_row(version_id: &str, snapshot: &str) -> Vec<Value> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(snapshot).expect("version ref test snapshot must be valid JSON");
+        let commit_id = parsed
+            .get("commit_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("version ref test snapshot must include commit_id");
+        vec![
+            Value::Text(version_id.to_string()),
+            Value::Text(crate::version::version_ref_schema_key().to_string()),
+            Value::Text(crate::version::version_ref_schema_version().to_string()),
+            Value::Text(crate::version::version_ref_file_id().to_string()),
+            Value::Text(crate::version::version_ref_storage_version_id().to_string()),
+            Value::Text(crate::version::version_ref_plugin_key().to_string()),
+            Value::Null,
+            Value::Text(format!("pointer-change-{version_id}")),
+            Value::Text(commit_id.to_string()),
+            Value::Text(version_id.to_string()),
+        ]
     }
 
     #[tokio::test]
@@ -3522,7 +3662,7 @@ mod tests {
             .lowered_sql
             .first()
             .expect("joined admin read should lower");
-        assert!(lowered_sql.contains("lix_internal_live_untracked_v1"));
+        assert!(lowered_sql.contains("lix_internal_live_untracked_v1_lix_active_version"));
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
     }
 
@@ -3556,7 +3696,7 @@ mod tests {
             .first()
             .expect("mixed read should lower");
         assert!(lowered_sql.contains("app_versions"));
-        assert!(lowered_sql.contains("lix_internal_live_untracked_v1"));
+        assert!(lowered_sql.contains("lix_internal_live_untracked_v1_lix_active_version"));
     }
 
     #[tokio::test]
@@ -3567,7 +3707,7 @@ mod tests {
             &parse_one(
                 "SELECT av.version_id \
                  FROM lix_active_version av \
-                 JOIN lix_internal_live_untracked_v1 u ON u.entity_id = av.id",
+                 JOIN lix_internal_live_untracked_v1_lix_active_version u ON u.entity_id = av.id",
             ),
             &[],
             "main",
@@ -3577,7 +3717,9 @@ mod tests {
         .expect_err("public/internal mixed read should be rejected");
 
         assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
-        assert!(error.description.contains("lix_internal_live_untracked_v1"));
+        assert!(error
+            .description
+            .contains("lix_internal_live_untracked_v1_lix_active_version"));
     }
 
     #[tokio::test]
@@ -3588,7 +3730,7 @@ mod tests {
             &parse_one(
                 "SELECT av.version_id \
                  FROM lix_active_version av \
-                 JOIN lix_internal_live_untracked_v1 u ON u.entity_id = av.id",
+                 JOIN lix_internal_live_untracked_v1_lix_active_version u ON u.entity_id = av.id",
             ),
             &[],
             "main",
@@ -3609,7 +3751,7 @@ mod tests {
             .lowered_sql
             .first()
             .expect("public/internal mixed read should lower");
-        assert!(lowered_sql.contains("lix_internal_live_untracked_v1"));
+        assert!(lowered_sql.contains("lix_internal_live_untracked_v1_lix_active_version"));
     }
 
     #[tokio::test]
@@ -3689,7 +3831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepares_state_history_reads_with_root_commit_pushdown_trace() {
+    async fn prepares_state_history_reads_with_root_commit_pushdown() {
         let backend = FakeBackend::default();
         let prepared = prepare_public_read(
             &backend,

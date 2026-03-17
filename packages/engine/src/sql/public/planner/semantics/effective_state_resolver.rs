@@ -1,3 +1,4 @@
+use crate::schema::live_store::{load_exact_live_row_with_executor, LiveRowScope};
 use crate::sql::common::dependency_spec::DependencySpec;
 use crate::sql::public::planner::ir::{
     CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
@@ -441,11 +442,7 @@ async fn load_exact_untracked_state_row(
     executor: &mut dyn CommitQueryExecutor,
     request: &ExactUntrackedStateRowRequest,
 ) -> Result<Option<ExactUntrackedStateRow>, LixError> {
-    let mut predicates = vec![
-        format!("schema_key = '{}'", escape_sql_string(&request.schema_key)),
-        format!("version_id = '{}'", escape_sql_string(&request.version_id)),
-        "snapshot_content IS NOT NULL".to_string(),
-    ];
+    let mut filters = BTreeMap::from([("version_id", request.version_id.clone())]);
     for column in [
         "entity_id",
         "file_id",
@@ -454,72 +451,50 @@ async fn load_exact_untracked_state_row(
         "writer_key",
     ] {
         if let Some(value) = row_key_text_value(&request.row_key, column) {
-            predicates.push(format!("{column} = '{}'", escape_sql_string(value)));
+            filters.insert(column, value.to_string());
         }
     }
 
-    let sql = format!(
-        "SELECT \
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, \
-             snapshot_content, metadata \
-         FROM lix_internal_live_untracked_v1 \
-         WHERE {predicates} \
-         LIMIT 2",
-        predicates = predicates.join(" AND "),
-    );
-    let mut result = executor.execute(&sql, &[]).await?;
-    if result.rows.len() > 1 {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "public effective-state resolver requires exactly one untracked target row for '{}@{}'",
-                request.schema_key, request.version_id
-            ),
-        });
-    }
-    let Some(row) = result.rows.pop() else {
+    let Some(row) = load_exact_live_row_with_executor(
+        executor,
+        LiveRowScope::Untracked,
+        &request.schema_key,
+        &filters,
+    )
+    .await?
+    else {
         return Ok(None);
     };
-    if row.len() < 8 {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "public effective-state resolver query returned too few columns"
-                .to_string(),
-        });
-    }
-
-    let entity_id = required_text_value(&row[0], "entity_id")?;
-    let schema_key = required_text_value(&row[1], "schema_key")?;
-    let schema_version = required_text_value(&row[2], "schema_version")?;
-    let file_id = required_text_value(&row[3], "file_id")?;
-    let version_id = required_text_value(&row[4], "version_id")?;
-    let plugin_key = required_text_value(&row[5], "plugin_key")?;
-    let snapshot_content = required_text_value(&row[6], "snapshot_content")?;
-    let metadata = optional_value(&row[7]);
 
     let mut values = BTreeMap::new();
-    values.insert("entity_id".to_string(), Value::Text(entity_id.clone()));
-    values.insert("schema_key".to_string(), Value::Text(schema_key.clone()));
+    values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
+    values.insert(
+        "schema_key".to_string(),
+        Value::Text(row.schema_key.clone()),
+    );
     values.insert(
         "schema_version".to_string(),
-        Value::Text(schema_version.clone()),
+        Value::Text(row.schema_version.clone()),
     );
-    values.insert("file_id".to_string(), Value::Text(file_id.clone()));
-    values.insert("version_id".to_string(), Value::Text(version_id.clone()));
-    values.insert("plugin_key".to_string(), Value::Text(plugin_key));
+    values.insert("file_id".to_string(), Value::Text(row.file_id.clone()));
     values.insert(
-        "snapshot_content".to_string(),
-        Value::Text(snapshot_content),
+        "version_id".to_string(),
+        Value::Text(row.version_id.clone()),
     );
-    if let Some(metadata) = metadata {
-        values.insert("metadata".to_string(), metadata);
+    values.insert(
+        "plugin_key".to_string(),
+        Value::Text(row.plugin_key.clone()),
+    );
+    if let Some(metadata) = row.metadata.clone() {
+        values.insert("metadata".to_string(), Value::Text(metadata));
     }
+    values.extend(row.values.clone());
 
     Ok(Some(ExactUntrackedStateRow {
-        entity_id,
-        schema_key,
-        file_id,
-        version_id,
+        entity_id: row.entity_id,
+        schema_key: row.schema_key,
+        file_id: row.file_id,
+        version_id: row.version_id,
         values,
     }))
 }
@@ -558,27 +533,6 @@ fn row_key_text_value<'a>(row_key: &'a CanonicalStateRowKey, column: &str) -> Op
         "writer_key" => row_key.writer_key.as_deref(),
         _ => None,
     }
-}
-
-fn required_text_value(value: &Value, label: &str) -> Result<String, LixError> {
-    match value {
-        Value::Text(value) => Ok(value.clone()),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("public effective-state resolver expected text for '{label}'"),
-        }),
-    }
-}
-
-fn optional_value(value: &Value) -> Option<Value> {
-    match value {
-        Value::Null => None,
-        other => Some(other.clone()),
-    }
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 #[cfg(test)]

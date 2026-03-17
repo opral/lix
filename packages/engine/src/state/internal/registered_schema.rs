@@ -4,6 +4,9 @@ use sqlparser::ast::{
     OnInsert, Statement, TableObject, Value, ValueWithSpan,
 };
 
+use crate::schema::live_layout::{
+    builtin_live_table_layout, live_table_layout_from_schema, normalized_live_column_values,
+};
 use crate::state::internal::{
     object_name_matches, MutationOperation, MutationRow, ResolvedCell, RowSourceResolver,
     SchemaLiveTableRequirement,
@@ -209,10 +212,11 @@ pub fn rewrite_insert(
     // `lix_registered_schema` materialized storage does not expose `untracked`.
     drop_column_if_present(&mut columns, &mut rows, "untracked");
 
+    let rewritten_rows = rows.clone();
     source.body = Box::new(sqlparser::ast::SetExpr::Values(sqlparser::ast::Values {
         explicit_row: values_layout.explicit_row,
         value_keyword: values_layout.value_keyword,
-        rows,
+        rows: rewritten_rows,
     }));
 
     let rewritten = Insert {
@@ -222,16 +226,58 @@ pub fn rewrite_insert(
         on: Some(build_on_conflict_do_nothing()),
         ..insert
     };
+    let mut mirrored_columns = rewritten.columns.clone();
+    let mut mirrored_rows = rows;
+    let layout = builtin_live_table_layout(REGISTERED_SCHEMA_KEY)?;
+    drop_column_if_present(
+        &mut mirrored_columns,
+        &mut mirrored_rows,
+        "snapshot_content",
+    );
+    if let Some(layout) = layout.as_ref() {
+        let normalized_values =
+            normalized_live_column_values(layout, Some(&snapshot_literal_value))?;
+        for column in &layout.columns {
+            mirrored_columns.push(Ident::new(column.column_name.clone()));
+            let value = normalized_values
+                .get(&column.column_name)
+                .cloned()
+                .unwrap_or(EngineValue::Null);
+            for row in &mut mirrored_rows {
+                row.push(engine_value_to_expr(&value));
+            }
+        }
+    }
+    let mirrored_source = sqlparser::ast::Query {
+        body: Box::new(sqlparser::ast::SetExpr::Values(sqlparser::ast::Values {
+            explicit_row: values_layout.explicit_row,
+            value_keyword: values_layout.value_keyword,
+            rows: mirrored_rows,
+        })),
+        ..(*rewritten
+            .source
+            .clone()
+            .expect("registered schema rewrite must keep source"))
+        .clone()
+    };
     let mirrored = Insert {
         table: table_object(MATERIALIZED_TABLE),
+        columns: mirrored_columns,
+        source: Some(Box::new(mirrored_source)),
         ..rewritten.clone()
     };
+    let live_layout =
+        live_table_layout_from_schema(snapshot_value.get("value").ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "registered schema snapshot_content missing value".to_string(),
+        })?)?;
 
     Ok(Some(RegisteredSchemaRewrite {
         statement: Statement::Insert(rewritten),
         supplemental_statements: vec![Statement::Insert(mirrored)],
         live_table_requirement: SchemaLiveTableRequirement {
             schema_key: schema_key_value,
+            layout: Some(live_layout),
         },
         mutation: MutationRow {
             operation: MutationOperation::Insert,

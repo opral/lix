@@ -2,6 +2,8 @@ pub(crate) mod active_version;
 pub(crate) mod bootstrap;
 pub(crate) mod seed;
 
+use crate::schema::live_layout::tracked_live_table_name;
+use crate::sql::live_snapshot::live_snapshot_select_expr_for_schema;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 const INIT_STATEMENTS: &[&str] = &[
@@ -67,60 +69,6 @@ const INIT_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_registered_schema_bootstrap_live_vfe \
      ON lix_internal_registered_schema_bootstrap (version_id, file_id, entity_id) \
      WHERE is_tombstone = 0 AND snapshot_content IS NOT NULL",
-    "CREATE TABLE IF NOT EXISTS lix_internal_live_v1_lix_registered_schema (\
-     entity_id TEXT NOT NULL,\
-     schema_key TEXT NOT NULL,\
-     schema_version TEXT NOT NULL,\
-     file_id TEXT NOT NULL,\
-     version_id TEXT NOT NULL,\
-     global BOOLEAN NOT NULL DEFAULT false,\
-     plugin_key TEXT NOT NULL,\
-     snapshot_content TEXT,\
-     change_id TEXT NOT NULL,\
-     metadata TEXT,\
-     writer_key TEXT,\
-     is_tombstone INTEGER NOT NULL DEFAULT 0,\
-     created_at TEXT NOT NULL,\
-     updated_at TEXT NOT NULL,\
-     PRIMARY KEY (entity_id, file_id, version_id)\
-     )",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_v1_lix_registered_schema_version_id \
-     ON lix_internal_live_v1_lix_registered_schema (version_id)",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_v1_lix_registered_schema_global_version \
-     ON lix_internal_live_v1_lix_registered_schema (global, version_id)",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_v1_lix_registered_schema_vfe \
-     ON lix_internal_live_v1_lix_registered_schema (version_id, file_id, entity_id)",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_v1_lix_registered_schema_ve \
-     ON lix_internal_live_v1_lix_registered_schema (version_id, entity_id)",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_v1_lix_registered_schema_fv \
-     ON lix_internal_live_v1_lix_registered_schema (file_id, version_id)",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_v1_lix_registered_schema_live_vfe \
-     ON lix_internal_live_v1_lix_registered_schema (version_id, file_id, entity_id) \
-     WHERE is_tombstone = 0 AND snapshot_content IS NOT NULL",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_v1_lix_registered_schema_tomb_vfe \
-     ON lix_internal_live_v1_lix_registered_schema (version_id, file_id, entity_id) \
-     WHERE is_tombstone = 1 AND snapshot_content IS NULL",
-    "CREATE TABLE IF NOT EXISTS lix_internal_live_untracked_v1 (\
-     entity_id TEXT NOT NULL,\
-     schema_key TEXT NOT NULL,\
-     file_id TEXT NOT NULL,\
-     version_id TEXT NOT NULL,\
-     global BOOLEAN NOT NULL DEFAULT false,\
-     plugin_key TEXT NOT NULL,\
-     snapshot_content TEXT,\
-     metadata TEXT,\
-     writer_key TEXT,\
-     schema_version TEXT NOT NULL,\
-     created_at TEXT NOT NULL,\
-     updated_at TEXT NOT NULL,\
-     PRIMARY KEY (entity_id, schema_key, file_id, version_id)\
-     )",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_untracked_v1_version_id \
-     ON lix_internal_live_untracked_v1 (version_id)",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_live_untracked_v1_global_version \
-     ON lix_internal_live_untracked_v1 (global, version_id)",
-    "CREATE INDEX IF NOT EXISTS ix_unt_v_f_s_e \
-     ON lix_internal_live_untracked_v1 (version_id, file_id, schema_key, entity_id)",
     "CREATE TABLE IF NOT EXISTS lix_internal_file_data_cache (\
      file_id TEXT NOT NULL,\
      version_id TEXT NOT NULL,\
@@ -254,9 +202,9 @@ pub async fn init_backend(backend: &dyn LixBackend) -> Result<(), LixError> {
     for statement in INIT_STATEMENTS {
         backend.execute(statement, &[]).await?;
     }
+    crate::schema::registry::ensure_schema_live_table(backend, "lix_registered_schema").await?;
     ensure_registered_schema_bootstrap_seeded(backend).await?;
     ensure_binary_chunk_codec_columns(backend).await?;
-    ensure_state_untracked_writer_key_column(backend).await?;
     ensure_observe_tick_table(backend).await?;
     Ok(())
 }
@@ -264,13 +212,20 @@ pub async fn init_backend(backend: &dyn LixBackend) -> Result<(), LixError> {
 async fn ensure_registered_schema_bootstrap_seeded(
     backend: &dyn LixBackend,
 ) -> Result<(), LixError> {
+    let registered_schema_table = tracked_live_table_name("lix_registered_schema");
+    let snapshot_expr = live_snapshot_select_expr_for_schema(
+        "lix_registered_schema",
+        backend.dialect(),
+        Some("m"),
+    )?;
     backend
         .execute(
-            "INSERT INTO lix_internal_registered_schema_bootstrap (\
+            &format!(
+                "INSERT INTO lix_internal_registered_schema_bootstrap (\
              entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
              ) \
-             SELECT m.entity_id, m.schema_key, m.schema_version, m.file_id, m.version_id, m.global, m.plugin_key, m.snapshot_content, m.change_id, m.metadata, m.writer_key, m.is_tombstone, m.created_at, m.updated_at \
-             FROM lix_internal_live_v1_lix_registered_schema m \
+             SELECT m.entity_id, m.schema_key, m.schema_version, m.file_id, m.version_id, m.global, m.plugin_key, {snapshot_expr}, m.change_id, m.metadata, m.writer_key, m.is_tombstone, m.created_at, m.updated_at \
+             FROM {registered_schema_table} m \
              WHERE NOT EXISTS (\
                SELECT 1 \
                FROM lix_internal_registered_schema_bootstrap b \
@@ -278,6 +233,8 @@ async fn ensure_registered_schema_bootstrap_seeded(
                  AND b.file_id = m.file_id \
                  AND b.version_id = m.version_id\
              )",
+                snapshot_expr = snapshot_expr,
+            ),
             &[],
         )
         .await?;
@@ -330,18 +287,6 @@ async fn ensure_binary_chunk_codec_columns(backend: &dyn LixBackend) -> Result<(
     )
     .await?;
     Ok(())
-}
-
-async fn ensure_state_untracked_writer_key_column(
-    backend: &dyn LixBackend,
-) -> Result<(), LixError> {
-    ensure_column_exists(
-        backend,
-        "lix_internal_live_untracked_v1",
-        "writer_key",
-        "TEXT",
-    )
-    .await
 }
 
 async fn ensure_column_exists(

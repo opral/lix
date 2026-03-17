@@ -42,12 +42,14 @@ simulation_test!(
         assert_eq!(row[4], Value::Text("lix".to_string()));
         assert_eq!(row[5], Value::Text("schema".to_string()));
         assert_boolean_like(&row[7], false);
-        assert_eq!(
-            row[6],
-            Value::Text(
-                "{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}".to_string()
+        let expected_snapshot = serde_json::to_string(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}",
             )
-        );
+            .expect("expected registered schema snapshot must be valid JSON"),
+        )
+        .expect("expected registered schema snapshot must serialize");
+        assert_eq!(row[6], Value::Text(expected_snapshot));
 
         let table_exists = engine
             .execute(
