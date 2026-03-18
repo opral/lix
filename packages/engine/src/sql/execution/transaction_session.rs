@@ -4,11 +4,7 @@ use std::sync::Arc;
 use sqlparser::ast::Statement;
 
 use crate::engine::reject_internal_table_writes;
-use crate::engine::PendingWriteTxnBuffer;
-use crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use crate::sql::execution::parse::parse_sql;
-use crate::sql::public::catalog::SurfaceRegistry;
-use crate::state::stream::StateCommitStreamChange;
 use crate::{
     errors, Engine, ExecuteOptions, ExecuteResult, LixBackend, LixError, LixTransaction,
     QueryResult, Value,
@@ -58,25 +54,15 @@ pub(crate) async fn execute_public_sql(
 struct SessionTransaction {
     _backend: Arc<dyn LixBackend + Send + Sync>,
     transaction: Option<Box<dyn LixTransaction + 'static>>,
-    options: ExecuteOptions,
-    public_surface_registry: SurfaceRegistry,
-    active_version_id: String,
-    active_version_changed: bool,
-    installed_plugins_cache_invalidation_pending: bool,
-    public_surface_registry_dirty: bool,
-    pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
-    observe_tick_already_emitted: bool,
-    pending_public_commit_session:
-        Option<crate::sql::execution::shared_path::PendingPublicCommitSession>,
-    pending_write_txn_buffer: Option<PendingWriteTxnBuffer>,
+    core: crate::engine::SharedTransactionCore,
 }
 
 impl SessionTransaction {
     fn validate_options(&self, options: &ExecuteOptions) -> Result<(), LixError> {
         if let Some(writer_key) = options.writer_key.as_deref() {
-            if self.options.writer_key.as_deref() != Some(writer_key) {
+            if self.core.options.writer_key.as_deref() != Some(writer_key) {
                 return Err(errors::transaction_writer_key_conflict_error(
-                    self.options.writer_key.as_deref(),
+                    self.core.options.writer_key.as_deref(),
                     writer_key,
                 ));
             }
@@ -89,44 +75,11 @@ impl SessionTransaction {
             .transaction
             .take()
             .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "transaction is no longer active"))?;
-        let active_version_before_flush = self.active_version_id.clone();
         engine
-            .flush_pending_write_txn_buffer_in_transaction(
-                transaction.as_mut(),
-                &mut self.public_surface_registry,
-                &mut self.public_surface_registry_dirty,
-                &mut self.active_version_id,
-                &mut self.pending_write_txn_buffer,
-                &mut self.pending_state_commit_stream_changes,
-                &mut self.pending_public_commit_session,
-                &mut self.observe_tick_already_emitted,
-            )
+            .prepare_transaction_core_for_commit(transaction.as_mut(), &mut self.core)
             .await?;
-        if self.active_version_id != active_version_before_flush {
-            self.active_version_changed = true;
-        }
-        if !self.observe_tick_already_emitted
-            && !self.pending_state_commit_stream_changes.is_empty()
-        {
-            engine
-                .append_observe_tick_in_transaction(
-                    transaction.as_mut(),
-                    self.options.writer_key.as_deref(),
-                )
-                .await?;
-        }
         transaction.commit().await?;
-        if self.active_version_changed {
-            engine.set_active_version_id(self.active_version_id);
-        }
-        if self.installed_plugins_cache_invalidation_pending {
-            engine.invalidate_installed_plugins_cache()?;
-        }
-        if self.public_surface_registry_dirty {
-            engine.refresh_public_surface_registry().await?;
-        }
-        engine.emit_state_commit_stream_changes(self.pending_state_commit_stream_changes);
-        Ok(())
+        engine.finalize_committed_transaction_core(self.core).await
     }
 
     async fn rollback(mut self) -> Result<(), LixError> {
@@ -157,7 +110,6 @@ async fn execute_transaction_control(
             if state.session_transaction.is_some() {
                 return Err(errors::transaction_already_active_error());
             }
-            let active_version_id = engine.require_active_version_id()?;
             let backend = Arc::clone(&engine.backend);
             let transaction = backend.begin_transaction().await?;
             let transaction = unsafe {
@@ -171,16 +123,7 @@ async fn execute_transaction_control(
             state.session_transaction = Some(SessionTransaction {
                 _backend: backend,
                 transaction: Some(transaction),
-                options,
-                public_surface_registry: engine.public_surface_registry(),
-                active_version_id,
-                active_version_changed: false,
-                installed_plugins_cache_invalidation_pending: false,
-                public_surface_registry_dirty: false,
-                pending_state_commit_stream_changes: Vec::new(),
-                observe_tick_already_emitted: false,
-                pending_public_commit_session: None,
-                pending_write_txn_buffer: None,
+                core: engine.new_shared_transaction_core(options)?,
             });
             sql_transaction_open.store(true, Ordering::SeqCst);
             Ok(empty_execute_result())
@@ -217,56 +160,23 @@ async fn execute_in_active_transaction(
         .as_mut()
         .ok_or_else(errors::transaction_already_active_error)?;
     session_transaction.validate_options(&options)?;
-    let previous_active_version_id = session_transaction.active_version_id.clone();
+    let previous_active_version_id = session_transaction.core.active_version_id.clone();
     let transaction = session_transaction
         .transaction
         .as_deref_mut()
         .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "transaction is no longer active"))?;
-    let result = if parsed_statements.len() > 1 {
-        engine
-            .execute_statement_script_with_options_in_transaction(
-                transaction,
-                parsed_statements.clone(),
-                params,
-                &session_transaction.options,
-                false,
-                &mut session_transaction.public_surface_registry,
-                &mut session_transaction.public_surface_registry_dirty,
-                &mut session_transaction.active_version_id,
-                &mut session_transaction.pending_write_txn_buffer,
-                &mut session_transaction.pending_state_commit_stream_changes,
-                &mut session_transaction.pending_public_commit_session,
-                &mut session_transaction.observe_tick_already_emitted,
-            )
-            .await?
-    } else {
-        let query_result = engine
-            .execute_with_options_in_transaction(
-                transaction,
-                sql,
-                params,
-                &session_transaction.options,
-                false,
-                &mut session_transaction.public_surface_registry,
-                &mut session_transaction.public_surface_registry_dirty,
-                &mut session_transaction.active_version_id,
-                &mut session_transaction.pending_write_txn_buffer,
-                None,
-                false,
-                &mut session_transaction.pending_state_commit_stream_changes,
-                &mut session_transaction.pending_public_commit_session,
-                &mut session_transaction.observe_tick_already_emitted,
-            )
-            .await?;
-        ExecuteResult {
-            statements: vec![query_result],
-        }
-    };
-    if session_transaction.active_version_id != previous_active_version_id {
-        session_transaction.active_version_changed = true;
-    }
-    if should_invalidate_installed_plugins_cache_for_statements(&parsed_statements) {
-        session_transaction.installed_plugins_cache_invalidation_pending = true;
+    let result = engine
+        .execute_parsed_statements_in_transaction_core(
+            transaction,
+            parsed_statements,
+            sql,
+            params,
+            false,
+            &mut session_transaction.core,
+        )
+        .await?;
+    if session_transaction.core.active_version_id != previous_active_version_id {
+        session_transaction.core.active_version_changed = true;
     }
     Ok(result)
 }

@@ -1,5 +1,4 @@
 use crate::engine::{reject_internal_table_writes, Engine, EngineTransaction, ExecuteOptions};
-use crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use crate::sql::execution::parse::parse_sql;
 use crate::{ExecuteResult, LixError, Value};
 use futures_util::FutureExt;
@@ -28,16 +27,7 @@ impl Engine {
         Ok(EngineTransaction {
             engine: self,
             transaction: Some(transaction),
-            options,
-            public_surface_registry: self.public_surface_registry(),
-            active_version_id: self.require_active_version_id()?,
-            active_version_changed: false,
-            installed_plugins_cache_invalidation_pending: false,
-            public_surface_registry_dirty: false,
-            pending_state_commit_stream_changes: Vec::new(),
-            observe_tick_already_emitted: false,
-            pending_public_commit_session: None,
-            pending_write_txn_buffer: None,
+            core: self.new_shared_transaction_core(options)?,
         })
     }
 
@@ -106,60 +96,21 @@ impl EngineTransaction<'_> {
         params: &[Value],
         allow_internal_tables: bool,
     ) -> Result<ExecuteResult, LixError> {
-        let previous_active_version_id = self.active_version_id.clone();
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         let transaction = self.transaction.as_mut().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
-        let result = if parsed_statements.len() > 1 {
-            self.engine
-                .execute_statement_script_with_options_in_transaction(
-                    transaction.as_mut(),
-                    parsed_statements.clone(),
-                    params,
-                    &self.options,
-                    allow_internal_tables,
-                    &mut self.public_surface_registry,
-                    &mut self.public_surface_registry_dirty,
-                    &mut self.active_version_id,
-                    &mut self.pending_write_txn_buffer,
-                    &mut self.pending_state_commit_stream_changes,
-                    &mut self.pending_public_commit_session,
-                    &mut self.observe_tick_already_emitted,
-                )
-                .await?
-        } else {
-            let single_statement_result = self
-                .engine
-                .execute_with_options_in_transaction(
-                    transaction.as_mut(),
-                    sql,
-                    params,
-                    &self.options,
-                    allow_internal_tables,
-                    &mut self.public_surface_registry,
-                    &mut self.public_surface_registry_dirty,
-                    &mut self.active_version_id,
-                    &mut self.pending_write_txn_buffer,
-                    None,
-                    false,
-                    &mut self.pending_state_commit_stream_changes,
-                    &mut self.pending_public_commit_session,
-                    &mut self.observe_tick_already_emitted,
-                )
-                .await?;
-            ExecuteResult {
-                statements: vec![single_statement_result],
-            }
-        };
-        if self.active_version_id != previous_active_version_id {
-            self.active_version_changed = true;
-        }
-        if should_invalidate_installed_plugins_cache_for_statements(&parsed_statements) {
-            self.installed_plugins_cache_invalidation_pending = true;
-        }
-        Ok(result)
+        self.engine
+            .execute_parsed_statements_in_transaction_core(
+                transaction.as_mut(),
+                parsed_statements,
+                sql,
+                params,
+                allow_internal_tables,
+                &mut self.core,
+            )
+            .await
     }
 
     pub async fn commit(mut self) -> Result<(), LixError> {
@@ -167,47 +118,16 @@ impl EngineTransaction<'_> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
-        let active_version_before_flush = self.active_version_id.clone();
         self.engine
-            .flush_pending_write_txn_buffer_in_transaction(
-                transaction.as_mut(),
-                &mut self.public_surface_registry,
-                &mut self.public_surface_registry_dirty,
-                &mut self.active_version_id,
-                &mut self.pending_write_txn_buffer,
-                &mut self.pending_state_commit_stream_changes,
-                &mut self.pending_public_commit_session,
-                &mut self.observe_tick_already_emitted,
-            )
+            .prepare_transaction_core_for_commit(transaction.as_mut(), &mut self.core)
             .await?;
-        if self.active_version_id != active_version_before_flush {
-            self.active_version_changed = true;
-        }
-        let should_emit_observe_tick = !self.observe_tick_already_emitted
-            && !self.pending_state_commit_stream_changes.is_empty();
-        if should_emit_observe_tick {
-            self.engine
-                .append_observe_tick_in_transaction(
-                    transaction.as_mut(),
-                    self.options.writer_key.as_deref(),
-                )
-                .await?;
-        }
         transaction.commit().await?;
-        if self.active_version_changed {
+        let core = std::mem::replace(
+            &mut self.core,
             self.engine
-                .set_active_version_id(std::mem::take(&mut self.active_version_id));
-        }
-        if self.installed_plugins_cache_invalidation_pending {
-            self.engine.invalidate_installed_plugins_cache()?;
-        }
-        if self.public_surface_registry_dirty {
-            self.engine.refresh_public_surface_registry().await?;
-        }
-        self.engine.emit_state_commit_stream_changes(std::mem::take(
-            &mut self.pending_state_commit_stream_changes,
-        ));
-        Ok(())
+                .new_shared_transaction_core(ExecuteOptions::default())?,
+        );
+        self.engine.finalize_committed_transaction_core(core).await
     }
 
     pub async fn rollback(mut self) -> Result<(), LixError> {

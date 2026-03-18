@@ -5,13 +5,12 @@ use std::path::{Component, Path};
 use serde_json::Value as JsonValue;
 use zip::read::ZipArchive;
 
-use crate::engine::PendingWriteTxnBuffer;
 use crate::engine::{Engine, ExecuteOptions};
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
 use crate::plugin::types::PluginManifest;
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
-use crate::{LixError, LixTransaction, StateCommitStreamChange, Value};
+use crate::{LixError, LixTransaction, Value};
 
 const INSTALL_REGISTERED_SCHEMA_SQL: &str =
     "INSERT INTO lix_registered_schema (value) VALUES (lix_json(?))";
@@ -33,28 +32,21 @@ impl Engine {
         ensure_valid_wasm_binary(&parsed.wasm_bytes)?;
 
         let mut transaction = self.begin_write_unit().await?;
-        let mut active_version_id = self.require_active_version_id()?;
-        let starting_active_version_id = active_version_id.clone();
-        let mut pending_state_commit_stream_changes = Vec::new();
-        let options = ExecuteOptions::default();
+        let mut core = self.new_shared_transaction_core(ExecuteOptions::default())?;
 
         let install_result = install_plugin_in_transaction(
             self,
             transaction.as_mut(),
             &parsed,
             archive_bytes,
-            &options,
-            &mut active_version_id,
-            &mut pending_state_commit_stream_changes,
+            &mut core,
         )
         .await;
 
         match install_result {
             Ok(()) => {
-                if !pending_state_commit_stream_changes.is_empty() {
-                    self.append_observe_tick_in_transaction(transaction.as_mut(), None)
-                        .await?;
-                }
+                self.prepare_transaction_core_for_commit(transaction.as_mut(), &mut core)
+                    .await?;
                 transaction.commit().await?
             }
             Err(error) => {
@@ -63,12 +55,9 @@ impl Engine {
             }
         }
 
-        if active_version_id != starting_active_version_id {
-            self.set_active_version_id(active_version_id);
-        }
-        self.refresh_public_surface_registry().await?;
-        self.invalidate_installed_plugins_cache()?;
-        self.emit_state_commit_stream_changes(pending_state_commit_stream_changes);
+        core.public_surface_registry_dirty = true;
+        core.installed_plugins_cache_invalidation_pending = true;
+        self.finalize_committed_transaction_core(core).await?;
         Ok(())
     }
 }
@@ -78,32 +67,25 @@ async fn install_plugin_in_transaction(
     transaction: &mut dyn LixTransaction,
     parsed: &ParsedPluginArchive,
     archive_bytes: &[u8],
-    options: &ExecuteOptions,
-    active_version_id: &mut String,
-    pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
+    core: &mut crate::engine::SharedTransactionCore,
 ) -> Result<(), LixError> {
-    let mut pending_public_commit_session = None;
-    let mut pending_write_txn_buffer: Option<PendingWriteTxnBuffer> = None;
-    let mut public_surface_registry = engine.public_surface_registry();
-    let mut public_surface_registry_dirty = false;
-    let mut observe_tick_already_emitted = false;
     for schema in &parsed.schemas {
         engine
             .execute_with_options_in_transaction(
                 transaction,
                 INSTALL_REGISTERED_SCHEMA_SQL,
                 &[Value::Text(schema.normalized_schema_json.clone())],
-                options,
+                &core.options,
                 false,
-                &mut public_surface_registry,
-                &mut public_surface_registry_dirty,
-                active_version_id,
-                &mut pending_write_txn_buffer,
+                &mut core.public_surface_registry,
+                &mut core.public_surface_registry_dirty,
+                &mut core.active_version_id,
+                &mut core.pending_write_txn_buffer,
                 None,
                 false,
-                pending_state_commit_stream_changes,
-                &mut pending_public_commit_session,
-                &mut observe_tick_already_emitted,
+                &mut core.pending_state_commit_stream_changes,
+                &mut core.pending_public_commit_session,
+                &mut core.observe_tick_already_emitted,
             )
             .await?;
     }
@@ -119,17 +101,17 @@ async fn install_plugin_in_transaction(
              WHERE lixcol_version_id = 'global' \
                AND id = $1",
             &[Value::Text(archive_id.clone())],
-            options,
+            &core.options,
             false,
-            &mut public_surface_registry,
-            &mut public_surface_registry_dirty,
-            active_version_id,
-            &mut pending_write_txn_buffer,
+            &mut core.public_surface_registry,
+            &mut core.public_surface_registry_dirty,
+            &mut core.active_version_id,
+            &mut core.pending_write_txn_buffer,
             None,
             false,
-            pending_state_commit_stream_changes,
-            &mut pending_public_commit_session,
-            &mut observe_tick_already_emitted,
+            &mut core.pending_state_commit_stream_changes,
+            &mut core.pending_public_commit_session,
+            &mut core.observe_tick_already_emitted,
         )
         .await?;
 
@@ -144,30 +126,17 @@ async fn install_plugin_in_transaction(
                 Value::Text(archive_path),
                 Value::Blob(archive_bytes.to_vec()),
             ],
-            options,
+            &core.options,
             false,
-            &mut public_surface_registry,
-            &mut public_surface_registry_dirty,
-            active_version_id,
-            &mut pending_write_txn_buffer,
+            &mut core.public_surface_registry,
+            &mut core.public_surface_registry_dirty,
+            &mut core.active_version_id,
+            &mut core.pending_write_txn_buffer,
             None,
             false,
-            pending_state_commit_stream_changes,
-            &mut pending_public_commit_session,
-            &mut observe_tick_already_emitted,
-        )
-        .await?;
-
-    engine
-        .flush_pending_write_txn_buffer_in_transaction(
-            transaction,
-            &mut public_surface_registry,
-            &mut public_surface_registry_dirty,
-            active_version_id,
-            &mut pending_write_txn_buffer,
-            pending_state_commit_stream_changes,
-            &mut pending_public_commit_session,
-            &mut observe_tick_already_emitted,
+            &mut core.pending_state_commit_stream_changes,
+            &mut core.pending_public_commit_session,
+            &mut core.observe_tick_already_emitted,
         )
         .await?;
 

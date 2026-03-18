@@ -68,6 +68,16 @@ pub struct Engine {
 pub struct EngineTransaction<'a> {
     pub(crate) engine: &'a Engine,
     pub(crate) transaction: Option<Box<dyn LixTransaction + 'a>>,
+    pub(crate) core: SharedTransactionCore,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingWriteTxnBuffer {
+    pub(crate) plan: WriteTxnPlan,
+    pub(crate) append_safe: bool,
+}
+
+pub(crate) struct SharedTransactionCore {
     pub(crate) options: ExecuteOptions,
     pub(crate) public_surface_registry: SurfaceRegistry,
     pub(crate) active_version_id: String,
@@ -81,13 +91,25 @@ pub struct EngineTransaction<'a> {
     pub(crate) pending_write_txn_buffer: Option<PendingWriteTxnBuffer>,
 }
 
-#[derive(Clone)]
-pub(crate) struct PendingWriteTxnBuffer {
-    pub(crate) plan: WriteTxnPlan,
-    pub(crate) append_safe: bool,
-}
-
 impl Engine {
+    pub(crate) fn new_shared_transaction_core(
+        &self,
+        options: ExecuteOptions,
+    ) -> Result<SharedTransactionCore, LixError> {
+        Ok(SharedTransactionCore {
+            options,
+            public_surface_registry: self.public_surface_registry(),
+            active_version_id: self.require_active_version_id()?,
+            active_version_changed: false,
+            installed_plugins_cache_invalidation_pending: false,
+            public_surface_registry_dirty: false,
+            pending_state_commit_stream_changes: Vec::new(),
+            observe_tick_already_emitted: false,
+            pending_public_commit_session: None,
+            pending_write_txn_buffer: None,
+        })
+    }
+
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
         self.wasm_runtime.clone()
     }
@@ -224,6 +246,57 @@ impl Engine {
 
     pub(crate) fn set_in_init_transaction(&self, active: bool) {
         self.in_init_transaction.store(active, Ordering::SeqCst);
+    }
+
+    pub(crate) async fn prepare_transaction_core_for_commit(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        core: &mut SharedTransactionCore,
+    ) -> Result<(), LixError> {
+        let active_version_before_flush = core.active_version_id.clone();
+        self.flush_pending_write_txn_buffer_in_transaction(
+            transaction,
+            &mut core.public_surface_registry,
+            &mut core.public_surface_registry_dirty,
+            &mut core.active_version_id,
+            &mut core.pending_write_txn_buffer,
+            &mut core.pending_state_commit_stream_changes,
+            &mut core.pending_public_commit_session,
+            &mut core.observe_tick_already_emitted,
+        )
+        .await?;
+        if core.active_version_id != active_version_before_flush {
+            core.active_version_changed = true;
+        }
+        if !core.observe_tick_already_emitted
+            && !core.pending_state_commit_stream_changes.is_empty()
+        {
+            self.append_observe_tick_in_transaction(
+                transaction,
+                core.options.writer_key.as_deref(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn finalize_committed_transaction_core(
+        &self,
+        mut core: SharedTransactionCore,
+    ) -> Result<(), LixError> {
+        if core.active_version_changed {
+            self.set_active_version_id(std::mem::take(&mut core.active_version_id));
+        }
+        if core.installed_plugins_cache_invalidation_pending {
+            self.invalidate_installed_plugins_cache()?;
+        }
+        if core.public_surface_registry_dirty {
+            self.refresh_public_surface_registry().await?;
+        }
+        self.emit_state_commit_stream_changes(std::mem::take(
+            &mut core.pending_state_commit_stream_changes,
+        ));
+        Ok(())
     }
 
     /// Begin an isolated unit of work on the backend.
@@ -909,7 +982,7 @@ mod tests {
             .begin_transaction_with_options(ExecuteOptions::default())
             .await
             .expect("begin transaction");
-        tx.installed_plugins_cache_invalidation_pending = true;
+        tx.core.installed_plugins_cache_invalidation_pending = true;
 
         assert!(
             engine
@@ -958,7 +1031,7 @@ mod tests {
             .begin_transaction_with_options(ExecuteOptions::default())
             .await
             .expect("begin transaction");
-        tx.installed_plugins_cache_invalidation_pending = true;
+        tx.core.installed_plugins_cache_invalidation_pending = true;
         tx.rollback().await.expect("rollback should succeed");
 
         assert!(!commit_called.load(Ordering::SeqCst));

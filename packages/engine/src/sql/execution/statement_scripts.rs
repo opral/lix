@@ -5,7 +5,9 @@ use crate::sql::execution::shared_path::{
     self, prepared_execution_mutates_public_surface_registry,
 };
 use crate::sql::execution::transaction_exec::public_write_execution_next_active_version_id;
-use crate::sql::execution::write_txn_plan::build_write_txn_plan;
+use crate::sql::execution::write_txn_plan::{
+    build_write_txn_plan, write_txn_plan_is_independent_filesystem,
+};
 use crate::sql::public::runtime::{
     apply_public_surface_registry_mutations, classify_public_execution_route_with_registry,
     public_surface_registry_mutations, PublicExecutionRoute,
@@ -42,16 +44,11 @@ impl Engine {
         allow_internal_tables: bool,
     ) -> Result<ExecuteResult, LixError> {
         let mut transaction = self.begin_write_unit().await?;
-        let mut active_version_id = self.require_active_version_id()?;
-        let mut public_surface_registry = self.public_surface_registry();
-        let starting_active_version_id = active_version_id.clone();
-        let mut pending_state_commit_stream_changes = Vec::new();
-        let mut pending_public_commit_session = None;
-        let mut pending_write_txn_buffer = None;
-        let mut observe_tick_already_emitted = false;
-        let mut public_surface_registry_dirty = false;
+        let mut core = self.new_shared_transaction_core(options.clone())?;
         let installed_plugins_cache_invalidation_pending =
             should_invalidate_installed_plugins_cache_for_statements(&statements);
+        core.installed_plugins_cache_invalidation_pending =
+            installed_plugins_cache_invalidation_pending;
         let result = self
             .execute_statement_script_with_options_in_transaction(
                 transaction.as_mut(),
@@ -59,13 +56,13 @@ impl Engine {
                 params,
                 options,
                 allow_internal_tables,
-                &mut public_surface_registry,
-                &mut public_surface_registry_dirty,
-                &mut active_version_id,
-                &mut pending_write_txn_buffer,
-                &mut pending_state_commit_stream_changes,
-                &mut pending_public_commit_session,
-                &mut observe_tick_already_emitted,
+                &mut core.public_surface_registry,
+                &mut core.public_surface_registry_dirty,
+                &mut core.active_version_id,
+                &mut core.pending_write_txn_buffer,
+                &mut core.pending_state_commit_stream_changes,
+                &mut core.pending_public_commit_session,
+                &mut core.observe_tick_already_emitted,
             )
             .await;
         let result = match result {
@@ -75,36 +72,10 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.flush_pending_write_txn_buffer_in_transaction(
-            transaction.as_mut(),
-            &mut public_surface_registry,
-            &mut public_surface_registry_dirty,
-            &mut active_version_id,
-            &mut pending_write_txn_buffer,
-            &mut pending_state_commit_stream_changes,
-            &mut pending_public_commit_session,
-            &mut observe_tick_already_emitted,
-        )
-        .await?;
-
-        if !observe_tick_already_emitted && !pending_state_commit_stream_changes.is_empty() {
-            self.append_observe_tick_in_transaction(
-                transaction.as_mut(),
-                options.writer_key.as_deref(),
-            )
+        self.prepare_transaction_core_for_commit(transaction.as_mut(), &mut core)
             .await?;
-        }
         transaction.commit().await?;
-        if active_version_id != starting_active_version_id {
-            self.set_active_version_id(active_version_id);
-        }
-        if installed_plugins_cache_invalidation_pending {
-            self.invalidate_installed_plugins_cache()?;
-        }
-        if public_surface_registry_dirty {
-            self.refresh_public_surface_registry().await?;
-        }
-        self.emit_state_commit_stream_changes(pending_state_commit_stream_changes);
+        self.finalize_committed_transaction_core(core).await?;
         Ok(result)
     }
 
@@ -268,7 +239,6 @@ impl Engine {
             let mut planning_registry = public_surface_registry.clone();
             let mut planning_active_version_id = active_version_id.clone();
             let mut registry_dirty = false;
-            let mut all_append_safe = true;
 
             for (_statement, (sql, statement_params)) in &executable_statements {
                 let parsed_statement = parse_sql(sql).map_err(LixError::from).and_then(
@@ -317,11 +287,6 @@ impl Engine {
                     shared_functions.clone(),
                 );
                 combined_plan.extend(statement_plan);
-                all_append_safe &=
-                    crate::sql::execution::transaction_exec::statement_is_append_safe_write(
-                        &parsed_statement,
-                        &prepared,
-                    );
 
                 if let Some(public_write) = prepared.public_write.as_ref() {
                     let mutations = public_surface_registry_mutations(public_write)?;
@@ -342,10 +307,12 @@ impl Engine {
                 *public_surface_registry_dirty = true;
             }
             *active_version_id = planning_active_version_id;
+            let combined_continuation_safe =
+                write_txn_plan_is_independent_filesystem(&combined_plan);
             crate::sql::execution::transaction_exec::append_pending_write_txn_buffer(
                 pending_write_txn_buffer,
                 combined_plan,
-                all_append_safe,
+                combined_continuation_safe,
             );
             return Ok(empty_mutating_script_result(result_statement_count));
         }
