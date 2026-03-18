@@ -41,8 +41,6 @@ pub fn resolve_db_path(context: &AppContext) -> Result<PathBuf, CliError> {
 }
 
 pub fn open_lix_at(path: &Path) -> Result<Lix, CliError> {
-    init_lix_at(path)?;
-
     let backend = SqliteBackend::from_path(path).map_err(|err| {
         CliError::msg(format!(
             "failed to open sqlite backend at {}: {}",
