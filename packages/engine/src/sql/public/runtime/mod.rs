@@ -45,11 +45,11 @@ use crate::state::commit::{
     CreateCommitIdempotencyKey, CreateCommitPreconditions, CreateCommitWriteLane,
     ProposedDomainChange,
 };
+use crate::state::history::ensure_state_history_timeline_materialized_for_root;
 use crate::state::stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamOperation,
 };
-use crate::state::timeline::ensure_history_timeline_materialized_for_root;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot, GLOBAL_VERSION_ID,
@@ -1206,7 +1206,8 @@ async fn ensure_public_read_history_timeline_roots(
     root_commit_ids: &[String],
 ) -> Result<(), LixError> {
     for root_commit_id in root_commit_ids {
-        ensure_history_timeline_materialized_for_root(backend, &root_commit_id, 512).await?;
+        ensure_state_history_timeline_materialized_for_root(backend, &root_commit_id, 512)
+            .await?;
     }
     Ok(())
 }

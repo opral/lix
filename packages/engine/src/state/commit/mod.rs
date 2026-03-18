@@ -15,9 +15,8 @@ pub(crate) use create_commit::{
 };
 pub(crate) use generate_commit::generate_commit;
 pub(crate) use graph_index::{
-    build_commit_generation_seed_sql, build_exact_commit_depth_cte_sql,
-    build_reachable_commits_for_root_cte_sql, build_reachable_commits_from_requested_cte_sql,
-    COMMIT_GRAPH_NODE_TABLE,
+    build_commit_generation_seed_sql, build_reachable_commits_for_root_cte_sql,
+    build_reachable_commits_from_requested_cte_sql, COMMIT_GRAPH_NODE_TABLE,
 };
 pub(crate) use runtime::{
     bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,

@@ -8,15 +8,14 @@ use crate::plugin::matching::select_best_glob_match;
 use crate::plugin::storage::plugin_key_from_archive_path;
 use crate::plugin::types::{InstalledPlugin, PluginContentType};
 use crate::schema::live_layout::tracked_live_table_name;
-use crate::sql::ast::lowering::lower_statement;
-use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::preprocess::preprocess_sql_to_plan as preprocess_sql;
-use crate::sql::public::runtime::lower_public_read_query_with_backend;
-use crate::state::commit::build_exact_commit_depth_cte_sql;
+use crate::state::history::{
+    load_state_history_rows, StateHistoryContentMode, StateHistoryRequest,
+    StateHistoryRootScope,
+};
 use crate::state::materialization::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
-use sqlparser::ast::Statement;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::path::{Component, Path};
@@ -581,32 +580,29 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
     commit_id: &str,
     depth: i64,
 ) -> Result<Vec<PluginEntityChange>, LixError> {
-    let params = vec![
-        Value::Text(file_id.to_string()),
-        Value::Text(plugin_key.to_string()),
-        Value::Text(root_commit_id.to_string()),
-        Value::Text(commit_id.to_string()),
-        Value::Integer(depth),
-    ];
-    let sql = format!(
-        "WITH {target_commit_depth_cte} \
-         SELECT entity_id, schema_key, schema_version, snapshot_content, depth \
-         FROM lix_state_history \
-         WHERE file_id = $1 \
-           AND plugin_key = $2 \
-           AND root_commit_id = $3 \
-           AND depth >= (SELECT raw_depth FROM target_commit_depth) \
-         ORDER BY entity_id ASC, depth ASC",
-        target_commit_depth_cte =
-            build_exact_commit_depth_cte_sql(backend.dialect(), "$3", "$4", "$5")
-                .trim_end_matches(", "),
-    );
-    let rows = execute_read_query_with_public_lowering(backend, &sql, &params).await?;
+    let rows = load_state_history_rows(
+        backend,
+        &StateHistoryRequest {
+            root_scope: StateHistoryRootScope::RequestedRoots(vec![root_commit_id.to_string()]),
+            file_ids: vec![file_id.to_string()],
+            plugin_keys: vec![plugin_key.to_string()],
+            max_depth: Some(depth),
+            content_mode: StateHistoryContentMode::IncludeSnapshotContent,
+            ..StateHistoryRequest::default()
+        },
+    )
+    .await?;
+    let raw_depth = rows
+        .iter()
+        .filter(|row| row.commit_id == commit_id)
+        .map(|row| row.depth)
+        .min()
+        .unwrap_or(depth);
 
     let mut changes = Vec::new();
     let mut previous_entity_id: Option<String> = None;
-    for row in rows.rows {
-        let entity_id = text_required(&row, 0, "entity_id")?;
+    for row in rows.into_iter().filter(|row| row.depth >= raw_depth) {
+        let entity_id = row.entity_id;
         if previous_entity_id
             .as_ref()
             .is_some_and(|previous| previous == &entity_id)
@@ -616,48 +612,12 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
         previous_entity_id = Some(entity_id.clone());
         changes.push(PluginEntityChange {
             entity_id,
-            schema_key: text_required(&row, 1, "schema_key")?,
-            schema_version: text_required(&row, 2, "schema_version")?,
-            snapshot_content: nullable_text(&row, 3, "snapshot_content")?,
+            schema_key: row.schema_key,
+            schema_version: row.schema_version,
+            snapshot_content: row.snapshot_content,
         });
     }
     Ok(changes)
-}
-
-async fn execute_read_query_with_public_lowering(
-    backend: &dyn LixBackend,
-    sql: &str,
-    params: &[Value],
-) -> Result<crate::QueryResult, LixError> {
-    let mut statements = parse_sql(sql).map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "plugin runtime: failed to parse query for public lowering: {error:?}"
-        ),
-    })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "plugin runtime: expected a single query statement".to_string(),
-        });
-    }
-    let Statement::Query(query) = statements.remove(0) else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "plugin runtime: expected a SELECT query for public lowering".to_string(),
-        });
-    };
-    let lowered_query = lower_public_read_query_with_backend(backend, *query, params).await?;
-    for schema_key in &lowered_query.required_schema_keys {
-        crate::schema::registry::ensure_schema_live_table(backend, schema_key).await?;
-    }
-    let lowered_statement = lower_statement(
-        Statement::Query(Box::new(lowered_query.query)),
-        backend.dialect(),
-    )?;
-    backend
-        .execute(&lowered_statement.to_string(), params)
-        .await
 }
 
 pub(crate) async fn load_installed_plugins(
