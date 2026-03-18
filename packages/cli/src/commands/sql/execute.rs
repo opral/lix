@@ -228,7 +228,7 @@ mod tests {
             .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let path = test_lix_path("param-binding");
-                std::fs::File::create(&path).expect("create test lix file");
+                db::init_lix_at(&path).expect("init test lix file");
                 let context = AppContext {
                     lix_path: Some(path.clone()),
                 };

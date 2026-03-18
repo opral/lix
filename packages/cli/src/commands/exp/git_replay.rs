@@ -473,7 +473,7 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     let trace_collector = trace_sql_json_path
         .as_ref()
         .map(|_| Arc::new(ReplaySqlTraceCollector::default()));
-    let lix = open_lix_at_path(&output_lix_path, trace_collector.clone())?;
+    let lix = init_and_open_lix_at_path(&output_lix_path, trace_collector.clone())?;
 
     let mut state = ReplayState::default();
     let mut expected_state_by_id = HashMap::<String, ExpectedFile>::new();
@@ -644,7 +644,7 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn open_lix_at_path(
+fn init_and_open_lix_at_path(
     path: &Path,
     trace_collector: Option<Arc<ReplaySqlTraceCollector>>,
 ) -> Result<Lix, CliError> {
