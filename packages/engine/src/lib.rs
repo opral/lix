@@ -28,6 +28,7 @@ pub use schema::{
     validate_lix_schema_definition,
 };
 
+pub use backend::execute_auto_transactional;
 pub use backend::execute_statement_with_backend;
 pub use backend::LixBackend;
 pub use backend::LixTransaction;

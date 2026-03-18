@@ -92,6 +92,10 @@ impl LixBackend for TestImageSqliteBackend {
         SqlDialect::Sqlite
     }
 
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        lix_engine::execute_auto_transactional(self, sql, params).await
+    }
+
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
         let conn = self.conn.lock().map_err(|_| {
             LixError::new("LIX_ERROR_UNKNOWN", "sqlite test backend mutex poisoned")
@@ -189,6 +193,10 @@ impl LixBackend for TestImageSqliteBackend {
         })();
         let _ = std::fs::remove_file(&image_path);
         restore_result
+    }
+
+    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        self.begin_transaction().await
     }
 }
 

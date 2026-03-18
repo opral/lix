@@ -49,7 +49,6 @@ impl Engine {
 
     #[doc(hidden)]
     pub async fn open_existing(&self) -> Result<(), LixError> {
-        init_backend(self.backend.as_ref()).await?;
         if !self.is_initialized().await? {
             return Err(errors::not_initialized_error());
         }

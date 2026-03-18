@@ -13,27 +13,27 @@ pub enum SqlDialect {
 pub trait LixBackend: Send + Sync {
     fn dialect(&self) -> SqlDialect;
 
-    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let mut transaction = self.begin_transaction().await?;
-        let result = transaction.execute(sql, params).await;
-        match result {
-            Ok(result) => {
-                transaction.commit().await?;
-                Ok(result)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
-    }
+    /// Execute a single SQL statement on the connection.
+    ///
+    /// No automatic transaction wrapping. If no transaction is active,
+    /// the statement auto-commits (standard SQL behavior). If a transaction
+    /// IS active, the statement participates in it.
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
 
+    /// Begin an exclusive transaction (`BEGIN IMMEDIATE` for SQLite).
+    ///
+    /// The returned handle holds exclusive access to the connection.
+    /// All SQL must go through the handle until commit/rollback.
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError>;
 
-    /// Exports the current Lix database snapshot as a SQLite database file payload.
+    /// Begin a named savepoint within an active transaction.
     ///
-    /// Implementations should write a valid SQLite3 database image (for example `.lix`)
-    /// to `writer` in one or more chunks.
+    /// Returns a handle that commits via `RELEASE SAVEPOINT`
+    /// and rolls back via `ROLLBACK TO SAVEPOINT`.
+    /// The caller provides the name.
+    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError>;
+
+    /// Exports the current Lix database snapshot as a SQLite database file payload.
     async fn export_image(&self, _writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -47,6 +47,30 @@ pub trait LixBackend: Send + Sync {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "restore_from_image is not supported by this backend".to_string(),
         })
+    }
+}
+
+/// Utility: execute a single statement wrapped in a transaction.
+///
+/// Useful for backends (e.g. test/pool backends) that want auto-transactional
+/// execute() behavior. Production backends like SqliteBackend should NOT use
+/// this — they execute directly on the connection.
+pub async fn execute_auto_transactional(
+    backend: &dyn LixBackend,
+    sql: &str,
+    params: &[Value],
+) -> Result<QueryResult, LixError> {
+    let mut transaction = backend.begin_transaction().await?;
+    let result = transaction.execute(sql, params).await;
+    match result {
+        Ok(result) => {
+            transaction.commit().await?;
+            Ok(result)
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
     }
 }
 

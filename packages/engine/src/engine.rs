@@ -15,7 +15,7 @@ use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -47,6 +47,10 @@ pub struct Engine {
     deterministic_boot_pending: AtomicBool,
     deterministic_settings_cache: RwLock<Option<DeterministicSettings>>,
     init_state: AtomicU8,
+    /// When true, the backend connection has an active transaction started by
+    /// the init path. `begin_write_unit()` uses savepoints instead of BEGIN.
+    in_init_transaction: AtomicBool,
+    savepoint_counter: AtomicU64,
     active_version_id: RwLock<Option<String>>,
     public_surface_registry: RwLock<SurfaceRegistry>,
     access_to_internal: bool,
@@ -210,6 +214,26 @@ impl Engine {
             .store(INIT_STATE_NOT_STARTED, Ordering::SeqCst);
     }
 
+    pub(crate) fn set_in_init_transaction(&self, active: bool) {
+        self.in_init_transaction.store(active, Ordering::SeqCst);
+    }
+
+    /// Begin an isolated unit of work on the backend.
+    ///
+    /// During normal operation, this starts a real transaction (`BEGIN IMMEDIATE`).
+    /// During init (when an outer transaction is active on the connection),
+    /// this uses a savepoint instead to avoid nested `BEGIN` errors.
+    pub(crate) async fn begin_write_unit(
+        &self,
+    ) -> Result<Box<dyn crate::LixTransaction + '_>, crate::LixError> {
+        if self.in_init_transaction.load(Ordering::SeqCst) {
+            let id = self.savepoint_counter.fetch_add(1, Ordering::SeqCst);
+            self.backend.begin_savepoint(&format!("sp_{id}")).await
+        } else {
+            self.backend.begin_transaction().await
+        }
+    }
+
     pub(crate) fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
         self.state_commit_stream_bus.emit(changes);
     }
@@ -360,7 +384,15 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "nested transactions are not supported".to_string(),
+            description: "nested transactions are not supported via TransactionBackendAdapter"
+                .to_string(),
+        })
+    }
+
+    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "savepoints are not supported via TransactionBackendAdapter".to_string(),
         })
     }
 }
@@ -382,6 +414,8 @@ impl Engine {
             deterministic_boot_pending: AtomicBool::new(deterministic_boot_pending),
             deterministic_settings_cache: RwLock::new(boot_deterministic_settings),
             init_state: AtomicU8::new(INIT_STATE_NOT_STARTED),
+            in_init_transaction: AtomicBool::new(false),
+            savepoint_counter: AtomicU64::new(0),
             active_version_id: RwLock::new(None),
             public_surface_registry: RwLock::new(SurfaceRegistry::with_builtin_surfaces()),
             access_to_internal: args.access_to_internal,
@@ -590,6 +624,13 @@ mod tests {
                 rollback_called: Arc::clone(&self.rollback_called),
             }))
         }
+
+        async fn begin_savepoint(
+            &self,
+            _name: &str,
+        ) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            self.begin_transaction().await
+        }
     }
 
     #[async_trait(?Send)]
@@ -656,6 +697,16 @@ mod tests {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "plain backend read should not begin a transaction",
+            ))
+        }
+
+        async fn begin_savepoint(
+            &self,
+            _name: &str,
+        ) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "begin_savepoint not supported in test backend",
             ))
         }
     }

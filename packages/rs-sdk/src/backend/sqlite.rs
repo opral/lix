@@ -18,6 +18,7 @@ pub struct SqliteBackend {
 struct SqliteTransaction<'a> {
     conn: MutexGuard<'a, Connection>,
     finalized: bool,
+    savepoint_name: Option<String>,
 }
 
 impl SqliteBackend {
@@ -50,6 +51,13 @@ impl SqliteBackend {
             conn: Mutex::new(conn),
         })
     }
+
+    fn lock_conn(&self) -> Result<MutexGuard<'_, Connection>, LixError> {
+        self.conn.lock().map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "sqlite mutex poisoned".to_string(),
+        })
+    }
 }
 
 #[async_trait(?Send)]
@@ -58,28 +66,60 @@ impl LixBackend for SqliteBackend {
         SqlDialect::Sqlite
     }
 
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        let conn = self.lock_conn()?;
+        execute_sql(&conn, sql, params)
+    }
+
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
-        let conn = self.conn.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "sqlite mutex poisoned".to_string(),
-        })?;
-        conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")
+        let conn = self.lock_conn()?;
+        if conn.is_autocommit() {
+            conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")
+                .map_err(|err| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: err.to_string(),
+                })?;
+            Ok(Box::new(SqliteTransaction {
+                conn,
+                finalized: false,
+                savepoint_name: None,
+            }))
+        } else {
+            // A transaction is already active (e.g. during init). Use a
+            // savepoint so callers deep in the call stack still get an
+            // atomic unit of work without failing on nested BEGIN.
+            static FALLBACK_SP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = FALLBACK_SP.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let name = format!("sp_auto_{id}");
+            conn.execute_batch(&format!("SAVEPOINT {name}"))
+                .map_err(|err| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: err.to_string(),
+                })?;
+            Ok(Box::new(SqliteTransaction {
+                conn,
+                finalized: false,
+                savepoint_name: Some(name),
+            }))
+        }
+    }
+
+    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        let conn = self.lock_conn()?;
+        conn.execute_batch(&format!("SAVEPOINT {name}"))
             .map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
             })?;
-
         Ok(Box::new(SqliteTransaction {
             conn,
             finalized: false,
+            savepoint_name: Some(name.to_string()),
         }))
     }
 
     async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
-        let conn = self.conn.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "sqlite mutex poisoned".to_string(),
-        })?;
+        let conn = self.lock_conn()?;
         let image_path = temp_image_path("export");
 
         let export_result = (|| -> Result<(), LixError> {
@@ -133,10 +173,7 @@ impl LixBackend for SqliteBackend {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
             })?;
-            let mut conn = self.conn.lock().map_err(|_| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "sqlite mutex poisoned".to_string(),
-            })?;
+            let mut conn = self.lock_conn()?;
             let backup = Backup::new(&source_conn, &mut conn).map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
@@ -164,7 +201,11 @@ impl LixTransaction for SqliteTransaction<'_> {
     }
 
     async fn commit(mut self: Box<Self>) -> Result<(), LixError> {
-        self.conn.execute_batch("COMMIT").map_err(|err| LixError {
+        let sql = match &self.savepoint_name {
+            Some(name) => format!("RELEASE SAVEPOINT {name}"),
+            None => "COMMIT".to_string(),
+        };
+        self.conn.execute_batch(&sql).map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: err.to_string(),
         })?;
@@ -173,12 +214,14 @@ impl LixTransaction for SqliteTransaction<'_> {
     }
 
     async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
-        self.conn
-            .execute_batch("ROLLBACK")
-            .map_err(|err| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: err.to_string(),
-            })?;
+        let sql = match &self.savepoint_name {
+            Some(name) => format!("ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"),
+            None => "ROLLBACK".to_string(),
+        };
+        self.conn.execute_batch(&sql).map_err(|err| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: err.to_string(),
+        })?;
         self.finalized = true;
         Ok(())
     }
@@ -187,7 +230,13 @@ impl LixTransaction for SqliteTransaction<'_> {
 impl Drop for SqliteTransaction<'_> {
     fn drop(&mut self) {
         if !self.finalized && !std::thread::panicking() {
-            let _ = self.conn.execute_batch("ROLLBACK");
+            let sql = match &self.savepoint_name {
+                Some(name) => {
+                    format!("ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}")
+                }
+                None => "ROLLBACK".to_string(),
+            };
+            let _ = self.conn.execute_batch(&sql);
         }
     }
 }

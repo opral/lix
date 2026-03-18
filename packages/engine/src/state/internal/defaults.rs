@@ -219,6 +219,16 @@ mod tests {
         async fn begin_transaction(&self) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
             panic!("defaulting should not open transactions in this test backend")
         }
+
+        async fn begin_savepoint(
+            &self,
+            _name: &str,
+        ) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
+            Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "begin_savepoint not supported in test backend",
+            ))
+        }
     }
 
     fn system_functions() -> SharedFunctionProvider<SystemFunctionProvider> {

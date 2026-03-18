@@ -279,6 +279,14 @@ impl LixBackend for TracingSqliteBackend {
         self.inner.dialect()
     }
 
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        self.inner.execute(sql, params).await
+    }
+
+    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        self.inner.begin_savepoint(name).await
+    }
+
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
         let started = Instant::now();
         let result = self.inner.begin_transaction().await;

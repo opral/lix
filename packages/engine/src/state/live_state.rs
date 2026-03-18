@@ -423,6 +423,16 @@ mod tests {
                 "transactions not used in fake backend",
             ))
         }
+
+        async fn begin_savepoint(
+            &self,
+            _name: &str,
+        ) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "begin_savepoint not supported in test backend",
+            ))
+        }
     }
 
     struct FakeTransaction {

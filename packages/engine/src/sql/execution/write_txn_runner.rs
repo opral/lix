@@ -25,7 +25,7 @@ pub(crate) async fn run_write_txn_plan_with_backend(
     plan: &WriteTxnPlan,
     pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
 ) -> Result<SqlExecutionOutcome, LixError> {
-    let mut transaction = engine.backend.begin_transaction().await?;
+    let mut transaction = engine.begin_write_unit().await?;
     let result = run_write_txn_plan_with_transaction(
         engine,
         transaction.as_mut(),

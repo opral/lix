@@ -98,6 +98,10 @@ impl LixBackend for SqliteBackend {
         SqlDialect::Sqlite
     }
 
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        lix_engine::execute_auto_transactional(self, sql, params).await
+    }
+
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
         let pool = self.pool().await?;
         let mut conn = pool.acquire().await.map_err(|err| LixError {
@@ -112,6 +116,10 @@ impl LixBackend for SqliteBackend {
                 description: err.to_string(),
             })?;
         Ok(Box::new(SqliteBackendTransaction { conn }))
+    }
+
+    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        self.begin_transaction().await
     }
 }
 
