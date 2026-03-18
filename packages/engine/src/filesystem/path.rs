@@ -142,9 +142,15 @@ fn segment_has_valid_percent_encoding(segment: &str) -> bool {
 
 pub(crate) fn normalize_file_path(path: &str) -> Result<String, LixError> {
     let normalized = path.nfc().collect::<String>();
-    if !normalized.starts_with('/') || normalized.ends_with('/') || normalized == "/" {
+    if !normalized.starts_with('/') {
         return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+            code: "LIX_ERROR_INVALID_FILE_PATH".to_string(),
+            description: format!("file paths must start with '/'. Got '{path}', use '/{path}' instead"),
+        });
+    }
+    if normalized.ends_with('/') || normalized == "/" {
+        return Err(LixError {
+            code: "LIX_ERROR_INVALID_FILE_PATH".to_string(),
             description: format!("lix_file_descriptor: Invalid file path {path}"),
         });
     }
