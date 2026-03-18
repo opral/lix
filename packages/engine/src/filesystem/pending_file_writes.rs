@@ -10,7 +10,6 @@ use crate::sql::ast::utils::{
     bind_sql_with_state, insert_values_rows_mut, resolve_expr_cell_with_state, resolve_values_rows,
     PlaceholderState, ResolvedCell,
 };
-use crate::sql::common::ast::lower_statement;
 use crate::sql::execution::preprocess::preprocess_sql_to_plan as preprocess_sql;
 use crate::sql::public::planner::semantics::filesystem_queries::load_file_row_by_id_without_path;
 use crate::sql::public::runtime::prepare_public_read;
@@ -1073,25 +1072,7 @@ async fn execute_public_prefetch_query(
             "public prefetch could not prepare query",
         ));
     };
-    if let Some(dependency_spec) = prepared.dependency_spec.as_ref() {
-        for schema_key in &dependency_spec.schema_keys {
-            if schema_key == "lix_active_version" {
-                continue;
-            }
-            crate::schema::registry::ensure_schema_live_table(backend, schema_key).await?;
-        }
-    }
-    let lowered = prepared.lowered_read;
-
-    let mut result = QueryResult {
-        rows: Vec::new(),
-        columns: Vec::new(),
-    };
-    for statement in lowered.statements {
-        let statement = lower_statement(statement, backend.dialect())?;
-        result = backend.execute(&statement.to_string(), &[]).await?;
-    }
-    Ok(result)
+    crate::sql::public::runtime::execute_prepared_public_read(backend, &prepared).await
 }
 
 async fn active_version_id_from_internal_state_update(

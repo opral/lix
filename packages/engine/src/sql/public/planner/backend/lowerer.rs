@@ -30,8 +30,8 @@ use crate::sql::public::planner::semantics::effective_state_resolver::{
 };
 use crate::state::history::query::build_state_history_query_sql;
 use crate::state::history::{
-    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest,
-    StateHistoryRootScope, StateHistoryVersionScope,
+    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
+    StateHistoryVersionScope,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,

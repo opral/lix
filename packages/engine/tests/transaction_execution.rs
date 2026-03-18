@@ -99,6 +99,37 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
     }
 }
 
+async fn register_state_history_test_schema(engine: &support::simulation_test::SimulationEngine) {
+    engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+             'lix_registered_schema',\
+             '{\"value\":{\"x-lix-key\":\"tx_state_history_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
+             )",
+            &[],
+        )
+        .await
+        .unwrap();
+}
+
+async fn active_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
+    let result = engine
+        .execute(
+            "SELECT v.commit_id \
+             FROM lix_active_version av \
+             JOIN lix_version v ON v.id = av.version_id \
+             LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.statements[0].rows.len(), 1);
+    match &result.statements[0].rows[0][0] {
+        Value::Text(text) => text.clone(),
+        other => panic!("expected commit_id text, got {other:?}"),
+    }
+}
+
 fn tx_dynamic_schema_snapshot_sql() -> String {
     serde_json::json!({
         "value": {
@@ -232,6 +263,62 @@ simulation_test!(
             "unexpected error: {}",
             error.description
         );
+    }
+);
+
+simulation_test!(
+    transaction_path_executes_direct_state_history_reads,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.initialize().await.unwrap();
+        register_state_history_test_schema(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'tx-history-entity', 'tx_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"initial\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+        let root_commit_id = active_commit_id(&engine).await;
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                let sql = format!(
+                    "SELECT depth, snapshot_content \
+                     FROM lix_state_history \
+                     WHERE entity_id = 'tx-history-entity' \
+                       AND schema_key = 'tx_state_history_schema' \
+                       AND root_commit_id = '{root_commit_id}' \
+                     ORDER BY depth ASC"
+                );
+                Box::pin(async move {
+                    let rows = tx.execute(&sql, &[]).await?;
+                    let [statement] = rows.statements.as_slice() else {
+                        panic!(
+                            "state history transaction read: expected 1 statement result(s), got {}",
+                            rows.statements.len()
+                        );
+                    };
+                    assert_eq!(statement.rows.len(), 1);
+                    assert_eq!(statement.rows[0][0], Value::Integer(0));
+                    assert_eq!(
+                        statement.rows[0][1],
+                        Value::Text("{\"value\":\"initial\"}".to_string())
+                    );
+                    Ok(())
+                })
+            })
+            .await
+            .expect("transactional direct state-history read should succeed");
     }
 );
 

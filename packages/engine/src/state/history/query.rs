@@ -6,8 +6,7 @@ use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::build_reachable_commits_from_requested_cte_sql;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id,
-    GLOBAL_VERSION_ID,
+    version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
@@ -45,16 +44,28 @@ pub(crate) fn build_state_history_query_sql(
     let source_sql = build_state_history_source_sql(dialect, request);
     let mut predicates = Vec::new();
     if !request.entity_ids.is_empty() {
-        predicates.push(render_text_in_predicate("history.entity_id", &request.entity_ids));
+        predicates.push(render_text_in_predicate(
+            "history.entity_id",
+            &request.entity_ids,
+        ));
     }
     if !request.file_ids.is_empty() {
-        predicates.push(render_text_in_predicate("history.file_id", &request.file_ids));
+        predicates.push(render_text_in_predicate(
+            "history.file_id",
+            &request.file_ids,
+        ));
     }
     if !request.schema_keys.is_empty() {
-        predicates.push(render_text_in_predicate("history.schema_key", &request.schema_keys));
+        predicates.push(render_text_in_predicate(
+            "history.schema_key",
+            &request.schema_keys,
+        ));
     }
     if !request.plugin_keys.is_empty() {
-        predicates.push(render_text_in_predicate("history.plugin_key", &request.plugin_keys));
+        predicates.push(render_text_in_predicate(
+            "history.plugin_key",
+            &request.plugin_keys,
+        ));
     }
     if let Some(min_depth) = request.min_depth {
         predicates.push(format!("history.depth >= {min_depth}"));
@@ -125,15 +136,16 @@ fn build_state_history_source_sql(dialect: SqlDialect, request: &StateHistoryReq
     if request.lineage_scope == StateHistoryLineageScope::ActiveVersion
         && requested_root_predicates.is_empty()
     {
-        requested_predicates.push("c.id IN (SELECT root_commit_id FROM default_root_commits)".to_string());
+        requested_predicates
+            .push("c.id IN (SELECT root_commit_id FROM default_root_commits)".to_string());
     }
     let requested_where_sql = render_where_clause_sql(&requested_predicates, "WHERE ");
 
-    let active_version_rows_sql = if request.lineage_scope == StateHistoryLineageScope::ActiveVersion
-    {
-        let active_version_column = active_version_payload_column_name();
-        format!(
-            "active_version_rows AS ( \
+    let active_version_rows_sql =
+        if request.lineage_scope == StateHistoryLineageScope::ActiveVersion {
+            let active_version_column = active_version_payload_column_name();
+            format!(
+                "active_version_rows AS ( \
                SELECT DISTINCT \
                  {active_version_column} AS version_id \
                FROM {active_version_table} \
@@ -141,20 +153,20 @@ fn build_state_history_source_sql(dialect: SqlDialect, request: &StateHistoryReq
                  AND version_id = '{storage_version_id}' \
                  AND {active_version_column} IS NOT NULL \
              ), ",
-            active_version_column = quote_ident(&active_version_column),
-            active_version_table =
-                quote_ident(&untracked_live_table_name(active_version_schema_key())),
-            file_id = escape_sql_string(active_version_file_id()),
-            storage_version_id = escape_sql_string(active_version_storage_version_id()),
-        )
-    } else {
-        String::new()
-    };
+                active_version_column = quote_ident(&active_version_column),
+                active_version_table =
+                    quote_ident(&untracked_live_table_name(active_version_schema_key())),
+                file_id = escape_sql_string(active_version_file_id()),
+                storage_version_id = escape_sql_string(active_version_storage_version_id()),
+            )
+        } else {
+            String::new()
+        };
 
-    let default_root_commits_sql = if request.lineage_scope == StateHistoryLineageScope::ActiveVersion
-    {
-        format!(
-            "default_root_commits AS ( \
+    let default_root_commits_sql =
+        if request.lineage_scope == StateHistoryLineageScope::ActiveVersion {
+            format!(
+                "default_root_commits AS ( \
                SELECT DISTINCT \
                  vp.{version_ref_commit_id_column} AS root_commit_id, \
                  vp.version_id AS root_version_id \
@@ -165,15 +177,15 @@ fn build_state_history_source_sql(dialect: SqlDialect, request: &StateHistoryReq
                  AND vp.file_id = '{file_id}' \
                  AND vp.version_id = '{storage_version_id}' \
              ), ",
-            version_ref_commit_id_column = version_ref_commit_id_column,
-            version_ref_table = version_ref_table,
-            schema_key = escape_sql_string(version_ref_schema_key()),
-            file_id = escape_sql_string(version_ref_file_id()),
-            storage_version_id = escape_sql_string(version_ref_storage_version_id()),
-        )
-    } else {
-        format!(
-            "default_root_commits AS ( \
+                version_ref_commit_id_column = version_ref_commit_id_column,
+                version_ref_table = version_ref_table,
+                schema_key = escape_sql_string(version_ref_schema_key()),
+                file_id = escape_sql_string(version_ref_file_id()),
+                storage_version_id = escape_sql_string(version_ref_storage_version_id()),
+            )
+        } else {
+            format!(
+                "default_root_commits AS ( \
                SELECT DISTINCT \
                  vp.{version_ref_commit_id_column} AS root_commit_id, \
                  vp.entity_id AS root_version_id \
@@ -182,27 +194,27 @@ fn build_state_history_source_sql(dialect: SqlDialect, request: &StateHistoryReq
                  AND vp.file_id = '{file_id}' \
                  AND vp.version_id = '{storage_version_id}' \
              ), ",
-            version_ref_commit_id_column = version_ref_commit_id_column,
-            version_ref_table = version_ref_table,
-            schema_key = escape_sql_string(version_ref_schema_key()),
-            file_id = escape_sql_string(version_ref_file_id()),
-            storage_version_id = escape_sql_string(version_ref_storage_version_id()),
-        )
-    };
+                version_ref_commit_id_column = version_ref_commit_id_column,
+                version_ref_table = version_ref_table,
+                schema_key = escape_sql_string(version_ref_schema_key()),
+                file_id = escape_sql_string(version_ref_file_id()),
+                storage_version_id = escape_sql_string(version_ref_storage_version_id()),
+            )
+        };
 
     let reachable_commits_cte_sql =
         build_reachable_commits_from_requested_cte_sql(dialect, "requested_commits", 512);
     let snapshot_projection = match request.content_mode {
         StateHistoryContentMode::MetadataOnly => "NULL AS snapshot_content".to_string(),
-        StateHistoryContentMode::IncludeSnapshotContent => "s.content AS snapshot_content".to_string(),
+        StateHistoryContentMode::IncludeSnapshotContent => {
+            "s.content AS snapshot_content".to_string()
+        }
     };
     let snapshot_join = match request.content_mode {
         StateHistoryContentMode::MetadataOnly => String::new(),
-        StateHistoryContentMode::IncludeSnapshotContent => {
-            "LEFT JOIN lix_internal_snapshot s \
+        StateHistoryContentMode::IncludeSnapshotContent => "LEFT JOIN lix_internal_snapshot s \
              ON s.id = h.snapshot_id "
-                .to_string()
-        }
+            .to_string(),
     };
 
     format!(

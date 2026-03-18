@@ -21,7 +21,7 @@ use crate::sql::public::catalog::{
 use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
 use crate::sql::public::planner::backend::lowerer::{
     rewrite_supported_public_read_surfaces_in_statement_with_registry_and_dialect,
-    summarize_bound_public_read_statement_with_registry, LoweredReadProgram,
+    summarize_bound_public_read_statement_with_registry, LoweredReadProgram, LoweredResultColumns,
 };
 use crate::sql::public::planner::canonicalize::{canonicalize_write, CanonicalizedWrite};
 use crate::sql::public::planner::ir::{
@@ -46,6 +46,7 @@ use crate::state::commit::{
     ProposedDomainChange,
 };
 use crate::state::history::ensure_state_history_timeline_materialized_for_root;
+use crate::state::history::StateHistoryRequest;
 use crate::state::stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamOperation,
@@ -111,14 +112,81 @@ pub(crate) struct PublicReadOptimization {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DirectStateHistoryField {
+    EntityId,
+    SchemaKey,
+    FileId,
+    PluginKey,
+    SnapshotContent,
+    Metadata,
+    SchemaVersion,
+    ChangeId,
+    CommitId,
+    CommitCreatedAt,
+    RootCommitId,
+    Depth,
+    VersionId,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StateHistoryProjection {
+    pub(crate) output_name: String,
+    pub(crate) field: DirectStateHistoryField,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StateHistorySortKey {
+    pub(crate) output_name: String,
+    pub(crate) field: Option<DirectStateHistoryField>,
+    pub(crate) descending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StateHistoryPredicate {
+    Eq(DirectStateHistoryField, Value),
+    NotEq(DirectStateHistoryField, Value),
+    Gt(DirectStateHistoryField, Value),
+    GtEq(DirectStateHistoryField, Value),
+    Lt(DirectStateHistoryField, Value),
+    LtEq(DirectStateHistoryField, Value),
+    In(DirectStateHistoryField, Vec<Value>),
+    IsNull(DirectStateHistoryField),
+    IsNotNull(DirectStateHistoryField),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StateHistoryDirectReadPlan {
+    pub(crate) request: StateHistoryRequest,
+    pub(crate) predicates: Vec<StateHistoryPredicate>,
+    pub(crate) projections: Vec<StateHistoryProjection>,
+    pub(crate) wildcard_projection: bool,
+    pub(crate) wildcard_columns: Vec<String>,
+    pub(crate) sort_keys: Vec<StateHistorySortKey>,
+    pub(crate) limit: Option<u64>,
+    pub(crate) offset: u64,
+    pub(crate) result_columns: LoweredResultColumns,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DirectPublicReadPlan {
+    StateHistory(StateHistoryDirectReadPlan),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PreparedPublicReadExecution {
+    LoweredSql(LoweredReadProgram),
+    Direct(DirectPublicReadPlan),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PreparedPublicRead {
     pub(crate) optimization: Option<PublicReadOptimization>,
     pub(crate) dependency_spec: Option<DependencySpec>,
-    pub(crate) lowered_read: LoweredReadProgram,
+    pub(crate) execution: PreparedPublicReadExecution,
     pub(crate) debug_trace: PublicExecutionDebugTrace,
 }
 
-pub(crate) use read::decode_public_read_result;
+pub(crate) use read::{decode_public_read_result, execute_prepared_public_read};
 
 impl PreparedPublicRead {
     pub(crate) fn structured_read(&self) -> Option<&StructuredPublicRead> {
@@ -137,6 +205,20 @@ impl PreparedPublicRead {
         self.optimization
             .as_ref()
             .and_then(|optimization| optimization.effective_state_plan.as_ref())
+    }
+
+    pub(crate) fn lowered_read(&self) -> Option<&LoweredReadProgram> {
+        match &self.execution {
+            PreparedPublicReadExecution::LoweredSql(lowered) => Some(lowered),
+            PreparedPublicReadExecution::Direct(_) => None,
+        }
+    }
+
+    pub(crate) fn direct_plan(&self) -> Option<&DirectPublicReadPlan> {
+        match &self.execution {
+            PreparedPublicReadExecution::LoweredSql(_) => None,
+            PreparedPublicReadExecution::Direct(plan) => Some(plan),
+        }
     }
 }
 
@@ -1206,8 +1288,7 @@ async fn ensure_public_read_history_timeline_roots(
     root_commit_ids: &[String],
 ) -> Result<(), LixError> {
     for root_commit_id in root_commit_ids {
-        ensure_state_history_timeline_materialized_for_root(backend, &root_commit_id, 512)
-            .await?;
+        ensure_state_history_timeline_materialized_for_root(backend, &root_commit_id, 512).await?;
     }
     Ok(())
 }
@@ -2340,8 +2421,10 @@ mod tests {
     use super::{
         lower_public_read_query_with_backend, prepare_public_execution,
         prepare_public_execution_with_internal_access, prepare_public_read,
-        prepare_public_read_strict, PreparedPublicExecution,
+        prepare_public_read_strict, DirectPublicReadPlan, PreparedPublicExecution,
+        PreparedPublicReadExecution,
     };
+    use crate::state::history::StateHistoryRootScope;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::json;
@@ -3866,13 +3949,24 @@ mod tests {
                 .accepted_predicates,
             vec!["root_commit_id = 'commit-1'".to_string()]
         );
-        let lowered_sql = prepared
-            .debug_trace
-            .lowered_sql
-            .first()
-            .expect("state-history read should lower");
-        assert!(lowered_sql.contains("FROM lix_internal_live_v1_lix_commit"));
-        assert!(lowered_sql.contains("c.id = 'commit-1'"));
+        match &prepared.execution {
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(plan)) => {
+                assert_eq!(
+                    plan.request.root_scope,
+                    StateHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
+                );
+                assert!(prepared.debug_trace.lowered_sql.is_empty());
+            }
+            PreparedPublicReadExecution::LoweredSql(lowered) => {
+                let lowered_sql = lowered
+                    .statements
+                    .first()
+                    .expect("state-history read should lower")
+                    .to_string();
+                assert!(lowered_sql.contains("FROM lix_internal_live_v1_lix_commit"));
+                assert!(lowered_sql.contains("c.id = 'commit-1'"));
+            }
+        }
     }
 
     #[tokio::test]
