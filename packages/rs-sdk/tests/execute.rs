@@ -176,8 +176,5 @@ fn temp_sqlite_path(label: &str) -> PathBuf {
 }
 
 fn cleanup_sqlite_path(path: &PathBuf) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
-    let _ = std::fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
-    let _ = std::fs::remove_file(PathBuf::from(format!("{}-journal", path.display())));
+    SqliteBackend::destroy_path(path).expect("sqlite test path should be destroyable");
 }

@@ -19,9 +19,7 @@ use crate::sql::execution::runtime_effects::{
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::sql::live_snapshot::live_snapshot_select_expr_for_schema;
 use crate::sql::public::planner::ir::LazyExactFileUpdate;
-use crate::state::live_state::{
-    ensure_live_state_ready_in_transaction,
-};
+use crate::state::live_state::ensure_live_state_ready_in_transaction;
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::SqlDialect;

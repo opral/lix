@@ -145,7 +145,9 @@ pub(crate) fn normalize_file_path(path: &str) -> Result<String, LixError> {
     if !normalized.starts_with('/') {
         return Err(LixError {
             code: "LIX_ERROR_INVALID_FILE_PATH".to_string(),
-            description: format!("file paths must start with '/'. Got '{path}', use '/{path}' instead"),
+            description: format!(
+                "file paths must start with '/'. Got '{path}', use '/{path}' instead"
+            ),
         });
     }
     if normalized.ends_with('/') || normalized == "/" {

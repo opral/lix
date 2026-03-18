@@ -263,7 +263,10 @@ pub(crate) fn transaction_writer_key_conflict_error(
 pub(crate) const FILE_DATA_EXPECTS_BYTES_MESSAGE: &str = "data expects bytes. To insert text use lix_text_encode(): INSERT INTO lix_file (path, data) VALUES ('file.txt', lix_text_encode('your text'))";
 
 pub(crate) fn file_data_expects_bytes_error() -> LixError {
-    build_error(ErrorCode::FileDataExpectsBytes, FILE_DATA_EXPECTS_BYTES_MESSAGE)
+    build_error(
+        ErrorCode::FileDataExpectsBytes,
+        FILE_DATA_EXPECTS_BYTES_MESSAGE,
+    )
 }
 
 pub(crate) fn unexpected_statement_count_error(

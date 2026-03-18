@@ -320,6 +320,10 @@ impl LixBackend for TracingSqliteBackend {
             }
         }
     }
+
+    async fn destroy(&self) -> Result<(), LixError> {
+        self.inner.destroy().await
+    }
 }
 
 #[async_trait(?Send)]
@@ -434,14 +438,14 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     validate_repo_dir(&repo_path)?;
     validate_git_repo(&repo_path)?;
     let output_lix_path = absolutize_from_cwd(&args.output_lix_path)?;
-    prepare_output_path(&output_lix_path, args.force)?;
+    db::prepare_lix_output_path(&output_lix_path, args.force)?;
     let profile_json_path = args
         .profile_json
         .as_ref()
         .map(|path| absolutize_from_cwd(path))
         .transpose()?;
     if let Some(path) = &profile_json_path {
-        prepare_output_path(path, args.force)?;
+        prepare_regular_output_path(path, args.force)?;
     }
     let trace_sql_json_path = args
         .trace_sql_json
@@ -449,7 +453,7 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
         .map(|path| absolutize_from_cwd(path))
         .transpose()?;
     if let Some(path) = &trace_sql_json_path {
-        prepare_output_path(path, args.force)?;
+        prepare_regular_output_path(path, args.force)?;
     }
     if args.trace_commit.is_some() && trace_sql_json_path.is_none() {
         return Err(CliError::InvalidArgs(
@@ -1555,7 +1559,7 @@ fn default_wasm_runtime() -> Result<Arc<WasmtimeRuntime>, CliError> {
         .map_err(|err| CliError::msg(format!("failed to initialize wasmtime runtime: {err}")))
 }
 
-fn prepare_output_path(path: &Path, force: bool) -> Result<(), CliError> {
+fn prepare_regular_output_path(path: &Path, force: bool) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|source| CliError::io("failed to create output directory", source))?;
@@ -1743,7 +1747,7 @@ mod tests {
         let output_path = temp_dir.join("existing.lix");
         fs::write(&output_path, b"existing").expect("seed file should be written");
 
-        let result = prepare_output_path(&output_path, false);
+        let result = db::prepare_lix_output_path(&output_path, false);
         assert!(result.is_err(), "expected error when output file exists");
         let message = format!("{}", result.expect_err("expected output path error"));
         assert!(
@@ -1761,7 +1765,7 @@ mod tests {
         let nested_parent = temp_dir.join("nested").join("output");
         let output_path = nested_parent.join("new.lix");
 
-        let result = prepare_output_path(&output_path, false);
+        let result = db::prepare_lix_output_path(&output_path, false);
         assert!(result.is_ok(), "expected success for absent output file");
         assert!(
             nested_parent.is_dir(),
@@ -1772,17 +1776,35 @@ mod tests {
     }
 
     #[test]
-    fn prepare_output_path_force_removes_existing_file() {
+    fn prepare_output_lix_path_force_removes_existing_file_and_sidecars() {
         let temp_dir = unique_temp_dir();
         fs::create_dir_all(&temp_dir).expect("temp dir should be created");
         let output_path = temp_dir.join("existing.lix");
         fs::write(&output_path, b"existing").expect("seed file should be written");
+        fs::write(
+            PathBuf::from(format!("{}-wal", output_path.display())),
+            b"wal-bytes",
+        )
+        .expect("wal file should be written");
+        fs::write(
+            PathBuf::from(format!("{}-shm", output_path.display())),
+            b"shm-bytes",
+        )
+        .expect("shm file should be written");
 
-        let result = prepare_output_path(&output_path, true);
+        let result = db::prepare_lix_output_path(&output_path, true);
         assert!(result.is_ok(), "expected success when force is enabled");
         assert!(
             !output_path.exists(),
             "expected existing output file to be removed"
+        );
+        assert!(
+            !PathBuf::from(format!("{}-wal", output_path.display())).exists(),
+            "expected wal sidecar to be removed"
+        );
+        assert!(
+            !PathBuf::from(format!("{}-shm", output_path.display())).exists(),
+            "expected shm sidecar to be removed"
         );
 
         fs::remove_dir_all(&temp_dir).expect("temp dir should be removable");
