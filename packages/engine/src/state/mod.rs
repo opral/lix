@@ -1,9 +1,9 @@
 pub(crate) mod checkpoint;
 pub(crate) mod commit;
+pub(crate) mod history;
 pub(crate) mod image;
 pub(crate) mod internal;
 pub(crate) mod live_state;
 pub(crate) mod materialization;
 pub(crate) mod stream;
-pub(crate) mod timeline;
 pub(crate) mod validation;

@@ -157,6 +157,7 @@ pub(crate) fn build_reachable_commits_from_requested_cte_sql(
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_exact_commit_depth_cte_sql(
     _dialect: SqlDialect,
     root_placeholder: &str,
