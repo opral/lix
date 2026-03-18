@@ -3856,7 +3856,10 @@ simulation_test!(invalid_filesystem_paths_are_rejected, |sim| async move {
         .expect_err("invalid file path should fail");
     assert!(
         file_err.description.contains("lix_file_descriptor")
-            || file_err.description.contains("does not match schema"),
+            || file_err.description.contains("does not match schema")
+            || file_err
+                .description
+                .contains("file paths must start with '/'"),
         "unexpected error: {}",
         file_err.description
     );
