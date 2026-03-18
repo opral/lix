@@ -1199,9 +1199,7 @@ fn unknown_write_column_error(
 }
 
 fn filesystem_file_data_error(_error: CanonicalizeError) -> CanonicalizeError {
-    CanonicalizeError::unsupported(
-        "data expects bytes; use lix_text_encode('...') for text, X'HEX', or a blob parameter",
-    )
+    CanonicalizeError::unsupported(crate::errors::FILE_DATA_EXPECTS_BYTES_MESSAGE)
 }
 
 fn expr_to_value(

@@ -3,6 +3,7 @@ pub(crate) mod classification;
 mod r#type;
 
 pub(crate) use catalog::ErrorCode;
+pub(crate) use catalog::FILE_DATA_EXPECTS_BYTES_MESSAGE;
 pub(crate) use catalog::{
     already_initialized_error, file_data_expects_bytes_error, internal_table_access_denied_error,
     live_state_not_ready_error, mixed_public_internal_query_error, no_active_transaction_error,

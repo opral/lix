@@ -218,9 +218,7 @@ fn blob_assignment(
         None => Ok(BlobAssignment::Unchanged),
         Some(Value::Blob(bytes)) => Ok(BlobAssignment::Set(bytes.clone())),
         Some(Value::Text(_)) => Err(FilesystemAssignmentsError {
-            message:
-                "data expects bytes; use lix_text_encode('...') for text, X'HEX', or a blob parameter"
-                    .to_string(),
+            message: crate::errors::FILE_DATA_EXPECTS_BYTES_MESSAGE.to_string(),
         }),
         Some(other) => Err(FilesystemAssignmentsError {
             message: format!("public filesystem resolver expected blob {key}, got {other:?}"),
@@ -236,9 +234,7 @@ fn insert_blob_value(
         None => Ok(None),
         Some(Value::Blob(bytes)) => Ok(Some(bytes.clone())),
         Some(Value::Text(_)) => Err(FilesystemAssignmentsError {
-            message:
-                "data expects bytes; use lix_text_encode('...') for text, X'HEX', or a blob parameter"
-                    .to_string(),
+            message: crate::errors::FILE_DATA_EXPECTS_BYTES_MESSAGE.to_string(),
         }),
         Some(other) => Err(FilesystemAssignmentsError {
             message: format!("public filesystem resolver expected blob {key}, got {other:?}"),
