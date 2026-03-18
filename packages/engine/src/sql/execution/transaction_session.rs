@@ -4,6 +4,7 @@ use std::sync::Arc;
 use sqlparser::ast::Statement;
 
 use crate::engine::reject_internal_table_writes;
+use crate::engine::PendingWriteTxnBuffer;
 use crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::public::catalog::SurfaceRegistry;
@@ -67,6 +68,7 @@ struct SessionTransaction {
     observe_tick_already_emitted: bool,
     pending_public_commit_session:
         Option<crate::sql::execution::shared_path::PendingPublicCommitSession>,
+    pending_write_txn_buffer: Option<PendingWriteTxnBuffer>,
 }
 
 impl SessionTransaction {
@@ -87,6 +89,22 @@ impl SessionTransaction {
             .transaction
             .take()
             .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "transaction is no longer active"))?;
+        let active_version_before_flush = self.active_version_id.clone();
+        engine
+            .flush_pending_write_txn_buffer_in_transaction(
+                transaction.as_mut(),
+                &mut self.public_surface_registry,
+                &mut self.public_surface_registry_dirty,
+                &mut self.active_version_id,
+                &mut self.pending_write_txn_buffer,
+                &mut self.pending_state_commit_stream_changes,
+                &mut self.pending_public_commit_session,
+                &mut self.observe_tick_already_emitted,
+            )
+            .await?;
+        if self.active_version_id != active_version_before_flush {
+            self.active_version_changed = true;
+        }
         if !self.observe_tick_already_emitted
             && !self.pending_state_commit_stream_changes.is_empty()
         {
@@ -162,6 +180,7 @@ async fn execute_transaction_control(
                 pending_state_commit_stream_changes: Vec::new(),
                 observe_tick_already_emitted: false,
                 pending_public_commit_session: None,
+                pending_write_txn_buffer: None,
             });
             sql_transaction_open.store(true, Ordering::SeqCst);
             Ok(empty_execute_result())
@@ -214,6 +233,7 @@ async fn execute_in_active_transaction(
                 &mut session_transaction.public_surface_registry,
                 &mut session_transaction.public_surface_registry_dirty,
                 &mut session_transaction.active_version_id,
+                &mut session_transaction.pending_write_txn_buffer,
                 &mut session_transaction.pending_state_commit_stream_changes,
                 &mut session_transaction.pending_public_commit_session,
                 &mut session_transaction.observe_tick_already_emitted,
@@ -230,10 +250,12 @@ async fn execute_in_active_transaction(
                 &mut session_transaction.public_surface_registry,
                 &mut session_transaction.public_surface_registry_dirty,
                 &mut session_transaction.active_version_id,
+                &mut session_transaction.pending_write_txn_buffer,
                 None,
                 false,
                 &mut session_transaction.pending_state_commit_stream_changes,
                 &mut session_transaction.pending_public_commit_session,
+                &mut session_transaction.observe_tick_already_emitted,
             )
             .await?;
         ExecuteResult {

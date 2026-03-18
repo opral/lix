@@ -22,6 +22,7 @@ use std::sync::RwLock;
 
 use crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange;
 use crate::sql::execution::contracts::planned_statement::MutationRow;
+use crate::sql::execution::write_txn_plan::WriteTxnPlan;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
@@ -77,6 +78,13 @@ pub struct EngineTransaction<'a> {
     pub(crate) observe_tick_already_emitted: bool,
     pub(crate) pending_public_commit_session:
         Option<crate::sql::execution::shared_path::PendingPublicCommitSession>,
+    pub(crate) pending_write_txn_buffer: Option<PendingWriteTxnBuffer>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingWriteTxnBuffer {
+    pub(crate) plan: WriteTxnPlan,
+    pub(crate) append_safe: bool,
 }
 
 impl Engine {

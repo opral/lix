@@ -37,6 +37,7 @@ impl Engine {
             pending_state_commit_stream_changes: Vec::new(),
             observe_tick_already_emitted: false,
             pending_public_commit_session: None,
+            pending_write_txn_buffer: None,
         })
     }
 
@@ -122,6 +123,7 @@ impl EngineTransaction<'_> {
                     &mut self.public_surface_registry,
                     &mut self.public_surface_registry_dirty,
                     &mut self.active_version_id,
+                    &mut self.pending_write_txn_buffer,
                     &mut self.pending_state_commit_stream_changes,
                     &mut self.pending_public_commit_session,
                     &mut self.observe_tick_already_emitted,
@@ -139,10 +141,12 @@ impl EngineTransaction<'_> {
                     &mut self.public_surface_registry,
                     &mut self.public_surface_registry_dirty,
                     &mut self.active_version_id,
+                    &mut self.pending_write_txn_buffer,
                     None,
                     false,
                     &mut self.pending_state_commit_stream_changes,
                     &mut self.pending_public_commit_session,
+                    &mut self.observe_tick_already_emitted,
                 )
                 .await?;
             ExecuteResult {
@@ -163,6 +167,22 @@ impl EngineTransaction<'_> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
+        let active_version_before_flush = self.active_version_id.clone();
+        self.engine
+            .flush_pending_write_txn_buffer_in_transaction(
+                transaction.as_mut(),
+                &mut self.public_surface_registry,
+                &mut self.public_surface_registry_dirty,
+                &mut self.active_version_id,
+                &mut self.pending_write_txn_buffer,
+                &mut self.pending_state_commit_stream_changes,
+                &mut self.pending_public_commit_session,
+                &mut self.observe_tick_already_emitted,
+            )
+            .await?;
+        if self.active_version_id != active_version_before_flush {
+            self.active_version_changed = true;
+        }
         let should_emit_observe_tick = !self.observe_tick_already_emitted
             && !self.pending_state_commit_stream_changes.is_empty();
         if should_emit_observe_tick {
