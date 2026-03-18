@@ -188,7 +188,7 @@ async fn run_internal_write_txn_with_transaction(
     plan: &InternalWriteTxnPlan,
     mode: WriteTxnRunMode,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    let execution = execute::execute_plan_sql_with_transaction(
+    let mut execution = execute::execute_plan_sql_with_transaction(
         transaction,
         &plan.plan,
         plan.plan.requirements.should_refresh_file_cache,
@@ -256,6 +256,10 @@ async fn run_internal_write_txn_with_transaction(
         engine
             .append_observe_tick_in_transaction(transaction, plan.writer_key.as_deref())
             .await?;
+    }
+
+    if execution.plan_effects_override.is_none() {
+        execution.plan_effects_override = Some(plan.plan.effects.clone());
     }
 
     Ok(Some(execution))

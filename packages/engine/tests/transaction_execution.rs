@@ -550,6 +550,51 @@ simulation_test!(
 );
 
 simulation_test!(
+    tx_execute_repeated_writes_flush_before_followup_read,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO lix_file (id, path, data) \
+                         VALUES ('tx-repeat-a', '/tx-repeat-a.md', lix_text_encode('a'))",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute(
+                        "INSERT INTO lix_file (id, path, data) \
+                         VALUES ('tx-repeat-b', '/tx-repeat-b.md', lix_text_encode('b'))",
+                        &[],
+                    )
+                    .await?;
+
+                    let count = tx
+                        .execute(
+                            "SELECT COUNT(*) \
+                             FROM lix_file \
+                             WHERE id IN ('tx-repeat-a', 'tx-repeat-b')",
+                            &[],
+                        )
+                        .await?;
+                    assert_eq!(count.statements.len(), 1);
+                    assert_eq!(count.statements[0].rows.len(), 1);
+                    assert_eq!(count.statements[0].rows[0][0], Value::Integer(2));
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .unwrap();
+    }
+);
+
+simulation_test!(
     transaction_script_path_preprocesses_lix_file_statements,
     simulations = [sqlite, postgres],
     |sim| async move {

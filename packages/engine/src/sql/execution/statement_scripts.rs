@@ -1,14 +1,14 @@
-use crate::engine::{Engine, TransactionBackendAdapter};
+use crate::engine::{Engine, PendingWriteTxnBuffer, TransactionBackendAdapter};
 use crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path::{
     self, prepared_execution_mutates_public_surface_registry,
 };
+use crate::sql::execution::transaction_exec::public_write_execution_next_active_version_id;
 use crate::sql::execution::write_txn_plan::build_write_txn_plan;
-use crate::sql::execution::write_txn_runner::run_write_txn_plan_with_transaction;
 use crate::sql::public::runtime::{
     apply_public_surface_registry_mutations, classify_public_execution_route_with_registry,
-    public_surface_registry_mutations, PublicExecutionRoute, PublicWriteExecutionPartition,
+    public_surface_registry_mutations, PublicExecutionRoute,
 };
 use crate::state::internal::script::{
     coalesce_vtable_inserts_in_statement_list, prepare_statement_script_sql_statements,
@@ -47,6 +47,7 @@ impl Engine {
         let starting_active_version_id = active_version_id.clone();
         let mut pending_state_commit_stream_changes = Vec::new();
         let mut pending_public_commit_session = None;
+        let mut pending_write_txn_buffer = None;
         let mut observe_tick_already_emitted = false;
         let mut public_surface_registry_dirty = false;
         let installed_plugins_cache_invalidation_pending =
@@ -61,6 +62,7 @@ impl Engine {
                 &mut public_surface_registry,
                 &mut public_surface_registry_dirty,
                 &mut active_version_id,
+                &mut pending_write_txn_buffer,
                 &mut pending_state_commit_stream_changes,
                 &mut pending_public_commit_session,
                 &mut observe_tick_already_emitted,
@@ -73,6 +75,17 @@ impl Engine {
                 return Err(error);
             }
         };
+        self.flush_pending_write_txn_buffer_in_transaction(
+            transaction.as_mut(),
+            &mut public_surface_registry,
+            &mut public_surface_registry_dirty,
+            &mut active_version_id,
+            &mut pending_write_txn_buffer,
+            &mut pending_state_commit_stream_changes,
+            &mut pending_public_commit_session,
+            &mut observe_tick_already_emitted,
+        )
+        .await?;
 
         if !observe_tick_already_emitted && !pending_state_commit_stream_changes.is_empty() {
             self.append_observe_tick_in_transaction(
@@ -105,6 +118,7 @@ impl Engine {
         public_surface_registry: &mut crate::sql::public::catalog::SurfaceRegistry,
         public_surface_registry_dirty: &mut bool,
         active_version_id: &mut String,
+        pending_write_txn_buffer: &mut Option<PendingWriteTxnBuffer>,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
         pending_public_commit_session: &mut Option<
             crate::sql::execution::shared_path::PendingPublicCommitSession,
@@ -118,6 +132,17 @@ impl Engine {
             params,
             transaction.dialect(),
         )?;
+        self.flush_pending_write_txn_buffer_in_transaction(
+            transaction,
+            public_surface_registry,
+            public_surface_registry_dirty,
+            active_version_id,
+            pending_write_txn_buffer,
+            pending_state_commit_stream_changes,
+            pending_public_commit_session,
+            observe_tick_already_emitted,
+        )
+        .await?;
         self.execute_statement_script_as_combined_write_txn_in_transaction(
             transaction,
             &script_statements,
@@ -129,6 +154,7 @@ impl Engine {
             public_surface_registry,
             public_surface_registry_dirty,
             active_version_id,
+            pending_write_txn_buffer,
             pending_state_commit_stream_changes,
             pending_public_commit_session,
             observe_tick_already_emitted,
@@ -148,6 +174,7 @@ impl Engine {
         public_surface_registry: &mut crate::sql::public::catalog::SurfaceRegistry,
         public_surface_registry_dirty: &mut bool,
         active_version_id: &mut String,
+        pending_write_txn_buffer: &mut Option<PendingWriteTxnBuffer>,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
         pending_public_commit_session: &mut Option<
             crate::sql::execution::shared_path::PendingPublicCommitSession,
@@ -209,40 +236,14 @@ impl Engine {
             let Some(combined_plan) = build_write_txn_plan(&combined_prepared, writer_key) else {
                 return Ok(empty_mutating_script_result(result_statement_count));
             };
-            let execution = run_write_txn_plan_with_transaction(
-                self,
-                transaction,
-                &combined_plan,
-                crate::sql::execution::write_txn_plan::WriteTxnRunMode::Borrowed,
-                Some(pending_public_commit_session),
-            )
-            .await?;
-
-            let active_effects = execution
-                .plan_effects_override
-                .as_ref()
-                .cloned()
-                .unwrap_or_default();
-            let mut state_commit_stream_changes =
-                active_effects.state_commit_stream_changes.clone();
-            state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());
-            if let Some(version_id) = &active_effects.next_active_version_id {
-                *active_version_id = version_id.clone();
-            }
-
-            self.maybe_invalidate_deterministic_settings_cache(
-                &combined_prepared.plan.preprocess.mutations,
-                &state_commit_stream_changes,
-            );
             if prepared_execution_mutates_public_surface_registry(&combined_prepared)? {
-                let backend = TransactionBackendAdapter::new(transaction);
-                *public_surface_registry =
-                    crate::sql::public::catalog::SurfaceRegistry::bootstrap_with_backend(&backend)
-                        .await?;
                 *public_surface_registry_dirty = true;
             }
-
-            pending_state_commit_stream_changes.extend(state_commit_stream_changes);
+            crate::sql::execution::transaction_exec::append_pending_write_txn_buffer(
+                pending_write_txn_buffer,
+                combined_plan,
+                false,
+            );
             return Ok(empty_mutating_script_result(result_statement_count));
         }
 
@@ -267,6 +268,7 @@ impl Engine {
             let mut planning_registry = public_surface_registry.clone();
             let mut planning_active_version_id = active_version_id.clone();
             let mut registry_dirty = false;
+            let mut all_append_safe = true;
 
             for (_statement, (sql, statement_params)) in &executable_statements {
                 let parsed_statement = parse_sql(sql).map_err(LixError::from).and_then(
@@ -315,6 +317,11 @@ impl Engine {
                     shared_functions.clone(),
                 );
                 combined_plan.extend(statement_plan);
+                all_append_safe &=
+                    crate::sql::execution::transaction_exec::statement_is_append_safe_write(
+                        &parsed_statement,
+                        &prepared,
+                    );
 
                 if let Some(public_write) = prepared.public_write.as_ref() {
                     let mutations = public_surface_registry_mutations(public_write)?;
@@ -330,32 +337,16 @@ impl Engine {
                 }
             }
 
-            let execution = run_write_txn_plan_with_transaction(
-                self,
-                transaction,
-                &combined_plan,
-                crate::sql::execution::write_txn_plan::WriteTxnRunMode::Borrowed,
-                Some(pending_public_commit_session),
-            )
-            .await?;
-            let active_effects = execution
-                .plan_effects_override
-                .as_ref()
-                .cloned()
-                .unwrap_or_default();
-            let mut state_commit_stream_changes =
-                active_effects.state_commit_stream_changes.clone();
-            state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());
-            if let Some(version_id) = &active_effects.next_active_version_id {
-                *active_version_id = version_id.clone();
-            }
-            self.maybe_invalidate_deterministic_settings_cache(&[], &state_commit_stream_changes);
             if registry_dirty {
                 *public_surface_registry = planning_registry;
                 *public_surface_registry_dirty = true;
             }
-            pending_state_commit_stream_changes.extend(state_commit_stream_changes);
-            *observe_tick_already_emitted |= execution.observe_tick_emitted;
+            *active_version_id = planning_active_version_id;
+            crate::sql::execution::transaction_exec::append_pending_write_txn_buffer(
+                pending_write_txn_buffer,
+                combined_plan,
+                all_append_safe,
+            );
             return Ok(empty_mutating_script_result(result_statement_count));
         }
 
@@ -371,10 +362,12 @@ impl Engine {
                     public_surface_registry,
                     public_surface_registry_dirty,
                     active_version_id,
+                    pending_write_txn_buffer,
                     None,
                     false,
                     pending_state_commit_stream_changes,
                     pending_public_commit_session,
+                    observe_tick_already_emitted,
                 )
                 .await?;
             results.push(result);
@@ -402,23 +395,4 @@ fn empty_mutating_script_result(statement_count: usize) -> ExecuteResult {
             statement_count
         ],
     }
-}
-
-fn public_write_execution_next_active_version_id(
-    public_write: &crate::sql::public::runtime::PreparedPublicWrite,
-) -> Option<String> {
-    public_write.execution.as_ref().and_then(|execution| {
-        execution
-            .partitions
-            .iter()
-            .rev()
-            .find_map(|partition| match partition {
-                PublicWriteExecutionPartition::Tracked(tracked) => {
-                    tracked.semantic_effects.next_active_version_id.clone()
-                }
-                PublicWriteExecutionPartition::Untracked(untracked) => {
-                    untracked.semantic_effects.next_active_version_id.clone()
-                }
-            })
-    })
 }

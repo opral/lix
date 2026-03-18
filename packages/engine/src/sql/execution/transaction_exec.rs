@@ -1,7 +1,9 @@
 use crate::engine::{
     dedupe_filesystem_payload_domain_changes, normalize_sql_execution_error_with_backend,
-    should_run_binary_cas_gc, DeferredTransactionSideEffects, Engine, TransactionBackendAdapter,
+    should_run_binary_cas_gc, DeferredTransactionSideEffects, Engine, PendingWriteTxnBuffer,
+    TransactionBackendAdapter,
 };
+use crate::sql::execution::contracts::result_contract::ResultContract;
 use crate::sql::execution::execute;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path;
@@ -11,13 +13,56 @@ use crate::sql::execution::write_txn_runner::run_write_txn_plan_with_transaction
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::sql::public::runtime::{
     apply_public_surface_registry_mutations, decode_public_read_result,
-    public_surface_registry_mutations,
+    public_surface_registry_mutations, PublicWriteExecutionPartition,
 };
 use crate::{
     ExecuteOptions, LixError, LixTransaction, QueryResult, StateCommitStreamChange, Value,
 };
+use sqlparser::ast::Statement;
 
 impl Engine {
+    pub(crate) async fn flush_pending_write_txn_buffer_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        public_surface_registry: &mut SurfaceRegistry,
+        public_surface_registry_dirty: &mut bool,
+        active_version_id: &mut String,
+        pending_write_txn_buffer: &mut Option<PendingWriteTxnBuffer>,
+        pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
+        pending_public_commit_session: &mut Option<shared_path::PendingPublicCommitSession>,
+        observe_tick_already_emitted: &mut bool,
+    ) -> Result<(), LixError> {
+        let Some(pending) = pending_write_txn_buffer.take() else {
+            return Ok(());
+        };
+        let execution = run_write_txn_plan_with_transaction(
+            self,
+            transaction,
+            &pending.plan,
+            WriteTxnRunMode::Borrowed,
+            Some(pending_public_commit_session),
+        )
+        .await?;
+        let active_effects = execution
+            .plan_effects_override
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(version_id) = &active_effects.next_active_version_id {
+            *active_version_id = version_id.clone();
+        }
+        let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
+        state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());
+        self.maybe_invalidate_deterministic_settings_cache(&[], &state_commit_stream_changes);
+        pending_state_commit_stream_changes.extend(state_commit_stream_changes);
+        *observe_tick_already_emitted |= execution.observe_tick_emitted;
+        if *public_surface_registry_dirty {
+            let backend = TransactionBackendAdapter::new(transaction);
+            *public_surface_registry = SurfaceRegistry::bootstrap_with_backend(&backend).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn execute_with_options_in_transaction(
         &self,
         transaction: &mut dyn LixTransaction,
@@ -28,10 +73,12 @@ impl Engine {
         public_surface_registry: &mut SurfaceRegistry,
         public_surface_registry_dirty: &mut bool,
         active_version_id: &mut String,
+        pending_write_txn_buffer: &mut Option<PendingWriteTxnBuffer>,
         deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
         skip_side_effect_collection: bool,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
         pending_public_commit_session: &mut Option<shared_path::PendingPublicCommitSession>,
+        observe_tick_already_emitted: &mut bool,
     ) -> Result<QueryResult, LixError> {
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         if parsed_statements.len() != 1 {
@@ -41,6 +88,24 @@ impl Engine {
                     "execute_with_options_in_transaction expects exactly one SQL statement"
                         .to_string(),
             });
+        }
+        if pending_write_txn_buffer.is_some()
+            && !pending_buffer_can_continue_with_statement(
+                &parsed_statements[0],
+                pending_write_txn_buffer,
+            )
+        {
+            self.flush_pending_write_txn_buffer_in_transaction(
+                transaction,
+                public_surface_registry,
+                public_surface_registry_dirty,
+                active_version_id,
+                pending_write_txn_buffer,
+                pending_state_commit_stream_changes,
+                pending_public_commit_session,
+                observe_tick_already_emitted,
+            )
+            .await?;
         }
         let writer_key = options.writer_key.as_deref();
         let _defer_side_effects = deferred_side_effects.is_some();
@@ -70,6 +135,36 @@ impl Engine {
         };
 
         let write_txn_plan = build_write_txn_plan(&prepared, writer_key);
+        let write_is_bufferable = write_txn_plan.is_some()
+            && !matches!(prepared.plan.result_contract, ResultContract::DmlReturning)
+            && !matches!(
+                parsed_statements[0],
+                Statement::Query(_) | Statement::Explain { .. }
+            );
+        let append_safe =
+            write_is_bufferable && statement_is_append_safe_write(&parsed_statements[0], &prepared);
+        if write_is_bufferable {
+            append_pending_write_txn_buffer(
+                pending_write_txn_buffer,
+                write_txn_plan.expect("bufferable write must have a transaction plan"),
+                append_safe,
+            );
+            if append_safe {
+                apply_buffered_write_planning_effects(
+                    &prepared,
+                    public_surface_registry,
+                    public_surface_registry_dirty,
+                    active_version_id,
+                )?;
+            } else if prepared_execution_mutates_public_surface_registry(&prepared)? {
+                *public_surface_registry_dirty = true;
+            }
+            return Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            });
+        }
+
         let execution = if let Some(plan) = write_txn_plan.as_ref() {
             run_write_txn_plan_with_transaction(
                 self,
@@ -257,4 +352,93 @@ impl Engine {
         };
         Ok(public_result)
     }
+}
+
+pub(crate) fn append_pending_write_txn_buffer(
+    pending_write_txn_buffer: &mut Option<PendingWriteTxnBuffer>,
+    plan: crate::sql::execution::write_txn_plan::WriteTxnPlan,
+    append_safe: bool,
+) {
+    match pending_write_txn_buffer {
+        Some(pending) => {
+            pending.plan.extend(plan);
+            pending.append_safe &= append_safe;
+        }
+        None => {
+            *pending_write_txn_buffer = Some(PendingWriteTxnBuffer { plan, append_safe });
+        }
+    }
+}
+
+fn pending_buffer_can_continue_with_statement(
+    statement: &Statement,
+    pending_write_txn_buffer: &Option<PendingWriteTxnBuffer>,
+) -> bool {
+    pending_write_txn_buffer
+        .as_ref()
+        .is_some_and(|pending| pending.append_safe && statement_is_append_safe_candidate(statement))
+}
+
+fn statement_is_append_safe_candidate(statement: &Statement) -> bool {
+    matches!(statement, Statement::Insert(insert) if insert.returning.is_none())
+}
+
+pub(crate) fn statement_is_append_safe_write(
+    statement: &Statement,
+    prepared: &shared_path::PreparedExecutionContext,
+) -> bool {
+    statement_is_append_safe_candidate(statement)
+        && prepared.public_write.as_ref().is_some_and(|public_write| {
+            matches!(
+                public_write
+                    .planned_write
+                    .command
+                    .target
+                    .descriptor
+                    .public_name
+                    .as_str(),
+                "lix_file" | "lix_file_by_version"
+            )
+        })
+}
+
+fn apply_buffered_write_planning_effects(
+    prepared: &shared_path::PreparedExecutionContext,
+    public_surface_registry: &mut SurfaceRegistry,
+    public_surface_registry_dirty: &mut bool,
+    active_version_id: &mut String,
+) -> Result<(), LixError> {
+    if let Some(public_write) = prepared.public_write.as_ref() {
+        let mutations = public_surface_registry_mutations(public_write)?;
+        if apply_public_surface_registry_mutations(public_surface_registry, &mutations)? {
+            *public_surface_registry_dirty = true;
+        }
+        if let Some(next_active_version_id) =
+            public_write_execution_next_active_version_id(public_write)
+        {
+            *active_version_id = next_active_version_id;
+        }
+    } else if let Some(version_id) = &prepared.plan.effects.next_active_version_id {
+        *active_version_id = version_id.clone();
+    }
+    Ok(())
+}
+
+pub(crate) fn public_write_execution_next_active_version_id(
+    public_write: &crate::sql::public::runtime::PreparedPublicWrite,
+) -> Option<String> {
+    public_write.execution.as_ref().and_then(|execution| {
+        execution
+            .partitions
+            .iter()
+            .rev()
+            .find_map(|partition| match partition {
+                PublicWriteExecutionPartition::Tracked(tracked) => {
+                    tracked.semantic_effects.next_active_version_id.clone()
+                }
+                PublicWriteExecutionPartition::Untracked(untracked) => {
+                    untracked.semantic_effects.next_active_version_id.clone()
+                }
+            })
+    })
 }

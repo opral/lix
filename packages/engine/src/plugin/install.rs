@@ -5,6 +5,7 @@ use std::path::{Component, Path};
 use serde_json::Value as JsonValue;
 use zip::read::ZipArchive;
 
+use crate::engine::PendingWriteTxnBuffer;
 use crate::engine::{Engine, ExecuteOptions};
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
@@ -82,8 +83,10 @@ async fn install_plugin_in_transaction(
     pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
 ) -> Result<(), LixError> {
     let mut pending_public_commit_session = None;
+    let mut pending_write_txn_buffer: Option<PendingWriteTxnBuffer> = None;
     let mut public_surface_registry = engine.public_surface_registry();
     let mut public_surface_registry_dirty = false;
+    let mut observe_tick_already_emitted = false;
     for schema in &parsed.schemas {
         engine
             .execute_with_options_in_transaction(
@@ -95,10 +98,12 @@ async fn install_plugin_in_transaction(
                 &mut public_surface_registry,
                 &mut public_surface_registry_dirty,
                 active_version_id,
+                &mut pending_write_txn_buffer,
                 None,
                 false,
                 pending_state_commit_stream_changes,
                 &mut pending_public_commit_session,
+                &mut observe_tick_already_emitted,
             )
             .await?;
     }
@@ -119,10 +124,12 @@ async fn install_plugin_in_transaction(
             &mut public_surface_registry,
             &mut public_surface_registry_dirty,
             active_version_id,
+            &mut pending_write_txn_buffer,
             None,
             false,
             pending_state_commit_stream_changes,
             &mut pending_public_commit_session,
+            &mut observe_tick_already_emitted,
         )
         .await?;
 
@@ -142,10 +149,25 @@ async fn install_plugin_in_transaction(
             &mut public_surface_registry,
             &mut public_surface_registry_dirty,
             active_version_id,
+            &mut pending_write_txn_buffer,
             None,
             false,
             pending_state_commit_stream_changes,
             &mut pending_public_commit_session,
+            &mut observe_tick_already_emitted,
+        )
+        .await?;
+
+    engine
+        .flush_pending_write_txn_buffer_in_transaction(
+            transaction,
+            &mut public_surface_registry,
+            &mut public_surface_registry_dirty,
+            active_version_id,
+            &mut pending_write_txn_buffer,
+            pending_state_commit_stream_changes,
+            &mut pending_public_commit_session,
+            &mut observe_tick_already_emitted,
         )
         .await?;
 
