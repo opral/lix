@@ -87,6 +87,50 @@ pub fn init_lix_at(path: &Path) -> Result<bool, CliError> {
     Ok(result.initialized)
 }
 
+pub fn destroy_lix_at(path: &Path) -> Result<(), CliError> {
+    SqliteBackend::destroy_path(path).map_err(|err| {
+        CliError::msg(format!(
+            "failed to destroy sqlite backend at {}: {}",
+            path.display(),
+            err
+        ))
+    })
+}
+
+/// Prepares a `.lix` output target for initialization.
+///
+/// The CLI delegates storage-backed cleanup to the backend boundary so command
+/// code does not need to know how a backend represents its physical artifacts.
+pub fn prepare_lix_output_path(path: &Path, force: bool) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|source| CliError::io("failed to create output directory", source))?;
+        }
+    }
+
+    if path.exists() && path.is_dir() {
+        return Err(CliError::msg(format!(
+            "output path points to a directory, expected a file: {}",
+            path.display()
+        )));
+    }
+
+    if force {
+        destroy_lix_at(path)?;
+        return Ok(());
+    }
+
+    if path.exists() {
+        return Err(CliError::msg(format!(
+            "output path already exists: {}",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
 fn find_lix_files(cwd: &Path) -> Result<Vec<PathBuf>, CliError> {
     let mut files = Vec::new();
     let entries =

@@ -372,10 +372,7 @@ fn reopen_after_bare_multi_statement_write_succeeds_sqlite() {
                 runtime.block_on(async move {
                     // --- First session: init + bare multi-statement write ---
                     let engine_a = boot_sqlite_engine_at_path(&path_for_thread);
-                    engine_a
-                        .initialize()
-                        .await
-                        .expect("init should succeed");
+                    engine_a.initialize().await.expect("init should succeed");
 
                     // Two INSERT statements separated by ; WITHOUT BEGIN/COMMIT.
                     // This is exactly what the CLI does when a user runs:
@@ -393,13 +390,10 @@ fn reopen_after_bare_multi_statement_write_succeeds_sqlite() {
 
                     // --- Second session: reopen must not fail ---
                     let engine_b = boot_sqlite_engine_at_path(&path_for_thread);
-                    engine_b
-                        .open_existing()
-                        .await
-                        .expect(
-                            "reopen after bare multi-statement write must not fail \
+                    engine_b.open_existing().await.expect(
+                        "reopen after bare multi-statement write must not fail \
                              with LIX_ERROR_LIVE_STATE_NOT_READY",
-                        );
+                    );
 
                     // Verify both rows are actually readable.
                     let result = engine_b

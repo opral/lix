@@ -48,6 +48,30 @@ pub trait LixBackend: Send + Sync {
             description: "restore_from_image is not supported by this backend".to_string(),
         })
     }
+
+    /// Destroys the physical storage target represented by this backend.
+    ///
+    /// This is a persistence lifecycle operation, not a logical SQL operation.
+    ///
+    /// Callers should treat the backend as the authority for what constitutes
+    /// the full storage target. For example:
+    ///
+    /// - native SQLite may delete the main database file plus WAL/SHM sidecars
+    /// - wasm/opfs SQLite may clear the persisted OPFS target
+    /// - Postgres may drop or clear the configured schema/database target
+    ///
+    /// Callers must not attempt to infer or delete backend-owned physical
+    /// artifacts themselves.
+    ///
+    /// Implementations may choose not to support destroy if the backend
+    /// instance does not have enough information or authority to remove its
+    /// target.
+    async fn destroy(&self) -> Result<(), LixError> {
+        Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "destroy is not supported by this backend".to_string(),
+        })
+    }
 }
 
 /// Utility: execute a single statement wrapped in a transaction.

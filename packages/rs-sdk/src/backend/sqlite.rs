@@ -7,18 +7,26 @@ use rusqlite::{
     backup::{Backup, StepResult},
     params_from_iter, Connection, Row,
 };
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct SqliteBackend {
-    conn: Mutex<Connection>,
+    conn: Mutex<Option<Connection>>,
+    target: SqliteStorageTarget,
 }
 
 struct SqliteTransaction<'a> {
-    conn: MutexGuard<'a, Connection>,
+    conn: MutexGuard<'a, Option<Connection>>,
     finalized: bool,
     savepoint_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum SqliteStorageTarget {
+    InMemory,
+    Path(PathBuf),
 }
 
 impl SqliteBackend {
@@ -27,32 +35,32 @@ impl SqliteBackend {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: err.to_string(),
         })?;
-        conn.busy_timeout(Duration::from_secs(30))
-            .map_err(|err| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: err.to_string(),
-            })?;
+        configure_connection(&conn, &SqliteStorageTarget::InMemory)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(Some(conn)),
+            target: SqliteStorageTarget::InMemory,
         })
     }
 
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, LixError> {
-        let conn = Connection::open(path).map_err(|err| LixError {
+        let path = path.as_ref().to_path_buf();
+        let conn = Connection::open(&path).map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: err.to_string(),
         })?;
-        conn.busy_timeout(Duration::from_secs(30))
-            .map_err(|err| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: err.to_string(),
-            })?;
+        let target = SqliteStorageTarget::Path(path);
+        configure_connection(&conn, &target)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(Some(conn)),
+            target,
         })
     }
 
-    fn lock_conn(&self) -> Result<MutexGuard<'_, Connection>, LixError> {
+    pub fn destroy_path(path: impl AsRef<Path>) -> Result<(), LixError> {
+        destroy_sqlite_artifacts(path.as_ref())
+    }
+
+    fn lock_conn(&self) -> Result<MutexGuard<'_, Option<Connection>>, LixError> {
         self.conn.lock().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "sqlite mutex poisoned".to_string(),
@@ -68,13 +76,16 @@ impl LixBackend for SqliteBackend {
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let conn = self.lock_conn()?;
-        execute_sql(&conn, sql, params)
+        let conn = conn.as_ref().ok_or_else(sqlite_backend_destroyed_error)?;
+        execute_sql(conn, sql, params)
     }
 
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
-        let conn = self.lock_conn()?;
-        if conn.is_autocommit() {
-            conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")
+        let mut conn = self.lock_conn()?;
+        let inner = conn.as_mut().ok_or_else(sqlite_backend_destroyed_error)?;
+        if inner.is_autocommit() {
+            inner
+                .execute_batch("BEGIN IMMEDIATE TRANSACTION")
                 .map_err(|err| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: err.to_string(),
@@ -91,7 +102,8 @@ impl LixBackend for SqliteBackend {
             static FALLBACK_SP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let id = FALLBACK_SP.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let name = format!("sp_auto_{id}");
-            conn.execute_batch(&format!("SAVEPOINT {name}"))
+            inner
+                .execute_batch(&format!("SAVEPOINT {name}"))
                 .map_err(|err| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: err.to_string(),
@@ -105,8 +117,10 @@ impl LixBackend for SqliteBackend {
     }
 
     async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
-        let conn = self.lock_conn()?;
-        conn.execute_batch(&format!("SAVEPOINT {name}"))
+        let mut conn = self.lock_conn()?;
+        let inner = conn.as_mut().ok_or_else(sqlite_backend_destroyed_error)?;
+        inner
+            .execute_batch(&format!("SAVEPOINT {name}"))
             .map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
@@ -120,6 +134,7 @@ impl LixBackend for SqliteBackend {
 
     async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
         let conn = self.lock_conn()?;
+        let conn = conn.as_ref().ok_or_else(sqlite_backend_destroyed_error)?;
         let image_path = temp_image_path("export");
 
         let export_result = (|| -> Result<(), LixError> {
@@ -174,7 +189,8 @@ impl LixBackend for SqliteBackend {
                 description: err.to_string(),
             })?;
             let mut conn = self.lock_conn()?;
-            let backup = Backup::new(&source_conn, &mut conn).map_err(|err| LixError {
+            let inner = conn.as_mut().ok_or_else(sqlite_backend_destroyed_error)?;
+            let backup = Backup::new(&source_conn, inner).map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
             })?;
@@ -183,6 +199,25 @@ impl LixBackend for SqliteBackend {
         })();
         let _ = std::fs::remove_file(&image_path);
         restore_result
+    }
+
+    async fn destroy(&self) -> Result<(), LixError> {
+        let maybe_path = match &self.target {
+            SqliteStorageTarget::InMemory => None,
+            SqliteStorageTarget::Path(path) => Some(path.clone()),
+        };
+
+        let taken = {
+            let mut conn = self.lock_conn()?;
+            conn.take()
+        };
+        drop(taken);
+
+        if let Some(path) = maybe_path {
+            destroy_sqlite_artifacts(&path)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -193,11 +228,19 @@ impl LixTransaction for SqliteTransaction<'_> {
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        execute_sql(&self.conn, sql, params)
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(sqlite_backend_destroyed_error)?;
+        execute_sql(conn, sql, params)
     }
 
     async fn execute_batch(&mut self, batch: &PreparedBatch) -> Result<QueryResult, LixError> {
-        execute_prepared_batch(&self.conn, batch, self.dialect())
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(sqlite_backend_destroyed_error)?;
+        execute_prepared_batch(conn, batch, self.dialect())
     }
 
     async fn commit(mut self: Box<Self>) -> Result<(), LixError> {
@@ -205,7 +248,11 @@ impl LixTransaction for SqliteTransaction<'_> {
             Some(name) => format!("RELEASE SAVEPOINT {name}"),
             None => "COMMIT".to_string(),
         };
-        self.conn.execute_batch(&sql).map_err(|err| LixError {
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or_else(sqlite_backend_destroyed_error)?;
+        conn.execute_batch(&sql).map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: err.to_string(),
         })?;
@@ -218,7 +265,11 @@ impl LixTransaction for SqliteTransaction<'_> {
             Some(name) => format!("ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}"),
             None => "ROLLBACK".to_string(),
         };
-        self.conn.execute_batch(&sql).map_err(|err| LixError {
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or_else(sqlite_backend_destroyed_error)?;
+        conn.execute_batch(&sql).map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: err.to_string(),
         })?;
@@ -236,8 +287,82 @@ impl Drop for SqliteTransaction<'_> {
                 }
                 None => "ROLLBACK".to_string(),
             };
-            let _ = self.conn.execute_batch(&sql);
+            if let Some(conn) = self.conn.as_mut() {
+                let _ = conn.execute_batch(&sql);
+            }
         }
+    }
+}
+
+fn configure_connection(conn: &Connection, target: &SqliteStorageTarget) -> Result<(), LixError> {
+    conn.busy_timeout(Duration::from_secs(30))
+        .map_err(|err| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: err.to_string(),
+        })?;
+
+    if matches!(target, SqliteStorageTarget::Path(_)) {
+        let journal_mode = query_single_text(conn, "PRAGMA journal_mode = WAL")?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "failed to enable sqlite WAL mode: expected 'wal', got '{journal_mode}'"
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn query_single_text(conn: &Connection, sql: &str) -> Result<String, LixError> {
+    conn.query_row(sql, [], |row| row.get::<_, String>(0))
+        .map_err(|err| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: err.to_string(),
+        })
+}
+
+fn destroy_sqlite_artifacts(path: &Path) -> Result<(), LixError> {
+    let mut first_error: Option<std::io::Error> = None;
+
+    for artifact_path in sqlite_artifact_paths(path) {
+        match fs::remove_file(&artifact_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+
+    if let Some(error) = first_error {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "failed to destroy sqlite storage artifacts for {}: {error}",
+                path.display()
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn sqlite_artifact_paths(path: &Path) -> Vec<PathBuf> {
+    let display = path.display().to_string();
+    vec![
+        path.to_path_buf(),
+        PathBuf::from(format!("{display}-wal")),
+        PathBuf::from(format!("{display}-shm")),
+        PathBuf::from(format!("{display}-journal")),
+    ]
+}
+
+fn sqlite_backend_destroyed_error() -> LixError {
+    LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: "sqlite backend storage has been destroyed".to_string(),
     }
 }
 
