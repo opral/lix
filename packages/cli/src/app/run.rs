@@ -2,15 +2,26 @@ use super::context::AppContext;
 use crate::cli::root::{Cli, Command};
 use crate::commands;
 use crate::error::CliError;
+use crate::hints;
 use clap::Parser;
 
 pub fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
-    let context = AppContext { lix_path: cli.path };
+    let no_hints = cli.no_hints;
+    let context = AppContext {
+        lix_path: cli.path,
+        no_hints,
+    };
 
-    match cli.command {
+    let output = match cli.command {
         Command::Exp(exp_command) => commands::exp::run(&context, exp_command),
         Command::Init(init_command) => commands::init::run(init_command),
         Command::Sql(sql_command) => commands::sql::run(&context, sql_command),
+    }?;
+
+    if !no_hints {
+        hints::render_hints(&output.hints);
     }
+
+    Ok(())
 }

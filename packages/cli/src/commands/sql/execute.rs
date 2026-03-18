@@ -2,13 +2,14 @@ use crate::app::AppContext;
 use crate::cli::sql::{SqlExecuteArgs, SqlOutputFormat};
 use crate::db;
 use crate::error::CliError;
+use crate::hints::{self, CommandOutput};
 use crate::output;
 use base64::Engine as _;
 use lix_rs_sdk::Value;
 use serde_json::Value as JsonValue;
 use std::io::Read;
 
-pub fn run(context: &AppContext, args: SqlExecuteArgs) -> Result<(), CliError> {
+pub fn run(context: &AppContext, args: SqlExecuteArgs) -> Result<CommandOutput, CliError> {
     let (sql, params) = resolve_sql_and_params(&args)?;
     let lix_path = db::resolve_db_path(context)?;
     let lix = db::open_lix_at(&lix_path)?;
@@ -20,7 +21,15 @@ pub fn run(context: &AppContext, args: SqlExecuteArgs) -> Result<(), CliError> {
         SqlOutputFormat::Table => output::print_execute_result_table(&result),
     }
 
-    Ok(())
+    let output_hints = if context.no_hints || !hints::are_hints_enabled(&lix) {
+        Vec::new()
+    } else {
+        let mut h = hints::hint_sqlite_master_query(&sql);
+        h.extend(hints::hint_blob_in_result(&result));
+        h
+    };
+
+    Ok(CommandOutput::with_hints(output_hints))
 }
 
 fn resolve_sql_and_params(args: &SqlExecuteArgs) -> Result<(String, Vec<Value>), CliError> {
@@ -231,6 +240,7 @@ mod tests {
                 db::init_lix_at(&path).expect("init test lix file");
                 let context = AppContext {
                     lix_path: Some(path.clone()),
+                    no_hints: true,
                 };
                 let args = SqlExecuteArgs {
                     format: SqlOutputFormat::Json,
