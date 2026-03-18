@@ -1962,6 +1962,13 @@ mod tests {
         async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, crate::LixError> {
             Ok(Box::new(UnusedTransaction))
         }
+
+        async fn begin_savepoint(
+            &self,
+            _name: &str,
+        ) -> Result<Box<dyn LixTransaction + '_>, crate::LixError> {
+            self.begin_transaction().await
+        }
     }
 
     #[async_trait(?Send)]

@@ -41,7 +41,7 @@ impl Engine {
         options: &ExecuteOptions,
         allow_internal_tables: bool,
     ) -> Result<ExecuteResult, LixError> {
-        let mut transaction = self.backend.begin_transaction().await?;
+        let mut transaction = self.begin_write_unit().await?;
         let mut active_version_id = self.require_active_version_id()?;
         let mut public_surface_registry = self.public_surface_registry();
         let starting_active_version_id = active_version_id.clone();

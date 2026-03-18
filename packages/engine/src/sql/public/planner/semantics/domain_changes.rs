@@ -428,6 +428,16 @@ mod tests {
                 description: "transactions are not needed in this test backend".to_string(),
             })
         }
+
+        async fn begin_savepoint(
+            &self,
+            _name: &str,
+        ) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
+            Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "begin_savepoint not supported in test backend",
+            ))
+        }
     }
 
     async fn planned_write_with_params(

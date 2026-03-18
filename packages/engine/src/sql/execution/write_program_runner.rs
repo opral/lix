@@ -318,6 +318,13 @@ mod tests {
                 fail_sql: self.fail_sql.clone(),
             }))
         }
+
+        async fn begin_savepoint(
+            &self,
+            _name: &str,
+        ) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            self.begin_transaction().await
+        }
     }
 
     #[async_trait(?Send)]

@@ -13,6 +13,19 @@ impl Engine {
     pub async fn initialize(&self) -> Result<(), LixError> {
         self.try_mark_init_in_progress()?;
 
+        // Wrap the entire initialization in a single transaction via plain SQL.
+        // For SQLite, BEGIN IMMEDIATE acquires the write lock immediately:
+        // - Other processes block until COMMIT (serializes concurrent inits)
+        // - On failure, ROLLBACK undoes everything (no partial state)
+        //
+        // The in_init_transaction flag tells the engine to use savepoints
+        // (via begin_write_unit) for any nested transactions that the init
+        // steps may open internally.
+        let has_transaction = self.backend.execute("BEGIN IMMEDIATE", &[]).await.is_ok();
+        if has_transaction {
+            self.set_in_init_transaction(true);
+        }
+
         let mut claimed_bootstrap = false;
         let init_result = async {
             init_backend(self.backend.as_ref())
@@ -80,12 +93,22 @@ impl Engine {
             Err(error) => Err(self.normalize_init_error(error).await),
         };
 
+        if has_transaction {
+            self.set_in_init_transaction(false);
+        }
+
         if result.is_ok() {
+            if has_transaction {
+                self.backend.execute("COMMIT", &[]).await?;
+            }
             if self.deterministic_boot_pending() {
                 self.clear_deterministic_boot_pending();
             }
             self.mark_init_completed();
         } else {
+            if has_transaction {
+                let _ = self.backend.execute("ROLLBACK", &[]).await;
+            }
             if claimed_bootstrap {
                 let _ = self.reset_failed_live_state_bootstrap().await;
             }

@@ -443,6 +443,16 @@ mod tests {
                 description: "FakeBackend does not support transactions".to_string(),
             })
         }
+
+        async fn begin_savepoint(
+            &self,
+            _name: &str,
+        ) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
+            Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "begin_savepoint not supported in test backend",
+            ))
+        }
     }
 
     fn extract_single_quoted(sql: &str, prefix: &str) -> Option<String> {
