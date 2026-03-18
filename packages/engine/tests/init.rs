@@ -194,7 +194,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let thread = std::thread::Builder::new()
         .name("init_reopen_preserves_working_changes_sqlite".to_string())
-        .stack_size(8 * 1024 * 1024)
+        .stack_size(32 * 1024 * 1024)
         .spawn(move || {
             let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let runtime = tokio::runtime::Builder::new_current_thread()
