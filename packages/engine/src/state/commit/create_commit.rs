@@ -20,7 +20,7 @@ use crate::sql::execution::write_program_runner::execute_write_program_with_tran
 use crate::sql::live_snapshot::live_snapshot_select_expr_for_schema;
 use crate::sql::public::planner::ir::LazyExactFileUpdate;
 use crate::state::live_state::{
-    build_mark_live_state_ready_sql, ensure_live_state_ready_in_transaction, CanonicalWatermark,
+    ensure_live_state_ready_in_transaction,
 };
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
@@ -372,12 +372,6 @@ pub(crate) async fn create_commit(
         derived_apply_input: generated_commit.derived_apply_input.clone(),
         operational_apply_input,
     };
-    let live_state_watermark =
-        canonical_watermark(&applied_output.canonical_output).ok_or_else(|| CreateCommitError {
-            kind: CreateCommitErrorKind::Internal,
-            message: "generated commit did not produce a canonical watermark".to_string(),
-        })?;
-
     let mut prepared_batch = bind_statement_batch_for_dialect(
         build_statement_batch_from_generate_commit_result(
             GenerateCommitResult {
@@ -406,7 +400,10 @@ pub(crate) async fn create_commit(
             observe_tick.writer_key.as_deref(),
         ));
     }
-    prepared_batch.append_sql(build_mark_live_state_ready_sql(&live_state_watermark));
+    // NOTE: watermark is intentionally NOT written here. It is written once
+    // at transaction-commit time by the caller, so that multi-statement
+    // transactions (including merged commits) always end with a consistent
+    // watermark pointing to the latest canonical change.
 
     let payloads = args
         .lazy_exact_file_updates
@@ -1295,21 +1292,6 @@ fn insert_idempotency_row_sql(idempotency: &CommitIdempotencyWrite) -> String {
     )
 }
 
-fn canonical_watermark(canonical_output: &CanonicalCommitOutput) -> Option<CanonicalWatermark> {
-    canonical_output
-        .changes
-        .iter()
-        .max_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.id.cmp(&right.id))
-        })
-        .map(|change| CanonicalWatermark {
-            change_id: change.id.clone(),
-            created_at: change.created_at.clone(),
-        })
-}
-
 fn lane_storage_key(concrete_lane: &ConcreteWriteLane) -> String {
     match concrete_lane {
         ConcreteWriteLane::Version { version_id } => format!("version:{version_id}"),
@@ -1728,11 +1710,11 @@ mod tests {
             "create_commit should persist idempotency state in the executed batch"
         );
         assert!(
-            transaction
+            !transaction
                 .executed_sql
                 .iter()
                 .any(|sql| sql.contains("INSERT INTO lix_internal_live_state_status ")),
-            "create_commit should update live-state readiness in the executed batch"
+            "create_commit must NOT write the watermark — the caller stamps it at commit time"
         );
     }
 

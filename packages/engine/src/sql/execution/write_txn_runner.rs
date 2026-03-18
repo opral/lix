@@ -17,6 +17,9 @@ use crate::sql::execution::write_txn_plan::{
     InternalWriteTxnPlan, PublicUntrackedWriteTxnPlan, WriteTxnPlan, WriteTxnRunMode, WriteTxnUnit,
 };
 use crate::sql::storage::sql_text::escape_sql_string;
+use crate::state::live_state::{
+    build_mark_live_state_ready_sql, load_latest_canonical_watermark_in_transaction,
+};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, LixTransaction, QueryResult, Value};
 
@@ -36,6 +39,7 @@ pub(crate) async fn run_write_txn_plan_with_backend(
     .await;
     match result {
         Ok(result) => {
+            stamp_watermark_before_commit(transaction.as_mut()).await?;
             transaction.commit().await?;
             Ok(result)
         }
@@ -525,6 +529,21 @@ fn sql_literal(value: &Value) -> String {
 
 fn quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// Writes the live-state watermark to match the latest canonical change,
+/// called once just before a write transaction commits. This ensures the
+/// watermark is always consistent regardless of how many statements or
+/// merged commits ran inside the transaction.
+pub(crate) async fn stamp_watermark_before_commit(
+    transaction: &mut dyn LixTransaction,
+) -> Result<(), LixError> {
+    if let Some(watermark) = load_latest_canonical_watermark_in_transaction(transaction).await? {
+        transaction
+            .execute(&build_mark_live_state_ready_sql(&watermark), &[])
+            .await?;
+    }
+    Ok(())
 }
 
 async fn persist_filesystem_payload_domain_changes_direct(

@@ -355,6 +355,96 @@ fn init_reopen_preserves_working_changes_sqlite() {
     }
 }
 
+#[test]
+fn reopen_after_bare_multi_statement_write_succeeds_sqlite() {
+    let path = temp_sqlite_init_path("multi-stmt-reopen");
+    let path_for_thread = path.clone();
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::Builder::new()
+        .name("reopen_after_bare_multi_statement_write_succeeds_sqlite".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build tokio runtime");
+                runtime.block_on(async move {
+                    // --- First session: init + bare multi-statement write ---
+                    let engine_a = boot_sqlite_engine_at_path(&path_for_thread);
+                    engine_a
+                        .initialize()
+                        .await
+                        .expect("init should succeed");
+
+                    // Two INSERT statements separated by ; WITHOUT BEGIN/COMMIT.
+                    // This is exactly what the CLI does when a user runs:
+                    //   lix sql execute "INSERT ...; INSERT ...;"
+                    engine_a
+                        .execute(
+                            "INSERT INTO lix_key_value (key, value) VALUES ('a', '\"1\"'); \
+                             INSERT INTO lix_key_value (key, value) VALUES ('b', '\"2\"');",
+                            &[],
+                        )
+                        .await
+                        .expect("bare multi-statement write should succeed");
+
+                    drop(engine_a);
+
+                    // --- Second session: reopen must not fail ---
+                    let engine_b = boot_sqlite_engine_at_path(&path_for_thread);
+                    engine_b
+                        .open_existing()
+                        .await
+                        .expect(
+                            "reopen after bare multi-statement write must not fail \
+                             with LIX_ERROR_LIVE_STATE_NOT_READY",
+                        );
+
+                    // Verify both rows are actually readable.
+                    let result = engine_b
+                        .execute(
+                            "SELECT key, value FROM lix_key_value \
+                             WHERE key IN ('a', 'b') ORDER BY key",
+                            &[],
+                        )
+                        .await
+                        .expect("select after reopen should succeed");
+                    assert_eq!(
+                        result.statements[0].rows.len(),
+                        2,
+                        "expected both inserted rows to be readable after reopen"
+                    );
+                });
+            }));
+            let _ = result_tx.send(run_result);
+        })
+        .expect("failed to spawn multi-statement reopen test thread");
+
+    let recv_result = result_rx.recv_timeout(Duration::from_secs(120));
+    cleanup_sqlite_path(&path);
+    match recv_result {
+        Ok(Ok(())) => {
+            thread
+                .join()
+                .expect("multi-statement reopen test thread panicked");
+        }
+        Ok(Err(payload)) => {
+            let _ = thread.join();
+            std::panic::resume_unwind(payload);
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("multi-statement reopen test timed out after 120s");
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(payload) = thread.join() {
+                std::panic::resume_unwind(payload);
+            }
+            panic!("multi-statement reopen test disconnected without result");
+        }
+    }
+}
+
 simulation_test!(init_creates_untracked_table, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)

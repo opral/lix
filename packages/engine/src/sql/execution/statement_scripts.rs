@@ -8,6 +8,9 @@ use crate::sql::execution::transaction_exec::public_write_execution_next_active_
 use crate::sql::execution::write_txn_plan::{
     build_write_txn_plan, write_txn_plan_is_independent_filesystem,
 };
+use crate::sql::execution::write_txn_runner::{
+    run_write_txn_plan_with_transaction, stamp_watermark_before_commit,
+};
 use crate::sql::public::runtime::{
     apply_public_surface_registry_mutations, classify_public_execution_route_with_registry,
     public_surface_registry_mutations, PublicExecutionRoute,
@@ -74,6 +77,7 @@ impl Engine {
         };
         self.prepare_transaction_core_for_commit(transaction.as_mut(), &mut core)
             .await?;
+        stamp_watermark_before_commit(transaction.as_mut()).await?;
         transaction.commit().await?;
         self.finalize_committed_transaction_core(core).await?;
         Ok(result)
