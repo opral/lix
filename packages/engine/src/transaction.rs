@@ -1,5 +1,6 @@
 use crate::engine::{reject_internal_table_writes, Engine, EngineTransaction, ExecuteOptions};
 use crate::sql::execution::parse::parse_sql;
+use crate::sql::execution::write_txn_runner::stamp_watermark_before_commit;
 use crate::{ExecuteResult, LixError, Value};
 use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
@@ -121,6 +122,7 @@ impl EngineTransaction<'_> {
         self.engine
             .prepare_transaction_core_for_commit(transaction.as_mut(), &mut self.core)
             .await?;
+        stamp_watermark_before_commit(transaction.as_mut()).await?;
         transaction.commit().await?;
         let core = std::mem::replace(
             &mut self.core,
