@@ -10,8 +10,7 @@ pub(crate) fn build_filesystem_history_source_sql(
     let requested_root_predicates = history_requested_root_predicates(pushdown_predicates);
     let requested_version_predicates = history_requested_version_predicates(pushdown_predicates);
     let requested_roots_where = render_where_clause_sql(&requested_root_predicates, " AND ");
-    let requested_versions_where =
-        render_where_clause_sql(&requested_version_predicates, " AND ");
+    let requested_versions_where = render_where_clause_sql(&requested_version_predicates, " AND ");
     let default_root_scope = if force_active_scope && requested_root_predicates.is_empty() {
         "AND ( \
            d.root_commit_id IS NOT NULL \

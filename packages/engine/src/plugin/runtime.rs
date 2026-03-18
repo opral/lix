@@ -10,8 +10,7 @@ use crate::plugin::types::{InstalledPlugin, PluginContentType};
 use crate::schema::live_layout::tracked_live_table_name;
 use crate::sql::execution::preprocess::preprocess_sql_to_plan as preprocess_sql;
 use crate::state::history::{
-    load_state_history_rows, StateHistoryContentMode, StateHistoryRequest,
-    StateHistoryRootScope,
+    load_state_history_rows, StateHistoryContentMode, StateHistoryRequest, StateHistoryRootScope,
 };
 use crate::state::materialization::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};

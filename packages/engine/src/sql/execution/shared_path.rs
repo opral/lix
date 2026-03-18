@@ -7,7 +7,8 @@ use crate::sql::public::runtime::{
     finalize_public_write_execution, prepare_public_execution_with_internal_access,
     prepare_public_execution_with_registry_and_internal_access,
     prepared_public_write_mutates_public_surface_registry, PreparedPublicExecution,
-    PreparedPublicRead, PreparedPublicWrite, PublicWriteExecutionPartition,
+    PreparedPublicRead, PreparedPublicReadExecution, PreparedPublicWrite,
+    PublicWriteExecutionPartition,
 };
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{
@@ -238,7 +239,11 @@ pub(crate) async fn prepare_execution_with_backend(
     };
     let plan_statements = public_read
         .as_ref()
-        .map(|prepared| prepared.lowered_read.statements.clone())
+        .and_then(|prepared| {
+            prepared
+                .lowered_read()
+                .map(|lowered| lowered.statements.clone())
+        })
         .unwrap_or_else(|| statements.clone());
 
     let skip_side_effect_collection = policy.skip_side_effect_collection
@@ -259,8 +264,17 @@ pub(crate) async fn prepare_execution_with_backend(
             })
         });
 
+    let public_read_owns_execution = public_read.as_ref().is_some_and(|prepared| {
+        matches!(prepared.execution, PreparedPublicReadExecution::Direct(_))
+    });
+
     let intent = if let Some(public_write) = public_write.as_ref() {
         derived_public_execution_intent(public_write)
+    } else if public_read_owns_execution {
+        ExecutionIntent {
+            pending_file_writes: Vec::new(),
+            pending_file_delete_targets: BTreeSet::new(),
+        }
     } else {
         collect_execution_intent_with_backend(
             engine,
@@ -330,6 +344,8 @@ pub(crate) async fn prepare_execution_with_backend(
                 })
                 .unwrap_or_default(),
         )
+    } else if public_read_owns_execution {
+        passthrough_execution_plan_for_public_read(&statements)
     } else {
         build_execution_plan(
             backend,
@@ -355,7 +371,10 @@ pub(crate) async fn prepare_execution_with_backend(
         })?
     };
 
-    if !public_write_owns_execution && !plan.preprocess.mutations.is_empty() {
+    if !public_write_owns_execution
+        && !public_read_owns_execution
+        && !plan.preprocess.mutations.is_empty()
+    {
         validate_inserts(backend, &engine.schema_cache, &plan.preprocess.mutations)
             .await
             .map_err(|error| LixError {
@@ -366,7 +385,10 @@ pub(crate) async fn prepare_execution_with_backend(
                 ),
             })?;
     }
-    if !public_write_owns_execution && !plan.preprocess.update_validations.is_empty() {
+    if !public_write_owns_execution
+        && !public_read_owns_execution
+        && !plan.preprocess.update_validations.is_empty()
+    {
         validate_updates(
             backend,
             &engine.schema_cache,
@@ -456,6 +478,26 @@ fn passthrough_execution_plan_for_public_write(
         },
         result_contract: derive_result_contract_for_statements(statements),
         requirements: PlanRequirements::default(),
+        dependency_spec: crate::sql::common::dependency_spec::DependencySpec::default(),
+        effects: PlanEffects::default(),
+    }
+}
+
+fn passthrough_execution_plan_for_public_read(statements: &[Statement]) -> ExecutionPlan {
+    let mut requirements = PlanRequirements::default();
+    requirements.read_only_query = true;
+
+    ExecutionPlan {
+        preprocess: PlannedStatementSet {
+            sql: String::new(),
+            prepared_statements: Vec::new(),
+            live_table_requirements: Vec::new(),
+            internal_state: None,
+            mutations: Vec::new(),
+            update_validations: Vec::new(),
+        },
+        result_contract: derive_result_contract_for_statements(statements),
+        requirements,
         dependency_spec: crate::sql::common::dependency_spec::DependencySpec::default(),
         effects: PlanEffects::default(),
     }

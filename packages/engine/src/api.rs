@@ -18,6 +18,7 @@ use crate::sql::execution::write_txn_plan::build_write_txn_plan;
 use crate::sql::execution::write_txn_runner::run_write_txn_plan_with_backend;
 use crate::sql::public::runtime::{
     classify_public_execution_route_with_registry, decode_public_read_result,
+    execute_prepared_public_read,
 };
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::internal::inline_functions::inline_lix_functions_with_provider;
@@ -178,8 +179,19 @@ impl Engine {
         .await?;
         let public_surface_registry_dirty =
             prepared_execution_mutates_public_surface_registry(&prepared)?;
+        let direct_public_read = prepared
+            .public_read
+            .as_ref()
+            .and_then(|prepared| prepared.direct_plan().map(|_| prepared));
 
         let write_txn_plan = build_write_txn_plan(&prepared, writer_key);
+        if let Some(public_read) = direct_public_read {
+            let result = execute_prepared_public_read(self.backend.as_ref(), public_read).await?;
+            return Ok(ExecuteResult {
+                statements: vec![result],
+            });
+        }
+
         let (execution, write_owned_transaction_committed) = if let Some(plan) = write_txn_plan {
             match run_write_txn_plan_with_backend(self, &plan, None).await {
                 Ok(execution) => (execution, true),
@@ -218,8 +230,12 @@ impl Engine {
         )
         .await?;
 
-        let public_result = if let Some(public_read) = prepared.public_read.as_ref() {
-            decode_public_read_result(execution.public_result, &public_read.lowered_read)
+        let public_result = if let Some(lowered) = prepared
+            .public_read
+            .as_ref()
+            .and_then(|prepared| prepared.lowered_read())
+        {
+            decode_public_read_result(execution.public_result, lowered)
         } else {
             execution.public_result
         };

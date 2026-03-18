@@ -17,6 +17,7 @@ use crate::sql::execution::write_txn_runner::run_write_txn_plan_with_transaction
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::sql::public::runtime::{
     apply_public_surface_registry_mutations, decode_public_read_result,
+    execute_prepared_public_read,
     public_surface_registry_mutations, PublicWriteExecutionPartition,
 };
 use crate::{
@@ -271,6 +272,14 @@ impl Engine {
                     Some(pending_public_commit_session),
                 )
                 .await?
+            } else if let Some(public_read) = prepared
+                .public_read
+                .as_ref()
+                .and_then(|prepared| prepared.direct_plan().map(|_| prepared))
+            {
+                let backend = TransactionBackendAdapter::new(transaction);
+                let public_result = execute_prepared_public_read(&backend, public_read).await?;
+                return Ok(public_result);
             } else {
                 match execute::execute_plan_sql_with_transaction(
                     transaction,
@@ -446,8 +455,12 @@ impl Engine {
             }
 
             pending_state_commit_stream_changes.extend(state_commit_stream_changes);
-            let public_result = if let Some(public_read) = prepared.public_read.as_ref() {
-                decode_public_read_result(execution.public_result, &public_read.lowered_read)
+            let public_result = if let Some(lowered) = prepared
+                .public_read
+                .as_ref()
+                .and_then(|prepared| prepared.lowered_read())
+            {
+                decode_public_read_result(execution.public_result, lowered)
             } else {
                 execution.public_result
             };
