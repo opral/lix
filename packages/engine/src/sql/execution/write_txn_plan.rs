@@ -105,6 +105,37 @@ impl WriteTxnPlan {
     }
 }
 
+pub(crate) fn write_txn_plan_is_independent_filesystem(plan: &WriteTxnPlan) -> bool {
+    !plan.units.is_empty()
+        && plan.units.iter().all(|unit| match unit {
+            WriteTxnUnit::PublicTracked(tracked) => tracked_plan_is_coalescible_filesystem(tracked),
+            WriteTxnUnit::PublicUntracked(_) | WriteTxnUnit::Internal(_) => false,
+        })
+}
+
+pub(crate) fn write_txn_plans_can_continue_together(
+    left: &WriteTxnPlan,
+    right: &WriteTxnPlan,
+) -> bool {
+    if !write_txn_plan_is_independent_filesystem(left)
+        || !write_txn_plan_is_independent_filesystem(right)
+    {
+        return false;
+    }
+
+    left.units.iter().all(|left_unit| {
+        let WriteTxnUnit::PublicTracked(left_tracked) = left_unit else {
+            return false;
+        };
+        right.units.iter().all(|right_unit| {
+            let WriteTxnUnit::PublicTracked(right_tracked) = right_unit else {
+                return false;
+            };
+            filesystem_tracked_plans_are_buffer_compatible(left_tracked, right_tracked)
+        })
+    })
+}
+
 pub(crate) fn build_write_txn_plan(
     prepared: &PreparedExecutionContext,
     writer_key: Option<&str>,
@@ -165,34 +196,7 @@ fn try_merge_filesystem_tracked_plans(
     current: &mut TrackedWriteTxnPlan,
     next: &TrackedWriteTxnPlan,
 ) -> bool {
-    if !tracked_plan_is_coalescible_filesystem(current)
-        || !tracked_plan_is_coalescible_filesystem(next)
-    {
-        return false;
-    }
-    if current
-        .public_write
-        .planned_write
-        .command
-        .target
-        .descriptor
-        .public_name
-        != next
-            .public_write
-            .planned_write
-            .command
-            .target
-            .descriptor
-            .public_name
-        || current.execution.create_preconditions.write_lane
-            != next.execution.create_preconditions.write_lane
-        || !create_commit_expected_head_compatible(
-            &current.execution.create_preconditions.expected_head,
-            &next.execution.create_preconditions.expected_head,
-        )
-        || current.writer_key != next.writer_key
-        || !tracked_plan_entity_targets_disjoint(current, next)
-    {
+    if !filesystem_tracked_plans_are_buffer_compatible(current, next) {
         return false;
     }
 
@@ -231,6 +235,39 @@ fn try_merge_filesystem_tracked_plans(
         .pending_file_writes
         .extend(next.pending_file_writes.clone());
     true
+}
+
+fn filesystem_tracked_plans_are_buffer_compatible(
+    current: &TrackedWriteTxnPlan,
+    next: &TrackedWriteTxnPlan,
+) -> bool {
+    if !tracked_plan_is_coalescible_filesystem(current)
+        || !tracked_plan_is_coalescible_filesystem(next)
+    {
+        return false;
+    }
+    current
+        .public_write
+        .planned_write
+        .command
+        .target
+        .descriptor
+        .public_name
+        == next
+            .public_write
+            .planned_write
+            .command
+            .target
+            .descriptor
+            .public_name
+        && current.execution.create_preconditions.write_lane
+            == next.execution.create_preconditions.write_lane
+        && create_commit_expected_head_compatible(
+            &current.execution.create_preconditions.expected_head,
+            &next.execution.create_preconditions.expected_head,
+        )
+        && current.writer_key == next.writer_key
+        && tracked_plan_entity_targets_disjoint(current, next)
 }
 
 fn tracked_plan_is_coalescible_filesystem(plan: &TrackedWriteTxnPlan) -> bool {
