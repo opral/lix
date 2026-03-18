@@ -442,10 +442,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn add_change_id_to_bootstrap_commit(
-        &self,
-        change_id: &str,
-    ) -> Result<(), LixError> {
+    async fn add_change_id_to_bootstrap_commit(&self, change_id: &str) -> Result<(), LixError> {
         let snapshot_row = self
             .backend
             .execute(
@@ -674,24 +671,10 @@ impl Engine {
             &global_desc_change_id,
         )
         .await?;
-        let global_ref_change_id = self
-            .seed_canonical_version_ref(GLOBAL_VERSION_ID, &bootstrap_commit_id)
+        self.seed_materialized_version_ref(GLOBAL_VERSION_ID, &bootstrap_commit_id)
             .await?;
-        self.seed_materialized_version_ref(
-            GLOBAL_VERSION_ID,
-            &bootstrap_commit_id,
-            &global_ref_change_id,
-        )
-        .await?;
-        let main_ref_change_id = self
-            .seed_canonical_version_ref(&main_version_id, &bootstrap_commit_id)
+        self.seed_materialized_version_ref(&main_version_id, &bootstrap_commit_id)
             .await?;
-        self.seed_materialized_version_ref(
-            &main_version_id,
-            &bootstrap_commit_id,
-            &main_ref_change_id,
-        )
-        .await?;
 
         Ok(main_version_id)
     }
@@ -836,7 +819,6 @@ impl Engine {
                AND entity_id = '{entity_id}' \
                AND file_id = '{file_id}' \
                AND version_id = '{version_id}' \
-               AND is_tombstone = 0 \
              LIMIT 1",
             table = table,
             schema_key = escape_sql_string(version_descriptor_schema_key()),
@@ -996,11 +978,10 @@ impl Engine {
         &self,
         entity_id: &str,
         commit_id: &str,
-        change_id: &str,
     ) -> Result<(), LixError> {
         ensure_schema_live_table(self.backend.as_ref(), version_ref_schema_key()).await?;
         let snapshot_content = version_ref_snapshot_content(entity_id, commit_id);
-        let table = tracked_live_table_name(version_ref_schema_key());
+        let table = untracked_live_table_name(version_ref_schema_key());
         builtin_live_table_layout(version_ref_schema_key())?.ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -1014,7 +995,6 @@ impl Engine {
                AND entity_id = '{entity_id}' \
                AND file_id = '{file_id}' \
                AND version_id = '{version_id}' \
-               AND is_tombstone = 0 \
              LIMIT 1",
             table = table,
             schema_key = escape_sql_string(version_ref_schema_key()),
@@ -1028,9 +1008,9 @@ impl Engine {
                 normalized_seed_values(version_ref_schema_key(), Some(&snapshot_content))?;
             let insert_sql = format!(
                 "INSERT INTO {table} (\
-                 entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, writer_key, is_tombstone, created_at, updated_at{normalized_columns}\
+                 entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, writer_key, created_at, updated_at{normalized_columns}\
                  ) VALUES (\
-                 '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'{normalized_literals}\
+                 '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', NULL, NULL, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'{normalized_literals}\
                  )",
                 table = quote_ident(&table),
                 entity_id = escape_sql_string(entity_id),
@@ -1039,87 +1019,13 @@ impl Engine {
                 file_id = escape_sql_string(version_ref_file_id()),
                 version_id = escape_sql_string(version_ref_storage_version_id()),
                 plugin_key = escape_sql_string(version_ref_plugin_key()),
-                change_id = escape_sql_string(&change_id),
                 normalized_columns = normalized_insert_columns_sql(&normalized_values),
                 normalized_literals = normalized_insert_literals_sql(&normalized_values),
             );
             self.backend.execute(&insert_sql, &[]).await?;
         }
 
-        self.seed_committed_pointer_change(
-            entity_id,
-            version_ref_schema_key(),
-            version_ref_schema_version(),
-            version_ref_file_id(),
-            version_ref_plugin_key(),
-            &snapshot_content,
-            &change_id,
-        )
-        .await
-    }
-
-    async fn seed_committed_pointer_change(
-        &self,
-        entity_id: &str,
-        schema_key: &str,
-        schema_version: &str,
-        file_id: &str,
-        plugin_key: &str,
-        snapshot_content: &str,
-        change_id: &str,
-    ) -> Result<(), LixError> {
-        let snapshot_id = format!("{change_id}~snapshot");
-        self.backend
-            .execute(
-                "INSERT INTO lix_internal_snapshot (id, content) \
-                 SELECT $1, $2 \
-                 WHERE NOT EXISTS (SELECT 1 FROM lix_internal_snapshot WHERE id = $1)",
-                &[
-                    Value::Text(snapshot_id.clone()),
-                    Value::Text(snapshot_content.to_string()),
-                ],
-            )
-            .await?;
-        self.backend
-            .execute(
-                "INSERT INTO lix_internal_change (\
-                 id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
-                 ) \
-                 SELECT $1, $2, $3, $4, $5, $6, $7, NULL, '1970-01-01T00:00:00Z' \
-                 WHERE NOT EXISTS (SELECT 1 FROM lix_internal_change WHERE id = $1)",
-                &[
-                    Value::Text(change_id.to_string()),
-                    Value::Text(entity_id.to_string()),
-                    Value::Text(schema_key.to_string()),
-                    Value::Text(schema_version.to_string()),
-                    Value::Text(file_id.to_string()),
-                    Value::Text(plugin_key.to_string()),
-                    Value::Text(snapshot_id),
-                ],
-            )
-            .await?;
         Ok(())
-    }
-
-    pub(crate) async fn seed_canonical_version_ref(
-        &self,
-        entity_id: &str,
-        commit_id: &str,
-    ) -> Result<String, LixError> {
-        let snapshot_content = version_ref_snapshot_content(entity_id, commit_id);
-        let change_id = self.generate_runtime_uuid().await?;
-        self.insert_change_row_for_snapshot(
-            entity_id,
-            version_ref_schema_key(),
-            version_ref_schema_version(),
-            version_ref_file_id(),
-            version_ref_plugin_key(),
-            &snapshot_content,
-            &change_id,
-        )
-        .await?;
-        self.add_change_id_to_bootstrap_commit(&change_id).await?;
-        Ok(change_id)
     }
 
     pub(crate) async fn insert_last_checkpoint_for_version(

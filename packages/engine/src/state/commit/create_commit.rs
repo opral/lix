@@ -1234,8 +1234,8 @@ fn extract_committed_head_id(
         ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
     };
     let pointer_change = commit_result
-        .canonical_output
-        .changes
+        .derived_apply_input
+        .live_state_rows
         .iter()
         .find(|change| {
             change.schema_key == VERSION_REF_SCHEMA_KEY && change.entity_id == version_id
@@ -1369,7 +1369,6 @@ mod tests {
             Value::Text(crate::version::version_ref_storage_version_id().to_string()),
             Value::Text(crate::version::version_ref_plugin_key().to_string()),
             Value::Null,
-            Value::Text(format!("pointer-change-{version_id}")),
             Value::Text(commit_id.to_string()),
             Value::Text(version_id.to_string()),
         ]
@@ -1471,7 +1470,7 @@ mod tests {
                 });
             }
 
-            if query_targets_table(sql, "lix_internal_live_v1_lix_version_ref") {
+            if query_targets_table(sql, "lix_internal_live_untracked_v1_lix_version_ref") {
                 let rows = self
                     .version_heads
                     .iter()
@@ -1488,7 +1487,6 @@ mod tests {
                         "version_id".to_string(),
                         "plugin_key".to_string(),
                         "metadata".to_string(),
-                        "change_id".to_string(),
                         "commit_id".to_string(),
                         "id".to_string(),
                     ],

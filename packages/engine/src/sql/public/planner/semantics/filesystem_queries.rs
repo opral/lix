@@ -918,7 +918,9 @@ where
         if version_rank > 0 {
             global_entity_ids.insert(id);
         }
-        resolved_by_key.entry(key_fn(&descriptor)).or_insert(descriptor);
+        resolved_by_key
+            .entry(key_fn(&descriptor))
+            .or_insert(descriptor);
     }
 
     // For rows that came from global, check if the local version has a tombstone

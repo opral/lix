@@ -4,6 +4,7 @@ use serde_json::json;
 
 use crate::schema::builtin::types::LixVersionRef;
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
+use crate::schema::live_store::load_untracked_live_rows_by_property_with_executor;
 use crate::state::materialization::loader::{load_data, ChangeRecord, LoadedData};
 use crate::state::materialization::types::{
     LatestVisibleWinnerDebugRow, LiveStateRebuildDebugMode, LiveStateRebuildDebugTrace,
@@ -58,6 +59,7 @@ struct BuiltinProjectionSchemaMeta {
     plugin_key: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct ResolvedVersionRef {
     change: ChangeRecord,
@@ -74,24 +76,14 @@ pub(crate) async fn live_state_rebuild_plan_internal(
     let mut warnings = Vec::new();
 
     let all_commit_edges = build_all_commit_edges(&data, &mut stats);
-    let commit_causal_rank = build_commit_causal_rank(&data, &all_commit_edges);
-    let change_commit_by_change_id = build_change_commit_index(&data);
-    let resolved_version_refs = resolve_version_ref_candidates(
-        &data,
-        &all_commit_edges,
-        &commit_causal_rank,
-        &change_commit_by_change_id,
-        &mut warnings,
-        &mut stats,
-    );
-    let version_refs = build_version_refs(&resolved_version_refs, &mut stats);
+    let version_refs =
+        load_version_heads_from_untracked(backend, &mut warnings, &mut stats).await?;
     let commit_graph = build_commit_graph(&version_refs, &all_commit_edges, &mut stats);
 
     let latest_visible_state = build_latest_visible_state(
         &data,
         &commit_graph,
         &version_refs,
-        &resolved_version_refs,
         &mut warnings,
         &mut stats,
     );
@@ -174,6 +166,7 @@ fn build_all_commit_edges(
     edges
 }
 
+#[cfg(test)]
 fn resolve_version_ref_candidates(
     data: &LoadedData,
     all_commit_edges: &BTreeSet<(String, String)>,
@@ -311,6 +304,7 @@ fn resolve_version_ref_candidates(
     resolved
 }
 
+#[cfg(test)]
 fn build_version_refs(
     resolved_version_refs: &BTreeMap<String, Vec<ResolvedVersionRef>>,
     stats: &mut Vec<StageStat>,
@@ -382,7 +376,6 @@ fn build_latest_visible_state(
     data: &LoadedData,
     commit_graph: &BTreeMap<(String, String), usize>,
     version_refs: &BTreeMap<String, Vec<String>>,
-    resolved_version_refs: &BTreeMap<String, Vec<ResolvedVersionRef>>,
     warnings: &mut Vec<LiveStateRebuildWarning>,
     stats: &mut Vec<StageStat>,
 ) -> Vec<VisibleRow> {
@@ -479,7 +472,6 @@ fn build_latest_visible_state(
         data,
         commit_graph,
         version_refs,
-        resolved_version_refs,
         warnings,
     ));
 
@@ -505,12 +497,10 @@ fn build_global_projection_rows(
     data: &LoadedData,
     commit_graph: &BTreeMap<(String, String), usize>,
     version_refs: &BTreeMap<String, Vec<String>>,
-    resolved_version_refs: &BTreeMap<String, Vec<ResolvedVersionRef>>,
     warnings: &mut Vec<LiveStateRebuildWarning>,
 ) -> Vec<VisibleRow> {
     let version_descriptor_schema = builtin_projection_schema_meta("lix_version_descriptor");
     let commit_schema = builtin_projection_schema_meta("lix_commit");
-    let version_ref_schema = builtin_projection_schema_meta("lix_version_ref");
     let change_set_element_schema = builtin_projection_schema_meta("lix_change_set_element");
     let commit_edge_schema = builtin_projection_schema_meta("lix_commit_edge");
     let change_author_schema = builtin_projection_schema_meta("lix_change_author");
@@ -587,117 +577,6 @@ fn build_global_projection_rows(
             .entry(key)
             .or_default()
             .push(ProjectionCandidate { depth, row });
-    }
-
-    for resolved_rows in resolved_version_refs.values() {
-        for resolved in resolved_rows {
-            let effective_commit_id = resolved
-                .target_commit_id
-                .clone()
-                .unwrap_or_else(|| resolved.owner_commit_id.clone());
-            let depth = commit_depths
-                .get(&effective_commit_id)
-                .copied()
-                .unwrap_or(usize::MAX / 4);
-
-            let snapshot_content =
-                resolved.change.snapshot_content.as_ref().and_then(
-                    |raw| match serde_json::from_str::<LixVersionRef>(raw) {
-                        Ok(snapshot)
-                            if !snapshot.id.is_empty() && !snapshot.commit_id.is_empty() =>
-                        {
-                            Some(canonical_json_value(json!({
-                                "id": snapshot.id,
-                                "commit_id": snapshot.commit_id,
-                            })))
-                        }
-                        Ok(_) => None,
-                        Err(error) => {
-                            warnings.push(LiveStateRebuildWarning {
-                                code: "invalid_version_ref_snapshot".to_string(),
-                                message: format!(
-                                    "lix_version_ref change '{}' has invalid snapshot JSON: {}",
-                                    resolved.change.id, error
-                                ),
-                            });
-                            None
-                        }
-                    },
-                );
-
-            let row = VisibleRow {
-                version_id: GLOBAL_VERSION_ID.to_string(),
-                commit_id: effective_commit_id,
-                change_id: resolved.change.id.clone(),
-                entity_id: resolved.change.entity_id.clone(),
-                schema_key: version_ref_schema.schema_key.clone(),
-                schema_version: resolved.change.schema_version.clone(),
-                file_id: resolved.change.file_id.clone(),
-                plugin_key: resolved.change.plugin_key.clone(),
-                snapshot_content,
-                metadata: resolved.change.metadata.clone(),
-                created_at: resolved.change.created_at.clone(),
-                updated_at: resolved.change.created_at.clone(),
-            };
-            let key = (
-                row.version_id.clone(),
-                row.entity_id.clone(),
-                row.schema_key.clone(),
-                row.file_id.clone(),
-            );
-            candidates
-                .entry(key)
-                .or_default()
-                .push(ProjectionCandidate { depth, row });
-        }
-    }
-
-    for (version_id, tip_commit_ids) in version_refs {
-        if resolved_version_refs.contains_key(version_id) {
-            continue;
-        }
-        for head_commit_id in tip_commit_ids {
-            let tip_depth = commit_depths
-                .get(head_commit_id)
-                .copied()
-                .unwrap_or(usize::MAX / 4);
-            let fallback_created_at = data
-                .commits
-                .get(head_commit_id)
-                .map(|commit| commit.created_at.clone())
-                .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-
-            let row = VisibleRow {
-                version_id: GLOBAL_VERSION_ID.to_string(),
-                commit_id: head_commit_id.clone(),
-                change_id: format!("syn~lix_version_ref~{}~{}", version_id, head_commit_id),
-                entity_id: version_id.clone(),
-                schema_key: version_ref_schema.schema_key.clone(),
-                schema_version: version_ref_schema.schema_version.clone(),
-                file_id: version_ref_schema.file_id.clone(),
-                plugin_key: version_ref_schema.plugin_key.clone(),
-                snapshot_content: Some(canonical_json_value(json!({
-                    "id": version_id,
-                    "commit_id": head_commit_id,
-                }))),
-                metadata: None,
-                created_at: fallback_created_at.clone(),
-                updated_at: fallback_created_at,
-            };
-            let key = (
-                row.version_id.clone(),
-                row.entity_id.clone(),
-                row.schema_key.clone(),
-                row.file_id.clone(),
-            );
-            candidates
-                .entry(key)
-                .or_default()
-                .push(ProjectionCandidate {
-                    depth: tip_depth,
-                    row,
-                });
-        }
     }
 
     for (commit_id, depth) in &commit_depths {
@@ -880,6 +759,67 @@ fn build_global_projection_rows(
     resolve_projection_candidates(candidates)
 }
 
+async fn load_version_heads_from_untracked(
+    backend: &dyn LixBackend,
+    warnings: &mut Vec<LiveStateRebuildWarning>,
+    stats: &mut Vec<StageStat>,
+) -> Result<BTreeMap<String, Vec<String>>, LixError> {
+    let mut executor = backend;
+    let rows = load_untracked_live_rows_by_property_with_executor(
+        &mut executor,
+        "lix_version_ref",
+        "commit_id",
+        &BTreeMap::new(),
+        true,
+        &["entity_id"],
+    )
+    .await?;
+
+    let mut heads = BTreeMap::<String, Vec<String>>::new();
+    for row in rows {
+        let Some(snapshot_raw) = crate::schema::live_store::logical_snapshot_text(
+            &crate::schema::live_layout::load_live_row_access_with_executor(
+                &mut executor,
+                "lix_version_ref",
+            )
+            .await?,
+            &row,
+        )?
+        else {
+            continue;
+        };
+        match serde_json::from_str::<LixVersionRef>(&snapshot_raw) {
+            Ok(snapshot) if !snapshot.id.is_empty() && !snapshot.commit_id.is_empty() => {
+                heads
+                    .entry(snapshot.id)
+                    .or_default()
+                    .push(snapshot.commit_id);
+            }
+            Ok(_) => {}
+            Err(error) => warnings.push(LiveStateRebuildWarning {
+                code: "invalid_version_ref_snapshot".to_string(),
+                message: format!(
+                    "untracked lix_version_ref '{}' has invalid snapshot JSON: {}",
+                    row.entity_id, error
+                ),
+            }),
+        }
+    }
+
+    for values in heads.values_mut() {
+        values.sort();
+        values.dedup();
+    }
+
+    stats.push(StageStat {
+        stage: "version_ref_heads".to_string(),
+        input_rows: heads.values().map(|rows| rows.len()).sum(),
+        output_rows: heads.values().map(|rows| rows.len()).sum(),
+    });
+
+    Ok(heads)
+}
+
 fn resolve_projection_candidates(
     candidates: BTreeMap<(String, String, String, String), Vec<ProjectionCandidate>>,
 ) -> Vec<VisibleRow> {
@@ -936,6 +876,7 @@ fn parents_by_child(
     parent_by_child
 }
 
+#[cfg(test)]
 fn maximal_commits(
     candidate_commit_ids: &BTreeSet<String>,
     parents_by_child: &BTreeMap<String, Vec<String>>,
@@ -966,6 +907,7 @@ fn maximal_commits(
     maximal
 }
 
+#[cfg(test)]
 fn ancestors_for_commit(
     commit_id: &str,
     parents_by_child: &BTreeMap<String, Vec<String>>,
@@ -991,6 +933,7 @@ fn ancestors_for_commit(
     ancestors
 }
 
+#[cfg(test)]
 fn build_commit_causal_rank(
     data: &LoadedData,
     all_commit_edges: &BTreeSet<(String, String)>,
@@ -1018,6 +961,7 @@ fn build_commit_causal_rank(
     memo
 }
 
+#[cfg(test)]
 fn commit_causal_rank_for_commit(
     commit_id: &str,
     parents_by_child: &BTreeMap<String, Vec<String>>,
@@ -1049,6 +993,7 @@ fn commit_causal_rank_for_commit(
     rank
 }
 
+#[cfg(test)]
 fn build_change_commit_index(data: &LoadedData) -> BTreeMap<String, String> {
     let mut index = BTreeMap::new();
     for commit in data.commits.values() {

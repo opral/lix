@@ -463,16 +463,8 @@ pub(crate) fn untracked_live_table_name(schema_key: &str) -> String {
     format!("{UNTRACKED_LIVE_TABLE_PREFIX}{schema_key}")
 }
 
-pub(crate) fn is_tracked_live_table(name: &str) -> bool {
-    name.starts_with(TRACKED_LIVE_TABLE_PREFIX)
-}
-
 pub(crate) fn is_untracked_live_table(name: &str) -> bool {
     name.starts_with(UNTRACKED_LIVE_TABLE_PREFIX)
-}
-
-pub(crate) fn is_live_table(name: &str) -> bool {
-    is_tracked_live_table(name) || is_untracked_live_table(name)
 }
 
 pub(crate) fn live_column_name_for_property<'a>(

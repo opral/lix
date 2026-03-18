@@ -991,7 +991,7 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
             )
         })?;
     let version_descriptor_table = tracked_live_table_name("lix_version_descriptor");
-    let version_ref_table = tracked_live_table_name("lix_version_ref");
+    let version_ref_table = untracked_live_table_name("lix_version_ref");
     let sql = match kind {
         CanonicalAdminKind::ActiveVersion => format!(
             "SELECT \
@@ -1034,12 +1034,10 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
                    ROW_NUMBER() OVER ( \
                      PARTITION BY entity_id \
                      ORDER BY updated_at DESC, \
-                              created_at DESC, \
-                              change_id DESC \
+                              created_at DESC \
                    ) AS rn \
                  FROM {version_ref_table} \
                  WHERE schema_key = 'lix_version_ref' \
-                   AND is_tombstone = 0 \
                    AND commit_id IS NOT NULL \
                ) ranked_version_refs \
                WHERE rn = 1 \
@@ -1566,7 +1564,7 @@ fn build_state_history_source_sql(
     let requested_root_predicates = state_history_requested_root_predicates(pushdown_predicates);
     let requested_version_predicates =
         state_history_requested_version_predicates(pushdown_predicates);
-    let version_ref_table = tracked_live_table_name("lix_version_ref");
+    let version_ref_table = untracked_live_table_name("lix_version_ref");
     let commit_table = tracked_live_table_name("lix_commit");
     let version_ref_commit_id_column = quote_ident(&live_payload_column_name(
         version_ref_schema_key(),
@@ -1615,7 +1613,6 @@ fn build_state_history_source_sql(
                WHERE vp.schema_key = '{schema_key}' \
                  AND vp.file_id = '{file_id}' \
                  AND vp.version_id = '{storage_version_id}' \
-                 AND vp.is_tombstone = 0 \
              ), ",
             version_ref_table = version_ref_table,
             version_ref_commit_id_column = version_ref_commit_id_column,
@@ -1633,7 +1630,6 @@ fn build_state_history_source_sql(
                WHERE vp.schema_key = '{schema_key}' \
                  AND vp.file_id = '{file_id}' \
                  AND vp.version_id = '{storage_version_id}' \
-                 AND vp.is_tombstone = 0 \
              ), ",
             version_ref_table = version_ref_table,
             version_ref_commit_id_column = version_ref_commit_id_column,
@@ -2278,7 +2274,7 @@ fn build_change_source_query() -> Result<Query, LixError> {
 
 fn build_working_changes_source_query() -> Result<Query, LixError> {
     let active_version_column = quote_ident(&active_version_payload_column_name());
-    let version_ref_table = tracked_live_table_name("lix_version_ref");
+    let version_ref_table = untracked_live_table_name("lix_version_ref");
     let commit_tracked_table = tracked_live_table_name("lix_commit");
     let cse_tracked_table = tracked_live_table_name("lix_change_set_element");
     let commit_edge_table = tracked_live_table_name("lix_commit_edge");
@@ -2334,7 +2330,6 @@ fn build_working_changes_source_query() -> Result<Query, LixError> {
                         WHERE file_id = 'lix' \
                           AND entity_id = (SELECT version_id FROM active_version) \
                           AND version_id = 'global' \
-                          AND is_tombstone = 0 \
                           AND {version_ref_commit_id_column} IS NOT NULL \
                         LIMIT 1 \
                     ) AS head_commit_id \
@@ -2348,7 +2343,6 @@ fn build_working_changes_source_query() -> Result<Query, LixError> {
                         WHERE file_id = 'lix' \
                           AND entity_id = 'global' \
                           AND version_id = 'global' \
-                          AND is_tombstone = 0 \
                           AND {version_ref_commit_id_column} IS NOT NULL \
                         LIMIT 1 \
                     ) AS head_commit_id \
@@ -3436,7 +3430,7 @@ mod tests {
         let lowered_sql = lowered.statements[0].to_string();
 
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
+        assert!(lowered_sql.contains("lix_internal_live_untracked_v1_lix_version_ref"));
         assert!(!lowered_sql.contains("FROM lix_version"));
         assert_eq!(
             lowered.pushdown_decision.accepted_predicates,
