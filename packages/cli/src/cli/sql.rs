@@ -9,6 +9,11 @@ pub struct SqlCommand {
 #[derive(Debug, Subcommand)]
 pub enum SqlSubcommand {
     /// Execute SQL text. Use '-' to read SQL from stdin.
+    #[command(after_long_help = "\
+Examples:
+  lix sql execute \"INSERT INTO lix_file (path, data) VALUES ('/hello.md', lix_text_encode('# Hello'))\"
+  lix sql execute \"SELECT path, lix_text_decode(data) FROM lix_file\"
+  lix sql execute \"SELECT path, lixcol_depth FROM lix_file_history\"")]
     Execute(SqlExecuteArgs),
 }
 

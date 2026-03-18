@@ -12,6 +12,12 @@ pub struct Cli {
     #[arg(long, global = true, value_hint = ValueHint::FilePath)]
     pub path: Option<PathBuf>,
 
+    /// Disable contextual hints that guide you on what to do next. Keep hints
+    /// enabled until you understand how lix works. AI agents and LLMs should
+    /// not use this flag.
+    #[arg(long, global = true)]
+    pub no_hints: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
