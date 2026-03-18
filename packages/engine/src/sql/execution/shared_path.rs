@@ -1183,27 +1183,65 @@ pub(crate) async fn apply_public_version_last_checkpoint_side_effects(
 
     match public_write.planned_write.command.operation_kind {
         crate::sql::public::planner::ir::WriteOperationKind::Insert => {
-            upsert_last_checkpoint_rows(transaction, &version_checkpoint_rows(batch), true).await
+            upsert_last_checkpoint_rows(
+                transaction,
+                &version_checkpoint_rows_from_resolved_write(public_write, batch),
+                true,
+            )
+            .await
         }
         crate::sql::public::planner::ir::WriteOperationKind::Update => {
-            upsert_last_checkpoint_rows(transaction, &version_checkpoint_rows(batch), false).await
+            upsert_last_checkpoint_rows(
+                transaction,
+                &version_checkpoint_rows_from_resolved_write(public_write, batch),
+                false,
+            )
+            .await
         }
         crate::sql::public::planner::ir::WriteOperationKind::Delete => {
-            let version_ids = batch
-                .changes
-                .iter()
-                .map(|change| change.entity_id.clone())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
+            let version_ids = version_ids_from_resolved_write(public_write, batch);
             delete_last_checkpoint_rows(transaction, &version_ids).await
         }
     }
 }
 
-fn version_checkpoint_rows(
+fn version_checkpoint_rows_from_resolved_write(
+    public_write: &PreparedPublicWrite,
     batch: &crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch,
 ) -> Vec<(String, String)> {
+    if let Some(resolved) = public_write.planned_write.resolved_write_plan.as_ref() {
+        let rows = resolved
+            .partitions
+            .iter()
+            .flat_map(|partition| partition.intended_post_state.iter())
+            .filter(|row| {
+                row.schema_key == crate::version::version_ref_schema_key() && !row.tombstone
+            })
+            .filter_map(|row| {
+                row.values
+                    .get("snapshot_content")
+                    .and_then(|value| match value {
+                        Value::Text(snapshot) => {
+                            serde_json::from_str::<serde_json::Value>(snapshot)
+                                .ok()
+                                .and_then(|snapshot| {
+                                    snapshot
+                                        .get("commit_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(|commit_id| {
+                                            (row.entity_id.clone(), commit_id.to_string())
+                                        })
+                                })
+                        }
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+        if !rows.is_empty() {
+            return rows;
+        }
+    }
+
     batch
         .changes
         .iter()
@@ -1221,6 +1259,39 @@ fn version_checkpoint_rows(
             })
         })
         .collect()
+}
+
+fn version_ids_from_resolved_write(
+    public_write: &PreparedPublicWrite,
+    batch: &crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch,
+) -> Vec<String> {
+    if let Some(resolved) = public_write.planned_write.resolved_write_plan.as_ref() {
+        let version_ids = resolved
+            .partitions
+            .iter()
+            .flat_map(|partition| partition.intended_post_state.iter())
+            .filter(|row| {
+                matches!(
+                    row.schema_key.as_str(),
+                    "lix_version_ref" | "lix_version_descriptor"
+                )
+            })
+            .map(|row| row.entity_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if !version_ids.is_empty() {
+            return version_ids;
+        }
+    }
+
+    batch
+        .changes
+        .iter()
+        .map(|change| change.entity_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
 }
 
 async fn upsert_last_checkpoint_rows(

@@ -225,7 +225,7 @@ simulation_test!(
         );
         assert_eq!(
             changes.statements[0].rows[0][1],
-            Value::Text(deterministic_uuid(10))
+            Value::Text(deterministic_uuid(9))
         );
         assert_eq!(
             changes.statements[0].rows[0][2],
@@ -258,7 +258,7 @@ simulation_test!(
             Value::Text("1970-01-01T00:00:00.000Z".to_string())
         );
 
-        assert_eq!(read_sequence_value(&engine).await, 13);
+        assert_eq!(read_sequence_value(&engine).await, 11);
     }
 );
 
@@ -366,8 +366,8 @@ simulation_test!(
         assert_eq!(id, deterministic_uuid(1));
         assert_eq!(created_at, "1970-01-01T00:00:00.000Z");
 
-        // 2 calls from CEL defaults + commit/materialization sequence consumption.
-        assert_eq!(read_sequence_value(&engine).await, 15);
+        // 2 calls from CEL defaults plus the remaining tracked commit/materialization writes.
+        assert_eq!(read_sequence_value(&engine).await, 13);
     }
 );
 

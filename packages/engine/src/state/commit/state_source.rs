@@ -143,7 +143,7 @@ async fn load_current_pointer_snapshot_content(
         ("version_id", storage_version_id.to_string()),
     ]);
     let Some(row) =
-        load_exact_live_row_with_executor(executor, LiveRowScope::Tracked, schema_key, &filters)
+        load_exact_live_row_with_executor(executor, LiveRowScope::Untracked, schema_key, &filters)
             .await?
     else {
         return Ok(None);
@@ -636,7 +636,7 @@ mod tests {
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             if sql.contains("FROM \"lix_internal_live_v1_lix_file_descriptor\"")
-                || sql.contains("FROM lix_internal_live_v1_lix_version_ref")
+                || sql.contains("FROM lix_internal_live_untracked_v1_lix_version_ref")
             {
                 return Err(LixError::new("LIX_ERROR_UNKNOWN", "no such table"));
             }

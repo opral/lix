@@ -113,30 +113,11 @@ where
 
     let unique_active_accounts = dedupe_ordered(&args.active_accounts);
     let mut meta_changes: Vec<ChangeRow> = Vec::new();
-    let mut version_ref_change_id_by_version: BTreeMap<String, String> = BTreeMap::new();
     let mut change_set_change_id_by_version: BTreeMap<String, String> = BTreeMap::new();
     let mut commit_change_id_by_version: BTreeMap<String, String> = BTreeMap::new();
     let mut commit_row_index_by_version: BTreeMap<String, usize> = BTreeMap::new();
 
     for (version_id, meta) in &meta_by_version {
-        let version_ref_change_id = generate_uuid();
-        version_ref_change_id_by_version.insert(version_id.clone(), version_ref_change_id.clone());
-
-        meta_changes.push(ChangeRow {
-            id: version_ref_change_id,
-            entity_id: version_id.clone(),
-            schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
-            schema_version: version_ref_schema.schema_version.clone(),
-            file_id: version_ref_schema.file_id.clone(),
-            plugin_key: version_ref_schema.plugin_key.clone(),
-            snapshot_content: Some(canonical_json(json!({
-                "id": version_id,
-                "commit_id": meta.commit_id,
-            }))?),
-            metadata: None,
-            created_at: args.timestamp.clone(),
-        });
-
         let change_set_change_id = generate_uuid();
         change_set_change_id_by_version.insert(version_id.clone(), change_set_change_id.clone());
         meta_changes.push(ChangeRow {
@@ -306,14 +287,11 @@ where
                 ),
             })?;
 
-        let mut member_change_ids: Vec<String> = domain_by_version
+        let member_change_ids: Vec<String> = domain_by_version
             .get(version_id)
             .into_iter()
             .flat_map(|changes| changes.iter().map(|change| change.id.clone()))
             .collect();
-        if let Some(change_id) = version_ref_change_id_by_version.get(version_id) {
-            member_change_ids.push(change_id.clone());
-        }
 
         snapshot["change_ids"] = serde_json::Value::Array(
             member_change_ids
@@ -421,12 +399,8 @@ where
             writer_key: None,
         });
 
-        let version_ref_id = version_ref_change_id_by_version
-            .get(version_id)
-            .cloned()
-            .unwrap_or_else(|| generate_uuid());
         live_state_rows.push(MaterializedStateRow {
-            id: version_ref_id.clone(),
+            id: generate_uuid(),
             entity_id: version_id.clone(),
             schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
             schema_version: version_ref_schema.schema_version.clone(),
@@ -442,52 +416,6 @@ where
             lixcol_commit_id: meta.commit_id.clone(),
             writer_key: None,
         });
-
-        live_state_rows.push(MaterializedStateRow {
-            id: generate_uuid(),
-            entity_id: format!("{}~{}", meta.change_set_id, version_ref_id),
-            schema_key: CHANGE_SET_ELEMENT_SCHEMA_KEY.to_string(),
-            schema_version: change_set_element_schema.schema_version.clone(),
-            file_id: change_set_element_schema.file_id.clone(),
-            plugin_key: change_set_element_schema.plugin_key.clone(),
-            snapshot_content: Some(canonical_json(json!({
-                "change_set_id": meta.change_set_id,
-                "change_id": version_ref_id.clone(),
-                "entity_id": version_id.clone(),
-                "schema_key": VERSION_REF_SCHEMA_KEY,
-                "file_id": version_ref_schema.file_id.clone(),
-            }))?),
-            metadata: None,
-            created_at: args.timestamp.clone(),
-            lixcol_version_id: GLOBAL_VERSION.to_string(),
-            lixcol_commit_id: global_commit_id
-                .clone()
-                .unwrap_or_else(|| meta.commit_id.clone()),
-            writer_key: None,
-        });
-
-        for account_id in &unique_active_accounts {
-            live_state_rows.push(MaterializedStateRow {
-                id: commit_change_id_by_version
-                    .get(version_id)
-                    .cloned()
-                    .unwrap_or_else(|| generate_uuid()),
-                entity_id: format!("{}~{}", version_ref_id, account_id),
-                schema_key: CHANGE_AUTHOR_SCHEMA_KEY.to_string(),
-                schema_version: change_author_schema.schema_version.clone(),
-                file_id: change_author_schema.file_id.clone(),
-                plugin_key: change_author_schema.plugin_key.clone(),
-                snapshot_content: Some(canonical_json(json!({
-                    "change_id": version_ref_id,
-                    "account_id": account_id,
-                }))?),
-                metadata: None,
-                created_at: args.timestamp.clone(),
-                lixcol_version_id: GLOBAL_VERSION.to_string(),
-                lixcol_commit_id: meta.commit_id.clone(),
-                writer_key: None,
-            });
-        }
     }
 
     // Materialize commit edges for commit graph topology.
@@ -686,16 +614,6 @@ mod tests {
         counts
     }
 
-    fn version_ref_change_ids(result: &GenerateCommitResult) -> Vec<String> {
-        result
-            .canonical_output
-            .changes
-            .iter()
-            .filter(|row| row.schema_key == "lix_version_ref")
-            .map(|row| row.id.clone())
-            .collect()
-    }
-
     #[test]
     fn generates_commit_for_single_active_version_change() {
         let mut versions = BTreeMap::new();
@@ -726,7 +644,7 @@ mod tests {
         })
         .expect("generate_commit should succeed");
 
-        assert_eq!(result.canonical_output.changes.len(), 4);
+        assert_eq!(result.canonical_output.changes.len(), 3);
         assert_eq!(
             result
                 .canonical_output
@@ -745,16 +663,6 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(
-            result
-                .canonical_output
-                .changes
-                .iter()
-                .filter(|row| row.schema_key == "lix_version_ref")
-                .count(),
-            1
-        );
-
         let commit_row = result
             .canonical_output
             .changes
@@ -764,10 +672,9 @@ mod tests {
         assert_eq!(commit_row.plugin_key, "lix");
         let commit_snapshot: serde_json::Value =
             serde_json::from_str(commit_row.snapshot_content.as_ref().unwrap()).unwrap();
-        let version_ref_ids = version_ref_change_ids(&result);
         assert_eq!(
             commit_snapshot["change_ids"],
-            serde_json::json!(["chg_active", version_ref_ids[0]])
+            serde_json::json!(["chg_active"])
         );
         assert_eq!(
             commit_snapshot["parent_commit_ids"],
@@ -791,13 +698,13 @@ mod tests {
 
         let materialized_counts = counts_by_schema(&result.derived_apply_input.live_state_rows);
         assert_eq!(materialized_counts.get("lix_key_value"), Some(&1));
-        assert_eq!(materialized_counts.get("lix_change_author"), Some(&2));
-        assert_eq!(materialized_counts.get("lix_change_set_element"), Some(&2));
+        assert_eq!(materialized_counts.get("lix_change_author"), Some(&1));
+        assert_eq!(materialized_counts.get("lix_change_set_element"), Some(&1));
         assert_eq!(materialized_counts.get("lix_change_set"), Some(&1));
         assert_eq!(materialized_counts.get("lix_commit"), Some(&1));
         assert_eq!(materialized_counts.get("lix_version_ref"), Some(&1));
         assert_eq!(materialized_counts.get("lix_commit_edge"), Some(&1));
-        assert_eq!(result.derived_apply_input.live_state_rows.len(), 9);
+        assert_eq!(result.derived_apply_input.live_state_rows.len(), 7);
 
         let domain_materialized = result
             .derived_apply_input
@@ -853,7 +760,7 @@ mod tests {
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_author")
                 .count(),
-            2
+            1
         );
         assert_eq!(
             result
@@ -862,7 +769,7 @@ mod tests {
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_set_element")
                 .count(),
-            2
+            1
         );
         assert_eq!(
             result
@@ -891,7 +798,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(result.derived_apply_input.live_state_rows.len(), 9);
+        assert_eq!(result.derived_apply_input.live_state_rows.len(), 7);
 
         let commit_row = result
             .canonical_output
@@ -909,10 +816,9 @@ mod tests {
             commit_snapshot["parent_commit_ids"],
             serde_json::json!(["P_global"])
         );
-        let version_ref_ids = version_ref_change_ids(&result);
         assert_eq!(
             commit_snapshot["change_ids"],
-            serde_json::json!(["chg_global", version_ref_ids[0]])
+            serde_json::json!(["chg_global"])
         );
 
         let author_row = result
@@ -962,7 +868,7 @@ mod tests {
         })
         .expect("generate_commit should succeed");
 
-        assert_eq!(result.canonical_output.changes.len(), 8);
+        assert_eq!(result.canonical_output.changes.len(), 6);
         assert_eq!(
             result
                 .canonical_output
@@ -983,22 +889,12 @@ mod tests {
         );
         assert_eq!(
             result
-                .canonical_output
-                .changes
-                .iter()
-                .filter(|row| row.schema_key == "lix_version_ref")
-                .count(),
-            2
-        );
-
-        assert_eq!(
-            result
                 .derived_apply_input
                 .live_state_rows
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_author")
                 .count(),
-            8
+            4
         );
         assert_eq!(
             result
@@ -1016,9 +912,9 @@ mod tests {
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_set_element")
                 .count(),
-            4
+            2
         );
-        assert_eq!(result.derived_apply_input.live_state_rows.len(), 22);
+        assert_eq!(result.derived_apply_input.live_state_rows.len(), 16);
 
         let commit_rows: Vec<_> = result
             .canonical_output
@@ -1034,7 +930,7 @@ mod tests {
                 commit_snapshot["author_account_ids"],
                 serde_json::json!(["acct-1", "acct-2"])
             );
-            assert_eq!(commit_snapshot["change_ids"].as_array().unwrap().len(), 2);
+            assert_eq!(commit_snapshot["change_ids"].as_array().unwrap().len(), 1);
         }
 
         let change_author_entities: BTreeSet<String> = result
@@ -1059,7 +955,7 @@ mod tests {
                 .iter()
                 .filter(|row| row.schema_key == "lix_change_author")
                 .count(),
-            8
+            4
         );
 
         let global_tip = result
@@ -1118,11 +1014,6 @@ mod tests {
             .map(|row| row.id.clone())
             .collect::<Vec<_>>();
         assert_eq!(domain_change_ids, vec!["chg_b1", "chg_a2"]);
-        let version_ref_id = version_ref_change_ids(&result)
-            .into_iter()
-            .next()
-            .expect("expected version ref change");
-
         let commit_row = result
             .canonical_output
             .changes
@@ -1133,7 +1024,7 @@ mod tests {
             serde_json::from_str(commit_row.snapshot_content.as_ref().unwrap()).unwrap();
         assert_eq!(
             commit_snapshot["change_ids"],
-            serde_json::json!(["chg_b1", "chg_a2", version_ref_id])
+            serde_json::json!(["chg_b1", "chg_a2"])
         );
 
         let cse_change_ids = result
@@ -1153,11 +1044,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             cse_change_ids,
-            BTreeSet::from([
-                "chg_b1".to_string(),
-                "chg_a2".to_string(),
-                version_ref_id.clone(),
-            ])
+            BTreeSet::from(["chg_b1".to_string(), "chg_a2".to_string()])
         );
 
         let change_author_entities = result
@@ -1169,11 +1056,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             change_author_entities,
-            BTreeSet::from([
-                "chg_b1~acct-1".to_string(),
-                "chg_a2~acct-1".to_string(),
-                format!("{version_ref_id}~acct-1"),
-            ])
+            BTreeSet::from(["chg_b1~acct-1".to_string(), "chg_a2~acct-1".to_string()])
         );
     }
 

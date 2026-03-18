@@ -1177,14 +1177,13 @@ fn active_version_commit_id_sql() -> String {
         .expect("active version live layout must include version_id");
     let version_ref_commit_id_column =
         quote_ident(&live_payload_column_name("lix_version_ref", "commit_id"));
-    let live_version_ref_table = tracked_live_table_name("lix_version_ref");
+    let live_version_ref_table = untracked_live_table_name("lix_version_ref");
     format!(
         "(\
          SELECT {version_ref_commit_id_column} \
          FROM {live_version_ref_table} vp \
          WHERE vp.schema_key = 'lix_version_ref' \
            AND vp.version_id = '{global_version}' \
-           AND vp.is_tombstone = 0 \
            AND {version_ref_commit_id_column} IS NOT NULL \
            AND vp.entity_id = (\
                SELECT {active_version_column} \
@@ -1260,7 +1259,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
             "change_set_id"
         ))
     );
-    let live_version_ref_table = tracked_live_table_name("lix_version_ref");
+    let live_version_ref_table = untracked_live_table_name("lix_version_ref");
     let live_commit_table = tracked_live_table_name("lix_commit");
     let live_cse_table = tracked_live_table_name("lix_change_set_element");
     let active_version_rows_sql = if force_active_scope {
@@ -1292,7 +1291,6 @@ pub(crate) fn build_filesystem_state_history_source_sql(
              ON av.version_id = vp.entity_id \
            WHERE vp.schema_key = 'lix_version_ref' \
              AND vp.version_id = '{global_version}' \
-             AND vp.is_tombstone = 0 \
              AND {version_ref_commit_id_column} IS NOT NULL \
          ), ",
             live_version_ref_table = live_version_ref_table,
@@ -1308,7 +1306,6 @@ pub(crate) fn build_filesystem_state_history_source_sql(
            FROM {live_version_ref_table} vp \
            WHERE vp.schema_key = 'lix_version_ref' \
              AND vp.version_id = '{global_version}' \
-             AND vp.is_tombstone = 0 \
              AND {version_ref_commit_id_column} IS NOT NULL \
          ), ",
             live_version_ref_table = live_version_ref_table,

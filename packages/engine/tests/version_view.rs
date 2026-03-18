@@ -562,12 +562,12 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
         .unwrap();
     assert_eq!(version_rows.statements[0].rows.len(), 0);
 
-    let deleted_rows = engine
+    let deleted_descriptor_rows = engine
         .execute(
             "SELECT DISTINCT schema_key \
              FROM lix_internal_state_vtable \
              WHERE entity_id = 'version-c' \
-               AND schema_key IN ('lix_version_descriptor', 'lix_version_ref') \
+               AND schema_key = 'lix_version_descriptor' \
                AND snapshot_content IS NULL \
              ORDER BY schema_key",
             &[],
@@ -575,12 +575,23 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
         .await
         .unwrap();
 
-    assert_eq!(deleted_rows.statements[0].rows.len(), 2);
+    assert_eq!(deleted_descriptor_rows.statements[0].rows.len(), 1);
     assert_text(
-        &deleted_rows.statements[0].rows[0][0],
+        &deleted_descriptor_rows.statements[0].rows[0][0],
         "lix_version_descriptor",
     );
-    assert_text(&deleted_rows.statements[0].rows[1][0], "lix_version_ref");
+
+    let version_ref_rows = engine
+        .execute(
+            "SELECT schema_key \
+             FROM lix_internal_state_vtable \
+             WHERE entity_id = 'version-c' \
+               AND schema_key = 'lix_version_ref'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(version_ref_rows.statements[0].rows.len(), 0);
 });
 
 simulation_test!(lix_version_delete_supports_placeholders, |sim| async move {

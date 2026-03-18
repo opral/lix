@@ -131,23 +131,6 @@ async fn matching_commit_change_set_ids(
     matching_change_set_ids
 }
 
-async fn count_version_ref_changes(engine: &SimulationEngine, version_id: &str) -> i64 {
-    let result = engine
-        .execute(
-            &format!(
-                "SELECT COUNT(*) \
-                 FROM lix_internal_change \
-                 WHERE schema_key = 'lix_version_ref' \
-                   AND entity_id = '{}'",
-                version_id
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
-    as_i64(&result.statements[0].rows[0][0])
-}
-
 async fn active_version_id(engine: &SimulationEngine) -> String {
     let result = engine
         .execute(
@@ -726,7 +709,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    content_only_update_emits_version_ref_change,
+    content_only_update_updates_untracked_version_ref_head,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -746,7 +729,7 @@ simulation_test!(
             .unwrap();
 
         let version_id = active_version_id(&engine).await;
-        let before = count_version_ref_changes(&engine, &version_id).await;
+        let before = read_version_ref_commit_id(&engine, &version_id).await;
 
         engine
             .execute(
@@ -757,7 +740,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        let after = count_version_ref_changes(&engine, &version_id).await;
-        assert_eq!(after, before + 1);
+        let after = read_version_ref_commit_id(&engine, &version_id).await;
+        assert_ne!(after, before);
     }
 );

@@ -713,12 +713,13 @@ simulation_test!(
 
         let main_authoritative_tip = engine
             .execute(
-                "SELECT lix_json_extract(s.content, 'commit_id') AS commit_id \
-                 FROM lix_internal_change c \
-                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-                 WHERE c.schema_key = 'lix_version_ref' \
-                   AND c.entity_id = $1 \
-                 ORDER BY c.created_at DESC, c.id DESC \
+                "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_version_ref' \
+                   AND entity_id = $1 \
+                   AND untracked = true \
+                   AND snapshot_content IS NOT NULL \
+                 ORDER BY updated_at DESC, created_at DESC \
                  LIMIT 1",
                 &[lix_engine::Value::Text(main_version_id.clone())],
             )
@@ -745,12 +746,13 @@ simulation_test!(
 
         let global_authoritative_tip = engine
             .execute(
-                "SELECT lix_json_extract(s.content, 'commit_id') AS commit_id \
-                 FROM lix_internal_change c \
-                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-                 WHERE c.schema_key = 'lix_version_ref' \
-                   AND c.entity_id = 'global' \
-                 ORDER BY c.created_at DESC, c.id DESC \
+                "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_version_ref' \
+                   AND entity_id = 'global' \
+                   AND untracked = true \
+                   AND snapshot_content IS NOT NULL \
+                 ORDER BY updated_at DESC, created_at DESC \
                  LIMIT 1",
                 &[],
             )

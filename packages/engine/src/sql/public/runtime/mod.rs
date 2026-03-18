@@ -1858,7 +1858,7 @@ fn public_untracked_operation_supported(planned_write: &PlannedWrite) -> bool {
         SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
     ) || matches!(
         planned_write.command.target.descriptor.public_name.as_str(),
-        "lix_active_version" | "lix_active_account"
+        "lix_active_version" | "lix_active_account" | "lix_version"
     )
 }
 
@@ -2535,7 +2535,7 @@ mod tests {
                     },
                 });
             }
-            if query_targets_table(sql, "lix_internal_live_v1_lix_version_ref") {
+            if query_targets_table(sql, "lix_internal_live_untracked_v1_lix_version_ref") {
                 let rows = self
                     .version_ref_rows
                     .iter()
@@ -2555,7 +2555,6 @@ mod tests {
                         "version_id".to_string(),
                         "plugin_key".to_string(),
                         "metadata".to_string(),
-                        "change_id".to_string(),
                         "commit_id".to_string(),
                         "id".to_string(),
                     ],
@@ -2831,7 +2830,6 @@ mod tests {
             Value::Text(crate::version::version_ref_storage_version_id().to_string()),
             Value::Text(crate::version::version_ref_plugin_key().to_string()),
             Value::Null,
-            Value::Text(format!("pointer-change-{version_id}")),
             Value::Text(commit_id.to_string()),
             Value::Text(version_id.to_string()),
         ]
@@ -3926,7 +3924,7 @@ mod tests {
             .expect("nested public-subquery read should lower");
         assert!(!lowered_sql.contains("FROM lix_active_version"));
         assert!(!lowered_sql.contains("FROM lix_version"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
+        assert!(lowered_sql.contains("lix_internal_live_untracked_v1_lix_version_ref"));
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
     }
 }

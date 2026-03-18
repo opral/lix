@@ -14,6 +14,7 @@ use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
 };
 use crate::functions::LixFunctionProvider;
+use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
 use crate::state::internal::quote_ident;
 
 use crate::schema::live_layout::{
@@ -232,7 +233,7 @@ pub(crate) fn build_statement_batch_from_commit_apply_input(
     let mut statement_params = Vec::new();
     let mut next_placeholder = placeholder_offset + 1;
     let mut change_rows = Vec::new();
-    let mut materialized_by_schema: BTreeMap<String, (Vec<Ident>, Vec<Vec<Expr>>, usize)> =
+    let mut materialized_by_schema: BTreeMap<String, (bool, Vec<Ident>, Vec<Vec<Expr>>, usize)> =
         BTreeMap::new();
 
     for change in &canonical_output.changes {
@@ -299,6 +300,7 @@ pub(crate) fn build_statement_batch_from_commit_apply_input(
     }
 
     for row in &derived_apply_input.live_state_rows {
+        let is_untracked = schema_uses_untracked_live_state(&row.schema_key);
         let layout = derived_apply_input
             .live_layouts
             .get(&row.schema_key)
@@ -309,19 +311,20 @@ pub(crate) fn build_statement_batch_from_commit_apply_input(
             layout.as_ref(),
             row.snapshot_content.as_deref(),
         )?;
-        let columns = live_state_insert_columns(layout.as_ref());
+        let columns = live_state_insert_columns(layout.as_ref(), is_untracked);
         let params_per_row = columns.len();
         let values = live_state_row_values_parameterized(
             row,
             layout.as_ref(),
+            is_untracked,
             &normalized_values,
             &mut next_placeholder,
             &mut statement_params,
         );
         let entry = materialized_by_schema
             .entry(row.schema_key.clone())
-            .or_insert_with(|| (columns.clone(), Vec::new(), params_per_row));
-        entry.1.push(values);
+            .or_insert_with(|| (is_untracked, columns.clone(), Vec::new(), params_per_row));
+        entry.2.push(values);
     }
 
     let mut statements = Vec::new();
@@ -367,14 +370,18 @@ pub(crate) fn build_statement_batch_from_commit_apply_input(
         );
     }
 
-    for (schema_key, (columns, rows, params_per_row)) in materialized_by_schema {
-        let table_name = tracked_live_table_name(&schema_key);
+    for (schema_key, (is_untracked, columns, rows, params_per_row)) in materialized_by_schema {
+        let table_name = if is_untracked {
+            untracked_live_table_name(&schema_key)
+        } else {
+            tracked_live_table_name(&schema_key)
+        };
         push_chunked_insert_statements(
             &mut statements,
             &table_name,
             columns.clone(),
             rows,
-            Some(build_live_state_on_conflict(&columns)),
+            Some(build_live_state_on_conflict(&columns, is_untracked)),
             max_rows_per_insert_for_dialect(dialect, params_per_row),
         );
     }
@@ -397,6 +404,18 @@ fn max_bind_parameters_for_dialect(dialect: SqlDialect) -> usize {
         SqlDialect::Sqlite => SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT,
         SqlDialect::Postgres => POSTGRES_MAX_BIND_PARAMETERS_PER_STATEMENT,
     }
+}
+
+fn schema_uses_untracked_live_state(schema_key: &str) -> bool {
+    builtin_schema_definition(schema_key)
+        .and_then(|schema| {
+            schema
+                .get("x-lix-override-lixcols")
+                .and_then(|value| value.get("lixcol_untracked"))
+                .and_then(|value| value.as_str())
+        })
+        .map(decode_lixcol_literal)
+        .is_some_and(|value| value == "true")
 }
 
 fn max_rows_per_insert_for_dialect(dialect: SqlDialect, params_per_row: usize) -> usize {
@@ -489,6 +508,7 @@ fn normalized_live_column_values_for_row(
 
 fn live_state_insert_columns(
     layout: Option<&crate::schema::live_layout::LiveTableLayout>,
+    untracked: bool,
 ) -> Vec<Ident> {
     let mut columns = vec![
         Ident::new("entity_id"),
@@ -498,13 +518,15 @@ fn live_state_insert_columns(
         Ident::new("version_id"),
         Ident::new("global"),
         Ident::new("plugin_key"),
-        Ident::new("change_id"),
         Ident::new("metadata"),
         Ident::new("writer_key"),
-        Ident::new("is_tombstone"),
         Ident::new("created_at"),
         Ident::new("updated_at"),
     ];
+    if !untracked {
+        columns.insert(7, Ident::new("change_id"));
+        columns.insert(10, Ident::new("is_tombstone"));
+    }
     if let Some(layout) = layout {
         columns.extend(
             layout
@@ -519,6 +541,7 @@ fn live_state_insert_columns(
 fn live_state_row_values_parameterized(
     row: &MaterializedStateRow,
     _layout: Option<&crate::schema::live_layout::LiveTableLayout>,
+    untracked: bool,
     normalized_columns: &[(String, EngineValue)],
     next_placeholder: &mut usize,
     params: &mut Vec<EngineValue>,
@@ -531,21 +554,26 @@ fn live_state_row_values_parameterized(
         text_param_expr(&row.lixcol_version_id, next_placeholder, params),
         boolean_expr(row.lixcol_version_id == GLOBAL_VERSION),
         text_param_expr(&row.plugin_key, next_placeholder, params),
-        text_param_expr(&row.id, next_placeholder, params),
         optional_text_param_expr(
             row.metadata.as_ref().map(|value| value.as_str()),
             next_placeholder,
             params,
         ),
         optional_text_param_expr(row.writer_key.as_deref(), next_placeholder, params),
-        number_expr(if row.snapshot_content.is_some() {
-            "0"
-        } else {
-            "1"
-        }),
         text_param_expr(&row.created_at, next_placeholder, params),
         text_param_expr(&row.created_at, next_placeholder, params),
     ];
+    if !untracked {
+        values.insert(7, text_param_expr(&row.id, next_placeholder, params));
+        values.insert(
+            10,
+            number_expr(if row.snapshot_content.is_some() {
+                "0"
+            } else {
+                "1"
+            }),
+        );
+    }
     for (_, value) in normalized_columns {
         values.push(value_param_expr(value, next_placeholder, params));
     }
@@ -609,7 +637,7 @@ fn build_snapshot_on_conflict() -> OnInsert {
     })
 }
 
-fn build_live_state_on_conflict(columns: &[Ident]) -> OnInsert {
+fn build_live_state_on_conflict(columns: &[Ident], untracked: bool) -> OnInsert {
     let mut assignments = vec![
         sqlparser::ast::Assignment {
             target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
@@ -631,12 +659,6 @@ fn build_live_state_on_conflict(columns: &[Ident]) -> OnInsert {
         },
         sqlparser::ast::Assignment {
             target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
-                ObjectNamePart::Identifier(Ident::new("change_id")),
-            ])),
-            value: Expr::Identifier(Ident::new("excluded.change_id")),
-        },
-        sqlparser::ast::Assignment {
-            target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
                 ObjectNamePart::Identifier(Ident::new("metadata")),
             ])),
             value: Expr::Identifier(Ident::new("excluded.metadata")),
@@ -649,17 +671,25 @@ fn build_live_state_on_conflict(columns: &[Ident]) -> OnInsert {
         },
         sqlparser::ast::Assignment {
             target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
-                ObjectNamePart::Identifier(Ident::new("is_tombstone")),
-            ])),
-            value: Expr::Identifier(Ident::new("excluded.is_tombstone")),
-        },
-        sqlparser::ast::Assignment {
-            target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
                 ObjectNamePart::Identifier(Ident::new("updated_at")),
             ])),
             value: Expr::Identifier(Ident::new("excluded.updated_at")),
         },
     ];
+    if !untracked {
+        assignments.push(sqlparser::ast::Assignment {
+            target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
+                ObjectNamePart::Identifier(Ident::new("change_id")),
+            ])),
+            value: Expr::Identifier(Ident::new("excluded.change_id")),
+        });
+        assignments.push(sqlparser::ast::Assignment {
+            target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
+                ObjectNamePart::Identifier(Ident::new("is_tombstone")),
+            ])),
+            value: Expr::Identifier(Ident::new("excluded.is_tombstone")),
+        });
+    }
     for column in columns {
         let name = column.value.as_str();
         if matches!(
@@ -671,13 +701,14 @@ fn build_live_state_on_conflict(columns: &[Ident]) -> OnInsert {
                 | "version_id"
                 | "global"
                 | "plugin_key"
-                | "change_id"
                 | "metadata"
                 | "writer_key"
-                | "is_tombstone"
                 | "created_at"
                 | "updated_at"
         ) {
+            continue;
+        }
+        if !untracked && matches!(name, "change_id" | "is_tombstone") {
             continue;
         }
         assignments.push(sqlparser::ast::Assignment {

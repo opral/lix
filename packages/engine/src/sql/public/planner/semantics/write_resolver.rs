@@ -621,9 +621,7 @@ async fn resolve_version_insert_write_plan(
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let rows = payload_maps(planned_write)?;
-    let mut authoritative_pre_state = Vec::new();
-    let mut intended_post_state = Vec::new();
-    let mut lineage = Vec::new();
+    let mut partitions = ResolvedWritePlanBuilder::default();
 
     for row in rows {
         let version_id = version_admin_id_from_payload_map(&row)?;
@@ -635,24 +633,42 @@ async fn resolve_version_insert_write_plan(
             .map_err(write_resolve_backend_error)?;
 
         if let Some(existing) = existing.as_ref() {
-            authoritative_pre_state.extend(version_admin_pre_state_refs(existing));
+            partitions
+                .partition_mut(WriteMode::Tracked, None)
+                .authoritative_pre_state
+                .extend(version_descriptor_pre_state_refs(existing));
+            partitions
+                .partition_mut(WriteMode::Untracked, None)
+                .authoritative_pre_state
+                .extend(version_ref_pre_state_refs(existing));
         }
-        intended_post_state.push(version_descriptor_row(&version_id, &name, hidden));
-        intended_post_state.push(version_ref_row(&version_id, &commit_id));
-        lineage.push(RowLineage {
-            entity_id: version_id,
-            source_change_id: None,
-            source_commit_id: None,
-        });
+        partitions
+            .partition_mut(WriteMode::Tracked, None)
+            .intended_post_state
+            .push(version_descriptor_row(&version_id, &name, hidden));
+        partitions
+            .partition_mut(WriteMode::Tracked, None)
+            .lineage
+            .push(RowLineage {
+                entity_id: version_id.clone(),
+                source_change_id: existing.and_then(|row| row.descriptor_change_id),
+                source_commit_id: None,
+            });
+        partitions
+            .partition_mut(WriteMode::Untracked, None)
+            .intended_post_state
+            .push(version_ref_row(&version_id, &commit_id));
+        partitions
+            .partition_mut(WriteMode::Untracked, None)
+            .lineage
+            .push(RowLineage {
+                entity_id: version_id,
+                source_change_id: None,
+                source_commit_id: None,
+            });
     }
 
-    Ok(single_partition_write_plan(
-        default_execution_mode_for_request(planned_write.command.requested_mode),
-        authoritative_pre_state,
-        intended_post_state,
-        Vec::new(),
-        lineage,
-    ))
+    Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
 }
 
 async fn resolve_existing_version_write(
@@ -700,9 +716,7 @@ async fn resolve_existing_version_write(
                     message: "public version update cannot modify id".to_string(),
                 });
             }
-            let mut authoritative_pre_state = Vec::new();
-            let mut intended_post_state = Vec::new();
-            let mut lineage = Vec::new();
+            let mut partitions = ResolvedWritePlanBuilder::default();
 
             for current_row in current_rows {
                 let next_name = payload
@@ -728,61 +742,76 @@ async fn resolve_existing_version_write(
                     });
                 }
 
-                authoritative_pre_state.extend(version_admin_pre_state_refs(&current_row));
-                lineage.push(RowLineage {
-                    entity_id: current_row.id.clone(),
-                    source_change_id: current_row
-                        .descriptor_change_id
-                        .clone()
-                        .or_else(|| current_row.pointer_change_id.clone()),
-                    source_commit_id: None,
-                });
                 if payload.contains_key("name") || payload.contains_key("hidden") {
-                    intended_post_state.push(version_descriptor_row(
+                    let tracked = partitions.partition_mut(WriteMode::Tracked, None);
+                    tracked
+                        .authoritative_pre_state
+                        .extend(version_descriptor_pre_state_refs(&current_row));
+                    tracked.lineage.push(RowLineage {
+                        entity_id: current_row.id.clone(),
+                        source_change_id: current_row.descriptor_change_id.clone(),
+                        source_commit_id: None,
+                    });
+                    tracked.intended_post_state.push(version_descriptor_row(
                         &current_row.id,
                         &next_name,
                         next_hidden,
                     ));
                 }
                 if payload.contains_key("commit_id") {
-                    intended_post_state.push(version_ref_row(&current_row.id, &next_commit_id));
+                    let untracked = partitions.partition_mut(WriteMode::Untracked, None);
+                    untracked
+                        .authoritative_pre_state
+                        .extend(version_ref_pre_state_refs(&current_row));
+                    untracked.lineage.push(RowLineage {
+                        entity_id: current_row.id.clone(),
+                        source_change_id: None,
+                        source_commit_id: None,
+                    });
+                    untracked
+                        .intended_post_state
+                        .push(version_ref_row(&current_row.id, &next_commit_id));
                 }
             }
 
-            Ok(single_partition_write_plan(
-                default_execution_mode_for_request(planned_write.command.requested_mode),
-                authoritative_pre_state,
-                intended_post_state,
-                Vec::new(),
-                lineage,
-            ))
+            Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
         WriteOperationKind::Delete => {
-            let mut authoritative_pre_state = Vec::new();
-            let mut intended_post_state = Vec::new();
-            let mut tombstones = Vec::new();
-            let mut lineage = Vec::new();
+            let mut partitions = ResolvedWritePlanBuilder::default();
             for current_row in current_rows {
-                authoritative_pre_state.extend(version_admin_pre_state_refs(&current_row));
-                intended_post_state.push(version_descriptor_tombstone_row(&current_row.id));
-                intended_post_state.push(version_ref_tombstone_row(&current_row.id));
-                tombstones.extend(version_admin_tombstone_refs(&current_row));
-                lineage.push(RowLineage {
+                let tracked = partitions.partition_mut(WriteMode::Tracked, None);
+                tracked
+                    .authoritative_pre_state
+                    .extend(version_descriptor_pre_state_refs(&current_row));
+                tracked
+                    .intended_post_state
+                    .push(version_descriptor_tombstone_row(&current_row.id));
+                tracked
+                    .tombstones
+                    .extend(version_descriptor_tombstone_refs(&current_row));
+                tracked.lineage.push(RowLineage {
                     entity_id: current_row.id.clone(),
-                    source_change_id: current_row
-                        .descriptor_change_id
-                        .clone()
-                        .or_else(|| current_row.pointer_change_id.clone()),
+                    source_change_id: current_row.descriptor_change_id.clone(),
+                    source_commit_id: None,
+                });
+
+                let untracked = partitions.partition_mut(WriteMode::Untracked, None);
+                untracked
+                    .authoritative_pre_state
+                    .extend(version_ref_pre_state_refs(&current_row));
+                untracked
+                    .intended_post_state
+                    .push(version_ref_tombstone_row(&current_row.id));
+                untracked
+                    .tombstones
+                    .extend(version_ref_tombstone_refs(&current_row));
+                untracked.lineage.push(RowLineage {
+                    entity_id: current_row.id.clone(),
+                    source_change_id: None,
                     source_commit_id: None,
                 });
             }
-            Ok(single_partition_write_plan(
-                default_execution_mode_for_request(planned_write.command.requested_mode),
-                authoritative_pre_state,
-                intended_post_state,
-                tombstones,
-                lineage,
-            ))
+            Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
         WriteOperationKind::Insert => Err(WriteResolveError {
             message: "public version existing-row resolver does not handle inserts".to_string(),
@@ -822,7 +851,7 @@ async fn load_version_admin_row(
     ]);
     let pointer_row = load_exact_live_row_with_executor(
         &mut executor,
-        LiveRowScope::Tracked,
+        LiveRowScope::Untracked,
         version_ref_schema_key(),
         &pointer_filters,
     )
@@ -840,31 +869,36 @@ async fn load_version_admin_row(
             .and_then(|row| row.property_text("commit_id"))
             .unwrap_or_default(),
         descriptor_change_id: descriptor_row.change_id,
-        pointer_change_id: pointer_row.and_then(|row| row.change_id),
+        pointer_change_id: None,
     }))
 }
 
-fn version_admin_pre_state_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
-    vec![
-        ResolvedRowRef {
-            entity_id: row.id.clone(),
-            schema_key: version_descriptor_schema_key().to_string(),
-            version_id: Some(GLOBAL_VERSION_ID.to_string()),
-            source_change_id: row.descriptor_change_id.clone(),
-            source_commit_id: None,
-        },
-        ResolvedRowRef {
-            entity_id: row.id.clone(),
-            schema_key: version_ref_schema_key().to_string(),
-            version_id: Some(GLOBAL_VERSION_ID.to_string()),
-            source_change_id: row.pointer_change_id.clone(),
-            source_commit_id: None,
-        },
-    ]
+fn version_descriptor_pre_state_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
+    vec![ResolvedRowRef {
+        entity_id: row.id.clone(),
+        schema_key: version_descriptor_schema_key().to_string(),
+        version_id: Some(GLOBAL_VERSION_ID.to_string()),
+        source_change_id: row.descriptor_change_id.clone(),
+        source_commit_id: None,
+    }]
 }
 
-fn version_admin_tombstone_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
-    version_admin_pre_state_refs(row)
+fn version_ref_pre_state_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
+    vec![ResolvedRowRef {
+        entity_id: row.id.clone(),
+        schema_key: version_ref_schema_key().to_string(),
+        version_id: Some(GLOBAL_VERSION_ID.to_string()),
+        source_change_id: None,
+        source_commit_id: None,
+    }]
+}
+
+fn version_descriptor_tombstone_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
+    version_descriptor_pre_state_refs(row)
+}
+
+fn version_ref_tombstone_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
+    version_ref_pre_state_refs(row)
 }
 
 fn version_admin_id_from_payload_map(
