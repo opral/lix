@@ -1,23 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::errors::classification::is_missing_relation_error;
 use crate::schema::builtin::types::LixVersionRef;
 use crate::schema::live_store::{
     load_exact_live_row_with_executor, logical_snapshot_text, LiveRowScope,
 };
 use crate::version::{
     version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-    version_ref_storage_version_id,
+    version_ref_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, Value};
 
 use super::types::{VersionInfo, VersionSnapshot};
 
 #[cfg(test)]
-use crate::errors::classification::is_missing_relation_error;
-#[cfg(test)]
-use crate::schema::live_layout::{logical_snapshot_text_from_projected_row, LiveRowAccess};
+use crate::schema::live_layout::LiveRowAccess;
 
-#[cfg(test)]
 const CANONICAL_FALLBACK_MAX_COMMIT_DEPTH: usize = 2048;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +26,26 @@ pub(crate) struct ExactCommittedStateRow {
     pub(crate) version_id: String,
     pub(crate) values: BTreeMap<String, Value>,
     pub(crate) source_change_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitLineageEntry {
+    pub(crate) id: String,
+    pub(crate) change_ids: Vec<String>,
+    pub(crate) parent_commit_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommittedCanonicalChangeRow {
+    pub(crate) id: String,
+    pub(crate) entity_id: String,
+    pub(crate) schema_key: String,
+    pub(crate) schema_version: String,
+    pub(crate) file_id: String,
+    pub(crate) plugin_key: String,
+    pub(crate) snapshot_content: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -230,47 +248,11 @@ pub(crate) async fn load_exact_committed_state_row_from_live_state_with_executor
     }))
 }
 
-#[cfg(test)]
-async fn load_version_ref_snapshot_content_from_canonical(
+pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
     executor: &mut dyn CommitQueryExecutor,
-    version_id: &str,
-) -> Result<Option<Value>, LixError> {
-    let sql = format!(
-        "SELECT s.content AS snapshot_content \
-         FROM lix_internal_change c \
-         LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-         WHERE c.schema_key = '{schema_key}' \
-           AND c.entity_id = '{entity_id}' \
-           AND c.file_id = '{file_id}' \
-           AND c.plugin_key = '{plugin_key}' \
-           AND s.content IS NOT NULL \
-         ORDER BY c.created_at DESC, c.id DESC \
-         LIMIT 1",
-        schema_key = escape_sql_string(version_ref_schema_key()),
-        entity_id = escape_sql_string(version_id),
-        file_id = escape_sql_string(version_ref_file_id()),
-        plugin_key = escape_sql_string(version_ref_plugin_key()),
-    );
-
-    match executor.execute(&sql, &[]).await {
-        Ok(result) => Ok(result.rows.first().and_then(|row| row.first()).cloned()),
-        Err(err) if is_missing_relation_error(&err) => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-#[cfg(test)]
-pub(crate) async fn reconstruct_exact_committed_state_row_from_canonical(
-    executor: &mut dyn CommitQueryExecutor,
+    head_commit_id: &str,
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    let Some(head_commit_id) =
-        reconstruct_committed_version_head_commit_id_from_canonical(executor, &request.version_id)
-            .await?
-    else {
-        return Ok(None);
-    };
-
     let (parent_join_sql, parent_value_expr) = json_array_text_join_sql(
         executor.dialect(),
         "commit_snapshot.content",
@@ -342,7 +324,7 @@ pub(crate) async fn reconstruct_exact_committed_state_row_from_canonical(
          FROM ranked_changes \
          ORDER BY depth ASC, created_at DESC, change_id DESC \
          LIMIT 1",
-        head_commit_id = escape_sql_string(&head_commit_id),
+        head_commit_id = escape_sql_string(head_commit_id),
         parent_value_expr = parent_value_expr,
         parent_join_sql = parent_join_sql,
         max_depth = CANONICAL_FALLBACK_MAX_COMMIT_DEPTH,
@@ -361,48 +343,17 @@ pub(crate) async fn reconstruct_exact_committed_state_row_from_canonical(
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
-    exact_committed_state_row_from_row(row, None, 6, 0)
-}
-
-#[cfg(test)]
-fn exact_committed_state_row_from_row(
-    row: &[Value],
-    access: Option<&LiveRowAccess>,
-    snapshot_index: usize,
-    normalized_start_index: usize,
-) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    let Some(entity_id) = row.first().and_then(text_from_value) else {
+    let entity_id = required_text(row, 0, "committed_state.entity_id")?;
+    let schema_key = required_text(row, 1, "committed_state.schema_key")?;
+    let schema_version = required_text(row, 2, "committed_state.schema_version")?;
+    let file_id = required_text(row, 3, "committed_state.file_id")?;
+    let version_id = required_text(row, 4, "committed_state.version_id")?;
+    let plugin_key = required_text(row, 5, "committed_state.plugin_key")?;
+    let Some(snapshot_content) = row.get(6).and_then(text_from_value) else {
         return Ok(None);
     };
-    let Some(schema_key) = row.get(1).and_then(text_from_value) else {
-        return Ok(None);
-    };
-    let Some(schema_version) = row.get(2).and_then(text_from_value) else {
-        return Ok(None);
-    };
-    let Some(file_id) = row.get(3).and_then(text_from_value) else {
-        return Ok(None);
-    };
-    let Some(version_id) = row.get(4).and_then(text_from_value) else {
-        return Ok(None);
-    };
-    let Some(plugin_key) = row.get(5).and_then(text_from_value) else {
-        return Ok(None);
-    };
-    let Some(snapshot_content) = logical_snapshot_text_from_projected_row(
-        access,
-        &schema_key,
-        row,
-        snapshot_index,
-        normalized_start_index,
-    )?
-    else {
-        return Ok(None);
-    };
-    let metadata_index = if access.is_some() { 6 } else { 7 };
-    let source_change_id_index = if access.is_some() { 7 } else { 8 };
-    let metadata = row.get(metadata_index).and_then(text_from_value);
-    let source_change_id = row.get(source_change_id_index).and_then(text_from_value);
+    let metadata = row.get(7).and_then(text_from_value);
+    let source_change_id = row.get(8).and_then(text_from_value);
 
     let mut values = BTreeMap::new();
     values.insert("entity_id".to_string(), Value::Text(entity_id.clone()));
@@ -427,6 +378,124 @@ fn exact_committed_state_row_from_row(
         values,
         source_change_id,
     }))
+}
+
+pub(crate) async fn load_commit_lineage_entry_by_id(
+    executor: &mut dyn CommitQueryExecutor,
+    commit_id: &str,
+) -> Result<Option<CommitLineageEntry>, LixError> {
+    let filters = BTreeMap::from([
+        ("entity_id", commit_id.to_string()),
+        ("file_id", "lix".to_string()),
+        ("plugin_key", "lix".to_string()),
+        ("version_id", GLOBAL_VERSION_ID.to_string()),
+    ]);
+    let mut row =
+        load_exact_live_row_with_executor(executor, LiveRowScope::Tracked, "lix_commit", &filters)
+            .await?;
+    if row.is_none() {
+        row = load_exact_live_row_with_executor(
+            executor,
+            LiveRowScope::Untracked,
+            "lix_commit",
+            &filters,
+        )
+        .await?;
+    }
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let access =
+        crate::schema::live_layout::load_live_row_access_with_executor(executor, "lix_commit")
+            .await?;
+    let Some(snapshot_content) = logical_snapshot_text(&access, &row)? else {
+        return Ok(None);
+    };
+    let parsed: crate::schema::builtin::types::LixCommit = serde_json::from_str(&snapshot_content)
+        .map_err(|error| {
+            LixError::unknown(format!(
+                "commit snapshot_content invalid JSON for '{}': {error}",
+                commit_id
+            ))
+        })?;
+    Ok(Some(CommitLineageEntry {
+        id: parsed.id,
+        change_ids: parsed.change_ids,
+        parent_commit_ids: parsed.parent_commit_ids,
+    }))
+}
+
+pub(crate) async fn load_canonical_change_row_by_id(
+    executor: &mut dyn CommitQueryExecutor,
+    change_id: &str,
+) -> Result<Option<CommittedCanonicalChangeRow>, LixError> {
+    let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content, c.metadata, c.created_at \
+               FROM lix_internal_change c \
+               LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+               WHERE c.id = $1 \
+               LIMIT 1";
+    let result = executor
+        .execute(sql, &[Value::Text(change_id.to_string())])
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some(CommittedCanonicalChangeRow {
+        id: required_text(row, 0, "lix_internal_change.id")?,
+        entity_id: required_text(row, 1, "lix_internal_change.entity_id")?,
+        schema_key: required_text(row, 2, "lix_internal_change.schema_key")?,
+        schema_version: required_text(row, 3, "lix_internal_change.schema_version")?,
+        file_id: required_text(row, 4, "lix_internal_change.file_id")?,
+        plugin_key: required_text(row, 5, "lix_internal_change.plugin_key")?,
+        snapshot_content: row.get(6).and_then(text_from_value),
+        metadata: row.get(7).and_then(text_from_value),
+        created_at: required_text(row, 8, "lix_internal_change.created_at")?,
+    }))
+}
+
+#[cfg(test)]
+async fn load_version_ref_snapshot_content_from_canonical(
+    executor: &mut dyn CommitQueryExecutor,
+    version_id: &str,
+) -> Result<Option<Value>, LixError> {
+    let sql = format!(
+        "SELECT s.content AS snapshot_content \
+         FROM lix_internal_change c \
+         LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+         WHERE c.schema_key = '{schema_key}' \
+           AND c.entity_id = '{entity_id}' \
+           AND c.file_id = '{file_id}' \
+           AND c.plugin_key = '{plugin_key}' \
+           AND s.content IS NOT NULL \
+         ORDER BY c.created_at DESC, c.id DESC \
+         LIMIT 1",
+        schema_key = escape_sql_string(version_ref_schema_key()),
+        entity_id = escape_sql_string(version_id),
+        file_id = escape_sql_string(version_ref_file_id()),
+        plugin_key = escape_sql_string(version_ref_plugin_key()),
+    );
+
+    match executor.execute(&sql, &[]).await {
+        Ok(result) => Ok(result.rows.first().and_then(|row| row.first()).cloned()),
+        Err(err) if is_missing_relation_error(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn reconstruct_exact_committed_state_row_from_canonical(
+    executor: &mut dyn CommitQueryExecutor,
+    request: &ExactCommittedStateRowRequest,
+) -> Result<Option<ExactCommittedStateRow>, LixError> {
+    let Some(head_commit_id) =
+        reconstruct_committed_version_head_commit_id_from_canonical(executor, &request.version_id)
+            .await?
+    else {
+        return Ok(None);
+    };
+
+    load_exact_committed_state_row_from_commit_with_executor(executor, &head_commit_id, request)
+        .await
 }
 
 fn parse_version_ref_snapshot(value: &Value) -> Result<Option<LixVersionRef>, LixError> {
@@ -458,13 +527,10 @@ fn text_from_value(value: &Value) -> Option<String> {
     }
 }
 
-#[cfg(test)]
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-#[cfg(test)]
-#[cfg(test)]
 fn json_array_text_join_sql(
     dialect: crate::SqlDialect,
     json_column: &str,
@@ -483,6 +549,18 @@ fn json_array_text_join_sql(
             ),
             format!("{alias}.{value_column}"),
         ),
+    }
+}
+
+fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, LixError> {
+    match row.get(index) {
+        Some(Value::Text(value)) if !value.is_empty() => Ok(value.clone()),
+        Some(Value::Text(_)) => Err(LixError::unknown(format!("{field} is empty"))),
+        Some(Value::Integer(value)) => Ok(value.to_string()),
+        Some(other) => Err(LixError::unknown(format!(
+            "expected text-like value for {field}, got {other:?}"
+        ))),
+        None => Err(LixError::unknown(format!("missing {field}"))),
     }
 }
 

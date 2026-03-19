@@ -10,8 +10,8 @@ mod wasm {
         InitResult as EngineInitResult, Lix as CoreLix, LixBackend, LixConfig, LixError,
         LixTransaction, ObserveEvent as EngineObserveEvent,
         ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
-        QueryResult as EngineQueryResult, SqlDialect, Value as EngineValue, WasmComponentInstance,
-        WasmLimits, WasmRuntime,
+        QueryResult as EngineQueryResult, RedoOptions, RedoResult, SqlDialect, UndoOptions,
+        UndoResult, Value as EngineValue, WasmComponentInstance, WasmLimits, WasmRuntime,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -105,6 +105,28 @@ export type CreateVersionResult = {
   name: string;
 };
 
+export type UndoOptions = {
+  /** Target `lix_version.id`. If omitted, uses the active `versionId`. */
+  versionId?: string;
+};
+
+export type RedoOptions = {
+  /** Target `lix_version.id`. If omitted, uses the active `versionId`. */
+  versionId?: string;
+};
+
+export type UndoResult = {
+  versionId: string;
+  targetCommitId: string;
+  inverseCommitId: string;
+};
+
+export type RedoResult = {
+  versionId: string;
+  targetCommitId: string;
+  replayCommitId: string;
+};
+
 export type ObserveQuery = {
   sql: string;
   params?: LixValue[];
@@ -179,6 +201,28 @@ export type LixObserveEvents = {
         pub async fn create_checkpoint(&self) -> Result<JsValue, JsValue> {
             let result = self.lix.create_checkpoint().await.map_err(js_error)?;
             Ok(create_checkpoint_result_to_js(result).into())
+        }
+
+        #[wasm_bindgen(js_name = undo)]
+        pub async fn undo(&self, args: Option<JsValue>) -> Result<JsValue, JsValue> {
+            let options = parse_undo_options(args).map_err(js_error)?;
+            let result = self
+                .lix
+                .undo_with_options(options)
+                .await
+                .map_err(js_error)?;
+            Ok(undo_result_to_js(result).into())
+        }
+
+        #[wasm_bindgen(js_name = redo)]
+        pub async fn redo(&self, args: Option<JsValue>) -> Result<JsValue, JsValue> {
+            let options = parse_redo_options(args).map_err(js_error)?;
+            let result = self
+                .lix
+                .redo_with_options(options)
+                .await
+                .map_err(js_error)?;
+            Ok(redo_result_to_js(result).into())
         }
 
         #[wasm_bindgen(js_name = createVersion)]
@@ -488,6 +532,28 @@ export type LixObserveEvents = {
         Ok(CreateVersionOptions { id, name, hidden })
     }
 
+    fn parse_undo_options(input: Option<JsValue>) -> Result<UndoOptions, LixError> {
+        let Some(input) = input else {
+            return Ok(UndoOptions::default());
+        };
+        if input.is_null() || input.is_undefined() {
+            return Ok(UndoOptions::default());
+        }
+        let version_id = read_optional_string_property_with_context(&input, "versionId", "undo")?;
+        Ok(UndoOptions { version_id })
+    }
+
+    fn parse_redo_options(input: Option<JsValue>) -> Result<RedoOptions, LixError> {
+        let Some(input) = input else {
+            return Ok(RedoOptions::default());
+        };
+        if input.is_null() || input.is_undefined() {
+            return Ok(RedoOptions::default());
+        }
+        let version_id = read_optional_string_property_with_context(&input, "versionId", "redo")?;
+        Ok(RedoOptions { version_id })
+    }
+
     fn parse_observe_query(input: JsValue) -> Result<EngineObserveQuery, LixError> {
         if input.is_null() || input.is_undefined() || !input.is_object() {
             return Err(LixError {
@@ -598,6 +664,46 @@ export type LixObserveEvents = {
             &object,
             &JsValue::from_str("name"),
             &JsValue::from_str(&result.name),
+        );
+        object
+    }
+
+    fn undo_result_to_js(result: UndoResult) -> Object {
+        let object = Object::new();
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("versionId"),
+            &JsValue::from_str(&result.version_id),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("targetCommitId"),
+            &JsValue::from_str(&result.target_commit_id),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("inverseCommitId"),
+            &JsValue::from_str(&result.inverse_commit_id),
+        );
+        object
+    }
+
+    fn redo_result_to_js(result: RedoResult) -> Object {
+        let object = Object::new();
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("versionId"),
+            &JsValue::from_str(&result.version_id),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("targetCommitId"),
+            &JsValue::from_str(&result.target_commit_id),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("replayCommitId"),
+            &JsValue::from_str(&result.replay_commit_id),
         );
         object
     }
