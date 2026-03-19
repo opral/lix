@@ -12,7 +12,6 @@ use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::post_commit_effects::apply_owned_execution_post_commit_effects;
 use crate::sql::execution::shared_path;
 use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
-use crate::sql::execution::transaction_session::execute_public_sql;
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::sql::execution::write_txn_plan::build_write_txn_plan;
 use crate::sql::execution::write_txn_runner::run_write_txn_plan_with_backend;
@@ -89,16 +88,7 @@ impl Engine {
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
-        let mut state = self.public_sql_state.lock().await;
-        execute_public_sql(
-            self,
-            &mut state,
-            &self.public_sql_transaction_open,
-            sql,
-            params,
-            options,
-        )
-        .await
+        self.execute_impl_sql(sql, params, options, false).await
     }
 
     pub(crate) async fn execute_internal(
@@ -291,12 +281,10 @@ impl Engine {
     }
 
     pub async fn create_checkpoint(&self) -> Result<crate::CreateCheckpointResult, LixError> {
-        self.ensure_no_open_public_sql_transaction("create_checkpoint")?;
         crate::state::checkpoint::create_checkpoint(self).await
     }
 
     pub async fn undo(&self) -> Result<crate::UndoResult, LixError> {
-        self.ensure_no_open_public_sql_transaction("undo")?;
         crate::undo_redo::undo(self).await
     }
 
@@ -304,12 +292,10 @@ impl Engine {
         &self,
         options: crate::UndoOptions,
     ) -> Result<crate::UndoResult, LixError> {
-        self.ensure_no_open_public_sql_transaction("undo")?;
         crate::undo_redo::undo_with_options(self, options).await
     }
 
     pub async fn redo(&self) -> Result<crate::RedoResult, LixError> {
-        self.ensure_no_open_public_sql_transaction("redo")?;
         crate::undo_redo::redo(self).await
     }
 
@@ -317,7 +303,6 @@ impl Engine {
         &self,
         options: crate::RedoOptions,
     ) -> Result<crate::RedoResult, LixError> {
-        self.ensure_no_open_public_sql_transaction("redo")?;
         crate::undo_redo::redo_with_options(self, options).await
     }
 
@@ -325,12 +310,10 @@ impl Engine {
         &self,
         options: crate::CreateVersionOptions,
     ) -> Result<crate::CreateVersionResult, LixError> {
-        self.ensure_no_open_public_sql_transaction("create_version")?;
         crate::version::create_version(self, options).await
     }
 
     pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
-        self.ensure_no_open_public_sql_transaction("switch_version")?;
         crate::version::switch_version(self, version_id).await
     }
 
@@ -339,7 +322,6 @@ impl Engine {
         &self,
         writer: &mut dyn crate::ImageChunkWriter,
     ) -> Result<(), LixError> {
-        self.ensure_no_open_public_sql_transaction("export_image")?;
         self.backend.export_image(writer).await
     }
 

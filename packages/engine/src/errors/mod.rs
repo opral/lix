@@ -6,11 +6,10 @@ pub(crate) use catalog::ErrorCode;
 pub(crate) use catalog::FILE_DATA_EXPECTS_BYTES_MESSAGE;
 pub(crate) use catalog::{
     already_initialized_error, file_data_expects_bytes_error, internal_table_access_denied_error,
-    live_state_not_ready_error, mixed_public_internal_query_error, no_active_transaction_error,
-    not_initialized_error, operation_blocked_by_active_transaction_error,
+    live_state_not_ready_error, mixed_public_internal_query_error, not_initialized_error,
     read_only_view_write_error, schema_not_registered_error, sql_unknown_column_error,
-    sql_unknown_table_error, table_not_found_read_error, transaction_already_active_error,
-    transaction_control_statement_denied_error, transaction_writer_key_conflict_error,
-    unexpected_statement_count_error, vtable_schema_key_required_error,
+    sql_unknown_table_error, table_not_found_read_error,
+    transaction_control_statement_denied_error, unexpected_statement_count_error,
+    vtable_schema_key_required_error,
 };
 pub use r#type::LixError;

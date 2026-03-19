@@ -27,7 +27,6 @@ struct ParsedSchema {
 
 impl Engine {
     pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
-        self.ensure_no_open_public_sql_transaction("install_plugin")?;
         let parsed = parse_plugin_archive(archive_bytes)?;
         ensure_valid_wasm_binary(&parsed.wasm_bytes)?;
 
