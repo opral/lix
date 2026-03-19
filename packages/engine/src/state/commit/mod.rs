@@ -23,9 +23,12 @@ pub(crate) use runtime::{
     load_commit_active_accounts, StatementBatch,
 };
 pub(crate) use state_source::{
+    load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,
     load_committed_version_head_commit_id_from_live_state,
+    load_exact_committed_state_row_from_commit_with_executor,
     load_exact_committed_state_row_from_live_state, load_version_info_for_versions,
-    CommitQueryExecutor, ExactCommittedStateRow, ExactCommittedStateRowRequest,
+    CommitLineageEntry, CommitQueryExecutor, CommittedCanonicalChangeRow, ExactCommittedStateRow,
+    ExactCommittedStateRowRequest,
 };
 pub(crate) use types::ProposedDomainChange;
 pub(crate) use types::{
