@@ -2080,6 +2080,13 @@ fn entity_id_component_from_json_value(
                 pointer
             ),
         }),
+        JsonValue::String(text) if text.is_empty() => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "cannot derive entity_id from empty primary-key value at pointer '{}'",
+                pointer
+            ),
+        }),
         JsonValue::String(text) => Ok(text.clone()),
         JsonValue::Bool(flag) => Ok(flag.to_string()),
         JsonValue::Number(number) => Ok(number.to_string()),
