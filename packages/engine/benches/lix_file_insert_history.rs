@@ -452,6 +452,20 @@ impl LixBackend for TracingBenchBackend {
             collector: Arc::clone(&self.collector),
         }))
     }
+
+    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        let started = std::time::Instant::now();
+        let tx = self.inner.begin_savepoint(name).await?;
+        self.collector.push(
+            "begin_savepoint",
+            Some(name),
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        Ok(Box::new(TracingBenchTransaction {
+            inner: tx,
+            collector: Arc::clone(&self.collector),
+        }))
+    }
 }
 
 #[async_trait(?Send)]
