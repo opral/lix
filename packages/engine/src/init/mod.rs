@@ -89,6 +89,17 @@ const INIT_STATEMENTS: &[&str] = &[
      )",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_last_checkpoint_commit \
      ON lix_internal_last_checkpoint (checkpoint_commit_id)",
+    "CREATE TABLE IF NOT EXISTS lix_internal_undo_redo_operation (\
+     version_id TEXT NOT NULL,\
+     operation_commit_id TEXT PRIMARY KEY,\
+     operation_kind TEXT NOT NULL,\
+     target_commit_id TEXT NOT NULL,\
+     created_at TEXT NOT NULL\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_undo_redo_operation_version_created \
+     ON lix_internal_undo_redo_operation (version_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_undo_redo_operation_target \
+     ON lix_internal_undo_redo_operation (target_commit_id)",
     "CREATE TABLE IF NOT EXISTS lix_internal_entity_state_timeline_breakpoint (\
      root_commit_id TEXT NOT NULL,\
      entity_id TEXT NOT NULL,\

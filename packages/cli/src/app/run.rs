@@ -16,7 +16,9 @@ pub fn run() -> Result<(), CliError> {
     let output = match cli.command {
         Command::Exp(exp_command) => commands::exp::run(&context, exp_command),
         Command::Init(init_command) => commands::init::run(init_command),
+        Command::Redo(redo_command) => commands::redo::run(&context, redo_command),
         Command::Sql(sql_command) => commands::sql::run(&context, sql_command),
+        Command::Undo(undo_command) => commands::undo::run(&context, undo_command),
     }?;
 
     if !no_hints {

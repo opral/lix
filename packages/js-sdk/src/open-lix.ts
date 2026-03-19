@@ -50,6 +50,28 @@ export type CreateCheckpointResult = {
 	changeSetId: string;
 };
 
+export type UndoOptions = {
+	/** Target `lix_version.id`. If omitted, uses the active `versionId`. */
+	versionId?: string;
+};
+
+export type RedoOptions = {
+	/** Target `lix_version.id`. If omitted, uses the active `versionId`. */
+	versionId?: string;
+};
+
+export type UndoResult = {
+	versionId: string;
+	targetCommitId: string;
+	inverseCommitId: string;
+};
+
+export type RedoResult = {
+	versionId: string;
+	targetCommitId: string;
+	replayCommitId: string;
+};
+
 export type ObserveQuery = {
 	sql: string;
 	params?: ReadonlyArray<LixRuntimeValue>;
@@ -89,6 +111,8 @@ export type Lix = {
 	observe(query: ObserveQuery): ObserveEvents;
 	createVersion(args?: CreateVersionOptions): Promise<CreateVersionResult>;
 	createCheckpoint(): Promise<CreateCheckpointResult>;
+	undo(args?: UndoOptions): Promise<UndoResult>;
+	redo(args?: RedoOptions): Promise<RedoResult>;
 	switchVersion(versionId: string): Promise<void>;
 	installPlugin(
 		args: InstallPluginOptions | Uint8Array | ArrayBuffer,
@@ -329,6 +353,80 @@ export async function openLix(
 		return { id, changeSetId };
 	};
 
+	const undo = async (args2: UndoOptions = {}): Promise<UndoResult> => {
+		ensureOpen("undo");
+		if (typeof (wasmLix as any).undo !== "function") {
+			throw new Error("undo is not available in this wasm build");
+		}
+		if (
+			args2.versionId !== undefined &&
+			(typeof args2.versionId !== "string" || args2.versionId.length === 0)
+		) {
+			throw new Error("undo requires versionId to be a non-empty string");
+		}
+		const raw = await runQueued(() => (wasmLix as any).undo(args2));
+		if (!raw || typeof raw !== "object") {
+			throw new Error("undo() must return an object");
+		}
+		const versionId = (raw as { versionId?: unknown }).versionId;
+		const targetCommitId = (raw as { targetCommitId?: unknown }).targetCommitId;
+		const inverseCommitId =
+			(raw as { inverseCommitId?: unknown }).inverseCommitId;
+		if (typeof versionId !== "string" || versionId.length === 0) {
+			throw new Error("undo() result is missing string versionId");
+		}
+		if (
+			typeof targetCommitId !== "string" ||
+			targetCommitId.length === 0
+		) {
+			throw new Error("undo() result is missing string targetCommitId");
+		}
+		if (
+			typeof inverseCommitId !== "string" ||
+			inverseCommitId.length === 0
+		) {
+			throw new Error("undo() result is missing string inverseCommitId");
+		}
+		return { versionId, targetCommitId, inverseCommitId };
+	};
+
+	const redo = async (args2: RedoOptions = {}): Promise<RedoResult> => {
+		ensureOpen("redo");
+		if (typeof (wasmLix as any).redo !== "function") {
+			throw new Error("redo is not available in this wasm build");
+		}
+		if (
+			args2.versionId !== undefined &&
+			(typeof args2.versionId !== "string" || args2.versionId.length === 0)
+		) {
+			throw new Error("redo requires versionId to be a non-empty string");
+		}
+		const raw = await runQueued(() => (wasmLix as any).redo(args2));
+		if (!raw || typeof raw !== "object") {
+			throw new Error("redo() must return an object");
+		}
+		const versionId = (raw as { versionId?: unknown }).versionId;
+		const targetCommitId = (raw as { targetCommitId?: unknown }).targetCommitId;
+		const replayCommitId =
+			(raw as { replayCommitId?: unknown }).replayCommitId;
+		if (typeof versionId !== "string" || versionId.length === 0) {
+			throw new Error("redo() result is missing string versionId");
+		}
+		if (
+			typeof targetCommitId !== "string" ||
+			targetCommitId.length === 0
+		) {
+			throw new Error("redo() result is missing string targetCommitId");
+		}
+		if (
+			typeof replayCommitId !== "string" ||
+			replayCommitId.length === 0
+		) {
+			throw new Error("redo() result is missing string replayCommitId");
+		}
+		return { versionId, targetCommitId, replayCommitId };
+	};
+
 	const export_image = async (): Promise<Uint8Array> => {
 		ensureOpen("export_image");
 		if (typeof (wasmLix as any).export_image !== "function") {
@@ -394,6 +492,8 @@ export async function openLix(
 		observe,
 		createVersion,
 		createCheckpoint,
+		undo,
+		redo,
 		switchVersion,
 		installPlugin,
 		export_image,

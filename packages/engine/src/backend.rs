@@ -130,6 +130,20 @@ impl QueryExecutor for Box<dyn LixTransaction + '_> {
 }
 
 #[async_trait(?Send)]
+impl<T> QueryExecutor for &mut T
+where
+    T: LixTransaction + ?Sized,
+{
+    fn dialect(&self) -> SqlDialect {
+        (**self).dialect()
+    }
+
+    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        (**self).execute(sql, params).await
+    }
+}
+
+#[async_trait(?Send)]
 pub trait LixTransaction {
     fn dialect(&self) -> SqlDialect;
 

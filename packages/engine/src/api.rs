@@ -295,6 +295,32 @@ impl Engine {
         crate::state::checkpoint::create_checkpoint(self).await
     }
 
+    pub async fn undo(&self) -> Result<crate::UndoResult, LixError> {
+        self.ensure_no_open_public_sql_transaction("undo")?;
+        crate::undo_redo::undo(self).await
+    }
+
+    pub async fn undo_with_options(
+        &self,
+        options: crate::UndoOptions,
+    ) -> Result<crate::UndoResult, LixError> {
+        self.ensure_no_open_public_sql_transaction("undo")?;
+        crate::undo_redo::undo_with_options(self, options).await
+    }
+
+    pub async fn redo(&self) -> Result<crate::RedoResult, LixError> {
+        self.ensure_no_open_public_sql_transaction("redo")?;
+        crate::undo_redo::redo(self).await
+    }
+
+    pub async fn redo_with_options(
+        &self,
+        options: crate::RedoOptions,
+    ) -> Result<crate::RedoResult, LixError> {
+        self.ensure_no_open_public_sql_transaction("redo")?;
+        crate::undo_redo::redo_with_options(self, options).await
+    }
+
     pub async fn create_version(
         &self,
         options: crate::CreateVersionOptions,
