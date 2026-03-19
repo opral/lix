@@ -23,6 +23,15 @@ fn i64_value(value: &lix_engine::Value, field: &str) -> i64 {
     }
 }
 
+fn assert_uuid_v7_like(value: &str, field: &str) {
+    assert_eq!(value.len(), 36, "expected {field} to be uuid-like, got {value}");
+    assert_eq!(
+        value.chars().nth(14),
+        Some('7'),
+        "expected {field} to be uuid v7-like, got {value}"
+    );
+}
+
 async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let result = engine
         .execute(
@@ -704,6 +713,45 @@ simulation_test!(
 );
 
 simulation_test!(
+    init_seeds_bootstrap_commit_and_change_set_with_uuid_ids,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+
+        engine.initialize().await.unwrap();
+
+        let commit_id = global_version_commit_id(&engine).await;
+        sim.assert_deterministic(commit_id.clone());
+        assert_uuid_v7_like(&commit_id, "bootstrap commit id");
+        assert_ne!(
+            commit_id, "00000000-0000-7000-8000-000000000002",
+            "bootstrap commit id must not use the old sentinel"
+        );
+
+        let change_set_result = engine
+            .execute(
+                "SELECT change_set_id \
+                 FROM lix_commit \
+                 WHERE id = $1 \
+                 LIMIT 1",
+                &[lix_engine::Value::Text(commit_id.clone())],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic(change_set_result.statements[0].rows.clone());
+        assert_eq!(change_set_result.statements[0].rows.len(), 1);
+        let change_set_id = text_value(&change_set_result.statements[0].rows[0][0], "change_set_id");
+        assert_uuid_v7_like(&change_set_id, "bootstrap change_set_id");
+        assert_ne!(
+            change_set_id, "00000000-0000-7000-8000-000000000001",
+            "bootstrap change set id must not use the old sentinel"
+        );
+    }
+);
+
+simulation_test!(
     init_seeds_main_version_and_global_checkpoint_pointers,
     |sim| async move {
         let engine = sim
@@ -1085,3 +1133,42 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
         active_result.statements[0].rows[2][1]
     );
 });
+
+simulation_test!(
+    init_seeds_global_system_directories_with_uuid_ids,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute(
+                "SELECT id, path \
+                 FROM lix_directory \
+                 WHERE path IN ('/.lix/', '/.lix/app_data/', '/.lix/plugins/') \
+                 ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.statements[0].rows.len(), 3);
+        for row in &result.statements[0].rows {
+            let lix_engine::Value::Text(id) = &row[0] else {
+                panic!("expected text id for seeded system directory, got {:?}", row[0]);
+            };
+            assert!(
+                !id.starts_with("dir:auto::"),
+                "expected seeded system directory id to be uuid-based, got {id}"
+            );
+            assert_eq!(
+                id.len(),
+                36,
+                "expected seeded system directory id to look like a UUID, got {id}"
+            );
+        }
+    }
+);
