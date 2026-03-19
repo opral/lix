@@ -1,3 +1,4 @@
+use super::{checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot};
 use crate::{errors, Engine, EngineTransaction, ExecuteOptions, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -153,8 +154,7 @@ async fn ensure_checkpoint_label_on_commit(
     tx: &mut EngineTransaction<'_>,
     commit_id: &str,
 ) -> Result<(), LixError> {
-    let checkpoint_label_id = load_checkpoint_label_id(tx).await?;
-    let state_entity_id = format!("{commit_id}~lix_commit~lix~{checkpoint_label_id}");
+    let state_entity_id = checkpoint_commit_label_entity_id(commit_id);
     let exists = tx
         .execute_internal(
             "SELECT 1 \
@@ -183,67 +183,17 @@ async fn ensure_checkpoint_label_on_commit(
     }
 
     tx.execute_internal(
-        "DELETE FROM lix_internal_state_vtable \
-         WHERE entity_id = $1 \
-           AND schema_key = 'lix_entity_label' \
-           AND file_id = 'lix' \
-           AND version_id = $2",
-        &[
-            Value::Text(state_entity_id.clone()),
-            Value::Text(crate::version::GLOBAL_VERSION_ID.to_string()),
-        ],
-    )
-    .await?;
-    tx.execute_internal(
         "INSERT INTO lix_internal_state_vtable (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
          ) VALUES ($1, 'lix_entity_label', 'lix', $2, 'lix', $3, '1', true)",
         &[
             Value::Text(state_entity_id),
             Value::Text(crate::version::GLOBAL_VERSION_ID.to_string()),
-            Value::Text(
-                serde_json::json!({
-                    "entity_id": commit_id,
-                    "schema_key": "lix_commit",
-                    "file_id": "lix",
-                    "label_id": checkpoint_label_id,
-                })
-                .to_string(),
-            ),
+            Value::Text(checkpoint_commit_label_snapshot(commit_id)),
         ],
     )
     .await?;
     Ok(())
-}
-
-async fn load_checkpoint_label_id(tx: &mut EngineTransaction<'_>) -> Result<String, LixError> {
-    let result = tx
-        .execute(
-            "SELECT id \
-             FROM lix_label \
-             WHERE name = 'checkpoint' \
-               AND lixcol_global = true \
-             LIMIT 1",
-            &[],
-        )
-        .await?;
-    let [statement] = result.statements.as_slice() else {
-        return Err(errors::unexpected_statement_count_error(
-            "checkpoint label lookup query",
-            1,
-            result.statements.len(),
-        ));
-    };
-    if let Some(row) = statement.rows.first() {
-        let label_id = text_at(row, 0, "id")?;
-        if !label_id.is_empty() {
-            return Ok(label_id);
-        }
-    }
-    Err(LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "checkpoint label row is missing in the global lane".to_string(),
-    })
 }
 
 fn text_at(row: &[Value], index: usize, field: &str) -> Result<String, LixError> {

@@ -30,9 +30,11 @@ use crate::sql::public::planner::ir::{
     InsertOnConflictAction, PlannedStateRow, PlannedWrite, ResolvedWritePlan, WriteMode,
     WriteOperationKind,
 };
+use crate::state::checkpoint::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME};
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+const CHECKPOINT_LABEL_SCHEMA_KEY: &str = "lix_label";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const REGISTERED_SCHEMA_FILE_ID: &str = "lix";
 const REGISTERED_SCHEMA_PLUGIN_KEY: &str = "lix";
@@ -223,6 +225,12 @@ pub async fn validate_updates(
             let snapshot = resolve_update_snapshot(plan, &base_snapshot, &schema_key)?;
             let storage = storage_kind_for_table(&plan.table);
 
+            validate_checkpoint_label_mutation(
+                &schema_key,
+                Some(&base_snapshot),
+                snapshot.as_ref(),
+            )?;
+
             if schema_key == REGISTERED_SCHEMA_KEY {
                 if let Some(snapshot) = snapshot.as_ref() {
                     validate_registered_schema_snapshot(&mut schema_provider, snapshot).await?;
@@ -355,6 +363,27 @@ async fn validate_planned_write(
             .is_some_and(|conflict| conflict.action == InsertOnConflictAction::DoUpdate);
     let pending_rows = collect_constraint_candidates(resolved, shadows_committed_identity)?;
     let deleted_rows = collect_delete_candidates(resolved)?;
+    let updated_identities = resolved
+        .intended_post_state()
+        .filter(|row| !row.tombstone)
+        .map(planned_state_row_identity)
+        .collect::<Result<HashSet<_>, _>>()?;
+
+    for deleted_row in &deleted_rows {
+        validate_checkpoint_label_mutation(
+            &deleted_row.identity.schema_key,
+            Some(&deleted_row.snapshot),
+            None,
+        )?;
+    }
+
+    for row in resolved.authoritative_pre_state_rows() {
+        if !updated_identities.contains(&planned_state_row_identity(row)?) {
+            continue;
+        }
+        let snapshot = planned_row_snapshot(row)?;
+        validate_checkpoint_label_mutation(&row.schema_key, snapshot.as_ref(), None)?;
+    }
 
     if planned_write.command.operation_kind == WriteOperationKind::Update {
         for row in resolved.intended_post_state() {
@@ -708,6 +737,7 @@ async fn validate_planned_row(
         row.schema_key.clone(),
         planned_row_required_text(row, "schema_version")?,
     );
+    validate_checkpoint_label_mutation(&row.schema_key, None, Some(&snapshot))?;
     validate_snapshot_content(provider, cache, &key, &snapshot).await?;
     validate_entity_id_matches_primary_key(provider, &key, &row.entity_id, &snapshot).await?;
 
@@ -754,6 +784,38 @@ fn extract_registered_schema_value(snapshot: &JsonValue) -> Result<&JsonValue, L
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "registered schema snapshot_content missing value".to_string(),
     })
+}
+
+fn is_checkpoint_label_snapshot(snapshot: &JsonValue) -> bool {
+    snapshot
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|id| id == CHECKPOINT_LABEL_ID)
+        || snapshot
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|name| name == CHECKPOINT_LABEL_NAME)
+}
+
+fn validate_checkpoint_label_mutation(
+    schema_key: &str,
+    before: Option<&JsonValue>,
+    after: Option<&JsonValue>,
+) -> Result<(), LixError> {
+    if schema_key != CHECKPOINT_LABEL_SCHEMA_KEY {
+        return Ok(());
+    }
+
+    if before.is_some_and(is_checkpoint_label_snapshot)
+        || after.is_some_and(is_checkpoint_label_snapshot)
+    {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "checkpoint label is system-managed and cannot be inserted, updated, or deleted",
+        ));
+    }
+
+    Ok(())
 }
 
 async fn validate_registered_schema_snapshot<P: SchemaProvider + ?Sized>(
@@ -1936,6 +1998,15 @@ fn planned_row_required_text(row: &PlannedStateRow, name: &str) -> Result<String
     })
 }
 
+fn planned_state_row_identity(row: &PlannedStateRow) -> Result<ConstraintRowIdentity, LixError> {
+    Ok(ConstraintRowIdentity {
+        entity_id: row.entity_id.clone(),
+        schema_key: row.schema_key.clone(),
+        file_id: planned_row_required_text(row, "file_id")?,
+        version_id: planned_row_required_text(row, "version_id")?,
+    })
+}
+
 fn planned_row_snapshot(row: &PlannedStateRow) -> Result<Option<JsonValue>, LixError> {
     let Some(value) = row.values.get("snapshot_content") else {
         return Ok(None);
@@ -2119,4 +2190,64 @@ fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        validate_checkpoint_label_mutation, CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn checkpoint_label_insert_is_rejected() {
+        let error = validate_checkpoint_label_mutation(
+            CHECKPOINT_LABEL_SCHEMA_KEY,
+            None,
+            Some(&json!({ "id": "label-1", "name": CHECKPOINT_LABEL_NAME })),
+        )
+        .expect_err("checkpoint label insert should be rejected");
+
+        assert!(error
+            .description
+            .contains("checkpoint label is system-managed"));
+    }
+
+    #[test]
+    fn checkpoint_label_update_is_rejected() {
+        let error = validate_checkpoint_label_mutation(
+            CHECKPOINT_LABEL_SCHEMA_KEY,
+            Some(&json!({ "id": "label-1", "name": CHECKPOINT_LABEL_NAME })),
+            Some(&json!({ "id": "label-1", "name": "renamed" })),
+        )
+        .expect_err("checkpoint label update should be rejected");
+
+        assert!(error
+            .description
+            .contains("checkpoint label is system-managed"));
+    }
+
+    #[test]
+    fn checkpoint_label_delete_is_rejected() {
+        let error = validate_checkpoint_label_mutation(
+            CHECKPOINT_LABEL_SCHEMA_KEY,
+            Some(&json!({ "id": "label-1", "name": CHECKPOINT_LABEL_NAME })),
+            None,
+        )
+        .expect_err("checkpoint label delete should be rejected");
+
+        assert!(error
+            .description
+            .contains("checkpoint label is system-managed"));
+    }
+
+    #[test]
+    fn non_checkpoint_labels_remain_mutable() {
+        validate_checkpoint_label_mutation(
+            CHECKPOINT_LABEL_SCHEMA_KEY,
+            Some(&json!({ "id": "label-1", "name": "release" })),
+            Some(&json!({ "id": "label-1", "name": "renamed-release" })),
+        )
+        .expect("non-checkpoint labels should remain mutable");
+    }
 }

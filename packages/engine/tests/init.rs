@@ -6,6 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lix_engine::{boot, BootArgs, NoopWasmRuntime};
 
+const CHECKPOINT_LABEL_ID: &str = "lix_label_checkpoint";
+
 fn text_value(value: &lix_engine::Value, field: &str) -> String {
     match value {
         lix_engine::Value::Text(value) => value.clone(),
@@ -699,10 +701,7 @@ simulation_test!(
             lix_engine::Value::Text(value) => value.clone(),
             other => panic!("expected text change_set_id for commit, got {other:?}"),
         };
-        assert!(
-            !change_set_id.is_empty(),
-            "bootstrap commit must reference a non-empty change_set_id"
-        );
+        assert_uuid_v7_like(&change_set_id, "bootstrap change_set_id");
 
         let change_set_exists = engine
             .execute(
@@ -966,7 +965,6 @@ simulation_test!(
             .unwrap();
 
         let mut has_checkpoint = false;
-        let mut checkpoint_label_id: Option<String> = None;
         for row in &result.statements[0].rows {
             let row_entity_id = match &row[0] {
                 lix_engine::Value::Text(value) => value.clone(),
@@ -985,14 +983,12 @@ simulation_test!(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(row_entity_id.as_str())
                     .to_string();
-                checkpoint_label_id = Some(label_id);
+                assert_eq!(label_id, CHECKPOINT_LABEL_ID);
                 break;
             }
         }
 
         assert!(has_checkpoint, "expected checkpoint label in global lane");
-        let checkpoint_label_id =
-            checkpoint_label_id.expect("checkpoint label id should be present");
         let global_commit_id = global_version_commit_id(&engine).await;
 
         let checkpoint_links = engine
@@ -1005,7 +1001,7 @@ simulation_test!(
                    AND label_id = $2",
                 &[
                     lix_engine::Value::Text(global_commit_id),
-                    lix_engine::Value::Text(checkpoint_label_id),
+                    lix_engine::Value::Text(CHECKPOINT_LABEL_ID.to_string()),
                 ],
             )
             .await
@@ -1014,6 +1010,22 @@ simulation_test!(
             checkpoint_links.statements[0].rows.len(),
             1,
             "expected exactly one checkpoint label link for bootstrap commit"
+        );
+
+        let tracked = engine
+            .execute(
+                "SELECT lixcol_untracked \
+                 FROM lix_label \
+                 WHERE id = $1 \
+                 LIMIT 1",
+                &[lix_engine::Value::Text(CHECKPOINT_LABEL_ID.to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(tracked.statements[0].rows.len(), 1);
+        assert_eq!(
+            tracked.statements[0].rows[0][0],
+            lix_engine::Value::Boolean(false)
         );
     }
 );
@@ -1025,17 +1037,14 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
         .expect("boot_simulated_engine should succeed");
 
     engine.initialize().await.unwrap();
-    let active_version_id = active_version_id(&engine).await;
 
     let result = engine
         .execute(
-            "SELECT path, hidden \
-                 FROM lix_directory_by_version \
-                 WHERE lixcol_version_id = $1 \
-                   AND lixcol_global = true \
-                   AND path IN ('/.lix/', '/.lix/app_data/', '/.lix/plugins/') \
+            "SELECT path, hidden, lixcol_untracked \
+                 FROM lix_directory \
+                 WHERE path IN ('/.lix/', '/.lix/app_data/', '/.lix/plugins/') \
                  ORDER BY path",
-            &[lix_engine::Value::Text(active_version_id)],
+            &[],
         )
         .await
         .unwrap();
@@ -1057,6 +1066,10 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
         result.statements[0].rows[0][1]
     );
     assert_eq!(
+        result.statements[0].rows[0][2],
+        lix_engine::Value::Boolean(false)
+    );
+    assert_eq!(
         result.statements[0].rows[1][0],
         lix_engine::Value::Text("/.lix/app_data/".to_string())
     );
@@ -1069,6 +1082,10 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
         app_data_hidden,
         "expected hidden=true for /.lix/app_data/, got {:?}",
         result.statements[0].rows[1][1]
+    );
+    assert_eq!(
+        result.statements[0].rows[1][2],
+        lix_engine::Value::Boolean(false)
     );
     assert_eq!(
         result.statements[0].rows[2][0],
@@ -1084,61 +1101,9 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
         "expected hidden=true for /.lix/plugins/, got {:?}",
         result.statements[0].rows[2][1]
     );
-
-    let active_result = engine
-        .execute(
-            "SELECT path, hidden \
-                 FROM lix_directory \
-                 WHERE path IN ('/.lix/', '/.lix/app_data/', '/.lix/plugins/') \
-                 ORDER BY path",
-            &[],
-        )
-        .await
-        .unwrap();
-
-    sim.assert_deterministic(active_result.statements[0].rows.clone());
-    assert_eq!(active_result.statements[0].rows.len(), 3);
     assert_eq!(
-        active_result.statements[0].rows[0][0],
-        lix_engine::Value::Text("/.lix/".to_string())
-    );
-    let active_root_hidden = match &active_result.statements[0].rows[0][1] {
-        lix_engine::Value::Boolean(value) => *value,
-        lix_engine::Value::Text(value) => value == "true",
-        _ => false,
-    };
-    assert!(
-        active_root_hidden,
-        "expected hidden=true for /.lix/ in lix_directory, got {:?}",
-        active_result.statements[0].rows[0][1]
-    );
-    assert_eq!(
-        active_result.statements[0].rows[1][0],
-        lix_engine::Value::Text("/.lix/app_data/".to_string())
-    );
-    let active_app_data_hidden = match &active_result.statements[0].rows[1][1] {
-        lix_engine::Value::Boolean(value) => *value,
-        lix_engine::Value::Text(value) => value == "true",
-        _ => false,
-    };
-    assert!(
-        active_app_data_hidden,
-        "expected hidden=true for /.lix/app_data/ in lix_directory, got {:?}",
-        active_result.statements[0].rows[1][1]
-    );
-    assert_eq!(
-        active_result.statements[0].rows[2][0],
-        lix_engine::Value::Text("/.lix/plugins/".to_string())
-    );
-    let active_plugins_hidden = match &active_result.statements[0].rows[2][1] {
-        lix_engine::Value::Boolean(value) => *value,
-        lix_engine::Value::Text(value) => value == "true",
-        _ => false,
-    };
-    assert!(
-        active_plugins_hidden,
-        "expected hidden=true for /.lix/plugins/ in lix_directory, got {:?}",
-        active_result.statements[0].rows[2][1]
+        result.statements[0].rows[2][2],
+        lix_engine::Value::Boolean(false)
     );
 });
 

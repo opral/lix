@@ -65,6 +65,21 @@ impl Engine {
         Ok(uuid)
     }
 
+    pub(crate) async fn generate_runtime_timestamp(&self) -> Result<String, LixError> {
+        let (settings, sequence_start, functions) = self
+            .prepare_runtime_functions_with_backend(self.backend.as_ref(), false)
+            .await?;
+        let timestamp = functions.call_timestamp();
+        self.persist_runtime_sequence_with_backend(
+            self.backend.as_ref(),
+            settings,
+            sequence_start,
+            &functions,
+        )
+        .await?;
+        Ok(timestamp)
+    }
+
     pub(crate) async fn load_and_cache_active_version(&self) -> Result<(), LixError> {
         let layout = builtin_live_table_layout(active_version_schema_key())?.ok_or_else(|| {
             LixError::new(

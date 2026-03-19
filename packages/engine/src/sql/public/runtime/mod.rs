@@ -3953,6 +3953,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_and_change_set_public_writes_are_rejected_semantically() {
+        let backend = FakeBackend::default();
+
+        for sql in [
+            "INSERT INTO lix_commit (id, change_set_id) VALUES ('c1', 'cs1')",
+            "INSERT INTO lix_change_set (id) VALUES ('cs1')",
+        ] {
+            let error = prepare_public_execution(&backend, &parse_one(sql), &[], "main", None)
+                .await
+                .expect_err("read-only public write should be rejected by public lowering");
+            assert_eq!(error.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");
+        }
+    }
+
+    #[tokio::test]
     async fn prepares_bindable_cte_join_group_by_reads_via_surface_expansion() {
         let backend = FakeBackend::default();
         let prepared = prepare_public_read_strict(

@@ -686,9 +686,11 @@ fn entity_surface_capability(schema_key: &str, variant: SurfaceVariant) -> Surfa
     }
 
     match schema_key {
-        "lix_commit_edge" | "lix_change_set_element" | "lix_change_author" => {
-            SurfaceCapability::ReadOnly
-        }
+        "lix_commit"
+        | "lix_change_set"
+        | "lix_commit_edge"
+        | "lix_change_set_element"
+        | "lix_change_author" => SurfaceCapability::ReadOnly,
         _ => SurfaceCapability::ReadWrite,
     }
 }
@@ -1291,6 +1293,10 @@ mod tests {
     fn derived_builtin_entity_surfaces_are_read_only() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
         for surface in [
+            "lix_commit",
+            "lix_commit_by_version",
+            "lix_change_set",
+            "lix_change_set_by_version",
             "lix_change_author",
             "lix_change_author_by_version",
             "lix_change_set_element",

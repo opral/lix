@@ -414,6 +414,7 @@ async fn resolve_file_insert_write_plan(
     Ok(ResolvedWritePlan::from_partition(ResolvedWritePartition {
         execution_mode,
         authoritative_pre_state: Vec::new(),
+        authoritative_pre_state_rows: Vec::new(),
         intended_post_state,
         tombstones: Vec::new(),
         lineage,
@@ -448,6 +449,7 @@ async fn resolve_existing_file_write(
                 return Ok(ResolvedWritePlan::from_partition(ResolvedWritePartition {
                     execution_mode,
                     authoritative_pre_state: Vec::new(),
+                    authoritative_pre_state_rows: Vec::new(),
                     intended_post_state: Vec::new(),
                     tombstones: Vec::new(),
                     lineage: Vec::new(),
@@ -597,6 +599,7 @@ async fn resolve_existing_file_write(
                         planned_write.command.requested_mode,
                     ),
                     authoritative_pre_state: Vec::new(),
+                    authoritative_pre_state_rows: Vec::new(),
                     intended_post_state: Vec::new(),
                     tombstones: Vec::new(),
                     lineage: Vec::new(),

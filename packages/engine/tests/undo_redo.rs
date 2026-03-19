@@ -4,6 +4,8 @@ use lix_engine::{
     CreateVersionOptions, StateCommitStreamFilter, StateCommitStreamOperation, UndoOptions, Value,
 };
 
+const CHECKPOINT_LABEL_ID: &str = "lix_label_checkpoint";
+
 fn as_text(value: &Value) -> String {
     match value {
         Value::Text(text) => text.clone(),
@@ -43,6 +45,58 @@ async fn key_value_value(
         )
         .await
         .expect("key value query should succeed");
+    result.statements[0]
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .map(as_text)
+}
+
+async fn checkpoint_label_id(
+    engine: &support::simulation_test::SimulationEngine,
+) -> Option<String> {
+    let result = engine
+        .execute(
+            "SELECT id FROM lix_label WHERE id = $1 LIMIT 1",
+            &[Value::Text(CHECKPOINT_LABEL_ID.to_string())],
+        )
+        .await
+        .expect("checkpoint label query should succeed");
+    result.statements[0]
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .map(as_text)
+}
+
+async fn plugins_directory_id(
+    engine: &support::simulation_test::SimulationEngine,
+) -> Option<String> {
+    let result = engine
+        .execute(
+            "SELECT id FROM lix_directory WHERE path = '/.lix/plugins/' LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("plugins directory query should succeed");
+    result.statements[0]
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .map(as_text)
+}
+
+async fn directory_descriptor_exists(
+    engine: &support::simulation_test::SimulationEngine,
+    id: &str,
+) -> Option<String> {
+    let result = engine
+        .execute(
+            "SELECT id FROM lix_directory_descriptor WHERE id = $1 LIMIT 1",
+            &[Value::Text(id.to_string())],
+        )
+        .await
+        .expect("directory descriptor query should succeed");
     result.statements[0]
         .rows
         .first()
@@ -228,6 +282,68 @@ simulation_test!(undo_stops_after_last_user_commit, |sim| async move {
         error.description
     );
 });
+
+simulation_test!(checkpoint_label_delete_is_rejected, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine_deterministic()
+        .await
+        .expect("boot_simulated_engine_deterministic should succeed");
+    engine.initialize().await.expect("init should succeed");
+
+    let original_id = checkpoint_label_id(&engine)
+        .await
+        .expect("checkpoint label should exist after init");
+    let error = engine
+        .execute(
+            "DELETE FROM lix_label WHERE id = $1",
+            &[Value::Text(CHECKPOINT_LABEL_ID.to_string())],
+        )
+        .await
+        .expect_err("checkpoint label delete should fail");
+    assert!(
+        error
+            .description
+            .contains("checkpoint label is system-managed"),
+        "unexpected delete error: {error}"
+    );
+    assert_eq!(checkpoint_label_id(&engine).await, Some(original_id));
+});
+
+simulation_test!(
+    undo_restores_deleted_bootstrap_plugins_directory,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.initialize().await.expect("init should succeed");
+
+        let original_id = plugins_directory_id(&engine)
+            .await
+            .expect("plugins directory should exist after init");
+        engine
+            .execute(
+                "DELETE FROM lix_directory_descriptor WHERE id = $1",
+                &[Value::Text(original_id.clone())],
+            )
+            .await
+            .expect("bootstrap plugins directory delete should succeed");
+        assert_eq!(
+            directory_descriptor_exists(&engine, &original_id).await,
+            None
+        );
+
+        let undo = engine
+            .undo()
+            .await
+            .expect("undo should restore bootstrap directory");
+        assert!(!undo.target_commit_id.is_empty());
+        assert_eq!(
+            directory_descriptor_exists(&engine, &original_id).await,
+            Some(original_id)
+        );
+    }
+);
 
 simulation_test!(
     undo_redo_reverts_updates_to_prior_snapshot,

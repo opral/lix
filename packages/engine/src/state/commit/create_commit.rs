@@ -723,7 +723,38 @@ async fn proposed_domain_change_is_noop(
     .map_err(backend_error)?;
 
     match current {
-        None => Ok(change.snapshot_content.is_none()),
+        None => {
+            if change.snapshot_content.is_some() {
+                return Ok(false);
+            }
+            if change.version_id.as_str() == GLOBAL_VERSION_ID {
+                return Ok(true);
+            }
+
+            let global_current = load_exact_committed_state_row_from_live_state_with_executor(
+                executor,
+                &ExactCommittedStateRowRequest {
+                    entity_id: change.entity_id.to_string(),
+                    schema_key: change.schema_key.to_string(),
+                    version_id: GLOBAL_VERSION_ID.to_string(),
+                    exact_filters: BTreeMap::from([
+                        ("file_id".to_string(), Value::Text(file_id.to_string())),
+                        (
+                            "plugin_key".to_string(),
+                            Value::Text(plugin_key.to_string()),
+                        ),
+                        (
+                            "schema_version".to_string(),
+                            Value::Text(schema_version.to_string()),
+                        ),
+                    ]),
+                },
+            )
+            .await
+            .map_err(backend_error)?;
+
+            Ok(global_current.is_none())
+        }
         Some(current) => {
             let current_snapshot = current
                 .values

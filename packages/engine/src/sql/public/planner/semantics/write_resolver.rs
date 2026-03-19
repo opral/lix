@@ -80,6 +80,7 @@ impl ResolvedWritePartitionBuilder {
         (!self.is_empty()).then_some(ResolvedWritePartition {
             execution_mode,
             authoritative_pre_state: self.authoritative_pre_state,
+            authoritative_pre_state_rows: self.authoritative_pre_state_rows,
             intended_post_state: self.intended_post_state,
             tombstones: self.tombstones,
             lineage: self.lineage,
@@ -1125,6 +1126,7 @@ fn single_partition_write_plan(
     ResolvedWritePlan::from_partition(ResolvedWritePartition {
         execution_mode,
         authoritative_pre_state: builder.authoritative_pre_state,
+        authoritative_pre_state_rows: builder.authoritative_pre_state_rows,
         intended_post_state: builder.intended_post_state,
         tombstones: builder.tombstones,
         lineage: builder.lineage,

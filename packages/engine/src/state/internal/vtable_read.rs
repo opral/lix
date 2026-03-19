@@ -371,6 +371,15 @@ fn build_schema_winner_query(
     dialect: SqlDialect,
     has_version_predicate: bool,
 ) -> Result<String, LixError> {
+    if schema_key == "lix_registered_schema" {
+        return build_registered_schema_bootstrap_query(
+            access,
+            include_snapshot_content,
+            stripped_predicate,
+            dialect,
+        );
+    }
+
     let untracked_table = quote_ident(&untracked_live_table_name(schema_key));
     let tracked_table = quote_ident(&tracked_live_table_name(schema_key));
     let tracked_full_projection = access.normalized_projection_sql(Some("t"));
@@ -475,6 +484,57 @@ fn build_schema_winner_query(
         tracked_table = tracked_table,
         tracked_where = tracked_where,
         tracked_full_projection = tracked_full_projection,
+    ))
+}
+
+fn build_registered_schema_bootstrap_query(
+    _access: &LiveRowAccess,
+    include_snapshot_content: bool,
+    stripped_predicate: Option<&Expr>,
+    dialect: SqlDialect,
+) -> Result<String, LixError> {
+    let table = "lix_internal_registered_schema_bootstrap";
+    let where_sql = stripped_predicate
+        .map(|expr| {
+            if include_snapshot_content {
+                render_pushdown_predicate_for_schema_with_snapshot_expr(
+                    expr,
+                    &format!(
+                        "CASE WHEN {} THEN NULL ELSE {} END",
+                        format!("{} = 1", qualified_column_ref(Some("b"), "is_tombstone")),
+                        qualified_column_ref(Some("b"), "snapshot_content")
+                    ),
+                )
+            } else {
+                render_pushdown_predicate_for_schema(expr, "lix_registered_schema", dialect)
+            }
+        })
+        .transpose()?
+        .map(|predicate| format!(" WHERE ({predicate})"))
+        .unwrap_or_default();
+    let snapshot_projection = if include_snapshot_content {
+        "CASE WHEN b.is_tombstone = 1 THEN NULL ELSE b.snapshot_content END AS snapshot_content, "
+            .to_string()
+    } else {
+        String::new()
+    };
+    let snapshot_payload_projection = if include_snapshot_content {
+        ", snapshot_content".to_string()
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "SELECT entity_id, schema_key, file_id, version_id, plugin_key, {snapshot_projection}metadata, schema_version, \
+                created_at, updated_at, global, change_id, writer_key, false AS untracked \
+         FROM (\
+             SELECT entity_id, schema_key, file_id, version_id, plugin_key, metadata, schema_version, \
+                    created_at, updated_at, global, change_id, writer_key, is_tombstone{snapshot_payload_projection} \
+             FROM {table} b{where_sql} \
+         ) AS b",
+        snapshot_projection = snapshot_projection,
+        snapshot_payload_projection = snapshot_payload_projection,
+        table = table,
+        where_sql = where_sql,
     ))
 }
 
@@ -994,7 +1054,7 @@ struct SnapshotContentPredicateRewriter {
 impl VisitorMut for SnapshotContentPredicateRewriter {
     type Break = LixError;
 
-    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         if expr_last_identifier_eq(expr, "snapshot_content") {
             *expr = self.replacement.clone();
         }
@@ -1162,4 +1222,36 @@ fn numbered_placeholders(start: usize, count: usize) -> String {
         .map(|offset| format!("${}", start + offset))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_pushdown_predicate_for_schema_with_snapshot_expr;
+    use crate::LixError;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse_expr(sql: &str) -> Result<sqlparser::ast::Expr, LixError> {
+        Parser::new(&GenericDialect {})
+            .try_with_sql(sql)
+            .map_err(|error| LixError::unknown(error.to_string()))?
+            .parse_expr()
+            .map_err(|error| LixError::unknown(error.to_string()))
+    }
+
+    #[test]
+    fn registered_schema_snapshot_predicate_rewrite_does_not_rewrite_inside_replacement() {
+        let predicate = parse_expr("snapshot_content IS NOT NULL").expect("predicate should parse");
+
+        let rewritten = render_pushdown_predicate_for_schema_with_snapshot_expr(
+            &predicate,
+            "CASE WHEN b.is_tombstone = 1 THEN NULL ELSE b.snapshot_content END",
+        )
+        .expect("rewrite should succeed");
+
+        assert_eq!(
+            rewritten,
+            "CASE WHEN b.is_tombstone = 1 THEN NULL ELSE b.snapshot_content END IS NOT NULL"
+        );
+    }
 }
