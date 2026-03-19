@@ -68,7 +68,7 @@ async fn undo_in_transaction(
                     inverse_changes.push(build_tombstone_proposed_change(
                         &version_id,
                         &effect.forward_change,
-                    ));
+                    )?);
                     state_commit_stream_changes.push(
                         crate::state::stream::StateCommitStreamChange {
                             operation: crate::state::stream::StateCommitStreamOperation::Delete,
@@ -95,12 +95,24 @@ async fn undo_in_transaction(
                     state_commit_stream_changes.push(
                         crate::state::stream::StateCommitStreamChange {
                             operation: crate::state::stream::StateCommitStreamOperation::Update,
-                            entity_id: restored.entity_id.clone(),
-                            schema_key: restored.schema_key.clone(),
-                            schema_version: restored.schema_version.clone().unwrap_or_default(),
-                            file_id: restored.file_id.clone().unwrap_or_default(),
+                            entity_id: restored.entity_id.to_string(),
+                            schema_key: restored.schema_key.to_string(),
+                            schema_version: restored
+                                .schema_version
+                                .clone()
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                            file_id: restored
+                                .file_id
+                                .clone()
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
                             version_id: version_id.clone(),
-                            plugin_key: restored.plugin_key.clone().unwrap_or_default(),
+                            plugin_key: restored
+                                .plugin_key
+                                .clone()
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
                             snapshot_content: restored
                                 .snapshot_content
                                 .as_deref()
@@ -128,12 +140,24 @@ async fn undo_in_transaction(
                     state_commit_stream_changes.push(
                         crate::state::stream::StateCommitStreamChange {
                             operation: crate::state::stream::StateCommitStreamOperation::Insert,
-                            entity_id: restored.entity_id.clone(),
-                            schema_key: restored.schema_key.clone(),
-                            schema_version: restored.schema_version.clone().unwrap_or_default(),
-                            file_id: restored.file_id.clone().unwrap_or_default(),
+                            entity_id: restored.entity_id.to_string(),
+                            schema_key: restored.schema_key.to_string(),
+                            schema_version: restored
+                                .schema_version
+                                .clone()
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                            file_id: restored
+                                .file_id
+                                .clone()
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
                             version_id: version_id.clone(),
-                            plugin_key: restored.plugin_key.clone().unwrap_or_default(),
+                            plugin_key: restored
+                                .plugin_key
+                                .clone()
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
                             snapshot_content: restored
                                 .snapshot_content
                                 .as_deref()

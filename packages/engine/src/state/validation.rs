@@ -6,6 +6,9 @@ use std::sync::{Arc, RwLock};
 use jsonschema::JSONSchema;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use crate::identity::{
+    derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
+};
 use crate::schema::live_layout::{
     is_untracked_live_table, load_live_row_access_for_table_name,
     load_live_row_access_with_backend, logical_snapshot_from_projected_row,
@@ -2021,7 +2024,8 @@ async fn validate_entity_id_matches_primary_key<P: SchemaProvider + ?Sized>(
         return Ok(());
     }
 
-    let mut parts = Vec::with_capacity(primary_key.len());
+    let mut pointer_paths = Vec::with_capacity(primary_key.len());
+    let mut pointer_labels = Vec::with_capacity(primary_key.len());
     for pointer_value in primary_key {
         let pointer = pointer_value.as_str().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -2040,22 +2044,33 @@ async fn validate_entity_id_matches_primary_key<P: SchemaProvider + ?Sized>(
                 ),
             });
         }
-
-        let value = json_pointer_get(snapshot, &pointer_path).ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                "entity_id '{}' is inconsistent for schema '{}' ({}): missing primary-key field at pointer '{}'",
-                entity_id, key.schema_key, key.schema_version, pointer
-            ),
-        })?;
-        parts.push(entity_id_component_from_json_value(value, pointer)?);
+        pointer_labels.push(pointer.to_string());
+        pointer_paths.push(pointer_path);
     }
 
-    let expected = if parts.len() == 1 {
-        parts.pop().unwrap()
-    } else {
-        parts.join("~")
-    };
+    let expected = derive_entity_id_from_json_paths(snapshot, &pointer_paths).map_err(|error| {
+        let description = match error {
+            EntityIdDerivationError::EmptyPrimaryKeyPath { index: _ } => format!(
+                "schema '{}' ({}) has invalid empty x-lix-primary-key pointer",
+                key.schema_key, key.schema_version
+            ),
+            EntityIdDerivationError::MissingPrimaryKeyValue { index } => format!(
+                "entity_id '{}' is inconsistent for schema '{}' ({}): missing primary-key field at pointer '{}'",
+                entity_id, key.schema_key, key.schema_version, pointer_labels[index]
+            ),
+            EntityIdDerivationError::NullPrimaryKeyValue { index } => format!(
+                "cannot derive entity_id from null primary-key value at pointer '{}'",
+                pointer_labels[index]
+            ),
+            EntityIdDerivationError::EmptyPrimaryKeyValue { index } => format!(
+                "cannot derive entity_id from empty primary-key value at pointer '{}'",
+                pointer_labels[index]
+            ),
+        };
+        LixError::unknown(description)
+    })?;
 
-    if expected != entity_id {
+    if expected.as_str() != entity_id {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
@@ -2066,32 +2081,6 @@ async fn validate_entity_id_matches_primary_key<P: SchemaProvider + ?Sized>(
     }
 
     Ok(())
-}
-
-fn entity_id_component_from_json_value(
-    value: &JsonValue,
-    pointer: &str,
-) -> Result<String, LixError> {
-    match value {
-        JsonValue::Null => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "cannot derive entity_id from null primary-key value at pointer '{}'",
-                pointer
-            ),
-        }),
-        JsonValue::String(text) if text.is_empty() => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "cannot derive entity_id from empty primary-key value at pointer '{}'",
-                pointer
-            ),
-        }),
-        JsonValue::String(text) => Ok(text.clone()),
-        JsonValue::Bool(flag) => Ok(flag.to_string()),
-        JsonValue::Number(number) => Ok(number.to_string()),
-        JsonValue::Array(_) | JsonValue::Object(_) => Ok(value.to_string()),
-    }
 }
 
 fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
@@ -2130,21 +2119,4 @@ fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
         }
     }
     Ok(out)
-}
-
-fn json_pointer_get<'a>(value: &'a JsonValue, pointer: &[String]) -> Option<&'a JsonValue> {
-    let mut current = value;
-    for segment in pointer {
-        match current {
-            JsonValue::Object(object) => {
-                current = object.get(segment)?;
-            }
-            JsonValue::Array(array) => {
-                let index = segment.parse::<usize>().ok()?;
-                current = array.get(index)?;
-            }
-            _ => return None,
-        }
-    }
-    Some(current)
 }

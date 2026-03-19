@@ -62,15 +62,27 @@ async fn redo_in_transaction(
         let mut forward_changes = Vec::with_capacity(effects.len());
         let mut state_commit_stream_changes = Vec::with_capacity(effects.len());
         for effect in &effects {
-            let proposed = build_forward_proposed_change(&version_id, &effect.forward_change);
+            let proposed = build_forward_proposed_change(&version_id, &effect.forward_change)?;
             state_commit_stream_changes.push(crate::state::stream::StateCommitStreamChange {
                 operation: effect.forward_operation,
-                entity_id: proposed.entity_id.clone(),
-                schema_key: proposed.schema_key.clone(),
-                schema_version: proposed.schema_version.clone().unwrap_or_default(),
-                file_id: proposed.file_id.clone().unwrap_or_default(),
+                entity_id: proposed.entity_id.to_string(),
+                schema_key: proposed.schema_key.to_string(),
+                schema_version: proposed
+                    .schema_version
+                    .clone()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                file_id: proposed
+                    .file_id
+                    .clone()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
                 version_id: version_id.clone(),
-                plugin_key: proposed.plugin_key.clone().unwrap_or_default(),
+                plugin_key: proposed
+                    .plugin_key
+                    .clone()
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
                 snapshot_content: proposed
                     .snapshot_content
                     .as_deref()
