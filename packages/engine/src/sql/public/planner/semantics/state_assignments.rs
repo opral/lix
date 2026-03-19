@@ -414,9 +414,8 @@ fn entity_id_component_from_json_value(value: &JsonValue) -> Result<String, Stat
                 .to_string(),
         }),
         JsonValue::String(text) if text.is_empty() => Err(StateAssignmentsError {
-            message:
-                "public entity resolver cannot derive entity_id from empty primary-key values"
-                    .to_string(),
+            message: "public entity resolver cannot derive entity_id from empty primary-key values"
+                .to_string(),
         }),
         JsonValue::String(text) => Ok(text.clone()),
         JsonValue::Bool(flag) => Ok(flag.to_string()),

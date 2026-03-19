@@ -1341,7 +1341,8 @@ fn build_entity_history_predicates_and_request(
     }
 
     if !root_commit_ids.is_empty() {
-        request.root_scope = StateHistoryRootScope::RequestedRoots(root_commit_ids.into_iter().collect());
+        request.root_scope =
+            StateHistoryRootScope::RequestedRoots(root_commit_ids.into_iter().collect());
     }
     if !version_ids.is_empty() {
         request.version_scope =
@@ -1377,7 +1378,10 @@ fn apply_entity_history_pushdown(
                 file_ids,
                 plugin_keys,
             );
-            if matches!(field, DirectEntityHistoryField::State(DirectStateHistoryField::Depth)) {
+            if matches!(
+                field,
+                DirectEntityHistoryField::State(DirectStateHistoryField::Depth)
+            ) {
                 if let Some(depth) = value_as_i64(value) {
                     update_min_depth(min_depth, depth);
                     update_max_depth(max_depth, depth);
@@ -1398,28 +1402,40 @@ fn apply_entity_history_pushdown(
             }
         }
         EntityHistoryPredicate::Gt(field, value) => {
-            if matches!(field, DirectEntityHistoryField::State(DirectStateHistoryField::Depth)) {
+            if matches!(
+                field,
+                DirectEntityHistoryField::State(DirectStateHistoryField::Depth)
+            ) {
                 if let Some(depth) = value_as_i64(value) {
                     update_min_depth(min_depth, depth + 1);
                 }
             }
         }
         EntityHistoryPredicate::GtEq(field, value) => {
-            if matches!(field, DirectEntityHistoryField::State(DirectStateHistoryField::Depth)) {
+            if matches!(
+                field,
+                DirectEntityHistoryField::State(DirectStateHistoryField::Depth)
+            ) {
                 if let Some(depth) = value_as_i64(value) {
                     update_min_depth(min_depth, depth);
                 }
             }
         }
         EntityHistoryPredicate::Lt(field, value) => {
-            if matches!(field, DirectEntityHistoryField::State(DirectStateHistoryField::Depth)) {
+            if matches!(
+                field,
+                DirectEntityHistoryField::State(DirectStateHistoryField::Depth)
+            ) {
                 if let Some(depth) = value_as_i64(value) {
                     update_max_depth(max_depth, depth - 1);
                 }
             }
         }
         EntityHistoryPredicate::LtEq(field, value) => {
-            if matches!(field, DirectEntityHistoryField::State(DirectStateHistoryField::Depth)) {
+            if matches!(
+                field,
+                DirectEntityHistoryField::State(DirectStateHistoryField::Depth)
+            ) {
                 if let Some(depth) = value_as_i64(value) {
                     update_max_depth(max_depth, depth);
                 }
@@ -1528,7 +1544,11 @@ fn build_entity_history_sort_keys(
         let output_name = direct_expr_output_name(&expr.expr);
         let field =
             direct_entity_history_field_from_expr(&structured_read.surface_binding, &expr.expr)?
-                .or_else(|| projection_aliases.get(&output_name.to_ascii_lowercase()).cloned());
+                .or_else(|| {
+                    projection_aliases
+                        .get(&output_name.to_ascii_lowercase())
+                        .cloned()
+                });
         let Some(field) = field else {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -1568,9 +1588,12 @@ fn direct_entity_history_result_columns(
         projections
             .iter()
             .map(|projection| {
-                direct_surface_column_type(surface_binding, direct_entity_history_field_name(&projection.field))
-                    .map(direct_lowered_result_column_from_surface_type)
-                    .unwrap_or(LoweredResultColumn::Untyped)
+                direct_surface_column_type(
+                    surface_binding,
+                    direct_entity_history_field_name(&projection.field),
+                )
+                .map(direct_lowered_result_column_from_surface_type)
+                .unwrap_or(LoweredResultColumn::Untyped)
             })
             .collect(),
     )
@@ -2867,8 +2890,11 @@ fn state_history_query_needs_snapshot_content(
     }
 
     for projection in &structured_read.query.projection {
-        let value =
-            direct_state_history_projection_value(&structured_read.surface_binding, projection, &[])?;
+        let value = direct_state_history_projection_value(
+            &structured_read.surface_binding,
+            projection,
+            &[],
+        )?;
         if let StateHistoryProjectionValue::Field(DirectStateHistoryField::SnapshotContent) = value
         {
             return Ok(true);
@@ -3019,17 +3045,15 @@ fn direct_state_history_result_columns(
     LoweredResultColumns::Static(
         projections
             .iter()
-            .map(|projection| {
-                match &projection.value {
-                    StateHistoryProjectionValue::Field(field) => direct_surface_column_type(
-                        surface_binding,
-                        direct_state_history_field_name(field),
-                    )
-                    .map(direct_lowered_result_column_from_surface_type)
-                    .unwrap_or(LoweredResultColumn::Untyped),
-                    StateHistoryProjectionValue::Aggregate(StateHistoryAggregate::Count) => {
-                        LoweredResultColumn::Untyped
-                    }
+            .map(|projection| match &projection.value {
+                StateHistoryProjectionValue::Field(field) => direct_surface_column_type(
+                    surface_binding,
+                    direct_state_history_field_name(field),
+                )
+                .map(direct_lowered_result_column_from_surface_type)
+                .unwrap_or(LoweredResultColumn::Untyped),
+                StateHistoryProjectionValue::Aggregate(StateHistoryAggregate::Count) => {
+                    LoweredResultColumn::Untyped
                 }
             })
             .collect(),
@@ -3173,9 +3197,7 @@ fn direct_state_history_aggregate_from_expr(
         return Ok(None);
     }
     match &list.args[0] {
-        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
-            Ok(Some(StateHistoryAggregate::Count))
-        }
+        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Ok(Some(StateHistoryAggregate::Count)),
         _ => Ok(direct_expr_is_count_star(expr).then_some(StateHistoryAggregate::Count)),
     }
 }
@@ -3829,7 +3851,9 @@ impl EntityHistoryRowView {
             Some(snapshot) => Some(serde_json::from_str(snapshot).map_err(|error| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    format!("direct entity-history execution could not parse snapshot_content: {error}"),
+                    format!(
+                        "direct entity-history execution could not parse snapshot_content: {error}"
+                    ),
                 )
             })?),
             None => None,
@@ -4009,7 +4033,9 @@ fn entity_history_row_matches_predicate(
     predicate: &EntityHistoryPredicate,
 ) -> bool {
     match predicate {
-        EntityHistoryPredicate::Eq(field, value) => entity_history_field_value(row, field) == *value,
+        EntityHistoryPredicate::Eq(field, value) => {
+            entity_history_field_value(row, field) == *value
+        }
         EntityHistoryPredicate::NotEq(field, value) => {
             entity_history_field_value(row, field) != *value
         }
@@ -4119,7 +4145,9 @@ fn project_state_history_row(
         .iter()
         .map(|projection| match &projection.value {
             StateHistoryProjectionValue::Field(field) => state_history_field_value(row, field),
-            StateHistoryProjectionValue::Aggregate(StateHistoryAggregate::Count) => Value::Integer(1),
+            StateHistoryProjectionValue::Aggregate(StateHistoryAggregate::Count) => {
+                Value::Integer(1)
+            }
         })
         .collect()
 }
@@ -4197,10 +4225,9 @@ fn compare_state_history_groups(
                 &state_history_group_field_value(left, &plan.group_by_fields, field),
                 &state_history_group_field_value(right, &plan.group_by_fields, field),
             ),
-            StateHistorySortValue::Aggregate(StateHistoryAggregate::Count) => compare_public_values(
-                &Value::Integer(left.count),
-                &Value::Integer(right.count),
-            ),
+            StateHistorySortValue::Aggregate(StateHistoryAggregate::Count) => {
+                compare_public_values(&Value::Integer(left.count), &Value::Integer(right.count))
+            }
         }
         .unwrap_or(std::cmp::Ordering::Equal);
         if ordering != std::cmp::Ordering::Equal {
@@ -4825,22 +4852,46 @@ fn direct_entity_history_field_name(field: &DirectEntityHistoryField) -> &str {
 fn entity_history_predicate_debug_sql(predicate: &EntityHistoryPredicate) -> String {
     match predicate {
         EntityHistoryPredicate::Eq(field, value) => {
-            format!("{} = {}", direct_entity_history_field_name(field), debug_value_sql(value))
+            format!(
+                "{} = {}",
+                direct_entity_history_field_name(field),
+                debug_value_sql(value)
+            )
         }
         EntityHistoryPredicate::NotEq(field, value) => {
-            format!("{} != {}", direct_entity_history_field_name(field), debug_value_sql(value))
+            format!(
+                "{} != {}",
+                direct_entity_history_field_name(field),
+                debug_value_sql(value)
+            )
         }
         EntityHistoryPredicate::Gt(field, value) => {
-            format!("{} > {}", direct_entity_history_field_name(field), debug_value_sql(value))
+            format!(
+                "{} > {}",
+                direct_entity_history_field_name(field),
+                debug_value_sql(value)
+            )
         }
         EntityHistoryPredicate::GtEq(field, value) => {
-            format!("{} >= {}", direct_entity_history_field_name(field), debug_value_sql(value))
+            format!(
+                "{} >= {}",
+                direct_entity_history_field_name(field),
+                debug_value_sql(value)
+            )
         }
         EntityHistoryPredicate::Lt(field, value) => {
-            format!("{} < {}", direct_entity_history_field_name(field), debug_value_sql(value))
+            format!(
+                "{} < {}",
+                direct_entity_history_field_name(field),
+                debug_value_sql(value)
+            )
         }
         EntityHistoryPredicate::LtEq(field, value) => {
-            format!("{} <= {}", direct_entity_history_field_name(field), debug_value_sql(value))
+            format!(
+                "{} <= {}",
+                direct_entity_history_field_name(field),
+                debug_value_sql(value)
+            )
         }
         EntityHistoryPredicate::In(field, values) => format!(
             "{} IN ({})",
@@ -5026,19 +5077,20 @@ async fn try_prepare_public_read_via_specialized_optimization(
 ) -> Result<SpecializedPublicReadPreparation, LixError> {
     let structured_read = match canonicalize_read(bound_statement.clone(), registry) {
         Ok(canonicalized) => canonicalized.structured_read(),
-        Err(error) => match try_build_direct_state_history_structured_read(
-            bound_statement.clone(),
-            registry,
-        )? {
-            Some(structured_read) => structured_read,
-            None => {
-                return Ok(SpecializedPublicReadPreparation::Declined {
-                    reason: error.message,
-                })
+        Err(error) => {
+            match try_build_direct_state_history_structured_read(bound_statement.clone(), registry)?
+            {
+                Some(structured_read) => structured_read,
+                None => {
+                    return Ok(SpecializedPublicReadPreparation::Declined {
+                        reason: error.message,
+                    })
+                }
             }
-        },
+        }
     };
-    if explain_envelope.is_some() && is_direct_only_history_surface(&structured_read.surface_binding)
+    if explain_envelope.is_some()
+        && is_direct_only_history_surface(&structured_read.surface_binding)
     {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -5048,14 +5100,15 @@ async fn try_prepare_public_read_via_specialized_optimization(
             ),
         ));
     }
-    let structured_read = maybe_bind_active_history_root(backend, structured_read, active_version_id)
-        .await
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "public read preparation could not bind active history root",
-            )
-        })?;
+    let structured_read =
+        maybe_bind_active_history_root(backend, structured_read, active_version_id)
+            .await
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "public read preparation could not bind active history root",
+                )
+            })?;
     ensure_public_read_history_timeline_roots(
         backend,
         &requested_history_root_commit_ids_from_selection(structured_read.query.selection.as_ref()),
@@ -5090,66 +5143,68 @@ async fn try_prepare_public_read_via_specialized_optimization(
             surface_binding.descriptor.surface_family,
             surface_binding.descriptor.public_name.as_str(),
         ) {
-            (SurfaceFamily::State, "lix_state_history") => match build_direct_state_history_plan(
-                &structured_read,
-            ) {
-                Ok(Some(plan)) => {
-                    let pushdown_decision = direct_state_history_pushdown_decision(&plan);
-                    (
-                        PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(
-                            plan,
-                        )),
-                        pushdown_decision,
-                        Vec::new(),
-                        dependency_spec,
-                    )
+            (SurfaceFamily::State, "lix_state_history") => {
+                match build_direct_state_history_plan(&structured_read) {
+                    Ok(Some(plan)) => {
+                        let pushdown_decision = direct_state_history_pushdown_decision(&plan);
+                        (
+                            PreparedPublicReadExecution::Direct(
+                                DirectPublicReadPlan::StateHistory(plan),
+                            ),
+                            pushdown_decision,
+                            Vec::new(),
+                            dependency_spec,
+                        )
+                    }
+                    Ok(None) => {
+                        return Ok(SpecializedPublicReadPreparation::Declined {
+                            reason: format!(
+                                "specialized read optimization declined '{}'",
+                                structured_read.surface_binding.descriptor.public_name
+                            ),
+                        })
+                    }
+                    Err(error) if specialized_public_read_error_is_semantic(&error) => {
+                        return Err(error)
+                    }
+                    Err(error) => {
+                        return Ok(SpecializedPublicReadPreparation::Declined {
+                            reason: error.description,
+                        })
+                    }
                 }
-                Ok(None) => {
-                    return Ok(SpecializedPublicReadPreparation::Declined {
-                        reason: format!(
-                            "specialized read optimization declined '{}'",
-                            structured_read.surface_binding.descriptor.public_name
-                        ),
-                    })
+            }
+            (SurfaceFamily::Entity, _) => {
+                match build_direct_entity_history_plan(&structured_read) {
+                    Ok(Some(plan)) => {
+                        let pushdown_decision = direct_entity_history_pushdown_decision(&plan);
+                        (
+                            PreparedPublicReadExecution::Direct(
+                                DirectPublicReadPlan::EntityHistory(plan),
+                            ),
+                            pushdown_decision,
+                            Vec::new(),
+                            dependency_spec,
+                        )
+                    }
+                    Ok(None) => {
+                        return Ok(SpecializedPublicReadPreparation::Declined {
+                            reason: format!(
+                                "specialized read optimization declined '{}'",
+                                structured_read.surface_binding.descriptor.public_name
+                            ),
+                        })
+                    }
+                    Err(error) if specialized_public_read_error_is_semantic(&error) => {
+                        return Err(error)
+                    }
+                    Err(error) => {
+                        return Ok(SpecializedPublicReadPreparation::Declined {
+                            reason: error.description,
+                        })
+                    }
                 }
-                Err(error) if specialized_public_read_error_is_semantic(&error) => {
-                    return Err(error)
-                }
-                Err(error) => {
-                    return Ok(SpecializedPublicReadPreparation::Declined {
-                        reason: error.description,
-                    })
-                }
-            },
-            (SurfaceFamily::Entity, _) => match build_direct_entity_history_plan(&structured_read) {
-                Ok(Some(plan)) => {
-                    let pushdown_decision = direct_entity_history_pushdown_decision(&plan);
-                    (
-                        PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(
-                            plan,
-                        )),
-                        pushdown_decision,
-                        Vec::new(),
-                        dependency_spec,
-                    )
-                }
-                Ok(None) => {
-                    return Ok(SpecializedPublicReadPreparation::Declined {
-                        reason: format!(
-                            "specialized read optimization declined '{}'",
-                            structured_read.surface_binding.descriptor.public_name
-                        ),
-                    })
-                }
-                Err(error) if specialized_public_read_error_is_semantic(&error) => {
-                    return Err(error)
-                }
-                Err(error) => {
-                    return Ok(SpecializedPublicReadPreparation::Declined {
-                        reason: error.description,
-                    })
-                }
-            },
+            }
             (SurfaceFamily::Filesystem, "lix_directory_history") => {
                 match build_direct_directory_history_plan(&structured_read) {
                     Ok(Some(plan)) => {
@@ -5181,37 +5236,40 @@ async fn try_prepare_public_read_via_specialized_optimization(
                     }
                 }
             }
-            (SurfaceFamily::Filesystem, _) => match build_direct_file_history_plan(&structured_read)
-            {
-                Ok(Some(plan)) => {
-                    let pushdown_decision = direct_file_history_pushdown_decision(&plan);
-                    (
-                        PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(
-                            plan,
-                        )),
-                        pushdown_decision,
-                        Vec::new(),
-                        dependency_spec,
-                    )
+            (SurfaceFamily::Filesystem, _) => {
+                match build_direct_file_history_plan(&structured_read) {
+                    Ok(Some(plan)) => {
+                        let pushdown_decision = direct_file_history_pushdown_decision(&plan);
+                        (
+                            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(
+                                plan,
+                            )),
+                            pushdown_decision,
+                            Vec::new(),
+                            dependency_spec,
+                        )
+                    }
+                    Ok(None) => {
+                        return Ok(SpecializedPublicReadPreparation::Declined {
+                            reason: format!(
+                                "specialized read optimization declined '{}'",
+                                structured_read.surface_binding.descriptor.public_name
+                            ),
+                        })
+                    }
+                    Err(error) if specialized_public_read_error_is_semantic(&error) => {
+                        return Err(error)
+                    }
+                    Err(error) => {
+                        return Ok(SpecializedPublicReadPreparation::Declined {
+                            reason: error.description,
+                        })
+                    }
                 }
-                Ok(None) => {
-                    return Ok(SpecializedPublicReadPreparation::Declined {
-                        reason: format!(
-                            "specialized read optimization declined '{}'",
-                            structured_read.surface_binding.descriptor.public_name
-                        ),
-                    })
-                }
-                Err(error) if specialized_public_read_error_is_semantic(&error) => {
-                    return Err(error)
-                }
-                Err(error) => {
-                    return Ok(SpecializedPublicReadPreparation::Declined {
-                        reason: error.description,
-                    })
-                }
-            },
-            _ => unreachable!("direct_execution already restricted to direct-only history surfaces"),
+            }
+            _ => {
+                unreachable!("direct_execution already restricted to direct-only history surfaces")
+            }
         }
     } else {
         let lowered_read = match lower_read_for_execution_with_layouts(
@@ -5646,7 +5704,9 @@ async fn prepare_public_read_via_surface_lowering(
     }))
 }
 
-fn bound_summary_contains_direct_only_history_surface(read_summary: &BoundPublicReadSummary) -> bool {
+fn bound_summary_contains_direct_only_history_surface(
+    read_summary: &BoundPublicReadSummary,
+) -> bool {
     read_summary
         .bound_surface_bindings
         .iter()

@@ -4,8 +4,8 @@ use crate::sql::public::catalog::{
 use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
 use crate::Value;
 use sqlparser::ast::{
-    Expr, GroupByExpr, Join, LimitClause, OrderBy, Query, Select, SelectItem, SetExpr,
-    Statement, TableAlias, TableFactor, TableWithJoins, With,
+    Expr, GroupByExpr, Join, LimitClause, OrderBy, Query, Select, SelectItem, SetExpr, Statement,
+    TableAlias, TableFactor, TableWithJoins, With,
 };
 use std::collections::{BTreeMap, BTreeSet};
 

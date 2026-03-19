@@ -1122,12 +1122,18 @@ mod tests {
         let args = GenerateCommitArgs {
             timestamp: "2025-01-01T00:00:00.000Z".to_string(),
             active_accounts: vec![],
-            changes: vec![domain_change("chg-empty-entity", "", "lix_key_value", "global", None)],
+            changes: vec![domain_change(
+                "chg-empty-entity",
+                "",
+                "lix_key_value",
+                "global",
+                None,
+            )],
             versions,
         };
 
-        let error = generate_commit(args, || "id".to_string())
-            .expect_err("expected empty entity_id error");
+        let error =
+            generate_commit(args, || "id".to_string()).expect_err("expected empty entity_id error");
         assert!(
             error.description.contains("requires non-empty entity_id"),
             "unexpected error: {}",
