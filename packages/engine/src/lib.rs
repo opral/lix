@@ -19,6 +19,7 @@ pub(crate) mod sql;
 pub(crate) mod state;
 mod transaction;
 mod types;
+mod undo_redo;
 mod version;
 mod wasm_runtime;
 pub mod wire;
@@ -58,5 +59,6 @@ pub use state::stream::{
     StateCommitStreamOperation,
 };
 pub use types::{ExecuteResult, QueryResult, Value};
+pub use undo_redo::{RedoOptions, RedoResult, UndoOptions, UndoResult};
 pub use version::{CreateVersionOptions, CreateVersionResult};
 pub use wasm_runtime::{NoopWasmRuntime, WasmComponentInstance, WasmLimits, WasmRuntime};

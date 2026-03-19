@@ -6,7 +6,8 @@ use serde_json::Value as JsonValue;
 use crate::{
     boot::EngineConfig, observe::observe_owned, BootKeyValue, CreateCheckpointResult,
     CreateVersionOptions, CreateVersionResult, Engine, ExecuteOptions, ExecuteResult,
-    ImageChunkWriter, LixBackend, LixError, ObserveEventsOwned, ObserveQuery, Value, WasmRuntime,
+    ImageChunkWriter, LixBackend, LixError, ObserveEventsOwned, ObserveQuery, RedoOptions,
+    RedoResult, UndoOptions, UndoResult, Value, WasmRuntime,
 };
 
 pub struct LixConfig {
@@ -94,6 +95,22 @@ impl Lix {
 
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointResult, LixError> {
         self.engine.create_checkpoint().await
+    }
+
+    pub async fn undo(&self) -> Result<UndoResult, LixError> {
+        self.engine.undo().await
+    }
+
+    pub async fn undo_with_options(&self, options: UndoOptions) -> Result<UndoResult, LixError> {
+        self.engine.undo_with_options(options).await
+    }
+
+    pub async fn redo(&self) -> Result<RedoResult, LixError> {
+        self.engine.redo().await
+    }
+
+    pub async fn redo_with_options(&self, options: RedoOptions) -> Result<RedoResult, LixError> {
+        self.engine.redo_with_options(options).await
     }
 
     pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {

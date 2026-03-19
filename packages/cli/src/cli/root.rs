@@ -1,6 +1,8 @@
 use super::exp::ExpCommand;
 use super::init::InitCommand;
+use super::redo::RedoCommand;
 use super::sql::SqlCommand;
+use super::undo::UndoCommand;
 use clap::{Parser, Subcommand, ValueHint};
 use std::path::PathBuf;
 
@@ -28,8 +30,12 @@ pub enum Command {
     Exp(ExpCommand),
     /// Initialize a Lix database file at the provided path.
     Init(InitCommand),
+    /// Reapply the most recently undone committed change unit.
+    Redo(RedoCommand),
     /// Execute raw SQL against a Lix database.
     Sql(SqlCommand),
+    /// Undo the most recent committed change unit.
+    Undo(UndoCommand),
 }
 
 #[cfg(test)]
@@ -68,6 +74,25 @@ mod tests {
                 }
             },
             _ => panic!("expected sql command"),
+        }
+    }
+
+    #[test]
+    fn parses_undo_command_version_flag() {
+        let cli =
+            Cli::try_parse_from(["lix", "undo", "--version", "branch-1"]).expect("parse succeeds");
+        match cli.command {
+            Command::Undo(command) => assert_eq!(command.version.as_deref(), Some("branch-1")),
+            _ => panic!("expected undo command"),
+        }
+    }
+
+    #[test]
+    fn parses_redo_command_without_version() {
+        let cli = Cli::try_parse_from(["lix", "redo"]).expect("parse succeeds");
+        match cli.command {
+            Command::Redo(command) => assert_eq!(command.version, None),
+            _ => panic!("expected redo command"),
         }
     }
 }

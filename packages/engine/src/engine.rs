@@ -447,6 +447,23 @@ impl<'a> TransactionBackendAdapter<'a> {
 }
 
 #[async_trait::async_trait(?Send)]
+impl<'a> crate::backend::QueryExecutor for TransactionBackendAdapter<'a> {
+    fn dialect(&self) -> crate::SqlDialect {
+        self.dialect
+    }
+
+    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        let mut guard = self.transaction.lock().map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "transaction adapter lock poisoned".to_string(),
+        })?;
+        // SAFETY: the pointer is created from a live `&mut dyn LixTransaction` and
+        // this mutex serializes all calls so the mutable borrow is not aliased.
+        unsafe { (&mut **guard).execute(sql, params).await }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
 impl<'a> LixBackend for TransactionBackendAdapter<'a> {
     fn dialect(&self) -> crate::SqlDialect {
         self.dialect
