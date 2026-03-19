@@ -22,6 +22,24 @@ fn authoritative_version_id_for_effective_row(current_row: &ExactEffectiveStateR
     }
 }
 
+fn authoritative_pre_state_row_for_effective_row(
+    current_row: &ExactEffectiveStateRow,
+    authoritative_version_id: &str,
+) -> PlannedStateRow {
+    let mut values = current_row.values.clone();
+    values.insert(
+        "version_id".to_string(),
+        Value::Text(authoritative_version_id.to_string()),
+    );
+    PlannedStateRow {
+        entity_id: current_row.entity_id.clone(),
+        schema_key: current_row.schema_key.clone(),
+        version_id: Some(authoritative_version_id.to_string()),
+        values,
+        tombstone: false,
+    }
+}
+
 pub(super) async fn resolve_state_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
@@ -242,6 +260,12 @@ async fn resolve_state_backed_insert_write(
                 )?;
                 let partition = partitions.partition_mut(row_execution_mode, target_write_lane);
                 partition.authoritative_pre_state.push(row_ref.clone());
+                partition.authoritative_pre_state_rows.push(
+                    authoritative_pre_state_row_for_effective_row(
+                        &current_row,
+                        &authoritative_version_id_for_effective_row(&current_row),
+                    ),
+                );
                 partition.lineage.push(RowLineage {
                     entity_id: row_ref.entity_id,
                     source_change_id: row_ref.source_change_id,
@@ -333,6 +357,12 @@ fn resolve_state_backed_existing_write_from_rows(
                 )?;
                 let partition = partitions.partition_mut(execution_mode, target_write_lane);
                 partition.authoritative_pre_state.push(row_ref.clone());
+                partition.authoritative_pre_state_rows.push(
+                    authoritative_pre_state_row_for_effective_row(
+                        &current_row,
+                        &authoritative_version_id,
+                    ),
+                );
                 partition.intended_post_state.push(PlannedStateRow {
                     entity_id: current_row.entity_id.clone(),
                     schema_key: current_row.schema_key.clone(),
