@@ -205,7 +205,7 @@ fn collect_commit_parent_map(
     let mut out = BTreeMap::<String, BTreeSet<String>>::new();
     for row in live_state_rows {
         if row.schema_key == "lix_commit" && row.lixcol_version_id == GLOBAL_VERSION_ID {
-            out.entry(row.entity_id.clone()).or_default();
+            out.entry(row.entity_id.to_string()).or_default();
         }
     }
 

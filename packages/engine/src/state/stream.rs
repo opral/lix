@@ -549,22 +549,25 @@ pub(crate) fn state_commit_stream_changes_from_domain_changes(
         };
         resolved.push(StateCommitStreamChange {
             operation,
-            entity_id: change.entity_id.clone(),
-            schema_key: change.schema_key.clone(),
+            entity_id: change.entity_id.to_string(),
+            schema_key: change.schema_key.to_string(),
             schema_version: change.schema_version.clone().ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "domain change state commit stream requires schema_version"
                     .to_string(),
-            })?,
+            })?
+            .to_string(),
             file_id: change.file_id.clone().ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "domain change state commit stream requires file_id".to_string(),
-            })?,
-            version_id: change.version_id.clone(),
+            })?
+            .to_string(),
+            version_id: change.version_id.to_string(),
             plugin_key: change.plugin_key.clone().ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "domain change state commit stream requires plugin_key".to_string(),
-            })?,
+            })?
+            .to_string(),
             snapshot_content,
             untracked: false,
             writer_key: change.writer_key.clone(),
@@ -761,14 +764,14 @@ mod tests {
     fn domain_changes_map_to_update_changes() {
         let changes = state_commit_stream_changes_from_domain_changes(
             &[ProposedDomainChange {
-                entity_id: "entity-1".to_string(),
-                schema_key: "lix_key_value".to_string(),
-                schema_version: Some("1".to_string()),
-                file_id: Some("file-1".to_string()),
-                plugin_key: Some("lix".to_string()),
+                entity_id: "entity-1".try_into().unwrap(),
+                schema_key: "lix_key_value".try_into().unwrap(),
+                schema_version: Some("1".try_into().unwrap()),
+                file_id: Some("file-1".try_into().unwrap()),
+                plugin_key: Some("lix".try_into().unwrap()),
                 snapshot_content: Some("{\"value\":\"after\"}".to_string()),
                 metadata: None,
-                version_id: "version-a".to_string(),
+                version_id: "version-a".try_into().unwrap(),
                 writer_key: Some("writer-a".to_string()),
             }],
             StateCommitStreamOperation::Update,

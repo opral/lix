@@ -1,4 +1,5 @@
 use crate::schema::defaults::apply_schema_defaults_with_system_functions;
+use crate::identity::{derive_entity_id_from_json_paths, EntityIdDerivationError};
 use crate::sql::public::planner::ir::{
     CanonicalStateAssignments, MutationPayload, PlannedStateRow,
 };
@@ -259,27 +260,28 @@ pub(crate) fn derive_entity_id_from_snapshot(
     }
 
     let snapshot = JsonValue::Object(snapshot.clone());
-    let mut parts = Vec::with_capacity(primary_key_paths.len());
-    for path in primary_key_paths {
-        if path.is_empty() {
-            return Err(StateAssignmentsError {
-                message: "public entity resolver does not support empty primary-key pointers"
-                    .to_string(),
-            });
-        }
-        let value = json_pointer_get(&snapshot, path).ok_or_else(|| StateAssignmentsError {
-            message:
-                "public entity resolver could not derive entity_id from the primary-key fields"
-                    .to_string(),
-        })?;
-        parts.push(entity_id_component_from_json_value(value)?);
-    }
-
-    Ok(if parts.len() == 1 {
-        parts.into_iter().next().expect("single primary key part")
-    } else {
-        parts.join("~")
-    })
+    derive_entity_id_from_json_paths(&snapshot, primary_key_paths)
+        .map(|entity_id| entity_id.into_inner())
+        .map_err(|error| StateAssignmentsError {
+            message: match error {
+                EntityIdDerivationError::EmptyPrimaryKeyPath { .. } => {
+                    "public entity resolver does not support empty primary-key pointers"
+                        .to_string()
+                }
+                EntityIdDerivationError::MissingPrimaryKeyValue { .. } => {
+                    "public entity resolver could not derive entity_id from the primary-key fields"
+                        .to_string()
+                }
+                EntityIdDerivationError::NullPrimaryKeyValue { .. } => {
+                    "public entity resolver cannot derive entity_id from null primary-key values"
+                        .to_string()
+                }
+                EntityIdDerivationError::EmptyPrimaryKeyValue { .. } => {
+                    "public entity resolver cannot derive entity_id from empty primary-key values"
+                        .to_string()
+                }
+            },
+        })
 }
 
 pub(crate) fn engine_value_to_json_value(
@@ -405,39 +407,6 @@ fn resolved_entity_state_value(
         .get(key)
         .cloned()
         .or_else(|| semantics.state_defaults.get(key).cloned())
-}
-
-fn entity_id_component_from_json_value(value: &JsonValue) -> Result<String, StateAssignmentsError> {
-    match value {
-        JsonValue::Null => Err(StateAssignmentsError {
-            message: "public entity resolver cannot derive entity_id from null primary-key values"
-                .to_string(),
-        }),
-        JsonValue::String(text) if text.is_empty() => Err(StateAssignmentsError {
-            message:
-                "public entity resolver cannot derive entity_id from empty primary-key values"
-                    .to_string(),
-        }),
-        JsonValue::String(text) => Ok(text.clone()),
-        JsonValue::Bool(flag) => Ok(flag.to_string()),
-        JsonValue::Number(number) => Ok(number.to_string()),
-        JsonValue::Array(_) | JsonValue::Object(_) => Ok(value.to_string()),
-    }
-}
-
-fn json_pointer_get<'a>(value: &'a JsonValue, pointer: &[String]) -> Option<&'a JsonValue> {
-    let mut current = value;
-    for segment in pointer {
-        match current {
-            JsonValue::Object(object) => current = object.get(segment)?,
-            JsonValue::Array(array) => {
-                let index = segment.parse::<usize>().ok()?;
-                current = array.get(index)?;
-            }
-            _ => return None,
-        }
-    }
-    Some(current)
 }
 
 fn text_from_value(value: &Value) -> Option<&str> {

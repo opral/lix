@@ -333,9 +333,9 @@ fn tracked_plan_entity_targets(plan: &TrackedWriteTxnPlan) -> BTreeSet<(String, 
                 continue;
             }
             targets.insert((
-                change.entity_id.clone(),
-                change.schema_key.clone(),
-                change.version_id.clone(),
+                change.entity_id.to_string(),
+                change.schema_key.to_string(),
+                change.version_id.to_string(),
             ));
         }
     }

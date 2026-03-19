@@ -113,21 +113,33 @@ fn build_domain_change_batch_for_partition(
             "state.upsert"
         };
         changes.push(ProposedDomainChange {
-            entity_id: row.entity_id.clone(),
-            schema_key: row.schema_key.clone(),
-            schema_version: text_value(&row.values, "schema_version"),
-            file_id: text_value(&row.values, "file_id"),
-            plugin_key: text_value(&row.values, "plugin_key"),
+            entity_id: require_identity(row.entity_id.clone(), "public domain-change entity_id")?,
+            schema_key: require_identity(
+                row.schema_key.clone(),
+                "public domain-change schema_key",
+            )?,
+            schema_version: text_value(&row.values, "schema_version")
+                .map(|value| require_identity(value, "public domain-change schema_version"))
+                .transpose()?,
+            file_id: text_value(&row.values, "file_id")
+                .map(|value| require_identity(value, "public domain-change file_id"))
+                .transpose()?,
+            plugin_key: text_value(&row.values, "plugin_key")
+                .map(|value| require_identity(value, "public domain-change plugin_key"))
+                .transpose()?,
             snapshot_content: if row.tombstone {
                 None
             } else {
                 serialized_value(&row.values, "snapshot_content")
             },
             metadata: serialized_value(&row.values, "metadata"),
-            version_id: row.version_id.clone().ok_or_else(|| DomainChangeError {
-                message: "public domain-change derivation requires a concrete version_id"
-                    .to_string(),
-            })?,
+            version_id: require_identity(
+                row.version_id.clone().ok_or_else(|| DomainChangeError {
+                    message: "public domain-change derivation requires a concrete version_id"
+                        .to_string(),
+                })?,
+                "public domain-change version_id",
+            )?,
             writer_key,
         });
         semantic_effects.push(SemanticEffect {
@@ -326,6 +338,19 @@ fn serialized_value(
         Some(crate::Value::Json(value)) => Some(value.to_string()),
         _ => text_value(values, key),
     }
+}
+
+fn require_identity<T>(value: impl Into<String>, context: &str) -> Result<T, DomainChangeError>
+where
+    T: TryFrom<String, Error = LixError>,
+{
+    let value = value.into();
+    T::try_from(value.clone()).map_err(|_| DomainChangeError {
+        message: format!(
+            "{context} must be a non-empty canonical identity, got '{}'",
+            value
+        ),
+    })
 }
 
 fn command_writer_key(planned_write: &PlannedWrite) -> Option<String> {

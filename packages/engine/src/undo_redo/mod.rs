@@ -259,18 +259,24 @@ pub(crate) async fn load_target_commit_change_effects(
 pub(crate) fn build_forward_proposed_change(
     version_id: &str,
     change: &CommittedCanonicalChangeRow,
-) -> ProposedDomainChange {
-    ProposedDomainChange {
-        entity_id: change.entity_id.clone(),
-        schema_key: change.schema_key.clone(),
-        schema_version: Some(change.schema_version.clone()),
-        file_id: Some(change.file_id.clone()),
-        plugin_key: Some(change.plugin_key.clone()),
+) -> Result<ProposedDomainChange, LixError> {
+    Ok(ProposedDomainChange {
+        entity_id: require_identity(change.entity_id.clone(), "undo forward entity_id")?,
+        schema_key: require_identity(change.schema_key.clone(), "undo forward schema_key")?,
+        schema_version: Some(require_identity(
+            change.schema_version.clone(),
+            "undo forward schema_version",
+        )?),
+        file_id: Some(require_identity(change.file_id.clone(), "undo forward file_id")?),
+        plugin_key: Some(require_identity(
+            change.plugin_key.clone(),
+            "undo forward plugin_key",
+        )?),
         snapshot_content: change.snapshot_content.clone(),
         metadata: change.metadata.clone(),
-        version_id: version_id.to_string(),
+        version_id: require_identity(version_id.to_string(), "undo forward version_id")?,
         writer_key: None,
-    }
+    })
 }
 
 pub(crate) fn build_restore_proposed_change(
@@ -278,16 +284,22 @@ pub(crate) fn build_restore_proposed_change(
     row: &ExactCommittedStateRow,
 ) -> Result<ProposedDomainChange, LixError> {
     Ok(ProposedDomainChange {
-        entity_id: row.entity_id.clone(),
-        schema_key: row.schema_key.clone(),
-        schema_version: Some(required_snapshot_text(
+        entity_id: require_identity(row.entity_id.clone(), "undo restore entity_id")?,
+        schema_key: require_identity(row.schema_key.clone(), "undo restore schema_key")?,
+        schema_version: Some(require_identity(
+            required_snapshot_text(
             row.values.get("schema_version"),
             "schema_version",
+        )?,
+            "undo restore schema_version",
         )?),
-        file_id: Some(row.file_id.clone()),
-        plugin_key: Some(required_snapshot_text(
+        file_id: Some(require_identity(row.file_id.clone(), "undo restore file_id")?),
+        plugin_key: Some(require_identity(
+            required_snapshot_text(
             row.values.get("plugin_key"),
             "plugin_key",
+        )?,
+            "undo restore plugin_key",
         )?),
         snapshot_content: Some(required_snapshot_text(
             row.values.get("snapshot_content"),
@@ -297,7 +309,7 @@ pub(crate) fn build_restore_proposed_change(
             .values
             .get("metadata")
             .and_then(|value| value_as_text(Some(value))),
-        version_id: version_id.to_string(),
+        version_id: require_identity(version_id.to_string(), "undo restore version_id")?,
         writer_key: None,
     })
 }
@@ -305,18 +317,24 @@ pub(crate) fn build_restore_proposed_change(
 pub(crate) fn build_tombstone_proposed_change(
     version_id: &str,
     change: &CommittedCanonicalChangeRow,
-) -> ProposedDomainChange {
-    ProposedDomainChange {
-        entity_id: change.entity_id.clone(),
-        schema_key: change.schema_key.clone(),
-        schema_version: Some(change.schema_version.clone()),
-        file_id: Some(change.file_id.clone()),
-        plugin_key: Some(change.plugin_key.clone()),
+) -> Result<ProposedDomainChange, LixError> {
+    Ok(ProposedDomainChange {
+        entity_id: require_identity(change.entity_id.clone(), "undo tombstone entity_id")?,
+        schema_key: require_identity(change.schema_key.clone(), "undo tombstone schema_key")?,
+        schema_version: Some(require_identity(
+            change.schema_version.clone(),
+            "undo tombstone schema_version",
+        )?),
+        file_id: Some(require_identity(change.file_id.clone(), "undo tombstone file_id")?),
+        plugin_key: Some(require_identity(
+            change.plugin_key.clone(),
+            "undo tombstone plugin_key",
+        )?),
         snapshot_content: None,
         metadata: None,
-        version_id: version_id.to_string(),
+        version_id: require_identity(version_id.to_string(), "undo tombstone version_id")?,
         writer_key: None,
-    }
+    })
 }
 
 fn classify_forward_operation(
@@ -337,6 +355,19 @@ fn classify_forward_operation(
 
 fn required_snapshot_text(value: Option<&crate::Value>, field: &str) -> Result<String, LixError> {
     value_as_text(value).ok_or_else(|| LixError::unknown(format!("missing {field}")))
+}
+
+fn require_identity<T>(value: impl Into<String>, context: &str) -> Result<T, LixError>
+where
+    T: TryFrom<String, Error = LixError>,
+{
+    let value = value.into();
+    T::try_from(value.clone()).map_err(|_| {
+        LixError::unknown(format!(
+            "{context} must be a non-empty canonical identity, got '{}'",
+            value
+        ))
+    })
 }
 
 fn value_as_text(value: Option<&crate::Value>) -> Option<String> {

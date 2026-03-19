@@ -1,10 +1,10 @@
-# Plan 70: Typed Canonical Identity Hardening
+# Plan 70: High-Impact Canonical Identity Hardening
 
 ## Goal
 
-Make invalid canonical identity impossible or very hard to represent inside the engine.
+Make invalid canonical identity impossible to represent in the engine core.
 
-This hardening targets the engine-level invariant that canonical identity fields are never empty:
+Canonical identity fields:
 
 - `entity_id`
 - `file_id`
@@ -13,41 +13,27 @@ This hardening targets the engine-level invariant that canonical identity fields
 - `schema_version`
 - `plugin_key`
 
-The desired end state is:
-
-1. external inputs may arrive as raw strings
-2. boundary code validates and converts them into typed identity values
-3. internal commit/state/materialization code only works with validated identity
-4. storage also rejects empty canonical identity as a backstop
-
-No backward compatibility is required.
+No backward compatibility is required. This should be implemented as one large clean-cut change, not a staged migration with bridge code.
 
 ## Why
 
-The empty-string undo corruption bug showed that the engine currently relies on scattered validation instead of one structural invariant. Some readers already treat empty text identity as corrupt, while some writers historically allowed it. That asymmetry lets invalid history persist and fail later in unrelated code such as undo/history reconstruction.
-
-The first-principles fix is to enforce identity validity at the type boundary and at the storage boundary.
+The empty-string undo bug happened because the engine accepted invalid identity on write, while later readers treated empty identity as corrupt. The highest-impact fix is to enforce identity validity structurally in Rust, not with more scattered checks.
 
 ## Scope
 
-High-impact hardening only:
+Only two high-impact hardening items:
 
 1. typed canonical identity in Rust
 2. centralized identity derivation
-3. engine boundary validation for plugin/materialization outputs
-4. DB `CHECK` constraints for canonical identity columns
-5. fail-fast invariant scan for existing corrupt history/state
 
-## Design
+## 1. Replace raw identity strings with validated types
 
-### 1. Introduce typed canonical identity wrappers
-
-Add validated newtypes for canonical identity:
+Introduce validated wrappers for canonical identity:
 
 - `EntityId`
 - `FileId`
 - `VersionId`
-- `SchemaKeyValue` or similar name that does not conflict with existing schema types
+- `SchemaKeyValue`
 - `SchemaVersionValue`
 - `PluginKeyValue`
 
@@ -55,106 +41,54 @@ Requirements:
 
 - constructor rejects empty string
 - cheap wrapper around `String`
-- `as_str()` accessor
-- `Display`, `Clone`, `Eq`, `Ord`, `Hash`
-- explicit conversion at trusted boundaries only
+- used by commit/state/materialization core types in the same change
 
-Likely location:
+Priority files:
 
-- `packages/engine/src/types.rs` or a dedicated `packages/engine/src/identity.rs`
-
-### 2. Move commit/state APIs onto typed identity
-
-Priority migration targets:
-
+- `packages/engine/src/types.rs` or a dedicated identity module
 - `packages/engine/src/state/commit/types.rs`
 - `packages/engine/src/state/commit/create_commit.rs`
 - `packages/engine/src/state/commit/generate_commit.rs`
 - `packages/engine/src/state/materialization/types.rs`
-- `packages/engine/src/state/stream.rs`
 
 Rule:
 
-- raw `String` identity is allowed at SQL/plugin input boundaries
-- canonical engine structs should use validated identity types
+- raw strings are allowed only at external boundaries
+- internal engine state should use validated identity types
+- do not keep dual typed/untyped core representations around
 
-This removes the class of bugs where internal callers construct invalid domain changes directly.
+## 2. Centralize PK-to-entity-id derivation
 
-### 3. Centralize PK-to-entity-id derivation
+There should be one shared helper for deriving canonical `entity_id` from primary-key fields.
 
-Today entity-id derivation logic exists in multiple places. Replace that with one shared helper that:
+That helper must:
 
-- rejects null primary-key components
-- rejects empty string primary-key components
-- produces the canonical encoded `entity_id`
+- reject `null`
+- reject `""`
+- produce the canonical encoded identity
 
-Migration targets:
+Priority files:
 
 - `packages/engine/src/state/validation.rs`
 - `packages/engine/src/sql/public/planner/semantics/state_assignments.rs`
-- any plugin/materialization path deriving entity ids from structured snapshots
 
-This avoids drift between public planning and lower-level validation.
+This removes drift between public planning and lower-level validation.
 
-### 4. Validate plugin/materialization outputs before commit/state insertion
+## Implementation Shape
 
-Any plugin-originated or materialization-originated entity change must be rejected if canonical identity is empty.
+Do this in one go:
 
-Priority targets:
+1. add the identity newtypes
+2. migrate commit/state/materialization core structs to the new types
+3. replace duplicated PK-to-entity-id logic with one shared helper
+4. remove old stringly-typed core paths rather than preserving compatibility shims
 
-- `packages/engine/src/plugin/runtime.rs`
-- file materialization / detect-changes ingestion
-- any path building `LiveStateWrite` or `DomainChangeInput`
-
-If a producer needs a logical root identity, it must use a non-empty canonical id instead of `""`.
-
-### 5. Add DB `CHECK` constraints
-
-Strengthen internal and live-state tables so the database also rejects empty canonical identity.
-
-Targets:
-
-- `packages/engine/src/init/mod.rs`
-- `packages/engine/src/schema/registry.rs`
-
-Add `CHECK` constraints for canonical identity columns on:
-
-- `lix_internal_change`
-- generated tracked live tables
-- generated untracked live tables
-- any other table that stores canonical state identity
-
-This is defense in depth against future regressions or non-Rust write paths.
-
-### 6. Fail fast on existing corruption
-
-Because no backward compatibility is needed, add an explicit invariant scan during init/rebuild/open that aborts if any canonical identity field is empty in committed state or live state.
-
-Priority targets:
-
-- init/open path
-- live-state rebuild path
-
-This converts latent corruption into an immediate hard error instead of letting undo/history fail later.
-
-## Rollout Order
-
-1. add identity newtypes and boundary constructors
-2. migrate commit-state core structs to typed identity
-3. centralize entity-id derivation
-4. validate plugin/materialization outputs
-5. add DB `CHECK` constraints
-6. add corruption scan
-7. run full engine simulations before merge
+The point is a clean new invariant boundary, not an incremental compatibility layer.
 
 ## Testing
 
-Add or expand tests for:
+Add or expand tests for the final shape only:
 
-- direct commit construction with empty canonical identity fails
+- direct internal commit construction with empty identity fails
 - public SQL insert with empty PK component fails
-- plugin/materialization output with empty identity fails
-- init/rebuild fails when corrupt rows already exist
-- undo/history/state queries remain green
-
-Before merge, run the full engine simulation matrix, not only targeted tests.
+- undo/history regressions remain green
