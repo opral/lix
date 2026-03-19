@@ -1,17 +1,12 @@
 use crate::cel::CelEvaluator;
 use crate::filesystem::live_projection::{
-    build_filesystem_file_history_projection_sql, build_filesystem_file_projection_sql,
-    build_filesystem_state_history_source_sql, FilesystemProjectionScope,
+    build_filesystem_file_projection_sql, FilesystemProjectionScope,
 };
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::matching::select_best_glob_match;
 use crate::plugin::storage::plugin_key_from_archive_path;
 use crate::plugin::types::{InstalledPlugin, PluginContentType};
-use crate::schema::live_layout::tracked_live_table_name;
 use crate::sql::execution::preprocess::preprocess_sql_to_plan as preprocess_sql;
-use crate::state::history::{
-    load_state_history_rows, StateHistoryContentMode, StateHistoryRequest, StateHistoryRootScope,
-};
 use crate::state::materialization::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
@@ -36,15 +31,6 @@ const BINARY_CHUNK_CODEC_PREFIX_ZSTD: &[u8] = b"LIXZSTD1";
 struct FileDescriptorRow {
     file_id: String,
     version_id: String,
-    path: String,
-}
-
-#[derive(Debug, Clone)]
-struct FileHistoryDescriptorRow {
-    file_id: String,
-    root_commit_id: String,
-    depth: i64,
-    commit_id: String,
     path: String,
 }
 
@@ -271,102 +257,6 @@ pub(crate) async fn materialize_file_data_with_plugins(
     Ok(())
 }
 
-pub(crate) async fn materialize_missing_file_history_data_with_plugins(
-    backend: &dyn LixBackend,
-    runtime: &dyn WasmRuntime,
-) -> Result<(), LixError> {
-    let descriptors = load_missing_file_history_descriptors(backend).await?;
-    if descriptors.is_empty() {
-        return Ok(());
-    }
-
-    let installed_plugins = load_installed_plugins(backend).await?;
-
-    let mut loaded_instances: BTreeMap<String, CachedPluginComponent> = BTreeMap::new();
-
-    for descriptor in descriptors.values() {
-        let plugin = select_plugin_for_path(&descriptor.path, None, &installed_plugins);
-        if plugin.is_none() {
-            let changes = load_plugin_state_changes_for_file_at_history_slice(
-                backend,
-                &descriptor.file_id,
-                BUILTIN_BINARY_FALLBACK_PLUGIN_KEY,
-                &descriptor.root_commit_id,
-                &descriptor.commit_id,
-                descriptor.depth,
-            )
-            .await?;
-            let Some(blob_ref) =
-                builtin_binary_blob_ref_from_changes(&changes, &descriptor.file_id)?
-            else {
-                continue;
-            };
-            let blob_data = load_binary_blob_data_by_hash(backend, &blob_ref.blob_hash)
-                .await?
-                .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                        "plugin materialization: missing builtin binary history blob payload for hash '{}' (file_id='{}' root_commit_id='{}' depth='{}')",
-                        blob_ref.blob_hash,
-                        descriptor.file_id,
-                        descriptor.root_commit_id,
-                        descriptor.depth
-                    ),
-                })?;
-            upsert_file_history_cache_data(
-                backend,
-                &descriptor.file_id,
-                &descriptor.root_commit_id,
-                descriptor.depth,
-                &blob_data,
-            )
-            .await?;
-            continue;
-        }
-        let plugin = plugin.expect("plugin must be present");
-
-        let changes = load_plugin_state_changes_for_file_at_history_slice(
-            backend,
-            &descriptor.file_id,
-            &plugin.key,
-            &descriptor.root_commit_id,
-            &descriptor.commit_id,
-            descriptor.depth,
-        )
-        .await?;
-        if changes.is_empty() {
-            continue;
-        }
-
-        let payload = serde_json::to_vec(&ApplyChangesRequest {
-            file: PluginFile {
-                id: descriptor.file_id.clone(),
-                path: descriptor.path.clone(),
-                data: Vec::new(),
-            },
-            changes,
-        })
-        .map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: failed to encode history apply-changes payload: {error}"
-            ),
-        })?;
-
-        let instance =
-            load_or_init_plugin_component(runtime, &mut loaded_instances, plugin).await?;
-        let output = call_apply_changes(instance.as_ref(), &payload).await?;
-        upsert_file_history_cache_data(
-            backend,
-            &descriptor.file_id,
-            &descriptor.root_commit_id,
-            descriptor.depth,
-            &output,
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
 fn select_plugin_for_file<'a>(
     descriptor: &FileDescriptorRow,
     plugins: &'a [InstalledPlugin],
@@ -509,114 +399,6 @@ async fn load_file_paths_for_descriptors(
         out.insert((version_id, file_id), path);
     }
     Ok(out)
-}
-
-async fn load_missing_file_history_descriptors(
-    backend: &dyn LixBackend,
-) -> Result<BTreeMap<(String, String, i64), FileHistoryDescriptorRow>, LixError> {
-    let commit_table = tracked_live_table_name("lix_commit");
-    let history_source_sql =
-        build_filesystem_state_history_source_sql(backend.dialect(), "", "", "", false);
-    let history_projection_sql = build_filesystem_file_history_projection_sql(&history_source_sql);
-    let sql = format!(
-        "SELECT \
-             history.id AS file_id, \
-             history.lixcol_root_commit_id AS root_commit_id, \
-             history.lixcol_depth AS depth, \
-             history.lixcol_commit_id AS commit_id, \
-             history.path \
-           FROM ({history_projection_sql}) history \
-           WHERE history.path IS NOT NULL \
-             AND history.lixcol_root_commit_id IN (\
-               SELECT entity_id \
-               FROM {commit_table} \
-               WHERE schema_key = 'lix_commit' \
-                 AND version_id = 'global' \
-                 AND is_tombstone = 0\
-             ) \
-             AND NOT EXISTS (\
-               SELECT 1 \
-               FROM lix_internal_file_history_data_cache cache \
-               WHERE cache.file_id = history.id \
-                 AND cache.root_commit_id = history.lixcol_root_commit_id \
-                 AND cache.depth = history.lixcol_depth\
-             ) \
-           ORDER BY history.lixcol_root_commit_id, history.lixcol_depth, history.id"
-    );
-
-    let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &[]).await?;
-    let rows = backend
-        .execute(&preprocessed.sql, preprocessed.single_statement_params()?)
-        .await?;
-
-    let mut descriptors: BTreeMap<(String, String, i64), FileHistoryDescriptorRow> =
-        BTreeMap::new();
-    for row in rows.rows {
-        let file_id = text_required(&row, 0, "file_id")?;
-        let root_commit_id = text_required(&row, 1, "root_commit_id")?;
-        let depth = i64_required(&row, 2, "depth")?;
-        let commit_id = text_required(&row, 3, "commit_id")?;
-        let path = text_required(&row, 4, "path")?;
-        descriptors.insert(
-            (root_commit_id.clone(), file_id.clone(), depth),
-            FileHistoryDescriptorRow {
-                file_id,
-                root_commit_id,
-                depth,
-                commit_id,
-                path,
-            },
-        );
-    }
-    Ok(descriptors)
-}
-
-async fn load_plugin_state_changes_for_file_at_history_slice(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    plugin_key: &str,
-    root_commit_id: &str,
-    commit_id: &str,
-    depth: i64,
-) -> Result<Vec<PluginEntityChange>, LixError> {
-    let rows = load_state_history_rows(
-        backend,
-        &StateHistoryRequest {
-            root_scope: StateHistoryRootScope::RequestedRoots(vec![root_commit_id.to_string()]),
-            file_ids: vec![file_id.to_string()],
-            plugin_keys: vec![plugin_key.to_string()],
-            max_depth: Some(depth),
-            content_mode: StateHistoryContentMode::IncludeSnapshotContent,
-            ..StateHistoryRequest::default()
-        },
-    )
-    .await?;
-    let raw_depth = rows
-        .iter()
-        .filter(|row| row.commit_id == commit_id)
-        .map(|row| row.depth)
-        .min()
-        .unwrap_or(depth);
-
-    let mut changes = Vec::new();
-    let mut previous_entity_id: Option<String> = None;
-    for row in rows.into_iter().filter(|row| row.depth >= raw_depth) {
-        let entity_id = row.entity_id;
-        if previous_entity_id
-            .as_ref()
-            .is_some_and(|previous| previous == &entity_id)
-        {
-            continue;
-        }
-        previous_entity_id = Some(entity_id.clone());
-        changes.push(PluginEntityChange {
-            entity_id,
-            schema_key: row.schema_key,
-            schema_version: row.schema_version,
-            snapshot_content: row.snapshot_content,
-        });
-    }
-    Ok(changes)
 }
 
 pub(crate) async fn load_installed_plugins(
@@ -889,7 +671,7 @@ fn ensure_valid_plugin_wasm(wasm_bytes: &[u8]) -> Result<(), LixError> {
     Ok(())
 }
 
-async fn load_binary_blob_data_by_hash(
+pub(crate) async fn load_binary_blob_data_by_hash(
     backend: &dyn LixBackend,
     blob_hash: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
@@ -1151,30 +933,6 @@ async fn upsert_file_cache_data(
             &[
                 Value::Text(file_id.to_string()),
                 Value::Text(version_id.to_string()),
-                Value::Blob(data.to_vec()),
-            ],
-        )
-        .await?;
-    Ok(())
-}
-
-async fn upsert_file_history_cache_data(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    root_commit_id: &str,
-    depth: i64,
-    data: &[u8],
-) -> Result<(), LixError> {
-    backend
-        .execute(
-            "INSERT INTO lix_internal_file_history_data_cache (file_id, root_commit_id, depth, data) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (file_id, root_commit_id, depth) DO UPDATE SET \
-             data = EXCLUDED.data",
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(root_commit_id.to_string()),
-                Value::Integer(depth),
                 Value::Blob(data.to_vec()),
             ],
         )

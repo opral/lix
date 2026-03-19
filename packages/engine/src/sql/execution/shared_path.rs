@@ -185,21 +185,6 @@ pub(crate) async fn prepare_execution_with_backend(
 
     let requirements = derive_plan_requirements(&statements);
 
-    engine
-        .maybe_materialize_reads_with_backend_from_statements(
-            backend,
-            &statements,
-            active_version_id,
-        )
-        .await
-        .map_err(|error| LixError {
-            code: error.code,
-            description: format!(
-                "prepare_execution_with_backend read materialization failed: {}",
-                error.description
-            ),
-        })?;
-
     let public_execution = match public_surface_registry_override {
         Some(registry) => {
             prepare_public_execution_with_registry_and_internal_access(

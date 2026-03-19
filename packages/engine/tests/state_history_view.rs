@@ -68,6 +68,18 @@ async fn active_commit_id(engine: &support::simulation_test::SimulationEngine) -
     }
 }
 
+async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
+    let result = engine
+        .execute("SELECT version_id FROM lix_active_version LIMIT 1", &[])
+        .await
+        .unwrap();
+    assert_eq!(result.statements[0].rows.len(), 1);
+    match &result.statements[0].rows[0][0] {
+        Value::Text(text) => text.clone(),
+        other => panic!("expected version_id text, got {other:?}"),
+    }
+}
+
 simulation_test!(
     lix_state_history_select_reads_depth_zero_for_active_commit,
     |sim| async move {
@@ -89,6 +101,7 @@ simulation_test!(
             .unwrap();
 
         let commit_id = active_commit_id(&engine).await;
+        let version_id = active_version_id(&engine).await;
         let rows = engine
             .execute(
                 &format!(
@@ -110,7 +123,7 @@ simulation_test!(
         assert_text(&rows.statements[0].rows[0][4], "{\"value\":\"initial\"}");
         assert_eq!(rows.statements[0].rows[0][5], Value::Null);
         assert_non_empty_text(&rows.statements[0].rows[0][6]);
-        assert_text(&rows.statements[0].rows[0][7], "global");
+        assert_text(&rows.statements[0].rows[0][7], &version_id);
     }
 );
 

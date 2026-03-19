@@ -1529,6 +1529,8 @@ fn normalized_public_read_query(
             .as_ref()
             .map(split_conjunctive_predicates)
             .unwrap_or_default(),
+        group_by: select.group_by.clone(),
+        having: select.having.clone(),
         order_by: query.order_by.clone(),
         limit_clause: query.limit_clause.clone(),
     })

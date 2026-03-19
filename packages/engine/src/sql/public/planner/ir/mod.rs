@@ -4,8 +4,8 @@ use crate::sql::public::catalog::{
 use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
 use crate::Value;
 use sqlparser::ast::{
-    Expr, Join, LimitClause, OrderBy, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
-    TableFactor, TableWithJoins, With,
+    Expr, GroupByExpr, Join, LimitClause, OrderBy, Query, Select, SelectItem, SetExpr,
+    Statement, TableAlias, TableFactor, TableWithJoins, With,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -258,6 +258,8 @@ pub(crate) struct NormalizedPublicReadQuery {
     pub(crate) projection: Vec<SelectItem>,
     pub(crate) selection: Option<Expr>,
     pub(crate) selection_predicates: Vec<Expr>,
+    pub(crate) group_by: GroupByExpr,
+    pub(crate) having: Option<Expr>,
     pub(crate) order_by: Option<OrderBy>,
     pub(crate) limit_clause: Option<LimitClause>,
 }

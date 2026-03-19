@@ -971,22 +971,20 @@ simulation_test!(
         let expected_after_content_change_id_rows = engine
             .execute(
                 &format!(
-                    "SELECT sh.change_id \
-                     FROM lix_state_history sh \
-                     JOIN lix_internal_change ic ON ic.id = sh.change_id \
-                     WHERE sh.file_id = 'history-partial' \
-                       AND sh.root_commit_id = '{}' \
-                       AND sh.depth = 0 \
-                       AND sh.schema_key != 'lix_file_descriptor' \
-                       AND sh.snapshot_content IS NOT NULL \
-                     ORDER BY ic.created_at DESC, sh.change_id DESC \
+                    "SELECT change_id \
+                     FROM lix_state_history \
+                     WHERE file_id = 'history-partial' \
+                       AND root_commit_id = '{}' \
+                       AND depth = 0 \
+                       AND schema_key IN ('lix_file_descriptor', 'lix_binary_blob_ref') \
+                     ORDER BY commit_created_at DESC, commit_id DESC, change_id DESC \
                      LIMIT 1",
                     after_commit_id
                 ),
                 &[],
             )
             .await
-            .expect("content-root change id lookup should succeed");
+            .expect("content checkpoint change id lookup should succeed");
         assert_eq!(
             expected_after_content_change_id_rows.statements[0]
                 .rows
