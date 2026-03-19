@@ -10,6 +10,7 @@ pub struct BenchSqliteBackend {
 
 struct BenchSqliteTransaction {
     conn: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    savepoint_name: Option<String>,
 }
 
 impl BenchSqliteBackend {
@@ -60,6 +61,29 @@ impl BenchSqliteBackend {
                     })
             })
             .await
+    }
+
+    async fn begin_scoped_transaction(
+        &self,
+        begin_sql: &str,
+        savepoint_name: Option<String>,
+    ) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        let pool = self.pool().await?;
+        let mut conn = pool.acquire().await.map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: error.to_string(),
+        })?;
+        sqlx::query(begin_sql)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: error.to_string(),
+            })?;
+        Ok(Box::new(BenchSqliteTransaction {
+            conn,
+            savepoint_name,
+        }))
     }
 }
 
@@ -117,19 +141,13 @@ impl LixBackend for BenchSqliteBackend {
     }
 
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
-        let pool = self.pool().await?;
-        let mut conn = pool.acquire().await.map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: error.to_string(),
-        })?;
-        sqlx::query("BEGIN")
-            .execute(&mut *conn)
-            .await
-            .map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: error.to_string(),
-            })?;
-        Ok(Box::new(BenchSqliteTransaction { conn }))
+        self.begin_scoped_transaction("BEGIN", None).await
+    }
+
+    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        let quoted = name.replace('"', "\"\"");
+        let sql = format!("BEGIN; SAVEPOINT \"{quoted}\"");
+        self.begin_scoped_transaction(&sql, Some(name.to_string())).await
     }
 }
 
@@ -188,7 +206,12 @@ impl LixTransaction for BenchSqliteTransaction {
     }
 
     async fn commit(mut self: Box<Self>) -> Result<(), LixError> {
-        sqlx::query("COMMIT")
+        let commit_sql = self
+            .savepoint_name
+            .as_ref()
+            .map(|name| format!("RELEASE SAVEPOINT \"{}\"; COMMIT", name.replace('"', "\"\"")))
+            .unwrap_or_else(|| "COMMIT".to_string());
+        sqlx::query(&commit_sql)
             .execute(&mut *self.conn)
             .await
             .map_err(|error| LixError {
@@ -199,7 +222,17 @@ impl LixTransaction for BenchSqliteTransaction {
     }
 
     async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
-        sqlx::query("ROLLBACK")
+        let rollback_sql = self
+            .savepoint_name
+            .as_ref()
+            .map(|name| {
+                format!(
+                    "ROLLBACK TO SAVEPOINT \"{}\"; ROLLBACK",
+                    name.replace('"', "\"\"")
+                )
+            })
+            .unwrap_or_else(|| "ROLLBACK".to_string());
+        sqlx::query(&rollback_sql)
             .execute(&mut *self.conn)
             .await
             .map_err(|error| LixError {
