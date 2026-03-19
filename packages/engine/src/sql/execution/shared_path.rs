@@ -21,7 +21,10 @@ use crate::state::commit::{
 use crate::state::validation::{
     validate_batch_local_write, validate_commit_time_write, validate_inserts, validate_updates,
 };
-use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
+use crate::{
+    CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, LixBackend,
+    LixError, LixTransaction, QueryResult, Value, VersionId,
+};
 
 use crate::schema::live_layout::{builtin_live_table_layout, LiveTableLayout};
 use crate::schema::registry::load_live_table_layout_in_transaction;
@@ -667,7 +670,7 @@ pub(crate) async fn build_pending_public_commit_session(
              LIMIT 1",
             &[
                 Value::Text(commit_change_id.clone()),
-                Value::Text(commit_row.entity_id.clone()),
+                Value::Text(commit_row.entity_id.to_string()),
             ],
         )
         .await?;
@@ -688,14 +691,14 @@ pub(crate) async fn build_pending_public_commit_session(
 
     Ok(PendingPublicCommitSession {
         lane,
-        commit_id: commit_row.entity_id.clone(),
+        commit_id: commit_row.entity_id.to_string(),
         change_set_id,
         commit_change_id,
         commit_change_snapshot_id,
         commit_materialized_change_id: commit_row.id.clone(),
-        commit_schema_version: commit_row.schema_version.clone(),
-        commit_file_id: commit_row.file_id.clone(),
-        commit_plugin_key: commit_row.plugin_key.clone(),
+        commit_schema_version: commit_row.schema_version.to_string(),
+        commit_file_id: commit_row.file_id.to_string(),
+        commit_plugin_key: commit_row.plugin_key.to_string(),
         commit_snapshot,
     })
 }
@@ -714,18 +717,20 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
         .map(|change| {
             Ok::<DomainChangeInput, LixError>(DomainChangeInput {
                 id: functions.uuid_v7(),
-                entity_id: change.entity_id.clone(),
-                schema_key: change.schema_key.clone(),
-                schema_version: change.schema_version.clone().ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!(
-                            "public merge requires schema_version for '{}:{}'",
-                            change.schema_key, change.entity_id
-                        ),
-                    )
-                })?,
-                file_id: change.file_id.clone().ok_or_else(|| {
+                entity_id: EntityId::new(change.entity_id.clone())?,
+                schema_key: CanonicalSchemaKey::new(change.schema_key.clone())?,
+                schema_version: CanonicalSchemaVersion::new(
+                    change.schema_version.clone().ok_or_else(|| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!(
+                                "public merge requires schema_version for '{}:{}'",
+                                change.schema_key, change.entity_id
+                            ),
+                        )
+                    })?,
+                )?,
+                file_id: FileId::new(change.file_id.clone().ok_or_else(|| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!(
@@ -733,16 +738,18 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
                             change.schema_key, change.entity_id
                         ),
                     )
-                })?,
-                plugin_key: change.plugin_key.clone().ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!(
-                            "public merge requires plugin_key for '{}:{}'",
-                            change.schema_key, change.entity_id
-                        ),
-                    )
-                })?,
+                })?)?,
+                plugin_key: CanonicalPluginKey::new(change.plugin_key.clone().ok_or_else(
+                    || {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!(
+                                "public merge requires plugin_key for '{}:{}'",
+                                change.schema_key, change.entity_id
+                            ),
+                        )
+                    },
+                )?)?,
                 snapshot_content: canonicalize_optional_json_text(
                     change.snapshot_content.as_deref(),
                     "snapshot_content",
@@ -756,7 +763,7 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
                     &change.entity_id,
                 )?,
                 created_at: timestamp.to_string(),
-                version_id: change.version_id.clone(),
+                version_id: VersionId::new(change.version_id.clone())?,
                 writer_key: change.writer_key.clone(),
             })
         })
@@ -841,7 +848,7 @@ async fn load_version_info_for_domain_changes(
 ) -> Result<BTreeMap<String, VersionInfo>, LixError> {
     let affected_versions = domain_changes
         .iter()
-        .map(|change| change.version_id.clone())
+        .map(|change| change.version_id.to_string())
         .collect::<BTreeSet<_>>();
     let mut executor = TransactionCommitExecutor { transaction };
     load_version_info_for_versions(&mut executor, &affected_versions).await
@@ -896,7 +903,7 @@ fn rewrite_generated_commit_result_for_pending_session(
                     row.snapshot_content.as_deref(),
                     &session.change_set_id,
                 )?;
-                row.entity_id = entity_id;
+                row.entity_id = EntityId::new(entity_id)?;
                 row.snapshot_content = Some(snapshot_content);
                 row.lixcol_commit_id = session.commit_id.clone();
             }
@@ -913,15 +920,15 @@ fn rewrite_generated_commit_result_for_pending_session(
 
     live_state_rows.push(MaterializedStateRow {
         id: session.commit_materialized_change_id.clone(),
-        entity_id: session.commit_id.clone(),
-        schema_key: "lix_commit".to_string(),
-        schema_version: session.commit_schema_version.clone(),
-        file_id: session.commit_file_id.clone(),
-        plugin_key: session.commit_plugin_key.clone(),
+        entity_id: EntityId::new(session.commit_id.clone())?,
+        schema_key: CanonicalSchemaKey::new("lix_commit".to_string())?,
+        schema_version: CanonicalSchemaVersion::new(session.commit_schema_version.clone())?,
+        file_id: FileId::new(session.commit_file_id.clone())?,
+        plugin_key: CanonicalPluginKey::new(session.commit_plugin_key.clone())?,
         snapshot_content: Some(CanonicalJson::from_value(session.commit_snapshot.clone())?),
         metadata: None,
         created_at: timestamp.to_string(),
-        lixcol_version_id: GLOBAL_VERSION_ID.to_string(),
+        lixcol_version_id: VersionId::new(GLOBAL_VERSION_ID.to_string())?,
         lixcol_commit_id: session.commit_id.clone(),
         writer_key: None,
     });
@@ -1091,11 +1098,11 @@ async fn load_live_layouts_for_rows_in_transaction(
         .collect::<BTreeSet<_>>();
     for schema_key in schema_keys {
         if let Some(layout) = builtin_live_table_layout(&schema_key)? {
-            layouts.insert(schema_key, layout);
+            layouts.insert(schema_key.to_string(), layout);
             continue;
         }
         layouts.insert(
-            schema_key.clone(),
+            schema_key.to_string(),
             load_live_table_layout_in_transaction(transaction, &schema_key).await?,
         );
     }
@@ -1256,7 +1263,7 @@ fn version_checkpoint_rows_from_resolved_write(
                                         .get("commit_id")
                                         .and_then(serde_json::Value::as_str)
                                         .map(|commit_id| {
-                                            (row.entity_id.clone(), commit_id.to_string())
+                                            (row.entity_id.to_string(), commit_id.to_string())
                                         })
                                 })
                         }
@@ -1281,7 +1288,7 @@ fn version_checkpoint_rows_from_resolved_write(
                         snapshot
                             .get("commit_id")
                             .and_then(serde_json::Value::as_str)
-                            .map(|commit_id| (change.entity_id.clone(), commit_id.to_string()))
+                            .map(|commit_id| (change.entity_id.to_string(), commit_id.to_string()))
                     })
             })
         })
@@ -1303,7 +1310,7 @@ fn version_ids_from_resolved_write(
                     "lix_version_ref" | "lix_version_descriptor"
                 )
             })
-            .map(|row| row.entity_id.clone())
+            .map(|row| row.entity_id.to_string())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -1315,7 +1322,7 @@ fn version_ids_from_resolved_write(
     batch
         .changes
         .iter()
-        .map(|change| change.entity_id.clone())
+        .map(|change| change.entity_id.to_string())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>()

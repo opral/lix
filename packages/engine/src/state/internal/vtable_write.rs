@@ -1245,15 +1245,18 @@ async fn rewrite_tracked_rows_with_backend(
 
         domain_changes.push(DomainChangeInput {
             id: change_id.clone(),
-            entity_id: entity_id.clone(),
-            schema_key: schema_key.clone(),
-            schema_version: schema_version.clone(),
-            file_id: file_id.clone(),
-            plugin_key: plugin_key.clone(),
+            entity_id: require_identity(entity_id.clone(), "vtable insert entity_id")?,
+            schema_key: require_identity(schema_key.clone(), "vtable insert schema_key")?,
+            schema_version: require_identity(
+                schema_version.clone(),
+                "vtable insert schema_version",
+            )?,
+            file_id: require_identity(file_id.clone(), "vtable insert file_id")?,
+            plugin_key: require_identity(plugin_key.clone(), "vtable insert plugin_key")?,
             snapshot_content,
             metadata,
             created_at: timestamp.clone(),
-            version_id: version_id.clone(),
+            version_id: require_identity(version_id.clone(), "vtable insert version_id")?,
             writer_key: domain_writer_key,
         });
 
@@ -1300,7 +1303,7 @@ async fn rewrite_tracked_rows_with_backend(
         let layout = commit_result
             .derived_apply_input
             .live_layouts
-            .get(&row.schema_key)
+            .get(row.schema_key.as_str())
             .cloned();
         ensure_live_table_requirement(live_table_requirements, &row.schema_key, layout);
     }
@@ -1373,7 +1376,7 @@ async fn load_live_layouts_for_rows_with_backend(
 ) -> Result<BTreeMap<String, crate::schema::live_layout::LiveTableLayout>, LixError> {
     let schema_keys = rows
         .iter()
-        .map(|row| row.schema_key.clone())
+        .map(|row| row.schema_key.to_string())
         .collect::<BTreeSet<_>>();
     let mut layouts = BTreeMap::new();
     for schema_key in schema_keys {
@@ -2322,6 +2325,19 @@ fn resolved_optional_string(
             description: format!("vtable insert requires literal {field_name}"),
         }),
     }
+}
+
+fn require_identity<T>(value: impl Into<String>, context: &str) -> Result<T, LixError>
+where
+    T: TryFrom<String, Error = LixError>,
+{
+    let value = value.into();
+    T::try_from(value.clone()).map_err(|_| {
+        LixError::unknown(format!(
+            "{context} must be a non-empty canonical identity, got '{}'",
+            value
+        ))
+    })
 }
 
 fn resolved_expr_or_original(

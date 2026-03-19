@@ -156,8 +156,7 @@ simulation_test!(
 
         let err = result.expect_err("expected empty primary-key rejection");
         assert!(
-            err.to_string()
-                .contains("cannot derive entity_id from empty primary-key value"),
+            err.to_string().contains("non-empty canonical identity"),
             "unexpected error: {err}"
         );
     }

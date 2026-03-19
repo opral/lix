@@ -343,12 +343,12 @@ async fn build_update_followup_statement_batch(
         affected_versions.insert(version_id.clone());
         domain_changes.push(DomainChangeInput {
             id: functions.uuid_v7(),
-            entity_id,
-            schema_key: plan.schema_key.clone(),
-            schema_version,
-            file_id,
-            version_id,
-            plugin_key,
+            entity_id: require_identity(entity_id, "vtable update entity_id")?,
+            schema_key: require_identity(plan.schema_key.clone(), "vtable update schema_key")?,
+            schema_version: require_identity(schema_version, "vtable update schema_version")?,
+            file_id: require_identity(file_id, "vtable update file_id")?,
+            version_id: require_identity(version_id, "vtable update version_id")?,
+            plugin_key: require_identity(plugin_key, "vtable update plugin_key")?,
             snapshot_content,
             metadata,
             created_at: timestamp.clone(),
@@ -417,12 +417,12 @@ async fn build_delete_followup_statement_batch(
         affected_versions.insert(version_id.clone());
         domain_changes.push(DomainChangeInput {
             id: functions.uuid_v7(),
-            entity_id,
-            schema_key: plan.schema_key.clone(),
-            schema_version,
-            file_id,
-            version_id,
-            plugin_key,
+            entity_id: require_identity(entity_id, "vtable delete entity_id")?,
+            schema_key: require_identity(plan.schema_key.clone(), "vtable delete schema_key")?,
+            schema_version: require_identity(schema_version, "vtable delete schema_version")?,
+            file_id: require_identity(file_id, "vtable delete file_id")?,
+            version_id: require_identity(version_id, "vtable delete version_id")?,
+            plugin_key: require_identity(plugin_key, "vtable delete plugin_key")?,
             snapshot_content: None,
             metadata,
             created_at: timestamp.clone(),
@@ -449,12 +449,30 @@ async fn build_delete_followup_statement_batch(
             affected_versions.insert(fallback_row.version_id.clone());
             domain_changes.push(DomainChangeInput {
                 id: functions.uuid_v7(),
-                entity_id: fallback_row.entity_id,
-                schema_key: plan.schema_key.clone(),
-                schema_version: fallback_row.schema_version,
-                file_id: fallback_row.file_id,
-                version_id: fallback_row.version_id,
-                plugin_key: fallback_row.plugin_key,
+                entity_id: require_identity(
+                    fallback_row.entity_id,
+                    "effective-scope delete fallback entity_id",
+                )?,
+                schema_key: require_identity(
+                    plan.schema_key.clone(),
+                    "effective-scope delete fallback schema_key",
+                )?,
+                schema_version: require_identity(
+                    fallback_row.schema_version,
+                    "effective-scope delete fallback schema_version",
+                )?,
+                file_id: require_identity(
+                    fallback_row.file_id,
+                    "effective-scope delete fallback file_id",
+                )?,
+                version_id: require_identity(
+                    fallback_row.version_id,
+                    "effective-scope delete fallback version_id",
+                )?,
+                plugin_key: require_identity(
+                    fallback_row.plugin_key,
+                    "effective-scope delete fallback plugin_key",
+                )?,
                 snapshot_content: None,
                 metadata: fallback_row.metadata,
                 created_at: timestamp.clone(),
@@ -662,6 +680,19 @@ fn value_to_string(value: &EngineValue, name: &str) -> Result<String, LixError> 
             description: format!("vtable update expected text for {name}"),
         }),
     }
+}
+
+fn require_identity<T>(value: impl Into<String>, context: &str) -> Result<T, LixError>
+where
+    T: TryFrom<String, Error = LixError>,
+{
+    let value = value.into();
+    T::try_from(value.clone()).map_err(|_| {
+        LixError::unknown(format!(
+            "{context} must be a non-empty canonical identity, got '{}'",
+            value
+        ))
+    })
 }
 
 fn quote_ident(value: &str) -> String {

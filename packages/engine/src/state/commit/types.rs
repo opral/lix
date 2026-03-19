@@ -1,39 +1,42 @@
 use std::collections::BTreeMap;
 
 use crate::schema::live_layout::LiveTableLayout;
-use crate::CanonicalJson;
+use crate::{
+    CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
+    FileId, VersionId,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProposedDomainChange {
-    pub(crate) entity_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) schema_version: Option<String>,
-    pub(crate) file_id: Option<String>,
-    pub(crate) plugin_key: Option<String>,
+    pub(crate) entity_id: EntityId,
+    pub(crate) schema_key: CanonicalSchemaKey,
+    pub(crate) schema_version: Option<CanonicalSchemaVersion>,
+    pub(crate) file_id: Option<FileId>,
+    pub(crate) plugin_key: Option<CanonicalPluginKey>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
-    pub(crate) version_id: String,
+    pub(crate) version_id: VersionId,
     pub(crate) writer_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainChangeInput {
     pub id: String,
-    pub entity_id: String,
-    pub schema_key: String,
-    pub schema_version: String,
-    pub file_id: String,
-    pub plugin_key: String,
+    pub entity_id: EntityId,
+    pub schema_key: CanonicalSchemaKey,
+    pub schema_version: CanonicalSchemaVersion,
+    pub file_id: FileId,
+    pub plugin_key: CanonicalPluginKey,
     pub snapshot_content: Option<CanonicalJson>,
     pub metadata: Option<CanonicalJson>,
     pub created_at: String,
-    pub version_id: String,
+    pub version_id: VersionId,
     pub writer_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionSnapshot {
-    pub id: String,
+    pub id: VersionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,11 +56,11 @@ pub struct GenerateCommitArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeRow {
     pub id: String,
-    pub entity_id: String,
-    pub schema_key: String,
-    pub schema_version: String,
-    pub file_id: String,
-    pub plugin_key: String,
+    pub entity_id: EntityId,
+    pub schema_key: CanonicalSchemaKey,
+    pub schema_version: CanonicalSchemaVersion,
+    pub file_id: FileId,
+    pub plugin_key: CanonicalPluginKey,
     pub snapshot_content: Option<CanonicalJson>,
     pub metadata: Option<CanonicalJson>,
     pub created_at: String,
@@ -66,15 +69,15 @@ pub struct ChangeRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializedStateRow {
     pub id: String,
-    pub entity_id: String,
-    pub schema_key: String,
-    pub schema_version: String,
-    pub file_id: String,
-    pub plugin_key: String,
+    pub entity_id: EntityId,
+    pub schema_key: CanonicalSchemaKey,
+    pub schema_version: CanonicalSchemaVersion,
+    pub file_id: FileId,
+    pub plugin_key: CanonicalPluginKey,
     pub snapshot_content: Option<CanonicalJson>,
     pub metadata: Option<CanonicalJson>,
     pub created_at: String,
-    pub lixcol_version_id: String,
+    pub lixcol_version_id: VersionId,
     pub lixcol_commit_id: String,
     pub writer_key: Option<String>,
 }

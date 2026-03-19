@@ -9,7 +9,7 @@ use crate::version::{
     version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
     version_ref_storage_version_id, GLOBAL_VERSION_ID,
 };
-use crate::{LixBackend, LixError, Value};
+use crate::{LixBackend, LixError, Value, VersionId};
 
 use super::types::{VersionInfo, VersionSnapshot};
 
@@ -122,7 +122,7 @@ pub(crate) async fn load_version_info_for_versions(
             VersionInfo {
                 parent_commit_ids: Vec::new(),
                 snapshot: VersionSnapshot {
-                    id: version_id.clone(),
+                    id: VersionId::new(version_id.clone())?,
                 },
             },
         );
@@ -136,7 +136,7 @@ pub(crate) async fn load_version_info_for_versions(
                 VersionInfo {
                     parent_commit_ids: vec![commit_id],
                     snapshot: VersionSnapshot {
-                        id: version_id.clone(),
+                        id: VersionId::new(version_id.clone())?,
                     },
                 },
             );

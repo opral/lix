@@ -97,7 +97,7 @@ pub(crate) async fn live_state_rebuild_plan_internal(
         &target_versions,
         &mut stats,
     );
-    let writes = build_writes(&final_state);
+    let writes = build_writes(&final_state)?;
 
     let debug = build_debug_trace(
         req,
@@ -107,7 +107,7 @@ pub(crate) async fn live_state_rebuild_plan_internal(
         &version_ancestry,
         &latest_visible_state,
         &final_state,
-    );
+    )?;
 
     Ok(LiveStateRebuildPlan {
         run_id: format!("materialization::{:?}", req.scope),
@@ -1177,7 +1177,7 @@ fn build_final_state(
     rows
 }
 
-fn build_writes(final_state: &[FinalStateRow]) -> Vec<LiveStateWrite> {
+fn build_writes(final_state: &[FinalStateRow]) -> Result<Vec<LiveStateWrite>, LixError> {
     let mut writes = Vec::new();
     for row in final_state {
         let op = if row.source.snapshot_content.is_some() {
@@ -1186,16 +1186,28 @@ fn build_writes(final_state: &[FinalStateRow]) -> Vec<LiveStateWrite> {
             LiveStateWriteOp::Tombstone
         };
         writes.push(LiveStateWrite {
-            schema_key: row.source.schema_key.clone(),
-            entity_id: row.source.entity_id.clone(),
-            file_id: row.source.file_id.clone(),
-            version_id: row.version_id.clone(),
+            schema_key: require_identity(
+                row.source.schema_key.clone(),
+                "live-state write schema_key",
+            )?,
+            entity_id: require_identity(
+                row.source.entity_id.clone(),
+                "live-state write entity_id",
+            )?,
+            file_id: require_identity(row.source.file_id.clone(), "live-state write file_id")?,
+            version_id: require_identity(row.version_id.clone(), "live-state write version_id")?,
             global: row.version_id == GLOBAL_VERSION_ID,
             op,
             snapshot_content: row.source.snapshot_content.clone(),
             metadata: row.source.metadata.clone(),
-            schema_version: row.source.schema_version.clone(),
-            plugin_key: row.source.plugin_key.clone(),
+            schema_version: require_identity(
+                row.source.schema_version.clone(),
+                "live-state write schema_version",
+            )?,
+            plugin_key: require_identity(
+                row.source.plugin_key.clone(),
+                "live-state write plugin_key",
+            )?,
             change_id: row.source.change_id.clone(),
             created_at: row.source.created_at.clone(),
             updated_at: row.source.updated_at.clone(),
@@ -1211,7 +1223,7 @@ fn build_writes(final_state: &[FinalStateRow]) -> Vec<LiveStateWrite> {
             .then_with(|| a.change_id.cmp(&b.change_id))
     });
 
-    writes
+    Ok(writes)
 }
 
 fn build_debug_trace(
@@ -1222,9 +1234,9 @@ fn build_debug_trace(
     version_ancestry: &BTreeMap<String, Vec<(String, usize)>>,
     latest_visible_state: &[VisibleRow],
     final_state: &[FinalStateRow],
-) -> Option<LiveStateRebuildDebugTrace> {
+) -> Result<Option<LiveStateRebuildDebugTrace>, LixError> {
     if matches!(req.debug, LiveStateRebuildDebugMode::Off) {
-        return None;
+        return Ok(None);
     }
 
     let limit = req.debug_row_limit.max(1);
@@ -1233,7 +1245,7 @@ fn build_debug_trace(
     for (version_id, tips) in version_refs {
         for tip in tips {
             heads_by_version.push(VersionHeadDebugRow {
-                version_id: version_id.clone(),
+                version_id: require_identity(version_id.clone(), "debug head version_id")?,
                 commit_id: tip.clone(),
             });
         }
@@ -1242,7 +1254,7 @@ fn build_debug_trace(
     let mut traversed_commits = Vec::new();
     for ((version_id, commit_id), depth) in commit_graph {
         traversed_commits.push(TraversedCommitDebugRow {
-            version_id: version_id.clone(),
+            version_id: require_identity(version_id.clone(), "debug traversed commit version_id")?,
             commit_id: commit_id.clone(),
             depth: *depth,
         });
@@ -1265,8 +1277,11 @@ fn build_debug_trace(
     for (version_id, rows) in version_ancestry {
         for (ancestor_version_id, inheritance_depth) in rows {
             ancestry_rows.push(VersionAncestryDebugRow {
-                version_id: version_id.clone(),
-                ancestor_version_id: ancestor_version_id.clone(),
+                version_id: require_identity(version_id.clone(), "debug ancestry version_id")?,
+                ancestor_version_id: require_identity(
+                    ancestor_version_id.clone(),
+                    "debug ancestry ancestor_version_id",
+                )?,
                 inheritance_depth: *inheritance_depth,
             });
         }
@@ -1275,16 +1290,27 @@ fn build_debug_trace(
     let latest_visible_winners = if matches!(req.debug, LiveStateRebuildDebugMode::Full) {
         latest_visible_state
             .iter()
-            .map(|row| LatestVisibleWinnerDebugRow {
-                version_id: row.version_id.clone(),
-                entity_id: row.entity_id.clone(),
-                schema_key: row.schema_key.clone(),
-                file_id: row.file_id.clone(),
-                commit_id: row.commit_id.clone(),
-                change_id: row.change_id.clone(),
+            .map(|row| {
+                Ok(LatestVisibleWinnerDebugRow {
+                    version_id: require_identity(
+                        row.version_id.clone(),
+                        "debug latest-visible version_id",
+                    )?,
+                    entity_id: require_identity(
+                        row.entity_id.clone(),
+                        "debug latest-visible entity_id",
+                    )?,
+                    schema_key: require_identity(
+                        row.schema_key.clone(),
+                        "debug latest-visible schema_key",
+                    )?,
+                    file_id: require_identity(row.file_id.clone(), "debug latest-visible file_id")?,
+                    commit_id: row.commit_id.clone(),
+                    change_id: row.change_id.clone(),
+                })
             })
             .take(limit)
-            .collect()
+            .collect::<Result<Vec<_>, LixError>>()?
     } else {
         Vec::new()
     };
@@ -1292,27 +1318,48 @@ fn build_debug_trace(
     let scope_winners = if matches!(req.debug, LiveStateRebuildDebugMode::Full) {
         final_state
             .iter()
-            .map(|row| ScopeWinnerDebugRow {
-                version_id: row.version_id.clone(),
-                entity_id: row.source.entity_id.clone(),
-                schema_key: row.source.schema_key.clone(),
-                file_id: row.source.file_id.clone(),
-                global: row.version_id == GLOBAL_VERSION_ID,
-                change_id: row.source.change_id.clone(),
+            .map(|row| {
+                Ok(ScopeWinnerDebugRow {
+                    version_id: require_identity(row.version_id.clone(), "debug scope version_id")?,
+                    entity_id: require_identity(
+                        row.source.entity_id.clone(),
+                        "debug scope entity_id",
+                    )?,
+                    schema_key: require_identity(
+                        row.source.schema_key.clone(),
+                        "debug scope schema_key",
+                    )?,
+                    file_id: require_identity(row.source.file_id.clone(), "debug scope file_id")?,
+                    global: row.version_id == GLOBAL_VERSION_ID,
+                    change_id: row.source.change_id.clone(),
+                })
             })
             .take(limit)
-            .collect()
+            .collect::<Result<Vec<_>, LixError>>()?
     } else {
         Vec::new()
     };
 
-    Some(LiveStateRebuildDebugTrace {
+    Ok(Some(LiveStateRebuildDebugTrace {
         heads_by_version: heads_by_version.into_iter().take(limit).collect(),
         traversed_commits: traversed_commits.into_iter().take(limit).collect(),
         traversed_edges: traversed_edges.into_iter().take(limit).collect(),
         version_ancestry: ancestry_rows.into_iter().take(limit).collect(),
         latest_visible_winners,
         scope_winners,
+    }))
+}
+
+fn require_identity<T>(value: impl Into<String>, context: &str) -> Result<T, LixError>
+where
+    T: TryFrom<String, Error = LixError>,
+{
+    let value = value.into();
+    T::try_from(value.clone()).map_err(|_| {
+        LixError::unknown(format!(
+            "{context} must be a non-empty canonical identity, got '{}'",
+            value
+        ))
     })
 }
 
