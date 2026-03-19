@@ -37,10 +37,7 @@ pub(crate) async fn load_state_history_rows(
     parse_state_history_rows(result)
 }
 
-pub(crate) fn build_state_history_query_sql(
-    dialect: SqlDialect,
-    request: &StateHistoryRequest,
-) -> String {
+fn build_state_history_query_sql(dialect: SqlDialect, request: &StateHistoryRequest) -> String {
     let source_sql = build_state_history_source_sql(dialect, request);
     let mut predicates = Vec::new();
     if !request.entity_ids.is_empty() {
@@ -169,7 +166,7 @@ fn build_state_history_source_sql(dialect: SqlDialect, request: &StateHistoryReq
                 "default_root_commits AS ( \
                SELECT DISTINCT \
                  vp.{version_ref_commit_id_column} AS root_commit_id, \
-                 vp.version_id AS root_version_id \
+                 vp.entity_id AS root_version_id \
                FROM {version_ref_table} vp \
                JOIN active_version_rows av \
                  ON av.version_id = vp.entity_id \

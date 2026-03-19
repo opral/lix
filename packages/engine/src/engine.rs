@@ -648,7 +648,6 @@ mod tests {
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
     use crate::schema::live_layout::{untracked_live_table_name, UNTRACKED_LIVE_TABLE_PREFIX};
-    use crate::sql::analysis::history_reads::file_history_read_materialization_required_for_statements;
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
     use crate::sql::analysis::state_resolution::effects::active_version_from_update_validations;
     use crate::sql::analysis::state_resolution::optimize::should_refresh_file_cache_for_statements;
@@ -1075,38 +1074,6 @@ mod tests {
     }
 
     #[test]
-    fn file_history_materialization_detection_includes_insert_select_sources() {
-        assert!(file_history_read_materialization_required_for_sql(
-            "INSERT INTO some_table (payload) \
-             SELECT data FROM lix_file_history \
-             WHERE id = 'file-a' \
-             LIMIT 1",
-        ));
-    }
-
-    #[test]
-    fn file_history_materialization_detection_includes_select_where_subquery_sources() {
-        assert!(file_history_read_materialization_required_for_sql(
-            "SELECT 1 \
-             WHERE EXISTS (\
-                SELECT 1 FROM lix_file_history WHERE id = 'file-a'\
-             )",
-        ));
-    }
-
-    #[test]
-    fn file_history_materialization_detection_includes_update_where_subquery_sources() {
-        assert!(file_history_read_materialization_required_for_sql(
-            "UPDATE some_table \
-             SET payload = 'x' \
-             WHERE EXISTS (\
-                 SELECT 1 FROM lix_file_history \
-                 WHERE id = 'file-a' \
-             )",
-        ));
-    }
-
-    #[test]
     fn extract_explicit_transaction_script_parses_begin_commit_wrapper() {
         let parsed = extract_explicit_transaction_script(
             "BEGIN; INSERT INTO lix_file (id, path, data) VALUES ('f1', '/a', x'01'); COMMIT;",
@@ -1128,14 +1095,6 @@ mod tests {
     fn should_refresh_file_cache_for_sql(sql: &str) -> bool {
         parse_sql_statements(sql)
             .map(|statements| should_refresh_file_cache_for_statements(&statements))
-            .unwrap_or(false)
-    }
-
-    fn file_history_read_materialization_required_for_sql(sql: &str) -> bool {
-        parse_sql_statements(sql)
-            .map(|statements| {
-                file_history_read_materialization_required_for_statements(&statements)
-            })
             .unwrap_or(false)
     }
 

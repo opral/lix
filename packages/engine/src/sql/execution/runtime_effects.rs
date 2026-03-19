@@ -2,7 +2,6 @@ use crate::engine::{
     dedupe_filesystem_payload_domain_changes, CollectedExecutionSideEffects, Engine,
     TransactionBackendAdapter,
 };
-use crate::sql::analysis::history_reads as history_plugin_inputs;
 use crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange;
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::sql::storage::queries::{
@@ -151,26 +150,6 @@ fn binary_blob_ref_tombstone_change_for_target(
 }
 
 impl Engine {
-    pub(crate) async fn maybe_materialize_reads_with_backend_from_statements(
-        &self,
-        backend: &dyn LixBackend,
-        statements: &[Statement],
-        active_version_id: &str,
-    ) -> Result<(), LixError> {
-        let _ = backend;
-        let _ = active_version_id;
-        if history_plugin_inputs::file_history_read_materialization_required_for_statements(
-            statements,
-        ) {
-            crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
-                backend,
-                self.wasm_runtime_ref(),
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
     pub(crate) async fn collect_execution_side_effects_with_backend_from_statements(
         &self,
         backend: &dyn LixBackend,

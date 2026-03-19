@@ -17,8 +17,7 @@ use crate::sql::execution::write_txn_runner::run_write_txn_plan_with_transaction
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::sql::public::runtime::{
     apply_public_surface_registry_mutations, decode_public_read_result,
-    execute_prepared_public_read,
-    public_surface_registry_mutations, PublicWriteExecutionPartition,
+    execute_prepared_public_read, public_surface_registry_mutations, PublicWriteExecutionPartition,
 };
 use crate::{
     ExecuteOptions, LixError, LixTransaction, QueryResult, StateCommitStreamChange, Value,

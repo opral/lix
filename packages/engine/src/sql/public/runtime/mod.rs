@@ -2,6 +2,7 @@ use crate::errors::schema_not_registered_error;
 use crate::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
 };
+use crate::filesystem::history::{DirectoryHistoryRequest, FileHistoryRequest};
 use crate::filesystem::pending_file_writes::PendingFileWrite;
 use crate::schema::builtin::builtin_schema_definition;
 use crate::schema::live_layout::{
@@ -16,7 +17,7 @@ use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirem
 use crate::sql::execution::intent::authoritative_pending_file_write_targets;
 use crate::sql::public::backend::PushdownDecision;
 use crate::sql::public::catalog::{
-    SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
+    SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
 use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
 use crate::sql::public::planner::backend::lowerer::{
@@ -129,15 +130,32 @@ pub(crate) enum DirectStateHistoryField {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StateHistoryAggregate {
+    Count,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StateHistoryProjectionValue {
+    Field(DirectStateHistoryField),
+    Aggregate(StateHistoryAggregate),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StateHistoryProjection {
     pub(crate) output_name: String,
-    pub(crate) field: DirectStateHistoryField,
+    pub(crate) value: StateHistoryProjectionValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StateHistorySortValue {
+    Field(DirectStateHistoryField),
+    Aggregate(StateHistoryAggregate),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StateHistorySortKey {
     pub(crate) output_name: String,
-    pub(crate) field: Option<DirectStateHistoryField>,
+    pub(crate) value: Option<StateHistorySortValue>,
     pub(crate) descending: bool,
 }
 
@@ -161,6 +179,8 @@ pub(crate) struct StateHistoryDirectReadPlan {
     pub(crate) projections: Vec<StateHistoryProjection>,
     pub(crate) wildcard_projection: bool,
     pub(crate) wildcard_columns: Vec<String>,
+    pub(crate) group_by_fields: Vec<DirectStateHistoryField>,
+    pub(crate) having: Option<StateHistoryAggregatePredicate>,
     pub(crate) sort_keys: Vec<StateHistorySortKey>,
     pub(crate) limit: Option<u64>,
     pub(crate) offset: u64,
@@ -168,8 +188,201 @@ pub(crate) struct StateHistoryDirectReadPlan {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StateHistoryAggregatePredicate {
+    Eq(StateHistoryAggregate, i64),
+    NotEq(StateHistoryAggregate, i64),
+    Gt(StateHistoryAggregate, i64),
+    GtEq(StateHistoryAggregate, i64),
+    Lt(StateHistoryAggregate, i64),
+    LtEq(StateHistoryAggregate, i64),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DirectEntityHistoryField {
+    Property(String),
+    State(DirectStateHistoryField),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EntityHistoryProjection {
+    pub(crate) output_name: String,
+    pub(crate) field: DirectEntityHistoryField,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EntityHistorySortKey {
+    pub(crate) output_name: String,
+    pub(crate) field: Option<DirectEntityHistoryField>,
+    pub(crate) descending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum EntityHistoryPredicate {
+    Eq(DirectEntityHistoryField, Value),
+    NotEq(DirectEntityHistoryField, Value),
+    Gt(DirectEntityHistoryField, Value),
+    GtEq(DirectEntityHistoryField, Value),
+    Lt(DirectEntityHistoryField, Value),
+    LtEq(DirectEntityHistoryField, Value),
+    In(DirectEntityHistoryField, Vec<Value>),
+    IsNull(DirectEntityHistoryField),
+    IsNotNull(DirectEntityHistoryField),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EntityHistoryDirectReadPlan {
+    pub(crate) surface_binding: SurfaceBinding,
+    pub(crate) request: StateHistoryRequest,
+    pub(crate) predicates: Vec<EntityHistoryPredicate>,
+    pub(crate) projections: Vec<EntityHistoryProjection>,
+    pub(crate) wildcard_projection: bool,
+    pub(crate) wildcard_columns: Vec<String>,
+    pub(crate) sort_keys: Vec<EntityHistorySortKey>,
+    pub(crate) limit: Option<u64>,
+    pub(crate) offset: u64,
+    pub(crate) result_columns: LoweredResultColumns,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DirectFileHistoryField {
+    Id,
+    Path,
+    Data,
+    Metadata,
+    Hidden,
+    EntityId,
+    SchemaKey,
+    FileId,
+    VersionId,
+    PluginKey,
+    SchemaVersion,
+    ChangeId,
+    LixcolMetadata,
+    CommitId,
+    CommitCreatedAt,
+    RootCommitId,
+    Depth,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FileHistoryProjection {
+    pub(crate) output_name: String,
+    pub(crate) field: DirectFileHistoryField,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FileHistorySortKey {
+    pub(crate) output_name: String,
+    pub(crate) field: Option<DirectFileHistoryField>,
+    pub(crate) descending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FileHistoryPredicate {
+    Eq(DirectFileHistoryField, Value),
+    NotEq(DirectFileHistoryField, Value),
+    Gt(DirectFileHistoryField, Value),
+    GtEq(DirectFileHistoryField, Value),
+    Lt(DirectFileHistoryField, Value),
+    LtEq(DirectFileHistoryField, Value),
+    In(DirectFileHistoryField, Vec<Value>),
+    IsNull(DirectFileHistoryField),
+    IsNotNull(DirectFileHistoryField),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FileHistoryAggregate {
+    Count,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FileHistoryDirectReadPlan {
+    pub(crate) request: FileHistoryRequest,
+    pub(crate) predicates: Vec<FileHistoryPredicate>,
+    pub(crate) projections: Vec<FileHistoryProjection>,
+    pub(crate) wildcard_projection: bool,
+    pub(crate) wildcard_columns: Vec<String>,
+    pub(crate) sort_keys: Vec<FileHistorySortKey>,
+    pub(crate) limit: Option<u64>,
+    pub(crate) offset: u64,
+    pub(crate) aggregate: Option<FileHistoryAggregate>,
+    pub(crate) aggregate_output_name: Option<String>,
+    pub(crate) result_columns: LoweredResultColumns,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DirectDirectoryHistoryField {
+    Id,
+    ParentId,
+    Name,
+    Path,
+    Hidden,
+    EntityId,
+    SchemaKey,
+    FileId,
+    VersionId,
+    PluginKey,
+    SchemaVersion,
+    ChangeId,
+    LixcolMetadata,
+    CommitId,
+    CommitCreatedAt,
+    RootCommitId,
+    Depth,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DirectoryHistoryProjection {
+    pub(crate) output_name: String,
+    pub(crate) field: DirectDirectoryHistoryField,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DirectoryHistorySortKey {
+    pub(crate) output_name: String,
+    pub(crate) field: Option<DirectDirectoryHistoryField>,
+    pub(crate) descending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DirectoryHistoryPredicate {
+    Eq(DirectDirectoryHistoryField, Value),
+    NotEq(DirectDirectoryHistoryField, Value),
+    Gt(DirectDirectoryHistoryField, Value),
+    GtEq(DirectDirectoryHistoryField, Value),
+    Lt(DirectDirectoryHistoryField, Value),
+    LtEq(DirectDirectoryHistoryField, Value),
+    In(DirectDirectoryHistoryField, Vec<Value>),
+    IsNull(DirectDirectoryHistoryField),
+    IsNotNull(DirectDirectoryHistoryField),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DirectoryHistoryAggregate {
+    Count,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DirectoryHistoryDirectReadPlan {
+    pub(crate) request: DirectoryHistoryRequest,
+    pub(crate) predicates: Vec<DirectoryHistoryPredicate>,
+    pub(crate) projections: Vec<DirectoryHistoryProjection>,
+    pub(crate) wildcard_projection: bool,
+    pub(crate) wildcard_columns: Vec<String>,
+    pub(crate) sort_keys: Vec<DirectoryHistorySortKey>,
+    pub(crate) limit: Option<u64>,
+    pub(crate) offset: u64,
+    pub(crate) aggregate: Option<DirectoryHistoryAggregate>,
+    pub(crate) aggregate_output_name: Option<String>,
+    pub(crate) result_columns: LoweredResultColumns,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DirectPublicReadPlan {
     StateHistory(StateHistoryDirectReadPlan),
+    EntityHistory(EntityHistoryDirectReadPlan),
+    FileHistory(FileHistoryDirectReadPlan),
+    DirectoryHistory(DirectoryHistoryDirectReadPlan),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2424,6 +2637,7 @@ mod tests {
         prepare_public_read_strict, DirectPublicReadPlan, PreparedPublicExecution,
         PreparedPublicReadExecution,
     };
+    use super::read::try_prepare_public_read;
     use crate::state::history::StateHistoryRootScope;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
@@ -3157,15 +3371,16 @@ mod tests {
                 .residual_predicates,
             vec!["key = 'hello'".to_string()]
         );
-        let lowered_sql = prepared
-            .debug_trace
-            .lowered_sql
-            .first()
-            .expect("entity history read should lower");
-        assert!(lowered_sql.contains("FROM lix_internal_live_v1_lix_commit"));
-        assert!(lowered_sql.contains("c.id = 'commit-active-root'"));
-        assert!(lowered_sql.contains("commit_id AS lixcol_commit_id"));
-        assert!(lowered_sql.contains("depth AS lixcol_depth"));
+        match &prepared.execution {
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(plan)) => {
+                assert_eq!(
+                    plan.request.root_scope,
+                    StateHistoryRootScope::RequestedRoots(vec!["commit-active-root".to_string()])
+                );
+                assert!(prepared.debug_trace.lowered_sql.is_empty());
+            }
+            _ => panic!("entity history read should use direct entity-history execution"),
+        }
     }
 
     #[tokio::test]
@@ -3390,22 +3605,32 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .residual_predicates,
-            vec![
-                "id = 'file-1'".to_string(),
-                "lixcol_root_commit_id = 'commit-1'".to_string()
-            ]
+                .accepted_predicates,
+            vec!["root_commit_id = 'commit-1'".to_string()]
         );
-        let lowered_sql = prepared
-            .debug_trace
-            .lowered_sql
-            .first()
-            .expect("filesystem history read should lower");
-        assert!(lowered_sql.contains("reachable_commit_walk AS"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_commit_edge"));
-        assert!(lowered_sql.contains("lix_internal_change ch"));
-        assert!(lowered_sql.contains("lix_internal_file_history_data_cache"));
-        assert!(!lowered_sql.contains("FROM lix_file_history"));
+        match &prepared.execution {
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(plan)) => {
+                assert_eq!(
+                    plan.request.root_scope,
+                    crate::filesystem::history::FileHistoryRootScope::RequestedRoots(vec![
+                        "commit-1".to_string()
+                    ])
+                );
+                assert!(prepared.debug_trace.lowered_sql.is_empty());
+            }
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(_)) => {
+                panic!("filesystem history read should not use state-history direct plan")
+            }
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(_)) => {
+                panic!("filesystem history read should not use entity-history direct plan")
+            }
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::DirectoryHistory(_)) => {
+                panic!("filesystem history read should not use directory-history direct plan")
+            }
+            PreparedPublicReadExecution::LoweredSql(_) => {
+                panic!("filesystem history read should not use lowered SQL")
+            }
+        }
     }
 
     #[tokio::test]
@@ -3431,16 +3656,106 @@ mod tests {
             prepared.debug_trace.surface_bindings,
             vec!["lix_file_history_by_version"]
         );
-        let lowered_sql = prepared
-            .debug_trace
-            .lowered_sql
-            .first()
-            .expect("filesystem by-version history read should lower");
-        assert!(lowered_sql.contains("reachable_commit_walk AS"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_commit_edge"));
-        assert!(lowered_sql.contains("lix_internal_change ch"));
-        assert!(lowered_sql.contains("lix_internal_file_history_data_cache"));
-        assert!(!lowered_sql.contains("FROM lix_file_history_by_version"));
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .accepted_predicates,
+            vec![
+                "root_commit_id = 'commit-1'".to_string(),
+                "version_id = 'version-a'".to_string()
+            ]
+        );
+        match &prepared.execution {
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(plan)) => {
+                assert_eq!(
+                    plan.request.version_scope,
+                    crate::filesystem::history::FileHistoryVersionScope::RequestedVersions(vec![
+                        "version-a".to_string()
+                    ])
+                );
+                assert!(prepared.debug_trace.lowered_sql.is_empty());
+            }
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(_)) => {
+                panic!(
+                    "filesystem by-version history read should not use state-history direct plan"
+                )
+            }
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(_)) => {
+                panic!(
+                    "filesystem by-version history read should not use entity-history direct plan"
+                )
+            }
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::DirectoryHistory(_)) => {
+                panic!(
+                    "filesystem by-version history read should not use directory-history direct plan"
+                )
+            }
+            PreparedPublicReadExecution::LoweredSql(_) => {
+                panic!("filesystem by-version history read should not use lowered SQL")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepares_directory_history_reads_through_internal_history_sources() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_public_read(
+            &backend,
+            &parse_one(
+                "SELECT id, path, lixcol_root_commit_id \
+                 FROM lix_directory_history \
+                 WHERE id = 'dir-1' AND lixcol_root_commit_id = 'commit-1'",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("directory history read should canonicalize");
+
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_directory_history"]
+        );
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .accepted_predicates,
+            vec![
+                "root_commit_id = 'commit-1'".to_string(),
+                "id = 'dir-1'".to_string()
+            ]
+        );
+        match &prepared.execution {
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::DirectoryHistory(plan)) => {
+                assert_eq!(
+                    plan.request.root_scope,
+                    crate::filesystem::history::FileHistoryRootScope::RequestedRoots(vec![
+                        "commit-1".to_string()
+                    ])
+                );
+                assert_eq!(plan.request.directory_ids, vec!["dir-1".to_string()]);
+                assert!(prepared.debug_trace.lowered_sql.is_empty());
+            }
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(_)) => {
+                panic!("directory history read should not use state-history direct plan")
+            }
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(_)) => {
+                panic!("directory history read should not use entity-history direct plan")
+            }
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(_)) => {
+                panic!("directory history read should not use file-history direct plan")
+            }
+            PreparedPublicReadExecution::LoweredSql(_) => {
+                panic!("directory history read should not use lowered SQL")
+            }
+        }
     }
 
     #[tokio::test]
@@ -3466,12 +3781,28 @@ mod tests {
         .await
         .expect("filesystem history read should canonicalize");
 
-        let lowered_sql = prepared
-            .debug_trace
-            .lowered_sql
-            .first()
-            .expect("filesystem history read should lower");
-        assert!(lowered_sql.contains("c.entity_id = 'commit-active-root'"));
+        match &prepared.execution {
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(plan)) => {
+                assert_eq!(
+                    plan.request.root_scope,
+                    crate::filesystem::history::FileHistoryRootScope::RequestedRoots(vec![
+                        "commit-active-root".to_string()
+                    ])
+                );
+            }
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(_)) => {
+                panic!("filesystem history read should not use state-history direct plan")
+            }
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(_)) => {
+                panic!("filesystem history read should not use entity-history direct plan")
+            }
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::DirectoryHistory(_)) => {
+                panic!("filesystem history read should not use directory-history direct plan")
+            }
+            PreparedPublicReadExecution::LoweredSql(_) => {
+                panic!("filesystem history read should not use lowered SQL")
+            }
+        }
     }
 
     #[tokio::test]
@@ -3497,12 +3828,39 @@ mod tests {
         .await
         .expect("entity history read should canonicalize");
 
-        let lowered_sql = prepared
-            .debug_trace
-            .lowered_sql
-            .first()
-            .expect("entity history read should lower");
-        assert!(lowered_sql.contains("c.id = 'commit-active-root'"));
+        match &prepared.execution {
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(plan)) => {
+                assert_eq!(
+                    plan.request.root_scope,
+                    StateHistoryRootScope::RequestedRoots(vec!["commit-active-root".to_string()])
+                );
+                assert!(prepared.debug_trace.lowered_sql.is_empty());
+            }
+            _ => panic!("entity history read should use direct entity-history execution"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_explain_over_history_surfaces() {
+        let backend = FakeBackend::default();
+        let error = try_prepare_public_read(
+            &backend,
+            &parse_one("EXPLAIN SELECT key FROM lix_key_value_history WHERE key = 'hello'"),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect_err("history EXPLAIN should be rejected");
+
+        assert!(
+            error.description.contains("EXPLAIN is not supported")
+                || error
+                    .description
+                    .contains("direct-only history surfaces do not support broad surface lowering"),
+            "{}",
+            error.description
+        );
     }
 
     #[tokio::test]
@@ -3957,15 +4315,59 @@ mod tests {
                 );
                 assert!(prepared.debug_trace.lowered_sql.is_empty());
             }
-            PreparedPublicReadExecution::LoweredSql(lowered) => {
-                let lowered_sql = lowered
-                    .statements
-                    .first()
-                    .expect("state-history read should lower")
-                    .to_string();
-                assert!(lowered_sql.contains("FROM lix_internal_live_v1_lix_commit"));
-                assert!(lowered_sql.contains("c.id = 'commit-1'"));
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(_)) => {
+                panic!("state-history read should not use entity-history direct plan")
             }
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(_)) => {
+                panic!("state-history read should not use file-history direct plan")
+            }
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::DirectoryHistory(_)) => {
+                panic!("state-history read should not use directory-history direct plan")
+            }
+            PreparedPublicReadExecution::LoweredSql(_) => {
+                panic!("state-history read should not use lowered SQL")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepares_grouped_state_history_reads_through_direct_history_source() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_public_read(
+            &backend,
+            &parse_one(
+                "SELECT entity_id, root_commit_id, depth, COUNT(*) AS count_rows \
+                 FROM lix_state_history \
+                 WHERE root_commit_id = 'commit-1' \
+                 GROUP BY entity_id, root_commit_id, depth \
+                 HAVING COUNT(*) > 0 \
+                 ORDER BY entity_id",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("grouped state-history read should canonicalize");
+
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .accepted_predicates,
+            vec!["root_commit_id = 'commit-1'".to_string()]
+        );
+        match &prepared.execution {
+            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(plan)) => {
+                assert_eq!(
+                    plan.request.root_scope,
+                    StateHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
+                );
+                assert!(prepared.debug_trace.lowered_sql.is_empty());
+            }
+            _ => panic!("grouped state-history read should use direct state-history execution"),
         }
     }
 

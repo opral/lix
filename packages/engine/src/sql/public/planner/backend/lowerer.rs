@@ -2,12 +2,8 @@ use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
 };
 use crate::errors::sql_unknown_column_error;
-use crate::filesystem::history::{
-    build_filesystem_history_source_sql, collect_filesystem_history_pushdown_predicates,
-};
 use crate::filesystem::live_projection::{
-    build_filesystem_directory_history_projection_sql, build_filesystem_directory_projection_sql,
-    build_filesystem_file_history_projection_sql, build_filesystem_file_projection_sql,
+    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
     FilesystemProjectionScope,
 };
 use crate::schema::live_layout::{
@@ -27,11 +23,6 @@ use crate::sql::public::planner::ir::{
 };
 use crate::sql::public::planner::semantics::effective_state_resolver::{
     EffectiveStatePlan, EffectiveStateRequest,
-};
-use crate::state::history::query::build_state_history_query_sql;
-use crate::state::history::{
-    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
-    StateHistoryVersionScope,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -599,7 +590,7 @@ fn rewrite_nested_filesystem_surfaces_in_table_factor(
             let Some(surface_name) = table_name_terminal(name) else {
                 return Ok(());
             };
-            if top_level || !is_filesystem_public_surface_name(surface_name) {
+            if top_level || !is_rewriteable_filesystem_public_surface_name(surface_name) {
                 return Ok(());
             }
             let Some(derived_query) = build_nested_filesystem_surface_query(dialect, surface_name)?
@@ -702,24 +693,6 @@ fn build_nested_filesystem_surface_query(
                 dialect,
             ))?
         }
-        "lix_file_history" => {
-            let state_history_source_sql = build_filesystem_history_source_sql(dialect, &[], true);
-            parse_single_query(&build_filesystem_file_history_projection_sql(
-                &state_history_source_sql,
-            ))?
-        }
-        "lix_file_history_by_version" => {
-            let state_history_source_sql = build_filesystem_history_source_sql(dialect, &[], false);
-            parse_single_query(&build_filesystem_file_history_projection_sql(
-                &state_history_source_sql,
-            ))?
-        }
-        "lix_directory_history" => {
-            let state_history_source_sql = build_filesystem_history_source_sql(dialect, &[], true);
-            parse_single_query(&build_filesystem_directory_history_projection_sql(
-                &state_history_source_sql,
-            ))?
-        }
         _ => return Ok(None),
     };
     Ok(Some(query))
@@ -773,7 +746,9 @@ fn table_factor_contains_nested_filesystem_surface(
 ) -> bool {
     match relation {
         TableFactor::Table { name, .. } => {
-            !top_level && table_name_terminal(name).is_some_and(is_filesystem_public_surface_name)
+            !top_level
+                && table_name_terminal(name)
+                    .is_some_and(is_rewriteable_filesystem_public_surface_name)
         }
         TableFactor::Derived { subquery, .. } => {
             query_set_expr_contains_nested_filesystem_surface(subquery.body.as_ref(), false)
@@ -836,16 +811,13 @@ fn table_name_terminal(name: &sqlparser::ast::ObjectName) -> Option<&str> {
         .map(|ident| ident.value.as_str())
 }
 
-fn is_filesystem_public_surface_name(name: &str) -> bool {
+fn is_rewriteable_filesystem_public_surface_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "lix_file"
             | "lix_file_by_version"
-            | "lix_file_history"
-            | "lix_file_history_by_version"
             | "lix_directory"
             | "lix_directory_by_version"
-            | "lix_directory_history"
     )
 }
 
@@ -874,18 +846,6 @@ fn lower_filesystem_read_for_execution(
     let Some(filesystem_scan) = canonical_filesystem_scan(&canonicalized.read_command.root) else {
         return Ok(None);
     };
-
-    let relation_name = canonicalized
-        .query
-        .source_alias
-        .as_ref()
-        .map(|value| value.name.value.clone())
-        .unwrap_or_else(|| canonicalized.surface_binding.descriptor.public_name.clone());
-    let history_pushdown_predicates = collect_filesystem_history_pushdown_predicates(
-        canonicalized.query.selection.as_ref(),
-        &relation_name,
-        true,
-    );
 
     let derived_query = match (filesystem_scan.kind, filesystem_scan.version_scope) {
         (FilesystemKind::File, VersionScope::ActiveVersion) => {
@@ -919,34 +879,6 @@ fn lower_filesystem_read_for_execution(
                 dialect,
             ))?
         }
-        (FilesystemKind::File, VersionScope::History)
-            if canonicalized.surface_binding.descriptor.public_name == "lix_file_history" =>
-        {
-            let state_history_source_sql =
-                build_filesystem_history_source_sql(dialect, &history_pushdown_predicates, true);
-            parse_single_query(&build_filesystem_file_history_projection_sql(
-                &state_history_source_sql,
-            ))?
-        }
-        (FilesystemKind::File, VersionScope::History)
-            if canonicalized.surface_binding.descriptor.public_name
-                == "lix_file_history_by_version" =>
-        {
-            let state_history_source_sql =
-                build_filesystem_history_source_sql(dialect, &history_pushdown_predicates, false);
-            parse_single_query(&build_filesystem_file_history_projection_sql(
-                &state_history_source_sql,
-            ))?
-        }
-        (FilesystemKind::Directory, VersionScope::History)
-            if canonicalized.surface_binding.descriptor.public_name == "lix_directory_history" =>
-        {
-            let state_history_source_sql =
-                build_filesystem_history_source_sql(dialect, &history_pushdown_predicates, true);
-            parse_single_query(&build_filesystem_directory_history_projection_sql(
-                &state_history_source_sql,
-            ))?
-        }
         _ => return Ok(None),
     };
     let query = build_lowered_read_query(
@@ -973,69 +905,10 @@ fn build_state_source_query(
             pushdown_predicates,
             known_live_layouts,
         )?,
-        SurfaceVariant::History => build_state_history_query_sql(
-            dialect,
-            &build_state_history_request_from_pushdown_predicates(pushdown_predicates, true),
-        ),
+        SurfaceVariant::History => return Ok(None),
         SurfaceVariant::Active | SurfaceVariant::WorkingChanges => return Ok(None),
     };
     parse_single_query(&sql).map(Some)
-}
-
-fn build_state_history_request_from_pushdown_predicates(
-    pushdown_predicates: &[String],
-    force_active_scope: bool,
-) -> StateHistoryRequest {
-    let root_commit_ids = extract_state_history_string_equality_values(
-        pushdown_predicates,
-        &["lixcol_root_commit_id", "root_commit_id"],
-    );
-    let version_ids = extract_state_history_string_equality_values(
-        pushdown_predicates,
-        &["lixcol_version_id", "version_id"],
-    );
-    let root_scope = if root_commit_ids.is_empty() {
-        StateHistoryRootScope::AllRoots
-    } else {
-        StateHistoryRootScope::RequestedRoots(root_commit_ids)
-    };
-    let lineage_scope = if force_active_scope {
-        StateHistoryLineageScope::ActiveVersion
-    } else {
-        StateHistoryLineageScope::Standard
-    };
-    let version_scope = if version_ids.is_empty() {
-        StateHistoryVersionScope::Any
-    } else {
-        StateHistoryVersionScope::RequestedVersions(version_ids)
-    };
-
-    StateHistoryRequest {
-        root_scope,
-        lineage_scope,
-        version_scope,
-        content_mode: StateHistoryContentMode::IncludeSnapshotContent,
-        ..StateHistoryRequest::default()
-    }
-}
-
-fn extract_state_history_string_equality_values(
-    predicates: &[String],
-    column_names: &[&str],
-) -> Vec<String> {
-    let mut values = BTreeSet::new();
-    for predicate in predicates {
-        for column_name in column_names {
-            let Some(rest) = predicate.strip_prefix(&format!("{column_name} = '")) else {
-                continue;
-            };
-            let Some(value) = rest.strip_suffix('\'') else {
-                continue;
-            };
-            values.insert(value.replace("''", "'"));
-        }
-    }
-    values.into_iter().collect()
 }
 
 fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError> {
@@ -1126,20 +999,6 @@ fn build_entity_source_query(
     pushdown_predicates: &[String],
     known_live_layouts: &BTreeMap<String, LiveTableLayout>,
 ) -> Result<Option<Query>, LixError> {
-    let Some(schema_key) = surface_binding
-        .implicit_overrides
-        .fixed_schema_key
-        .as_deref()
-    else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "public entity read lowerer requires fixed schema binding for '{}'",
-                surface_binding.descriptor.public_name
-            ),
-        });
-    };
-
     let projection = entity_projection_sql(surface_binding, effective_state_request);
     let projection = if projection.is_empty() {
         "entity_id AS lixcol_entity_id".to_string()
@@ -1158,29 +1017,13 @@ fn build_entity_source_query(
                 false,
             )?)?)
         }
-        SurfaceVariant::History => build_state_source_query(
-            dialect,
-            surface_binding,
-            effective_state_request,
-            pushdown_predicates,
-            known_live_layouts,
-        )?,
+        SurfaceVariant::History => None,
         SurfaceVariant::Active | SurfaceVariant::WorkingChanges => None,
     };
     let Some(state_source_query) = state_source_query else {
         return Ok(None);
     };
     let mut predicates = Vec::new();
-    if !matches!(
-        surface_binding.descriptor.surface_variant,
-        SurfaceVariant::Default | SurfaceVariant::ByVersion | SurfaceVariant::History
-    ) {
-        predicates.push(format!(
-            "{} = '{}'",
-            render_identifier("schema_key"),
-            escape_sql_string(schema_key)
-        ));
-    }
     for predicate in &surface_binding.implicit_overrides.predicate_overrides {
         predicates.push(render_override_predicate(predicate));
     }
@@ -2380,20 +2223,6 @@ fn entity_projection_sql_for_column(
         let alias = render_identifier(column);
         let expression = if entity_surface_uses_payload_alias(surface_binding, column) {
             render_identifier(&entity_surface_payload_alias(column))
-        } else if surface_binding.descriptor.surface_variant == SurfaceVariant::History {
-            let path = escape_sql_string(column);
-            match surface_column_type(surface_binding, column) {
-                Some(SurfaceColumnType::Boolean) => {
-                    format!("lix_json_extract_boolean(snapshot_content, '{path}')")
-                }
-                Some(
-                    SurfaceColumnType::String
-                    | SurfaceColumnType::Integer
-                    | SurfaceColumnType::Number
-                    | SurfaceColumnType::Json,
-                )
-                | None => format!("lix_json_extract(snapshot_content, '{path}')"),
-            }
         } else {
             render_identifier(column)
         };
@@ -2417,34 +2246,9 @@ fn entity_hidden_alias_source_column(alias: &str, variant: SurfaceVariant) -> Op
         "lixcol_writer_key" => Some("writer_key"),
         "lixcol_untracked" => Some("untracked"),
         "lixcol_metadata" => Some("metadata"),
-        "lixcol_version_id" if variant != SurfaceVariant::Default => Some("version_id"),
-        "lixcol_commit_id" if variant == SurfaceVariant::History => Some("commit_id"),
-        "lixcol_root_commit_id" if variant == SurfaceVariant::History => Some("root_commit_id"),
-        "lixcol_depth" if variant == SurfaceVariant::History => Some("depth"),
+        "lixcol_version_id" if variant == SurfaceVariant::ByVersion => Some("version_id"),
         _ => None,
     }
-}
-
-fn entity_source_predicates(
-    surface_binding: &SurfaceBinding,
-    schema_key: &str,
-) -> (String, Vec<String>) {
-    let predicates = vec![format!(
-        "{} = '{}'",
-        render_identifier("schema_key"),
-        escape_sql_string(schema_key)
-    )];
-
-    let source_table = match surface_binding.descriptor.surface_variant {
-        SurfaceVariant::Default => "lix_state".to_string(),
-        SurfaceVariant::ByVersion => "lix_state_by_version".to_string(),
-        SurfaceVariant::History => "lix_state_history".to_string(),
-        SurfaceVariant::Active | SurfaceVariant::WorkingChanges => {
-            surface_binding.descriptor.public_name.clone()
-        }
-    };
-
-    (source_table, predicates)
 }
 
 fn render_override_predicate(predicate: &SurfaceOverridePredicate) -> String {
@@ -3064,27 +2868,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lowers_entity_history_root_commit_alias_through_history_source() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
-        let lowered = lowered_program(
-            &registry,
-            "SELECT key, lixcol_root_commit_id, lixcol_depth \
-             FROM lix_key_value_history \
-             WHERE lixcol_root_commit_id = 'commit-1' AND lixcol_depth = 0",
-        )
-        .expect("entity history read should lower");
-        let lowered_sql = lowered.statements[0].to_string();
-
-        assert!(lowered_sql.contains("c.id = 'commit-1'"));
-        assert!(!lowered_sql.contains("lixcol_c.entity_id"));
-        assert_eq!(
-            lowered.pushdown_decision.accepted_predicates,
-            vec!["lixcol_root_commit_id = 'commit-1'".to_string()]
-        );
-        assert_eq!(
-            lowered.pushdown_decision.residual_predicates,
-            vec!["lixcol_depth = 0".to_string()]
-        );
-    }
 }
