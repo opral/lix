@@ -433,7 +433,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    public_sql_transaction_path_registered_schema_write_updates_bootstrap_for_followup_dynamic_surface_use,
+    transaction_script_path_uses_dynamic_surface_after_schema_is_registered,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -446,14 +446,22 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         let active_version_id = active_version_id(&engine).await;
-        engine.execute("BEGIN;", &[]).await.unwrap();
-        engine.execute(&insert_tx_dynamic_schema_sql(), &[]).await.unwrap();
         engine
-            .execute(&insert_tx_dynamic_schema_row_sql(&active_version_id), &[])
+            .execute(&insert_tx_dynamic_schema_sql(), &[])
             .await
             .unwrap();
-        assert_tx_dynamic_schema_row_visible(&engine).await;
-        engine.execute("COMMIT;", &[]).await.unwrap();
+        engine
+            .execute(
+                &format!(
+                    "BEGIN; \
+                     {}; \
+                     COMMIT;",
+                    insert_tx_dynamic_schema_row_sql(&active_version_id)
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
 
         assert_tx_dynamic_schema_row_visible(&engine).await;
     }
@@ -495,7 +503,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    public_sql_transaction_path_registered_schema_tombstone_removes_followup_dynamic_surface_dispatch,
+    transaction_script_path_registered_schema_tombstone_removes_followup_dynamic_surface_dispatch,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -518,12 +526,13 @@ simulation_test!(
             .unwrap();
         assert_tx_dynamic_schema_row_visible(&engine).await;
 
-        engine.execute("BEGIN;", &[]).await.unwrap();
         engine
-            .execute(delete_tx_dynamic_schema_sql(), &[])
+            .execute(
+                &format!("BEGIN; {}; COMMIT;", delete_tx_dynamic_schema_sql()),
+                &[],
+            )
             .await
             .unwrap();
-        engine.execute("COMMIT;", &[]).await.unwrap();
 
         assert_tx_dynamic_schema_unknown_table(&engine).await;
     }
@@ -771,7 +780,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    execute_separate_begin_and_commit_calls_form_transaction,
+    execute_rejects_standalone_begin,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -783,132 +792,49 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        engine
+        let error = engine
             .execute("BEGIN;", &[])
             .await
-            .expect("BEGIN should start a public SQL transaction");
+            .expect_err("standalone BEGIN should be denied");
+        assert_eq!(error.code, "LIX_ERROR_TRANSACTION_CONTROL_STATEMENT_DENIED");
+    }
+);
 
-        engine
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('tx-separate-begin-a', 'a')",
-                &[],
-            )
+simulation_test!(
+    execute_rejects_standalone_commit_and_rollback,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                access_to_internal: false,
+                ..Default::default()
+            }))
             .await
-            .expect("first insert should run inside the transaction");
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
 
-        engine
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('tx-separate-begin-b', 'b')",
-                &[],
-            )
-            .await
-            .expect("second insert should run inside the transaction");
-
-        engine
+        let commit_error = engine
             .execute("COMMIT;", &[])
             .await
-            .expect("COMMIT should finish the transaction");
-
-        let result = engine
-            .execute(
-                "SELECT key, value \
-                 FROM lix_key_value \
-                 WHERE key IN ('tx-separate-begin-a', 'tx-separate-begin-b') \
-                 ORDER BY key",
-                &[],
-            )
-            .await
-            .expect("verification query should succeed");
-        assert_eq!(result.statements[0].rows.len(), 2);
+            .expect_err("standalone COMMIT should be denied");
         assert_eq!(
-            result.statements[0].rows[0],
-            vec![
-                Value::Text("tx-separate-begin-a".to_string()),
-                Value::Text("a".to_string())
-            ]
+            commit_error.code,
+            "LIX_ERROR_TRANSACTION_CONTROL_STATEMENT_DENIED"
         );
-        assert_eq!(
-            result.statements[0].rows[1],
-            vec![
-                Value::Text("tx-separate-begin-b".to_string()),
-                Value::Text("b".to_string())
-            ]
-        );
-    }
-);
 
-simulation_test!(
-    execute_separate_begin_and_rollback_discards_changes,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
-                access_to_internal: false,
-                ..Default::default()
-            }))
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.initialize().await.unwrap();
-
-        engine
-            .execute("BEGIN;", &[])
-            .await
-            .expect("BEGIN should start a public SQL transaction");
-        engine
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('tx-separate-rollback', 'a')",
-                &[],
-            )
-            .await
-            .expect("insert should run inside the transaction");
-        engine
+        let rollback_error = engine
             .execute("ROLLBACK;", &[])
             .await
-            .expect("ROLLBACK should discard the transaction");
-
-        let result = engine
-            .execute(
-                "SELECT value \
-                 FROM lix_key_value \
-                 WHERE key = 'tx-separate-rollback' \
-                 LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("verification query should succeed");
-        assert!(result.statements[0].rows.is_empty());
-    }
-);
-
-simulation_test!(
-    non_execute_methods_fail_while_public_sql_transaction_is_open,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
-                access_to_internal: false,
-                ..Default::default()
-            }))
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.initialize().await.unwrap();
+            .expect_err("standalone ROLLBACK should be denied");
+        assert_eq!(
+            rollback_error.code,
+            "LIX_ERROR_TRANSACTION_CONTROL_STATEMENT_DENIED"
+        );
 
         engine
-            .execute("BEGIN;", &[])
-            .await
-            .expect("BEGIN should start a public SQL transaction");
-        let error = engine
             .create_version(CreateVersionOptions::default())
             .await
-            .expect_err("create_version should fail while transaction is open");
-        assert_eq!(
-            error.code,
-            "LIX_ERROR_OPERATION_BLOCKED_BY_ACTIVE_TRANSACTION"
-        );
-        engine
-            .execute("ROLLBACK;", &[])
-            .await
-            .expect("ROLLBACK should close the transaction");
+            .expect("create_version should remain available without hidden SQL session state");
     }
 );
 

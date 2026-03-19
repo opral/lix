@@ -187,16 +187,10 @@ impl Engine {
         let root_id = self
             .ensure_seeded_system_directory(SYSTEM_ROOT_DIRECTORY_PATH, None)
             .await?;
-        self.ensure_seeded_system_directory(
-            SYSTEM_APP_DATA_DIRECTORY_PATH,
-            Some(root_id.as_str()),
-        )
-        .await?;
-        self.ensure_seeded_system_directory(
-            SYSTEM_PLUGIN_DIRECTORY_PATH,
-            Some(root_id.as_str()),
-        )
-        .await?;
+        self.ensure_seeded_system_directory(SYSTEM_APP_DATA_DIRECTORY_PATH, Some(root_id.as_str()))
+            .await?;
+        self.ensure_seeded_system_directory(SYSTEM_PLUGIN_DIRECTORY_PATH, Some(root_id.as_str()))
+            .await?;
 
         Ok(())
     }
@@ -212,8 +206,8 @@ impl Engine {
             Some(parent_id) => {
                 self.backend
                     .execute(
-                    &format!(
-                        "SELECT entity_id \
+                        &format!(
+                            "SELECT entity_id \
                          FROM {table_name} \
                          WHERE file_id = 'lix' \
                            AND version_id = 'global' \
@@ -221,19 +215,19 @@ impl Engine {
                            AND parent_id = $2 \
                          ORDER BY updated_at DESC, created_at DESC \
                          LIMIT 1",
-                    ),
-                    &[
-                        Value::Text(name.clone()),
-                        Value::Text(parent_id.to_string()),
-                    ],
-                )
-                .await?
+                        ),
+                        &[
+                            Value::Text(name.clone()),
+                            Value::Text(parent_id.to_string()),
+                        ],
+                    )
+                    .await?
             }
             None => {
                 self.backend
                     .execute(
-                    &format!(
-                        "SELECT entity_id \
+                        &format!(
+                            "SELECT entity_id \
                          FROM {table_name} \
                          WHERE file_id = 'lix' \
                            AND version_id = 'global' \
@@ -241,10 +235,10 @@ impl Engine {
                            AND parent_id IS NULL \
                          ORDER BY updated_at DESC, created_at DESC \
                          LIMIT 1"
-                    ),
-                    &[Value::Text(name.clone())],
-                )
-                .await?
+                        ),
+                        &[Value::Text(name.clone())],
+                    )
+                    .await?
             }
         };
         if let Some(row) = existing.rows.first() {
@@ -478,7 +472,11 @@ impl Engine {
         Ok(())
     }
 
-    async fn add_change_id_to_commit(&self, commit_id: &str, change_id: &str) -> Result<(), LixError> {
+    async fn add_change_id_to_commit(
+        &self,
+        commit_id: &str,
+        change_id: &str,
+    ) -> Result<(), LixError> {
         let snapshot_row = self
             .backend
             .execute(

@@ -555,7 +555,6 @@ async fn execute_observe_query(
 
 impl Engine {
     pub fn observe(&self, query: ObserveQuery) -> Result<ObserveEvents<'_>, LixError> {
-        self.ensure_no_open_public_sql_transaction("observe")?;
         let state = build_observe_state(self, query)?;
         Ok(ObserveEvents {
             engine: self,
@@ -568,7 +567,6 @@ pub(crate) fn observe_owned(
     engine: Arc<Engine>,
     query: ObserveQuery,
 ) -> Result<ObserveEventsOwned, LixError> {
-    engine.ensure_no_open_public_sql_transaction("observe")?;
     let state = build_observe_state(engine.as_ref(), query)?;
     Ok(ObserveEventsOwned { engine, state })
 }

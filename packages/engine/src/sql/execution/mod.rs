@@ -17,7 +17,6 @@ pub(crate) mod shared_path;
 pub(crate) mod statement_scripts;
 pub(crate) mod tracked_write_runner;
 pub(crate) mod transaction_exec;
-pub(crate) mod transaction_session;
 pub(crate) mod write_program_runner;
 pub(crate) mod write_txn_plan;
 pub(crate) mod write_txn_runner;

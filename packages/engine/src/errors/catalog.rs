@@ -14,10 +14,6 @@ pub(crate) enum ErrorCode {
     ReadOnlyViewWriteDenied,
     VtableSchemaKeyRequired,
     TransactionControlStatementDenied,
-    TransactionAlreadyActive,
-    NoActiveTransaction,
-    OperationBlockedByActiveTransaction,
-    TransactionWriterKeyConflict,
     FileDataExpectsBytes,
     UnexpectedStatementCount,
 }
@@ -38,12 +34,6 @@ impl ErrorCode {
             Self::TransactionControlStatementDenied => {
                 "LIX_ERROR_TRANSACTION_CONTROL_STATEMENT_DENIED"
             }
-            Self::TransactionAlreadyActive => "LIX_ERROR_TRANSACTION_ALREADY_ACTIVE",
-            Self::NoActiveTransaction => "LIX_ERROR_NO_ACTIVE_TRANSACTION",
-            Self::OperationBlockedByActiveTransaction => {
-                "LIX_ERROR_OPERATION_BLOCKED_BY_ACTIVE_TRANSACTION"
-            }
-            Self::TransactionWriterKeyConflict => "LIX_ERROR_TRANSACTION_WRITER_KEY_CONFLICT",
             Self::FileDataExpectsBytes => "LIX_ERROR_FILE_DATA_EXPECTS_BYTES",
             Self::UnexpectedStatementCount => "LIX_ERROR_UNEXPECTED_STATEMENT_COUNT",
         }
@@ -63,10 +53,6 @@ impl ErrorCode {
             Self::ReadOnlyViewWriteDenied,
             Self::VtableSchemaKeyRequired,
             Self::TransactionControlStatementDenied,
-            Self::TransactionAlreadyActive,
-            Self::NoActiveTransaction,
-            Self::OperationBlockedByActiveTransaction,
-            Self::TransactionWriterKeyConflict,
             Self::FileDataExpectsBytes,
             Self::UnexpectedStatementCount,
         ]
@@ -220,43 +206,7 @@ pub(crate) fn vtable_schema_key_required_error() -> LixError {
 pub(crate) fn transaction_control_statement_denied_error() -> LixError {
     build_error(
         ErrorCode::TransactionControlStatementDenied,
-        "Only plain BEGIN, COMMIT, and ROLLBACK are supported as standalone transaction control. Savepoints, transaction modifiers, and nested transaction-control statements are not supported here.",
-    )
-}
-
-pub(crate) fn transaction_already_active_error() -> LixError {
-    build_error(
-        ErrorCode::TransactionAlreadyActive,
-        "A SQL transaction is already active on this Lix instance. Commit or roll it back before starting another transaction.",
-    )
-}
-
-pub(crate) fn no_active_transaction_error(statement: &str) -> LixError {
-    build_error(
-        ErrorCode::NoActiveTransaction,
-        &format!("`{statement}` requires an active SQL transaction on this Lix instance."),
-    )
-}
-
-pub(crate) fn operation_blocked_by_active_transaction_error(operation: &str) -> LixError {
-    build_error(
-        ErrorCode::OperationBlockedByActiveTransaction,
-        &format!(
-            "`{operation}` is unavailable while a SQL transaction is open on this Lix instance. Commit or roll back the transaction first."
-        ),
-    )
-}
-
-pub(crate) fn transaction_writer_key_conflict_error(
-    active_writer_key: Option<&str>,
-    requested_writer_key: &str,
-) -> LixError {
-    let active_writer_key = active_writer_key.unwrap_or("(none)");
-    build_error(
-        ErrorCode::TransactionWriterKeyConflict,
-        &format!(
-            "writerKey `{requested_writer_key}` does not match the active SQL transaction writerKey `{active_writer_key}`."
-        ),
+        "Standalone transaction control is not supported via execute(). Use a single BEGIN ... COMMIT script or the typed transaction API.",
     )
 }
 
@@ -285,12 +235,10 @@ mod tests {
     use super::{
         already_initialized_error, file_data_expects_bytes_error,
         internal_table_access_denied_error, mixed_public_internal_query_error,
-        no_active_transaction_error, not_initialized_error,
-        operation_blocked_by_active_transaction_error, read_only_view_write_error,
-        schema_not_registered_error, sql_unknown_column_error, sql_unknown_table_error,
-        table_not_found_read_error, transaction_already_active_error,
-        transaction_control_statement_denied_error, transaction_writer_key_conflict_error,
-        unexpected_statement_count_error, vtable_schema_key_required_error, ErrorCode,
+        not_initialized_error, read_only_view_write_error, schema_not_registered_error,
+        sql_unknown_column_error, sql_unknown_table_error, table_not_found_read_error,
+        transaction_control_statement_denied_error, unexpected_statement_count_error,
+        vtable_schema_key_required_error, ErrorCode,
     };
     use std::collections::HashSet;
 
@@ -359,31 +307,6 @@ mod tests {
         assert_eq!(
             transaction_control_denied.code,
             "LIX_ERROR_TRANSACTION_CONTROL_STATEMENT_DENIED"
-        );
-
-        let transaction_already_active = transaction_already_active_error();
-        assert_eq!(
-            transaction_already_active.code,
-            "LIX_ERROR_TRANSACTION_ALREADY_ACTIVE"
-        );
-
-        let no_active_transaction = no_active_transaction_error("COMMIT");
-        assert_eq!(
-            no_active_transaction.code,
-            "LIX_ERROR_NO_ACTIVE_TRANSACTION"
-        );
-
-        let blocked_operation = operation_blocked_by_active_transaction_error("create_version");
-        assert_eq!(
-            blocked_operation.code,
-            "LIX_ERROR_OPERATION_BLOCKED_BY_ACTIVE_TRANSACTION"
-        );
-
-        let writer_key_conflict =
-            transaction_writer_key_conflict_error(Some("writer-a"), "writer-b");
-        assert_eq!(
-            writer_key_conflict.code,
-            "LIX_ERROR_TRANSACTION_WRITER_KEY_CONFLICT"
         );
 
         let file_data_expects_bytes = file_data_expects_bytes_error();

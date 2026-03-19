@@ -23,7 +23,6 @@ impl Engine {
         &self,
         options: ExecuteOptions,
     ) -> Result<EngineTransaction<'_>, LixError> {
-        self.ensure_no_open_public_sql_transaction("begin_transaction")?;
         let transaction = self.begin_write_unit().await?;
         Ok(EngineTransaction {
             engine: self,

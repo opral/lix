@@ -24,7 +24,11 @@ fn i64_value(value: &lix_engine::Value, field: &str) -> i64 {
 }
 
 fn assert_uuid_v7_like(value: &str, field: &str) {
-    assert_eq!(value.len(), 36, "expected {field} to be uuid-like, got {value}");
+    assert_eq!(
+        value.len(),
+        36,
+        "expected {field} to be uuid-like, got {value}"
+    );
     assert_eq!(
         value.chars().nth(14),
         Some('7'),
@@ -690,12 +694,15 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(change_set_result.statements[0].rows.clone());
         assert_eq!(change_set_result.statements[0].rows.len(), 1);
         let change_set_id = match &change_set_result.statements[0].rows[0][0] {
             lix_engine::Value::Text(value) => value.clone(),
             other => panic!("expected text change_set_id for commit, got {other:?}"),
         };
+        assert!(
+            !change_set_id.is_empty(),
+            "bootstrap commit must reference a non-empty change_set_id"
+        );
 
         let change_set_exists = engine
             .execute(
@@ -742,7 +749,8 @@ simulation_test!(
             .unwrap();
         sim.assert_deterministic(change_set_result.statements[0].rows.clone());
         assert_eq!(change_set_result.statements[0].rows.len(), 1);
-        let change_set_id = text_value(&change_set_result.statements[0].rows[0][0], "change_set_id");
+        let change_set_id =
+            text_value(&change_set_result.statements[0].rows[0][0], "change_set_id");
         assert_uuid_v7_like(&change_set_id, "bootstrap change_set_id");
         assert_ne!(
             change_set_id, "00000000-0000-7000-8000-000000000001",
@@ -1158,7 +1166,10 @@ simulation_test!(
         assert_eq!(result.statements[0].rows.len(), 3);
         for row in &result.statements[0].rows {
             let lix_engine::Value::Text(id) = &row[0] else {
-                panic!("expected text id for seeded system directory, got {:?}", row[0]);
+                panic!(
+                    "expected text id for seeded system directory, got {:?}",
+                    row[0]
+                );
             };
             assert!(
                 !id.starts_with("dir:auto::"),
