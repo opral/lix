@@ -59,6 +59,7 @@ impl From<FilesystemQueryError> for WriteResolveError {
 #[derive(Default, Clone)]
 struct ResolvedWritePartitionBuilder {
     authoritative_pre_state: Vec<ResolvedRowRef>,
+    authoritative_pre_state_rows: Vec<PlannedStateRow>,
     intended_post_state: Vec<PlannedStateRow>,
     tombstones: Vec<ResolvedRowRef>,
     lineage: Vec<RowLineage>,
@@ -74,7 +75,8 @@ impl ResolvedWritePartitionBuilder {
             && self.lineage.is_empty()
     }
 
-    fn into_partition(self, execution_mode: WriteMode) -> Option<ResolvedWritePartition> {
+    fn into_partition(mut self, execution_mode: WriteMode) -> Option<ResolvedWritePartition> {
+        self.normalize_semantic_noops();
         (!self.is_empty()).then_some(ResolvedWritePartition {
             execution_mode,
             authoritative_pre_state: self.authoritative_pre_state,
@@ -86,6 +88,43 @@ impl ResolvedWritePartitionBuilder {
             filesystem_payload_writes: self.filesystem_payload_writes,
             filesystem_payload_delete_targets: self.filesystem_payload_delete_targets,
         })
+    }
+
+    fn normalize_semantic_noops(&mut self) {
+        if self.authoritative_pre_state_rows.is_empty() || self.intended_post_state.is_empty() {
+            return;
+        }
+
+        let authoritative_by_identity = self
+            .authoritative_pre_state_rows
+            .iter()
+            .map(|row| (planned_state_row_identity(row), row))
+            .collect::<BTreeMap<_, _>>();
+        let mut dropped_blob_rows = std::collections::BTreeSet::new();
+
+        self.intended_post_state.retain(|row| {
+            let Some(authoritative) =
+                authoritative_by_identity.get(&planned_state_row_identity(row))
+            else {
+                return true;
+            };
+            let unchanged = !row.tombstone && planned_state_rows_equivalent(authoritative, row);
+            if unchanged && row.schema_key == "lix_binary_blob_ref" && row.version_id.is_some() {
+                dropped_blob_rows.insert((
+                    row.entity_id.clone(),
+                    row.version_id
+                        .clone()
+                        .expect("checked version_id presence above"),
+                ));
+            }
+            !unchanged
+        });
+
+        if !dropped_blob_rows.is_empty() {
+            self.filesystem_payload_writes.retain(|write| {
+                !dropped_blob_rows.contains(&(write.file_id.clone(), write.version_id.clone()))
+            });
+        }
     }
 }
 
@@ -293,6 +332,10 @@ async fn resolve_active_version_update_write_plan(
         .iter()
         .map(|row| active_version_admin_row(&row.id, &next_version_id))
         .collect::<Vec<_>>();
+    let authoritative_pre_state_rows = matching_rows
+        .iter()
+        .map(|row| active_version_admin_row(&row.id, &row.version_id))
+        .collect::<Vec<_>>();
     let lineage = matching_rows
         .into_iter()
         .map(|row| RowLineage {
@@ -305,6 +348,7 @@ async fn resolve_active_version_update_write_plan(
     Ok(single_partition_write_plan(
         default_execution_mode_for_request(planned_write.command.requested_mode),
         authoritative_pre_state,
+        authoritative_pre_state_rows,
         intended_post_state,
         Vec::new(),
         lineage,
@@ -386,6 +430,10 @@ async fn resolve_active_account_insert_write_plan(
     Ok(single_partition_write_plan(
         default_execution_mode_for_request(planned_write.command.requested_mode),
         authoritative_pre_state,
+        current_rows
+            .iter()
+            .map(|row| active_account_admin_row(&row.account_id))
+            .collect(),
         intended_post_state,
         tombstones,
         lineage,
@@ -433,9 +481,9 @@ async fn resolve_active_account_delete_write_plan(
         .map(active_account_admin_pre_state_ref)
         .collect::<Vec<_>>();
     let lineage = matching_rows
-        .into_iter()
+        .iter()
         .map(|row| RowLineage {
-            entity_id: row.account_id,
+            entity_id: row.account_id.clone(),
             source_change_id: None,
             source_commit_id: None,
         })
@@ -444,6 +492,10 @@ async fn resolve_active_account_delete_write_plan(
     Ok(single_partition_write_plan(
         default_execution_mode_for_request(planned_write.command.requested_mode),
         authoritative_pre_state,
+        matching_rows
+            .iter()
+            .map(|row| active_account_admin_row(&row.account_id))
+            .collect(),
         intended_post_state,
         tombstones,
         lineage,
@@ -747,6 +799,13 @@ async fn resolve_existing_version_write(
                     tracked
                         .authoritative_pre_state
                         .extend(version_descriptor_pre_state_refs(&current_row));
+                    tracked
+                        .authoritative_pre_state_rows
+                        .push(version_descriptor_row(
+                            &current_row.id,
+                            &current_row.name,
+                            current_row.hidden,
+                        ));
                     tracked.lineage.push(RowLineage {
                         entity_id: current_row.id.clone(),
                         source_change_id: current_row.descriptor_change_id.clone(),
@@ -763,6 +822,9 @@ async fn resolve_existing_version_write(
                     untracked
                         .authoritative_pre_state
                         .extend(version_ref_pre_state_refs(&current_row));
+                    untracked
+                        .authoritative_pre_state_rows
+                        .push(version_ref_row(&current_row.id, &current_row.commit_id));
                     untracked.lineage.push(RowLineage {
                         entity_id: current_row.id.clone(),
                         source_change_id: None,
@@ -1045,21 +1107,48 @@ fn default_execution_mode_for_request(requested_mode: WriteModeRequest) -> Write
 fn single_partition_write_plan(
     execution_mode: WriteMode,
     authoritative_pre_state: Vec<ResolvedRowRef>,
+    authoritative_pre_state_rows: Vec<PlannedStateRow>,
     intended_post_state: Vec<PlannedStateRow>,
     tombstones: Vec<ResolvedRowRef>,
     lineage: Vec<RowLineage>,
 ) -> ResolvedWritePlan {
-    ResolvedWritePlan::from_partition(ResolvedWritePartition {
-        execution_mode,
+    let mut builder = ResolvedWritePartitionBuilder {
         authoritative_pre_state,
+        authoritative_pre_state_rows,
         intended_post_state,
         tombstones,
         lineage,
-        target_write_lane: None,
-        lazy_exact_file_update: None,
         filesystem_payload_writes: Vec::new(),
         filesystem_payload_delete_targets: std::collections::BTreeSet::new(),
+    };
+    builder.normalize_semantic_noops();
+    ResolvedWritePlan::from_partition(ResolvedWritePartition {
+        execution_mode,
+        authoritative_pre_state: builder.authoritative_pre_state,
+        intended_post_state: builder.intended_post_state,
+        tombstones: builder.tombstones,
+        lineage: builder.lineage,
+        target_write_lane: None,
+        lazy_exact_file_update: None,
+        filesystem_payload_writes: builder.filesystem_payload_writes,
+        filesystem_payload_delete_targets: builder.filesystem_payload_delete_targets,
     })
+}
+
+fn planned_state_row_identity(row: &PlannedStateRow) -> (String, String, Option<String>) {
+    (
+        row.entity_id.clone(),
+        row.schema_key.clone(),
+        row.version_id.clone(),
+    )
+}
+
+fn planned_state_rows_equivalent(left: &PlannedStateRow, right: &PlannedStateRow) -> bool {
+    left.entity_id == right.entity_id
+        && left.schema_key == right.schema_key
+        && left.version_id == right.version_id
+        && left.tombstone == right.tombstone
+        && left.values == right.values
 }
 
 fn execution_mode_for_overlay_lane(overlay_lane: OverlayLane) -> WriteMode {
@@ -1287,6 +1376,7 @@ fn finalize_resolved_write_plan(
 fn noop_resolved_write_plan(execution_mode: WriteMode) -> ResolvedWritePlan {
     single_partition_write_plan(
         execution_mode,
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         Vec::new(),

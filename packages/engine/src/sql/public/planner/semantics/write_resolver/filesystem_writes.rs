@@ -124,6 +124,7 @@ async fn resolve_directory_insert_write_plan(
     Ok(single_partition_write_plan(
         default_execution_mode_for_request(planned_write.command.requested_mode),
         Vec::new(),
+        Vec::new(),
         intended_post_state,
         Vec::new(),
         lineage,
@@ -198,6 +199,16 @@ async fn resolve_existing_directory_write(
                 )?;
                 let partition = partitions.partition_mut(execution_mode, target_write_lane);
                 partition.authoritative_pre_state.push(row_ref.clone());
+                partition
+                    .authoritative_pre_state_rows
+                    .push(directory_descriptor_row(
+                        &current_row.id,
+                        current_row.parent_id.as_deref(),
+                        &current_row.name,
+                        current_row.hidden,
+                        &version_id,
+                        current_row.metadata.as_deref(),
+                    ));
                 partition.intended_post_state.push(directory_descriptor_row(
                     &current_row.id,
                     next_row.parent_id.as_deref(),
@@ -495,6 +506,17 @@ async fn resolve_existing_file_write(
                 )?;
                 let partition = partitions.partition_mut(execution_mode, target_write_lane);
                 partition.authoritative_pre_state.push(row_ref.clone());
+                partition
+                    .authoritative_pre_state_rows
+                    .push(file_descriptor_row(
+                        &current_row.id,
+                        current_row.directory_id.as_deref(),
+                        &current_row.name,
+                        current_row.extension.as_deref(),
+                        current_row.hidden,
+                        &version_id,
+                        current_row.metadata.as_deref(),
+                    ));
 
                 let (next_row, ancestor_rows) = resolve_file_update_target(
                     backend,
