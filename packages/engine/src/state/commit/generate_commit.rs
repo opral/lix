@@ -123,10 +123,7 @@ where
         meta_changes.push(ChangeRow {
             id: change_set_change_id,
             entity_id: expect_identity(meta.change_set_id.clone(), "change_set entity_id"),
-            schema_key: expect_identity(
-                CHANGE_SET_SCHEMA_KEY.to_string(),
-                "change_set schema_key",
-            ),
+            schema_key: expect_identity(CHANGE_SET_SCHEMA_KEY.to_string(), "change_set schema_key"),
             schema_version: expect_identity(
                 change_set_schema.schema_version.clone(),
                 "change_set schema_version",
@@ -408,10 +405,7 @@ where
         live_state_rows.push(MaterializedStateRow {
             id: change_set_change_id,
             entity_id: expect_identity(meta.change_set_id.clone(), "change_set entity_id"),
-            schema_key: expect_identity(
-                CHANGE_SET_SCHEMA_KEY.to_string(),
-                "change_set schema_key",
-            ),
+            schema_key: expect_identity(CHANGE_SET_SCHEMA_KEY.to_string(), "change_set schema_key"),
             schema_version: expect_identity(
                 change_set_schema.schema_version.clone(),
                 "change_set schema_version",

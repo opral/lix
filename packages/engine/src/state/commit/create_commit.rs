@@ -279,8 +279,15 @@ pub(crate) async fn create_commit(
         invariant_checker.recheck_invariants(transaction).await?;
     }
 
-    let applied_domain_changes =
-        resolve_proposed_domain_changes(&args.changes, &args.lazy_exact_file_updates, &preflight)?;
+    let normalized_changes = {
+        let mut executor = TransactionCommitExecutor { transaction };
+        normalize_proposed_domain_changes(&mut executor, &args.changes).await?
+    };
+    let applied_domain_changes = resolve_proposed_domain_changes(
+        &normalized_changes,
+        &args.lazy_exact_file_updates,
+        &preflight,
+    )?;
     if applied_domain_changes.is_empty() {
         return Ok(CreateCommitResult {
             disposition: CreateCommitDisposition::Replay,
@@ -514,14 +521,15 @@ fn resolve_proposed_domain_changes(
     lazy_exact_file_updates: &[LazyExactFileUpdate],
     preflight: &CreateCommitPreflightState,
 ) -> Result<Vec<ProposedDomainChange>, CreateCommitError> {
-    if lazy_exact_file_updates.is_empty() {
-        return Ok(changes.to_vec());
-    }
     let mut resolved = changes.to_vec();
     for lazy in lazy_exact_file_updates {
         match lazy {
             LazyExactFileUpdate::Metadata(lazy) => {
                 let current = required_exact_file_descriptor(preflight, &lazy.file_id)?;
+                let next_metadata = lazy.metadata.apply(current.metadata.clone());
+                if next_metadata == current.metadata {
+                    continue;
+                }
                 resolved.push(ProposedDomainChange {
                     entity_id: try_identity(lazy.file_id.clone(), "lazy metadata entity_id")?,
                     schema_key: try_identity(
@@ -547,17 +555,21 @@ fn resolve_proposed_domain_changes(
                             "directory_id": current.directory_id,
                             "name": current.name,
                             "extension": current.extension,
-                            "metadata": lazy.metadata.apply(current.metadata.clone()),
+                            "metadata": next_metadata,
                             "hidden": current.hidden,
                         })
                         .to_string(),
                     ),
-                    metadata: lazy.metadata.apply(current.metadata.clone()),
+                    metadata: next_metadata,
                     writer_key: None,
                 });
             }
             LazyExactFileUpdate::Data(lazy) => {
                 let _current = required_exact_file_descriptor(preflight, &lazy.file_id)?;
+                let next_blob_hash = crate::plugin::runtime::binary_blob_hash_hex(&lazy.data);
+                if preflight.file_blob_hashes.get(&lazy.file_id) == Some(&next_blob_hash) {
+                    continue;
+                }
                 resolved.push(ProposedDomainChange {
                     entity_id: try_identity(lazy.file_id.clone(), "lazy data entity_id")?,
                     schema_key: try_identity(
@@ -577,7 +589,7 @@ fn resolve_proposed_domain_changes(
                     snapshot_content: Some(
                         serde_json::json!({
                             "id": lazy.file_id,
-                            "blob_hash": crate::plugin::runtime::binary_blob_hash_hex(&lazy.data),
+                            "blob_hash": next_blob_hash,
                             "size_bytes": u64::try_from(lazy.data.len()).map_err(|_| CreateCommitError {
                                 kind: CreateCommitErrorKind::Internal,
                                 message: format!(
@@ -659,6 +671,84 @@ fn resolve_proposed_domain_changes(
         }
     }
     Ok(resolved)
+}
+
+async fn normalize_proposed_domain_changes(
+    executor: &mut dyn CommitQueryExecutor,
+    changes: &[ProposedDomainChange],
+) -> Result<Vec<ProposedDomainChange>, CreateCommitError> {
+    let mut normalized = Vec::with_capacity(changes.len());
+    for change in changes {
+        if proposed_domain_change_is_noop(executor, change).await? {
+            continue;
+        }
+        normalized.push(change.clone());
+    }
+    Ok(normalized)
+}
+
+async fn proposed_domain_change_is_noop(
+    executor: &mut dyn CommitQueryExecutor,
+    change: &ProposedDomainChange,
+) -> Result<bool, CreateCommitError> {
+    let Some(file_id) = change.file_id.clone() else {
+        return Ok(false);
+    };
+    let Some(plugin_key) = change.plugin_key.clone() else {
+        return Ok(false);
+    };
+    let Some(schema_version) = change.schema_version.clone() else {
+        return Ok(false);
+    };
+    let current = load_exact_committed_state_row_from_live_state_with_executor(
+        executor,
+        &ExactCommittedStateRowRequest {
+            entity_id: change.entity_id.to_string(),
+            schema_key: change.schema_key.to_string(),
+            version_id: change.version_id.to_string(),
+            exact_filters: BTreeMap::from([
+                ("file_id".to_string(), Value::Text(file_id.to_string())),
+                (
+                    "plugin_key".to_string(),
+                    Value::Text(plugin_key.to_string()),
+                ),
+                (
+                    "schema_version".to_string(),
+                    Value::Text(schema_version.to_string()),
+                ),
+            ]),
+        },
+    )
+    .await
+    .map_err(backend_error)?;
+
+    match current {
+        None => Ok(change.snapshot_content.is_none()),
+        Some(current) => {
+            let current_snapshot = current
+                .values
+                .get("snapshot_content")
+                .and_then(value_as_text);
+            let current_metadata = current.values.get("metadata").and_then(value_as_text);
+            Ok(canonicalize_change_payload(
+                change.snapshot_content.as_deref(),
+                &change.schema_key,
+                "snapshot_content",
+            )? == canonicalize_change_payload(
+                current_snapshot.as_deref(),
+                &change.schema_key,
+                "snapshot_content",
+            )? && canonicalize_change_payload(
+                change.metadata.as_deref(),
+                &change.schema_key,
+                "metadata",
+            )? == canonicalize_change_payload(
+                current_metadata.as_deref(),
+                &change.schema_key,
+                "metadata",
+            )?)
+        }
+    }
 }
 
 fn required_exact_file_descriptor<'a>(
@@ -767,6 +857,7 @@ struct CreateCommitPreflightState {
     deterministic_sequence_start: Option<i64>,
     active_accounts: Vec<String>,
     file_descriptors: BTreeMap<String, CreateCommitPreflightFileDescriptor>,
+    file_blob_hashes: BTreeMap<String, String>,
 }
 
 struct CreateCommitPreflightFileDescriptor {
@@ -817,6 +908,9 @@ async fn load_create_commit_preflight_state_with_active_accounts(
     let file_descriptors =
         load_create_commit_file_descriptors(executor, lazy_exact_file_updates, lane_entity_id)
             .await?;
+    let file_blob_hashes =
+        load_create_commit_file_blob_hashes(executor, lazy_exact_file_updates, lane_entity_id)
+            .await?;
 
     Ok(CreateCommitPreflightState {
         current_head,
@@ -825,6 +919,7 @@ async fn load_create_commit_preflight_state_with_active_accounts(
         deterministic_sequence_start,
         active_accounts,
         file_descriptors,
+        file_blob_hashes,
     })
 }
 
@@ -864,6 +959,24 @@ fn parse_file_descriptor_preflight_row(
         metadata,
         untracked,
     })
+}
+
+fn parse_file_blob_hash_preflight_row(snapshot_content: &str) -> Result<String, CreateCommitError> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(snapshot_content).map_err(|error| CreateCommitError {
+            kind: CreateCommitErrorKind::Internal,
+            message: format!(
+                "create commit preflight file blob snapshot could not be parsed: {error}"
+            ),
+        })?;
+    parsed
+        .get("blob_hash")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| CreateCommitError {
+            kind: CreateCommitErrorKind::Internal,
+            message: "create commit preflight file blob snapshot is missing blob_hash".to_string(),
+        })
 }
 
 async fn load_create_commit_existing_replay(
@@ -1042,6 +1155,27 @@ async fn load_create_commit_file_descriptors(
     Ok(file_descriptors)
 }
 
+async fn load_create_commit_file_blob_hashes(
+    executor: &mut dyn CommitQueryExecutor,
+    lazy_exact_file_updates: &[LazyExactFileUpdate],
+    lane_entity_id: &str,
+) -> Result<BTreeMap<String, String>, CreateCommitError> {
+    let exact_file_ids = lazy_exact_file_updates
+        .iter()
+        .flat_map(LazyExactFileUpdate::file_ids)
+        .collect::<BTreeSet<_>>();
+    let mut file_blob_hashes = BTreeMap::new();
+    for file_id in exact_file_ids {
+        let Some(blob_hash) =
+            load_create_commit_file_blob_hash(executor, file_id, lane_entity_id).await?
+        else {
+            continue;
+        };
+        file_blob_hashes.insert(file_id.to_string(), blob_hash);
+    }
+    Ok(file_blob_hashes)
+}
+
 async fn load_create_commit_file_descriptor(
     executor: &mut dyn CommitQueryExecutor,
     file_id: &str,
@@ -1139,6 +1273,38 @@ async fn load_tracked_file_descriptor(
     };
     let metadata = row.values.get("metadata").and_then(value_as_text);
     parse_file_descriptor_preflight_row(&snapshot_content, metadata, false).map(Some)
+}
+
+async fn load_create_commit_file_blob_hash(
+    executor: &mut dyn CommitQueryExecutor,
+    file_id: &str,
+    version_id: &str,
+) -> Result<Option<String>, CreateCommitError> {
+    let row = load_exact_committed_state_row_from_live_state_with_executor(
+        executor,
+        &ExactCommittedStateRowRequest {
+            entity_id: file_id.to_string(),
+            schema_key: "lix_binary_blob_ref".to_string(),
+            version_id: version_id.to_string(),
+            exact_filters: BTreeMap::from([
+                ("file_id".to_string(), Value::Text(file_id.to_string())),
+                (
+                    "plugin_key".to_string(),
+                    Value::Text(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
+                ),
+                ("schema_version".to_string(), Value::Text("1".to_string())),
+            ]),
+        },
+    )
+    .await
+    .map_err(backend_error)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let Some(snapshot_content) = row.values.get("snapshot_content").and_then(value_as_text) else {
+        return Ok(None);
+    };
+    parse_file_blob_hash_preflight_row(&snapshot_content).map(Some)
 }
 
 fn parse_deterministic_sequence_snapshot(snapshot_content: &str) -> Result<i64, CreateCommitError> {
