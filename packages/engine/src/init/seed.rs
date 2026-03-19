@@ -35,8 +35,6 @@ use serde_json::Value as JsonValue;
 const SYSTEM_ROOT_DIRECTORY_PATH: &str = "/.lix/";
 const SYSTEM_APP_DATA_DIRECTORY_PATH: &str = "/.lix/app_data/";
 const SYSTEM_PLUGIN_DIRECTORY_PATH: &str = "/.lix/plugins/";
-const BOOTSTRAP_CHANGE_SET_ID: &str = "00000000-0000-7000-8000-000000000001";
-const BOOTSTRAP_COMMIT_ID: &str = "00000000-0000-7000-8000-000000000002";
 const LIX_ID_KEY: &str = "lix_id";
 
 impl Engine {
@@ -186,71 +184,109 @@ impl Engine {
 
     pub(crate) async fn seed_global_system_directories(&self) -> Result<(), LixError> {
         ensure_schema_live_table(self.backend.as_ref(), "lix_directory_descriptor").await?;
-        let table_name = quote_ident(&untracked_live_table_name("lix_directory_descriptor"));
-        let directories = [
-            SYSTEM_ROOT_DIRECTORY_PATH,
-            SYSTEM_APP_DATA_DIRECTORY_PATH,
-            SYSTEM_PLUGIN_DIRECTORY_PATH,
-        ];
-
-        for path in directories {
-            let (entity_id, parent_id, name) = system_directory_descriptor_parts(path);
-            let existing = self
-                .backend
-                .execute(
-                    &format!(
-                        "SELECT 1 \
-                         FROM {table_name} \
-                         WHERE entity_id = '{entity_id}' \
-                           AND file_id = 'lix' \
-                           AND version_id = 'global' \
-                         LIMIT 1",
-                        table_name = table_name,
-                        entity_id = escape_sql_string(&entity_id),
-                    ),
-                    &[],
-                )
-                .await?;
-            if !existing.rows.is_empty() {
-                continue;
-            }
-
-            let snapshot_content = serde_json::json!({
-                "id": entity_id,
-                "parent_id": parent_id,
-                "name": name,
-                "hidden": true,
-            })
-            .to_string();
-            let normalized_values =
-                normalized_seed_values("lix_directory_descriptor", Some(&snapshot_content))?;
-            let insert_sql = format!(
-                "INSERT INTO {table_name} (\
-                 entity_id, schema_key, file_id, version_id, global, plugin_key, schema_version, created_at, updated_at{normalized_columns}\
-                 ) VALUES (\
-                 '{entity_id}', 'lix_directory_descriptor', 'lix', 'global', true, 'lix', '1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'{normalized_literals}\
-                 )",
-                table_name = table_name,
-                entity_id = escape_sql_string(&entity_id),
-                normalized_columns = normalized_insert_columns_sql(&normalized_values),
-                normalized_literals = normalized_insert_literals_sql(&normalized_values),
-            );
-            self.backend.execute(&insert_sql, &[]).await?;
-
-            let change_id = self.generate_runtime_uuid().await?;
-            self.insert_change_row_for_snapshot(
-                &entity_id,
-                "lix_directory_descriptor",
-                "1",
-                "lix",
-                "lix",
-                &snapshot_content,
-                &change_id,
-            )
+        let root_id = self
+            .ensure_seeded_system_directory(SYSTEM_ROOT_DIRECTORY_PATH, None)
             .await?;
-        }
+        self.ensure_seeded_system_directory(
+            SYSTEM_APP_DATA_DIRECTORY_PATH,
+            Some(root_id.as_str()),
+        )
+        .await?;
+        self.ensure_seeded_system_directory(
+            SYSTEM_PLUGIN_DIRECTORY_PATH,
+            Some(root_id.as_str()),
+        )
+        .await?;
 
         Ok(())
+    }
+
+    async fn ensure_seeded_system_directory(
+        &self,
+        path: &str,
+        parent_id: Option<&str>,
+    ) -> Result<String, LixError> {
+        let table_name = quote_ident(&untracked_live_table_name("lix_directory_descriptor"));
+        let name = system_directory_name(path);
+        let existing = match parent_id {
+            Some(parent_id) => {
+                self.backend
+                    .execute(
+                    &format!(
+                        "SELECT entity_id \
+                         FROM {table_name} \
+                         WHERE file_id = 'lix' \
+                           AND version_id = 'global' \
+                           AND name = $1 \
+                           AND parent_id = $2 \
+                         ORDER BY updated_at DESC, created_at DESC \
+                         LIMIT 1",
+                    ),
+                    &[
+                        Value::Text(name.clone()),
+                        Value::Text(parent_id.to_string()),
+                    ],
+                )
+                .await?
+            }
+            None => {
+                self.backend
+                    .execute(
+                    &format!(
+                        "SELECT entity_id \
+                         FROM {table_name} \
+                         WHERE file_id = 'lix' \
+                           AND version_id = 'global' \
+                           AND name = $1 \
+                           AND parent_id IS NULL \
+                         ORDER BY updated_at DESC, created_at DESC \
+                         LIMIT 1"
+                    ),
+                    &[Value::Text(name.clone())],
+                )
+                .await?
+            }
+        };
+        if let Some(row) = existing.rows.first() {
+            return text_value(row.first(), "system directory entity_id");
+        }
+
+        let entity_id = self.generate_runtime_uuid().await?;
+        let parent_id_json = parent_id.map(ToString::to_string);
+        let snapshot_content = serde_json::json!({
+            "id": entity_id,
+            "parent_id": parent_id_json,
+            "name": name,
+            "hidden": true,
+        })
+        .to_string();
+        let normalized_values =
+            normalized_seed_values("lix_directory_descriptor", Some(&snapshot_content))?;
+        let insert_sql = format!(
+            "INSERT INTO {table_name} (\
+             entity_id, schema_key, file_id, version_id, global, plugin_key, schema_version, created_at, updated_at{normalized_columns}\
+             ) VALUES (\
+             '{entity_id}', 'lix_directory_descriptor', 'lix', 'global', true, 'lix', '1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'{normalized_literals}\
+             )",
+            entity_id = escape_sql_string(&entity_id),
+            normalized_columns = normalized_insert_columns_sql(&normalized_values),
+            normalized_literals = normalized_insert_literals_sql(&normalized_values),
+        );
+        self.backend.execute(&insert_sql, &[]).await?;
+
+        let change_id = self.generate_runtime_uuid().await?;
+        self.insert_change_row_for_snapshot(
+            &entity_id,
+            "lix_directory_descriptor",
+            "1",
+            "lix",
+            "lix",
+            &snapshot_content,
+            &change_id,
+        )
+        .await?;
+
+        Ok(entity_id)
     }
 
     pub(crate) async fn seed_default_checkpoint_label(&self) -> Result<(), LixError> {
@@ -442,7 +478,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn add_change_id_to_bootstrap_commit(&self, change_id: &str) -> Result<(), LixError> {
+    async fn add_change_id_to_commit(&self, commit_id: &str, change_id: &str) -> Result<(), LixError> {
         let snapshot_row = self
             .backend
             .execute(
@@ -454,7 +490,7 @@ impl Engine {
                    AND c.file_id = 'lix' \
                  ORDER BY c.created_at DESC \
                  LIMIT 1",
-                &[Value::Text(BOOTSTRAP_COMMIT_ID.to_string())],
+                &[Value::Text(commit_id.to_string())],
             )
             .await?;
 
@@ -469,7 +505,9 @@ impl Engine {
             .ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    "add_change_id_to_bootstrap_commit: bootstrap commit canonical snapshot not found",
+                    format!(
+                        "add_change_id_to_commit: commit '{commit_id}' canonical snapshot not found"
+                    ),
                 )
             })?;
 
@@ -478,7 +516,7 @@ impl Engine {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
-                        "add_change_id_to_bootstrap_commit: invalid JSON in bootstrap commit snapshot: {error}"
+                        "add_change_id_to_commit: invalid JSON in commit '{commit_id}' snapshot: {error}"
                     ),
                 )
             })?;
@@ -489,7 +527,9 @@ impl Engine {
             .ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    "add_change_id_to_bootstrap_commit: bootstrap commit snapshot missing change_ids array",
+                    format!(
+                        "add_change_id_to_commit: commit '{commit_id}' snapshot missing change_ids array"
+                    ),
                 )
             })?;
         change_ids.push(JsonValue::String(change_id.to_string()));
@@ -507,7 +547,7 @@ impl Engine {
                    AND c.file_id = 'lix' \
                  ORDER BY c.created_at DESC \
                  LIMIT 1",
-                &[Value::Text(BOOTSTRAP_COMMIT_ID.to_string())],
+                &[Value::Text(commit_id.to_string())],
             )
             .await?;
         let snapshot_id = snapshot_id_row
@@ -521,7 +561,9 @@ impl Engine {
             .ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    "add_change_id_to_bootstrap_commit: could not find snapshot_id for bootstrap commit change",
+                    format!(
+                        "add_change_id_to_commit: could not find snapshot_id for commit '{commit_id}' change"
+                    ),
                 )
             })?;
 
@@ -545,7 +587,7 @@ impl Engine {
                AND version_id = 'global'",
             &[
                 Value::Text(updated_snapshot),
-                Value::Text(BOOTSTRAP_COMMIT_ID.to_string()),
+                Value::Text(commit_id.to_string()),
             ],
             ExecuteOptions::default(),
         )
@@ -620,22 +662,24 @@ impl Engine {
 
     pub(crate) async fn seed_default_versions(&self) -> Result<String, LixError> {
         // Bootstrap commit + change set must be seeded first so that
-        // `add_change_id_to_bootstrap_commit` can find the canonical snapshot.
-        let bootstrap_commit_id = self
-            .load_latest_commit_id()
-            .await?
-            .unwrap_or_else(|| BOOTSTRAP_COMMIT_ID.to_string());
-        if bootstrap_commit_id == BOOTSTRAP_COMMIT_ID {
-            let change_set_change_id = self
-                .seed_bootstrap_change_set(BOOTSTRAP_CHANGE_SET_ID)
-                .await?;
-            self.seed_bootstrap_commit(BOOTSTRAP_COMMIT_ID, BOOTSTRAP_CHANGE_SET_ID)
-                .await?;
-            // Change set canonical storage does not need a change_ids entry
-            // because lix_change_set is discovered via the commit snapshot's
-            // change_set_id property, not through change_ids membership.
-            let _ = change_set_change_id;
-        }
+        // `add_change_id_to_commit` can find the canonical snapshot.
+        let bootstrap_commit_id = match self.load_latest_commit_id().await? {
+            Some(commit_id) => commit_id,
+            None => {
+                let bootstrap_change_set_id = self.generate_runtime_uuid().await?;
+                let bootstrap_commit_id = self.generate_runtime_uuid().await?;
+                let change_set_change_id = self
+                    .seed_bootstrap_change_set(&bootstrap_change_set_id)
+                    .await?;
+                self.seed_bootstrap_commit(&bootstrap_commit_id, &bootstrap_change_set_id)
+                    .await?;
+                // Change set canonical storage does not need a change_ids entry
+                // because lix_change_set is discovered via the commit snapshot's
+                // change_set_id property, not through change_ids membership.
+                let _ = change_set_change_id;
+                bootstrap_commit_id
+            }
+        };
         self.assert_commit_change_set_integrity(&bootstrap_commit_id)
             .await?;
 
@@ -648,6 +692,7 @@ impl Engine {
                 let generated_main_id = self.generate_runtime_uuid().await?;
                 let desc_change_id = self
                     .seed_canonical_version_descriptor(
+                        &bootstrap_commit_id,
                         &generated_main_id,
                         DEFAULT_ACTIVE_VERSION_NAME,
                     )
@@ -663,7 +708,11 @@ impl Engine {
         };
 
         let global_desc_change_id = self
-            .seed_canonical_version_descriptor(GLOBAL_VERSION_ID, GLOBAL_VERSION_ID)
+            .seed_canonical_version_descriptor(
+                &bootstrap_commit_id,
+                GLOBAL_VERSION_ID,
+                GLOBAL_VERSION_ID,
+            )
             .await?;
         self.seed_materialized_version_descriptor(
             GLOBAL_VERSION_ID,
@@ -865,6 +914,7 @@ impl Engine {
 
     pub(crate) async fn seed_canonical_version_descriptor(
         &self,
+        bootstrap_commit_id: &str,
         entity_id: &str,
         name: &str,
     ) -> Result<String, LixError> {
@@ -881,7 +931,8 @@ impl Engine {
             &change_id,
         )
         .await?;
-        self.add_change_id_to_bootstrap_commit(&change_id).await?;
+        self.add_change_id_to_commit(bootstrap_commit_id, &change_id)
+            .await?;
         Ok(change_id)
     }
 
@@ -1574,21 +1625,12 @@ fn live_payload_column_name(schema_key: &str, property_name: &str) -> String {
         .to_string()
 }
 
-fn system_directory_descriptor_parts(path: &str) -> (String, Option<String>, String) {
-    let entity_id = format!("dir:auto::{path}");
+fn system_directory_name(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
-    let name = trimmed
+    trimmed
         .rsplit('/')
         .next()
         .filter(|segment| !segment.is_empty())
         .unwrap_or(".lix")
-        .to_string();
-    let parent_id = match path {
-        SYSTEM_ROOT_DIRECTORY_PATH => None,
-        SYSTEM_APP_DATA_DIRECTORY_PATH | SYSTEM_PLUGIN_DIRECTORY_PATH => {
-            Some(format!("dir:auto::{SYSTEM_ROOT_DIRECTORY_PATH}"))
-        }
-        _ => None,
-    };
-    (entity_id, parent_id, name)
+        .to_string()
 }
