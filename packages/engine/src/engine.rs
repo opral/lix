@@ -369,14 +369,14 @@ pub(crate) struct DeferredTransactionSideEffects {
 
 pub(crate) fn reject_internal_table_writes(statements: &[Statement]) -> Result<(), LixError> {
     for statement in statements {
-        if statement_writes_to_lix_internal_table(statement) {
+        if statement_mutates_lix_internal_table(statement) {
             return Err(crate::errors::internal_table_access_denied_error());
         }
     }
     Ok(())
 }
 
-fn statement_writes_to_lix_internal_table(statement: &Statement) -> bool {
+fn statement_mutates_lix_internal_table(statement: &Statement) -> bool {
     match statement {
         Statement::Insert(insert) => match &insert.table {
             TableObject::TableName(name) => object_name_is_lix_internal(name),
@@ -396,6 +396,34 @@ fn statement_writes_to_lix_internal_table(statement: &Statement) -> bool {
                 _ => false,
             })
         }
+        Statement::AlterTable(alter) => object_name_is_lix_internal(&alter.name),
+        Statement::CreateIndex(create_index) => {
+            object_name_is_lix_internal(&create_index.table_name)
+        }
+        Statement::CreateTrigger(create_trigger) => {
+            object_name_is_lix_internal(&create_trigger.table_name)
+                || create_trigger
+                    .referenced_table_name
+                    .as_ref()
+                    .map(object_name_is_lix_internal)
+                    .unwrap_or(false)
+        }
+        Statement::DropTrigger(drop_trigger) => drop_trigger
+            .table_name
+            .as_ref()
+            .map(object_name_is_lix_internal)
+            .unwrap_or(false),
+        Statement::Drop { names, table, .. } => {
+            names.iter().any(object_name_is_lix_internal)
+                || table
+                    .as_ref()
+                    .map(object_name_is_lix_internal)
+                    .unwrap_or(false)
+        }
+        Statement::Truncate(truncate) => truncate
+            .table_names
+            .iter()
+            .any(|target| object_name_is_lix_internal(&target.name)),
         _ => false,
     }
 }
