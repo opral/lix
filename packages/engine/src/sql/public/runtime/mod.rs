@@ -2212,7 +2212,7 @@ fn create_commit_preconditions_for_public_write(
             let version_id = batch
                 .into_iter()
                 .flat_map(|batch| batch.changes.first())
-                .map(|change| change.version_id.clone())
+                .map(|change| change.version_id.to_string())
                 .next()
                 .or_else(|| {
                     planned_write
@@ -2356,7 +2356,7 @@ fn file_cache_refresh_targets_from_domain_changes(
             change
                 .file_id
                 .as_ref()
-                .map(|file_id| (file_id.clone(), change.version_id.clone()))
+                .map(|file_id| (file_id.to_string(), change.version_id.to_string()))
         })
         .collect()
 }

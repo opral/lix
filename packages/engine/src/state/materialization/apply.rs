@@ -29,7 +29,7 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
 
     let mut schema_keys = BTreeSet::new();
     for write in &plan.writes {
-        schema_keys.insert(write.schema_key.clone());
+        schema_keys.insert(write.schema_key.to_string());
     }
 
     let rows_deleted = clear_scope_rows(

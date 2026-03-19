@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use crate::CanonicalJson;
+use crate::{
+    CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
+    FileId, VersionId,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LiveStateRebuildScope {
@@ -40,16 +43,16 @@ pub enum LiveStateWriteOp {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LiveStateWrite {
-    pub schema_key: String,
-    pub entity_id: String,
-    pub file_id: String,
-    pub version_id: String,
+    pub schema_key: CanonicalSchemaKey,
+    pub entity_id: EntityId,
+    pub file_id: FileId,
+    pub version_id: VersionId,
     pub global: bool,
     pub op: LiveStateWriteOp,
     pub snapshot_content: Option<CanonicalJson>,
     pub metadata: Option<CanonicalJson>,
-    pub schema_version: String,
-    pub plugin_key: String,
+    pub schema_version: CanonicalSchemaVersion,
+    pub plugin_key: CanonicalPluginKey,
     pub change_id: String,
     pub created_at: String,
     pub updated_at: String,
@@ -70,13 +73,13 @@ pub struct LiveStateRebuildWarning {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VersionHeadDebugRow {
-    pub version_id: String,
+    pub version_id: VersionId,
     pub commit_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TraversedCommitDebugRow {
-    pub version_id: String,
+    pub version_id: VersionId,
     pub commit_id: String,
     pub depth: usize,
 }
@@ -90,27 +93,27 @@ pub struct TraversedEdgeDebugRow {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VersionAncestryDebugRow {
-    pub version_id: String,
-    pub ancestor_version_id: String,
+    pub version_id: VersionId,
+    pub ancestor_version_id: VersionId,
     pub inheritance_depth: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LatestVisibleWinnerDebugRow {
-    pub version_id: String,
-    pub entity_id: String,
-    pub schema_key: String,
-    pub file_id: String,
+    pub version_id: VersionId,
+    pub entity_id: EntityId,
+    pub schema_key: CanonicalSchemaKey,
+    pub file_id: FileId,
     pub commit_id: String,
     pub change_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ScopeWinnerDebugRow {
-    pub version_id: String,
-    pub entity_id: String,
-    pub schema_key: String,
-    pub file_id: String,
+    pub version_id: VersionId,
+    pub entity_id: EntityId,
+    pub schema_key: CanonicalSchemaKey,
+    pub file_id: FileId,
     pub global: bool,
     pub change_id: String,
 }

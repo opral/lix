@@ -23,7 +23,7 @@ use crate::state::live_state::ensure_live_state_ready_in_transaction;
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::SqlDialect;
-use crate::{LixError, LixTransaction, QueryResult, Value};
+use crate::{CanonicalSchemaKey, LixError, LixTransaction, QueryResult, Value};
 use async_trait::async_trait;
 
 use super::generate_commit::generate_commit;
@@ -300,7 +300,7 @@ pub(crate) async fn create_commit(
         materialize_domain_changes(&timestamp, &applied_domain_changes, functions)?;
     let affected_versions = domain_changes
         .iter()
-        .map(|change| change.version_id.clone())
+        .map(|change| change.version_id.to_string())
         .collect::<BTreeSet<_>>();
     let lane_version_id = match &concrete_lane {
         ConcreteWriteLane::Version { version_id } => Some(version_id.clone()),
@@ -323,18 +323,20 @@ pub(crate) async fn create_commit(
             VersionInfo {
                 parent_commit_ids: current_head.clone().into_iter().collect(),
                 snapshot: VersionSnapshot {
-                    id: version_id.clone(),
+                    id: try_identity(version_id.clone(), "lane version snapshot id")?,
                 },
             },
         );
     }
     if matches!(concrete_lane, ConcreteWriteLane::GlobalAdmin) {
+        let global_snapshot_id =
+            try_identity(GLOBAL_VERSION_ID.to_string(), "global version snapshot id")?;
         let global_version = versions
             .entry(GLOBAL_VERSION_ID.to_string())
-            .or_insert_with(|| VersionInfo {
+            .or_insert(VersionInfo {
                 parent_commit_ids: Vec::new(),
                 snapshot: VersionSnapshot {
-                    id: GLOBAL_VERSION_ID.to_string(),
+                    id: global_snapshot_id,
                 },
             });
         global_version.parent_commit_ids = current_head.clone().into_iter().collect();
@@ -454,7 +456,7 @@ async fn load_live_layouts_for_rows_in_transaction(
     let mut layouts = BTreeMap::new();
     let schema_keys = rows
         .iter()
-        .map(|row| row.schema_key.clone())
+        .map(|row| row.schema_key.to_string())
         .collect::<BTreeSet<_>>();
     for schema_key in schema_keys {
         if let Some(layout) = builtin_live_table_layout(&schema_key)? {
@@ -529,12 +531,24 @@ fn resolve_proposed_domain_changes(
                     continue;
                 }
                 resolved.push(ProposedDomainChange {
-                    entity_id: lazy.file_id.clone(),
-                    schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
-                    schema_version: Some(FILESYSTEM_FILE_SCHEMA_VERSION.to_string()),
-                    file_id: Some(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
-                    version_id: lazy.version_id.clone(),
-                    plugin_key: Some(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
+                    entity_id: try_identity(lazy.file_id.clone(), "lazy metadata entity_id")?,
+                    schema_key: try_identity(
+                        FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
+                        "lazy metadata schema_key",
+                    )?,
+                    schema_version: Some(try_identity(
+                        FILESYSTEM_FILE_SCHEMA_VERSION.to_string(),
+                        "lazy metadata schema_version",
+                    )?),
+                    file_id: Some(try_identity(
+                        FILESYSTEM_DESCRIPTOR_FILE_ID.to_string(),
+                        "lazy metadata file_id",
+                    )?),
+                    version_id: try_identity(lazy.version_id.clone(), "lazy metadata version_id")?,
+                    plugin_key: Some(try_identity(
+                        FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string(),
+                        "lazy metadata plugin_key",
+                    )?),
                     snapshot_content: Some(
                         serde_json::json!({
                             "id": lazy.file_id,
@@ -557,12 +571,21 @@ fn resolve_proposed_domain_changes(
                     continue;
                 }
                 resolved.push(ProposedDomainChange {
-                    entity_id: lazy.file_id.clone(),
-                    schema_key: "lix_binary_blob_ref".to_string(),
-                    schema_version: Some("1".to_string()),
-                    file_id: Some(lazy.file_id.clone()),
-                    version_id: lazy.version_id.clone(),
-                    plugin_key: Some(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
+                    entity_id: try_identity(lazy.file_id.clone(), "lazy data entity_id")?,
+                    schema_key: try_identity(
+                        "lix_binary_blob_ref".to_string(),
+                        "lazy data schema_key",
+                    )?,
+                    schema_version: Some(try_identity(
+                        "1".to_string(),
+                        "lazy data schema_version",
+                    )?),
+                    file_id: Some(try_identity(lazy.file_id.clone(), "lazy data file_id")?),
+                    version_id: try_identity(lazy.version_id.clone(), "lazy data version_id")?,
+                    plugin_key: Some(try_identity(
+                        FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string(),
+                        "lazy data plugin_key",
+                    )?),
                     snapshot_content: Some(
                         serde_json::json!({
                             "id": lazy.file_id,
@@ -595,23 +618,50 @@ fn resolve_proposed_domain_changes(
                         });
                     }
                     resolved.push(ProposedDomainChange {
-                        entity_id: file_id.clone(),
-                        schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
-                        schema_version: Some(FILESYSTEM_FILE_SCHEMA_VERSION.to_string()),
-                        file_id: Some(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
-                        version_id: lazy.version_id.clone(),
-                        plugin_key: Some(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
+                        entity_id: try_identity(file_id.clone(), "lazy delete entity_id")?,
+                        schema_key: try_identity(
+                            FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
+                            "lazy delete schema_key",
+                        )?,
+                        schema_version: Some(try_identity(
+                            FILESYSTEM_FILE_SCHEMA_VERSION.to_string(),
+                            "lazy delete schema_version",
+                        )?),
+                        file_id: Some(try_identity(
+                            FILESYSTEM_DESCRIPTOR_FILE_ID.to_string(),
+                            "lazy delete file_id",
+                        )?),
+                        version_id: try_identity(
+                            lazy.version_id.clone(),
+                            "lazy delete version_id",
+                        )?,
+                        plugin_key: Some(try_identity(
+                            FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string(),
+                            "lazy delete plugin_key",
+                        )?),
                         snapshot_content: None,
                         metadata: None,
                         writer_key: None,
                     });
                     resolved.push(ProposedDomainChange {
-                        entity_id: file_id.clone(),
-                        schema_key: "lix_binary_blob_ref".to_string(),
-                        schema_version: Some("1".to_string()),
-                        file_id: Some(file_id.clone()),
-                        version_id: lazy.version_id.clone(),
-                        plugin_key: Some(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
+                        entity_id: try_identity(file_id.clone(), "lazy delete blob entity_id")?,
+                        schema_key: try_identity(
+                            "lix_binary_blob_ref".to_string(),
+                            "lazy delete blob schema_key",
+                        )?,
+                        schema_version: Some(try_identity(
+                            "1".to_string(),
+                            "lazy delete blob schema_version",
+                        )?),
+                        file_id: Some(try_identity(file_id.clone(), "lazy delete blob file_id")?),
+                        version_id: try_identity(
+                            lazy.version_id.clone(),
+                            "lazy delete blob version_id",
+                        )?,
+                        plugin_key: Some(try_identity(
+                            FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string(),
+                            "lazy delete blob plugin_key",
+                        )?),
                         snapshot_content: None,
                         metadata: None,
                         writer_key: None,
@@ -780,11 +830,11 @@ fn canonicalize_change_payload(
         })
 }
 
-fn require_change_field(
-    value: Option<String>,
-    schema_key: &str,
+fn require_change_field<T>(
+    value: Option<T>,
+    schema_key: &CanonicalSchemaKey,
     field_name: &str,
-) -> Result<String, CreateCommitError> {
+) -> Result<T, CreateCommitError> {
     value.ok_or_else(|| CreateCommitError {
         kind: CreateCommitErrorKind::MissingDomainField,
         message: format!(
@@ -1482,6 +1532,16 @@ fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+fn try_identity<T>(value: impl Into<String>, context: &str) -> Result<T, CreateCommitError>
+where
+    T: TryFrom<String, Error = LixError>,
+{
+    T::try_from(value.into()).map_err(|error| CreateCommitError {
+        kind: CreateCommitErrorKind::Internal,
+        message: format!("{context}: {}", error.description),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1763,32 +1823,42 @@ mod tests {
 
     fn sample_change() -> crate::state::commit::ProposedDomainChange {
         crate::state::commit::ProposedDomainChange {
-            entity_id: "entity-1".to_string(),
-            schema_key: "lix_key_value".to_string(),
-            schema_version: Some("1".to_string()),
-            file_id: Some("lix".to_string()),
-            plugin_key: Some("lix".to_string()),
+            entity_id: "entity-1".try_into().unwrap(),
+            schema_key: "lix_key_value".try_into().unwrap(),
+            schema_version: Some("1".try_into().unwrap()),
+            file_id: Some("lix".try_into().unwrap()),
+            plugin_key: Some("lix".try_into().unwrap()),
             snapshot_content: Some("{\"key\":\"hello\"}".to_string()),
             metadata: None,
-            version_id: "version-a".to_string(),
+            version_id: "version-a".try_into().unwrap(),
             writer_key: Some("writer-a".to_string()),
         }
     }
 
     fn sample_global_change() -> crate::state::commit::ProposedDomainChange {
         crate::state::commit::ProposedDomainChange {
-            entity_id: "version-a".to_string(),
-            schema_key: "lix_version_descriptor".to_string(),
-            schema_version: Some("1".to_string()),
-            file_id: Some(crate::version::version_descriptor_file_id().to_string()),
-            plugin_key: Some(crate::version::version_descriptor_plugin_key().to_string()),
+            entity_id: "version-a".try_into().unwrap(),
+            schema_key: "lix_version_descriptor".try_into().unwrap(),
+            schema_version: Some("1".try_into().unwrap()),
+            file_id: Some(
+                crate::version::version_descriptor_file_id()
+                    .to_string()
+                    .try_into()
+                    .unwrap(),
+            ),
+            plugin_key: Some(
+                crate::version::version_descriptor_plugin_key()
+                    .to_string()
+                    .try_into()
+                    .unwrap(),
+            ),
             snapshot_content: Some(crate::version::version_descriptor_snapshot_content(
                 "version-a",
                 "Version A",
                 false,
             )),
             metadata: None,
-            version_id: GLOBAL_VERSION_ID.to_string(),
+            version_id: GLOBAL_VERSION_ID.try_into().unwrap(),
             writer_key: Some("writer-a".to_string()),
         }
     }

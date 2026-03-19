@@ -9,6 +9,7 @@ mod engine;
 mod errors;
 mod filesystem;
 mod functions;
+mod identity;
 mod init;
 mod key_value;
 mod lix;
@@ -39,6 +40,9 @@ pub use canonical_json::CanonicalJson;
 pub use engine::{boot, BootArgs};
 pub use engine::{BootAccount, BootKeyValue, Engine, EngineTransaction, ExecuteOptions};
 pub use errors::LixError;
+pub use identity::{
+    CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
+};
 pub use lix::{InitResult, Lix, LixConfig};
 pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
 pub use sql::execution::contracts::prepared_statement::{

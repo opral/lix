@@ -108,13 +108,13 @@ pub(crate) async fn materialize_file_data_with_plugins(
         }
         let key = (write.version_id.clone(), write.entity_id.clone());
         if write.op == LiveStateWriteOp::Tombstone {
-            tombstoned_files.push((key.1, key.0));
+            tombstoned_files.push((key.1.to_string(), key.0.to_string()));
             continue;
         }
         let Some(_) = write.snapshot_content.as_deref() else {
             continue;
         };
-        descriptor_targets.insert(key);
+        descriptor_targets.insert((key.0.to_string(), key.1.to_string()));
     }
 
     for (file_id, version_id) in tombstoned_files {
@@ -142,9 +142,9 @@ pub(crate) async fn materialize_file_data_with_plugins(
         }
         writes_by_target
             .entry((
-                write.version_id.clone(),
-                write.file_id.clone(),
-                write.plugin_key.clone(),
+                write.version_id.to_string(),
+                write.file_id.to_string(),
+                write.plugin_key.to_string(),
             ))
             .or_default()
             .push(write);
@@ -168,7 +168,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
         let mut seen_keys: BTreeSet<(String, String)> = BTreeSet::new();
         let mut changes: Vec<PluginEntityChange> = Vec::new();
         for write in grouped_writes {
-            let dedupe_key = (write.schema_key.clone(), write.entity_id.clone());
+            let dedupe_key = (write.schema_key.to_string(), write.entity_id.to_string());
             if !seen_keys.insert(dedupe_key.clone()) {
                 return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                         "plugin materialization: duplicate change key for plugin '{}' file '{}' version '{}': schema_key='{}' entity_id='{}'",
@@ -182,9 +182,9 @@ pub(crate) async fn materialize_file_data_with_plugins(
             }
 
             changes.push(PluginEntityChange {
-                entity_id: write.entity_id.clone(),
-                schema_key: write.schema_key.clone(),
-                schema_version: write.schema_version.clone(),
+                entity_id: write.entity_id.to_string(),
+                schema_key: write.schema_key.to_string(),
+                schema_version: write.schema_version.to_string(),
                 snapshot_content: if write.op == LiveStateWriteOp::Tombstone {
                     None
                 } else {

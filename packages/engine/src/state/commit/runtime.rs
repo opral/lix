@@ -303,7 +303,7 @@ pub(crate) fn build_statement_batch_from_commit_apply_input(
         let is_untracked = schema_uses_untracked_live_state(&row.schema_key);
         let layout = derived_apply_input
             .live_layouts
-            .get(&row.schema_key)
+            .get(row.schema_key.as_str())
             .cloned()
             .map(Some)
             .unwrap_or(builtin_live_table_layout(&row.schema_key)?);
@@ -322,7 +322,7 @@ pub(crate) fn build_statement_batch_from_commit_apply_input(
             &mut statement_params,
         );
         let entry = materialized_by_schema
-            .entry(row.schema_key.clone())
+            .entry(row.schema_key.to_string())
             .or_insert_with(|| (is_untracked, columns.clone(), Vec::new(), params_per_row));
         entry.2.push(values);
     }

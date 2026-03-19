@@ -104,7 +104,7 @@ simulation_test!(
         let schema_keys: BTreeSet<String> = plan
             .writes
             .iter()
-            .map(|write| write.schema_key.clone())
+            .map(|write| write.schema_key.to_string())
             .collect();
         assert!(schema_keys.contains("lix_commit"));
         assert!(schema_keys.contains("lix_change_set_element"));
@@ -116,7 +116,7 @@ simulation_test!(
             debug
                 .heads_by_version
                 .iter()
-                .any(|head| head.version_id == main_version_id),
+                .any(|head| head.version_id.as_str() == main_version_id),
             "expected main version head in debug trace"
         );
         assert!(
@@ -238,10 +238,10 @@ simulation_test!(
             scope: LiveStateRebuildScope::Versions(scoped_versions.clone()),
             stats: Vec::new(),
             writes: vec![LiveStateWrite {
-                schema_key: "materialization_test_schema".to_string(),
-                entity_id: "entity-old".to_string(),
-                file_id: "file-1".to_string(),
-                version_id: main_version_id.clone(),
+                schema_key: "materialization_test_schema".try_into().unwrap(),
+                entity_id: "entity-old".try_into().unwrap(),
+                file_id: "file-1".try_into().unwrap(),
+                version_id: main_version_id.clone().try_into().unwrap(),
                 global: false,
                 op: LiveStateWriteOp::Upsert,
                 snapshot_content: Some(
@@ -249,8 +249,8 @@ simulation_test!(
                         .expect("test payload should be valid canonical json"),
                 ),
                 metadata: None,
-                schema_version: "1".to_string(),
-                plugin_key: "lix".to_string(),
+                schema_version: "1".try_into().unwrap(),
+                plugin_key: "lix".try_into().unwrap(),
                 change_id: "seed-change".to_string(),
                 created_at: "1970-01-01T00:00:00Z".to_string(),
                 updated_at: "1970-01-01T00:00:00Z".to_string(),
@@ -268,10 +268,10 @@ simulation_test!(
             scope: LiveStateRebuildScope::Full,
             stats: Vec::new(),
             writes: vec![LiveStateWrite {
-                schema_key: "materialization_test_schema".to_string(),
-                entity_id: "entity-new".to_string(),
-                file_id: "file-1".to_string(),
-                version_id: main_version_id.clone(),
+                schema_key: "materialization_test_schema".try_into().unwrap(),
+                entity_id: "entity-new".try_into().unwrap(),
+                file_id: "file-1".try_into().unwrap(),
+                version_id: main_version_id.clone().try_into().unwrap(),
                 global: false,
                 op: LiveStateWriteOp::Upsert,
                 snapshot_content: Some(
@@ -279,8 +279,8 @@ simulation_test!(
                         .expect("test payload should be valid canonical json"),
                 ),
                 metadata: None,
-                schema_version: "1".to_string(),
-                plugin_key: "lix".to_string(),
+                schema_version: "1".try_into().unwrap(),
+                plugin_key: "lix".try_into().unwrap(),
                 change_id: "full-change".to_string(),
                 created_at: "1970-01-01T00:00:00Z".to_string(),
                 updated_at: "1970-01-01T00:00:00Z".to_string(),
