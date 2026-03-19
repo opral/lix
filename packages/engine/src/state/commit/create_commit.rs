@@ -703,13 +703,19 @@ async fn proposed_domain_change_is_noop(
     let current = load_exact_committed_state_row_from_live_state_with_executor(
         executor,
         &ExactCommittedStateRowRequest {
-            entity_id: change.entity_id.clone(),
-            schema_key: change.schema_key.clone(),
-            version_id: change.version_id.clone(),
+            entity_id: change.entity_id.to_string(),
+            schema_key: change.schema_key.to_string(),
+            version_id: change.version_id.to_string(),
             exact_filters: BTreeMap::from([
-                ("file_id".to_string(), Value::Text(file_id)),
-                ("plugin_key".to_string(), Value::Text(plugin_key)),
-                ("schema_version".to_string(), Value::Text(schema_version)),
+                ("file_id".to_string(), Value::Text(file_id.to_string())),
+                (
+                    "plugin_key".to_string(),
+                    Value::Text(plugin_key.to_string()),
+                ),
+                (
+                    "schema_version".to_string(),
+                    Value::Text(schema_version.to_string()),
+                ),
             ]),
         },
     )
