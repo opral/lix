@@ -69,6 +69,12 @@ struct LiveStateStatusRow {
     watermark: Option<CanonicalWatermark>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveStateSnapshot {
+    status: Option<LiveStateStatusRow>,
+    pub(crate) latest_canonical_watermark: Option<CanonicalWatermark>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveStateReadiness {
     Uninitialized,
@@ -76,33 +82,83 @@ pub(crate) enum LiveStateReadiness {
     NeedsRebuild,
 }
 
-pub(crate) async fn refresh_live_state_readiness(
-    backend: &dyn LixBackend,
-) -> Result<LiveStateReadiness, LixError> {
-    let status = load_live_state_status_row_with_backend(backend).await?;
-    if status.mode == LiveStateMode::Uninitialized {
-        return Ok(LiveStateReadiness::Uninitialized);
-    }
-    if matches!(
-        status.mode,
-        LiveStateMode::Bootstrapping | LiveStateMode::Rebuilding | LiveStateMode::NeedsRebuild
-    ) {
-        return Ok(LiveStateReadiness::NeedsRebuild);
-    }
-    let latest = load_latest_canonical_watermark(backend).await?;
-    let ready = status.mode == LiveStateMode::Ready
-        && status.schema_epoch == LIVE_STATE_SCHEMA_EPOCH
-        && status.watermark == latest;
-    if ready {
-        return Ok(LiveStateReadiness::Ready);
-    }
+pub(crate) fn evaluate_live_state_transaction_eligibility(
+    snapshot: &LiveStateSnapshot,
+) -> LiveStateReadiness {
+    let Some(status) = snapshot.status.as_ref() else {
+        return if snapshot.latest_canonical_watermark.is_some() {
+            LiveStateReadiness::NeedsRebuild
+        } else {
+            LiveStateReadiness::Uninitialized
+        };
+    };
 
-    mark_live_state_mode_with_backend(backend, LiveStateMode::NeedsRebuild).await?;
-    Ok(LiveStateReadiness::NeedsRebuild)
+    match status.mode {
+        LiveStateMode::Uninitialized => {
+            if snapshot.latest_canonical_watermark.is_some() {
+                LiveStateReadiness::NeedsRebuild
+            } else {
+                LiveStateReadiness::Uninitialized
+            }
+        }
+        LiveStateMode::Bootstrapping | LiveStateMode::Rebuilding | LiveStateMode::NeedsRebuild => {
+            LiveStateReadiness::NeedsRebuild
+        }
+        // Inside an open write transaction the canonical change head may advance
+        // before the transaction stamps the live-state watermark at commit time.
+        // Transaction eligibility therefore validates owner state and schema epoch,
+        // not watermark equality.
+        LiveStateMode::Ready => {
+            if status.schema_epoch == LIVE_STATE_SCHEMA_EPOCH {
+                LiveStateReadiness::Ready
+            } else {
+                LiveStateReadiness::NeedsRebuild
+            }
+        }
+    }
+}
+
+pub(crate) fn evaluate_live_state_snapshot(snapshot: &LiveStateSnapshot) -> LiveStateReadiness {
+    let Some(status) = snapshot.status.as_ref() else {
+        return if snapshot.latest_canonical_watermark.is_some() {
+            LiveStateReadiness::NeedsRebuild
+        } else {
+            LiveStateReadiness::Uninitialized
+        };
+    };
+
+    match status.mode {
+        LiveStateMode::Uninitialized => {
+            if snapshot.latest_canonical_watermark.is_some() {
+                LiveStateReadiness::NeedsRebuild
+            } else {
+                LiveStateReadiness::Uninitialized
+            }
+        }
+        LiveStateMode::Bootstrapping | LiveStateMode::Rebuilding | LiveStateMode::NeedsRebuild => {
+            LiveStateReadiness::NeedsRebuild
+        }
+        LiveStateMode::Ready => {
+            let ready = status.schema_epoch == LIVE_STATE_SCHEMA_EPOCH
+                && status.watermark == snapshot.latest_canonical_watermark;
+            if ready {
+                LiveStateReadiness::Ready
+            } else {
+                LiveStateReadiness::NeedsRebuild
+            }
+        }
+    }
+}
+
+pub(crate) async fn load_live_state_snapshot(
+    backend: &dyn LixBackend,
+) -> Result<LiveStateSnapshot, LixError> {
+    load_live_state_snapshot_with_backend(backend).await
 }
 
 pub(crate) async fn ensure_live_state_ready(backend: &dyn LixBackend) -> Result<(), LixError> {
-    match refresh_live_state_readiness(backend).await? {
+    let snapshot = load_live_state_snapshot(backend).await?;
+    match evaluate_live_state_snapshot(&snapshot) {
         LiveStateReadiness::Ready => Ok(()),
         LiveStateReadiness::Uninitialized => Err(crate::errors::not_initialized_error()),
         LiveStateReadiness::NeedsRebuild => Err(crate::errors::live_state_not_ready_error()),
@@ -112,13 +168,12 @@ pub(crate) async fn ensure_live_state_ready(backend: &dyn LixBackend) -> Result<
 pub(crate) async fn ensure_live_state_ready_in_transaction(
     transaction: &mut dyn LixTransaction,
 ) -> Result<(), LixError> {
-    let status = load_live_state_status_row_in_transaction(transaction).await?;
-    let ready =
-        status.mode == LiveStateMode::Ready && status.schema_epoch == LIVE_STATE_SCHEMA_EPOCH;
-    if ready {
-        return Ok(());
+    let snapshot = load_live_state_snapshot_in_transaction(transaction).await?;
+    match evaluate_live_state_transaction_eligibility(&snapshot) {
+        LiveStateReadiness::Ready => Ok(()),
+        LiveStateReadiness::Uninitialized => Err(crate::errors::not_initialized_error()),
+        LiveStateReadiness::NeedsRebuild => Err(crate::errors::live_state_not_ready_error()),
     }
-    Err(crate::errors::live_state_not_ready_error())
 }
 
 pub(crate) async fn mark_live_state_mode_with_backend(
@@ -263,19 +318,22 @@ async fn load_live_state_status_row_with_backend(
     parse_live_state_status_result(result)
 }
 
-async fn load_live_state_status_row_in_transaction(
-    transaction: &mut dyn LixTransaction,
-) -> Result<LiveStateStatusRow, LixError> {
-    let result = transaction
-        .execute(
-            "SELECT mode, latest_change_id, latest_change_created_at, schema_epoch \
-             FROM lix_internal_live_state_status \
-             WHERE singleton_id = 1 \
-             LIMIT 1",
-            &[],
-        )
+async fn load_live_state_snapshot_with_backend(
+    backend: &dyn LixBackend,
+) -> Result<LiveStateSnapshot, LixError> {
+    let result = backend
+        .execute(&build_load_live_state_snapshot_sql(), &[])
         .await;
-    parse_live_state_status_result(result)
+    parse_live_state_snapshot_result(result)
+}
+
+async fn load_live_state_snapshot_in_transaction(
+    transaction: &mut dyn LixTransaction,
+) -> Result<LiveStateSnapshot, LixError> {
+    let result = transaction
+        .execute(&build_load_live_state_snapshot_sql(), &[])
+        .await;
+    parse_live_state_snapshot_result(result)
 }
 
 fn parse_live_state_status_result(
@@ -290,6 +348,26 @@ fn parse_live_state_status_result(
         return Ok(default_live_state_status());
     };
     live_state_status_row_from_values(row)
+}
+
+fn parse_live_state_snapshot_result(
+    result: Result<QueryResult, LixError>,
+) -> Result<LiveStateSnapshot, LixError> {
+    let result = match result {
+        Ok(result) => result,
+        Err(error) if is_missing_relation_error(&error) => return Ok(default_live_state_snapshot()),
+        Err(error) => return Err(error),
+    };
+    let Some(row) = result.rows.first() else {
+        return Ok(default_live_state_snapshot());
+    };
+
+    let status = parse_nullable_live_state_status(row)?;
+    let latest_canonical_watermark = parse_nullable_canonical_watermark(row.get(4), row.get(5))?;
+    Ok(LiveStateSnapshot {
+        status,
+        latest_canonical_watermark,
+    })
 }
 
 fn live_state_status_row_from_values(row: &[Value]) -> Result<LiveStateStatusRow, LixError> {
@@ -331,6 +409,88 @@ fn default_live_state_status() -> LiveStateStatusRow {
     }
 }
 
+fn default_live_state_snapshot() -> LiveStateSnapshot {
+    LiveStateSnapshot {
+        status: None,
+        latest_canonical_watermark: None,
+    }
+}
+
+fn parse_nullable_live_state_status(row: &[Value]) -> Result<Option<LiveStateStatusRow>, LixError> {
+    if row.is_empty() {
+        return Ok(None);
+    }
+    match optional_text_value(row.first())? {
+        None => {
+            let latest_change_id = optional_text_value(row.get(1))?;
+            let latest_change_created_at = optional_text_value(row.get(2))?;
+            let schema_epoch = optional_text_value(row.get(3))?;
+            if latest_change_id.is_some()
+                || latest_change_created_at.is_some()
+                || schema_epoch.is_some()
+            {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "live state status row is partially populated",
+                ));
+            }
+            Ok(None)
+        }
+        Some(mode_text) => {
+            let Some(mode) = LiveStateMode::parse(&mode_text) else {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    &format!("invalid live state mode '{mode_text}'"),
+                ));
+            };
+            let latest_change_id = optional_text_value(row.get(1))?;
+            let latest_change_created_at = optional_text_value(row.get(2))?;
+            let watermark = match (latest_change_id, latest_change_created_at) {
+                (Some(change_id), Some(created_at)) => Some(CanonicalWatermark {
+                    change_id,
+                    created_at,
+                }),
+                (None, None) => None,
+                _ => {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "live state watermark is partially populated",
+                    ))
+                }
+            };
+
+            Ok(Some(LiveStateStatusRow {
+                mode,
+                schema_epoch: text_value(
+                    row.get(3),
+                    "lix_internal_live_state_status.schema_epoch",
+                )?,
+                watermark,
+            }))
+        }
+    }
+}
+
+fn parse_nullable_canonical_watermark(
+    change_id: Option<&Value>,
+    created_at: Option<&Value>,
+) -> Result<Option<CanonicalWatermark>, LixError> {
+    match (
+        optional_text_value(change_id)?,
+        optional_text_value(created_at)?,
+    ) {
+        (Some(change_id), Some(created_at)) => Ok(Some(CanonicalWatermark {
+            change_id,
+            created_at,
+        })),
+        (None, None) => Ok(None),
+        _ => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "canonical live-state watermark is partially populated",
+        )),
+    }
+}
+
 fn text_value(value: Option<&Value>, field: &str) -> Result<String, LixError> {
     match value {
         Some(Value::Text(text)) if !text.is_empty() => Ok(text.clone()),
@@ -366,6 +526,28 @@ fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+fn build_load_live_state_snapshot_sql() -> String {
+    "WITH status AS (\
+       SELECT mode, latest_change_id, latest_change_created_at, schema_epoch \
+       FROM lix_internal_live_state_status \
+       WHERE singleton_id = 1 \
+       LIMIT 1\
+     ), canonical AS (\
+       SELECT id, created_at \
+       FROM lix_internal_change \
+       ORDER BY created_at DESC, id DESC \
+       LIMIT 1\
+     ) \
+     SELECT \
+       (SELECT mode FROM status), \
+       (SELECT latest_change_id FROM status), \
+       (SELECT latest_change_created_at FROM status), \
+       (SELECT schema_epoch FROM status), \
+       (SELECT id FROM canonical), \
+       (SELECT created_at FROM canonical)"
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +569,36 @@ mod tests {
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             self.executed_sql.lock().unwrap().push(sql.to_string());
+            if sql.contains("WITH status AS")
+                && sql.contains("lix_internal_live_state_status")
+                && sql.contains("lix_internal_change")
+            {
+                let mut row = self
+                    .status_row
+                    .clone()
+                    .unwrap_or_else(|| vec![Value::Null, Value::Null, Value::Null, Value::Null]);
+                match &self.latest_watermark {
+                    Some((id, created_at)) => {
+                        row.push(Value::Text(id.clone()));
+                        row.push(Value::Text(created_at.clone()));
+                    }
+                    None => {
+                        row.push(Value::Null);
+                        row.push(Value::Null);
+                    }
+                }
+                return Ok(QueryResult {
+                    rows: vec![row],
+                    columns: vec![
+                        "mode".to_string(),
+                        "latest_change_id".to_string(),
+                        "latest_change_created_at".to_string(),
+                        "schema_epoch".to_string(),
+                        "id".to_string(),
+                        "created_at".to_string(),
+                    ],
+                });
+            }
             if sql.contains("FROM lix_internal_live_state_status") {
                 return Ok(QueryResult {
                     rows: self.status_row.clone().into_iter().collect(),
@@ -436,7 +648,8 @@ mod tests {
     }
 
     struct FakeTransaction {
-        status_row: Vec<Value>,
+        status_row: Option<Vec<Value>>,
+        latest_watermark: Option<(String, String)>,
     }
 
     #[async_trait(?Send)]
@@ -446,9 +659,39 @@ mod tests {
         }
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            if sql.contains("WITH status AS")
+                && sql.contains("lix_internal_live_state_status")
+                && sql.contains("lix_internal_change")
+            {
+                let mut row = self
+                    .status_row
+                    .clone()
+                    .unwrap_or_else(|| vec![Value::Null, Value::Null, Value::Null, Value::Null]);
+                match &self.latest_watermark {
+                    Some((id, created_at)) => {
+                        row.push(Value::Text(id.clone()));
+                        row.push(Value::Text(created_at.clone()));
+                    }
+                    None => {
+                        row.push(Value::Null);
+                        row.push(Value::Null);
+                    }
+                }
+                return Ok(QueryResult {
+                    rows: vec![row],
+                    columns: vec![
+                        "mode".to_string(),
+                        "latest_change_id".to_string(),
+                        "latest_change_created_at".to_string(),
+                        "schema_epoch".to_string(),
+                        "id".to_string(),
+                        "created_at".to_string(),
+                    ],
+                });
+            }
             if sql.contains("FROM lix_internal_live_state_status") {
                 return Ok(QueryResult {
-                    rows: vec![self.status_row.clone()],
+                    rows: self.status_row.clone().into_iter().collect(),
                     columns: vec![
                         "mode".to_string(),
                         "latest_change_id".to_string(),
@@ -476,7 +719,7 @@ mod tests {
     async fn readiness_is_uninitialized_without_canonical_state() {
         let backend = FakeBackend::default();
         assert_eq!(
-            refresh_live_state_readiness(&backend).await.unwrap(),
+            evaluate_live_state_snapshot(&load_live_state_snapshot(&backend).await.unwrap()),
             LiveStateReadiness::Uninitialized
         );
     }
@@ -495,20 +738,56 @@ mod tests {
         };
 
         assert_eq!(
-            refresh_live_state_readiness(&backend).await.unwrap(),
+            evaluate_live_state_snapshot(&load_live_state_snapshot(&backend).await.unwrap()),
             LiveStateReadiness::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_mismatch_is_observed_without_mutating_status() {
+        let backend = FakeBackend {
+            status_row: Some(vec![
+                Value::Text("ready".to_string()),
+                Value::Text("change-1".to_string()),
+                Value::Text("2026-03-15T01:02:02Z".to_string()),
+                Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
+            ]),
+            latest_watermark: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            executed_sql: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let snapshot = load_live_state_snapshot(&backend).await.unwrap();
+        assert_eq!(
+            evaluate_live_state_snapshot(&snapshot),
+            LiveStateReadiness::NeedsRebuild
+        );
+
+        let executed_sql = backend.executed_sql.lock().unwrap().clone();
+        assert_eq!(executed_sql.len(), 1);
+        assert!(
+            !executed_sql[0]
+                .to_ascii_lowercase()
+                .contains("insert into lix_internal_live_state_status"),
+            "observer path must not mutate live-state status"
+        );
+        assert!(
+            !executed_sql[0]
+                .to_ascii_lowercase()
+                .contains("update lix_internal_live_state_status"),
+            "observer path must not mutate live-state status"
         );
     }
 
     #[tokio::test]
     async fn transaction_ready_check_rejects_needs_rebuild() {
         let mut transaction = FakeTransaction {
-            status_row: vec![
+            status_row: Some(vec![
                 Value::Text("needs_rebuild".to_string()),
                 Value::Null,
                 Value::Null,
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
-            ],
+            ]),
+            latest_watermark: None,
         };
 
         let error = ensure_live_state_ready_in_transaction(&mut transaction)
@@ -518,5 +797,37 @@ mod tests {
             error.code,
             crate::errors::ErrorCode::LiveStateNotReady.as_str()
         );
+    }
+
+    #[tokio::test]
+    async fn readiness_without_status_but_with_canonical_state_requires_rebuild() {
+        let backend = FakeBackend {
+            status_row: None,
+            latest_watermark: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            executed_sql: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let snapshot = load_live_state_snapshot(&backend).await.unwrap();
+        assert_eq!(
+            evaluate_live_state_snapshot(&snapshot),
+            LiveStateReadiness::NeedsRebuild
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_ready_check_allows_inflight_watermark_drift() {
+        let mut transaction = FakeTransaction {
+            status_row: Some(vec![
+                Value::Text("ready".to_string()),
+                Value::Text("change-1".to_string()),
+                Value::Text("2026-03-15T01:02:02Z".to_string()),
+                Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
+            ]),
+            latest_watermark: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+        };
+
+        ensure_live_state_ready_in_transaction(&mut transaction)
+            .await
+            .expect("inflight watermark drift inside transaction should be allowed");
     }
 }
