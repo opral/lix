@@ -270,20 +270,6 @@ pub(crate) fn logical_snapshot_from_projected_row(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn logical_snapshot_text_from_projected_row(
-    access: Option<&LiveRowAccess>,
-    _schema_key: &str,
-    row: &[Value],
-    snapshot_index: usize,
-    normalized_start_index: usize,
-) -> Result<Option<String>, LixError> {
-    match access {
-        Some(access) => access.logical_snapshot_text_from_row(row, normalized_start_index),
-        None => Ok(row.get(snapshot_index).and_then(text_from_live_row_value)),
-    }
-}
-
 pub(crate) async fn load_live_row_access_with_backend(
     backend: &dyn LixBackend,
     schema_key: &str,
@@ -654,14 +640,6 @@ pub(crate) fn json_value_from_live_row_cell(
 
 fn quote_ident_fragment(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
-}
-
-#[cfg(test)]
-fn text_from_live_row_value(value: &Value) -> Option<String> {
-    match value {
-        Value::Text(text) => Some(text.clone()),
-        _ => None,
-    }
 }
 
 pub(crate) fn live_schema_key_for_table_name(table_name: &str) -> Option<&str> {
