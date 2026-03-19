@@ -57,6 +57,36 @@ pub(crate) async fn load_exact_live_row_with_executor(
     Ok(result.into_iter().next())
 }
 
+pub(crate) async fn tracked_live_row_exists_with_executor(
+    executor: &mut dyn QueryExecutor,
+    schema_key: &str,
+    filters: &BTreeMap<&str, String>,
+) -> Result<bool, LixError> {
+    let table_name = tracked_live_table_name(schema_key);
+    let mut sql = format!(
+        "SELECT 1 \
+         FROM {table_name} \
+         WHERE schema_key = '{schema_key}'",
+        table_name = quote_ident(&table_name),
+        schema_key = escape_sql_string(schema_key),
+    );
+    for (column, value) in filters {
+        sql.push_str(&format!(
+            " AND {column} = '{value}'",
+            column = quote_ident(column),
+            value = escape_sql_string(value),
+        ));
+    }
+    sql.push_str(" LIMIT 1");
+
+    let result = match executor.execute(&sql, &[]).await {
+        Ok(result) => result,
+        Err(err) if is_missing_relation_error(&err) => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    Ok(!result.rows.is_empty())
+}
+
 pub(crate) async fn load_live_rows_with_executor(
     executor: &mut dyn QueryExecutor,
     scope: LiveRowScope,

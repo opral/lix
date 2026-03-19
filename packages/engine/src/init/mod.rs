@@ -211,7 +211,7 @@ pub async fn init_backend(backend: &dyn LixBackend) -> Result<(), LixError> {
     Ok(())
 }
 
-async fn ensure_registered_schema_bootstrap_seeded(
+pub(crate) async fn ensure_registered_schema_bootstrap_seeded(
     backend: &dyn LixBackend,
 ) -> Result<(), LixError> {
     let registered_schema_table = tracked_live_table_name("lix_registered_schema");

@@ -1,4 +1,6 @@
-use crate::schema::live_store::{load_exact_live_row_with_executor, LiveRowScope};
+use crate::schema::live_store::{
+    load_exact_live_row_with_executor, tracked_live_row_exists_with_executor, LiveRowScope,
+};
 use crate::sql::common::dependency_spec::DependencySpec;
 use crate::sql::public::planner::ir::{
     CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
@@ -318,9 +320,38 @@ pub(crate) async fn resolve_exact_effective_state_row(
         if row.is_some() {
             return Ok(row);
         }
+
+        if matches!(lane, OverlayLane::LocalTracked | OverlayLane::GlobalTracked)
+            && tracked_exact_row_exists_including_tombstones(backend, request, &internal_version_id)
+                .await?
+        {
+            return Ok(None);
+        }
     }
 
     Ok(None)
+}
+
+async fn tracked_exact_row_exists_including_tombstones(
+    backend: &dyn LixBackend,
+    request: &ExactEffectiveStateRowRequest,
+    version_id: &str,
+) -> Result<bool, LixError> {
+    let mut filters = BTreeMap::from([("version_id", version_id.to_string())]);
+    for column in [
+        "entity_id",
+        "file_id",
+        "plugin_key",
+        "schema_version",
+        "writer_key",
+    ] {
+        if let Some(value) = row_key_text_value(&request.row_key, column) {
+            filters.insert(column, value.to_string());
+        }
+    }
+
+    let mut executor = backend;
+    tracked_live_row_exists_with_executor(&mut executor, &request.schema_key, &filters).await
 }
 
 async fn load_exact_tracked_effective_row(

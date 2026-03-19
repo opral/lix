@@ -11,7 +11,7 @@ use crate::state::internal::{
     object_name_matches, MutationOperation, MutationRow, ResolvedCell, RowSourceResolver,
     SchemaLiveTableRequirement,
 };
-use crate::{LixError, Value as EngineValue};
+use crate::{CanonicalJson, LixError, Value as EngineValue};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const GLOBAL_VERSION: &str = "global";
@@ -142,6 +142,11 @@ pub fn rewrite_insert(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("registered schema snapshot_content must be valid JSON: {err}"),
         })?;
+    let snapshot_literal_value = CanonicalJson::from_value(snapshot_value.clone())?.into_string();
+    for row in &mut rows {
+        row[snapshot_index] =
+            engine_value_to_expr(&EngineValue::Text(snapshot_literal_value.clone()));
+    }
 
     if let Some(entity_index) = find_column_index(&columns, "entity_id") {
         if !resolved_rows

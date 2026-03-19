@@ -627,6 +627,7 @@ pub(crate) struct FilesystemPayloadWriteIntent {
 pub(crate) struct ResolvedWritePartition {
     pub(crate) execution_mode: WriteMode,
     pub(crate) authoritative_pre_state: Vec<ResolvedRowRef>,
+    pub(crate) authoritative_pre_state_rows: Vec<PlannedStateRow>,
     pub(crate) intended_post_state: Vec<PlannedStateRow>,
     pub(crate) tombstones: Vec<ResolvedRowRef>,
     pub(crate) lineage: Vec<RowLineage>,
@@ -688,6 +689,12 @@ impl ResolvedWritePlan {
         self.partitions
             .iter()
             .flat_map(|partition| partition.authoritative_pre_state.iter())
+    }
+
+    pub(crate) fn authoritative_pre_state_rows(&self) -> impl Iterator<Item = &PlannedStateRow> {
+        self.partitions
+            .iter()
+            .flat_map(|partition| partition.authoritative_pre_state_rows.iter())
     }
 
     pub(crate) fn intended_post_state(&self) -> impl Iterator<Item = &PlannedStateRow> {
