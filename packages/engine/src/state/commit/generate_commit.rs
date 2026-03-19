@@ -67,6 +67,7 @@ where
                 description: format!("generate_commit: duplicate change id '{}'", change.id),
             });
         }
+        validate_domain_change_identity(change)?;
     }
 
     let commit_schema = builtin_schema_meta(COMMIT_SCHEMA_KEY)?;
@@ -469,6 +470,35 @@ fn sanitize_domain_change(change: &DomainChangeInput) -> ChangeRow {
         metadata: change.metadata.clone(),
         created_at: change.created_at.clone(),
     }
+}
+
+fn validate_domain_change_identity(change: &DomainChangeInput) -> Result<(), LixError> {
+    let change_label = if change.id.is_empty() {
+        "<empty change id>"
+    } else {
+        change.id.as_str()
+    };
+
+    for (field, value) in [
+        ("id", change.id.as_str()),
+        ("entity_id", change.entity_id.as_str()),
+        ("schema_key", change.schema_key.as_str()),
+        ("schema_version", change.schema_version.as_str()),
+        ("file_id", change.file_id.as_str()),
+        ("plugin_key", change.plugin_key.as_str()),
+        ("version_id", change.version_id.as_str()),
+    ] {
+        if value.is_empty() {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "generate_commit: change '{change_label}' requires non-empty {field}"
+                ),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn canonical_json(value: serde_json::Value) -> Result<CanonicalJson, LixError> {
@@ -1079,6 +1109,27 @@ mod tests {
             generate_commit(args, || "id".to_string()).expect_err("expected duplicate id error");
         assert!(
             error.description.contains("duplicate change id"),
+            "unexpected error: {}",
+            error.description
+        );
+    }
+
+    #[test]
+    fn rejects_empty_domain_change_entity_id() {
+        let mut versions = BTreeMap::new();
+        versions.insert("global".to_string(), version_info("global", &["P_global"]));
+
+        let args = GenerateCommitArgs {
+            timestamp: "2025-01-01T00:00:00.000Z".to_string(),
+            active_accounts: vec![],
+            changes: vec![domain_change("chg-empty-entity", "", "lix_key_value", "global", None)],
+            versions,
+        };
+
+        let error = generate_commit(args, || "id".to_string())
+            .expect_err("expected empty entity_id error");
+        assert!(
+            error.description.contains("requires non-empty entity_id"),
             "unexpected error: {}",
             error.description
         );

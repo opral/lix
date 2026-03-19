@@ -2158,6 +2158,12 @@ fn resolved_string_required(
         ..
     }) = cell
     {
+        if value.is_empty() {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!("vtable insert requires non-empty {name}"),
+            });
+        }
         return Ok(value.clone());
     }
 
@@ -2173,7 +2179,14 @@ fn literal_string_required(expr: Option<&Expr>, name: &str) -> Result<String, Li
         Expr::Value(ValueWithSpan {
             value: Value::SingleQuotedString(value),
             ..
-        }) => Ok(value.clone()),
+        }) if !value.is_empty() => Ok(value.clone()),
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(_),
+            ..
+        }) => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("vtable insert requires non-empty {name}"),
+        }),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("vtable insert requires literal {name}"),

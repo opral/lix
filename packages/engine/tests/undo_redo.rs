@@ -112,6 +112,48 @@ simulation_test!(undo_redo_reverts_insert_and_replays_it, |sim| async move {
 });
 
 simulation_test!(
+    empty_key_insert_is_rejected_without_poisoning_undo_history,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.initialize().await.expect("init should succeed");
+
+        let (version_id, _baseline_commit_id) = active_version_ref(&engine).await;
+        engine
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('undo-safe-key', 'before')",
+                &[],
+            )
+            .await
+            .expect("tracked insert should succeed");
+        let (_version_id, inserted_commit_id) = active_version_ref(&engine).await;
+
+        let empty_insert = engine
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('', 'bad')",
+                &[],
+            )
+            .await
+            .expect_err("empty key insert should fail");
+        assert!(
+            empty_insert
+                .to_string()
+                .contains("empty primary-key value")
+                || empty_insert.to_string().contains("non-empty entity_id")
+                || empty_insert.to_string().contains("non-empty key"),
+            "unexpected error: {empty_insert}"
+        );
+
+        let undo = engine.undo().await.expect("undo should still succeed");
+        assert_eq!(undo.version_id, version_id);
+        assert_eq!(undo.target_commit_id, inserted_commit_id);
+        assert_eq!(key_value_value(&engine, "undo-safe-key").await, None);
+    }
+);
+
+simulation_test!(
     undo_rejects_bootstrap_boundary_on_fresh_project,
     |sim| async move {
         let engine = sim

@@ -76,16 +76,12 @@ pub(crate) fn build_entity_insert_rows(
     let mut rows = Vec::with_capacity(payloads.len());
     for payload in payloads {
         let snapshot = snapshot_from_entity_payload(&payload, semantics)?;
-        let entity_id = payload
-            .get("entity_id")
-            .and_then(text_from_value)
-            .map(ToString::to_string)
-            .or_else(|| derive_entity_id_from_snapshot(&snapshot, semantics.primary_key_paths).ok())
-            .ok_or_else(|| StateAssignmentsError {
-                message:
-                    "public entity insert resolver requires an exact primary-key-derived entity_id"
-                        .to_string(),
-            })?;
+        let entity_id = if let Some(entity_id) = payload.get("entity_id").and_then(text_from_value)
+        {
+            entity_id.to_string()
+        } else {
+            derive_entity_id_from_snapshot(&snapshot, semantics.primary_key_paths)?
+        };
         let mut values = BTreeMap::new();
         values.insert("entity_id".to_string(), Value::Text(entity_id.clone()));
         values.insert(
@@ -416,6 +412,11 @@ fn entity_id_component_from_json_value(value: &JsonValue) -> Result<String, Stat
         JsonValue::Null => Err(StateAssignmentsError {
             message: "public entity resolver cannot derive entity_id from null primary-key values"
                 .to_string(),
+        }),
+        JsonValue::String(text) if text.is_empty() => Err(StateAssignmentsError {
+            message:
+                "public entity resolver cannot derive entity_id from empty primary-key values"
+                    .to_string(),
         }),
         JsonValue::String(text) => Ok(text.clone()),
         JsonValue::Bool(flag) => Ok(flag.to_string()),

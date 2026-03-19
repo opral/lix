@@ -131,6 +131,39 @@ simulation_test!(
 );
 
 simulation_test!(
+    primary_key_insert_rejects_empty_primary_key_value,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        register_pk_schema(&engine, "pk_empty_primary_key").await;
+        insert_version(&engine, "version-a").await;
+
+        let result = engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 '', 'pk_empty_primary_key', 'alpha.md', 'version-a', 'lix', '1', '{\"id\":\"\",\"name\":\"Ada\"}'\
+                 )",
+                &[],
+            )
+            .await;
+
+        let err = result.expect_err("expected empty primary-key rejection");
+        assert!(
+            err.to_string()
+                .contains("cannot derive entity_id from empty primary-key value"),
+            "unexpected error: {err}"
+        );
+    }
+);
+
+simulation_test!(
     primary_key_update_rejects_entity_id_mismatch,
     simulations = [sqlite],
     |sim| async move {
