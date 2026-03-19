@@ -551,23 +551,33 @@ pub(crate) fn state_commit_stream_changes_from_domain_changes(
             operation,
             entity_id: change.entity_id.to_string(),
             schema_key: change.schema_key.to_string(),
-            schema_version: change.schema_version.clone().ok_or_else(|| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "domain change state commit stream requires schema_version"
-                    .to_string(),
-            })?
-            .to_string(),
-            file_id: change.file_id.clone().ok_or_else(|| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "domain change state commit stream requires file_id".to_string(),
-            })?
-            .to_string(),
+            schema_version: change
+                .schema_version
+                .clone()
+                .ok_or_else(|| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: "domain change state commit stream requires schema_version"
+                        .to_string(),
+                })?
+                .to_string(),
+            file_id: change
+                .file_id
+                .clone()
+                .ok_or_else(|| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: "domain change state commit stream requires file_id".to_string(),
+                })?
+                .to_string(),
             version_id: change.version_id.to_string(),
-            plugin_key: change.plugin_key.clone().ok_or_else(|| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "domain change state commit stream requires plugin_key".to_string(),
-            })?
-            .to_string(),
+            plugin_key: change
+                .plugin_key
+                .clone()
+                .ok_or_else(|| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: "domain change state commit stream requires plugin_key"
+                        .to_string(),
+                })?
+                .to_string(),
             snapshot_content,
             untracked: false,
             writer_key: change.writer_key.clone(),

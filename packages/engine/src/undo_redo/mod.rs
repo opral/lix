@@ -267,7 +267,10 @@ pub(crate) fn build_forward_proposed_change(
             change.schema_version.clone(),
             "undo forward schema_version",
         )?),
-        file_id: Some(require_identity(change.file_id.clone(), "undo forward file_id")?),
+        file_id: Some(require_identity(
+            change.file_id.clone(),
+            "undo forward file_id",
+        )?),
         plugin_key: Some(require_identity(
             change.plugin_key.clone(),
             "undo forward plugin_key",
@@ -287,18 +290,15 @@ pub(crate) fn build_restore_proposed_change(
         entity_id: require_identity(row.entity_id.clone(), "undo restore entity_id")?,
         schema_key: require_identity(row.schema_key.clone(), "undo restore schema_key")?,
         schema_version: Some(require_identity(
-            required_snapshot_text(
-            row.values.get("schema_version"),
-            "schema_version",
-        )?,
+            required_snapshot_text(row.values.get("schema_version"), "schema_version")?,
             "undo restore schema_version",
         )?),
-        file_id: Some(require_identity(row.file_id.clone(), "undo restore file_id")?),
+        file_id: Some(require_identity(
+            row.file_id.clone(),
+            "undo restore file_id",
+        )?),
         plugin_key: Some(require_identity(
-            required_snapshot_text(
-            row.values.get("plugin_key"),
-            "plugin_key",
-        )?,
+            required_snapshot_text(row.values.get("plugin_key"), "plugin_key")?,
             "undo restore plugin_key",
         )?),
         snapshot_content: Some(required_snapshot_text(
@@ -325,7 +325,10 @@ pub(crate) fn build_tombstone_proposed_change(
             change.schema_version.clone(),
             "undo tombstone schema_version",
         )?),
-        file_id: Some(require_identity(change.file_id.clone(), "undo tombstone file_id")?),
+        file_id: Some(require_identity(
+            change.file_id.clone(),
+            "undo tombstone file_id",
+        )?),
         plugin_key: Some(require_identity(
             change.plugin_key.clone(),
             "undo tombstone plugin_key",

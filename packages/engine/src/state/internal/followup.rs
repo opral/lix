@@ -345,10 +345,7 @@ async fn build_update_followup_statement_batch(
             id: functions.uuid_v7(),
             entity_id: require_identity(entity_id, "vtable update entity_id")?,
             schema_key: require_identity(plan.schema_key.clone(), "vtable update schema_key")?,
-            schema_version: require_identity(
-                schema_version,
-                "vtable update schema_version",
-            )?,
+            schema_version: require_identity(schema_version, "vtable update schema_version")?,
             file_id: require_identity(file_id, "vtable update file_id")?,
             version_id: require_identity(version_id, "vtable update version_id")?,
             plugin_key: require_identity(plugin_key, "vtable update plugin_key")?,
@@ -422,10 +419,7 @@ async fn build_delete_followup_statement_batch(
             id: functions.uuid_v7(),
             entity_id: require_identity(entity_id, "vtable delete entity_id")?,
             schema_key: require_identity(plan.schema_key.clone(), "vtable delete schema_key")?,
-            schema_version: require_identity(
-                schema_version,
-                "vtable delete schema_version",
-            )?,
+            schema_version: require_identity(schema_version, "vtable delete schema_version")?,
             file_id: require_identity(file_id, "vtable delete file_id")?,
             version_id: require_identity(version_id, "vtable delete version_id")?,
             plugin_key: require_identity(plugin_key, "vtable delete plugin_key")?,

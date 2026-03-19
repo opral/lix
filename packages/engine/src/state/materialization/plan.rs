@@ -1186,8 +1186,14 @@ fn build_writes(final_state: &[FinalStateRow]) -> Result<Vec<LiveStateWrite>, Li
             LiveStateWriteOp::Tombstone
         };
         writes.push(LiveStateWrite {
-            schema_key: require_identity(row.source.schema_key.clone(), "live-state write schema_key")?,
-            entity_id: require_identity(row.source.entity_id.clone(), "live-state write entity_id")?,
+            schema_key: require_identity(
+                row.source.schema_key.clone(),
+                "live-state write schema_key",
+            )?,
+            entity_id: require_identity(
+                row.source.entity_id.clone(),
+                "live-state write entity_id",
+            )?,
             file_id: require_identity(row.source.file_id.clone(), "live-state write file_id")?,
             version_id: require_identity(row.version_id.clone(), "live-state write version_id")?,
             global: row.version_id == GLOBAL_VERSION_ID,
@@ -1198,7 +1204,10 @@ fn build_writes(final_state: &[FinalStateRow]) -> Result<Vec<LiveStateWrite>, Li
                 row.source.schema_version.clone(),
                 "live-state write schema_version",
             )?,
-            plugin_key: require_identity(row.source.plugin_key.clone(), "live-state write plugin_key")?,
+            plugin_key: require_identity(
+                row.source.plugin_key.clone(),
+                "live-state write plugin_key",
+            )?,
             change_id: row.source.change_id.clone(),
             created_at: row.source.created_at.clone(),
             updated_at: row.source.updated_at.clone(),

@@ -814,10 +814,7 @@ fn table_name_terminal(name: &sqlparser::ast::ObjectName) -> Option<&str> {
 fn is_rewriteable_filesystem_public_surface_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "lix_file"
-            | "lix_file_by_version"
-            | "lix_directory"
-            | "lix_directory_by_version"
+        "lix_file" | "lix_file_by_version" | "lix_directory" | "lix_directory_by_version"
     )
 }
 
@@ -2867,5 +2864,4 @@ mod tests {
             vec!["lixcol_entity_id = 'x~1'".to_string()]
         );
     }
-
 }

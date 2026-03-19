@@ -2631,13 +2631,13 @@ fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWri
 
 #[cfg(test)]
 mod tests {
+    use super::read::try_prepare_public_read;
     use super::{
         lower_public_read_query_with_backend, prepare_public_execution,
         prepare_public_execution_with_internal_access, prepare_public_read,
         prepare_public_read_strict, DirectPublicReadPlan, PreparedPublicExecution,
         PreparedPublicReadExecution,
     };
-    use super::read::try_prepare_public_read;
     use crate::state::history::StateHistoryRootScope;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;

@@ -1,5 +1,5 @@
-use crate::schema::defaults::apply_schema_defaults_with_system_functions;
 use crate::identity::{derive_entity_id_from_json_paths, EntityIdDerivationError};
+use crate::schema::defaults::apply_schema_defaults_with_system_functions;
 use crate::sql::public::planner::ir::{
     CanonicalStateAssignments, MutationPayload, PlannedStateRow,
 };
@@ -265,8 +265,7 @@ pub(crate) fn derive_entity_id_from_snapshot(
         .map_err(|error| StateAssignmentsError {
             message: match error {
                 EntityIdDerivationError::EmptyPrimaryKeyPath { .. } => {
-                    "public entity resolver does not support empty primary-key pointers"
-                        .to_string()
+                    "public entity resolver does not support empty primary-key pointers".to_string()
                 }
                 EntityIdDerivationError::MissingPrimaryKeyValue { .. } => {
                     "public entity resolver could not derive entity_id from the primary-key fields"
@@ -408,7 +407,6 @@ fn resolved_entity_state_value(
         .cloned()
         .or_else(|| semantics.state_defaults.get(key).cloned())
 }
-
 fn text_from_value(value: &Value) -> Option<&str> {
     match value {
         Value::Text(value) => Some(value.as_str()),

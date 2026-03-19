@@ -719,15 +719,17 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
                 id: functions.uuid_v7(),
                 entity_id: EntityId::new(change.entity_id.clone())?,
                 schema_key: CanonicalSchemaKey::new(change.schema_key.clone())?,
-                schema_version: CanonicalSchemaVersion::new(change.schema_version.clone().ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!(
-                            "public merge requires schema_version for '{}:{}'",
-                            change.schema_key, change.entity_id
-                        ),
-                    )
-                })?)?,
+                schema_version: CanonicalSchemaVersion::new(
+                    change.schema_version.clone().ok_or_else(|| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!(
+                                "public merge requires schema_version for '{}:{}'",
+                                change.schema_key, change.entity_id
+                            ),
+                        )
+                    })?,
+                )?,
                 file_id: FileId::new(change.file_id.clone().ok_or_else(|| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
@@ -737,15 +739,17 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
                         ),
                     )
                 })?)?,
-                plugin_key: CanonicalPluginKey::new(change.plugin_key.clone().ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!(
-                            "public merge requires plugin_key for '{}:{}'",
-                            change.schema_key, change.entity_id
-                        ),
-                    )
-                })?)?,
+                plugin_key: CanonicalPluginKey::new(change.plugin_key.clone().ok_or_else(
+                    || {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!(
+                                "public merge requires plugin_key for '{}:{}'",
+                                change.schema_key, change.entity_id
+                            ),
+                        )
+                    },
+                )?)?,
                 snapshot_content: canonicalize_optional_json_text(
                     change.snapshot_content.as_deref(),
                     "snapshot_content",
@@ -914,20 +918,20 @@ fn rewrite_generated_commit_result_for_pending_session(
         live_state_rows.push(row);
     }
 
-        live_state_rows.push(MaterializedStateRow {
-            id: session.commit_materialized_change_id.clone(),
-            entity_id: EntityId::new(session.commit_id.clone())?,
-            schema_key: CanonicalSchemaKey::new("lix_commit".to_string())?,
-            schema_version: CanonicalSchemaVersion::new(session.commit_schema_version.clone())?,
-            file_id: FileId::new(session.commit_file_id.clone())?,
-            plugin_key: CanonicalPluginKey::new(session.commit_plugin_key.clone())?,
-            snapshot_content: Some(CanonicalJson::from_value(session.commit_snapshot.clone())?),
-            metadata: None,
-            created_at: timestamp.to_string(),
-            lixcol_version_id: VersionId::new(GLOBAL_VERSION_ID.to_string())?,
-            lixcol_commit_id: session.commit_id.clone(),
-            writer_key: None,
-        });
+    live_state_rows.push(MaterializedStateRow {
+        id: session.commit_materialized_change_id.clone(),
+        entity_id: EntityId::new(session.commit_id.clone())?,
+        schema_key: CanonicalSchemaKey::new("lix_commit".to_string())?,
+        schema_version: CanonicalSchemaVersion::new(session.commit_schema_version.clone())?,
+        file_id: FileId::new(session.commit_file_id.clone())?,
+        plugin_key: CanonicalPluginKey::new(session.commit_plugin_key.clone())?,
+        snapshot_content: Some(CanonicalJson::from_value(session.commit_snapshot.clone())?),
+        metadata: None,
+        created_at: timestamp.to_string(),
+        lixcol_version_id: VersionId::new(GLOBAL_VERSION_ID.to_string())?,
+        lixcol_commit_id: session.commit_id.clone(),
+        writer_key: None,
+    });
 
     Ok(GenerateCommitResult {
         canonical_output: crate::state::commit::CanonicalCommitOutput {

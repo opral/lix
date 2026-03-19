@@ -147,7 +147,8 @@ impl LixBackend for BenchSqliteBackend {
     async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
         let quoted = name.replace('"', "\"\"");
         let sql = format!("BEGIN; SAVEPOINT \"{quoted}\"");
-        self.begin_scoped_transaction(&sql, Some(name.to_string())).await
+        self.begin_scoped_transaction(&sql, Some(name.to_string()))
+            .await
     }
 }
 
@@ -209,7 +210,12 @@ impl LixTransaction for BenchSqliteTransaction {
         let commit_sql = self
             .savepoint_name
             .as_ref()
-            .map(|name| format!("RELEASE SAVEPOINT \"{}\"; COMMIT", name.replace('"', "\"\"")))
+            .map(|name| {
+                format!(
+                    "RELEASE SAVEPOINT \"{}\"; COMMIT",
+                    name.replace('"', "\"\"")
+                )
+            })
             .unwrap_or_else(|| "COMMIT".to_string());
         sqlx::query(&commit_sql)
             .execute(&mut *self.conn)

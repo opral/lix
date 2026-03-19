@@ -16,10 +16,7 @@ macro_rules! canonical_identity_type {
             pub fn new(value: impl Into<String>) -> Result<Self, LixError> {
                 let value = value.into();
                 if value.is_empty() {
-                    return Err(LixError::unknown(format!(
-                        "{} must be non-empty",
-                        $label
-                    )));
+                    return Err(LixError::unknown(format!("{} must be non-empty", $label)));
                 }
                 Ok(Self(value))
             }
