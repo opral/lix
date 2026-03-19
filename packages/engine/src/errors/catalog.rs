@@ -174,7 +174,7 @@ pub(crate) fn internal_table_access_denied_error() -> LixError {
     build_error(
         ErrorCode::InternalTableAccessDenied,
         &format!(
-            "Direct writes to `lix_internal_*` tables can lead to data corruption. Public SQL tables: {available_tables}."
+            "Direct writes or DDL against `lix_internal_*` tables can lead to data corruption. Public SQL tables: {available_tables}."
         ),
     )
 }

@@ -148,9 +148,9 @@ simulation_test!(
             .expect_err("internal table write should be rejected");
 
         assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
-        assert!(error
-            .description
-            .contains("Direct writes to `lix_internal_*` tables can lead to data corruption."));
+        assert!(error.description.contains(
+            "Direct writes or DDL against `lix_internal_*` tables can lead to data corruption."
+        ));
     }
 );
 
@@ -178,5 +178,74 @@ simulation_test!(
             .expect_err("internal table write in transaction should be rejected");
         assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
         tx.rollback().await.expect("rollback should succeed");
+    }
+);
+
+simulation_test!(
+    internal_table_drop_table_returns_access_denied,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let mut boot_args = SimulationBootArgs::default();
+        boot_args.access_to_internal = false;
+        let engine = sim
+            .boot_simulated_engine(Some(boot_args))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.expect("init should succeed");
+
+        let error = engine
+            .execute("DROP TABLE lix_internal_state_vtable", &[])
+            .await
+            .expect_err("internal table drop should be rejected");
+
+        assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
+    }
+);
+
+simulation_test!(
+    internal_table_alter_table_returns_access_denied,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let mut boot_args = SimulationBootArgs::default();
+        boot_args.access_to_internal = false;
+        let engine = sim
+            .boot_simulated_engine(Some(boot_args))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.expect("init should succeed");
+
+        let error = engine
+            .execute(
+                "ALTER TABLE lix_internal_state_vtable ADD COLUMN blocked INTEGER",
+                &[],
+            )
+            .await
+            .expect_err("internal table alter should be rejected");
+
+        assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
+    }
+);
+
+simulation_test!(
+    internal_table_create_trigger_returns_access_denied,
+    simulations = [sqlite],
+    |sim| async move {
+        let mut boot_args = SimulationBootArgs::default();
+        boot_args.access_to_internal = false;
+        let engine = sim
+            .boot_simulated_engine(Some(boot_args))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.expect("init should succeed");
+
+        let error = engine
+            .execute(
+                "CREATE TRIGGER lix_blocked_trigger AFTER INSERT ON lix_internal_state_vtable BEGIN SELECT 1; END",
+                &[],
+            )
+            .await
+            .expect_err("internal table trigger creation should be rejected");
+
+        assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
     }
 );
