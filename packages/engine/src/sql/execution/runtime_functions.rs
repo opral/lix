@@ -166,7 +166,7 @@ mod tests {
         let engine = boot(BootArgs::new(Box::new(backend), Arc::new(NoopWasmRuntime)));
 
         let (settings, sequence_start, _) = engine
-            .prepare_runtime_functions_with_backend(engine.backend_ref(), false)
+            .prepare_runtime_functions_with_backend(engine.backend.as_ref(), false)
             .await
             .expect("first runtime preparation should succeed");
         assert!(!settings.enabled);
@@ -178,7 +178,7 @@ mod tests {
         );
 
         let (_settings, sequence_start, _) = engine
-            .prepare_runtime_functions_with_backend(engine.backend_ref(), false)
+            .prepare_runtime_functions_with_backend(engine.backend.as_ref(), false)
             .await
             .expect("second runtime preparation should succeed");
         assert_eq!(sequence_start, 0);
@@ -191,7 +191,7 @@ mod tests {
         engine.invalidate_deterministic_settings_cache();
 
         let (_settings, sequence_start, _) = engine
-            .prepare_runtime_functions_with_backend(engine.backend_ref(), false)
+            .prepare_runtime_functions_with_backend(engine.backend.as_ref(), false)
             .await
             .expect("runtime preparation after invalidation should succeed");
         assert_eq!(sequence_start, 0);

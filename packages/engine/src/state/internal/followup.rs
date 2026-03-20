@@ -25,9 +25,7 @@ use crate::{
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
 use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
-use crate::sql::execution::execute_prepared::{
-    execute_prepared_with_backend, execute_prepared_with_transaction,
-};
+use crate::sql::execution::execute_prepared::execute_prepared_with_transaction;
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{
@@ -35,11 +33,7 @@ use crate::state::commit::{
     load_version_info_for_versions, CommitQueryExecutor,
 };
 use crate::state::internal::write_program::WriteProgram;
-use crate::state::internal::{
-    InternalStatePlan, PostprocessPlan, VtableDeletePlan, VtableUpdatePlan,
-};
-use crate::LixBackend;
-
+use crate::state::internal::{PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "entity_id",
     "file_id",
@@ -58,52 +52,15 @@ pub(crate) struct PostprocessExecutionOutcome {
     pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
 }
 
-pub(crate) async fn execute_internal_state_plan_with_backend(
-    backend: &dyn LixBackend,
-    prepared_statements: &[PreparedStatement],
-    internal_state: Option<&InternalStatePlan>,
-    should_refresh_file_cache: bool,
-    functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
-    writer_key: Option<&str>,
-) -> Result<PostprocessExecutionOutcome, LixError> {
-    let Some(postprocess_plan) = internal_state.and_then(|plan| plan.postprocess.as_ref()) else {
-        return Ok(PostprocessExecutionOutcome {
-            internal_result: execute_prepared_with_backend(backend, prepared_statements).await?,
-            postprocess_file_cache_targets: BTreeSet::new(),
-            state_commit_stream_changes: Vec::new(),
-        });
-    };
-
-    let mut transaction = backend.begin_transaction().await?;
-    let outcome = match execute_postprocess_with_transaction(
-        transaction.as_mut(),
-        prepared_statements,
-        postprocess_plan,
-        should_refresh_file_cache,
-        functions,
-        writer_key,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            return Err(error);
-        }
-    };
-    transaction.commit().await?;
-    Ok(outcome)
-}
-
-pub(crate) async fn execute_internal_state_plan_with_transaction(
+pub(crate) async fn execute_internal_postprocess_with_transaction(
     transaction: &mut dyn LixTransaction,
     prepared_statements: &[PreparedStatement],
-    internal_state: Option<&InternalStatePlan>,
+    postprocess_plan: Option<&PostprocessPlan>,
     should_refresh_file_cache: bool,
     functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
     writer_key: Option<&str>,
 ) -> Result<PostprocessExecutionOutcome, LixError> {
-    let Some(postprocess_plan) = internal_state.and_then(|plan| plan.postprocess.as_ref()) else {
+    let Some(postprocess_plan) = postprocess_plan else {
         return Ok(PostprocessExecutionOutcome {
             internal_result: execute_prepared_with_transaction(transaction, prepared_statements)
                 .await?,

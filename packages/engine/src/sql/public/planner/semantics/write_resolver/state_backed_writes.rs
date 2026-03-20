@@ -1,12 +1,10 @@
-use super::selector_queries::{
-    assign_state_row_key_value, exact_filter_text, query_entity_selector_rows,
-    query_state_selector_rows,
-};
 use super::*;
 use crate::schema::builtin::builtin_schema_definition;
 use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
+use crate::sql::execution::shared_path::PendingTransactionView;
 use crate::sql::public::planner::ir::CanonicalStateAssignments;
 use crate::sql::public::planner::ir::CanonicalStateRowKey;
+use crate::sql::public::planner::semantics::effective_state_resolver::resolve_exact_effective_state_row_with_pending_transaction_view;
 use crate::sql::public::planner::semantics::state_assignments::{
     apply_entity_state_assignments, apply_state_assignments, assignments_from_payload,
     build_entity_insert_rows as build_entity_insert_rows_from_assignments, build_state_insert_row,
@@ -20,6 +18,197 @@ fn authoritative_version_id_for_effective_row(current_row: &ExactEffectiveStateR
         OverlayLane::GlobalTracked | OverlayLane::GlobalUntracked => GLOBAL_VERSION_ID.to_string(),
         OverlayLane::LocalTracked | OverlayLane::LocalUntracked => current_row.version_id.clone(),
     }
+}
+
+async fn query_entity_selector_rows(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
+) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError> {
+    let selector = canonical_state_selector(planned_write);
+    let mut selector_columns = vec!["lixcol_entity_id"];
+    if let Some(version_column) = selector.version_column.as_deref() {
+        selector_columns.push(version_column);
+    }
+    let query_result = execute_public_selector_query_strict(
+        backend,
+        planned_write,
+        pending_transaction_view,
+        build_public_selector_query(
+            &planned_write.command.target.descriptor.public_name,
+            &selector,
+            &selector_columns,
+        ),
+    )
+    .await
+    .map_err(write_resolve_backend_error)?;
+
+    let mut selector_rows = Vec::new();
+    for row in query_result.rows {
+        let selector_row = CanonicalStateRowKey {
+            entity_id: required_text_value_index(&row, 0, "lixcol_entity_id")?,
+            file_id: None,
+            plugin_key: None,
+            schema_version: None,
+            version_id: selector
+                .version_column
+                .as_deref()
+                .map(|version_column| required_text_value_index(&row, 1, version_column))
+                .transpose()?,
+            global: None,
+            untracked: None,
+            writer_key: None,
+        };
+        if !selector_rows
+            .iter()
+            .any(|existing| existing == &selector_row)
+        {
+            selector_rows.push(selector_row);
+        }
+    }
+    Ok(selector_rows)
+}
+
+async fn query_state_selector_rows(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
+) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError> {
+    let selector = canonical_state_selector(planned_write);
+    let mut selector_columns = vec!["entity_id", "file_id", "plugin_key", "schema_version"];
+    if let Some(version_column) = selector.version_column.as_deref() {
+        selector_columns.push(version_column);
+    }
+    selector_columns.push("global");
+    selector_columns.push("untracked");
+    let query_result = execute_public_selector_query_strict(
+        backend,
+        planned_write,
+        pending_transaction_view,
+        build_public_selector_query(
+            &planned_write.command.target.descriptor.public_name,
+            &selector,
+            &selector_columns,
+        ),
+    )
+    .await
+    .map_err(write_resolve_backend_error)?;
+
+    let mut selector_rows = Vec::new();
+    for row in query_result.rows {
+        let version_offset = usize::from(selector.version_column.is_some());
+        let selector_row = CanonicalStateRowKey {
+            entity_id: required_text_value_index(&row, 0, "entity_id")?,
+            file_id: Some(required_text_value_index(&row, 1, "file_id")?),
+            plugin_key: Some(required_text_value_index(&row, 2, "plugin_key")?),
+            schema_version: Some(required_text_value_index(&row, 3, "schema_version")?),
+            version_id: selector
+                .version_column
+                .as_deref()
+                .map(|version_column| required_text_value_index(&row, 4, version_column))
+                .transpose()?,
+            global: Some(required_bool_value_index(
+                &row,
+                4 + version_offset,
+                "global",
+            )?),
+            untracked: Some(required_bool_value_index(
+                &row,
+                5 + version_offset,
+                "untracked",
+            )?),
+            writer_key: None,
+        };
+        if !selector_rows
+            .iter()
+            .any(|existing| existing == &selector_row)
+        {
+            selector_rows.push(selector_row);
+        }
+    }
+    Ok(selector_rows)
+}
+
+fn assign_state_row_key_value(
+    row_key: &mut CanonicalStateRowKey,
+    column: &str,
+    value: &Value,
+) -> Result<(), WriteResolveError> {
+    match column {
+        "entity_id" => {
+            row_key.entity_id = exact_text_value(
+                value,
+                "public state row key requires text-compatible 'entity_id'",
+            )?;
+        }
+        "file_id" => {
+            row_key.file_id = Some(exact_text_value(
+                value,
+                "public state row key requires text-compatible 'file_id'",
+            )?);
+        }
+        "plugin_key" => {
+            row_key.plugin_key = Some(exact_text_value(
+                value,
+                "public state row key requires text-compatible 'plugin_key'",
+            )?);
+        }
+        "schema_version" => {
+            row_key.schema_version = Some(exact_text_value(
+                value,
+                "public state row key requires text-compatible 'schema_version'",
+            )?);
+        }
+        "version_id" => {
+            row_key.version_id = Some(exact_text_value(
+                value,
+                "public state row key requires text-compatible 'version_id'",
+            )?);
+        }
+        "writer_key" => {
+            row_key.writer_key = Some(exact_text_value(
+                value,
+                "public state row key requires text-compatible 'writer_key'",
+            )?);
+        }
+        "global" => {
+            row_key.global = Some(exact_bool_value(
+                value,
+                "public state row key requires boolean-compatible 'global'",
+            )?);
+        }
+        "untracked" => {
+            row_key.untracked = Some(exact_bool_value(
+                value,
+                "public state row key requires boolean-compatible 'untracked'",
+            )?);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn exact_filter_text(
+    filters: &std::collections::BTreeMap<String, Value>,
+    key: &str,
+    error_message: &str,
+) -> Result<Option<String>, WriteResolveError> {
+    filters
+        .get(key)
+        .map(|value| exact_text_value(value, error_message))
+        .transpose()
+}
+
+fn exact_text_value(value: &Value, error_message: &str) -> Result<String, WriteResolveError> {
+    text_from_value(value).ok_or_else(|| WriteResolveError {
+        message: error_message.to_string(),
+    })
+}
+
+fn exact_bool_value(value: &Value, error_message: &str) -> Result<bool, WriteResolveError> {
+    bool_from_value(value).ok_or_else(|| WriteResolveError {
+        message: error_message.to_string(),
+    })
 }
 
 fn authoritative_pre_state_row_for_effective_row(
@@ -43,13 +232,21 @@ fn authoritative_pre_state_row_for_effective_row(
 pub(super) async fn resolve_state_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    resolve_state_backed_write(backend, planned_write, StateBackedSurface::State).await
+    resolve_state_backed_write(
+        backend,
+        planned_write,
+        pending_transaction_view,
+        StateBackedSurface::State,
+    )
+    .await
 }
 
 pub(super) async fn resolve_entity_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let mut provider = SqlRegisteredSchemaProvider::new(backend);
     let entity_schema = load_entity_schema(&mut provider, planned_write)
@@ -59,6 +256,7 @@ pub(super) async fn resolve_entity_write(
     resolve_state_backed_write(
         backend,
         planned_write,
+        pending_transaction_view,
         StateBackedSurface::Entity(&entity_schema),
     )
     .await
@@ -151,6 +349,7 @@ impl StateBackedSurface<'_> {
     async fn resolve_insert_conflict_row(
         self,
         backend: &dyn LixBackend,
+        pending_transaction_view: Option<&PendingTransactionView>,
         _planned_write: &PlannedWrite,
         row: &PlannedStateRow,
     ) -> Result<Option<ExactEffectiveStateRow>, WriteResolveError> {
@@ -160,7 +359,7 @@ impl StateBackedSurface<'_> {
                     message: "public state insert resolver requires a concrete version_id"
                         .to_string(),
                 })?;
-                resolve_exact_effective_state_row(
+                resolve_exact_effective_state_row_with_pending_transaction_view(
                     backend,
                     &ExactEffectiveStateRowRequest {
                         schema_key: row.schema_key.clone(),
@@ -169,6 +368,7 @@ impl StateBackedSurface<'_> {
                         include_global_overlay: true,
                         include_untracked_overlay: true,
                     },
+                    pending_transaction_view,
                 )
                 .await
                 .map_err(write_resolve_backend_error)
@@ -178,7 +378,7 @@ impl StateBackedSurface<'_> {
                     message: "public entity insert resolver requires a concrete version_id"
                         .to_string(),
                 })?;
-                resolve_exact_effective_state_row(
+                resolve_exact_effective_state_row_with_pending_transaction_view(
                     backend,
                     &ExactEffectiveStateRowRequest {
                         schema_key: entity_schema.schema_key.clone(),
@@ -187,6 +387,7 @@ impl StateBackedSurface<'_> {
                         include_global_overlay: true,
                         include_untracked_overlay: true,
                     },
+                    pending_transaction_view,
                 )
                 .await
                 .map_err(write_resolve_backend_error)
@@ -198,11 +399,20 @@ impl StateBackedSurface<'_> {
         self,
         backend: &dyn LixBackend,
         planned_write: &PlannedWrite,
+        pending_transaction_view: Option<&PendingTransactionView>,
     ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
         match self {
-            Self::State => resolve_target_state_rows(backend, planned_write).await,
+            Self::State => {
+                resolve_target_state_rows(backend, planned_write, pending_transaction_view).await
+            }
             Self::Entity(entity_schema) => {
-                resolve_target_entity_rows(backend, planned_write, entity_schema).await
+                resolve_target_entity_rows(
+                    backend,
+                    planned_write,
+                    entity_schema,
+                    pending_transaction_view,
+                )
+                .await
             }
         }
     }
@@ -211,14 +421,27 @@ impl StateBackedSurface<'_> {
 async fn resolve_state_backed_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
     surface: StateBackedSurface<'_>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     match planned_write.command.operation_kind {
         WriteOperationKind::Insert => {
-            resolve_state_backed_insert_write(backend, planned_write, surface).await
+            resolve_state_backed_insert_write(
+                backend,
+                planned_write,
+                pending_transaction_view,
+                surface,
+            )
+            .await
         }
         WriteOperationKind::Update | WriteOperationKind::Delete => {
-            resolve_state_backed_existing_write(backend, planned_write, surface).await
+            resolve_state_backed_existing_write(
+                backend,
+                planned_write,
+                pending_transaction_view,
+                surface,
+            )
+            .await
         }
     }
 }
@@ -226,6 +449,7 @@ async fn resolve_state_backed_write(
 async fn resolve_state_backed_insert_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
     surface: StateBackedSurface<'_>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let rows = surface.build_insert_rows(planned_write)?;
@@ -236,7 +460,7 @@ async fn resolve_state_backed_insert_write(
     for row in rows {
         if let Some(conflict) = planned_write.command.on_conflict.as_ref() {
             if let Some(current_row) = surface
-                .resolve_insert_conflict_row(backend, planned_write, &row)
+                .resolve_insert_conflict_row(backend, pending_transaction_view, planned_write, &row)
                 .await?
             {
                 if conflict.action == InsertOnConflictAction::DoNothing {
@@ -295,6 +519,7 @@ async fn resolve_state_backed_insert_write(
 async fn resolve_state_backed_existing_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
     surface: StateBackedSurface<'_>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let current_rows = match surface {
@@ -302,9 +527,14 @@ async fn resolve_state_backed_existing_write(
             if planned_write.command.selector.exact_only
                 && state_selector_targets_single_effective_row(planned_write) =>
         {
-            resolve_exact_state_target_rows(backend, planned_write).await?
+            resolve_exact_state_target_rows(backend, planned_write, pending_transaction_view)
+                .await?
         }
-        _ => surface.resolve_target_rows(backend, planned_write).await?,
+        _ => {
+            surface
+                .resolve_target_rows(backend, planned_write, pending_transaction_view)
+                .await?
+        }
     };
     resolve_state_backed_existing_write_from_rows(surface, planned_write, current_rows)
 }
@@ -505,12 +735,13 @@ fn exact_selector_row_key(
 async fn resolve_exact_state_target_rows(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
     let schema_key = resolved_schema_key(planned_write)?;
     let version_id = resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
         message: "public existing-row write resolver requires a concrete version_id".to_string(),
     })?;
-    let current_row = resolve_exact_effective_state_row(
+    let current_row = resolve_exact_effective_state_row_with_pending_transaction_view(
         backend,
         &ExactEffectiveStateRowRequest {
             schema_key,
@@ -519,6 +750,7 @@ async fn resolve_exact_state_target_rows(
             include_global_overlay: true,
             include_untracked_overlay: true,
         },
+        pending_transaction_view,
     )
     .await
     .map_err(write_resolve_backend_error)?;
@@ -542,14 +774,16 @@ async fn resolve_target_entity_rows(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
     entity_schema: &EntityWriteSchema,
+    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
-    let selector_rows = query_entity_selector_rows(backend, planned_write).await?;
+    let selector_rows =
+        query_entity_selector_rows(backend, planned_write, pending_transaction_view).await?;
     let mut rows = Vec::new();
     for selector_row in selector_rows {
         let version_id =
             selector_row_version_id(planned_write, selector_row.version_id.as_deref())?;
         let row_key = entity_state_row_key(planned_write, entity_schema, &selector_row.entity_id)?;
-        let Some(current_row) = resolve_exact_effective_state_row(
+        let Some(current_row) = resolve_exact_effective_state_row_with_pending_transaction_view(
             backend,
             &ExactEffectiveStateRowRequest {
                 schema_key: entity_schema.schema_key.clone(),
@@ -558,6 +792,7 @@ async fn resolve_target_entity_rows(
                 include_global_overlay: true,
                 include_untracked_overlay: true,
             },
+            pending_transaction_view,
         )
         .await
         .map_err(write_resolve_backend_error)?
@@ -572,14 +807,16 @@ async fn resolve_target_entity_rows(
 async fn resolve_target_state_rows(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
     let schema_key = resolved_schema_key(planned_write)?;
-    let selector_rows = query_state_selector_rows(backend, planned_write).await?;
+    let selector_rows =
+        query_state_selector_rows(backend, planned_write, pending_transaction_view).await?;
     let mut rows = Vec::new();
     for selector_row in selector_rows {
         let version_id =
             selector_row_version_id(planned_write, selector_row.version_id.as_deref())?;
-        let Some(current_row) = resolve_exact_effective_state_row(
+        let Some(current_row) = resolve_exact_effective_state_row_with_pending_transaction_view(
             backend,
             &ExactEffectiveStateRowRequest {
                 schema_key: schema_key.clone(),
@@ -588,6 +825,7 @@ async fn resolve_target_state_rows(
                 include_global_overlay: true,
                 include_untracked_overlay: true,
             },
+            pending_transaction_view,
         )
         .await
         .map_err(write_resolve_backend_error)?

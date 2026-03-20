@@ -39,37 +39,6 @@ pub(crate) fn extract_explicit_transaction_script_from_statements(
     Ok(Some(middle.to_vec()))
 }
 
-pub(crate) fn coalesce_vtable_inserts_in_statement_list(
-    statements: Vec<Statement>,
-) -> Result<Vec<Statement>, LixError> {
-    let mut result = Vec::with_capacity(statements.len());
-    let mut pending_insert: Option<Insert> = None;
-
-    for statement in statements {
-        match statement {
-            Statement::Insert(insert) => {
-                if let Some(existing) = pending_insert.as_mut() {
-                    if can_merge_coalescable_insert(existing, &insert) {
-                        append_insert_rows(existing, &insert)?;
-                    } else {
-                        flush_pending_insert(&mut result, &mut pending_insert);
-                        pending_insert = Some(insert);
-                    }
-                } else {
-                    pending_insert = Some(insert);
-                }
-            }
-            other => {
-                flush_pending_insert(&mut result, &mut pending_insert);
-                result.push(other);
-            }
-        }
-    }
-
-    flush_pending_insert(&mut result, &mut pending_insert);
-    Ok(result)
-}
-
 pub(crate) fn coalesce_vtable_inserts_in_transactions(
     statements: Vec<Statement>,
 ) -> Result<Vec<Statement>, LixError> {

@@ -5,7 +5,6 @@ pub(crate) enum PlannerError {
     Parse(LixError),
     BindOnce(LixError),
     Preprocess(LixError),
-    Invariant(String),
 }
 
 impl PlannerError {
@@ -20,10 +19,6 @@ impl PlannerError {
     pub(crate) fn preprocess(error: LixError) -> Self {
         Self::Preprocess(error)
     }
-
-    pub(crate) fn invariant(message: impl Into<String>) -> Self {
-        Self::Invariant(message.into())
-    }
 }
 
 impl From<PlannerError> for LixError {
@@ -32,7 +27,6 @@ impl From<PlannerError> for LixError {
             PlannerError::Parse(error)
             | PlannerError::BindOnce(error)
             | PlannerError::Preprocess(error) => error,
-            PlannerError::Invariant(message) => LixError::unknown(message),
         }
     }
 }

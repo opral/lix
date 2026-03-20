@@ -18,6 +18,7 @@ use crate::sql::execution::runtime_effects::{
     binary_blob_writes_from_filesystem_state, delete_targets_from_filesystem_state,
     FilesystemTransactionState,
 };
+use crate::sql::execution::shared_path::PendingTransactionView;
 use crate::sql::public::backend::PushdownDecision;
 use crate::sql::public::catalog::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
@@ -452,8 +453,28 @@ pub(crate) struct PreparedPublicWrite {
     pub(crate) canonicalized: CanonicalizedWrite,
     pub(crate) planned_write: PlannedWrite,
     pub(crate) domain_change_batches: Vec<DomainChangeBatch>,
-    pub(crate) execution: Option<PublicWriteExecution>,
+    pub(crate) execution: PreparedPublicWriteExecution,
     pub(crate) debug_trace: PublicExecutionDebugTrace,
+}
+
+impl PreparedPublicWrite {
+    pub(crate) fn materialization(&self) -> Option<&PublicWriteMaterialization> {
+        match &self.execution {
+            PreparedPublicWriteExecution::Noop => None,
+            PreparedPublicWriteExecution::Materialize(materialization) => Some(materialization),
+        }
+    }
+
+    pub(crate) fn materialization_mut(&mut self) -> Option<&mut PublicWriteMaterialization> {
+        match &mut self.execution {
+            PreparedPublicWriteExecution::Noop => None,
+            PreparedPublicWriteExecution::Materialize(materialization) => Some(materialization),
+        }
+    }
+
+    pub(crate) fn is_noop(&self) -> bool {
+        matches!(self.execution, PreparedPublicWriteExecution::Noop)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -463,7 +484,13 @@ pub(crate) enum PublicSurfaceRegistryMutation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PublicWriteExecution {
+pub(crate) enum PreparedPublicWriteExecution {
+    Noop,
+    Materialize(PublicWriteMaterialization),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PublicWriteMaterialization {
     pub(crate) partitions: Vec<PublicWriteExecutionPartition>,
 }
 
@@ -541,6 +568,29 @@ pub(crate) async fn prepare_public_execution_with_registry_and_internal_access(
     writer_key: Option<&str>,
     allow_internal_tables: bool,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
+    prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view(
+        backend,
+        registry,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+        allow_internal_tables,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view(
+    backend: &dyn LixBackend,
+    registry: &SurfaceRegistry,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+    allow_internal_tables: bool,
+    pending_transaction_view: Option<&PendingTransactionView>,
+) -> Result<Option<PreparedPublicExecution>, LixError> {
     let Some(route) = classify_public_execution_route_with_registry(registry, parsed_statements)
     else {
         return Ok(None);
@@ -557,6 +607,7 @@ pub(crate) async fn prepare_public_execution_with_registry_and_internal_access(
                 params,
                 active_version_id,
                 writer_key,
+                pending_transaction_view,
             )
             .await?;
             prepared
@@ -609,6 +660,21 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
     writer_key: Option<&str>,
     allow_internal_tables: bool,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
+    let builtin_registry = SurfaceRegistry::with_builtin_surfaces();
+    if classify_public_execution_route_with_registry(&builtin_registry, parsed_statements).is_some()
+    {
+        return prepare_public_execution_with_registry_and_internal_access(
+            backend,
+            &builtin_registry,
+            parsed_statements,
+            params,
+            active_version_id,
+            writer_key,
+            allow_internal_tables,
+        )
+        .await;
+    }
+
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
@@ -628,6 +694,13 @@ pub(crate) async fn classify_public_execution_route_with_backend(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
 ) -> Result<Option<PublicExecutionRoute>, LixError> {
+    let builtin_registry = SurfaceRegistry::with_builtin_surfaces();
+    if let Some(route) =
+        classify_public_execution_route_with_registry(&builtin_registry, parsed_statements)
+    {
+        return Ok(Some(route));
+    }
+
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
@@ -647,6 +720,10 @@ pub(crate) async fn statement_references_public_surface_with_backend(
     backend: &dyn LixBackend,
     statement: &Statement,
 ) -> bool {
+    if statement_references_public_surface_with_builtin_registry(statement) {
+        return true;
+    }
+
     let registry = match SurfaceRegistry::bootstrap_with_backend(backend).await {
         Ok(registry) => registry,
         Err(_) => return statement_references_public_surface_with_builtin_registry(statement),
@@ -714,6 +791,27 @@ pub(crate) async fn lower_public_read_query_with_backend(
     read::lower_public_read_query_with_backend(backend, query, params).await
 }
 
+pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
+    backend: &dyn LixBackend,
+    registry: &SurfaceRegistry,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+    allow_internal_tables: bool,
+) -> Result<Option<PreparedPublicRead>, LixError> {
+    read::try_prepare_public_read_with_registry_and_internal_access(
+        backend,
+        registry,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+        allow_internal_tables,
+    )
+    .await
+}
+
 async fn try_prepare_public_read(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
@@ -722,6 +820,22 @@ async fn try_prepare_public_read(
     writer_key: Option<&str>,
     allow_internal_tables: bool,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
+    let builtin_registry = SurfaceRegistry::with_builtin_surfaces();
+    if parsed_statements.len() == 1
+        && statement_references_public_surface(&builtin_registry, &parsed_statements[0])
+    {
+        return read::try_prepare_public_read_with_registry_and_internal_access(
+            backend,
+            &builtin_registry,
+            parsed_statements,
+            params,
+            active_version_id,
+            writer_key,
+            allow_internal_tables,
+        )
+        .await;
+    }
+
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
@@ -1759,6 +1873,7 @@ pub(crate) async fn try_prepare_public_write(
         params,
         active_version_id,
         writer_key,
+        None,
     )
     .await
 }
@@ -1770,6 +1885,7 @@ pub(crate) async fn try_prepare_public_write_with_registry(
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
+    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<Option<PreparedPublicWrite>, LixError> {
     if parsed_statements.len() != 1 {
         return Ok(None);
@@ -1822,13 +1938,14 @@ pub(crate) async fn try_prepare_public_write_with_registry(
             return Ok(None);
         }
     };
-    let resolved_write_plan = match resolve_write_plan(backend, &planned_write).await {
-        Ok(resolved_write_plan) => resolved_write_plan,
-        Err(error) => match public_authoritative_write_error(&canonicalized, error.message) {
-            Some(error) => return Err(error),
-            None => return Ok(None),
-        },
-    };
+    let resolved_write_plan =
+        match resolve_write_plan(backend, &planned_write, pending_transaction_view).await {
+            Ok(resolved_write_plan) => resolved_write_plan,
+            Err(error) => match public_authoritative_write_error(&canonicalized, error.message) {
+                Some(error) => return Err(error),
+                None => return Ok(None),
+            },
+        };
     planned_write.resolved_write_plan = Some(resolved_write_plan.clone());
     let domain_change_batches = match build_domain_change_batch(&planned_write) {
         Ok(domain_change_batches) => domain_change_batches,
@@ -1854,7 +1971,13 @@ pub(crate) async fn try_prepare_public_write_with_registry(
         &planned_write,
         &domain_change_batches,
         &commit_preconditions,
-    )?;
+    )?
+    .ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "public write target must route through explicit public materialization",
+        )
+    })?;
 
     Ok(Some(PreparedPublicWrite {
         debug_trace: PublicExecutionDebugTrace {
@@ -1906,7 +2029,7 @@ fn build_public_write_execution(
     planned_write: &PlannedWrite,
     domain_change_batches: &[DomainChangeBatch],
     commit_preconditions: &[CommitPreconditions],
-) -> Result<Option<PublicWriteExecution>, LixError> {
+) -> Result<Option<PreparedPublicWriteExecution>, LixError> {
     let Some(resolved) = planned_write.resolved_write_plan.as_ref() else {
         return Ok(None);
     };
@@ -1969,11 +2092,15 @@ fn build_public_write_execution(
         return Ok(None);
     }
 
-    Ok(Some(PublicWriteExecution { partitions }))
+    Ok(Some(if partitions.is_empty() {
+        PreparedPublicWriteExecution::Noop
+    } else {
+        PreparedPublicWriteExecution::Materialize(PublicWriteMaterialization { partitions })
+    }))
 }
 
 pub(crate) fn finalize_public_write_execution(
-    execution: &mut PublicWriteExecution,
+    execution: &mut PublicWriteMaterialization,
     planned_write: &PlannedWrite,
     filesystem_state: &FilesystemTransactionState,
 ) -> Result<(), LixError> {
@@ -3099,6 +3226,19 @@ mod tests {
         ]
     }
 
+    fn run_with_large_stack<T, F>(run: F) -> T
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run)
+            .expect("test thread should spawn")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
     #[tokio::test]
     async fn prepares_builtin_schema_derived_entity_reads() {
         let backend = FakeBackend::default();
@@ -3853,74 +3993,113 @@ mod tests {
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
     }
 
-    #[tokio::test]
-    async fn classifies_public_reads_through_public_execution() {
-        let backend = FakeBackend::default();
-        let prepared = prepare_public_execution(
-            &backend,
-            &parse_one("SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'"),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("public read classification should succeed");
+    #[test]
+    fn classifies_public_reads_through_public_execution() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let backend = FakeBackend::default();
+                    let prepared = prepare_public_execution(
+                        &backend,
+                        &parse_one(
+                            "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'",
+                        ),
+                        &[],
+                        "main",
+                        None,
+                    )
+                    .await
+                    .expect("public read classification should succeed");
 
-        assert!(matches!(prepared, Some(PreparedPublicExecution::Read(_))));
+                    assert!(matches!(prepared, Some(PreparedPublicExecution::Read(_))));
+                })
+        });
     }
 
-    #[tokio::test]
-    async fn classifies_public_writes_through_public_execution() {
-        let mut backend = FakeBackend::default();
-        backend.version_ref_rows.insert(
-            "main".to_string(),
-            crate::version::version_ref_snapshot_content("main", "commit-active-root"),
-        );
-        let prepared = prepare_public_execution(
-            &backend,
-            &parse_one("INSERT INTO lix_key_value (key, value) VALUES ('phase1-boundary', 'ok')"),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("public write classification should succeed");
+    #[test]
+    fn classifies_public_writes_through_public_execution() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let mut backend = FakeBackend::default();
+                    backend.version_ref_rows.insert(
+                        "main".to_string(),
+                        crate::version::version_ref_snapshot_content("main", "commit-active-root"),
+                    );
+                    let prepared = prepare_public_execution(
+                        &backend,
+                        &parse_one(
+                            "INSERT INTO lix_key_value (key, value) VALUES ('phase1-boundary', 'ok')",
+                        ),
+                        &[],
+                        "main",
+                        None,
+                    )
+                    .await
+                    .expect("public write classification should succeed");
 
-        assert!(matches!(prepared, Some(PreparedPublicExecution::Write(_))));
+                    assert!(matches!(prepared, Some(PreparedPublicExecution::Write(_))));
+                })
+        });
     }
 
-    #[tokio::test]
-    async fn read_only_public_writes_are_owned_by_public_lowering_and_rejected_semantically() {
-        let backend = FakeBackend::default();
-        let error = prepare_public_execution(
-            &backend,
-            &parse_one(
-                "INSERT INTO lix_change (id, entity_id, schema_key, schema_version, file_id, plugin_key, created_at) \
-                 VALUES ('c1', 'e1', 's1', '1', 'lix', 'lix', '2026-01-01T00:00:00Z')",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect_err("read-only public write should be rejected by public lowering");
+    #[test]
+    fn read_only_public_writes_are_owned_by_public_lowering_and_rejected_semantically() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let backend = FakeBackend::default();
+                    let error = prepare_public_execution(
+                        &backend,
+                        &parse_one(
+                            "INSERT INTO lix_change (id, entity_id, schema_key, schema_version, file_id, plugin_key, created_at) \
+                             VALUES ('c1', 'e1', 's1', '1', 'lix', 'lix', '2026-01-01T00:00:00Z')",
+                        ),
+                        &[],
+                        "main",
+                        None,
+                    )
+                    .await
+                    .expect_err("read-only public write should be rejected by public lowering");
 
-        assert_eq!(error.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");
+                    assert_eq!(error.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");
+                })
+        });
     }
 
-    #[tokio::test]
-    async fn commit_and_change_set_public_writes_are_rejected_semantically() {
-        let backend = FakeBackend::default();
+    #[test]
+    fn commit_and_change_set_public_writes_are_rejected_semantically() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let backend = FakeBackend::default();
 
-        for sql in [
-            "INSERT INTO lix_commit (id, change_set_id) VALUES ('c1', 'cs1')",
-            "INSERT INTO lix_change_set (id) VALUES ('cs1')",
-        ] {
-            let error = prepare_public_execution(&backend, &parse_one(sql), &[], "main", None)
-                .await
-                .expect_err("read-only public write should be rejected by public lowering");
-            assert_eq!(error.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");
-        }
+                    for sql in [
+                        "INSERT INTO lix_commit (id, change_set_id) VALUES ('c1', 'cs1')",
+                        "INSERT INTO lix_change_set (id) VALUES ('cs1')",
+                    ] {
+                        let error =
+                            prepare_public_execution(&backend, &parse_one(sql), &[], "main", None)
+                                .await
+                                .expect_err(
+                                    "read-only public write should be rejected by public lowering",
+                                );
+                        assert_eq!(error.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");
+                    }
+                })
+        });
     }
 
     #[tokio::test]
@@ -4018,22 +4197,30 @@ mod tests {
         assert!(lowered_sql.contains("HAVING"));
     }
 
-    #[tokio::test]
-    async fn cte_shadowing_public_surface_names_stays_non_public() {
-        let backend = FakeBackend::default();
-        let prepared = prepare_public_execution(
-            &backend,
-            &parse_one(
-                "WITH lix_state AS (SELECT 'shadow' AS entity_id) SELECT entity_id FROM lix_state",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("cte shadowing should classify cleanly");
+    #[test]
+    fn cte_shadowing_public_surface_names_stays_non_public() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let backend = FakeBackend::default();
+                    let prepared = prepare_public_execution(
+                        &backend,
+                        &parse_one(
+                            "WITH lix_state AS (SELECT 'shadow' AS entity_id) SELECT entity_id FROM lix_state",
+                        ),
+                        &[],
+                        "main",
+                        None,
+                    )
+                    .await
+                    .expect("cte shadowing should classify cleanly");
 
-        assert!(prepared.is_none());
+                    assert!(prepared.is_none());
+                })
+        });
     }
 
     #[tokio::test]

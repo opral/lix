@@ -1,7 +1,7 @@
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::functions::SharedFunctionProvider;
+use crate::sql::execution::execution_program::CompiledExecution;
 use crate::sql::execution::runtime_effects::FilesystemTransactionState;
-use crate::sql::execution::shared_path::PreparedExecutionContext;
 
 use super::{PreparedPublicWrite, TrackedWriteExecution};
 
@@ -37,7 +37,7 @@ impl TrackedTxnUnit {
 pub(crate) fn build_tracked_txn_unit(
     public_write: &PreparedPublicWrite,
     execution: &TrackedWriteExecution,
-    prepared: &PreparedExecutionContext,
+    prepared: &CompiledExecution,
     writer_key: Option<&str>,
 ) -> TrackedTxnUnit {
     TrackedTxnUnit {

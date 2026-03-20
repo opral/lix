@@ -580,6 +580,123 @@ simulation_test!(
 );
 
 simulation_test!(
+    transaction_path_public_noop_filesystem_delete_stays_in_public_pipeline,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let commit_count_before = public_commit_count(&engine).await;
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute("DELETE FROM lix_file WHERE id = 'tx-public-noop-missing'", &[])
+                        .await?;
+                    tx.execute(
+                        "INSERT INTO lix_file (id, path, data) \
+                         VALUES ('tx-public-noop-file', '/tx-public-noop-file.md', lix_text_encode('after'))",
+                        &[],
+                    )
+                    .await?;
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .expect("public noop followed by insert should stay in the public pipeline");
+
+        let rows = engine
+            .execute(
+                "SELECT id, path, data FROM lix_file WHERE id = 'tx-public-noop-file'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_eq!(
+            rows.statements[0].rows[0][0],
+            Value::Text("tx-public-noop-file".to_string())
+        );
+        assert_eq!(
+            rows.statements[0].rows[0][1],
+            Value::Text("/tx-public-noop-file.md".to_string())
+        );
+        assert_blob_text(&rows.statements[0].rows[0][2], "after");
+        assert_eq!(public_commit_count(&engine).await, commit_count_before + 1);
+    }
+);
+
+simulation_test!(
+    transaction_path_public_entity_like_update_sees_pending_rows,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let commit_count_before = public_commit_count(&engine).await;
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO lix_key_value (key, value) VALUES ('tx-pending-like-a', 'before-a')",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute(
+                        "INSERT INTO lix_key_value (key, value) VALUES ('tx-pending-like-b', 'before-b')",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE lix_key_value SET value = $2 WHERE key LIKE $1",
+                        &[
+                            Value::Text("tx-pending-like-%".to_string()),
+                            Value::Text("after".to_string()),
+                        ],
+                    )
+                    .await?;
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .expect("pending entity rows should be selectable for public LIKE updates");
+
+        let rows = engine
+            .execute(
+                "SELECT key, value FROM lix_key_value \
+                 WHERE key LIKE 'tx-pending-like-%' \
+                 ORDER BY key",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_eq!(
+            rows.statements[0].rows[0],
+            vec![
+                Value::Text("tx-pending-like-a".to_string()),
+                Value::Text("after".to_string()),
+            ]
+        );
+        assert_eq!(
+            rows.statements[0].rows[1],
+            vec![
+                Value::Text("tx-pending-like-b".to_string()),
+                Value::Text("after".to_string()),
+            ]
+        );
+        assert_eq!(public_commit_count(&engine).await, commit_count_before + 1);
+    }
+);
+
+simulation_test!(
     tx_execute_multistmt_has_statement_barriers_for_file_bytes,
     simulations = [sqlite, postgres],
     |sim| async move {

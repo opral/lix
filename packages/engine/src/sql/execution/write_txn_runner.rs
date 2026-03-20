@@ -10,7 +10,9 @@ use crate::schema::registry::{
     load_live_table_layout_in_transaction,
 };
 use crate::sql::execution::contracts::effects::PlanEffects;
-use crate::sql::execution::execute::{self, SqlExecutionOutcome};
+use crate::sql::execution::execution_program::{
+    execute_internal_execution_with_transaction, SqlExecutionOutcome,
+};
 use crate::sql::execution::runtime_effects::build_filesystem_payload_domain_changes_insert;
 use crate::sql::execution::shared_path::{
     apply_public_version_last_checkpoint_side_effects, build_pending_public_commit_session,
@@ -20,7 +22,7 @@ use crate::sql::execution::shared_path::{
     PendingPublicCommitSession, PublicCommitInvariantChecker,
 };
 use crate::sql::execution::write_txn_plan::{
-    InternalTxnUnit, PublicUntrackedTxnUnit, TxnDelta, TxnMaterializationUnit, WriteTxnRunMode,
+    InternalTxnUnit, PublicUntrackedTxnUnit, TxnDelta, TxnMaterializationUnit,
 };
 use crate::sql::public::planner::ir::WriteLane;
 use crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch;
@@ -35,38 +37,10 @@ use crate::state::live_state::{
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, LixTransaction, QueryResult, Value};
 
-pub(crate) async fn run_txn_delta_with_backend(
-    engine: &Engine,
-    delta: &TxnDelta,
-    pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
-) -> Result<SqlExecutionOutcome, LixError> {
-    let mut transaction = engine.begin_write_unit().await?;
-    let result = run_txn_delta_with_transaction(
-        engine,
-        transaction.as_mut(),
-        delta,
-        WriteTxnRunMode::Owned,
-        pending_commit_session,
-    )
-    .await;
-    match result {
-        Ok(result) => {
-            stamp_watermark_before_commit(transaction.as_mut()).await?;
-            transaction.commit().await?;
-            Ok(result)
-        }
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            Err(error)
-        }
-    }
-}
-
 pub(crate) async fn run_txn_delta_with_transaction(
     engine: &Engine,
     transaction: &mut dyn LixTransaction,
     delta: &TxnDelta,
-    mode: WriteTxnRunMode,
     mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
 ) -> Result<SqlExecutionOutcome, LixError> {
     let mut combined = None;
@@ -83,16 +57,11 @@ pub(crate) async fn run_txn_delta_with_transaction(
                 .await?
             }
             TxnMaterializationUnit::PublicUntracked(untracked) => {
-                run_public_untracked_write_txn_with_transaction(
-                    engine,
-                    transaction,
-                    untracked,
-                    mode,
-                )
-                .await?
+                run_public_untracked_write_txn_with_transaction(engine, transaction, untracked)
+                    .await?
             }
             TxnMaterializationUnit::Internal(internal) => {
-                run_internal_write_txn_with_transaction(engine, transaction, internal, mode).await?
+                run_internal_write_txn_with_transaction(engine, transaction, internal).await?
             }
         };
 
@@ -354,7 +323,6 @@ async fn run_public_untracked_write_txn_with_transaction(
     engine: &Engine,
     transaction: &mut dyn LixTransaction,
     plan: &PublicUntrackedTxnUnit,
-    mode: WriteTxnRunMode,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
     let mut runtime_functions = plan.functions.clone();
     let timestamp = runtime_functions.timestamp();
@@ -418,18 +386,6 @@ async fn run_public_untracked_write_txn_with_transaction(
             ),
         })?;
 
-    if matches!(mode, WriteTxnRunMode::Owned)
-        && !plan
-            .execution
-            .semantic_effects
-            .state_commit_stream_changes
-            .is_empty()
-    {
-        engine
-            .append_observe_tick_in_transaction(transaction, plan.writer_key.as_deref())
-            .await?;
-    }
-
     Ok(Some(SqlExecutionOutcome {
         public_result: QueryResult {
             rows: Vec::new(),
@@ -439,12 +395,7 @@ async fn run_public_untracked_write_txn_with_transaction(
         plugin_changes_committed: false,
         plan_effects_override: Some(plan.execution.semantic_effects.clone()),
         state_commit_stream_changes: Vec::new(),
-        observe_tick_emitted: matches!(mode, WriteTxnRunMode::Owned)
-            && !plan
-                .execution
-                .semantic_effects
-                .state_commit_stream_changes
-                .is_empty(),
+        observe_tick_emitted: false,
     }))
 }
 
@@ -452,12 +403,11 @@ async fn run_internal_write_txn_with_transaction(
     engine: &Engine,
     transaction: &mut dyn LixTransaction,
     plan: &InternalTxnUnit,
-    mode: WriteTxnRunMode,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    let mut execution = execute::execute_plan_sql_with_transaction(
+    let mut execution = execute_internal_execution_with_transaction(
         transaction,
-        &plan.plan,
-        plan.plan.requirements.should_refresh_file_cache,
+        &plan.execution,
+        plan.result_contract,
         &plan.functions,
         plan.writer_key.as_deref(),
     )
@@ -469,7 +419,7 @@ async fn run_internal_write_txn_with_transaction(
             transaction,
             &plan.filesystem_state,
             plan.writer_key.as_deref(),
-            &plan.plan.preprocess.mutations,
+            &plan.execution.mutations,
         )
         .await?;
     if !filesystem_finalization.binary_blob_writes.is_empty() {
@@ -510,17 +460,11 @@ async fn run_internal_write_txn_with_transaction(
     let active_effects = execution
         .plan_effects_override
         .as_ref()
-        .unwrap_or(&plan.plan.effects);
+        .unwrap_or(&plan.effects);
     let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
     state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());
-    if matches!(mode, WriteTxnRunMode::Owned) && !state_commit_stream_changes.is_empty() {
-        engine
-            .append_observe_tick_in_transaction(transaction, plan.writer_key.as_deref())
-            .await?;
-    }
-
     if execution.plan_effects_override.is_none() {
-        execution.plan_effects_override = Some(plan.plan.effects.clone());
+        execution.plan_effects_override = Some(plan.effects.clone());
     }
 
     Ok(Some(execution))

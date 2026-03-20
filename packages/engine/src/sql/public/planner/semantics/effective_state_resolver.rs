@@ -1,7 +1,12 @@
+use crate::schema::live_layout::{
+    load_live_row_access_with_backend, normalized_live_column_values,
+};
 use crate::schema::live_store::{
     load_exact_live_row_with_executor, tracked_live_row_exists_with_executor, LiveRowScope,
 };
 use crate::sql::common::dependency_spec::DependencySpec;
+use crate::sql::execution::shared_path::PendingTransactionView;
+use crate::sql::execution::write_txn_plan::{PendingSemanticRow, PendingSemanticStorage};
 use crate::sql::public::planner::ir::{
     CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
 };
@@ -275,6 +280,14 @@ pub(crate) async fn resolve_exact_effective_state_row(
     backend: &dyn LixBackend,
     request: &ExactEffectiveStateRowRequest,
 ) -> Result<Option<ExactEffectiveStateRow>, LixError> {
+    resolve_exact_effective_state_row_with_pending_transaction_view(backend, request, None).await
+}
+
+pub(crate) async fn resolve_exact_effective_state_row_with_pending_transaction_view(
+    backend: &dyn LixBackend,
+    request: &ExactEffectiveStateRowRequest,
+    pending_transaction_view: Option<&PendingTransactionView>,
+) -> Result<Option<ExactEffectiveStateRow>, LixError> {
     let requested_untracked = request.row_key.untracked;
     let mut requested_global = request.row_key.global;
     if request.version_id == GLOBAL_VERSION_ID {
@@ -305,6 +318,18 @@ pub(crate) async fn resolve_exact_effective_state_row(
         } else {
             request.version_id.clone()
         };
+
+        if let Some(row) = load_exact_pending_effective_row(
+            backend,
+            pending_transaction_view,
+            request,
+            &internal_version_id,
+            lane,
+        )
+        .await?
+        {
+            return Ok(row);
+        }
 
         let row = match lane {
             OverlayLane::LocalTracked | OverlayLane::GlobalTracked => {
@@ -564,6 +589,107 @@ fn row_key_text_value<'a>(row_key: &'a CanonicalStateRowKey, column: &str) -> Op
         "writer_key" => row_key.writer_key.as_deref(),
         _ => None,
     }
+}
+
+async fn load_exact_pending_effective_row(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    request: &ExactEffectiveStateRowRequest,
+    internal_version_id: &str,
+    overlay_lane: OverlayLane,
+) -> Result<Option<Option<ExactEffectiveStateRow>>, LixError> {
+    let storage = match overlay_lane {
+        OverlayLane::LocalTracked | OverlayLane::GlobalTracked => PendingSemanticStorage::Tracked,
+        OverlayLane::LocalUntracked | OverlayLane::GlobalUntracked => {
+            PendingSemanticStorage::Untracked
+        }
+    };
+    let Some(overlay) = pending_transaction_view.and_then(PendingTransactionView::semantic_overlay)
+    else {
+        return Ok(None);
+    };
+
+    let pending = overlay
+        .visible_rows(storage, &request.schema_key)
+        .find(|row| pending_row_matches_exact_request(row, request, internal_version_id));
+    let Some(pending) = pending else {
+        return Ok(None);
+    };
+
+    if pending.tombstone && matches!(storage, PendingSemanticStorage::Tracked) {
+        return Ok(Some(None));
+    }
+
+    Ok(Some(Some(
+        exact_effective_state_row_from_pending(backend, pending, &request.version_id, overlay_lane)
+            .await?,
+    )))
+}
+
+fn pending_row_matches_exact_request(
+    row: &PendingSemanticRow,
+    request: &ExactEffectiveStateRowRequest,
+    internal_version_id: &str,
+) -> bool {
+    row.entity_id == request.row_key.entity_id
+        && row.version_id == internal_version_id
+        && row.file_id == row_key_text_value(&request.row_key, "file_id").unwrap_or(&row.file_id)
+        && row.plugin_key
+            == row_key_text_value(&request.row_key, "plugin_key").unwrap_or(&row.plugin_key)
+        && row.schema_version
+            == row_key_text_value(&request.row_key, "schema_version").unwrap_or(&row.schema_version)
+}
+
+async fn exact_effective_state_row_from_pending(
+    backend: &dyn LixBackend,
+    row: &PendingSemanticRow,
+    requested_version_id: &str,
+    overlay_lane: OverlayLane,
+) -> Result<ExactEffectiveStateRow, LixError> {
+    let projected_version_id = if matches!(
+        overlay_lane,
+        OverlayLane::GlobalTracked | OverlayLane::GlobalUntracked
+    ) && row.version_id == GLOBAL_VERSION_ID
+    {
+        requested_version_id.to_string()
+    } else {
+        row.version_id.clone()
+    };
+    let access = load_live_row_access_with_backend(backend, &row.schema_key).await?;
+    let mut values =
+        normalized_live_column_values(access.layout(), row.snapshot_content.as_deref())?;
+    values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
+    values.insert(
+        "schema_key".to_string(),
+        Value::Text(row.schema_key.clone()),
+    );
+    values.insert(
+        "schema_version".to_string(),
+        Value::Text(row.schema_version.clone()),
+    );
+    values.insert("file_id".to_string(), Value::Text(row.file_id.clone()));
+    values.insert(
+        "version_id".to_string(),
+        Value::Text(projected_version_id.clone()),
+    );
+    values.insert(
+        "plugin_key".to_string(),
+        Value::Text(row.plugin_key.clone()),
+    );
+    values.insert(
+        "metadata".to_string(),
+        row.metadata.clone().map(Value::Text).unwrap_or(Value::Null),
+    );
+
+    Ok(ExactEffectiveStateRow {
+        entity_id: row.entity_id.clone(),
+        schema_key: row.schema_key.clone(),
+        file_id: row.file_id.clone(),
+        version_id: projected_version_id,
+        values,
+        source_change_id: Some("pending".to_string()),
+        overlay_lane,
+    })
 }
 
 #[cfg(test)]

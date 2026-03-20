@@ -8,6 +8,7 @@ use crate::sql::common::placeholders::{resolve_placeholder_index, PlaceholderSta
 use crate::sql::execution::runtime_effects::{
     FilesystemDescriptorState, FilesystemTransactionFileState, FilesystemTransactionState,
 };
+use crate::sql::execution::shared_path::PendingTransactionView;
 use crate::sql::public::planner::semantics::filesystem_assignments::{
     parse_directory_insert_assignments, parse_directory_update_assignments,
     parse_file_insert_assignments, parse_file_update_assignments, DirectoryUpdateAssignments,
@@ -18,9 +19,13 @@ use crate::sql::public::planner::semantics::filesystem_planning::{
 };
 use crate::sql::public::planner::semantics::filesystem_queries::{
     ensure_no_directory_at_file_path, ensure_no_file_at_directory_path, load_directory_row_by_id,
-    load_directory_rows_under_path, load_file_row_by_id, load_file_row_by_id_without_path,
-    load_file_rows_under_path, lookup_directory_id_by_path, lookup_directory_path_by_id,
-    lookup_file_id_by_path, DirectoryFilesystemRow, FileFilesystemRow,
+    load_directory_row_by_id_with_pending_transaction_view, load_directory_rows_under_path,
+    load_file_row_by_id_with_pending_transaction_view,
+    load_file_row_by_id_without_path_with_pending_transaction_view,
+    load_file_row_by_path_with_pending_transaction_view, load_file_rows_under_path,
+    lookup_directory_id_by_path, lookup_directory_id_by_path_with_pending_transaction_view,
+    lookup_directory_path_by_id, lookup_file_id_by_path_with_pending_transaction_view,
+    DirectoryFilesystemRow, FileFilesystemRow,
 };
 use serde_json::json;
 use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue, ValueWithSpan};
@@ -38,6 +43,7 @@ const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 pub(super) async fn resolve_filesystem_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     match planned_write.command.target.descriptor.public_name.as_str() {
         "lix_file" | "lix_file_by_version" => match planned_write.command.operation_kind {
@@ -45,7 +51,7 @@ pub(super) async fn resolve_filesystem_write(
                 resolve_file_insert_write_plan(backend, planned_write).await
             }
             WriteOperationKind::Update | WriteOperationKind::Delete => {
-                resolve_existing_file_write(backend, planned_write).await
+                resolve_existing_file_write(backend, planned_write, pending_transaction_view).await
             }
         },
         "lix_directory" | "lix_directory_by_version" => {
@@ -54,7 +60,12 @@ pub(super) async fn resolve_filesystem_write(
                     resolve_directory_insert_write_plan(backend, planned_write).await
                 }
                 WriteOperationKind::Update | WriteOperationKind::Delete => {
-                    resolve_existing_directory_write(backend, planned_write).await
+                    resolve_existing_directory_write(
+                        backend,
+                        planned_write,
+                        pending_transaction_view,
+                    )
+                    .await
                 }
             }
         }
@@ -133,12 +144,18 @@ async fn resolve_directory_insert_write_plan(
 async fn resolve_existing_directory_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let version_id = resolved_filesystem_version_id(planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
-    let current_rows =
-        load_target_directory_rows_for_selector(backend, planned_write, &version_id, lookup_scope)
-            .await?;
+    let current_rows = load_target_directory_rows_for_selector(
+        backend,
+        planned_write,
+        pending_transaction_view,
+        &version_id,
+        lookup_scope,
+    )
+    .await?;
     if current_rows.is_empty() {
         return Ok(noop_resolved_write_plan(
             default_execution_mode_for_request(planned_write.command.requested_mode),
@@ -441,6 +458,7 @@ async fn resolve_file_insert_write_plan(
 async fn resolve_existing_file_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let version_id = resolved_filesystem_version_id(planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
@@ -452,6 +470,7 @@ async fn resolve_existing_file_write(
             let current_rows = load_target_file_rows_for_selector(
                 backend,
                 planned_write,
+                pending_transaction_view,
                 &version_id,
                 lookup_scope,
                 assignments.path.is_some(),
@@ -512,6 +531,7 @@ async fn resolve_existing_file_write(
 
                 let (next_row, ancestor_rows) = resolve_file_update_target(
                     backend,
+                    pending_transaction_view,
                     &current_row,
                     &assignments,
                     &version_id,
@@ -596,6 +616,7 @@ async fn resolve_existing_file_write(
             let current_rows = load_target_file_rows_for_selector(
                 backend,
                 planned_write,
+                pending_transaction_view,
                 &version_id,
                 lookup_scope,
                 true,
@@ -675,6 +696,7 @@ async fn resolve_existing_file_write(
 
 async fn resolve_parent_directory_target(
     backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
     version_id: &str,
     directory_path: Option<&str>,
     untracked: bool,
@@ -685,6 +707,7 @@ async fn resolve_parent_directory_target(
     };
     let missing_rows = resolve_missing_directory_rows(
         backend,
+        pending_transaction_view,
         version_id,
         directory_path,
         untracked,
@@ -694,8 +717,9 @@ async fn resolve_parent_directory_target(
     let directory_id = if let Some(last_row) = missing_rows.last() {
         Some(last_row.id.clone())
     } else {
-        lookup_directory_id_by_path(
+        lookup_directory_id_by_path_with_pending_transaction_view(
             backend,
+            pending_transaction_view,
             version_id,
             &NormalizedDirectoryPath::from_normalized(directory_path.to_string()),
             lookup_scope,
@@ -784,6 +808,7 @@ fn set_filesystem_deleted_state(
 
 async fn resolve_missing_directory_rows(
     backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
     version_id: &str,
     directory_path: &str,
     untracked: bool,
@@ -795,8 +820,9 @@ async fn resolve_missing_directory_rows(
     paths.push(directory_path.to_string());
 
     for candidate_path in paths {
-        if let Some(existing_id) = lookup_directory_id_by_path(
+        if let Some(existing_id) = lookup_directory_id_by_path_with_pending_transaction_view(
             backend,
+            pending_transaction_view,
             version_id,
             &NormalizedDirectoryPath::from_normalized(candidate_path.clone()),
             lookup_scope,
@@ -817,13 +843,15 @@ async fn resolve_missing_directory_rows(
             Some(parent_path) => {
                 if let Some(parent_id) = known_ids.get(&parent_path).cloned() {
                     Some(parent_id)
-                } else if let Some(existing_parent_id) = lookup_directory_id_by_path(
-                    backend,
-                    version_id,
-                    &NormalizedDirectoryPath::from_normalized(parent_path.clone()),
-                    lookup_scope,
-                )
-                .await?
+                } else if let Some(existing_parent_id) =
+                    lookup_directory_id_by_path_with_pending_transaction_view(
+                        backend,
+                        pending_transaction_view,
+                        version_id,
+                        &NormalizedDirectoryPath::from_normalized(parent_path.clone()),
+                        lookup_scope,
+                    )
+                    .await?
                 {
                     Some(existing_parent_id)
                 } else {
@@ -852,6 +880,7 @@ async fn resolve_missing_directory_rows(
 
 async fn resolve_file_update_target(
     backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
     current_row: &FileFilesystemRow,
     assignments: &FileUpdateAssignments,
     version_id: &str,
@@ -866,6 +895,7 @@ async fn resolve_file_update_target(
             ensure_no_directory_at_file_path(backend, version_id, parsed, lookup_scope).await?;
             let (directory_id, missing_ancestors) = resolve_parent_directory_target(
                 backend,
+                pending_transaction_view,
                 version_id,
                 parsed.directory_path.as_deref(),
                 current_row.untracked,
@@ -889,8 +919,9 @@ async fn resolve_file_update_target(
         };
 
     if let Some(next_path) = next_path.as_ref() {
-        if let Some(existing_id) = lookup_file_id_by_path(
+        if let Some(existing_id) = lookup_file_id_by_path_with_pending_transaction_view(
             backend,
+            pending_transaction_view,
             version_id,
             &ParsedFilePath::from_normalized_path(next_path.clone())
                 .map_err(write_resolve_backend_error)?,
@@ -1255,20 +1286,26 @@ fn resolve_proposed_directory_path(
 async fn load_target_directory_rows_for_selector(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<Vec<DirectoryFilesystemRow>, WriteResolveError> {
     if let Some(directory_id) = exact_id_selector_value(planned_write) {
-        return Ok(
-            load_directory_row_by_id(backend, version_id, &directory_id, lookup_scope)
-                .await?
-                .into_iter()
-                .collect(),
-        );
+        return Ok(load_directory_row_by_id_with_pending_transaction_view(
+            backend,
+            pending_transaction_view,
+            version_id,
+            &directory_id,
+            lookup_scope,
+        )
+        .await?
+        .into_iter()
+        .collect());
     }
     let directory_ids = query_text_selector_values_for_write_selector(
         backend,
         planned_write,
+        pending_transaction_view,
         "id",
         "public filesystem directory selector resolver expected id text rows",
     )
@@ -1287,21 +1324,56 @@ async fn load_target_directory_rows_for_selector(
 async fn load_target_file_rows_for_selector(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
     require_paths: bool,
 ) -> Result<Vec<FileFilesystemRow>, WriteResolveError> {
     if let Some(file_id) = exact_id_selector_value(planned_write) {
         let row = if require_paths {
-            load_file_row_by_id(backend, version_id, &file_id, lookup_scope).await?
+            load_file_row_by_id_with_pending_transaction_view(
+                backend,
+                pending_transaction_view,
+                version_id,
+                &file_id,
+                lookup_scope,
+            )
+            .await?
         } else {
-            load_file_row_by_id_without_path(backend, version_id, &file_id, lookup_scope).await?
+            load_file_row_by_id_without_path_with_pending_transaction_view(
+                backend,
+                pending_transaction_view,
+                version_id,
+                &file_id,
+                lookup_scope,
+            )
+            .await?
         };
         return Ok(row.into_iter().collect());
+    }
+    if let Some(paths) = exact_path_selector_values(planned_write) {
+        let mut rows = Vec::new();
+        for path in paths {
+            let parsed =
+                ParsedFilePath::from_normalized_path(path).map_err(write_resolve_backend_error)?;
+            let row = load_file_row_by_path_with_pending_transaction_view(
+                backend,
+                pending_transaction_view,
+                version_id,
+                &parsed,
+                lookup_scope,
+            )
+            .await?;
+            if let Some(row) = row {
+                rows.push(row);
+            }
+        }
+        return Ok(rows);
     }
     let file_ids = query_text_selector_values_for_write_selector(
         backend,
         planned_write,
+        pending_transaction_view,
         "id",
         "public filesystem file selector resolver expected id text rows",
     )
@@ -1309,9 +1381,23 @@ async fn load_target_file_rows_for_selector(
     let mut rows = Vec::new();
     for file_id in file_ids {
         let row = if require_paths {
-            load_file_row_by_id(backend, version_id, &file_id, lookup_scope).await?
+            load_file_row_by_id_with_pending_transaction_view(
+                backend,
+                pending_transaction_view,
+                version_id,
+                &file_id,
+                lookup_scope,
+            )
+            .await?
         } else {
-            load_file_row_by_id_without_path(backend, version_id, &file_id, lookup_scope).await?
+            load_file_row_by_id_without_path_with_pending_transaction_view(
+                backend,
+                pending_transaction_view,
+                version_id,
+                &file_id,
+                lookup_scope,
+            )
+            .await?
         };
         if let Some(row) = row {
             rows.push(row);
@@ -1326,16 +1412,32 @@ fn exact_id_selector_value(planned_write: &PlannedWrite) -> Option<String> {
         .and_then(|ids| ids.into_iter().next())
 }
 
+fn exact_path_selector_values(planned_write: &PlannedWrite) -> Option<Vec<String>> {
+    exact_selector_values_for_column(planned_write, "path")
+}
+
 fn exact_id_selector_values(planned_write: &PlannedWrite) -> Option<Vec<String>> {
+    exact_selector_values_for_column(planned_write, "id")
+}
+
+fn exact_selector_values_for_column(
+    planned_write: &PlannedWrite,
+    column_name: &str,
+) -> Option<Vec<String>> {
     if !planned_write.command.selector.exact_only {
-        return exact_id_selector_values_from_residuals(planned_write);
+        return exact_selector_values_from_residuals(planned_write, column_name);
     }
     if !planned_write
         .command
         .selector
         .exact_filters
         .keys()
-        .all(|key| matches!(key.as_str(), "id" | "version_id" | "lixcol_version_id"))
+        .all(|key| {
+            matches!(
+                key.as_str(),
+                "id" | "path" | "version_id" | "lixcol_version_id"
+            )
+        })
     {
         return None;
     }
@@ -1343,12 +1445,15 @@ fn exact_id_selector_values(planned_write: &PlannedWrite) -> Option<Vec<String>>
         .command
         .selector
         .exact_filters
-        .get("id")
+        .get(column_name)
         .and_then(text_from_value)
         .map(|value| vec![value])
 }
 
-fn exact_id_selector_values_from_residuals(planned_write: &PlannedWrite) -> Option<Vec<String>> {
+fn exact_selector_values_from_residuals(
+    planned_write: &PlannedWrite,
+    column_name: &str,
+) -> Option<Vec<String>> {
     let [predicate] = planned_write
         .command
         .selector
@@ -1357,28 +1462,30 @@ fn exact_id_selector_values_from_residuals(planned_write: &PlannedWrite) -> Opti
     else {
         return None;
     };
-    let mut file_ids = BTreeSet::new();
+    let mut values = BTreeSet::new();
     let mut placeholder_state = PlaceholderState::new();
-    if !collect_exact_id_selector_values(
+    if !collect_exact_selector_values(
         predicate,
         &planned_write.command.bound_parameters,
         &mut placeholder_state,
-        &mut file_ids,
+        column_name,
+        &mut values,
     ) {
         return None;
     }
-    if file_ids.is_empty() {
+    if values.is_empty() {
         None
     } else {
-        Some(file_ids.into_iter().collect())
+        Some(values.into_iter().collect())
     }
 }
 
-fn collect_exact_id_selector_values(
+fn collect_exact_selector_values(
     expr: &Expr,
     params: &[Value],
     placeholder_state: &mut PlaceholderState,
-    file_ids: &mut BTreeSet<String>,
+    column_name: &str,
+    values: &mut BTreeSet<String>,
 ) -> bool {
     match expr {
         Expr::BinaryOp {
@@ -1386,8 +1493,14 @@ fn collect_exact_id_selector_values(
             op: BinaryOperator::And,
             right,
         } => {
-            collect_exact_id_selector_values(left, params, placeholder_state, file_ids)
-                && collect_exact_id_selector_values(right, params, placeholder_state, file_ids)
+            collect_exact_selector_values(left, params, placeholder_state, column_name, values)
+                && collect_exact_selector_values(
+                    right,
+                    params,
+                    placeholder_state,
+                    column_name,
+                    values,
+                )
         }
         Expr::BinaryOp {
             left,
@@ -1399,7 +1512,7 @@ fn collect_exact_id_selector_values(
             else {
                 return false;
             };
-            if column == "id" {
+            if column == column_name {
                 let value_expr = if exact_selector_column_name(left).is_some() {
                     right
                 } else {
@@ -1407,7 +1520,7 @@ fn collect_exact_id_selector_values(
                 };
                 let value = exact_expr_text_value(value_expr, params, placeholder_state);
                 if let Some(value) = value {
-                    file_ids.insert(value);
+                    values.insert(value);
                     true
                 } else {
                     false
@@ -1424,7 +1537,7 @@ fn collect_exact_id_selector_values(
             let Some(column) = exact_selector_column_name(expr) else {
                 return false;
             };
-            if column != "id" {
+            if column != column_name {
                 return matches!(column.as_str(), "version_id" | "lixcol_version_id");
             }
             let mut local = Vec::with_capacity(list.len());
@@ -1435,11 +1548,11 @@ fn collect_exact_id_selector_values(
                 };
                 local.push(value);
             }
-            file_ids.extend(local);
+            values.extend(local);
             true
         }
         Expr::Nested(inner) => {
-            collect_exact_id_selector_values(inner, params, placeholder_state, file_ids)
+            collect_exact_selector_values(inner, params, placeholder_state, column_name, values)
         }
         _ => false,
     }
