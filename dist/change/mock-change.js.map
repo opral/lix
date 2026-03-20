@@ -1,0 +1,1 @@
+{"version":3,"file":"mock-change.js","sourceRoot":"","sources":["../../src/change/mock-change.ts"],"names":[],"mappings":"AAEA;;;;;;GAMG;AACH,MAAM,UAAU,UAAU,CAAC,IAAwB;IAClD,OAAO;QACN,EAAE,EAAE,MAAM;QACV,UAAU,EAAE,MAAM;QAClB,UAAU,EAAE,MAAM;QAClB,OAAO,EAAE,MAAM;QACf,SAAS,EAAE,MAAM;QACjB,UAAU,EAAE,MAAM;QAClB,WAAW,EAAE,YAAY;QACzB,GAAG,IAAI;KACP,CAAC;AACH,CAAC"}

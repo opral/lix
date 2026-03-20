@@ -1,0 +1,1 @@
+{"version":3,"file":"parse-jsonb-plugin-v2.d.ts","sourceRoot":"","sources":["../../../src/database/kysely-plugin/parse-jsonb-plugin-v2.ts"],"names":[],"mappings":"AAGA;;;;;;;;GAQG;AAEH,OAAO,EAIN,KAAK,YAAY,EAEjB,MAAM,QAAQ,CAAC;AAIhB,wBAAgB,kBAAkB,CACjC,YAAY,EAAE,MAAM,CAAC,MAAM,EAAE,MAAM,EAAE,CAAC,GACpC,YAAY,CAwCd"}

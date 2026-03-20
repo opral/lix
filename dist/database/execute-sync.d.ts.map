@@ -1,0 +1,1 @@
+{"version":3,"file":"execute-sync.d.ts","sourceRoot":"","sources":["../../src/database/execute-sync.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,GAAG,EAAE,MAAM,oBAAoB,CAAC;AAE9C;;;;;;;;;;;GAWG;AACH,wBAAgB,WAAW,CAAC,IAAI,EAAE;IACjC,GAAG,EAAE,IAAI,CAAC,GAAG,EAAE,QAAQ,CAAC,CAAC;IACzB,KAAK,EAAE,GAAG,CAAC;CACX,GAAG,KAAK,CAAC,GAAG,CAAC,CA6Bb"}

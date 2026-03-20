@@ -1,0 +1,1 @@
+{"version":3,"file":"mock-json-snapshot.js","sourceRoot":"","sources":["../../src/snapshot/mock-json-snapshot.ts"],"names":[],"mappings":"AACA,OAAO,EAAE,UAAU,EAAE,MAAM,mBAAmB,CAAC;AAE/C;;;;GAIG;AACH,MAAM,UAAU,gBAAgB,CAAC,OAA4B;IAC5D,OAAO;QACN,EAAE,EAAE,UAAU,CAAC,OAAO,CAAC;QACvB,OAAO,EAAE,OAAO;KAChB,CAAC;AACH,CAAC"}

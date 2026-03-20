@@ -1,0 +1,18 @@
+import type { Lix } from "../lix/open-lix.js";
+/**
+ * Execute a query synchronously.
+ *
+ * WARNING: This function is not recommended for general use.
+ * Only if you need sync queries, like in a trigger for exmaple,
+ * you should use this function. The function is not transforming
+ * the query or the result as the db API does. You get raw SQL.
+ *
+ * @example
+ *   const query = lix.db.selectFrom("key_value").selectAll();
+ *   const result = executeSync({ lix, query }) as KeyValue[];
+ */
+export declare function executeSync(args: {
+    lix: Pick<Lix, "sqlite">;
+    query: any;
+}): Array<any>;
+//# sourceMappingURL=execute-sync.d.ts.map

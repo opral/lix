@@ -1,0 +1,1 @@
+{"version":3,"file":"file-queue-process.d.ts","sourceRoot":"","sources":["../../src/file-queue/file-queue-process.ts"],"names":[],"mappings":"AAKA,OAAO,KAAK,EAAE,GAAG,EAAE,MAAM,oBAAoB,CAAC;AAE9C,wBAAsB,oBAAoB,CAAC,IAAI,EAAE;IAChD,GAAG,EAAE,IAAI,CAAC,GAAG,EAAE,IAAI,GAAG,QAAQ,GAAG,QAAQ,CAAC,CAAC;CAC3C,GAAG,OAAO,CAAC,IAAI,CAAC,CAkGhB"}

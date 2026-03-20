@@ -1,0 +1,1 @@
+{"version":3,"file":"with-transaction.js","sourceRoot":"","sources":["../../src/plugin/with-transaction.ts"],"names":[],"mappings":"AAKA;;;;GAIG;AACH,MAAM,UAAU,eAAe,CAC9B,GAAQ,EACR,GAAmC;IAEnC,OAAO;QACN,EAAE,EAAE;YACH,UAAU,EAAE,GAAG,CAAC,UAAU;YAC1B,aAAa,EAAE,GAAG,CAAC,aAAa;SAChC;QACD,MAAM,EAAE,GAAG,CAAC,MAAM;KAClB,CAAC;AACH,CAAC"}
