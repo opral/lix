@@ -1,4 +1,4 @@
-use super::bind::bind_public_query;
+use super::bind::{bind_public_query, bind_public_statement_sql};
 use super::*;
 use crate::filesystem::history::{
     load_directory_history_rows, load_file_history_rows, DirectoryHistoryRequest,
@@ -124,9 +124,21 @@ pub(crate) async fn execute_prepared_public_read(
     backend: &dyn LixBackend,
     prepared: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
+    let bound_params = prepared
+        .debug_trace
+        .bound_statements
+        .first()
+        .map(|statement| statement.bound_parameters.as_slice())
+        .unwrap_or(&[]);
     match &prepared.execution {
         PreparedPublicReadExecution::LoweredSql(lowered) => {
-            execute_lowered_public_read(backend, lowered, prepared.dependency_spec.as_ref()).await
+            execute_lowered_public_read(
+                backend,
+                lowered,
+                prepared.dependency_spec.as_ref(),
+                bound_params,
+            )
+            .await
         }
         PreparedPublicReadExecution::Direct(plan) => {
             execute_direct_public_read(backend, plan).await
@@ -138,6 +150,7 @@ async fn execute_lowered_public_read(
     backend: &dyn LixBackend,
     lowered: &LoweredReadProgram,
     dependency_spec: Option<&DependencySpec>,
+    params: &[Value],
 ) -> Result<QueryResult, LixError> {
     for schema_key in required_schema_keys_from_dependency_spec(dependency_spec) {
         crate::schema::registry::ensure_schema_live_table(backend, &schema_key).await?;
@@ -149,7 +162,8 @@ async fn execute_lowered_public_read(
     };
     for statement in lowered.statements.iter().cloned() {
         let statement = lower_statement(statement, backend.dialect())?;
-        result = backend.execute(&statement.to_string(), &[]).await?;
+        let bound = bind_public_statement_sql(statement, params, backend.dialect())?;
+        result = backend.execute(&bound.sql, &bound.params).await?;
     }
     Ok(decode_public_read_result_columns(
         result,

@@ -13,8 +13,6 @@ use crate::sql::execution::post_commit_effects::apply_owned_execution_post_commi
 use crate::sql::execution::shared_path;
 use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
-use crate::sql::execution::write_txn_plan::build_write_txn_plan;
-use crate::sql::execution::write_txn_runner::run_write_txn_plan_with_backend;
 use crate::sql::public::runtime::{
     classify_public_execution_route_with_registry, decode_public_read_result,
     execute_prepared_public_read,
@@ -157,8 +155,6 @@ impl Engine {
             self,
             self.backend.as_ref(),
             None,
-            None,
-            None,
             &parsed_statements,
             params,
             &active_version_id,
@@ -177,7 +173,8 @@ impl Engine {
             .as_ref()
             .and_then(|prepared| prepared.direct_plan().map(|_| prepared));
 
-        let write_txn_plan = build_write_txn_plan(&prepared, writer_key);
+        let write_txn_delta =
+            crate::sql::execution::write_txn_plan::build_txn_delta(&prepared, writer_key)?;
         if let Some(public_read) = direct_public_read {
             let result = execute_prepared_public_read(self.backend.as_ref(), public_read).await?;
             return Ok(ExecuteResult {
@@ -185,8 +182,12 @@ impl Engine {
             });
         }
 
-        let (execution, write_owned_transaction_committed) = if let Some(plan) = write_txn_plan {
-            match run_write_txn_plan_with_backend(self, &plan, None).await {
+        let (execution, write_owned_transaction_committed) = if let Some(delta) = write_txn_delta {
+            match crate::sql::execution::write_txn_runner::run_txn_delta_with_backend(
+                self, &delta, None,
+            )
+            .await
+            {
                 Ok(execution) => (execution, true),
                 Err(error) => return Err(error),
             }

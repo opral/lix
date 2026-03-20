@@ -4,13 +4,9 @@ use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path::{
     self, prepared_execution_mutates_public_surface_registry,
 };
-use crate::sql::execution::transaction_exec::{
-    public_write_execution_next_active_version_id, statement_can_prepare_against_pending_overlay,
-};
+use crate::sql::execution::transaction_exec::public_write_execution_next_active_version_id;
 use crate::sql::execution::write_txn_plan::{
-    build_write_txn_plan, pending_filesystem_overlay_for_write_plan,
-    pending_registered_schema_overlay_for_write_plan, pending_semantic_overlay_for_write_plan,
-    write_txn_plan_is_independent_filesystem, MutationJournal,
+    build_txn_delta, txn_materialization_plan_is_independent_filesystem, MutationJournal, TxnDelta,
 };
 use crate::sql::execution::write_txn_runner::stamp_watermark_before_commit;
 use crate::sql::public::runtime::{
@@ -21,7 +17,7 @@ use crate::state::internal::script::{
     coalesce_vtable_inserts_in_statement_list, prepare_statement_script_sql_statements,
 };
 use crate::state::stream::StateCommitStreamChange;
-use crate::{ExecuteOptions, ExecuteResult, LixBackend, LixError, LixTransaction, Value};
+use crate::{ExecuteOptions, ExecuteResult, LixError, LixTransaction, Value};
 use sqlparser::ast::Statement;
 
 impl Engine {
@@ -193,8 +189,6 @@ impl Engine {
                 self,
                 &backend,
                 None,
-                None,
-                None,
                 original_statements,
                 params,
                 active_version_id.as_str(),
@@ -207,11 +201,11 @@ impl Engine {
             )
             .await;
             if let Ok(combined_prepared) = combined_prepared {
-                if let Some(combined_plan) = build_write_txn_plan(&combined_prepared, writer_key) {
+                if let Some(combined_delta) = build_txn_delta(&combined_prepared, writer_key)? {
                     if prepared_execution_mutates_public_surface_registry(&combined_prepared)? {
                         *public_surface_registry_dirty = true;
                     }
-                    mutation_journal.stage_write_plan(combined_plan)?;
+                    mutation_journal.stage_delta(combined_delta)?;
                     return Ok(empty_mutating_script_result(result_statement_count));
                 }
             }
@@ -234,10 +228,11 @@ impl Engine {
                 self.prepare_runtime_functions_with_backend(&backend, defer_runtime_sequence_load)
                     .await?
             };
-            let mut combined_plan = crate::sql::execution::write_txn_plan::WriteTxnPlan::default();
+            let mut combined_delta: Option<TxnDelta> = None;
             let mut planning_registry = public_surface_registry.clone();
             let mut planning_active_version_id = active_version_id.clone();
             let mut registry_dirty = false;
+            let mut combined_path_supported = true;
 
             for (_statement, (sql, statement_params)) in &executable_statements {
                 let parsed_statement = parse_sql(sql).map_err(LixError::from).and_then(
@@ -251,29 +246,13 @@ impl Engine {
                 )?;
                 let prepared = {
                     let backend = TransactionBackendAdapter::new(transaction);
-                    let pending_registered_schema_overlay =
-                        pending_registered_schema_overlay_for_write_plan(&combined_plan)?;
-                    let pending_filesystem_overlay =
-                        pending_filesystem_overlay_for_write_plan(&combined_plan);
-                    let pending_semantic_overlay = statement_can_prepare_against_pending_overlay(
-                        &planning_registry,
-                        backend.dialect(),
-                        &parsed_statement,
-                        statement_params,
-                        planning_active_version_id.as_str(),
-                        writer_key,
-                        true,
-                        pending_filesystem_overlay.is_some(),
-                    )
-                    .then(|| pending_semantic_overlay_for_write_plan(&combined_plan))
-                    .transpose()?
-                    .flatten();
+                    let pending_transaction_view = combined_delta
+                        .as_ref()
+                        .and_then(TxnDelta::pending_transaction_view);
                     shared_path::prepare_execution_with_backend(
                         self,
                         &backend,
-                        pending_registered_schema_overlay.as_ref(),
-                        pending_semantic_overlay.as_ref(),
-                        pending_filesystem_overlay.as_ref(),
+                        pending_transaction_view.as_ref(),
                         std::slice::from_ref(&parsed_statement),
                         statement_params,
                         planning_active_version_id.as_str(),
@@ -285,24 +264,28 @@ impl Engine {
                         },
                     )
                     .await
-                    .map_err(|error| LixError {
-                        code: error.code,
-                        description: format!(
-                            "statement script combined public prepare_execution_with_backend failed: {}",
-                            error.description
-                        ),
-                    })?
                 };
-                let Some(statement_plan) = build_write_txn_plan(&prepared, writer_key) else {
+                let prepared = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(_) => {
+                        combined_path_supported = false;
+                        break;
+                    }
+                };
+                let Some(statement_delta) = build_txn_delta(&prepared, writer_key)? else {
                     continue;
                 };
-                let mut statement_plan = statement_plan;
+                let mut statement_plan = statement_delta.materialization_plan().clone();
                 statement_plan.bind_runtime(
                     shared_settings,
                     shared_sequence_start,
                     shared_functions.clone(),
                 );
-                combined_plan.extend(statement_plan);
+                let statement_delta = TxnDelta::from_materialization_plan(statement_plan)?;
+                match combined_delta.as_mut() {
+                    Some(current) => current.extend(statement_delta)?,
+                    None => combined_delta = Some(statement_delta),
+                }
 
                 if let Some(public_write) = prepared.public_write.as_ref() {
                     let mutations = public_surface_registry_mutations(public_write)?;
@@ -318,19 +301,25 @@ impl Engine {
                 }
             }
 
-            if registry_dirty {
+            if combined_path_supported && registry_dirty {
                 *public_surface_registry = planning_registry;
                 *public_surface_registry_dirty = true;
             }
-            *active_version_id = planning_active_version_id;
-            let combined_continuation_safe =
-                write_txn_plan_is_independent_filesystem(&combined_plan);
-            debug_assert!(
-                mutation_journal.is_empty() || combined_continuation_safe,
-                "combined public script path should only stage into an empty or continuation-safe journal"
-            );
-            mutation_journal.stage_write_plan(combined_plan)?;
-            return Ok(empty_mutating_script_result(result_statement_count));
+            if combined_path_supported {
+                *active_version_id = planning_active_version_id;
+                let combined_delta = combined_delta.unwrap_or_else(|| {
+                    unreachable!("combined public script path should have produced a delta")
+                });
+                let combined_continuation_safe = txn_materialization_plan_is_independent_filesystem(
+                    combined_delta.materialization_plan(),
+                );
+                debug_assert!(
+                    mutation_journal.is_empty() || combined_continuation_safe,
+                    "combined public script path should only stage into an empty or continuation-safe journal"
+                );
+                mutation_journal.stage_delta(combined_delta)?;
+                return Ok(empty_mutating_script_result(result_statement_count));
+            }
         }
 
         let mut results = Vec::with_capacity(result_statement_count);

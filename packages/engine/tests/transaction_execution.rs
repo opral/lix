@@ -796,6 +796,102 @@ simulation_test!(
 );
 
 simulation_test!(
+    transaction_path_direct_history_read_does_not_split_buffered_public_commit,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+        register_state_history_test_schema(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'tx-history-midpoint', 'tx_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"initial\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let root_commit_id = active_commit_id(&engine).await;
+        let version_id = active_version_id(&engine).await;
+        let before_commit_count = public_commit_count(&engine).await;
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                let version_id = version_id.clone();
+                let history_sql = format!(
+                    "SELECT depth, snapshot_content \
+                     FROM lix_state_history \
+                     WHERE entity_id = 'tx-history-midpoint' \
+                       AND schema_key = 'tx_state_history_schema' \
+                       AND root_commit_id = '{root_commit_id}' \
+                     ORDER BY depth ASC"
+                );
+                Box::pin(async move {
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO lix_state_by_version (\
+                             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                             ) VALUES (\
+                             'tx-mid-a', 'lix_key_value', 'lix', '{version_id}', 'lix', '{{\"key\":\"tx-mid-a\",\"value\":\"a\"}}', '1'\
+                             )"
+                        ),
+                        &[],
+                    )
+                    .await?;
+
+                    let history_rows = tx.execute(&history_sql, &[]).await?;
+                    assert_eq!(history_rows.statements.len(), 1);
+                    assert_eq!(history_rows.statements[0].rows.len(), 1);
+                    assert_eq!(history_rows.statements[0].rows[0][0], Value::Integer(0));
+                    assert_eq!(
+                        history_rows.statements[0].rows[0][1],
+                        Value::Text("{\"value\":\"initial\"}".to_string())
+                    );
+
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO lix_state_by_version (\
+                             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                             ) VALUES (\
+                             'tx-mid-b', 'lix_key_value', 'lix', '{version_id}', 'lix', '{{\"key\":\"tx-mid-b\",\"value\":\"b\"}}', '1'\
+                             )"
+                        ),
+                        &[],
+                    )
+                    .await?;
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let after_commit_count = public_commit_count(&engine).await;
+        assert_eq!(after_commit_count - before_commit_count, 1);
+
+        let rows = engine
+            .execute(
+                "SELECT value \
+                 FROM lix_key_value \
+                 WHERE key IN ('tx-mid-a', 'tx-mid-b') \
+                 ORDER BY key",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_eq!(rows.statements[0].rows[0][0], Value::Text("a".to_string()));
+        assert_eq!(rows.statements[0].rows[1][0], Value::Text("b".to_string()));
+    }
+);
+
+simulation_test!(
     transaction_path_exact_public_state_updates_coalesce_into_single_commit,
     simulations = [sqlite, postgres],
     |sim| async move {

@@ -7,20 +7,13 @@ use crate::sql::execution::contracts::result_contract::ResultContract;
 use crate::sql::execution::execute;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path;
-use crate::sql::execution::shared_path::{
-    prepared_execution_mutates_public_surface_registry, top_level_write_target_name,
-};
-use crate::sql::execution::write_txn_plan::{
-    build_write_txn_plan, MutationJournal, WriteTxnRunMode,
-};
-use crate::sql::execution::write_txn_runner::run_write_txn_plan_with_transaction;
-use crate::sql::public::catalog::{SurfaceFamily, SurfaceRegistry};
-use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
-use crate::sql::public::planner::canonicalize::canonicalize_write;
-use crate::sql::public::planner::semantics::write_analysis::analyze_write;
+use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
+use crate::sql::execution::write_txn_plan::{build_txn_delta, MutationJournal, WriteTxnRunMode};
+use crate::sql::execution::write_txn_runner::run_txn_delta_with_transaction;
+use crate::sql::public::catalog::SurfaceRegistry;
 use crate::sql::public::runtime::{
     apply_public_surface_registry_mutations, decode_public_read_result,
-    execute_prepared_public_read, public_surface_registry_mutations, PublicWriteExecutionPartition,
+    public_surface_registry_mutations, PublicWriteExecutionPartition,
 };
 use crate::{
     ExecuteOptions, LixError, LixTransaction, QueryResult, StateCommitStreamChange, Value,
@@ -97,13 +90,13 @@ impl Engine {
         pending_public_commit_session: &mut Option<shared_path::PendingPublicCommitSession>,
         observe_tick_already_emitted: &mut bool,
     ) -> Result<(), LixError> {
-        let Some(plan) = mutation_journal.take_staged_write_plan() else {
+        let Some(delta) = mutation_journal.take_staged_delta() else {
             return Ok(());
         };
-        let execution = run_write_txn_plan_with_transaction(
+        let execution = run_txn_delta_with_transaction(
             self,
             transaction,
-            &plan,
+            &delta,
             WriteTxnRunMode::Borrowed,
             Some(pending_public_commit_session),
         )
@@ -157,47 +150,13 @@ impl Engine {
         let writer_key = options.writer_key.as_deref();
         let _defer_side_effects = deferred_side_effects.is_some();
         loop {
-            let pending_registered_schema_overlay =
-                mutation_journal.pending_registered_schema_overlay()?;
-            let pending_semantic_overlay = mutation_journal.pending_semantic_overlay()?;
-            let pending_filesystem_overlay = mutation_journal.pending_filesystem_overlay();
-            let pending_overlay_can_continue = statement_can_prepare_against_pending_overlay(
-                public_surface_registry,
-                transaction.dialect(),
-                &parsed_statements[0],
-                params,
-                active_version_id.as_str(),
-                writer_key,
-                pending_semantic_overlay.is_some(),
-                pending_filesystem_overlay.is_some(),
-            );
-            if !mutation_journal.is_empty()
-                && ((!mutation_journal.continuation_safe()
-                    && pending_registered_schema_overlay.is_none()
-                    && !pending_overlay_can_continue)
-                    || statement_requires_flushed_pending_buffer(&parsed_statements[0]))
-            {
-                self.flush_mutation_journal_in_transaction(
-                    transaction,
-                    public_surface_registry,
-                    public_surface_registry_dirty,
-                    active_version_id,
-                    mutation_journal,
-                    pending_state_commit_stream_changes,
-                    pending_public_commit_session,
-                    observe_tick_already_emitted,
-                )
-                .await?;
-            }
-
+            let pending_transaction_view = mutation_journal.pending_transaction_view()?;
             let prepared = {
                 let backend = TransactionBackendAdapter::new(transaction);
                 shared_path::prepare_execution_with_backend(
                     self,
                     &backend,
-                    pending_registered_schema_overlay.as_ref(),
-                    pending_semantic_overlay.as_ref(),
-                    pending_filesystem_overlay.as_ref(),
+                    pending_transaction_view.as_ref(),
                     &parsed_statements,
                     params,
                     active_version_id.as_str(),
@@ -209,26 +168,49 @@ impl Engine {
                     },
                 )
                 .await
-                .map_err(|error| LixError {
-                    code: error.code,
-                    description: format!(
-                        "transaction prepare_execution_with_backend failed: {}",
-                        error.description
-                    ),
-                })?
+            };
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) if !mutation_journal.is_empty() => {
+                    self.flush_mutation_journal_in_transaction(
+                        transaction,
+                        public_surface_registry,
+                        public_surface_registry_dirty,
+                        active_version_id,
+                        mutation_journal,
+                        pending_state_commit_stream_changes,
+                        pending_public_commit_session,
+                        observe_tick_already_emitted,
+                    )
+                    .await?;
+                    let _ = error;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(LixError {
+                        code: error.code,
+                        description: format!(
+                            "transaction prepare_execution_with_backend failed: {}",
+                            error.description
+                        ),
+                    });
+                }
             };
 
-            let write_txn_plan = build_write_txn_plan(&prepared, writer_key);
-            let write_is_bufferable = write_txn_plan.is_some()
+            let write_txn_delta = build_txn_delta(&prepared, writer_key)?;
+            let has_materialization_plan = write_txn_delta
+                .as_ref()
+                .is_some_and(|delta| !delta.materialization_plan().units.is_empty());
+            let write_is_bufferable = write_txn_delta.is_some()
                 && !matches!(prepared.plan.result_contract, ResultContract::DmlReturning)
                 && !matches!(
                     parsed_statements[0],
                     Statement::Query(_) | Statement::Explain { .. }
                 );
             if write_is_bufferable {
-                let statement_plan =
-                    write_txn_plan.expect("bufferable write must have a transaction plan");
-                let continuation_safe = mutation_journal.can_stage_write_plan(&statement_plan)?;
+                let statement_delta =
+                    write_txn_delta.expect("bufferable write must have a transaction delta");
+                let continuation_safe = mutation_journal.can_stage_delta(&statement_delta)?;
                 if !mutation_journal.is_empty() && !continuation_safe {
                     self.flush_mutation_journal_in_transaction(
                         transaction,
@@ -244,7 +226,9 @@ impl Engine {
                     continue;
                 }
 
-                mutation_journal.stage_write_plan(statement_plan)?;
+                mutation_journal.stage_delta(statement_delta)?;
+                let registry_mutated =
+                    prepared_execution_mutates_public_surface_registry(&prepared)?;
                 if continuation_safe {
                     apply_buffered_write_planning_effects(
                         &prepared,
@@ -252,8 +236,15 @@ impl Engine {
                         public_surface_registry_dirty,
                         active_version_id,
                     )?;
-                } else if prepared_execution_mutates_public_surface_registry(&prepared)? {
-                    *public_surface_registry_dirty = true;
+                }
+                if registry_mutated {
+                    refresh_public_surface_registry_from_pending_transaction_view(
+                        transaction,
+                        public_surface_registry,
+                        public_surface_registry_dirty,
+                        mutation_journal,
+                    )
+                    .await?;
                 }
                 return Ok(QueryResult {
                     rows: Vec::new(),
@@ -261,39 +252,61 @@ impl Engine {
                 });
             }
 
-            if !mutation_journal.is_empty() {
-                self.flush_mutation_journal_in_transaction(
-                    transaction,
-                    public_surface_registry,
-                    public_surface_registry_dirty,
-                    active_version_id,
-                    mutation_journal,
-                    pending_state_commit_stream_changes,
-                    pending_public_commit_session,
-                    observe_tick_already_emitted,
-                )
-                .await?;
-                continue;
-            }
-
-            let execution = if let Some(plan) = write_txn_plan.as_ref() {
-                run_write_txn_plan_with_transaction(
+            let execution = if let Some(delta) = write_txn_delta.as_ref() {
+                run_txn_delta_with_transaction(
                     self,
                     transaction,
-                    plan,
+                    delta,
                     WriteTxnRunMode::Borrowed,
                     Some(pending_public_commit_session),
                 )
                 .await?
-            } else if let Some(public_read) = prepared
-                .public_read
-                .as_ref()
-                .and_then(|prepared| prepared.direct_plan().map(|_| prepared))
-            {
+            } else if let Some(public_read) = prepared.public_read.as_ref() {
+                if !mutation_journal.is_empty()
+                    && matches!(
+                        shared_path::prepared_public_read_transaction_mode(public_read),
+                        shared_path::PreparedPublicReadTransactionMode::MaterializedState
+                    )
+                {
+                    self.flush_mutation_journal_in_transaction(
+                        transaction,
+                        public_surface_registry,
+                        public_surface_registry_dirty,
+                        active_version_id,
+                        mutation_journal,
+                        pending_state_commit_stream_changes,
+                        pending_public_commit_session,
+                        observe_tick_already_emitted,
+                    )
+                    .await?;
+                    continue;
+                }
                 let backend = TransactionBackendAdapter::new(transaction);
-                let public_result = execute_prepared_public_read(&backend, public_read).await?;
+                let public_result =
+                    shared_path::execute_prepared_public_read_with_pending_transaction_view(
+                        &backend,
+                        pending_transaction_view.as_ref(),
+                        public_read,
+                    )
+                    .await?;
                 return Ok(public_result);
             } else {
+                if !mutation_journal.is_empty() && !has_materialization_plan {
+                    // Non-public reads still execute through the legacy SQL plan path.
+                    // Flush first until that path has its own transaction-local read engine.
+                    self.flush_mutation_journal_in_transaction(
+                        transaction,
+                        public_surface_registry,
+                        public_surface_registry_dirty,
+                        active_version_id,
+                        mutation_journal,
+                        pending_state_commit_stream_changes,
+                        pending_public_commit_session,
+                        observe_tick_already_emitted,
+                    )
+                    .await?;
+                    continue;
+                }
                 match execute::execute_plan_sql_with_transaction(
                     transaction,
                     &prepared.plan,
@@ -362,7 +375,7 @@ impl Engine {
                 &state_commit_stream_changes,
             );
 
-            let write_handled_by_runner = write_txn_plan.is_some();
+            let write_handled_by_runner = write_txn_delta.is_some();
 
             if write_handled_by_runner {
                 // The universal write runner owns all transactional DB side effects for writes.
@@ -482,73 +495,20 @@ impl Engine {
     }
 }
 
-fn statement_requires_flushed_pending_buffer(statement: &Statement) -> bool {
-    matches!(statement, Statement::Query(_) | Statement::Explain { .. })
-}
-
-pub(crate) fn statement_can_prepare_against_pending_overlay(
-    public_surface_registry: &SurfaceRegistry,
-    dialect: crate::SqlDialect,
-    statement: &Statement,
-    params: &[Value],
-    active_version_id: &str,
-    writer_key: Option<&str>,
-    allow_state_overlay: bool,
-    allow_filesystem_overlay: bool,
-) -> bool {
-    let Some(target_name) = top_level_write_target_name(statement) else {
-        return false;
-    };
-    let Some(binding) = public_surface_registry.bind_relation_name(&target_name) else {
-        return false;
-    };
-
-    if matches!(statement, Statement::Insert(_)) {
-        return match binding.descriptor.surface_family {
-            SurfaceFamily::State => allow_state_overlay,
-            SurfaceFamily::Filesystem => {
-                allow_filesystem_overlay
-                    && matches!(
-                        target_name.as_str(),
-                        "lix_file"
-                            | "lix_file_by_version"
-                            | "lix_directory"
-                            | "lix_directory_by_version"
-                    )
-            }
-            _ => false,
-        };
-    }
-
-    match binding.descriptor.surface_family {
-        SurfaceFamily::State if allow_state_overlay => {}
-        SurfaceFamily::Filesystem
-            if allow_filesystem_overlay
-                && matches!(target_name.as_str(), "lix_file" | "lix_file_by_version") => {}
-        _ => return false,
-    }
-
-    let bound_statement = BoundStatement::from_statement(
-        statement.clone(),
-        params.to_vec(),
-        ExecutionContext {
-            dialect: Some(dialect),
-            writer_key: writer_key.map(str::to_string),
-            requested_version_id: Some(active_version_id.to_string()),
-        },
-    );
-    let Ok(canonicalized) = canonicalize_write(bound_statement, public_surface_registry) else {
-        return false;
-    };
-    let Ok(planned_write) = analyze_write(&canonicalized) else {
-        return false;
-    };
-
-    matches!(
-        planned_write.command.operation_kind,
-        crate::sql::public::planner::ir::WriteOperationKind::Update
-            | crate::sql::public::planner::ir::WriteOperationKind::Delete
-    ) && planned_write.command.selector.exact_only
+async fn refresh_public_surface_registry_from_pending_transaction_view(
+    transaction: &mut dyn LixTransaction,
+    public_surface_registry: &mut SurfaceRegistry,
+    public_surface_registry_dirty: &mut bool,
+    mutation_journal: &MutationJournal,
+) -> Result<(), LixError> {
+    let backend = TransactionBackendAdapter::new(transaction);
+    let pending_transaction_view = mutation_journal.pending_transaction_view()?;
+    let transaction_view_backend =
+        shared_path::TransactionViewBackend::new(&backend, pending_transaction_view.as_ref());
+    *public_surface_registry =
+        SurfaceRegistry::bootstrap_with_backend(&transaction_view_backend).await?;
+    *public_surface_registry_dirty = true;
+    Ok(())
 }
 
 fn apply_buffered_write_planning_effects(
