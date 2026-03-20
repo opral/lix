@@ -660,8 +660,14 @@ fn proposed_domain_change_from_filesystem_semantic_change(
     change: &FilesystemSemanticChange,
 ) -> Result<ProposedDomainChange, CreateCommitError> {
     Ok(ProposedDomainChange {
-        entity_id: try_identity(change.entity_id.clone(), "filesystem semantic change entity_id")?,
-        schema_key: try_identity(change.schema_key.clone(), "filesystem semantic change schema_key")?,
+        entity_id: try_identity(
+            change.entity_id.clone(),
+            "filesystem semantic change entity_id",
+        )?,
+        schema_key: try_identity(
+            change.schema_key.clone(),
+            "filesystem semantic change schema_key",
+        )?,
         schema_version: Some(try_identity(
             change.schema_version.clone(),
             "filesystem semantic change schema_version",
@@ -676,7 +682,10 @@ fn proposed_domain_change_from_filesystem_semantic_change(
         )?),
         snapshot_content: change.snapshot_content.clone(),
         metadata: change.metadata.clone(),
-        version_id: try_identity(change.version_id.clone(), "filesystem semantic change version_id")?,
+        version_id: try_identity(
+            change.version_id.clone(),
+            "filesystem semantic change version_id",
+        )?,
         writer_key: change.writer_key.clone(),
     })
 }

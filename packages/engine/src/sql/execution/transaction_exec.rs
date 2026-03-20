@@ -19,8 +19,9 @@ use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
 use crate::sql::public::planner::canonicalize::canonicalize_write;
 use crate::sql::public::planner::semantics::write_analysis::analyze_write;
 use crate::sql::public::runtime::{
-    apply_public_surface_registry_mutations, decode_public_read_result,
-    execute_prepared_public_read, public_surface_registry_mutations, PublicWriteExecutionPartition,
+    apply_public_surface_registry_mutations, execute_prepared_public_read,
+    finalize_prepared_public_read_result, public_surface_registry_mutations,
+    PublicWriteExecutionPartition,
 };
 use crate::{
     ExecuteOptions, LixError, LixTransaction, QueryResult, StateCommitStreamChange, Value,
@@ -468,12 +469,8 @@ impl Engine {
             }
 
             pending_state_commit_stream_changes.extend(state_commit_stream_changes);
-            let public_result = if let Some(lowered) = prepared
-                .public_read
-                .as_ref()
-                .and_then(|prepared| prepared.lowered_read())
-            {
-                decode_public_read_result(execution.public_result, lowered)
+            let public_result = if let Some(public_read) = prepared.public_read.as_ref() {
+                finalize_prepared_public_read_result(execution.public_result, public_read)
             } else {
                 execution.public_result
             };
