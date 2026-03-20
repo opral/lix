@@ -1,5 +1,6 @@
 use super::bind::bind_public_query;
 use super::*;
+use crate::errors::classification::sanitize_lowered_public_sql_error_description;
 use crate::filesystem::history::{
     load_directory_history_rows, load_file_history_rows, DirectoryHistoryRequest,
     DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
@@ -32,6 +33,7 @@ pub(crate) struct LoweredPublicReadQuery {
     pub(crate) query: Query,
     pub(crate) required_schema_keys: BTreeSet<String>,
     pub(crate) result_columns: Option<LoweredResultColumns>,
+    pub(crate) public_output_columns: Option<Vec<String>>,
 }
 
 pub(super) async fn execute_public_read_query_strict(
@@ -39,6 +41,7 @@ pub(super) async fn execute_public_read_query_strict(
     mut query: Query,
     params: &[Value],
 ) -> Result<QueryResult, LixError> {
+    let original_public_output_columns = public_output_columns_from_query(&query);
     let mut nested_required_schema_keys = BTreeSet::new();
     lower_nested_public_read_subqueries_in_query(
         backend,
@@ -54,17 +57,27 @@ pub(super) async fn execute_public_read_query_strict(
         crate::schema::registry::ensure_schema_live_table(backend, schema_key).await?;
     }
     let bound = bind_public_query(lowered.query, params, backend.dialect())?;
-    let result = backend.execute(&bound.sql, &bound.params).await?;
+    let result = backend
+        .execute(&bound.sql, &bound.params)
+        .await
+        .map_err(|error| translate_lowered_public_read_error(error, &[]))?;
+    let public_output_columns = lowered
+        .public_output_columns
+        .as_deref()
+        .or(original_public_output_columns.as_deref());
     let Some(result_columns) = lowered.result_columns.as_ref() else {
-        return Ok(result);
+        return Ok(apply_public_output_columns(result, public_output_columns));
     };
-    Ok(decode_public_read_result(
-        result,
-        &LoweredReadProgram {
-            statements: Vec::new(),
-            pushdown_decision: PushdownDecision::default(),
-            result_columns: result_columns.clone(),
-        },
+    Ok(apply_public_output_columns(
+        decode_public_read_result(
+            result,
+            &LoweredReadProgram {
+                statements: Vec::new(),
+                pushdown_decision: PushdownDecision::default(),
+                result_columns: result_columns.clone(),
+            },
+        ),
+        public_output_columns,
     ))
 }
 
@@ -73,6 +86,18 @@ pub(crate) fn decode_public_read_result(
     lowered_read: &LoweredReadProgram,
 ) -> QueryResult {
     decode_public_read_result_columns(result, &lowered_read.result_columns)
+}
+
+pub(crate) fn finalize_prepared_public_read_result(
+    result: QueryResult,
+    prepared: &PreparedPublicRead,
+) -> QueryResult {
+    let result = if let Some(lowered) = prepared.lowered_read() {
+        decode_public_read_result(result, lowered)
+    } else {
+        result
+    };
+    apply_public_output_columns(result, prepared.public_output_columns.as_deref())
 }
 
 pub(crate) fn decode_public_read_result_columns(
@@ -124,20 +149,28 @@ pub(crate) async fn execute_prepared_public_read(
     backend: &dyn LixBackend,
     prepared: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
-    match &prepared.execution {
+    let result = match &prepared.execution {
         PreparedPublicReadExecution::LoweredSql(lowered) => {
-            execute_lowered_public_read(backend, lowered, prepared.dependency_spec.as_ref()).await
+            execute_lowered_public_read(
+                backend,
+                lowered,
+                prepared.dependency_spec.as_ref(),
+                &prepared.debug_trace.surface_bindings,
+            )
+            .await
         }
         PreparedPublicReadExecution::Direct(plan) => {
             execute_direct_public_read(backend, plan).await
         }
-    }
+    }?;
+    Ok(finalize_prepared_public_read_result(result, prepared))
 }
 
 async fn execute_lowered_public_read(
     backend: &dyn LixBackend,
     lowered: &LoweredReadProgram,
     dependency_spec: Option<&DependencySpec>,
+    public_surfaces: &[String],
 ) -> Result<QueryResult, LixError> {
     for schema_key in required_schema_keys_from_dependency_spec(dependency_spec) {
         crate::schema::registry::ensure_schema_live_table(backend, &schema_key).await?;
@@ -149,12 +182,34 @@ async fn execute_lowered_public_read(
     };
     for statement in lowered.statements.iter().cloned() {
         let statement = lower_statement(statement, backend.dialect())?;
-        result = backend.execute(&statement.to_string(), &[]).await?;
+        result = backend
+            .execute(&statement.to_string(), &[])
+            .await
+            .map_err(|error| translate_lowered_public_read_error(error, public_surfaces))?;
     }
     Ok(decode_public_read_result_columns(
         result,
         &lowered.result_columns,
     ))
+}
+
+fn apply_public_output_columns(
+    mut result: QueryResult,
+    public_output_columns: Option<&[String]>,
+) -> QueryResult {
+    let Some(public_output_columns) = public_output_columns else {
+        return result;
+    };
+    if !public_output_columns.is_empty() && public_output_columns.len() == result.columns.len() {
+        result.columns = public_output_columns.to_vec();
+    }
+    result
+}
+
+fn translate_lowered_public_read_error(error: LixError, public_surfaces: &[String]) -> LixError {
+    let description =
+        sanitize_lowered_public_sql_error_description(&error.description, public_surfaces);
+    LixError::new(&error.code, description)
 }
 
 async fn execute_direct_public_read(
@@ -976,6 +1031,7 @@ async fn lower_public_read_query_with_details(
             query,
             required_schema_keys: BTreeSet::new(),
             result_columns: None,
+            public_output_columns: None,
         });
     }
     let active_version_id = load_active_version_id_for_public_read(backend).await?;
@@ -990,6 +1046,9 @@ async fn lower_public_read_query_with_details(
         true,
     )
     .await?;
+    let prepared_public_output_columns = prepared
+        .as_ref()
+        .and_then(|prepared| prepared.public_output_columns.clone());
     let maybe_lowered_from_prepared = prepared
         .as_ref()
         .and_then(|prepared| prepared.lowered_read().cloned());
@@ -1012,6 +1071,7 @@ async fn lower_public_read_query_with_details(
                 query: rewritten,
                 required_schema_keys: BTreeSet::new(),
                 result_columns: None,
+                public_output_columns: None,
             });
         }
         let bound_statement = BoundStatement::from_statement(
@@ -1076,6 +1136,7 @@ async fn lower_public_read_query_with_details(
             query: *query,
             required_schema_keys,
             result_columns: Some(lowered.result_columns),
+            public_output_columns: prepared_public_output_columns,
         }),
         _ => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -1096,6 +1157,32 @@ fn required_schema_keys_from_dependency_spec(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn public_output_columns_from_statement(statement: &Statement) -> Option<Vec<String>> {
+    match statement {
+        Statement::Query(query) => public_output_columns_from_query(query),
+        _ => None,
+    }
+}
+
+fn public_output_columns_from_query(query: &Query) -> Option<Vec<String>> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    public_output_columns_from_select(select.as_ref())
+}
+
+fn public_output_columns_from_select(select: &Select) -> Option<Vec<String>> {
+    let mut output = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) => output.push(expr.to_string()),
+            SelectItem::ExprWithAlias { alias, .. } => output.push(alias.value.clone()),
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => return None,
+        }
+    }
+    Some(output)
 }
 
 async fn load_known_live_layouts_for_dependency_spec(
@@ -5074,6 +5161,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
     active_version_id: &str,
     explain_envelope: Option<&ExplainEnvelope>,
     registry: &SurfaceRegistry,
+    public_output_columns: Option<Vec<String>>,
 ) -> Result<SpecializedPublicReadPreparation, LixError> {
     let structured_read = match canonicalize_read(bound_statement.clone(), registry) {
         Ok(canonicalized) => canonicalized.structured_read(),
@@ -5316,6 +5404,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                 effective_state_request: effective_state_request.clone(),
                 effective_state_plan: effective_state_plan.clone(),
             }),
+            public_output_columns,
             debug_trace: PublicExecutionDebugTrace {
                 bound_statements: vec![bound_statement],
                 surface_bindings: vec![surface_binding.descriptor.public_name.clone()],
@@ -5535,6 +5624,11 @@ async fn try_prepare_public_read_with_internal_access(
     let Some((statement, explain_envelope)) = explain_query_statement(&parsed_statements[0]) else {
         return Ok(None);
     };
+    let public_output_columns = if explain_envelope.is_none() {
+        public_output_columns_from_statement(&statement)
+    } else {
+        None
+    };
     let read_summary = summarize_bound_public_read_statement(&registry, &statement);
     if read_summary.bound_surface_bindings.len() > 1
         && bound_summary_contains_direct_only_history_surface(&read_summary)
@@ -5567,6 +5661,7 @@ async fn try_prepare_public_read_with_internal_access(
             explain_envelope.as_ref(),
             &registry,
             allow_internal_tables,
+            public_output_columns.clone(),
         )
         .await?
         {
@@ -5579,6 +5674,7 @@ async fn try_prepare_public_read_with_internal_access(
         active_version_id,
         explain_envelope.as_ref(),
         &registry,
+        public_output_columns.clone(),
     )
     .await?;
     match specialized {
@@ -5591,6 +5687,7 @@ async fn try_prepare_public_read_with_internal_access(
                     explain_envelope.as_ref(),
                     &registry,
                     allow_internal_tables,
+                    public_output_columns,
                 )
                 .await?
                 {
@@ -5611,6 +5708,7 @@ async fn prepare_public_read_via_surface_lowering(
     explain_envelope: Option<&ExplainEnvelope>,
     registry: &SurfaceRegistry,
     allow_internal_tables: bool,
+    public_output_columns: Option<Vec<String>>,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
     let read_summary = summarize_bound_public_read_statement(registry, &bound_statement.statement);
     if bound_summary_contains_direct_only_history_surface(&read_summary) {
@@ -5672,6 +5770,7 @@ async fn prepare_public_read_via_surface_lowering(
 
     Ok(Some(PreparedPublicRead {
         optimization: None,
+        public_output_columns,
         debug_trace: PublicExecutionDebugTrace {
             bound_statements: vec![bound_statement.clone()],
             surface_bindings: read_summary

@@ -47,6 +47,15 @@ pub(crate) fn normalize_sql_error(error: LixError, statements: &[Statement]) -> 
         return errors::table_not_found_read_error();
     }
 
+    let public_surfaces = builtin_public_surfaces_in_statements(statements);
+    if !public_surfaces.is_empty() {
+        let sanitized =
+            sanitize_lowered_public_sql_error_description(&error.description, &public_surfaces);
+        if sanitized != error.description {
+            return LixError::new(&error.code, sanitized);
+        }
+    }
+
     error
 }
 
@@ -95,7 +104,40 @@ pub(crate) async fn normalize_sql_error_with_backend(
         return errors::table_not_found_read_error();
     }
 
+    let public_surfaces = public_surfaces_in_statements_with_backend(backend, statements).await;
+    if !public_surfaces.is_empty() {
+        let sanitized =
+            sanitize_lowered_public_sql_error_description(&error.description, &public_surfaces);
+        if sanitized != error.description {
+            return LixError::new(&error.code, sanitized);
+        }
+    }
+
     error
+}
+
+pub(crate) fn sanitize_lowered_public_sql_error_description(
+    description: &str,
+    public_surfaces: &[String],
+) -> String {
+    if let Some(ambiguous) = extract_backend_error_summary(description, "ambiguous column name:") {
+        return ambiguous;
+    }
+    if let Some(missing) = extract_backend_error_summary(description, "no such column:") {
+        return missing;
+    }
+    if let Some(missing_relation) = extract_backend_error_summary(description, "no such table:") {
+        return missing_relation;
+    }
+    if lowered_public_sql_artifact_leaked(description) {
+        let surface_summary = if public_surfaces.is_empty() {
+            "public read".to_string()
+        } else {
+            format!("public read on {}", public_surfaces.join(", "))
+        };
+        return format!("{surface_summary} execution failed after lowering");
+    }
+    description.to_string()
 }
 
 async fn resolve_available_columns(
@@ -124,6 +166,33 @@ async fn resolve_available_tables(backend: &dyn LixBackend) -> Vec<String> {
         Ok(registry) => registry.public_surface_names(),
         Err(_) => builtin_public_surface_names(),
     }
+}
+
+async fn public_surfaces_in_statements_with_backend(
+    backend: &dyn LixBackend,
+    statements: &[Statement],
+) -> Vec<String> {
+    let relation_names = relation_names_from_statements(statements);
+    let registry = match SurfaceRegistry::bootstrap_with_backend(backend).await {
+        Ok(registry) => registry,
+        Err(_) => return builtin_public_surfaces_in_statements(statements),
+    };
+    relation_names
+        .into_iter()
+        .filter(|name| registry.bind_relation_name(name).is_some())
+        .collect()
+}
+
+fn builtin_public_surfaces_in_statements(statements: &[Statement]) -> Vec<String> {
+    let builtin_surfaces = builtin_public_surface_names();
+    relation_names_from_statements(statements)
+        .into_iter()
+        .filter(|name| {
+            builtin_surfaces
+                .iter()
+                .any(|surface| surface.eq_ignore_ascii_case(name))
+        })
+        .collect()
 }
 
 pub(crate) fn is_missing_relation_error(err: &LixError) -> bool {
@@ -213,6 +282,28 @@ fn parse_sql_offset(description: &str) -> Option<usize> {
     digits.parse::<usize>().ok()
 }
 
+fn lowered_public_sql_artifact_leaked(description: &str) -> bool {
+    let lower = description.to_ascii_lowercase();
+    lower.contains("lix_internal_")
+        || lower.contains("with target_versions")
+        || lower.contains("lix_internal_live_v1_")
+        || lower.contains("lix_internal_live_untracked_v1_")
+}
+
+pub(crate) fn extract_backend_error_summary(description: &str, marker: &str) -> Option<String> {
+    let start = description.find(marker)?;
+    let tail = &description[start + marker.len()..];
+    let end = tail
+        .find(" in ")
+        .or_else(|| tail.find(" at offset"))
+        .unwrap_or(tail.len());
+    let value = tail[..end].trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(format!("{marker} {value}"))
+}
+
 fn extract_name_between(description: &str, start_marker: &str, end_marker: &str) -> Option<String> {
     let lower = description.to_ascii_lowercase();
     let start_marker_lower = start_marker.to_ascii_lowercase();
@@ -256,7 +347,10 @@ fn sanitize_name(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_missing_relation_error, normalize_sql_error};
+    use super::{
+        is_missing_relation_error, normalize_sql_error,
+        sanitize_lowered_public_sql_error_description,
+    };
     use crate::LixError;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -364,5 +458,39 @@ mod tests {
         assert!(error.description.contains("Available columns: value"));
         assert!(error.description.contains("lixcol_entity_id"));
         assert!(!error.description.contains("Available columns: (unknown)."));
+    }
+
+    #[test]
+    fn sanitizes_lowered_public_ambiguous_column_errors() {
+        let sanitized = sanitize_lowered_public_sql_error_description(
+            "ambiguous column name: *.lix_key_value.key in SELECT * FROM (WITH target_versions AS (...) SELECT * FROM lix_internal_live_v1_lix_key_value)",
+            &[String::from("lix_key_value")],
+        );
+
+        assert_eq!(sanitized, "ambiguous column name: *.lix_key_value.key");
+    }
+
+    #[test]
+    fn normalizes_lowered_public_sql_leaks_to_generic_message() {
+        let statements = Parser::parse_sql(
+            &GenericDialect {},
+            "SELECT * FROM lix_key_value, lix_key_value",
+        )
+        .expect("parse SQL");
+        let error = normalize_sql_error(
+            LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description:
+                    "backend failed in SELECT * FROM (WITH target_versions AS (...) SELECT * FROM lix_internal_live_v1_lix_key_value)"
+                        .to_string(),
+            },
+            &statements,
+        );
+
+        assert_eq!(error.code, "LIX_ERROR_UNKNOWN");
+        assert_eq!(
+            error.description,
+            "public read on lix_key_value execution failed after lowering"
+        );
     }
 }

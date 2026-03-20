@@ -399,10 +399,11 @@ pub(crate) struct PreparedPublicRead {
     pub(crate) optimization: Option<PublicReadOptimization>,
     pub(crate) dependency_spec: Option<DependencySpec>,
     pub(crate) execution: PreparedPublicReadExecution,
+    pub(crate) public_output_columns: Option<Vec<String>>,
     pub(crate) debug_trace: PublicExecutionDebugTrace,
 }
 
-pub(crate) use read::{decode_public_read_result, execute_prepared_public_read};
+pub(crate) use read::{execute_prepared_public_read, finalize_prepared_public_read_result};
 
 impl PreparedPublicRead {
     pub(crate) fn structured_read(&self) -> Option<&StructuredPublicRead> {

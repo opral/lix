@@ -16,8 +16,8 @@ use crate::sql::execution::write_program_runner::execute_write_program_with_tran
 use crate::sql::execution::write_txn_plan::build_write_txn_plan;
 use crate::sql::execution::write_txn_runner::run_write_txn_plan_with_backend;
 use crate::sql::public::runtime::{
-    classify_public_execution_route_with_registry, decode_public_read_result,
-    execute_prepared_public_read,
+    classify_public_execution_route_with_registry, execute_prepared_public_read,
+    finalize_prepared_public_read_result,
 };
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::internal::inline_functions::inline_lix_functions_with_provider;
@@ -223,12 +223,8 @@ impl Engine {
         )
         .await?;
 
-        let public_result = if let Some(lowered) = prepared
-            .public_read
-            .as_ref()
-            .and_then(|prepared| prepared.lowered_read())
-        {
-            decode_public_read_result(execution.public_result, lowered)
+        let public_result = if let Some(public_read) = prepared.public_read.as_ref() {
+            finalize_prepared_public_read_result(execution.public_result, public_read)
         } else {
             execution.public_result
         };
