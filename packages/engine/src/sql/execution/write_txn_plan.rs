@@ -3,27 +3,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::functions::SharedFunctionProvider;
 use crate::sql::execution::contracts::effects::PlanEffects;
+use crate::sql::execution::execution_program::{CompiledExecution, CompiledInternalExecution};
 use crate::sql::execution::runtime_effects::{
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
     FilesystemTransactionFileState, FilesystemTransactionState,
 };
-use crate::sql::execution::shared_path::{PendingTransactionView, PreparedExecutionContext};
+use crate::sql::execution::shared_path::PendingTransactionView;
 use crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch;
 use crate::sql::public::runtime::{
     build_tracked_txn_unit, PublicWriteExecutionPartition, TrackedTxnUnit, UntrackedWriteExecution,
 };
 use crate::LixError;
 
-use super::contracts::execution_plan::ExecutionPlan;
-
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const GLOBAL_VERSION_ID: &str = "global";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WriteTxnRunMode {
-    Owned,
-    Borrowed,
-}
 
 #[derive(Clone)]
 pub(crate) struct PublicUntrackedTxnUnit {
@@ -37,7 +30,9 @@ pub(crate) struct PublicUntrackedTxnUnit {
 
 #[derive(Clone)]
 pub(crate) struct InternalTxnUnit {
-    pub(crate) plan: ExecutionPlan,
+    pub(crate) execution: CompiledInternalExecution,
+    pub(crate) effects: PlanEffects,
+    pub(crate) result_contract: crate::sql::execution::contracts::result_contract::ResultContract,
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) functions: SharedFunctionProvider<RuntimeFunctionProvider>,
     pub(crate) settings: DeterministicSettings,
@@ -61,31 +56,6 @@ impl TxnMaterializationPlan {
     pub(crate) fn extend(&mut self, other: TxnMaterializationPlan) {
         self.units.extend(other.units);
         self.coalesce_filesystem_tracked_units();
-    }
-
-    pub(crate) fn bind_runtime(
-        &mut self,
-        settings: DeterministicSettings,
-        sequence_start: i64,
-        functions: SharedFunctionProvider<RuntimeFunctionProvider>,
-    ) {
-        for unit in &mut self.units {
-            match unit {
-                TxnMaterializationUnit::PublicTracked(tracked) => {
-                    tracked.functions = functions.clone();
-                }
-                TxnMaterializationUnit::PublicUntracked(untracked) => {
-                    untracked.settings = settings;
-                    untracked.sequence_start = sequence_start;
-                    untracked.functions = functions.clone();
-                }
-                TxnMaterializationUnit::Internal(internal) => {
-                    internal.settings = settings;
-                    internal.sequence_start = sequence_start;
-                    internal.functions = functions.clone();
-                }
-            }
-        }
     }
 
     pub(crate) fn coalesce_filesystem_tracked_units(&mut self) {
@@ -445,13 +415,13 @@ pub(crate) fn txn_materialization_plans_can_continue_together(
 }
 
 pub(crate) fn build_txn_materialization_plan(
-    prepared: &PreparedExecutionContext,
+    prepared: &CompiledExecution,
     writer_key: Option<&str>,
 ) -> Option<TxnMaterializationPlan> {
     let mut units = Vec::new();
 
-    if let Some(public_write) = prepared.public_write.as_ref() {
-        if let Some(execution) = public_write.execution.as_ref() {
+    if let Some(public_write) = prepared.public_write() {
+        if let Some(execution) = public_write.materialization() {
             for partition in &execution.partitions {
                 match partition {
                     PublicWriteExecutionPartition::Tracked(tracked) => {
@@ -474,9 +444,14 @@ pub(crate) fn build_txn_materialization_plan(
                 }
             }
         }
-    } else if !prepared.plan.requirements.read_only_query {
+    } else if !prepared.read_only_query {
+        let Some(internal_execution) = prepared.internal_execution().cloned() else {
+            return None;
+        };
         units.push(TxnMaterializationUnit::Internal(InternalTxnUnit {
-            plan: prepared.plan.clone(),
+            execution: internal_execution,
+            effects: prepared.effects.clone(),
+            result_contract: prepared.result_contract,
             filesystem_state: prepared.intent.filesystem_state.clone(),
             functions: prepared.functions.clone(),
             settings: prepared.settings,
@@ -495,7 +470,7 @@ pub(crate) fn build_txn_materialization_plan(
 }
 
 pub(crate) fn build_txn_delta(
-    prepared: &PreparedExecutionContext,
+    prepared: &CompiledExecution,
     writer_key: Option<&str>,
 ) -> Result<Option<TxnDelta>, LixError> {
     build_txn_materialization_plan(prepared, writer_key)
@@ -535,12 +510,12 @@ fn collect_semantic_overlay_from_plan(
             }
             TxnMaterializationUnit::Internal(internal) => {
                 internal.filesystem_state.files.is_empty()
-                    && internal.plan.preprocess.internal_state.is_none()
+                    && internal.execution.postprocess.is_none()
                     && collect_semantic_overlay_from_mutation_rows(
-                        &internal.plan.preprocess.mutations,
+                        &internal.execution.mutations,
                         overlay,
                     )?
-                    && internal.plan.preprocess.update_validations.is_empty()
+                    && internal.execution.update_validations.is_empty()
             }
         };
 

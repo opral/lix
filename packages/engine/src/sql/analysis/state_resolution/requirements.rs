@@ -13,7 +13,5 @@ pub(crate) fn derive_requirements_from_state_resolution(
     PlanRequirements {
         read_only_query: optimized.read_only_query,
         should_refresh_file_cache: optimized.should_refresh_file_cache,
-        should_invalidate_installed_plugins_cache: optimized
-            .should_invalidate_installed_plugins_cache,
     }
 }

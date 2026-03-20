@@ -34,7 +34,7 @@ pub(crate) struct LoweredPublicReadQuery {
     pub(crate) result_columns: Option<LoweredResultColumns>,
 }
 
-pub(super) async fn execute_public_read_query_strict(
+pub(crate) async fn execute_public_read_query_strict(
     backend: &dyn LixBackend,
     mut query: Query,
     params: &[Value],
@@ -132,62 +132,40 @@ pub(crate) async fn execute_prepared_public_read(
         .unwrap_or(&[]);
     match &prepared.execution {
         PreparedPublicReadExecution::LoweredSql(lowered) => {
-            execute_lowered_public_read(
-                backend,
-                lowered,
-                prepared.dependency_spec.as_ref(),
-                bound_params,
-            )
-            .await
-        }
-        PreparedPublicReadExecution::Direct(plan) => {
-            execute_direct_public_read(backend, plan).await
-        }
-    }
-}
+            for schema_key in
+                required_schema_keys_from_dependency_spec(prepared.dependency_spec.as_ref())
+            {
+                crate::schema::registry::ensure_schema_live_table(backend, &schema_key).await?;
+            }
 
-async fn execute_lowered_public_read(
-    backend: &dyn LixBackend,
-    lowered: &LoweredReadProgram,
-    dependency_spec: Option<&DependencySpec>,
-    params: &[Value],
-) -> Result<QueryResult, LixError> {
-    for schema_key in required_schema_keys_from_dependency_spec(dependency_spec) {
-        crate::schema::registry::ensure_schema_live_table(backend, &schema_key).await?;
-    }
-
-    let mut result = QueryResult {
-        rows: Vec::new(),
-        columns: Vec::new(),
-    };
-    for statement in lowered.statements.iter().cloned() {
-        let statement = lower_statement(statement, backend.dialect())?;
-        let bound = bind_public_statement_sql(statement, params, backend.dialect())?;
-        result = backend.execute(&bound.sql, &bound.params).await?;
-    }
-    Ok(decode_public_read_result_columns(
-        result,
-        &lowered.result_columns,
-    ))
-}
-
-async fn execute_direct_public_read(
-    backend: &dyn LixBackend,
-    plan: &DirectPublicReadPlan,
-) -> Result<QueryResult, LixError> {
-    match plan {
-        DirectPublicReadPlan::StateHistory(plan) => {
-            execute_direct_state_history_read(backend, plan).await
+            let mut result = QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            };
+            for statement in lowered.statements.iter().cloned() {
+                let statement = lower_statement(statement, backend.dialect())?;
+                let bound = bind_public_statement_sql(statement, bound_params, backend.dialect())?;
+                result = backend.execute(&bound.sql, &bound.params).await?;
+            }
+            Ok(decode_public_read_result_columns(
+                result,
+                &lowered.result_columns,
+            ))
         }
-        DirectPublicReadPlan::EntityHistory(plan) => {
-            execute_direct_entity_history_read(backend, plan).await
-        }
-        DirectPublicReadPlan::FileHistory(plan) => {
-            execute_direct_file_history_read(backend, plan).await
-        }
-        DirectPublicReadPlan::DirectoryHistory(plan) => {
-            execute_direct_directory_history_read(backend, plan).await
-        }
+        PreparedPublicReadExecution::Direct(plan) => match plan {
+            DirectPublicReadPlan::StateHistory(plan) => {
+                execute_direct_state_history_read(backend, plan).await
+            }
+            DirectPublicReadPlan::EntityHistory(plan) => {
+                execute_direct_entity_history_read(backend, plan).await
+            }
+            DirectPublicReadPlan::FileHistory(plan) => {
+                execute_direct_file_history_read(backend, plan).await
+            }
+            DirectPublicReadPlan::DirectoryHistory(plan) => {
+                execute_direct_directory_history_read(backend, plan).await
+            }
+        },
     }
 }
 
@@ -1056,6 +1034,7 @@ async fn lower_public_read_query_with_details(
         let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
         let known_live_layouts = load_known_live_layouts_for_public_read(
             backend,
+            &structured_read,
             dependency_spec.as_ref(),
             effective_state.as_ref().map(|(request, _)| request),
         )
@@ -1130,11 +1109,29 @@ async fn load_known_live_layouts_for_dependency_spec(
 
 async fn load_known_live_layouts_for_public_read(
     backend: &dyn LixBackend,
+    structured_read: &StructuredPublicRead,
     dependency_spec: Option<&DependencySpec>,
     effective_state_request: Option<&EffectiveStateRequest>,
 ) -> Result<BTreeMap<String, LiveTableLayout>, LixError> {
     let mut layouts = load_known_live_layouts_for_dependency_spec(backend, dependency_spec).await?;
     if let Some(request) = effective_state_request {
+        if let Some(schema_key) = structured_read
+            .surface_binding
+            .implicit_overrides
+            .fixed_schema_key
+            .as_ref()
+        {
+            if !layouts.contains_key(schema_key) {
+                if let Some(layout) =
+                    crate::schema::live_layout::builtin_live_table_layout(schema_key)?
+                {
+                    layouts.insert(schema_key.clone(), layout);
+                } else {
+                    let layout = load_live_table_layout_with_backend(backend, schema_key).await?;
+                    layouts.insert(schema_key.clone(), layout);
+                }
+            }
+        }
         for schema_key in &request.schema_set {
             if layouts.contains_key(schema_key) {
                 continue;
@@ -5082,6 +5079,38 @@ enum SpecializedPublicReadPreparation {
     Declined { reason: String },
 }
 
+fn parse_public_read_unknown_column_name(message: &str) -> Option<String> {
+    let prefix = "strict rewrite violation: unknown column '";
+    let start = message.find(prefix)? + prefix.len();
+    let end = message[start..].find('\'')? + start;
+    let column = &message[start..end];
+    (!column.is_empty()).then(|| column.to_string())
+}
+
+fn public_read_preparation_error(bindings: &[SurfaceBinding], message: &str) -> Option<LixError> {
+    let missing_column = parse_public_read_unknown_column_name(message)?;
+    let binding = if bindings.len() == 1 {
+        bindings.first()
+    } else {
+        bindings
+            .iter()
+            .find(|binding| message.contains(&format!("on '{}'", binding.descriptor.public_name)))
+    }?;
+    let available_columns = binding
+        .descriptor
+        .visible_columns
+        .iter()
+        .chain(binding.descriptor.hidden_columns.iter())
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    Some(crate::errors::sql_unknown_column_error(
+        &missing_column,
+        Some(&binding.descriptor.public_name),
+        available_columns.as_slice(),
+        None,
+    ))
+}
+
 async fn try_prepare_public_read_via_specialized_optimization(
     backend: &dyn LixBackend,
     bound_statement: BoundStatement,
@@ -5142,6 +5171,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
     let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
     let known_live_layouts = load_known_live_layouts_for_public_read(
         backend,
+        &structured_read,
         dependency_spec.as_ref(),
         effective_state.as_ref().map(|(request, _)| request),
     )
@@ -5611,6 +5641,11 @@ async fn try_prepare_public_read_with_internal_access(
                     return Ok(Some(prepared));
                 }
             }
+            if let Some(error) =
+                public_read_preparation_error(&read_summary.bound_surface_bindings, &reason)
+            {
+                return Err(error);
+            }
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!("public read preparation failed: {reason}"),
@@ -5649,11 +5684,20 @@ async fn prepare_public_read_via_surface_lowering(
     }
 
     let mut rewritten_statement = bound_statement.statement.clone();
-    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_dialect(
-        &mut rewritten_statement,
-        registry,
-        backend.dialect(),
-    )?;
+    if let Err(error) =
+        rewrite_supported_public_read_surfaces_in_statement_with_registry_and_dialect(
+            &mut rewritten_statement,
+            registry,
+            backend.dialect(),
+        )
+    {
+        if let Some(mapped) =
+            public_read_preparation_error(&read_summary.bound_surface_bindings, &error.description)
+        {
+            return Err(mapped);
+        }
+        return Err(error);
+    }
     if statement_references_public_surface(registry, &rewritten_statement) {
         return Ok(None);
     }

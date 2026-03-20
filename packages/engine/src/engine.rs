@@ -2,6 +2,7 @@ use crate::cel::CelEvaluator;
 use crate::deterministic_mode::{deterministic_mode_key, DeterministicSettings};
 use crate::key_value::key_value_schema_key;
 use crate::plugin::types::InstalledPlugin;
+use crate::sql::execution::execution_program::ExecutionContext;
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
@@ -20,7 +21,6 @@ use std::sync::RwLock;
 
 use crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange;
 use crate::sql::execution::contracts::planned_statement::MutationRow;
-use crate::sql::execution::write_txn_plan::MutationJournal;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
@@ -64,40 +64,24 @@ pub struct Engine {
 pub struct EngineTransaction<'a> {
     pub(crate) engine: &'a Engine,
     pub(crate) transaction: Option<Box<dyn LixTransaction + 'a>>,
-    pub(crate) core: SharedTransactionCore,
-}
-
-pub(crate) struct SharedTransactionCore {
-    pub(crate) options: ExecuteOptions,
-    pub(crate) public_surface_registry: SurfaceRegistry,
-    pub(crate) active_version_id: String,
-    pub(crate) active_version_changed: bool,
-    pub(crate) installed_plugins_cache_invalidation_pending: bool,
-    pub(crate) public_surface_registry_dirty: bool,
-    pub(crate) pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
-    pub(crate) observe_tick_already_emitted: bool,
-    pub(crate) pending_public_commit_session:
-        Option<crate::sql::execution::shared_path::PendingPublicCommitSession>,
-    pub(crate) mutation_journal: MutationJournal,
+    pub(crate) context: ExecutionContext,
 }
 
 impl Engine {
-    pub(crate) fn new_shared_transaction_core(
+    pub(crate) fn new_execution_context(
         &self,
         options: ExecuteOptions,
-    ) -> Result<SharedTransactionCore, LixError> {
-        Ok(SharedTransactionCore {
-            options,
-            public_surface_registry: self.public_surface_registry(),
-            active_version_id: self.require_active_version_id()?,
-            active_version_changed: false,
-            installed_plugins_cache_invalidation_pending: false,
-            public_surface_registry_dirty: false,
-            pending_state_commit_stream_changes: Vec::new(),
-            observe_tick_already_emitted: false,
-            pending_public_commit_session: None,
-            mutation_journal: MutationJournal::default(),
-        })
+    ) -> Result<ExecutionContext, LixError> {
+        let active_version_id = self.require_active_version_id()?;
+        Ok(self.new_execution_context_with_active_version(options, active_version_id))
+    }
+
+    pub(crate) fn new_execution_context_with_active_version(
+        &self,
+        options: ExecuteOptions,
+        active_version_id: String,
+    ) -> ExecutionContext {
+        ExecutionContext::new(options, self.public_surface_registry(), active_version_id)
     }
 
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
@@ -106,10 +90,6 @@ impl Engine {
 
     pub fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {
         self.state_commit_stream_bus.subscribe(filter)
-    }
-
-    pub(crate) fn backend_ref(&self) -> &(dyn LixBackend + Send + Sync) {
-        self.backend.as_ref()
     }
 
     pub(crate) fn access_to_internal(&self) -> bool {
@@ -228,53 +208,44 @@ impl Engine {
         self.in_init_transaction.store(active, Ordering::SeqCst);
     }
 
-    pub(crate) async fn prepare_transaction_core_for_commit(
+    pub(crate) async fn prepare_execution_context_for_commit(
         &self,
         transaction: &mut dyn LixTransaction,
-        core: &mut SharedTransactionCore,
+        context: &mut ExecutionContext,
     ) -> Result<(), LixError> {
-        let active_version_before_flush = core.active_version_id.clone();
-        self.flush_mutation_journal_in_transaction(
-            transaction,
-            &mut core.public_surface_registry,
-            &mut core.public_surface_registry_dirty,
-            &mut core.active_version_id,
-            &mut core.mutation_journal,
-            &mut core.pending_state_commit_stream_changes,
-            &mut core.pending_public_commit_session,
-            &mut core.observe_tick_already_emitted,
-        )
-        .await?;
-        if core.active_version_id != active_version_before_flush {
-            core.active_version_changed = true;
+        let active_version_before_flush = context.active_version_id.clone();
+        self.flush_mutation_journal_in_transaction(transaction, context)
+            .await?;
+        if context.active_version_id != active_version_before_flush {
+            context.active_version_changed = true;
         }
-        if !core.observe_tick_already_emitted
-            && !core.pending_state_commit_stream_changes.is_empty()
+        if !context.observe_tick_already_emitted
+            && !context.pending_state_commit_stream_changes.is_empty()
         {
             self.append_observe_tick_in_transaction(
                 transaction,
-                core.options.writer_key.as_deref(),
+                context.options.writer_key.as_deref(),
             )
             .await?;
         }
         Ok(())
     }
 
-    pub(crate) async fn finalize_committed_transaction_core(
+    pub(crate) async fn finalize_committed_execution_context(
         &self,
-        mut core: SharedTransactionCore,
+        mut context: ExecutionContext,
     ) -> Result<(), LixError> {
-        if core.active_version_changed {
-            self.set_active_version_id(std::mem::take(&mut core.active_version_id));
+        if context.active_version_changed {
+            self.set_active_version_id(std::mem::take(&mut context.active_version_id));
         }
-        if core.installed_plugins_cache_invalidation_pending {
+        if context.installed_plugins_cache_invalidation_pending {
             self.invalidate_installed_plugins_cache()?;
         }
-        if core.public_surface_registry_dirty {
+        if context.public_surface_registry_dirty {
             self.refresh_public_surface_registry().await?;
         }
         self.emit_state_commit_stream_changes(std::mem::take(
-            &mut core.pending_state_commit_stream_changes,
+            &mut context.pending_state_commit_stream_changes,
         ));
         Ok(())
     }
@@ -665,7 +636,7 @@ mod tests {
         boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
-    use crate::schema::live_layout::{untracked_live_table_name, UNTRACKED_LIVE_TABLE_PREFIX};
+    use crate::schema::live_layout::untracked_live_table_name;
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
     use crate::sql::analysis::state_resolution::effects::active_version_from_update_validations;
     use crate::sql::analysis::state_resolution::optimize::should_refresh_file_cache_for_statements;
@@ -690,11 +661,6 @@ mod tests {
     struct TestTransaction {
         commit_called: Arc<AtomicBool>,
         rollback_called: Arc<AtomicBool>,
-    }
-
-    #[derive(Default)]
-    struct PlainReadBackend {
-        executed_sql: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[async_trait(?Send)]
@@ -737,11 +703,13 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        async fn execute(
-            &mut self,
-            _sql: &str,
-            _params: &[Value],
-        ) -> Result<QueryResult, LixError> {
+        async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            if sql.to_ascii_lowercase().contains("unknown_table") {
+                return Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: "no such table: unknown_table".to_string(),
+                });
+            }
             Ok(QueryResult {
                 rows: Vec::new(),
                 columns: Vec::new(),
@@ -756,56 +724,6 @@ mod tests {
         async fn rollback(self: Box<Self>) -> Result<(), LixError> {
             self.rollback_called.store(true, Ordering::SeqCst);
             Ok(())
-        }
-    }
-
-    #[async_trait(?Send)]
-    impl LixBackend for PlainReadBackend {
-        fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
-        }
-
-        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            self.executed_sql
-                .lock()
-                .expect("executed_sql lock")
-                .push(sql.to_string());
-            if sql.contains("lix_deterministic_mode")
-                || sql.contains(UNTRACKED_LIVE_TABLE_PREFIX)
-                || sql.contains("lix_internal_registered_schema_bootstrap")
-            {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("plain backend read should not execute preparation SQL: {sql}"),
-                ));
-            }
-            if sql.trim() == "SELECT 1 + 1" {
-                return Ok(QueryResult {
-                    rows: vec![vec![Value::Integer(2)]],
-                    columns: vec!["?column?".to_string()],
-                });
-            }
-            Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("unexpected SQL in PlainReadBackend: {sql}"),
-            ))
-        }
-
-        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
-            Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "plain backend read should not begin a transaction",
-            ))
-        }
-
-        async fn begin_savepoint(
-            &self,
-            _name: &str,
-        ) -> Result<Box<dyn LixTransaction + '_>, LixError> {
-            Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "begin_savepoint not supported in test backend",
-            ))
         }
     }
 
@@ -927,38 +845,6 @@ mod tests {
     }
 
     #[test]
-    fn plain_backend_read_bypasses_public_preparation() {
-        std::thread::Builder::new()
-            .name("plain-backend-read-test".to_string())
-            .stack_size(32 * 1024 * 1024)
-            .spawn(|| {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("build tokio runtime");
-                runtime.block_on(async {
-                    let backend = PlainReadBackend::default();
-                    let executed_sql = Arc::clone(&backend.executed_sql);
-                    let engine = boot(BootArgs::new(Box::new(backend), Arc::new(NoopWasmRuntime)));
-                    engine.set_active_version_id("version-test".to_string());
-
-                    let result = engine
-                        .execute("SELECT 1 + 1", &[])
-                        .await
-                        .expect("plain backend read should succeed");
-
-                    assert_eq!(result.statements[0].rows, vec![vec![Value::Integer(2)]]);
-                    let executed = executed_sql.lock().expect("executed_sql lock");
-                    assert_eq!(executed.len(), 1);
-                    assert_eq!(executed[0], "SELECT 1 + 1");
-                });
-            })
-            .expect("spawn plain backend read test thread")
-            .join()
-            .expect("plain backend read test thread should succeed");
-    }
-
-    #[test]
     fn plugin_cache_invalidation_detects_filesystem_mutations() {
         assert!(should_invalidate_installed_plugins_cache_for_sql(
             "INSERT INTO lix_file (id, path, data) VALUES ('f', '/.lix/plugins/k.lixplugin', X'00')"
@@ -999,7 +885,7 @@ mod tests {
             .begin_transaction_with_options(ExecuteOptions::default())
             .await
             .expect("begin transaction");
-        tx.core.installed_plugins_cache_invalidation_pending = true;
+        tx.context.installed_plugins_cache_invalidation_pending = true;
 
         assert!(
             engine
@@ -1048,7 +934,7 @@ mod tests {
             .begin_transaction_with_options(ExecuteOptions::default())
             .await
             .expect("begin transaction");
-        tx.core.installed_plugins_cache_invalidation_pending = true;
+        tx.context.installed_plugins_cache_invalidation_pending = true;
         tx.rollback().await.expect("rollback should succeed");
 
         assert!(!commit_called.load(Ordering::SeqCst));

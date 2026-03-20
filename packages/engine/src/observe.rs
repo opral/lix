@@ -875,7 +875,9 @@ mod tests {
         observe_query_hits: Arc<AtomicUsize>,
     }
 
-    struct CountingObserveTransaction;
+    struct CountingObserveTransaction {
+        observe_query_hits: Arc<AtomicUsize>,
+    }
 
     #[async_trait(?Send)]
     impl LixBackend for CountingObserveBackend {
@@ -904,7 +906,9 @@ mod tests {
         }
 
         async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
-            Ok(Box::new(CountingObserveTransaction))
+            Ok(Box::new(CountingObserveTransaction {
+                observe_query_hits: Arc::clone(&self.observe_query_hits),
+            }))
         }
 
         async fn begin_savepoint(
@@ -921,11 +925,20 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        async fn execute(
-            &mut self,
-            _sql: &str,
-            _params: &[Value],
-        ) -> Result<QueryResult, LixError> {
+        async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            if sql.contains("observe-shared-sentinel") {
+                self.observe_query_hits.fetch_add(1, Ordering::SeqCst);
+                return Ok(QueryResult {
+                    rows: vec![vec![Value::Text("observe-shared-sentinel".to_string())]],
+                    columns: vec!["marker".to_string()],
+                });
+            }
+            if sql.contains("FROM lix_internal_observe_tick") {
+                return Ok(QueryResult {
+                    rows: Vec::new(),
+                    columns: vec!["tick_seq".to_string(), "writer_key".to_string()],
+                });
+            }
             Ok(QueryResult {
                 rows: Vec::new(),
                 columns: Vec::new(),
