@@ -6,7 +6,7 @@ use crate::sql::execution::shared_path::PreparedExecutionContext;
 use super::{PreparedPublicWrite, TrackedWriteExecution};
 
 #[derive(Clone)]
-pub(crate) struct TrackedWriteTxnPlan {
+pub(crate) struct TrackedTxnUnit {
     pub(crate) public_writes: Vec<PreparedPublicWrite>,
     pub(crate) public_write: PreparedPublicWrite,
     pub(crate) execution: TrackedWriteExecution,
@@ -15,7 +15,7 @@ pub(crate) struct TrackedWriteTxnPlan {
     pub(crate) writer_key: Option<String>,
 }
 
-impl TrackedWriteTxnPlan {
+impl TrackedTxnUnit {
     pub(crate) fn should_emit_observe_tick(&self) -> bool {
         self.has_compiler_only_filesystem_changes()
             || !self
@@ -34,13 +34,13 @@ impl TrackedWriteTxnPlan {
     }
 }
 
-pub(crate) fn build_tracked_write_txn_plan(
+pub(crate) fn build_tracked_txn_unit(
     public_write: &PreparedPublicWrite,
     execution: &TrackedWriteExecution,
     prepared: &PreparedExecutionContext,
     writer_key: Option<&str>,
-) -> TrackedWriteTxnPlan {
-    TrackedWriteTxnPlan {
+) -> TrackedTxnUnit {
+    TrackedTxnUnit {
         public_writes: vec![public_write.clone()],
         public_write: public_write.clone(),
         execution: execution.clone(),

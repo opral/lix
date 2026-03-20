@@ -3,8 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::sql::public::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::sql::public::runtime::{
-    finalize_public_write_execution, prepare_public_execution_with_internal_access,
+    decode_public_read_result, execute_prepared_public_read, finalize_public_write_execution,
+    prepare_public_execution_with_internal_access,
     prepare_public_execution_with_registry_and_internal_access,
     prepared_public_write_mutates_public_surface_registry, PreparedPublicExecution,
     PreparedPublicRead, PreparedPublicReadExecution, PreparedPublicWrite,
@@ -79,6 +81,69 @@ pub(crate) struct PreparedExecutionContext {
     pub(crate) plan: ExecutionPlan,
     pub(crate) public_read: Option<PreparedPublicRead>,
     pub(crate) public_write: Option<PreparedPublicWrite>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparedPublicReadTransactionMode {
+    PendingView,
+    CommittedOnly,
+    MaterializedState,
+}
+
+pub(crate) struct TransactionViewBackend<'a> {
+    inner: TransactionViewBackendInner<'a>,
+}
+
+enum TransactionViewBackendInner<'a> {
+    Base(&'a dyn LixBackend),
+    Overlay(TransactionOverlayBackend<'a>),
+}
+
+impl<'a> TransactionViewBackend<'a> {
+    pub(crate) fn new(
+        base: &'a dyn LixBackend,
+        pending_transaction_view: Option<&PendingTransactionView>,
+    ) -> Self {
+        match pending_transaction_view.cloned() {
+            Some(pending_transaction_view) => Self {
+                inner: TransactionViewBackendInner::Overlay(TransactionOverlayBackend::new(
+                    base,
+                    pending_transaction_view,
+                )),
+            },
+            None => Self {
+                inner: TransactionViewBackendInner::Base(base),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct PendingTransactionView {
+    registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
+    semantic_overlay: Option<PendingSemanticOverlay>,
+    filesystem_overlay: Option<PendingFilesystemOverlay>,
+}
+
+impl PendingTransactionView {
+    pub(crate) fn new(
+        registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
+        semantic_overlay: Option<PendingSemanticOverlay>,
+        filesystem_overlay: Option<PendingFilesystemOverlay>,
+    ) -> Option<Self> {
+        let view = Self {
+            registered_schema_overlay,
+            semantic_overlay,
+            filesystem_overlay,
+        };
+        view.has_overlays().then_some(view)
+    }
+
+    fn has_overlays(&self) -> bool {
+        self.registered_schema_overlay.is_some()
+            || self.semantic_overlay.is_some()
+            || self.filesystem_overlay.is_some()
+    }
 }
 
 pub(crate) fn prepared_execution_mutates_public_surface_registry(
@@ -176,9 +241,7 @@ impl CommitQueryExecutor for TransactionCommitExecutor<'_> {
 pub(crate) async fn prepare_execution_with_backend(
     engine: &Engine,
     backend: &dyn LixBackend,
-    pending_registered_schema_overlay: Option<&PendingRegisteredSchemaOverlay>,
-    pending_semantic_overlay: Option<&PendingSemanticOverlay>,
-    pending_filesystem_overlay: Option<&PendingFilesystemOverlay>,
+    pending_transaction_view: Option<&PendingTransactionView>,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
@@ -187,21 +250,8 @@ pub(crate) async fn prepare_execution_with_backend(
     public_surface_registry_override: Option<&crate::sql::public::catalog::SurfaceRegistry>,
     policy: PreparationPolicy,
 ) -> Result<PreparedExecutionContext, LixError> {
-    let overlay_backend;
-    let backend: &dyn LixBackend = if pending_registered_schema_overlay.is_some()
-        || pending_semantic_overlay.is_some()
-        || pending_filesystem_overlay.is_some()
-    {
-        overlay_backend = TransactionOverlayBackend::new(
-            backend,
-            pending_registered_schema_overlay.cloned(),
-            pending_semantic_overlay.cloned(),
-            pending_filesystem_overlay.cloned(),
-        );
-        &overlay_backend
-    } else {
-        backend
-    };
+    let transaction_view_backend = TransactionViewBackend::new(backend, pending_transaction_view);
+    let backend: &dyn LixBackend = &transaction_view_backend;
 
     let defer_runtime_sequence_load = !allow_internal_tables
         && !crate::filesystem::statements_require_generated_filesystem_insert_ids(
@@ -432,11 +482,88 @@ pub(crate) async fn prepare_execution_with_backend(
     })
 }
 
+pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view(
+    base: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    public_read: &PreparedPublicRead,
+) -> Result<QueryResult, LixError> {
+    let Some(pending_transaction_view) = pending_transaction_view.cloned() else {
+        return execute_prepared_public_read(base, public_read).await;
+    };
+
+    match prepared_public_read_transaction_mode(public_read) {
+        PreparedPublicReadTransactionMode::PendingView => {
+            if let Some(query) = live_table_query_from_prepared_public_read(public_read) {
+                let overlay = TransactionOverlayBackend::new(base, pending_transaction_view);
+                let result = overlay.execute_live_table_query(&query).await?;
+                if let Some(lowered) = public_read.lowered_read() {
+                    return Ok(decode_public_read_result(result, lowered));
+                }
+                return Ok(result);
+            }
+
+            let backend = TransactionViewBackend::new(base, Some(&pending_transaction_view));
+            execute_prepared_public_read(&backend, public_read).await
+        }
+        PreparedPublicReadTransactionMode::CommittedOnly
+        | PreparedPublicReadTransactionMode::MaterializedState => {
+            execute_prepared_public_read(base, public_read).await
+        }
+    }
+}
+
+pub(crate) fn prepared_public_read_transaction_mode(
+    public_read: &PreparedPublicRead,
+) -> PreparedPublicReadTransactionMode {
+    if public_read.direct_plan().is_some() {
+        return PreparedPublicReadTransactionMode::CommittedOnly;
+    }
+
+    if live_table_query_from_prepared_public_read(public_read).is_some()
+        || public_read.effective_state_plan().is_some()
+    {
+        return PreparedPublicReadTransactionMode::PendingView;
+    }
+
+    PreparedPublicReadTransactionMode::MaterializedState
+}
+
 struct TransactionOverlayBackend<'a> {
     base: &'a dyn LixBackend,
     registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
     semantic_overlay: Option<PendingSemanticOverlay>,
     filesystem_overlay: Option<PendingFilesystemOverlay>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl LixBackend for TransactionViewBackend<'_> {
+    fn dialect(&self) -> crate::SqlDialect {
+        match &self.inner {
+            TransactionViewBackendInner::Base(base) => base.dialect(),
+            TransactionViewBackendInner::Overlay(overlay) => overlay.dialect(),
+        }
+    }
+
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        match &self.inner {
+            TransactionViewBackendInner::Base(base) => base.execute(sql, params).await,
+            TransactionViewBackendInner::Overlay(overlay) => overlay.execute(sql, params).await,
+        }
+    }
+
+    async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        match &self.inner {
+            TransactionViewBackendInner::Base(base) => base.begin_transaction().await,
+            TransactionViewBackendInner::Overlay(overlay) => overlay.begin_transaction().await,
+        }
+    }
+
+    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        match &self.inner {
+            TransactionViewBackendInner::Base(base) => base.begin_savepoint(name).await,
+            TransactionViewBackendInner::Overlay(overlay) => overlay.begin_savepoint(name).await,
+        }
+    }
 }
 
 enum RegisteredSchemaOverlayQuery {
@@ -461,14 +588,20 @@ struct LiveTableOverlayQuery {
 }
 
 #[derive(Clone)]
-struct LiveProjection {
-    source_column: String,
-    output_column: String,
+enum LiveProjection {
+    Column {
+        source_column: String,
+        output_column: String,
+    },
+    CountAll {
+        output_column: String,
+    },
 }
 
 #[derive(Clone)]
 enum LiveFilter {
     Equals(String, Value),
+    In(String, Vec<Value>),
     IsNotNull(String),
 }
 
@@ -504,17 +637,12 @@ struct OverlayVisibleLiveRowIdentity {
 }
 
 impl<'a> TransactionOverlayBackend<'a> {
-    fn new(
-        base: &'a dyn LixBackend,
-        registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
-        semantic_overlay: Option<PendingSemanticOverlay>,
-        filesystem_overlay: Option<PendingFilesystemOverlay>,
-    ) -> Self {
+    fn new(base: &'a dyn LixBackend, pending_transaction_view: PendingTransactionView) -> Self {
         Self {
             base,
-            registered_schema_overlay,
-            semantic_overlay,
-            filesystem_overlay,
+            registered_schema_overlay: pending_transaction_view.registered_schema_overlay,
+            semantic_overlay: pending_transaction_view.semantic_overlay,
+            filesystem_overlay: pending_transaction_view.filesystem_overlay,
         }
     }
 
@@ -696,7 +824,7 @@ impl<'a> TransactionOverlayBackend<'a> {
         &self,
         query: &LiveTableOverlayQuery,
     ) -> Result<QueryResult, LixError> {
-        let access = load_live_row_access_with_backend(self.base, &query.schema_key).await?;
+        let access = load_live_row_access_with_backend(self, &query.schema_key).await?;
         let mut text_filters = BTreeMap::new();
         for filter in &query.filters {
             if let LiveFilter::Equals(column, value) = filter {
@@ -705,7 +833,7 @@ impl<'a> TransactionOverlayBackend<'a> {
                 }
             }
         }
-        let mut rows = load_live_rows_with_executor(
+        let mut rows = match load_live_rows_with_executor(
             &mut &*self.base,
             match query.storage {
                 PendingSemanticStorage::Tracked => LiveRowScope::Tracked,
@@ -716,7 +844,12 @@ impl<'a> TransactionOverlayBackend<'a> {
             &[],
             None,
         )
-        .await?
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) if error.description.contains("is not stored") => Vec::new(),
+            Err(error) => return Err(error),
+        }
         .into_iter()
         .map(|row| visible_live_row_from_loaded(&access, query.storage, row))
         .collect::<Result<Vec<_>, _>>()?;
@@ -750,11 +883,35 @@ impl<'a> TransactionOverlayBackend<'a> {
         if let Some(limit) = query.limit {
             rows.truncate(limit);
         }
+        if query
+            .projections
+            .iter()
+            .all(|projection| matches!(projection, LiveProjection::CountAll { .. }))
+        {
+            return Ok(QueryResult {
+                columns: query
+                    .projections
+                    .iter()
+                    .map(|projection| match projection {
+                        LiveProjection::CountAll { output_column } => output_column.clone(),
+                        LiveProjection::Column { output_column, .. } => output_column.clone(),
+                    })
+                    .collect(),
+                rows: vec![query
+                    .projections
+                    .iter()
+                    .map(|_| Value::Integer(rows.len() as i64))
+                    .collect()],
+            });
+        }
         Ok(QueryResult {
             columns: query
                 .projections
                 .iter()
-                .map(|projection| projection.output_column.clone())
+                .map(|projection| match projection {
+                    LiveProjection::Column { output_column, .. }
+                    | LiveProjection::CountAll { output_column } => output_column.clone(),
+                })
                 .collect(),
             rows: rows
                 .into_iter()
@@ -762,7 +919,7 @@ impl<'a> TransactionOverlayBackend<'a> {
                     query
                         .projections
                         .iter()
-                        .map(|projection| live_projection_value(&row, &projection.source_column))
+                        .map(|projection| live_projection_value(&row, projection))
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -924,16 +1081,84 @@ fn live_projection_from_select_item(
     table_alias: Option<&str>,
 ) -> Option<LiveProjection> {
     match item {
-        SelectItem::UnnamedExpr(expr) => Some(LiveProjection {
-            source_column: live_identifier_name(expr, table_alias)?,
-            output_column: live_identifier_name(expr, table_alias)?,
-        }),
-        SelectItem::ExprWithAlias { expr, alias } => Some(LiveProjection {
-            source_column: live_identifier_name(expr, table_alias)?,
-            output_column: alias.value.clone(),
-        }),
+        SelectItem::UnnamedExpr(expr) => live_projection_from_expr(
+            expr,
+            table_alias,
+            live_identifier_name(expr, table_alias).unwrap_or_else(|| expr.to_string()),
+        ),
+        SelectItem::ExprWithAlias { expr, alias } => {
+            live_projection_from_expr(expr, table_alias, alias.value.clone())
+        }
         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
     }
+}
+
+fn live_table_query_from_prepared_public_read(
+    public_read: &PreparedPublicRead,
+) -> Option<LiveTableOverlayQuery> {
+    let structured_read = public_read.structured_read()?;
+    if !matches!(
+        structured_read.surface_binding.descriptor.surface_family,
+        SurfaceFamily::State | SurfaceFamily::Entity
+    ) {
+        return None;
+    }
+    if matches!(
+        structured_read.surface_binding.descriptor.surface_variant,
+        SurfaceVariant::History | SurfaceVariant::WorkingChanges
+    ) {
+        return None;
+    }
+
+    let table_alias = structured_read
+        .query
+        .source_alias
+        .as_ref()
+        .map(|alias| alias.name.value.as_str());
+
+    Some(LiveTableOverlayQuery {
+        storage: PendingSemanticStorage::Tracked,
+        schema_key: structured_read
+            .surface_binding
+            .implicit_overrides
+            .fixed_schema_key
+            .clone()?,
+        projections: structured_read
+            .query
+            .projection
+            .iter()
+            .map(|item| live_projection_from_select_item(item, table_alias))
+            .collect::<Option<Vec<_>>>()?,
+        filters: structured_read
+            .query
+            .selection_predicates
+            .iter()
+            .map(|predicate| live_filter_from_expr(predicate, table_alias))
+            .collect::<Option<Vec<_>>>()?,
+        order_by: structured_read
+            .query
+            .order_by
+            .as_ref()
+            .map(|order_by| live_order_by_from_clause(order_by, table_alias))
+            .flatten()
+            .unwrap_or_default(),
+        limit: live_limit_from_clause(structured_read.query.limit_clause.as_ref())?,
+    })
+}
+
+fn live_projection_from_expr(
+    expr: &Expr,
+    table_alias: Option<&str>,
+    output_column: String,
+) -> Option<LiveProjection> {
+    if live_expr_is_count_all(expr) {
+        return Some(LiveProjection::CountAll { output_column });
+    }
+
+    Some(LiveProjection::Column {
+        source_column: live_identifier_name(expr, table_alias)?,
+        output_column,
+    })
 }
 
 fn group_by_is_empty(group_by: &sqlparser::ast::GroupByExpr) -> bool {
@@ -958,6 +1183,19 @@ fn live_filter_from_expr(expr: &Expr, table_alias: Option<&str>) -> Option<LiveF
             )),
             _ => None,
         },
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => Some(LiveFilter::In(
+            live_identifier_name(expr, table_alias)?,
+            list.iter()
+                .map(|expr| match expr {
+                    Expr::Value(value) => sql_value_as_engine_value(value),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?,
+        )),
         Expr::IsNotNull(expr) => Some(LiveFilter::IsNotNull(live_identifier_name(
             expr,
             table_alias,
@@ -1032,6 +1270,22 @@ fn live_identifier_name(expr: &Expr, table_alias: Option<&str>) -> Option<String
         }
         _ => None,
     }
+}
+
+fn live_expr_is_count_all(expr: &Expr) -> bool {
+    let Expr::Function(function) = expr else {
+        return false;
+    };
+    if !function.name.to_string().eq_ignore_ascii_case("count") {
+        return false;
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return false;
+    };
+    matches!(
+        arguments.args.as_slice(),
+        [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
+    )
 }
 
 fn overlay_filter_text(value: &Value) -> Option<String> {
@@ -1160,6 +1414,8 @@ fn live_filter_matches_row(filter: &LiveFilter, row: &OverlayVisibleLiveRow) -> 
         LiveFilter::Equals(column, expected) => {
             live_row_value(row, column).is_some_and(|actual| actual == *expected)
         }
+        LiveFilter::In(column, expected) => live_row_value(row, column)
+            .is_some_and(|actual| expected.iter().any(|candidate| candidate == &actual)),
         LiveFilter::IsNotNull(column) => {
             !matches!(live_row_value(row, column), Some(Value::Null) | None)
         }
@@ -1199,14 +1455,18 @@ fn compare_live_values(left: &Option<Value>, right: &Option<Value>) -> std::cmp:
 
 fn live_projection_value(
     row: &OverlayVisibleLiveRow,
-    source_column: &str,
+    projection: &LiveProjection,
 ) -> Result<Value, LixError> {
-    live_row_value(row, source_column).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("overlay query requested unsupported live column '{source_column}'"),
-        )
-    })
+    match projection {
+        LiveProjection::Column { source_column, .. } => live_row_value(row, source_column)
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("overlay query requested unsupported live column '{source_column}'"),
+                )
+            }),
+        LiveProjection::CountAll { .. } => Ok(Value::Integer(1)),
+    }
 }
 
 fn live_row_value(row: &OverlayVisibleLiveRow, column: &str) -> Option<Value> {
@@ -1397,6 +1657,7 @@ fn derive_result_contract_for_statements(statements: &[Statement]) -> ResultCont
     }
 }
 
+#[cfg(test)]
 pub(crate) fn top_level_write_target_name(statement: &Statement) -> Option<String> {
     match statement {
         Statement::Insert(insert) => match &insert.table {

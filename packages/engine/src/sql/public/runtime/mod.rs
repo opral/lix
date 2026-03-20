@@ -512,7 +512,7 @@ mod bind;
 mod read;
 mod tracked_write_plan;
 
-pub(crate) use tracked_write_plan::{build_tracked_write_txn_plan, TrackedWriteTxnPlan};
+pub(crate) use tracked_write_plan::{build_tracked_txn_unit, TrackedTxnUnit};
 
 pub(crate) async fn prepare_public_execution(
     backend: &dyn LixBackend,
