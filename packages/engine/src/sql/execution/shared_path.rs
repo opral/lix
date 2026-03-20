@@ -12,9 +12,9 @@ use crate::sql::public::runtime::{
 };
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{
-    bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
-    generate_commit, load_commit_active_accounts, load_version_info_for_versions,
-    CommitQueryExecutor, CreateCommitError, CreateCommitErrorKind, CreateCommitExpectedHead,
+    build_prepared_batch_from_generate_commit_result_with_executor, generate_commit,
+    load_commit_active_accounts, load_version_info_for_versions, CommitQueryExecutor,
+    CreateCommitError, CreateCommitErrorKind, CreateCommitExpectedHead,
     CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
     DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow, VersionInfo,
 };
@@ -26,8 +26,13 @@ use crate::{
     LixError, LixTransaction, QueryResult, Value, VersionId,
 };
 
-use crate::schema::live_layout::{builtin_live_table_layout, LiveTableLayout};
-use crate::schema::registry::load_live_table_layout_in_transaction;
+use crate::schema::live_layout::{
+    is_untracked_live_table, live_schema_key_for_table_name, load_live_row_access_with_backend,
+    normalized_live_column_values,
+};
+use crate::schema::live_store::{
+    load_live_rows_with_executor, logical_snapshot_text, LiveRowScope, LoadedLiveRow,
+};
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::contracts::execution_plan::ExecutionPlan;
 use crate::sql::execution::contracts::planned_statement::{
@@ -38,18 +43,25 @@ use crate::sql::execution::contracts::result_contract::ResultContract;
 use crate::sql::execution::derive_requirements::derive_plan_requirements;
 use crate::sql::execution::execute::SqlExecutionOutcome;
 use crate::sql::execution::intent::{
-    authoritative_pending_file_write_targets, collect_execution_intent_with_backend,
-    ExecutionIntent, IntentCollectionPolicy,
+    collect_execution_intent_with_backend, ExecutionIntent, IntentCollectionPolicy,
 };
+use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::plan::build_execution_plan;
 use crate::sql::execution::runtime_effects::{
-    build_binary_blob_fastcdc_write_program, BinaryBlobWriteInput,
+    build_binary_blob_fastcdc_write_program, BinaryBlobWrite, FilesystemTransactionFileState,
 };
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
+use crate::sql::execution::write_txn_plan::{
+    PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
+    PendingSemanticRow, PendingSemanticStorage,
+};
 use crate::state::internal::write_program::WriteProgram;
 use crate::CanonicalJson;
 use serde_json::{json, Value as JsonValue};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, OrderBy, OrderByExpr,
+    OrderByKind, Select, SelectItem, SetExpr, Statement, TableFactor, Value as SqlValue,
+};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
@@ -164,6 +176,9 @@ impl CommitQueryExecutor for TransactionCommitExecutor<'_> {
 pub(crate) async fn prepare_execution_with_backend(
     engine: &Engine,
     backend: &dyn LixBackend,
+    pending_registered_schema_overlay: Option<&PendingRegisteredSchemaOverlay>,
+    pending_semantic_overlay: Option<&PendingSemanticOverlay>,
+    pending_filesystem_overlay: Option<&PendingFilesystemOverlay>,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
@@ -172,8 +187,24 @@ pub(crate) async fn prepare_execution_with_backend(
     public_surface_registry_override: Option<&crate::sql::public::catalog::SurfaceRegistry>,
     policy: PreparationPolicy,
 ) -> Result<PreparedExecutionContext, LixError> {
+    let overlay_backend;
+    let backend: &dyn LixBackend = if pending_registered_schema_overlay.is_some()
+        || pending_semantic_overlay.is_some()
+        || pending_filesystem_overlay.is_some()
+    {
+        overlay_backend = TransactionOverlayBackend::new(
+            backend,
+            pending_registered_schema_overlay.cloned(),
+            pending_semantic_overlay.cloned(),
+            pending_filesystem_overlay.cloned(),
+        );
+        &overlay_backend
+    } else {
+        backend
+    };
+
     let defer_runtime_sequence_load = !allow_internal_tables
-        && !crate::filesystem::pending_file_writes::statements_require_generated_file_insert_ids(
+        && !crate::filesystem::statements_require_generated_filesystem_insert_ids(
             parsed_statements,
         );
     let (settings, sequence_start, functions) = engine
@@ -181,10 +212,7 @@ pub(crate) async fn prepare_execution_with_backend(
         .await?;
 
     let mut statements = parsed_statements.to_vec();
-    crate::filesystem::pending_file_writes::ensure_file_insert_ids_for_data_writes(
-        &mut statements,
-        &functions,
-    )?;
+    crate::filesystem::ensure_generated_filesystem_insert_ids(&mut statements, &functions)?;
 
     let requirements = derive_plan_requirements(&statements);
 
@@ -236,20 +264,17 @@ pub(crate) async fn prepare_execution_with_backend(
 
     let skip_side_effect_collection = policy.skip_side_effect_collection
         || public_write.as_ref().is_some_and(|prepared| {
-            prepared.execution.as_ref().is_some_and(|execution| {
-                execution.partitions.iter().any(|partition| {
-                    matches!(
-                        partition,
-                        PublicWriteExecutionPartition::Tracked(execution)
-                            if execution.lazy_exact_file_updates.iter().any(|update| {
-                                matches!(
-                                    update,
-                                    crate::sql::public::planner::ir::LazyExactFileUpdate::Data(_)
-                                )
-                            })
-                    )
+            prepared
+                .planned_write
+                .resolved_write_plan
+                .as_ref()
+                .is_some_and(|resolved| {
+                    resolved
+                        .filesystem_state()
+                        .files
+                        .values()
+                        .any(|file| file.data.is_some())
                 })
-            })
         });
 
     let public_read_owns_execution = public_read.as_ref().is_some_and(|prepared| {
@@ -260,8 +285,7 @@ pub(crate) async fn prepare_execution_with_backend(
         derived_public_execution_intent(public_write)
     } else if public_read_owns_execution {
         ExecutionIntent {
-            pending_file_writes: Vec::new(),
-            pending_file_delete_targets: BTreeSet::new(),
+            filesystem_state: Default::default(),
         }
     } else {
         collect_execution_intent_with_backend(
@@ -290,19 +314,14 @@ pub(crate) async fn prepare_execution_with_backend(
     if let Some(public_write) = public_write.as_mut() {
         if let Some(execution) = public_write.execution.as_mut() {
             let planned_write = &public_write.planned_write;
-            finalize_public_write_execution(
-                execution,
-                planned_write,
-                &intent.pending_file_writes,
-                &intent.pending_file_delete_targets,
-            )
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "prepare_execution_with_backend public execution finalization failed: {}",
-                    error.description
-                ),
-            })?;
+            finalize_public_write_execution(execution, planned_write, &intent.filesystem_state)
+                .map_err(|error| LixError {
+                    code: error.code,
+                    description: format!(
+                        "prepare_execution_with_backend public execution finalization failed: {}",
+                        error.description
+                    ),
+                })?;
         }
     }
 
@@ -344,8 +363,6 @@ pub(crate) async fn prepare_execution_with_backend(
                 .as_ref()
                 .and_then(|prepared| prepared.dependency_spec.clone()),
             functions.clone(),
-            &intent.pending_file_delete_targets,
-            &authoritative_pending_file_write_targets(&intent.pending_file_writes),
             writer_key,
         )
         .await
@@ -415,39 +432,900 @@ pub(crate) async fn prepare_execution_with_backend(
     })
 }
 
+struct TransactionOverlayBackend<'a> {
+    base: &'a dyn LixBackend,
+    registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
+    semantic_overlay: Option<PendingSemanticOverlay>,
+    filesystem_overlay: Option<PendingFilesystemOverlay>,
+}
+
+enum RegisteredSchemaOverlayQuery {
+    FullScan,
+    ExactEntityId(String),
+    LatestBySchemaKey(String),
+}
+
+enum TransactionOverlayQuery {
+    RegisteredSchema(RegisteredSchemaOverlayQuery),
+    LiveTable(LiveTableOverlayQuery),
+}
+
+#[derive(Clone)]
+struct LiveTableOverlayQuery {
+    storage: PendingSemanticStorage,
+    schema_key: String,
+    projections: Vec<LiveProjection>,
+    filters: Vec<LiveFilter>,
+    order_by: Vec<LiveOrderClause>,
+    limit: Option<usize>,
+}
+
+#[derive(Clone)]
+struct LiveProjection {
+    source_column: String,
+    output_column: String,
+}
+
+#[derive(Clone)]
+enum LiveFilter {
+    Equals(String, Value),
+    IsNotNull(String),
+}
+
+#[derive(Clone)]
+struct LiveOrderClause {
+    column: String,
+    descending: bool,
+}
+
+#[derive(Clone)]
+struct OverlayVisibleLiveRow {
+    entity_id: String,
+    schema_key: String,
+    schema_version: String,
+    file_id: String,
+    version_id: String,
+    plugin_key: String,
+    metadata: Option<String>,
+    change_id: Option<String>,
+    snapshot_content: Option<String>,
+    is_tombstone: bool,
+    normalized_values: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OverlayVisibleLiveRowIdentity {
+    entity_id: String,
+    schema_key: String,
+    schema_version: String,
+    file_id: String,
+    version_id: String,
+    plugin_key: String,
+}
+
+impl<'a> TransactionOverlayBackend<'a> {
+    fn new(
+        base: &'a dyn LixBackend,
+        registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
+        semantic_overlay: Option<PendingSemanticOverlay>,
+        filesystem_overlay: Option<PendingFilesystemOverlay>,
+    ) -> Self {
+        Self {
+            base,
+            registered_schema_overlay,
+            semantic_overlay,
+            filesystem_overlay,
+        }
+    }
+
+    async fn visible_registered_schema_rows(&self) -> Result<BTreeMap<String, String>, LixError> {
+        let Some(overlay) = self.registered_schema_overlay.as_ref() else {
+            return Ok(BTreeMap::new());
+        };
+        let sql = format!(
+            "SELECT snapshot_content FROM {table} \
+             WHERE version_id = '{global_version}' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL",
+            table = REGISTERED_SCHEMA_BOOTSTRAP_TABLE,
+            global_version = GLOBAL_VERSION_ID,
+        );
+        let result = self.base.execute(&sql, &[]).await?;
+        let mut rows = BTreeMap::new();
+        for row in result.rows {
+            let Some(Value::Text(snapshot_content)) = row.first() else {
+                continue;
+            };
+            let snapshot: JsonValue =
+                serde_json::from_str(snapshot_content).map_err(|error| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
+                        "registered schema snapshot_content invalid JSON: {error}"
+                    ),
+                })?;
+            let (key, _) = crate::schema::schema_from_registered_snapshot(&snapshot)?;
+            rows.insert(key.entity_id(), snapshot_content.clone());
+        }
+        for (entity_id, pending) in overlay.visible_entries() {
+            match pending.snapshot_content.as_ref() {
+                Some(snapshot_content) => {
+                    rows.insert(entity_id.to_string(), snapshot_content.clone());
+                }
+                None => {
+                    rows.remove(entity_id);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    fn classify_query(sql: &str) -> Option<TransactionOverlayQuery> {
+        let parsed = parse_sql(sql).ok()?;
+        let [Statement::Query(query)] = parsed.as_slice() else {
+            return None;
+        };
+        if let Some(query) = Self::classify_live_table_query(query.as_ref()) {
+            return Some(TransactionOverlayQuery::LiveTable(query));
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        if select.from.len() != 1 {
+            return None;
+        }
+        let TableFactor::Table { name, .. } = &select.from[0].relation else {
+            return None;
+        };
+        let table_name = name.0.last().and_then(|part| match part {
+            sqlparser::ast::ObjectNamePart::Identifier(ident) => Some(ident.value.as_str()),
+            _ => None,
+        })?;
+        if table_name != REGISTERED_SCHEMA_BOOTSTRAP_TABLE {
+            return None;
+        }
+
+        if select.projection.len() == 2
+            && matches!(select.projection[0], SelectItem::UnnamedExpr(Expr::Identifier(ref ident)) if ident.value == "schema_version")
+            && matches!(select.projection[1], SelectItem::UnnamedExpr(Expr::Identifier(ref ident)) if ident.value == "snapshot_content")
+        {
+            let selection = select.selection.as_ref()?;
+            for predicate in conjuncts(selection) {
+                if let Some(schema_key) = latest_schema_key_predicate(predicate) {
+                    return Some(TransactionOverlayQuery::RegisteredSchema(
+                        RegisteredSchemaOverlayQuery::LatestBySchemaKey(schema_key),
+                    ));
+                }
+            }
+            return None;
+        }
+
+        if select.projection.len() == 1
+            && matches!(select.projection[0], SelectItem::UnnamedExpr(Expr::Identifier(ref ident)) if ident.value == "snapshot_content")
+        {
+            if let Some(selection) = select.selection.as_ref() {
+                for predicate in conjuncts(selection) {
+                    if let Some(entity_id) = exact_entity_id_predicate(predicate) {
+                        return Some(TransactionOverlayQuery::RegisteredSchema(
+                            RegisteredSchemaOverlayQuery::ExactEntityId(entity_id),
+                        ));
+                    }
+                }
+            }
+            return Some(TransactionOverlayQuery::RegisteredSchema(
+                RegisteredSchemaOverlayQuery::FullScan,
+            ));
+        }
+
+        None
+    }
+
+    fn classify_live_table_query(query: &sqlparser::ast::Query) -> Option<LiveTableOverlayQuery> {
+        if query.with.is_some() || query.fetch.is_some() || query.for_clause.is_some() {
+            return None;
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return None;
+        };
+        Self::live_table_query_from_select(
+            select.as_ref(),
+            query.order_by.as_ref(),
+            query.limit_clause.as_ref(),
+        )
+    }
+
+    fn live_table_query_from_select(
+        select: &Select,
+        order_by: Option<&OrderBy>,
+        limit_clause: Option<&sqlparser::ast::LimitClause>,
+    ) -> Option<LiveTableOverlayQuery> {
+        if select.from.len() != 1
+            || !select.lateral_views.is_empty()
+            || select.selection.is_none() && select.from[0].joins.len() > 0
+            || !group_by_is_empty(&select.group_by)
+            || select.having.is_some()
+            || select.qualify.is_some()
+        {
+            return None;
+        }
+        if !select.from[0].joins.is_empty() {
+            return None;
+        }
+        let TableFactor::Table { name, alias, .. } = &select.from[0].relation else {
+            return None;
+        };
+        let table_name = name.0.last().and_then(|part| match part {
+            sqlparser::ast::ObjectNamePart::Identifier(ident) => Some(ident.value.as_str()),
+            _ => None,
+        })?;
+        let schema_key = live_schema_key_for_table_name(table_name)?.to_string();
+        let storage = if is_untracked_live_table(table_name) {
+            PendingSemanticStorage::Untracked
+        } else {
+            PendingSemanticStorage::Tracked
+        };
+        let table_alias = alias.as_ref().map(|alias| alias.name.value.as_str());
+        let projections = select
+            .projection
+            .iter()
+            .map(|item| live_projection_from_select_item(item, table_alias))
+            .collect::<Option<Vec<_>>>()?;
+        let filters = select
+            .selection
+            .as_ref()
+            .map(conjuncts)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|predicate| live_filter_from_expr(predicate, table_alias))
+            .collect::<Option<Vec<_>>>()?;
+        let order_by = match order_by {
+            Some(order_by) => live_order_by_from_clause(order_by, table_alias)?,
+            None => Vec::new(),
+        };
+        let limit = live_limit_from_clause(limit_clause)?;
+        Some(LiveTableOverlayQuery {
+            storage,
+            schema_key,
+            projections,
+            filters,
+            order_by,
+            limit,
+        })
+    }
+
+    async fn execute_live_table_query(
+        &self,
+        query: &LiveTableOverlayQuery,
+    ) -> Result<QueryResult, LixError> {
+        let access = load_live_row_access_with_backend(self.base, &query.schema_key).await?;
+        let mut text_filters = BTreeMap::new();
+        for filter in &query.filters {
+            if let LiveFilter::Equals(column, value) = filter {
+                if let Some(text) = overlay_filter_text(value) {
+                    text_filters.insert(column.as_str(), text);
+                }
+            }
+        }
+        let mut rows = load_live_rows_with_executor(
+            &mut &*self.base,
+            match query.storage {
+                PendingSemanticStorage::Tracked => LiveRowScope::Tracked,
+                PendingSemanticStorage::Untracked => LiveRowScope::Untracked,
+            },
+            &query.schema_key,
+            &text_filters,
+            &[],
+            None,
+        )
+        .await?
+        .into_iter()
+        .map(|row| visible_live_row_from_loaded(&access, query.storage, row))
+        .collect::<Result<Vec<_>, _>>()?;
+        let mut by_identity = rows
+            .drain(..)
+            .map(|row| (visible_live_row_identity(&row), row))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(overlay) = self.semantic_overlay.as_ref() {
+            for row in overlay.visible_rows(query.storage, &query.schema_key) {
+                let visible = visible_live_row_from_pending(&access, row)?;
+                let identity = visible_live_row_identity(&visible);
+                if visible.is_tombstone && matches!(query.storage, PendingSemanticStorage::Tracked)
+                {
+                    by_identity.remove(&identity);
+                } else {
+                    by_identity.insert(identity, visible);
+                }
+            }
+        }
+        self.apply_filesystem_overlay_to_rows(query, &access, &mut by_identity);
+        let mut rows = by_identity
+            .into_values()
+            .filter(|row| {
+                query
+                    .filters
+                    .iter()
+                    .all(|filter| live_filter_matches_row(filter, row))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| compare_live_rows(left, right, &query.order_by));
+        if let Some(limit) = query.limit {
+            rows.truncate(limit);
+        }
+        Ok(QueryResult {
+            columns: query
+                .projections
+                .iter()
+                .map(|projection| projection.output_column.clone())
+                .collect(),
+            rows: rows
+                .into_iter()
+                .map(|row| {
+                    query
+                        .projections
+                        .iter()
+                        .map(|projection| live_projection_value(&row, &projection.source_column))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    fn apply_filesystem_overlay_to_rows(
+        &self,
+        query: &LiveTableOverlayQuery,
+        access: &crate::schema::live_layout::LiveRowAccess,
+        rows: &mut BTreeMap<OverlayVisibleLiveRowIdentity, OverlayVisibleLiveRow>,
+    ) {
+        let Some(overlay) = self.filesystem_overlay.as_ref() else {
+            return;
+        };
+        if query.storage != PendingSemanticStorage::Tracked
+            || !matches!(
+                query.schema_key.as_str(),
+                "lix_file_descriptor" | "lix_directory_descriptor"
+            )
+        {
+            return;
+        }
+
+        for pending in
+            overlay.visible_directory_rows(PendingSemanticStorage::Tracked, &query.schema_key)
+        {
+            let Ok(visible) = visible_live_row_from_pending(access, pending) else {
+                continue;
+            };
+            let identity = visible_live_row_identity(&visible);
+            if visible.is_tombstone {
+                rows.remove(&identity);
+            } else {
+                rows.insert(identity, visible);
+            }
+        }
+
+        if query.schema_key != "lix_file_descriptor" {
+            return;
+        }
+
+        for pending in overlay.visible_files() {
+            if pending.deleted {
+                rows.retain(|_, row| {
+                    !(row.schema_key == "lix_file_descriptor"
+                        && row.entity_id == pending.file_id
+                        && row.version_id == pending.version_id)
+                });
+                continue;
+            }
+
+            if let Some(visible) = visible_live_row_from_pending_filesystem_state(access, pending) {
+                let identity = visible_live_row_identity(&visible);
+                rows.insert(identity, visible);
+                continue;
+            }
+
+            for row in rows.values_mut() {
+                if row.schema_key == "lix_file_descriptor"
+                    && row.entity_id == pending.file_id
+                    && row.version_id == pending.version_id
+                {
+                    row.metadata = pending.metadata_patch.apply(row.metadata.clone());
+                }
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl LixBackend for TransactionOverlayBackend<'_> {
+    fn dialect(&self) -> crate::SqlDialect {
+        self.base.dialect()
+    }
+
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        let Some(query) = Self::classify_query(sql) else {
+            return self.base.execute(sql, params).await;
+        };
+
+        match query {
+            TransactionOverlayQuery::LiveTable(query) => {
+                if self.semantic_overlay.is_none() && self.filesystem_overlay.is_none() {
+                    return self.base.execute(sql, params).await;
+                }
+                self.execute_live_table_query(&query).await
+            }
+            TransactionOverlayQuery::RegisteredSchema(
+                RegisteredSchemaOverlayQuery::LatestBySchemaKey(schema_key),
+            ) => {
+                let visible_rows = self.visible_registered_schema_rows().await?;
+                let latest = visible_rows
+                    .iter()
+                    .filter_map(|(_, snapshot_content)| {
+                        let snapshot: JsonValue = serde_json::from_str(snapshot_content).ok()?;
+                        let (key, _) =
+                            crate::schema::schema_from_registered_snapshot(&snapshot).ok()?;
+                        (key.schema_key == schema_key).then_some((key, snapshot_content))
+                    })
+                    .max_by(|(left, _), (right, _)| {
+                        match (left.version_number(), right.version_number()) {
+                            (Some(left_version), Some(right_version)) => {
+                                left_version.cmp(&right_version)
+                            }
+                            _ => left.schema_version.cmp(&right.schema_version),
+                        }
+                    });
+                let Some((key, snapshot_content)) = latest else {
+                    return Ok(QueryResult {
+                        rows: Vec::new(),
+                        columns: vec!["schema_version".to_string(), "snapshot_content".to_string()],
+                    });
+                };
+                Ok(QueryResult {
+                    rows: vec![vec![
+                        Value::Text(key.schema_version),
+                        Value::Text(snapshot_content.clone()),
+                    ]],
+                    columns: vec!["schema_version".to_string(), "snapshot_content".to_string()],
+                })
+            }
+            TransactionOverlayQuery::RegisteredSchema(
+                RegisteredSchemaOverlayQuery::ExactEntityId(entity_id),
+            ) => {
+                let visible_rows = self.visible_registered_schema_rows().await?;
+                Ok(QueryResult {
+                    rows: visible_rows
+                        .get(entity_id.as_str())
+                        .map(|snapshot_content| vec![vec![Value::Text(snapshot_content.clone())]])
+                        .unwrap_or_default(),
+                    columns: vec!["snapshot_content".to_string()],
+                })
+            }
+            TransactionOverlayQuery::RegisteredSchema(RegisteredSchemaOverlayQuery::FullScan) => {
+                let visible_rows = self.visible_registered_schema_rows().await?;
+                Ok(QueryResult {
+                    rows: visible_rows
+                        .into_values()
+                        .map(|snapshot_content| vec![Value::Text(snapshot_content)])
+                        .collect(),
+                    columns: vec!["snapshot_content".to_string()],
+                })
+            }
+        }
+    }
+
+    async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        self.base.begin_transaction().await
+    }
+
+    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        self.base.begin_savepoint(name).await
+    }
+}
+
+fn live_projection_from_select_item(
+    item: &SelectItem,
+    table_alias: Option<&str>,
+) -> Option<LiveProjection> {
+    match item {
+        SelectItem::UnnamedExpr(expr) => Some(LiveProjection {
+            source_column: live_identifier_name(expr, table_alias)?,
+            output_column: live_identifier_name(expr, table_alias)?,
+        }),
+        SelectItem::ExprWithAlias { expr, alias } => Some(LiveProjection {
+            source_column: live_identifier_name(expr, table_alias)?,
+            output_column: alias.value.clone(),
+        }),
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
+    }
+}
+
+fn group_by_is_empty(group_by: &sqlparser::ast::GroupByExpr) -> bool {
+    match group_by {
+        sqlparser::ast::GroupByExpr::Expressions(expressions, modifiers) => {
+            expressions.is_empty() && modifiers.is_empty()
+        }
+        sqlparser::ast::GroupByExpr::All(_) => false,
+    }
+}
+
+fn live_filter_from_expr(expr: &Expr, table_alias: Option<&str>) -> Option<LiveFilter> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (left, Expr::Value(value)) | (Expr::Value(value), left) => Some(LiveFilter::Equals(
+                live_identifier_name(left, table_alias)?,
+                sql_value_as_engine_value(value)?,
+            )),
+            _ => None,
+        },
+        Expr::IsNotNull(expr) => Some(LiveFilter::IsNotNull(live_identifier_name(
+            expr,
+            table_alias,
+        )?)),
+        _ => None,
+    }
+}
+
+fn live_order_by_from_clause(
+    order_by: &OrderBy,
+    table_alias: Option<&str>,
+) -> Option<Vec<LiveOrderClause>> {
+    let OrderByKind::Expressions(expressions) = &order_by.kind else {
+        return None;
+    };
+    expressions
+        .iter()
+        .map(|expr| live_order_clause_from_expr(expr, table_alias))
+        .collect()
+}
+
+fn live_order_clause_from_expr(
+    expr: &OrderByExpr,
+    table_alias: Option<&str>,
+) -> Option<LiveOrderClause> {
+    Some(LiveOrderClause {
+        column: live_identifier_name(&expr.expr, table_alias)?,
+        descending: expr.options.asc == Some(false),
+    })
+}
+
+fn live_limit_from_clause(
+    limit_clause: Option<&sqlparser::ast::LimitClause>,
+) -> Option<Option<usize>> {
+    let Some(limit_clause) = limit_clause else {
+        return Some(None);
+    };
+    match limit_clause {
+        sqlparser::ast::LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => {
+            if offset.is_some() || !limit_by.is_empty() {
+                return None;
+            }
+            let Some(limit) = limit.as_ref() else {
+                return Some(None);
+            };
+            let Expr::Value(value) = limit else {
+                return None;
+            };
+            match &value.value {
+                SqlValue::Number(value, _) => value.parse::<usize>().ok().map(Some),
+                _ => None,
+            }
+        }
+        sqlparser::ast::LimitClause::OffsetCommaLimit { .. } => None,
+    }
+}
+
+fn live_identifier_name(expr: &Expr, table_alias: Option<&str>) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let qualifier = &parts[0].value;
+            let column = &parts[1].value;
+            if table_alias.is_some_and(|alias| alias != qualifier) {
+                return None;
+            }
+            Some(column.clone())
+        }
+        _ => None,
+    }
+}
+
+fn overlay_filter_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Text(text) => Some(text.clone()),
+        Value::Integer(value) => Some(value.to_string()),
+        Value::Boolean(value) => Some(if *value { "1" } else { "0" }.to_string()),
+        Value::Real(value) => Some(value.to_string()),
+        Value::Json(value) => Some(value.to_string()),
+        Value::Null | Value::Blob(_) => None,
+    }
+}
+
+fn sql_value_as_engine_value(value: &sqlparser::ast::ValueWithSpan) -> Option<Value> {
+    match &value.value {
+        SqlValue::Null => Some(Value::Null),
+        SqlValue::Boolean(value) => Some(Value::Boolean(*value)),
+        SqlValue::SingleQuotedString(text)
+        | SqlValue::TripleSingleQuotedString(text)
+        | SqlValue::EscapedStringLiteral(text)
+        | SqlValue::DollarQuotedString(sqlparser::ast::DollarQuotedString {
+            value: text, ..
+        }) => Some(Value::Text(text.clone())),
+        SqlValue::Number(value, _) => value
+            .parse::<i64>()
+            .map(Value::Integer)
+            .or_else(|_| value.parse::<f64>().map(Value::Real))
+            .ok(),
+        _ => None,
+    }
+}
+
+fn visible_live_row_from_loaded(
+    access: &crate::schema::live_layout::LiveRowAccess,
+    _storage: PendingSemanticStorage,
+    row: LoadedLiveRow,
+) -> Result<OverlayVisibleLiveRow, LixError> {
+    let snapshot_content = logical_snapshot_text(access, &row)?;
+    Ok(OverlayVisibleLiveRow {
+        entity_id: row.entity_id,
+        schema_key: row.schema_key,
+        schema_version: row.schema_version,
+        file_id: row.file_id,
+        version_id: row.version_id,
+        plugin_key: row.plugin_key,
+        metadata: row.metadata,
+        change_id: row.change_id,
+        normalized_values: normalized_live_column_values(
+            access.layout(),
+            snapshot_content.as_deref(),
+        )?,
+        snapshot_content,
+        is_tombstone: false,
+    })
+}
+
+fn visible_live_row_from_pending(
+    access: &crate::schema::live_layout::LiveRowAccess,
+    row: &PendingSemanticRow,
+) -> Result<OverlayVisibleLiveRow, LixError> {
+    Ok(OverlayVisibleLiveRow {
+        entity_id: row.entity_id.clone(),
+        schema_key: row.schema_key.clone(),
+        schema_version: row.schema_version.clone(),
+        file_id: row.file_id.clone(),
+        version_id: row.version_id.clone(),
+        plugin_key: row.plugin_key.clone(),
+        metadata: row.metadata.clone(),
+        change_id: None,
+        normalized_values: normalized_live_column_values(
+            access.layout(),
+            row.snapshot_content.as_deref(),
+        )?,
+        snapshot_content: row.snapshot_content.clone(),
+        is_tombstone: row.tombstone,
+    })
+}
+
+fn visible_live_row_from_pending_filesystem_state(
+    access: &crate::schema::live_layout::LiveRowAccess,
+    row: &FilesystemTransactionFileState,
+) -> Option<OverlayVisibleLiveRow> {
+    let descriptor = row.descriptor.as_ref()?;
+    let snapshot_content = serde_json::json!({
+        "id": row.file_id,
+        "directory_id": if descriptor.directory_id.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(descriptor.directory_id.clone())
+        },
+        "name": descriptor.name,
+        "extension": descriptor.extension,
+        "metadata": descriptor.metadata,
+        "hidden": descriptor.hidden,
+    })
+    .to_string();
+    Some(OverlayVisibleLiveRow {
+        entity_id: row.file_id.clone(),
+        schema_key: "lix_file_descriptor".to_string(),
+        schema_version: "1".to_string(),
+        file_id: "lix".to_string(),
+        version_id: row.version_id.clone(),
+        plugin_key: "lix".to_string(),
+        metadata: descriptor.metadata.clone(),
+        change_id: None,
+        normalized_values: normalized_live_column_values(access.layout(), Some(&snapshot_content))
+            .ok()?,
+        snapshot_content: Some(snapshot_content),
+        is_tombstone: false,
+    })
+}
+
+fn visible_live_row_identity(row: &OverlayVisibleLiveRow) -> OverlayVisibleLiveRowIdentity {
+    OverlayVisibleLiveRowIdentity {
+        entity_id: row.entity_id.clone(),
+        schema_key: row.schema_key.clone(),
+        schema_version: row.schema_version.clone(),
+        file_id: row.file_id.clone(),
+        version_id: row.version_id.clone(),
+        plugin_key: row.plugin_key.clone(),
+    }
+}
+
+fn live_filter_matches_row(filter: &LiveFilter, row: &OverlayVisibleLiveRow) -> bool {
+    match filter {
+        LiveFilter::Equals(column, expected) => {
+            live_row_value(row, column).is_some_and(|actual| actual == *expected)
+        }
+        LiveFilter::IsNotNull(column) => {
+            !matches!(live_row_value(row, column), Some(Value::Null) | None)
+        }
+    }
+}
+
+fn compare_live_rows(
+    left: &OverlayVisibleLiveRow,
+    right: &OverlayVisibleLiveRow,
+    order_by: &[LiveOrderClause],
+) -> std::cmp::Ordering {
+    for clause in order_by {
+        let ordering = compare_live_values(
+            &live_row_value(left, &clause.column),
+            &live_row_value(right, &clause.column),
+        );
+        if ordering != std::cmp::Ordering::Equal {
+            return if clause.descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+        }
+    }
+    visible_live_row_identity(left).cmp(&visible_live_row_identity(right))
+}
+
+fn compare_live_values(left: &Option<Value>, right: &Option<Value>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (left, right) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(left), Some(right)) => format!("{left:?}").cmp(&format!("{right:?}")),
+    }
+}
+
+fn live_projection_value(
+    row: &OverlayVisibleLiveRow,
+    source_column: &str,
+) -> Result<Value, LixError> {
+    live_row_value(row, source_column).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("overlay query requested unsupported live column '{source_column}'"),
+        )
+    })
+}
+
+fn live_row_value(row: &OverlayVisibleLiveRow, column: &str) -> Option<Value> {
+    match column {
+        "entity_id" => Some(Value::Text(row.entity_id.clone())),
+        "schema_key" => Some(Value::Text(row.schema_key.clone())),
+        "schema_version" => Some(Value::Text(row.schema_version.clone())),
+        "file_id" => Some(Value::Text(row.file_id.clone())),
+        "version_id" => Some(Value::Text(row.version_id.clone())),
+        "plugin_key" => Some(Value::Text(row.plugin_key.clone())),
+        "metadata" => Some(row.metadata.clone().map(Value::Text).unwrap_or(Value::Null)),
+        "change_id" => Some(
+            row.change_id
+                .clone()
+                .map(Value::Text)
+                .unwrap_or(Value::Null),
+        ),
+        "snapshot_content" => Some(
+            row.snapshot_content
+                .clone()
+                .map(Value::Text)
+                .unwrap_or(Value::Null),
+        ),
+        "is_tombstone" => Some(Value::Integer(i64::from(row.is_tombstone))),
+        other => row.normalized_values.get(other).cloned(),
+    }
+}
+
+fn conjuncts(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let mut predicates = conjuncts(left);
+            predicates.extend(conjuncts(right));
+            predicates
+        }
+        _ => vec![expr],
+    }
+}
+
+fn exact_entity_id_predicate(expr: &Expr) -> Option<String> {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(ident), Expr::Value(value))
+        | (Expr::Value(value), Expr::Identifier(ident))
+            if ident.value == "entity_id" =>
+        {
+            sql_value_as_string(value)
+        }
+        _ => None,
+    }
+}
+
+fn latest_schema_key_predicate(expr: &Expr) -> Option<String> {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return None;
+    };
+    let (function, value) = match (left.as_ref(), right.as_ref()) {
+        (Expr::Function(function), Expr::Value(value))
+        | (Expr::Value(value), Expr::Function(function)) => (function, value),
+        _ => return None,
+    };
+    if function.name.to_string().to_lowercase() != "substr" {
+        return None;
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))), ..] =
+        arguments.args.as_slice()
+    else {
+        return None;
+    };
+    if ident.value != "entity_id" {
+        return None;
+    }
+    sql_value_as_string(value).and_then(|prefix| prefix.strip_suffix('~').map(str::to_string))
+}
+
+fn sql_value_as_string(value: &sqlparser::ast::ValueWithSpan) -> Option<String> {
+    match &value.value {
+        SqlValue::SingleQuotedString(text)
+        | SqlValue::TripleSingleQuotedString(text)
+        | SqlValue::EscapedStringLiteral(text)
+        | SqlValue::SingleQuotedByteStringLiteral(text)
+        | SqlValue::DoubleQuotedByteStringLiteral(text)
+        | SqlValue::TripleSingleQuotedByteStringLiteral(text)
+        | SqlValue::TripleDoubleQuotedByteStringLiteral(text) => Some(text.clone()),
+        SqlValue::DollarQuotedString(dollar) => Some(dollar.value.clone()),
+        _ => None,
+    }
+}
+
 fn derived_public_execution_intent(
     prepared: &PreparedPublicWrite,
 ) -> crate::sql::execution::intent::ExecutionIntent {
     let Some(resolved) = prepared.planned_write.resolved_write_plan.as_ref() else {
         return crate::sql::execution::intent::ExecutionIntent {
-            pending_file_writes: Vec::new(),
-            pending_file_delete_targets: BTreeSet::new(),
+            filesystem_state: Default::default(),
         };
     };
 
-    let pending_file_writes = resolved
-        .filesystem_payload_writes()
-        .map(
-            |write| crate::filesystem::pending_file_writes::PendingFileWrite {
-                file_id: write.file_id.clone(),
-                version_id: write.version_id.clone(),
-                untracked: write.untracked,
-                before_path: None,
-                after_path: None,
-                data_is_authoritative: true,
-                before_data: None,
-                after_data: write.data.clone(),
-            },
-        )
-        .collect();
-    let pending_file_delete_targets = resolved
-        .filesystem_payload_delete_targets()
-        .cloned()
-        .collect();
-
     crate::sql::execution::intent::ExecutionIntent {
-        pending_file_writes,
-        pending_file_delete_targets,
+        filesystem_state: resolved.filesystem_state(),
     }
 }
 
@@ -519,8 +1397,7 @@ fn derive_result_contract_for_statements(statements: &[Statement]) -> ResultCont
     }
 }
 
-#[cfg(test)]
-fn top_level_write_target_name(statement: &Statement) -> Option<String> {
+pub(crate) fn top_level_write_target_name(statement: &Statement) -> Option<String> {
     match statement {
         Statement::Insert(insert) => match &insert.table {
             sqlparser::ast::TableObject::TableName(name) => Some(name.to_string()),
@@ -707,7 +1584,7 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
     transaction: &mut dyn LixTransaction,
     session: &mut PendingPublicCommitSession,
     batch: &crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch,
-    additional_binary_blob_payloads: &[Vec<u8>],
+    binary_blob_writes: &[BinaryBlobWrite],
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
     timestamp: &str,
 ) -> Result<(), LixError> {
@@ -813,13 +1690,7 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
         domain_changes.len(),
         timestamp,
     )?;
-    execute_generated_commit_result(
-        transaction,
-        rewritten,
-        additional_binary_blob_payloads,
-        functions,
-    )
-    .await
+    execute_generated_commit_result(transaction, rewritten, binary_blob_writes, functions).await
 }
 
 fn canonicalize_optional_json_text(
@@ -1049,33 +1920,22 @@ where
 
 async fn execute_generated_commit_result(
     transaction: &mut dyn LixTransaction,
-    mut result: GenerateCommitResult,
-    additional_binary_blob_payloads: &[Vec<u8>],
+    result: GenerateCommitResult,
+    binary_blob_writes: &[BinaryBlobWrite],
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
 ) -> Result<(), LixError> {
-    result.derived_apply_input.live_layouts = load_live_layouts_for_rows_in_transaction(
-        transaction,
-        &result.derived_apply_input.live_state_rows,
+    let mut executor = &mut *transaction;
+    let prepared = build_prepared_batch_from_generate_commit_result_with_executor(
+        &mut executor,
+        result,
+        functions,
     )
     .await?;
-    let prepared = bind_statement_batch_for_dialect(
-        build_statement_batch_from_generate_commit_result(
-            result,
-            functions,
-            0,
-            transaction.dialect(),
-        )?,
-        transaction.dialect(),
-    )?;
     let mut program = WriteProgram::new();
-    if !additional_binary_blob_payloads.is_empty() {
-        let payloads = additional_binary_blob_payloads
+    if !binary_blob_writes.is_empty() {
+        let payloads = binary_blob_writes
             .iter()
-            .map(|data| BinaryBlobWriteInput {
-                file_id: "",
-                version_id: "",
-                data,
-            })
+            .map(BinaryBlobWrite::as_input)
             .collect::<Vec<_>>();
         program.extend(build_binary_blob_fastcdc_write_program(
             transaction.dialect(),
@@ -1087,42 +1947,26 @@ async fn execute_generated_commit_result(
     Ok(())
 }
 
-async fn load_live_layouts_for_rows_in_transaction(
-    transaction: &mut dyn LixTransaction,
-    rows: &[MaterializedStateRow],
-) -> Result<BTreeMap<String, LiveTableLayout>, LixError> {
-    let mut layouts = BTreeMap::new();
-    let schema_keys = rows
-        .iter()
-        .map(|row| row.schema_key.clone())
-        .collect::<BTreeSet<_>>();
-    for schema_key in schema_keys {
-        if let Some(layout) = builtin_live_table_layout(&schema_key)? {
-            layouts.insert(schema_key.to_string(), layout);
-            continue;
-        }
-        layouts.insert(
-            schema_key.to_string(),
-            load_live_table_layout_in_transaction(transaction, &schema_key).await?,
-        );
-    }
-    Ok(layouts)
-}
-
 pub(crate) fn public_write_filesystem_payload_changes_already_committed(
     prepared: &PreparedExecutionContext,
 ) -> bool {
     let Some(public_write) = prepared.public_write.as_ref() else {
         return false;
     };
-    public_write.execution.as_ref().is_some_and(|execution| {
-        execution.partitions.iter().any(|partition| {
-            matches!(
-                partition,
-                PublicWriteExecutionPartition::Tracked(execution)
-                    if execution.filesystem_payload_changes_committed_by_write
-            )
-        })
+    matches!(
+        public_write
+            .planned_write
+            .command
+            .target
+            .descriptor
+            .public_name
+            .as_str(),
+        "lix_file" | "lix_file_by_version"
+    ) && public_write.execution.as_ref().is_some_and(|execution| {
+        execution
+            .partitions
+            .iter()
+            .any(|partition| matches!(partition, PublicWriteExecutionPartition::Tracked(_)))
     })
 }
 

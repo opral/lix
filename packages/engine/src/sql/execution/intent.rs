@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-use crate::engine::{CollectedExecutionSideEffects, Engine};
 use crate::sql::execution::contracts::requirements::PlanRequirements;
+use crate::sql::execution::runtime_effects::{BinaryBlobWrite, FilesystemTransactionState};
 use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::Statement;
 
@@ -11,58 +11,41 @@ pub(crate) struct IntentCollectionPolicy {
 }
 
 pub(crate) struct ExecutionIntent {
-    pub(crate) pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
-    pub(crate) pending_file_delete_targets: BTreeSet<(String, String)>,
+    pub(crate) filesystem_state: FilesystemTransactionState,
 }
 
 pub(crate) async fn collect_execution_intent_with_backend(
-    engine: &Engine,
-    backend: &dyn LixBackend,
-    statements: &[Statement],
-    params: &[Value],
-    active_version_id: &str,
-    writer_key: Option<&str>,
+    _engine: &crate::engine::Engine,
+    _backend: &dyn LixBackend,
+    _statements: &[Statement],
+    _params: &[Value],
+    _active_version_id: &str,
+    _writer_key: Option<&str>,
     requirements: &PlanRequirements,
     policy: IntentCollectionPolicy,
 ) -> Result<ExecutionIntent, LixError> {
-    let CollectedExecutionSideEffects {
-        pending_file_writes,
-        pending_file_delete_targets,
-    } = if policy.skip_side_effect_collection || requirements.read_only_query {
-        CollectedExecutionSideEffects {
-            pending_file_writes: Vec::new(),
-            pending_file_delete_targets: BTreeSet::new(),
-        }
+    let filesystem_state = if policy.skip_side_effect_collection || requirements.read_only_query {
+        FilesystemTransactionState::default()
     } else {
-        engine
-            .collect_execution_side_effects_with_backend_from_statements(
-                backend,
-                statements,
-                params,
-                active_version_id,
-                writer_key,
-            )
-            .await?
+        // Raw SQL intent collection no longer stages filesystem ops through a separate
+        // event stream. Public and transaction-local filesystem writes are carried by the
+        // typed filesystem state built during write planning.
+        FilesystemTransactionState::default()
     };
 
-    Ok(ExecutionIntent {
-        pending_file_writes,
-        pending_file_delete_targets,
-    })
+    Ok(ExecutionIntent { filesystem_state })
 }
 
-pub(crate) fn authoritative_pending_file_write_targets(
-    writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
+pub(crate) fn authoritative_binary_blob_write_targets(
+    writes: &[BinaryBlobWrite],
 ) -> BTreeSet<(String, String)> {
     writes
         .iter()
-        .filter(|write| write.data_is_authoritative)
-        .filter(|write| {
-            crate::filesystem::pending_file_writes::unresolved_auto_file_path_from_id(
-                &write.file_id,
-            )
-            .is_none()
+        .filter_map(|write| {
+            write
+                .file_id
+                .as_ref()
+                .map(|file_id| (file_id.clone(), write.version_id.clone()))
         })
-        .map(|write| (write.file_id.clone(), write.version_id.clone()))
         .collect()
 }

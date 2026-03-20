@@ -63,8 +63,7 @@ struct ResolvedWritePartitionBuilder {
     intended_post_state: Vec<PlannedStateRow>,
     tombstones: Vec<ResolvedRowRef>,
     lineage: Vec<RowLineage>,
-    filesystem_payload_writes: Vec<crate::sql::public::planner::ir::FilesystemPayloadWriteIntent>,
-    filesystem_payload_delete_targets: std::collections::BTreeSet<(String, String)>,
+    filesystem_state: crate::sql::execution::runtime_effects::FilesystemTransactionState,
 }
 
 impl ResolvedWritePartitionBuilder {
@@ -85,9 +84,7 @@ impl ResolvedWritePartitionBuilder {
             tombstones: self.tombstones,
             lineage: self.lineage,
             target_write_lane: None,
-            lazy_exact_file_update: None,
-            filesystem_payload_writes: self.filesystem_payload_writes,
-            filesystem_payload_delete_targets: self.filesystem_payload_delete_targets,
+            filesystem_state: self.filesystem_state,
         })
     }
 
@@ -122,8 +119,19 @@ impl ResolvedWritePartitionBuilder {
         });
 
         if !dropped_blob_rows.is_empty() {
-            self.filesystem_payload_writes.retain(|write| {
-                !dropped_blob_rows.contains(&(write.file_id.clone(), write.version_id.clone()))
+            for file in self.filesystem_state.files.values_mut() {
+                if dropped_blob_rows.contains(&(file.file_id.clone(), file.version_id.clone())) {
+                    file.data = None;
+                }
+            }
+            self.filesystem_state.files.retain(|_, file| {
+                file.deleted
+                    || file.descriptor.is_some()
+                    || file.data.is_some()
+                    || !matches!(
+                        file.metadata_patch,
+                        crate::sql::public::planner::ir::OptionalTextPatch::Unchanged
+                    )
             });
         }
     }
@@ -1113,28 +1121,18 @@ fn single_partition_write_plan(
     tombstones: Vec<ResolvedRowRef>,
     lineage: Vec<RowLineage>,
 ) -> ResolvedWritePlan {
-    let mut builder = ResolvedWritePartitionBuilder {
+    let builder = ResolvedWritePartitionBuilder {
         authoritative_pre_state,
         authoritative_pre_state_rows,
         intended_post_state,
         tombstones,
         lineage,
-        filesystem_payload_writes: Vec::new(),
-        filesystem_payload_delete_targets: std::collections::BTreeSet::new(),
+        filesystem_state: Default::default(),
     };
-    builder.normalize_semantic_noops();
-    ResolvedWritePlan::from_partition(ResolvedWritePartition {
-        execution_mode,
-        authoritative_pre_state: builder.authoritative_pre_state,
-        authoritative_pre_state_rows: builder.authoritative_pre_state_rows,
-        intended_post_state: builder.intended_post_state,
-        tombstones: builder.tombstones,
-        lineage: builder.lineage,
-        target_write_lane: None,
-        lazy_exact_file_update: None,
-        filesystem_payload_writes: builder.filesystem_payload_writes,
-        filesystem_payload_delete_targets: builder.filesystem_payload_delete_targets,
-    })
+    builder
+        .into_partition(execution_mode)
+        .map(ResolvedWritePlan::from_partition)
+        .unwrap_or_else(|| ResolvedWritePlan::from_partitions(Vec::new()))
 }
 
 fn planned_state_row_identity(row: &PlannedStateRow) -> (String, String, Option<String>) {
@@ -1361,7 +1359,7 @@ fn finalize_resolved_write_plan(
     mut resolved: ResolvedWritePlan,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     resolved.partitions.retain(|partition| {
-        !partition.intended_post_state.is_empty() || partition.lazy_exact_file_update.is_some()
+        !partition.intended_post_state.is_empty() || !partition.filesystem_state.files.is_empty()
     });
     for partition in &mut resolved.partitions {
         if partition.execution_mode == WriteMode::Untracked {

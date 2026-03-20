@@ -19,8 +19,7 @@ pub(crate) use graph_index::{
     build_reachable_commits_from_requested_cte_sql, COMMIT_GRAPH_NODE_TABLE,
 };
 pub(crate) use runtime::{
-    bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
-    load_commit_active_accounts, StatementBatch,
+    build_prepared_batch_from_generate_commit_result_with_executor, load_commit_active_accounts,
 };
 pub(crate) use state_source::{
     load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,

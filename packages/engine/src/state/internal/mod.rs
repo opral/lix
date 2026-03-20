@@ -17,9 +17,6 @@ use crate::functions::LixFunctionProvider;
 use crate::functions::SharedFunctionProvider;
 use crate::sql::common::ast::parse_sql_statements;
 use crate::sql::execution::contracts::planned_statement::PlannedStatementSet;
-use crate::state::internal::bind_once::{
-    bind_statements_with_appended_params_once, StatementWithAppendedParams,
-};
 use crate::state::internal::defaults::apply_vtable_insert_defaults;
 use crate::state::internal::inline_functions::inline_lix_functions_with_provider;
 use crate::state::internal::param_context::normalize_statement_placeholders_in_batch;
@@ -55,6 +52,7 @@ pub(crate) struct InternalStatePlan {
 #[derive(Debug, Clone)]
 pub(crate) struct RewriteOutput {
     pub(crate) statements: Vec<Statement>,
+    pub(crate) prepared_statements: Vec<PreparedStatement>,
     pub(crate) effect_only: bool,
     pub(crate) params: Vec<Value>,
     pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
@@ -76,6 +74,7 @@ pub(crate) struct PreprocessOutput {
 #[derive(Debug, Clone)]
 struct StatementRewriteOutput {
     statements: Vec<Statement>,
+    prepared_statements: Vec<PreparedStatement>,
     params: Vec<Value>,
     live_table_requirements: Vec<SchemaLiveTableRequirement>,
     internal_state: Option<InternalStatePlan>,
@@ -84,9 +83,12 @@ struct StatementRewriteOutput {
 }
 
 #[derive(Debug, Clone)]
-struct RewrittenStatementBinding {
-    statement: Statement,
-    appended_params: Arc<Vec<Value>>,
+enum RewrittenStatementBinding {
+    Ast {
+        statement: Statement,
+        appended_params: Arc<Vec<Value>>,
+    },
+    Prepared(PreparedStatement),
 }
 
 impl From<PreprocessOutput> for PlannedStatementSet {
@@ -284,6 +286,7 @@ where
 fn passthrough_output(statement: Statement) -> RewriteOutput {
     RewriteOutput {
         statements: vec![statement],
+        prepared_statements: Vec::new(),
         effect_only: false,
         params: Vec::new(),
         live_table_requirements: Vec::new(),
@@ -295,6 +298,7 @@ fn passthrough_output(statement: Statement) -> RewriteOutput {
 
 fn validate_statement_output(output: &RewriteOutput) -> Result<(), LixError> {
     if output.statements.is_empty()
+        && output.prepared_statements.is_empty()
         && !(output.effect_only
             && output.postprocess.is_none()
             && output.mutations.is_empty()
@@ -597,9 +601,12 @@ fn accumulate_rewrite_output<P: LixFunctionProvider>(
     update_validations.extend(output.update_validations);
 
     let appended_params = Arc::new(output.params);
+    for prepared in output.prepared_statements {
+        rewritten.push(RewrittenStatementBinding::Prepared(prepared));
+    }
     for statement in output.statements {
         let inlined = inline_lix_functions_with_provider(statement, provider);
-        rewritten.push(RewrittenStatementBinding {
+        rewritten.push(RewrittenStatementBinding::Ast {
             statement: lower_statement(inlined, dialect)?,
             appended_params: Arc::clone(&appended_params),
         });
@@ -613,27 +620,35 @@ fn render_statements_with_params(
     base_params: &[Value],
     dialect: SqlDialect,
 ) -> Result<(String, Vec<PreparedStatement>), LixError> {
-    let statement_sql = statements
-        .iter()
-        .map(|statement| statement.statement.to_string())
-        .collect::<Vec<_>>();
-    let statement_inputs = statements
-        .iter()
-        .zip(statement_sql.iter())
-        .map(|(statement, sql)| StatementWithAppendedParams {
-            sql: sql.as_str(),
-            appended_params: statement.appended_params.as_slice(),
-        })
-        .collect::<Vec<_>>();
-    let bound_statements =
-        bind_statements_with_appended_params_once(&statement_inputs, base_params, dialect)
-            .map_err(LixError::from)?;
+    let mut rendered = Vec::with_capacity(statements.len());
+    let mut prepared_statements = Vec::with_capacity(statements.len());
+    let mut placeholder_state = PlaceholderState::new();
 
-    let mut rendered = Vec::with_capacity(bound_statements.len());
-    let mut prepared_statements = Vec::with_capacity(bound_statements.len());
-    for (sql, params) in bound_statements {
-        rendered.push(sql.clone());
-        prepared_statements.push(PreparedStatement { sql, params });
+    for statement in statements {
+        match statement {
+            RewrittenStatementBinding::Prepared(prepared) => {
+                rendered.push(prepared.sql.clone());
+                prepared_statements.push(prepared.clone());
+            }
+            RewrittenStatementBinding::Ast {
+                statement,
+                appended_params,
+            } => {
+                let bound = crate::sql::ast::utils::bind_sql_with_state_and_appended_params(
+                    &statement.to_string(),
+                    base_params,
+                    appended_params.as_slice(),
+                    dialect,
+                    placeholder_state,
+                )?;
+                placeholder_state = bound.state;
+                rendered.push(bound.sql.clone());
+                prepared_statements.push(PreparedStatement {
+                    sql: bound.sql,
+                    params: bound.params,
+                });
+            }
+        }
     }
 
     Ok((rendered.join("; "), prepared_statements))
@@ -642,6 +657,7 @@ fn render_statements_with_params(
 fn from_rewrite_output(output: RewriteOutput) -> StatementRewriteOutput {
     StatementRewriteOutput {
         statements: output.statements,
+        prepared_statements: output.prepared_statements,
         params: output.params,
         live_table_requirements: output.live_table_requirements,
         internal_state: internal_state_plan_from_postprocess(output.postprocess),
@@ -805,6 +821,7 @@ async fn rewrite_internal_state_query_read_backend(
 fn rewrite_output_from_statement(statement: Statement) -> RewriteOutput {
     RewriteOutput {
         statements: vec![statement],
+        prepared_statements: Vec::new(),
         ..empty_rewrite_output()
     }
 }
@@ -812,6 +829,7 @@ fn rewrite_output_from_statement(statement: Statement) -> RewriteOutput {
 fn empty_rewrite_output() -> RewriteOutput {
     RewriteOutput {
         statements: Vec::new(),
+        prepared_statements: Vec::new(),
         effect_only: false,
         params: Vec::new(),
         live_table_requirements: Vec::new(),

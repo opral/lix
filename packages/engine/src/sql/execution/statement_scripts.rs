@@ -1,12 +1,16 @@
-use crate::engine::{Engine, PendingWriteTxnBuffer, TransactionBackendAdapter};
+use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path::{
     self, prepared_execution_mutates_public_surface_registry,
 };
-use crate::sql::execution::transaction_exec::public_write_execution_next_active_version_id;
+use crate::sql::execution::transaction_exec::{
+    public_write_execution_next_active_version_id, statement_can_prepare_against_pending_overlay,
+};
 use crate::sql::execution::write_txn_plan::{
-    build_write_txn_plan, write_txn_plan_is_independent_filesystem,
+    build_write_txn_plan, pending_filesystem_overlay_for_write_plan,
+    pending_registered_schema_overlay_for_write_plan, pending_semantic_overlay_for_write_plan,
+    write_txn_plan_is_independent_filesystem, MutationJournal,
 };
 use crate::sql::execution::write_txn_runner::stamp_watermark_before_commit;
 use crate::sql::public::runtime::{
@@ -17,7 +21,7 @@ use crate::state::internal::script::{
     coalesce_vtable_inserts_in_statement_list, prepare_statement_script_sql_statements,
 };
 use crate::state::stream::StateCommitStreamChange;
-use crate::{ExecuteOptions, ExecuteResult, LixError, LixTransaction, Value};
+use crate::{ExecuteOptions, ExecuteResult, LixBackend, LixError, LixTransaction, Value};
 use sqlparser::ast::Statement;
 
 impl Engine {
@@ -60,7 +64,7 @@ impl Engine {
                 &mut core.public_surface_registry,
                 &mut core.public_surface_registry_dirty,
                 &mut core.active_version_id,
-                &mut core.pending_write_txn_buffer,
+                &mut core.mutation_journal,
                 &mut core.pending_state_commit_stream_changes,
                 &mut core.pending_public_commit_session,
                 &mut core.observe_tick_already_emitted,
@@ -91,7 +95,7 @@ impl Engine {
         public_surface_registry: &mut crate::sql::public::catalog::SurfaceRegistry,
         public_surface_registry_dirty: &mut bool,
         active_version_id: &mut String,
-        pending_write_txn_buffer: &mut Option<PendingWriteTxnBuffer>,
+        mutation_journal: &mut MutationJournal,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
         pending_public_commit_session: &mut Option<
             crate::sql::execution::shared_path::PendingPublicCommitSession,
@@ -105,12 +109,12 @@ impl Engine {
             params,
             transaction.dialect(),
         )?;
-        self.flush_pending_write_txn_buffer_in_transaction(
+        self.flush_mutation_journal_in_transaction(
             transaction,
             public_surface_registry,
             public_surface_registry_dirty,
             active_version_id,
-            pending_write_txn_buffer,
+            mutation_journal,
             pending_state_commit_stream_changes,
             pending_public_commit_session,
             observe_tick_already_emitted,
@@ -127,7 +131,7 @@ impl Engine {
             public_surface_registry,
             public_surface_registry_dirty,
             active_version_id,
-            pending_write_txn_buffer,
+            mutation_journal,
             pending_state_commit_stream_changes,
             pending_public_commit_session,
             observe_tick_already_emitted,
@@ -147,7 +151,7 @@ impl Engine {
         public_surface_registry: &mut crate::sql::public::catalog::SurfaceRegistry,
         public_surface_registry_dirty: &mut bool,
         active_version_id: &mut String,
-        pending_write_txn_buffer: &mut Option<PendingWriteTxnBuffer>,
+        mutation_journal: &mut MutationJournal,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
         pending_public_commit_session: &mut Option<
             crate::sql::execution::shared_path::PendingPublicCommitSession,
@@ -188,36 +192,29 @@ impl Engine {
             let combined_prepared = shared_path::prepare_execution_with_backend(
                 self,
                 &backend,
+                None,
+                None,
+                None,
                 original_statements,
                 params,
                 active_version_id.as_str(),
                 writer_key,
                 allow_internal_tables,
-                Some(public_surface_registry),
+                Some(&*public_surface_registry),
                 shared_path::PreparationPolicy {
                     skip_side_effect_collection: false,
                 },
             )
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "statement script combined prepare_execution_with_backend failed: {}",
-                    error.description
-                ),
-            })?;
-            let Some(combined_plan) = build_write_txn_plan(&combined_prepared, writer_key) else {
-                return Ok(empty_mutating_script_result(result_statement_count));
-            };
-            if prepared_execution_mutates_public_surface_registry(&combined_prepared)? {
-                *public_surface_registry_dirty = true;
+            .await;
+            if let Ok(combined_prepared) = combined_prepared {
+                if let Some(combined_plan) = build_write_txn_plan(&combined_prepared, writer_key) {
+                    if prepared_execution_mutates_public_surface_registry(&combined_prepared)? {
+                        *public_surface_registry_dirty = true;
+                    }
+                    mutation_journal.stage_write_plan(combined_plan)?;
+                    return Ok(empty_mutating_script_result(result_statement_count));
+                }
             }
-            crate::sql::execution::transaction_exec::append_pending_write_txn_buffer(
-                pending_write_txn_buffer,
-                combined_plan,
-                false,
-            );
-            return Ok(empty_mutating_script_result(result_statement_count));
         }
 
         let public_mutating_only_script = executable_statements.iter().all(|(statement, _)| {
@@ -229,7 +226,7 @@ impl Engine {
         });
         if public_mutating_only_script {
             let defer_runtime_sequence_load = !allow_internal_tables
-                && !crate::filesystem::pending_file_writes::statements_require_generated_file_insert_ids(
+                && !crate::filesystem::statements_require_generated_filesystem_insert_ids(
                     original_statements,
                 );
             let (shared_settings, shared_sequence_start, shared_functions) = {
@@ -254,9 +251,29 @@ impl Engine {
                 )?;
                 let prepared = {
                     let backend = TransactionBackendAdapter::new(transaction);
+                    let pending_registered_schema_overlay =
+                        pending_registered_schema_overlay_for_write_plan(&combined_plan)?;
+                    let pending_filesystem_overlay =
+                        pending_filesystem_overlay_for_write_plan(&combined_plan);
+                    let pending_semantic_overlay = statement_can_prepare_against_pending_overlay(
+                        &planning_registry,
+                        backend.dialect(),
+                        &parsed_statement,
+                        statement_params,
+                        planning_active_version_id.as_str(),
+                        writer_key,
+                        true,
+                        pending_filesystem_overlay.is_some(),
+                    )
+                    .then(|| pending_semantic_overlay_for_write_plan(&combined_plan))
+                    .transpose()?
+                    .flatten();
                     shared_path::prepare_execution_with_backend(
                         self,
                         &backend,
+                        pending_registered_schema_overlay.as_ref(),
+                        pending_semantic_overlay.as_ref(),
+                        pending_filesystem_overlay.as_ref(),
                         std::slice::from_ref(&parsed_statement),
                         statement_params,
                         planning_active_version_id.as_str(),
@@ -277,10 +294,7 @@ impl Engine {
                     })?
                 };
                 let Some(statement_plan) = build_write_txn_plan(&prepared, writer_key) else {
-                    return Err(LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        "public mutating transaction statement did not lower to a write transaction plan",
-                    ));
+                    continue;
                 };
                 let mut statement_plan = statement_plan;
                 statement_plan.bind_runtime(
@@ -311,11 +325,11 @@ impl Engine {
             *active_version_id = planning_active_version_id;
             let combined_continuation_safe =
                 write_txn_plan_is_independent_filesystem(&combined_plan);
-            crate::sql::execution::transaction_exec::append_pending_write_txn_buffer(
-                pending_write_txn_buffer,
-                combined_plan,
-                combined_continuation_safe,
+            debug_assert!(
+                mutation_journal.is_empty() || combined_continuation_safe,
+                "combined public script path should only stage into an empty or continuation-safe journal"
             );
+            mutation_journal.stage_write_plan(combined_plan)?;
             return Ok(empty_mutating_script_result(result_statement_count));
         }
 
@@ -331,7 +345,7 @@ impl Engine {
                     public_surface_registry,
                     public_surface_registry_dirty,
                     active_version_id,
-                    pending_write_txn_buffer,
+                    mutation_journal,
                     None,
                     false,
                     pending_state_commit_stream_changes,

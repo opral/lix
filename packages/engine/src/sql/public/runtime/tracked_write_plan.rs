@@ -1,6 +1,6 @@
 use crate::deterministic_mode::RuntimeFunctionProvider;
-use crate::filesystem::pending_file_writes::PendingFileWrite;
 use crate::functions::SharedFunctionProvider;
+use crate::sql::execution::runtime_effects::FilesystemTransactionState;
 use crate::sql::execution::shared_path::PreparedExecutionContext;
 
 use super::{PreparedPublicWrite, TrackedWriteExecution};
@@ -10,14 +10,14 @@ pub(crate) struct TrackedWriteTxnPlan {
     pub(crate) public_writes: Vec<PreparedPublicWrite>,
     pub(crate) public_write: PreparedPublicWrite,
     pub(crate) execution: TrackedWriteExecution,
-    pub(crate) pending_file_writes: Vec<PendingFileWrite>,
+    pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) functions: SharedFunctionProvider<RuntimeFunctionProvider>,
     pub(crate) writer_key: Option<String>,
 }
 
 impl TrackedWriteTxnPlan {
     pub(crate) fn should_emit_observe_tick(&self) -> bool {
-        !self.execution.lazy_exact_file_updates.is_empty()
+        self.has_compiler_only_filesystem_changes()
             || !self
                 .execution
                 .semantic_effects
@@ -25,8 +25,8 @@ impl TrackedWriteTxnPlan {
                 .is_empty()
     }
 
-    pub(crate) fn has_lazy_exact_file_updates(&self) -> bool {
-        !self.execution.lazy_exact_file_updates.is_empty()
+    pub(crate) fn has_compiler_only_filesystem_changes(&self) -> bool {
+        self.execution.domain_change_batch.is_none() && !self.filesystem_state.files.is_empty()
     }
 
     pub(crate) fn is_merged_transaction_plan(&self) -> bool {
@@ -44,7 +44,7 @@ pub(crate) fn build_tracked_write_txn_plan(
         public_writes: vec![public_write.clone()],
         public_write: public_write.clone(),
         execution: execution.clone(),
-        pending_file_writes: prepared.intent.pending_file_writes.clone(),
+        filesystem_state: prepared.intent.filesystem_state.clone(),
         functions: prepared.functions.clone(),
         writer_key: writer_key.map(str::to_string),
     }

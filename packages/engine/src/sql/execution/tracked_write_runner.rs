@@ -8,6 +8,7 @@ use crate::schema::registry::{
 };
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::execute::SqlExecutionOutcome;
+use crate::sql::execution::runtime_effects::binary_blob_writes_from_filesystem_state;
 use crate::sql::execution::shared_path::{
     apply_public_version_last_checkpoint_side_effects, build_pending_public_commit_session,
     create_commit_error_to_lix_error, empty_public_write_execution_outcome,
@@ -51,24 +52,20 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
         .domain_change_batch
         .as_ref()
         .is_some_and(|batch| batch.changes.is_empty())
-        && !plan.has_lazy_exact_file_updates()
+        && !plan.has_compiler_only_filesystem_changes()
     {
         return Ok(Some(empty_public_write_execution_outcome()));
     }
 
     let mut create_commit_functions = plan.functions.clone();
-    let additional_binary_blob_payloads = plan
-        .pending_file_writes
-        .iter()
-        .filter(|write| write.data_is_authoritative)
-        .map(|write| write.after_data.clone())
-        .collect::<Vec<_>>();
     if let Some(session_slot) = pending_commit_session.as_mut() {
-        let can_merge = !plan.has_lazy_exact_file_updates()
+        let can_merge = !plan.has_compiler_only_filesystem_changes()
             && session_slot.as_ref().is_some_and(|session| {
                 pending_session_matches_create_commit(session, &plan.execution.create_preconditions)
             });
         if can_merge {
+            let binary_blob_writes =
+                binary_blob_writes_from_filesystem_state(&plan.filesystem_state);
             engine
                 .ensure_runtime_sequence_initialized_in_transaction(
                     transaction,
@@ -92,7 +89,7 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
                     .domain_change_batch
                     .as_ref()
                     .expect("merged tracked writes should have a domain change batch"),
-                &additional_binary_blob_payloads,
+                &binary_blob_writes,
                 &mut create_commit_functions,
                 &timestamp,
             )
@@ -143,11 +140,11 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
                 .as_ref()
                 .map(|batch| batch.changes.clone())
                 .unwrap_or_default(),
-            lazy_exact_file_updates: plan.execution.lazy_exact_file_updates.clone(),
-            additional_binary_blob_payloads,
+            filesystem_state: plan.filesystem_state.clone(),
             preconditions: plan.execution.create_preconditions.clone(),
             should_emit_observe_tick: plan.should_emit_observe_tick(),
             observe_tick_writer_key: plan.writer_key.clone(),
+            writer_key: plan.writer_key.clone(),
         },
         &mut create_commit_functions,
         invariant_checker,
@@ -247,7 +244,7 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
     }
 
     let plan_effects_override = if plugin_changes_committed {
-        if plan.has_lazy_exact_file_updates() {
+        if plan.has_compiler_only_filesystem_changes() {
             semantic_plan_effects_from_domain_changes(
                 &create_result.applied_domain_changes,
                 state_commit_stream_operation(

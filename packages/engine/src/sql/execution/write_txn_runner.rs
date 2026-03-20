@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::engine::{dedupe_filesystem_payload_domain_changes, should_run_binary_cas_gc, Engine};
+use crate::engine::Engine;
 use crate::functions::LixFunctionProvider;
 use crate::schema::live_layout::{normalized_live_column_values, untracked_live_table_name};
 use crate::schema::registry::{
@@ -102,10 +102,28 @@ async fn run_public_untracked_write_txn_with_transaction(
     let timestamp = runtime_functions.timestamp();
 
     if plan.execution.persist_filesystem_payloads_before_write {
+        // Untracked filesystem writes materialize blob payloads eagerly, but keep
+        // descriptor-domain visibility in the untracked live tables owned here.
+    }
+
+    apply_public_untracked_rows(transaction, &plan.execution.intended_post_state, &timestamp)
+        .await?;
+
+    let filesystem_finalization = engine
+        .compile_filesystem_finalization_from_state_in_transaction(
+            transaction,
+            &plan.filesystem_state,
+            plan.writer_key.as_deref(),
+            &[],
+        )
+        .await?;
+    if plan.execution.persist_filesystem_payloads_before_write
+        && !filesystem_finalization.binary_blob_writes.is_empty()
+    {
         engine
-            .persist_pending_file_data_updates_in_transaction(
+            .persist_binary_blob_writes_in_transaction(
                 transaction,
-                &plan.pending_file_writes,
+                &filesystem_finalization.binary_blob_writes,
             )
             .await
             .map_err(|error| LixError {
@@ -116,25 +134,11 @@ async fn run_public_untracked_write_txn_with_transaction(
                 ),
             })?;
     }
-
-    apply_public_untracked_rows(transaction, &plan.execution.intended_post_state, &timestamp)
-        .await?;
-
-    let filesystem_payload_domain_changes = dedupe_filesystem_payload_domain_changes(
-        &engine
-            .collect_live_filesystem_payload_domain_changes_in_transaction(
-                transaction,
-                &plan.pending_file_writes,
-                &plan.pending_file_delete_targets,
-                plan.writer_key.as_deref(),
-            )
-            .await?,
-    );
     // Public untracked writes already materialize their intended post-state directly into the
     // normalized per-schema untracked live tables via apply_public_untracked_rows(). Re-persisting
     // the derived payload-domain changes here is both redundant and unsafe, because the legacy
     // vtable-based insertion path is not part of the unified runner contract anymore.
-    if should_run_binary_cas_gc(&[], &filesystem_payload_domain_changes) {
+    if filesystem_finalization.should_run_gc {
         engine
             .garbage_collect_unreachable_binary_cas_in_transaction(transaction)
             .await?;
@@ -202,33 +206,28 @@ async fn run_internal_write_txn_with_transaction(
     .await
     .map_err(LixError::from)?;
 
-    let filesystem_payload_domain_changes = dedupe_filesystem_payload_domain_changes(
-        &engine
-            .collect_live_filesystem_payload_domain_changes_in_transaction(
-                transaction,
-                &plan.pending_file_writes,
-                &plan.pending_file_delete_targets,
-                plan.writer_key.as_deref(),
-            )
-            .await?,
-    );
-    if !plan.pending_file_writes.is_empty() {
+    let filesystem_finalization = engine
+        .compile_filesystem_finalization_from_state_in_transaction(
+            transaction,
+            &plan.filesystem_state,
+            plan.writer_key.as_deref(),
+            &plan.plan.preprocess.mutations,
+        )
+        .await?;
+    if !filesystem_finalization.binary_blob_writes.is_empty() {
         engine
-            .persist_pending_file_data_updates_in_transaction(
+            .persist_binary_blob_writes_in_transaction(
                 transaction,
-                &plan.pending_file_writes,
+                &filesystem_finalization.binary_blob_writes,
             )
             .await?;
     }
     persist_filesystem_payload_domain_changes_direct(
         transaction,
-        &filesystem_payload_domain_changes,
+        &filesystem_finalization.payload_domain_changes(),
     )
     .await?;
-    if should_run_binary_cas_gc(
-        &plan.plan.preprocess.mutations,
-        &filesystem_payload_domain_changes,
-    ) {
+    if filesystem_finalization.should_run_gc {
         engine
             .garbage_collect_unreachable_binary_cas_in_transaction(transaction)
             .await?;

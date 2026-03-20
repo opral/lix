@@ -130,6 +130,18 @@ async fn active_commit_id(engine: &support::simulation_test::SimulationEngine) -
     }
 }
 
+async fn public_commit_count(engine: &support::simulation_test::SimulationEngine) -> i64 {
+    let rows = engine
+        .execute("SELECT COUNT(*) FROM lix_commit", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match rows.statements[0].rows[0][0] {
+        Value::Integer(value) => value,
+        ref other => panic!("expected integer commit count, got {other:?}"),
+    }
+}
+
 fn tx_dynamic_schema_snapshot_sql() -> String {
     serde_json::json!({
         "value": {
@@ -180,6 +192,35 @@ fn delete_tx_dynamic_schema_sql() -> &'static str {
        AND schema_key = 'lix_registered_schema' \
        AND file_id = 'lix' \
        AND version_id = 'global'"
+}
+
+fn insert_key_value_state_row_sql(entity_id: &str, version_id: &str, value_json: &str) -> String {
+    format!(
+        "INSERT INTO lix_state_by_version (\
+         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+         ) VALUES (\
+         '{entity_id}', 'lix_key_value', 'lix', '{version_id}', 'lix', '{{\"key\":\"{entity_id}\",\"value\":{value_json}}}', '1'\
+         )"
+    )
+}
+
+fn update_key_value_state_row_sql(entity_id: &str, value_json: &str) -> String {
+    format!(
+        "UPDATE lix_state_by_version \
+         SET snapshot_content = '{{\"key\":\"{entity_id}\",\"value\":{value_json}}}' \
+         WHERE entity_id = '{entity_id}' \
+           AND schema_key = 'lix_key_value' \
+           AND file_id = 'lix'"
+    )
+}
+
+fn delete_key_value_state_row_sql(entity_id: &str) -> String {
+    format!(
+        "DELETE FROM lix_state_by_version \
+         WHERE entity_id = '{entity_id}' \
+           AND schema_key = 'lix_key_value' \
+           AND file_id = 'lix'"
+    )
 }
 
 async fn assert_tx_dynamic_schema_row_visible(engine: &support::simulation_test::SimulationEngine) {
@@ -687,6 +728,406 @@ simulation_test!(
             })
             .await
             .unwrap();
+    }
+);
+
+simulation_test!(
+    transaction_path_public_state_inserts_coalesce_into_single_commit,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let before_commit_count = public_commit_count(&engine).await;
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                let version_id = version_id.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO lix_state_by_version (\
+                             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                             ) VALUES (\
+                             'tx-state-a', 'lix_key_value', 'lix', '{version_id}', 'lix', '{{\"key\":\"tx-state-a\",\"value\":\"a\"}}', '1'\
+                             )"
+                        ),
+                        &[],
+                    )
+                    .await?;
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO lix_state_by_version (\
+                             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                             ) VALUES (\
+                             'tx-state-b', 'lix_key_value', 'lix', '{version_id}', 'lix', '{{\"key\":\"tx-state-b\",\"value\":\"b\"}}', '1'\
+                             )"
+                        ),
+                        &[],
+                    )
+                    .await?;
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let after_commit_count = public_commit_count(&engine).await;
+        assert_eq!(after_commit_count - before_commit_count, 1);
+
+        let rows = engine
+            .execute(
+                "SELECT value \
+                 FROM lix_key_value \
+                 WHERE key IN ('tx-state-a', 'tx-state-b') \
+                 ORDER BY key",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_eq!(rows.statements[0].rows[0][0], Value::Text("a".to_string()));
+        assert_eq!(rows.statements[0].rows[1][0], Value::Text("b".to_string()));
+    }
+);
+
+simulation_test!(
+    transaction_path_exact_public_state_updates_coalesce_into_single_commit,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        engine
+            .execute(
+                &insert_key_value_state_row_sql("tx-update-a", &version_id, "\"before-a\""),
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                &insert_key_value_state_row_sql("tx-update-b", &version_id, "\"before-b\""),
+                &[],
+            )
+            .await
+            .unwrap();
+        let before_commit_count = public_commit_count(&engine).await;
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        &update_key_value_state_row_sql("tx-update-a", "\"after-a\""),
+                        &[],
+                    )
+                    .await?;
+                    tx.execute(
+                        &update_key_value_state_row_sql("tx-update-b", "\"after-b\""),
+                        &[],
+                    )
+                    .await?;
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let after_commit_count = public_commit_count(&engine).await;
+        assert_eq!(after_commit_count - before_commit_count, 1);
+
+        let rows = engine
+            .execute(
+                "SELECT value \
+                 FROM lix_key_value \
+                 WHERE key IN ('tx-update-a', 'tx-update-b') \
+                 ORDER BY key",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.statements[0].rows,
+            vec![
+                vec![Value::Text("after-a".to_string())],
+                vec![Value::Text("after-b".to_string())],
+            ]
+        );
+    }
+);
+
+simulation_test!(
+    transaction_path_exact_public_state_update_and_delete_coalesce_into_single_commit,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        engine
+            .execute(
+                &insert_key_value_state_row_sql("tx-ud-a", &version_id, "\"before-a\""),
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                &insert_key_value_state_row_sql("tx-ud-b", &version_id, "\"before-b\""),
+                &[],
+            )
+            .await
+            .unwrap();
+        let before_commit_count = public_commit_count(&engine).await;
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        &update_key_value_state_row_sql("tx-ud-a", "\"after-a\""),
+                        &[],
+                    )
+                    .await?;
+                    tx.execute(&delete_key_value_state_row_sql("tx-ud-b"), &[])
+                        .await?;
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let after_commit_count = public_commit_count(&engine).await;
+        assert_eq!(after_commit_count - before_commit_count, 1);
+
+        let rows = engine
+            .execute(
+                "SELECT key, value \
+                 FROM lix_key_value \
+                 WHERE key IN ('tx-ud-a', 'tx-ud-b') \
+                 ORDER BY key",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.statements[0].rows,
+            vec![vec![
+                Value::Text("tx-ud-a".to_string()),
+                Value::Text("after-a".to_string()),
+            ]]
+        );
+    }
+);
+
+simulation_test!(
+    transaction_path_exact_filesystem_metadata_updates_coalesce_into_single_commit,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('tx-file-update-a', '/tx-file-update-a.md', lix_text_encode('a'))",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('tx-file-update-b', '/tx-file-update-b.md', lix_text_encode('b'))",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let before_commit_count = public_commit_count(&engine).await;
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE lix_file SET metadata = '{\"tag\":\"after-a\"}' \
+                         WHERE id = 'tx-file-update-a'",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE lix_file SET metadata = '{\"tag\":\"after-b\"}' \
+                         WHERE id = 'tx-file-update-b'",
+                        &[],
+                    )
+                    .await?;
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let after_commit_count = public_commit_count(&engine).await;
+        assert_eq!(after_commit_count - before_commit_count, 1);
+
+        let rows = engine
+            .execute(
+                "SELECT id, metadata \
+                 FROM lix_file \
+                 WHERE id IN ('tx-file-update-a', 'tx-file-update-b') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.statements[0].rows,
+            vec![
+                vec![
+                    Value::Text("tx-file-update-a".to_string()),
+                    Value::Text("{\"tag\":\"after-a\"}".to_string())
+                ],
+                vec![
+                    Value::Text("tx-file-update-b".to_string()),
+                    Value::Text("{\"tag\":\"after-b\"}".to_string())
+                ],
+            ]
+        );
+    }
+);
+
+simulation_test!(
+    transaction_path_exact_filesystem_update_and_delete_coalesce_into_single_commit,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('tx-file-ud-a', '/tx-file-ud-a.md', lix_text_encode('a'))",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('tx-file-ud-b', '/tx-file-ud-b.md', lix_text_encode('b'))",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let before_commit_count = public_commit_count(&engine).await;
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE lix_file SET metadata = '{\"tag\":\"after-a\"}' \
+                         WHERE id = 'tx-file-ud-a'",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute("DELETE FROM lix_file WHERE id = 'tx-file-ud-b'", &[])
+                        .await?;
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let after_commit_count = public_commit_count(&engine).await;
+        assert_eq!(after_commit_count - before_commit_count, 1);
+
+        let rows = engine
+            .execute(
+                "SELECT id, metadata \
+                 FROM lix_file \
+                 WHERE id IN ('tx-file-ud-a', 'tx-file-ud-b') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.statements[0].rows,
+            vec![vec![
+                Value::Text("tx-file-ud-a".to_string()),
+                Value::Text("{\"tag\":\"after-a\"}".to_string())
+            ],]
+        );
+    }
+);
+
+simulation_test!(
+    transaction_path_filesystem_insert_then_path_update_coalesces_into_single_commit,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let before_commit_count = public_commit_count(&engine).await;
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO lix_file (id, path, data) \
+                         VALUES ('tx-file-insert-then-path-update', '/tx-file-before.md', lix_text_encode('before'))",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE lix_file SET path = '/tx-file-after.md' \
+                         WHERE path = '/tx-file-before.md'",
+                        &[],
+                    )
+                    .await?;
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let after_commit_count = public_commit_count(&engine).await;
+        assert_eq!(after_commit_count - before_commit_count, 1);
+
+        let rows = engine
+            .execute(
+                "SELECT path, data \
+                 FROM lix_file \
+                 WHERE id = 'tx-file-insert-then-path-update'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.statements[0].rows[0][0],
+            Value::Text("/tx-file-after.md".to_string())
+        );
+        assert_blob_text(&rows.statements[0].rows[0][1], "before");
     }
 );
 

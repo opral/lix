@@ -143,6 +143,47 @@ pub(crate) fn bind_sql_with_state_and_appended_params(
     })
 }
 
+pub(crate) fn bind_statement_ast(
+    statement: &Statement,
+    params: &[Value],
+    dialect: SqlDialect,
+) -> Result<BoundSql, LixError> {
+    bind_statement_ast_with_state(statement, params, dialect, PlaceholderState::new())
+}
+
+pub(crate) fn bind_statement_ast_with_state(
+    statement: &Statement,
+    params: &[Value],
+    dialect: SqlDialect,
+    mut state: PlaceholderState,
+) -> Result<BoundSql, LixError> {
+    let mut statement = statement.clone();
+    let mut used_source_indices = Vec::new();
+    let mut source_to_dense: HashMap<usize, usize> = HashMap::new();
+
+    let mut visitor = PlaceholderBinder {
+        params_len: params.len(),
+        dialect,
+        state: &mut state,
+        source_to_dense: &mut source_to_dense,
+        used_source_indices: &mut used_source_indices,
+    };
+    if let ControlFlow::Break(error) = statement.visit(&mut visitor) {
+        return Err(error);
+    }
+
+    let bound_params = used_source_indices
+        .into_iter()
+        .map(|source_index| params[source_index].clone())
+        .collect();
+
+    Ok(BoundSql {
+        sql: statement.to_string(),
+        params: bound_params,
+        state,
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn advance_placeholder_state_for_statement_ast(
     statement: &mut Statement,

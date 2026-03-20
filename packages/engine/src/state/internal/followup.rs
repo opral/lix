@@ -31,9 +31,8 @@ use crate::sql::execution::execute_prepared::{
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{
-    bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
-    load_commit_active_accounts, load_version_info_for_versions, CommitQueryExecutor,
-    StatementBatch,
+    build_prepared_batch_from_generate_commit_result_with_executor, load_commit_active_accounts,
+    load_version_info_for_versions, CommitQueryExecutor,
 };
 use crate::state::internal::write_program::WriteProgram;
 use crate::state::internal::{
@@ -262,10 +261,7 @@ pub(crate) async fn build_update_followup_statements(
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
 ) -> Result<PreparedBatch, LixError> {
     let mut executor = TransactionExecutor { transaction };
-    let batch =
-        build_update_followup_statement_batch(&mut executor, plan, rows, writer_key, functions)
-            .await?;
-    bind_statement_batch_for_dialect(batch, executor.dialect())
+    build_update_followup_statement_batch(&mut executor, plan, rows, writer_key, functions).await
 }
 
 pub(crate) async fn build_delete_followup_statements(
@@ -277,16 +273,8 @@ pub(crate) async fn build_delete_followup_statements(
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
 ) -> Result<PreparedBatch, LixError> {
     let mut executor = TransactionExecutor { transaction };
-    let batch = build_delete_followup_statement_batch(
-        &mut executor,
-        plan,
-        rows,
-        params,
-        writer_key,
-        functions,
-    )
-    .await?;
-    bind_statement_batch_for_dialect(batch, executor.dialect())
+    build_delete_followup_statement_batch(&mut executor, plan, rows, params, writer_key, functions)
+        .await
 }
 
 async fn build_update_followup_statement_batch(
@@ -295,12 +283,9 @@ async fn build_update_followup_statement_batch(
     rows: &[Vec<EngineValue>],
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
-) -> Result<StatementBatch, LixError> {
+) -> Result<PreparedBatch, LixError> {
     if rows.is_empty() {
-        return Ok(StatementBatch {
-            statements: Vec::new(),
-            params: Vec::new(),
-        });
+        return Ok(PreparedBatch { steps: Vec::new() });
     }
 
     let timestamp = functions.timestamp();
@@ -369,12 +354,12 @@ async fn build_update_followup_statement_batch(
         },
         || functions.uuid_v7(),
     )?;
-    build_statement_batch_from_generate_commit_result(
+    build_prepared_batch_from_generate_commit_result_with_executor(
+        &mut commit_executor,
         commit_result,
         functions,
-        0,
-        executor.dialect(),
     )
+    .await
 }
 
 async fn build_delete_followup_statement_batch(
@@ -384,7 +369,7 @@ async fn build_delete_followup_statement_batch(
     params: &[EngineValue],
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
-) -> Result<StatementBatch, LixError> {
+) -> Result<PreparedBatch, LixError> {
     let timestamp = functions.timestamp();
     let mut domain_changes = Vec::new();
     let mut affected_versions = BTreeSet::new();
@@ -482,10 +467,7 @@ async fn build_delete_followup_statement_batch(
     }
 
     if domain_changes.is_empty() {
-        return Ok(StatementBatch {
-            statements: Vec::new(),
-            params: Vec::new(),
-        });
+        return Ok(PreparedBatch { steps: Vec::new() });
     }
 
     let mut commit_executor = CommitExecutorAdapter { executor };
@@ -501,12 +483,12 @@ async fn build_delete_followup_statement_batch(
         },
         || functions.uuid_v7(),
     )?;
-    build_statement_batch_from_generate_commit_result(
+    build_prepared_batch_from_generate_commit_result_with_executor(
+        &mut commit_executor,
         commit_result,
         functions,
-        0,
-        executor.dialect(),
     )
+    .await
 }
 
 async fn delete_effective_scope_untracked_rows(

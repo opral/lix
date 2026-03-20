@@ -20,7 +20,7 @@ use std::sync::RwLock;
 
 use crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange;
 use crate::sql::execution::contracts::planned_statement::MutationRow;
-use crate::sql::execution::write_txn_plan::WriteTxnPlan;
+use crate::sql::execution::write_txn_plan::MutationJournal;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
@@ -67,12 +67,6 @@ pub struct EngineTransaction<'a> {
     pub(crate) core: SharedTransactionCore,
 }
 
-#[derive(Clone)]
-pub(crate) struct PendingWriteTxnBuffer {
-    pub(crate) plan: WriteTxnPlan,
-    pub(crate) append_safe: bool,
-}
-
 pub(crate) struct SharedTransactionCore {
     pub(crate) options: ExecuteOptions,
     pub(crate) public_surface_registry: SurfaceRegistry,
@@ -84,7 +78,7 @@ pub(crate) struct SharedTransactionCore {
     pub(crate) observe_tick_already_emitted: bool,
     pub(crate) pending_public_commit_session:
         Option<crate::sql::execution::shared_path::PendingPublicCommitSession>,
-    pub(crate) pending_write_txn_buffer: Option<PendingWriteTxnBuffer>,
+    pub(crate) mutation_journal: MutationJournal,
 }
 
 impl Engine {
@@ -102,7 +96,7 @@ impl Engine {
             pending_state_commit_stream_changes: Vec::new(),
             observe_tick_already_emitted: false,
             pending_public_commit_session: None,
-            pending_write_txn_buffer: None,
+            mutation_journal: MutationJournal::default(),
         })
     }
 
@@ -240,12 +234,12 @@ impl Engine {
         core: &mut SharedTransactionCore,
     ) -> Result<(), LixError> {
         let active_version_before_flush = core.active_version_id.clone();
-        self.flush_pending_write_txn_buffer_in_transaction(
+        self.flush_mutation_journal_in_transaction(
             transaction,
             &mut core.public_surface_registry,
             &mut core.public_surface_registry_dirty,
             &mut core.active_version_id,
-            &mut core.pending_write_txn_buffer,
+            &mut core.mutation_journal,
             &mut core.pending_state_commit_stream_changes,
             &mut core.pending_public_commit_session,
             &mut core.observe_tick_already_emitted,
@@ -343,14 +337,9 @@ pub(crate) struct TransactionBackendAdapter<'a> {
     _lifetime: PhantomData<&'a ()>,
 }
 
-pub(crate) struct CollectedExecutionSideEffects {
-    pub(crate) pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
-    pub(crate) pending_file_delete_targets: BTreeSet<(String, String)>,
-}
-
 #[derive(Default)]
 pub(crate) struct DeferredTransactionSideEffects {
-    pub(crate) pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
+    pub(crate) filesystem_state: crate::sql::execution::runtime_effects::FilesystemTransactionState,
 }
 
 pub(crate) fn reject_internal_table_writes(statements: &[Statement]) -> Result<(), LixError> {

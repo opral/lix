@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use crate::engine::direct_state_file_cache_refresh_targets;
 use crate::schema::live_layout::untracked_live_table_name;
 use crate::state::stream::state_commit_stream_changes_from_mutations;
@@ -19,14 +17,10 @@ use crate::sql::execution::contracts::planner_error::PlannerError;
 pub(crate) fn derive_effects_from_state_resolution(
     preprocess: &PlannedStatementSet,
     writer_key: Option<&str>,
-    pending_file_delete_targets: &BTreeSet<(String, String)>,
-    authoritative_pending_file_write_targets: &BTreeSet<(String, String)>,
 ) -> Result<PlanEffects, PlannerError> {
     let state_commit_stream_changes =
         state_commit_stream_changes_from_mutations(&preprocess.mutations, writer_key);
     let file_cache_refresh_targets = direct_state_file_cache_refresh_targets(&preprocess.mutations);
-    let _ = authoritative_pending_file_write_targets;
-    let _ = pending_file_delete_targets;
     let next_active_version_id = active_version_from_mutations(&preprocess.mutations)
         .map_err(PlannerError::preprocess)?
         .or(

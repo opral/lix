@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use crate::cel::CelEvaluator;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::execution::contracts::dependency_spec::DependencySpec;
@@ -22,8 +20,6 @@ pub(crate) async fn build_execution_plan<P>(
     params: &[Value],
     dependency_spec_override: Option<DependencySpec>,
     functions: SharedFunctionProvider<P>,
-    pending_file_delete_targets: &BTreeSet<(String, String)>,
-    authoritative_pending_file_write_targets: &BTreeSet<(String, String)>,
     writer_key: Option<&str>,
 ) -> Result<ExecutionPlan, PlannerError>
 where
@@ -47,12 +43,7 @@ where
         None => derive_dependency_spec_from_statements(&parsed_statements, params)
             .map_err(PlannerError::parse)?,
     };
-    let effects = derive_plan_effects(
-        &preprocess,
-        writer_key,
-        pending_file_delete_targets,
-        authoritative_pending_file_write_targets,
-    )?;
+    let effects = derive_plan_effects(&preprocess, writer_key)?;
 
     let plan = ExecutionPlan {
         preprocess,

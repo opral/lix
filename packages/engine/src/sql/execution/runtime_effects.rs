@@ -1,19 +1,23 @@
-use crate::engine::{
-    dedupe_filesystem_payload_domain_changes, CollectedExecutionSideEffects, Engine,
-    TransactionBackendAdapter,
-};
+use crate::engine::{dedupe_filesystem_payload_domain_changes, Engine, TransactionBackendAdapter};
+use crate::filesystem::live_projection::FilesystemProjectionScope;
 use crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange;
+use crate::sql::execution::contracts::planned_statement::MutationRow;
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
+use crate::sql::public::planner::ir::OptionalTextPatch;
+use crate::sql::public::planner::semantics::filesystem_queries::load_file_row_by_id_without_path;
 use crate::sql::storage::queries::{
     filesystem as filesystem_queries, history as history_queries, state as state_queries,
 };
 use crate::sql::storage::tables;
 use crate::state::internal::write_program::WriteProgram;
-use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
-use sqlparser::ast::Statement;
+use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";
+pub(crate) const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
+pub(crate) const FILESYSTEM_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
+pub(crate) const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
+pub(crate) const FILESYSTEM_FILE_SCHEMA_VERSION: &str = "1";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 const SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 32_766;
@@ -23,6 +27,278 @@ pub(crate) struct BinaryBlobWriteInput<'a> {
     pub(crate) file_id: &'a str,
     pub(crate) version_id: &'a str,
     pub(crate) data: &'a [u8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BinaryBlobWrite {
+    pub(crate) file_id: Option<String>,
+    pub(crate) auto_path: Option<String>,
+    pub(crate) version_id: String,
+    pub(crate) untracked: bool,
+    pub(crate) data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FilesystemDescriptorState {
+    pub(crate) directory_id: String,
+    pub(crate) name: String,
+    pub(crate) extension: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) hidden: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactFilesystemDescriptorState {
+    pub(crate) descriptor: FilesystemDescriptorState,
+    pub(crate) untracked: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FilesystemTransactionState {
+    pub(crate) files: BTreeMap<(String, String), FilesystemTransactionFileState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FilesystemTransactionFileState {
+    pub(crate) file_id: String,
+    pub(crate) version_id: String,
+    pub(crate) untracked: bool,
+    pub(crate) descriptor: Option<FilesystemDescriptorState>,
+    pub(crate) metadata_patch: OptionalTextPatch,
+    pub(crate) data: Option<Vec<u8>>,
+    pub(crate) deleted: bool,
+}
+
+pub(crate) fn binary_blob_writes_from_filesystem_state(
+    state: &FilesystemTransactionState,
+) -> Vec<BinaryBlobWrite> {
+    state
+        .files
+        .values()
+        .filter_map(|file| {
+            file.data.as_ref().map(|data| BinaryBlobWrite {
+                file_id: Some(file.file_id.clone()),
+                auto_path: None,
+                version_id: file.version_id.clone(),
+                untracked: file.untracked,
+                data: data.clone(),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn delete_targets_from_filesystem_state(
+    state: &FilesystemTransactionState,
+) -> BTreeSet<(String, String)> {
+    state
+        .files
+        .values()
+        .filter(|file| file.deleted)
+        .map(|file| (file.file_id.clone(), file.version_id.clone()))
+        .collect()
+}
+
+pub(crate) fn filesystem_transaction_state_has_binary_payloads(
+    state: &FilesystemTransactionState,
+) -> bool {
+    state.files.values().any(|file| file.data.is_some())
+}
+
+pub(crate) fn merge_filesystem_transaction_state(
+    current: &mut FilesystemTransactionState,
+    next: &FilesystemTransactionState,
+) {
+    current.files.extend(next.files.clone());
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompiledFilesystemFinalization {
+    pub(crate) binary_blob_writes: Vec<BinaryBlobWrite>,
+    pub(crate) semantic_changes: Vec<FilesystemSemanticChange>,
+    pub(crate) should_run_gc: bool,
+}
+
+impl CompiledFilesystemFinalization {
+    pub(crate) fn payload_domain_changes(&self) -> Vec<FilesystemPayloadDomainChange> {
+        dedupe_filesystem_payload_domain_changes(
+            &self
+                .semantic_changes
+                .iter()
+                .map(FilesystemSemanticChange::to_payload_domain_change)
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+pub(crate) fn compile_filesystem_finalization(
+    semantic_changes: Vec<FilesystemSemanticChange>,
+    binary_blob_writes: Vec<BinaryBlobWrite>,
+    mutations: &[MutationRow],
+) -> CompiledFilesystemFinalization {
+    let payload_domain_changes = dedupe_filesystem_payload_domain_changes(
+        &semantic_changes
+            .iter()
+            .map(FilesystemSemanticChange::to_payload_domain_change)
+            .collect::<Vec<_>>(),
+    );
+    CompiledFilesystemFinalization {
+        binary_blob_writes,
+        semantic_changes,
+        should_run_gc: crate::engine::should_run_binary_cas_gc(mutations, &payload_domain_changes),
+    }
+}
+
+pub(crate) fn filesystem_transaction_state_needs_exact_descriptors(
+    state: &FilesystemTransactionState,
+) -> bool {
+    state.files.values().any(|file| {
+        !file.deleted
+            && file.descriptor.is_none()
+            && !matches!(file.metadata_patch, OptionalTextPatch::Unchanged)
+    })
+}
+
+pub(crate) fn with_exact_filesystem_descriptors(
+    state: &FilesystemTransactionState,
+    exact_descriptors: &BTreeMap<String, ExactFilesystemDescriptorState>,
+) -> FilesystemTransactionState {
+    let mut hydrated = state.clone();
+    for file in hydrated.files.values_mut() {
+        if file.deleted || file.descriptor.is_some() {
+            continue;
+        }
+        let Some(current) = exact_descriptors.get(&file.file_id) else {
+            continue;
+        };
+        let mut descriptor = current.descriptor.clone();
+        descriptor.metadata = file.metadata_patch.apply(descriptor.metadata);
+        file.descriptor = Some(descriptor);
+        file.untracked = current.untracked;
+        file.metadata_patch = OptionalTextPatch::Unchanged;
+    }
+    hydrated
+}
+
+pub(crate) fn compile_filesystem_transaction_state_from_state(
+    state: &FilesystemTransactionState,
+    writer_key: Option<&str>,
+    mutations: &[MutationRow],
+) -> Result<CompiledFilesystemFinalization, LixError> {
+    let mut semantic_changes = BTreeMap::new();
+    let mut binary_blob_writes = Vec::new();
+    for file in state.files.values() {
+        if file.deleted {
+            upsert_semantic_change(
+                &mut semantic_changes,
+                FilesystemSemanticChange {
+                    entity_id: file.file_id.clone(),
+                    schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
+                    schema_version: FILESYSTEM_FILE_SCHEMA_VERSION.to_string(),
+                    file_id: FILESYSTEM_DESCRIPTOR_FILE_ID.to_string(),
+                    version_id: file.version_id.clone(),
+                    untracked: file.untracked,
+                    plugin_key: FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string(),
+                    snapshot_content: None,
+                    metadata: None,
+                    writer_key: writer_key.map(ToString::to_string),
+                },
+            );
+            upsert_semantic_change(
+                &mut semantic_changes,
+                binary_blob_ref_tombstone_change_for_target(
+                    &file.file_id,
+                    &file.version_id,
+                    file.untracked,
+                    writer_key,
+                ),
+            );
+            continue;
+        }
+
+        if let Some(descriptor) = file.descriptor.as_ref() {
+            upsert_semantic_change(
+                &mut semantic_changes,
+                file_descriptor_change_for_state(
+                    &file.file_id,
+                    &file.version_id,
+                    descriptor,
+                    file.untracked,
+                    writer_key,
+                ),
+            );
+        }
+
+        if let Some(data) = file.data.as_ref() {
+            upsert_semantic_change(
+                &mut semantic_changes,
+                binary_blob_ref_change_for_bytes(
+                    &file.file_id,
+                    &file.version_id,
+                    data,
+                    file.untracked,
+                    writer_key,
+                )?,
+            );
+            binary_blob_writes.push(BinaryBlobWrite {
+                file_id: Some(file.file_id.clone()),
+                auto_path: None,
+                version_id: file.version_id.clone(),
+                untracked: file.untracked,
+                data: data.clone(),
+            });
+        }
+    }
+
+    Ok(compile_filesystem_finalization(
+        semantic_changes.into_values().collect(),
+        binary_blob_writes,
+        mutations,
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FilesystemSemanticChange {
+    pub(crate) entity_id: String,
+    pub(crate) schema_key: String,
+    pub(crate) schema_version: String,
+    pub(crate) file_id: String,
+    pub(crate) version_id: String,
+    pub(crate) untracked: bool,
+    pub(crate) plugin_key: String,
+    pub(crate) snapshot_content: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) writer_key: Option<String>,
+}
+
+impl FilesystemSemanticChange {
+    pub(crate) fn to_payload_domain_change(&self) -> FilesystemPayloadDomainChange {
+        FilesystemPayloadDomainChange {
+            entity_id: self.entity_id.clone(),
+            schema_key: self.schema_key.clone(),
+            schema_version: self.schema_version.clone(),
+            file_id: self.file_id.clone(),
+            version_id: self.version_id.clone(),
+            untracked: self.untracked,
+            plugin_key: self.plugin_key.clone(),
+            snapshot_content: self.snapshot_content.clone(),
+            metadata: self.metadata.clone(),
+            writer_key: self.writer_key.clone(),
+        }
+    }
+}
+
+impl BinaryBlobWrite {
+    pub(crate) fn as_input(&self) -> BinaryBlobWriteInput<'_> {
+        BinaryBlobWriteInput {
+            file_id: self
+                .file_id
+                .as_deref()
+                .or(self.auto_path.as_deref())
+                .unwrap_or("<staged-binary-blob>"),
+            version_id: self.version_id.as_str(),
+            data: &self.data,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -67,14 +343,18 @@ struct TrackedFilesystemPayloadBatch {
     manifest_chunk_rows: Vec<BinaryBlobManifestChunkRow>,
 }
 
-async fn resolve_pending_write_file_id_in_transaction(
+async fn resolve_binary_blob_write_file_id_in_transaction(
     transaction: &mut dyn LixTransaction,
-    write: &crate::filesystem::pending_file_writes::PendingFileWrite,
+    write: &BinaryBlobWrite,
 ) -> Result<String, LixError> {
-    let Some(path) =
-        crate::filesystem::pending_file_writes::unresolved_auto_file_path_from_id(&write.file_id)
-    else {
-        return Ok(write.file_id.clone());
+    if let Some(file_id) = write.file_id.as_ref() {
+        return Ok(file_id.clone());
+    }
+    let Some(path) = write.auto_path.as_deref() else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "binary blob write is missing both file_id and auto_path".to_string(),
+        });
     };
     let resolved = {
         let backend = TransactionBackendAdapter::new(transaction);
@@ -86,8 +366,10 @@ async fn resolve_pending_write_file_id_in_transaction(
         .await?
     };
     let Some(file_id) = resolved else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                "pending file write: unable to resolve auto-generated file id for path '{}' in version '{}'",
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "binary blob write: unable to resolve auto-generated file id for path '{}' in version '{}'",
                 path, write.version_id
             ),
         });
@@ -101,7 +383,7 @@ fn binary_blob_ref_change_for_bytes(
     data: &[u8],
     untracked: bool,
     writer_key: Option<&str>,
-) -> Result<FilesystemPayloadDomainChange, LixError> {
+) -> Result<FilesystemSemanticChange, LixError> {
     let size_bytes = u64::try_from(data.len()).map_err(|_| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!(
@@ -115,7 +397,7 @@ fn binary_blob_ref_change_for_bytes(
         "size_bytes": size_bytes,
     })
     .to_string();
-    Ok(FilesystemPayloadDomainChange {
+    Ok(FilesystemSemanticChange {
         entity_id: file_id.to_string(),
         schema_key: BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
         schema_version: BINARY_BLOB_REF_SCHEMA_VERSION.to_string(),
@@ -129,13 +411,63 @@ fn binary_blob_ref_change_for_bytes(
     })
 }
 
+fn file_descriptor_change_for_state(
+    file_id: &str,
+    version_id: &str,
+    descriptor: &FilesystemDescriptorState,
+    untracked: bool,
+    writer_key: Option<&str>,
+) -> FilesystemSemanticChange {
+    let metadata = descriptor.metadata.clone();
+    FilesystemSemanticChange {
+        entity_id: file_id.to_string(),
+        schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
+        schema_version: FILESYSTEM_FILE_SCHEMA_VERSION.to_string(),
+        file_id: FILESYSTEM_DESCRIPTOR_FILE_ID.to_string(),
+        version_id: version_id.to_string(),
+        untracked,
+        plugin_key: FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string(),
+        snapshot_content: Some(
+            serde_json::json!({
+                "id": file_id,
+                "directory_id": if descriptor.directory_id.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(descriptor.directory_id.clone())
+                },
+                "name": descriptor.name,
+                "extension": descriptor.extension,
+                "metadata": metadata,
+                "hidden": descriptor.hidden,
+            })
+            .to_string(),
+        ),
+        metadata,
+        writer_key: writer_key.map(ToString::to_string),
+    }
+}
+
+fn upsert_semantic_change(
+    changes: &mut BTreeMap<(String, String, String, String, bool), FilesystemSemanticChange>,
+    change: FilesystemSemanticChange,
+) {
+    let key = (
+        change.entity_id.clone(),
+        change.schema_key.clone(),
+        change.file_id.clone(),
+        change.version_id.clone(),
+        change.untracked,
+    );
+    changes.insert(key, change);
+}
+
 fn binary_blob_ref_tombstone_change_for_target(
     file_id: &str,
     version_id: &str,
     untracked: bool,
     writer_key: Option<&str>,
-) -> FilesystemPayloadDomainChange {
-    FilesystemPayloadDomainChange {
+) -> FilesystemSemanticChange {
+    FilesystemSemanticChange {
         entity_id: file_id.to_string(),
         schema_key: BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
         schema_version: BINARY_BLOB_REF_SCHEMA_VERSION.to_string(),
@@ -150,55 +482,6 @@ fn binary_blob_ref_tombstone_change_for_target(
 }
 
 impl Engine {
-    pub(crate) async fn collect_execution_side_effects_with_backend_from_statements(
-        &self,
-        backend: &dyn LixBackend,
-        statements: &[Statement],
-        params: &[Value],
-        active_version_id: &str,
-        _writer_key: Option<&str>,
-    ) -> Result<CollectedExecutionSideEffects, LixError> {
-        let pending_file_write_collection =
-            crate::filesystem::pending_file_writes::collect_pending_file_writes_from_statements(
-                backend,
-                statements,
-                params,
-                active_version_id,
-            )
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "pending file writes collection failed: {}",
-                    error.description
-                ),
-            })?;
-        let crate::filesystem::pending_file_writes::PendingFileWriteCollection {
-            writes: pending_file_writes,
-            writes_by_statement: _pending_file_writes_by_statement,
-        } = pending_file_write_collection;
-        let pending_file_delete_targets =
-            crate::filesystem::pending_file_writes::collect_pending_file_delete_targets_from_statements(
-                backend,
-                statements,
-                params,
-                active_version_id,
-            )
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "pending file delete collection failed: {}",
-                    error.description
-                ),
-            })?;
-
-        Ok(CollectedExecutionSideEffects {
-            pending_file_writes,
-            pending_file_delete_targets,
-        })
-    }
-
     pub(crate) async fn persist_filesystem_payload_domain_changes_in_transaction(
         &self,
         transaction: &mut dyn LixTransaction,
@@ -265,56 +548,35 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) async fn collect_live_filesystem_payload_domain_changes_in_transaction(
+    pub(crate) async fn compile_filesystem_finalization_from_state_in_transaction(
         &self,
         transaction: &mut dyn LixTransaction,
-        writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
-        delete_targets: &BTreeSet<(String, String)>,
+        filesystem_state: &FilesystemTransactionState,
         writer_key: Option<&str>,
-    ) -> Result<Vec<FilesystemPayloadDomainChange>, LixError> {
-        let mut latest_by_key = BTreeMap::new();
-
-        for write in writes {
-            if !write.data_is_authoritative {
-                continue;
-            }
-            let resolved_file_id =
-                resolve_pending_write_file_id_in_transaction(transaction, write).await?;
-            let change = binary_blob_ref_change_for_bytes(
-                &resolved_file_id,
-                &write.version_id,
-                &write.after_data,
-                write.untracked,
-                writer_key,
-            )?;
-            latest_by_key.insert(
-                (resolved_file_id, write.version_id.clone(), write.untracked),
-                change,
-            );
-        }
-
-        for (file_id, version_id) in delete_targets {
-            latest_by_key.insert(
-                (file_id.clone(), version_id.clone(), false),
-                binary_blob_ref_tombstone_change_for_target(file_id, version_id, false, writer_key),
-            );
-        }
-
-        Ok(latest_by_key.into_values().collect())
+        mutations: &[MutationRow],
+    ) -> Result<CompiledFilesystemFinalization, LixError> {
+        let state = if filesystem_transaction_state_needs_exact_descriptors(filesystem_state) {
+            let exact_descriptors = load_exact_filesystem_descriptors_for_state_in_transaction(
+                transaction,
+                filesystem_state,
+            )
+            .await?;
+            with_exact_filesystem_descriptors(filesystem_state, &exact_descriptors)
+        } else {
+            filesystem_state.clone()
+        };
+        compile_filesystem_transaction_state_from_state(&state, writer_key, mutations)
     }
 
-    pub(crate) async fn persist_pending_file_data_updates_in_transaction(
+    pub(crate) async fn persist_binary_blob_writes_in_transaction(
         &self,
         transaction: &mut dyn LixTransaction,
-        writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
+        writes: &[BinaryBlobWrite],
     ) -> Result<(), LixError> {
         let mut latest_index_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
         for (index, write) in writes.iter().enumerate() {
-            if !write.data_is_authoritative {
-                continue;
-            }
             let resolved_file_id =
-                resolve_pending_write_file_id_in_transaction(transaction, write).await?;
+                resolve_binary_blob_write_file_id_in_transaction(transaction, write).await?;
             latest_index_by_key.insert((resolved_file_id, write.version_id.clone()), index);
         }
 
@@ -330,7 +592,7 @@ impl Engine {
             payloads.push(BinaryBlobWriteInput {
                 file_id,
                 version_id,
-                data: &write.after_data,
+                data: &write.data,
             });
         }
         let program = build_binary_blob_fastcdc_write_program(transaction.dialect(), &payloads)?;
@@ -345,6 +607,69 @@ impl Engine {
     ) -> Result<(), LixError> {
         garbage_collect_unreachable_binary_cas_in_transaction(transaction).await
     }
+}
+
+async fn load_exact_filesystem_descriptors_for_state_in_transaction(
+    transaction: &mut dyn LixTransaction,
+    filesystem_state: &FilesystemTransactionState,
+) -> Result<BTreeMap<String, ExactFilesystemDescriptorState>, LixError> {
+    let targets = filesystem_state
+        .files
+        .values()
+        .filter(|file| {
+            !file.deleted
+                && file.descriptor.is_none()
+                && !matches!(file.metadata_patch, OptionalTextPatch::Unchanged)
+        })
+        .map(|file| (file.file_id.as_str(), file.version_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut loaded = BTreeMap::new();
+    let backend = TransactionBackendAdapter::new(transaction);
+    for (file_id, version_id) in targets {
+        let row = load_file_row_by_id_without_path(
+            &backend,
+            version_id,
+            file_id,
+            FilesystemProjectionScope::ExplicitVersion,
+        )
+        .await
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: error.message,
+        })?;
+        let row = if row.is_some() || version_id == crate::version::GLOBAL_VERSION_ID {
+            row
+        } else {
+            load_file_row_by_id_without_path(
+                &backend,
+                crate::version::GLOBAL_VERSION_ID,
+                file_id,
+                FilesystemProjectionScope::ExplicitVersion,
+            )
+            .await
+            .map_err(|error| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: error.message,
+            })?
+        };
+        let Some(row) = row else {
+            continue;
+        };
+        loaded.insert(
+            file_id.to_string(),
+            ExactFilesystemDescriptorState {
+                descriptor: FilesystemDescriptorState {
+                    directory_id: row.directory_id.unwrap_or_default(),
+                    name: row.name,
+                    extension: row.extension,
+                    metadata: row.metadata,
+                    hidden: row.hidden,
+                },
+                untracked: row.untracked,
+            },
+        );
+    }
+    Ok(loaded)
 }
 
 pub(crate) fn build_filesystem_payload_domain_changes_insert(
@@ -439,6 +764,8 @@ fn build_bulk_insert_binary_blob_manifest_chunk_sql(rows: &[String]) -> String {
 const FASTCDC_MIN_CHUNK_BYTES: usize = 16 * 1024;
 const FASTCDC_AVG_CHUNK_BYTES: usize = 64 * 1024;
 const FASTCDC_MAX_CHUNK_BYTES: usize = 256 * 1024;
+const SINGLE_CHUNK_FAST_PATH_MAX_BYTES: usize = 64 * 1024;
+const ZSTD_MIN_CHUNK_BYTES: usize = 32 * 1024;
 const BINARY_CHUNK_CODEC_RAW: &str = "raw";
 const BINARY_CHUNK_CODEC_ZSTD: &str = "zstd";
 
@@ -507,7 +834,12 @@ fn build_tracked_filesystem_payload_batch(
                 payload.file_id, payload.version_id
             ),
         })?;
-        let chunk_ranges = fastcdc_chunk_ranges(payload.data);
+        let materialize_chunk_cas = should_materialize_chunk_cas(payload.data);
+        let chunk_ranges = if materialize_chunk_cas {
+            fastcdc_chunk_ranges(payload.data)
+        } else {
+            Vec::new()
+        };
         let chunk_count = i64::try_from(chunk_ranges.len()).map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
@@ -587,6 +919,10 @@ fn build_tracked_filesystem_payload_batch(
         chunk_store_rows: chunk_store_rows.into_values().collect(),
         manifest_chunk_rows: manifest_chunk_rows.into_values().collect(),
     })
+}
+
+fn should_materialize_chunk_cas(data: &[u8]) -> bool {
+    data.len() > SINGLE_CHUNK_FAST_PATH_MAX_BYTES
 }
 
 fn push_blob_manifest_rows(
@@ -713,6 +1049,9 @@ fn fastcdc_chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     if data.is_empty() {
         return Vec::new();
     }
+    if data.len() <= SINGLE_CHUNK_FAST_PATH_MAX_BYTES {
+        return vec![(0, data.len())];
+    }
 
     fastcdc::v2020::FastCDC::new(
         data,
@@ -729,6 +1068,14 @@ fn fastcdc_chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
 }
 
 fn encode_binary_chunk_payload(chunk_data: &[u8]) -> Result<EncodedBinaryChunkPayload, LixError> {
+    if chunk_data.len() < ZSTD_MIN_CHUNK_BYTES {
+        return Ok(EncodedBinaryChunkPayload {
+            codec: BINARY_CHUNK_CODEC_RAW,
+            codec_dict_id: None,
+            data: chunk_data.to_vec(),
+        });
+    }
+
     // Phase 2: per-chunk compression with "if smaller" admission.
     let compressed = compress_binary_chunk_payload(chunk_data)?;
     if compressed.len() < chunk_data.len() {

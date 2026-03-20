@@ -18,10 +18,12 @@ use crate::schema::live_layout::{
     tracked_live_table_name, untracked_live_table_name, LiveColumnKind, LiveTableLayout,
 };
 use crate::schema::registry::load_live_table_layout_with_backend;
+use crate::sql::ast::utils::bind_statement_ast;
 use crate::sql::execution::contracts::planned_statement::UpdateValidationKind;
+use crate::sql::execution::contracts::prepared_statement::PreparedStatement;
 use crate::state::commit::{
-    build_statement_batch_from_generate_commit_result, load_commit_active_accounts,
-    load_version_info_for_versions, CommitQueryExecutor, StatementBatch,
+    build_prepared_batch_from_generate_commit_result_with_executor, load_commit_active_accounts,
+    load_version_info_for_versions, CommitQueryExecutor,
 };
 use crate::state::commit::{generate_commit, DomainChangeInput, GenerateCommitArgs};
 use crate::state::internal::param_context::{
@@ -72,6 +74,7 @@ impl CommitQueryExecutor for BackendExecutor<'_> {
 
 pub struct VtableWriteRewrite {
     pub statements: Vec<Statement>,
+    pub prepared_statements: Vec<PreparedStatement>,
     pub params: Vec<EngineValue>,
     pub live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub mutations: Vec<MutationRow>,
@@ -182,6 +185,7 @@ pub fn rewrite_insert_with_writer_key(
 
     Ok(Some(VtableWriteRewrite {
         statements,
+        prepared_statements: Vec::new(),
         params: generated_params,
         live_table_requirements,
         mutations,
@@ -193,7 +197,6 @@ pub async fn rewrite_insert_with_backend(
     mut insert: sqlparser::ast::Insert,
     known_live_layouts: &BTreeMap<String, crate::schema::live_layout::LiveTableLayout>,
     params: &[EngineValue],
-    generated_param_offset: usize,
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Option<VtableWriteRewrite>, LixError> {
@@ -226,8 +229,8 @@ pub async fn rewrite_insert_with_backend(
     let tracked_rows = split_rows.tracked;
     let untracked_rows = split_rows.untracked;
 
-    let mut statements: Vec<Statement> = Vec::new();
-    let mut generated_params: Vec<EngineValue> = Vec::new();
+    let statements: Vec<Statement> = Vec::new();
+    let mut prepared_statements: Vec<PreparedStatement> = Vec::new();
     let mut live_table_requirements: Vec<SchemaLiveTableRequirement> = Vec::new();
     let mut mutations: Vec<MutationRow> = Vec::new();
 
@@ -239,13 +242,11 @@ pub async fn rewrite_insert_with_backend(
             &mut live_table_requirements,
             &mut mutations,
             known_live_layouts,
-            params.len() + generated_param_offset,
             writer_key,
             functions,
         )
         .await?;
-        statements.extend(tracked.statements);
-        generated_params.extend(tracked.params);
+        prepared_statements.extend(tracked);
     }
 
     if !untracked_rows.is_empty() {
@@ -260,12 +261,13 @@ pub async fn rewrite_insert_with_backend(
             functions,
         )
         .await?;
-        statements.extend(untracked);
+        prepared_statements.extend(untracked);
     }
 
     Ok(Some(VtableWriteRewrite {
         statements,
-        params: generated_params,
+        prepared_statements,
+        params: Vec::new(),
         live_table_requirements,
         mutations,
     }))
@@ -1166,10 +1168,9 @@ async fn rewrite_tracked_rows_with_backend(
     live_table_requirements: &mut Vec<SchemaLiveTableRequirement>,
     mutations: &mut Vec<MutationRow>,
     known_live_layouts: &BTreeMap<String, crate::schema::live_layout::LiveTableLayout>,
-    placeholder_offset: usize,
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
-) -> Result<StatementBatch, LixError> {
+) -> Result<Vec<PreparedStatement>, LixError> {
     let entity_idx = required_column_index(&insert.columns, "entity_id")?;
     let schema_idx = required_column_index(&insert.columns, "schema_key")?;
     let file_idx = required_column_index(&insert.columns, "file_id")?;
@@ -1274,10 +1275,7 @@ async fn rewrite_tracked_rows_with_backend(
     }
 
     if domain_changes.is_empty() {
-        return Ok(StatementBatch {
-            statements: Vec::new(),
-            params: Vec::new(),
-        });
+        return Ok(Vec::new());
     }
 
     let mut executor = BackendExecutor { backend };
@@ -1308,11 +1306,14 @@ async fn rewrite_tracked_rows_with_backend(
         ensure_live_table_requirement(live_table_requirements, &row.schema_key, layout);
     }
 
-    build_statement_batch_from_generate_commit_result(
-        commit_result,
-        functions,
-        placeholder_offset,
-        backend.dialect(),
+    Ok(
+        build_prepared_batch_from_generate_commit_result_with_executor(
+            &mut executor,
+            commit_result,
+            functions,
+        )
+        .await?
+        .steps,
     )
 }
 
@@ -1570,7 +1571,7 @@ async fn build_untracked_insert_with_backend(
     known_live_layouts: &BTreeMap<String, crate::schema::live_layout::LiveTableLayout>,
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
-) -> Result<Vec<Statement>, LixError> {
+) -> Result<Vec<PreparedStatement>, LixError> {
     let entity_idx = required_column_index(&insert.columns, "entity_id")?;
     let schema_idx = required_column_index(&insert.columns, "schema_key")?;
     let file_idx = required_column_index(&insert.columns, "file_id")?;
@@ -1724,7 +1725,16 @@ async fn build_untracked_insert_with_backend(
         ));
     }
 
-    Ok(statements)
+    let mut prepared = Vec::with_capacity(statements.len());
+    for statement in statements {
+        let bound = bind_statement_ast(&statement, &[], backend.dialect())?;
+        prepared.push(PreparedStatement {
+            sql: bound.sql,
+            params: bound.params,
+        });
+    }
+
+    Ok(prepared)
 }
 
 fn filter_update_assignments(assignments: Vec<Assignment>) -> Vec<Assignment> {

@@ -1,34 +1,31 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::ops::ControlFlow;
-
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     ConflictTarget, DoUpdate, Expr, Ident, ObjectName, ObjectNamePart, OnConflict,
     OnConflictAction, OnInsert, Query, SetExpr, Statement, TableObject, Value as SqlValue, Values,
 };
-use sqlparser::ast::{VisitMut, VisitorMut};
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
 };
 use crate::functions::LixFunctionProvider;
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
+use crate::schema::live_layout::load_live_table_layout_with_executor;
 use crate::state::internal::quote_ident;
 
 use crate::schema::live_layout::{
     builtin_live_table_layout, normalized_live_column_values, tracked_live_table_name,
     untracked_live_table_name,
 };
-use crate::sql::ast::utils::{
-    bind_sql, parse_sql_statements, resolve_placeholder_index, PlaceholderState,
-};
+use crate::sql::ast::utils::bind_statement_ast;
 use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::{LixError, SqlDialect, Value as EngineValue};
 
-use super::graph_index::append_commit_graph_node_statements;
+use super::graph_index::{
+    resolve_commit_graph_node_write_rows_with_executor, CommitGraphNodeWriteRow,
+    COMMIT_GRAPH_NODE_TABLE,
+};
 use super::state_source::CommitQueryExecutor;
 use super::types::{
     CanonicalCommitOutput, DerivedCommitApplyInput, DomainChangeInput, GenerateCommitResult,
@@ -43,119 +40,30 @@ const SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 32_766;
 const POSTGRES_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 65_535;
 const SNAPSHOT_INSERT_PARAM_COLUMNS: usize = 2;
 const CHANGE_INSERT_PARAM_COLUMNS: usize = 9;
+
+#[derive(Debug, Clone)]
+struct SnapshotInsertRow {
+    id: String,
+    content: String,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalChangeInsertRow {
+    id: String,
+    entity_id: String,
+    schema_key: String,
+    schema_version: String,
+    file_id: String,
+    plugin_key: String,
+    snapshot_id: String,
+    metadata: Option<String>,
+    created_at: String,
+}
+
 #[derive(Debug)]
-pub(crate) struct StatementBatch {
-    pub(crate) statements: Vec<Statement>,
-    pub(crate) params: Vec<EngineValue>,
-}
-
-pub(crate) fn bind_statement_batch_for_dialect(
-    batch: StatementBatch,
-    dialect: SqlDialect,
-) -> Result<PreparedBatch, LixError> {
-    let mut prepared = Vec::with_capacity(batch.statements.len());
-    for statement in batch.statements {
-        prepared.push(PreparedStatement {
-            sql: bind_statement_for_batch(statement, &batch.params, dialect)?,
-            params: Vec::new(),
-        });
-    }
-
-    Ok(PreparedBatch { steps: prepared })
-}
-
-fn bind_statement_for_batch(
-    statement: Statement,
-    params: &[EngineValue],
-    dialect: SqlDialect,
-) -> Result<String, LixError> {
-    let bound = bind_sql(&statement.to_string(), params, dialect)?;
-    inline_bound_statement(&bound.sql, &bound.params, dialect)
-}
-
-fn inline_bound_statement(
-    sql: &str,
-    params: &[EngineValue],
-    dialect: SqlDialect,
-) -> Result<String, LixError> {
-    let mut statements = parse_sql_statements(sql)?;
-    let mut state = PlaceholderState::new();
-
-    for statement in &mut statements {
-        let mut visitor = PlaceholderLiteralInliner {
-            params,
-            dialect,
-            state: &mut state,
-        };
-        if let ControlFlow::Break(error) = statement.visit(&mut visitor) {
-            return Err(error);
-        }
-    }
-
-    Ok(statements
-        .into_iter()
-        .map(|statement| statement.to_string())
-        .collect::<Vec<_>>()
-        .join("; "))
-}
-
-struct PlaceholderLiteralInliner<'a> {
-    params: &'a [EngineValue],
-    dialect: SqlDialect,
-    state: &'a mut PlaceholderState,
-}
-
-impl VisitorMut for PlaceholderLiteralInliner<'_> {
-    type Break = LixError;
-
-    fn pre_visit_value(&mut self, value: &mut SqlValue) -> ControlFlow<Self::Break> {
-        let SqlValue::Placeholder(token) = value else {
-            return ControlFlow::Continue(());
-        };
-
-        let source_index = match resolve_placeholder_index(token, self.params.len(), self.state) {
-            Ok(index) => index,
-            Err(error) => return ControlFlow::Break(error),
-        };
-
-        *value = match engine_value_to_sql_literal(&self.params[source_index], self.dialect) {
-            Ok(value) => value,
-            Err(error) => return ControlFlow::Break(error),
-        };
-
-        ControlFlow::Continue(())
-    }
-}
-
-fn engine_value_to_sql_literal(
-    value: &EngineValue,
-    dialect: SqlDialect,
-) -> Result<SqlValue, LixError> {
-    match value {
-        EngineValue::Null => Ok(SqlValue::Null),
-        EngineValue::Boolean(value) => Ok(SqlValue::Boolean(*value)),
-        EngineValue::Integer(value) => Ok(SqlValue::Number(value.to_string(), false)),
-        EngineValue::Real(value) => Ok(SqlValue::Number(value.to_string(), false)),
-        EngineValue::Text(value) => Ok(SqlValue::SingleQuotedString(value.clone())),
-        EngineValue::Json(value) => Ok(SqlValue::SingleQuotedString(value.to_string())),
-        EngineValue::Blob(value) => match dialect {
-            SqlDialect::Sqlite => Ok(SqlValue::HexStringLiteral(encode_hex_upper(value))),
-            SqlDialect::Postgres => Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "postgres batch literal inlining does not support blob parameters",
-            )),
-        },
-    }
-}
-
-fn encode_hex_upper(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0F) as usize] as char);
-    }
-    out
+struct PreparedLiveStateInsertRow<'a> {
+    row: &'a MaterializedStateRow,
+    normalized_columns: Vec<(String, EngineValue)>,
 }
 
 pub(crate) async fn load_commit_active_accounts(
@@ -206,50 +114,53 @@ pub(crate) async fn load_commit_active_accounts(
     Ok(deduped.into_iter().collect())
 }
 
-pub(crate) fn build_statement_batch_from_generate_commit_result(
-    commit_result: GenerateCommitResult,
+pub(crate) async fn build_prepared_batch_from_generate_commit_result_with_executor(
+    executor: &mut dyn CommitQueryExecutor,
+    mut commit_result: GenerateCommitResult,
     functions: &mut dyn LixFunctionProvider,
-    placeholder_offset: usize,
-    dialect: SqlDialect,
-) -> Result<StatementBatch, LixError> {
-    build_statement_batch_from_commit_apply_input(
+) -> Result<PreparedBatch, LixError> {
+    commit_result.derived_apply_input.live_layouts = load_live_layouts_for_rows_with_executor(
+        executor,
+        &commit_result.derived_apply_input.live_state_rows,
+    )
+    .await?;
+    let commit_graph_rows = resolve_commit_graph_node_write_rows_with_executor(
+        executor,
+        &commit_result.derived_apply_input.live_state_rows,
+    )
+    .await?;
+    build_prepared_batch_from_commit_apply_input(
         &commit_result.canonical_output,
         &commit_result.derived_apply_input,
+        &commit_graph_rows,
         functions,
-        placeholder_offset,
-        dialect,
+        executor.dialect(),
     )
 }
 
-pub(crate) fn build_statement_batch_from_commit_apply_input(
+pub(crate) fn build_prepared_batch_from_commit_apply_input<'a>(
     canonical_output: &CanonicalCommitOutput,
-    derived_apply_input: &DerivedCommitApplyInput,
+    derived_apply_input: &'a DerivedCommitApplyInput,
+    commit_graph_rows: &[CommitGraphNodeWriteRow],
     functions: &mut dyn LixFunctionProvider,
-    placeholder_offset: usize,
     dialect: SqlDialect,
-) -> Result<StatementBatch, LixError> {
+) -> Result<PreparedBatch, LixError> {
     let mut ensure_no_content = false;
     let mut snapshot_rows = Vec::new();
-    let mut statement_params = Vec::new();
-    let mut next_placeholder = placeholder_offset + 1;
     let mut change_rows = Vec::new();
-    let mut materialized_by_schema: BTreeMap<String, (bool, Vec<Ident>, Vec<Vec<Expr>>, usize)> =
-        BTreeMap::new();
+    let mut materialized_by_schema: BTreeMap<
+        String,
+        (bool, Vec<Ident>, Vec<PreparedLiveStateInsertRow<'a>>, usize),
+    > = BTreeMap::new();
 
     for change in &canonical_output.changes {
         let snapshot_id = match &change.snapshot_content {
             Some(content) => {
                 let id = functions.uuid_v7();
-                let id_placeholder = next_placeholder;
-                next_placeholder += 1;
-                statement_params.push(EngineValue::Text(id.clone()));
-                let content_placeholder = next_placeholder;
-                next_placeholder += 1;
-                statement_params.push(EngineValue::Text(content.as_str().to_string()));
-                snapshot_rows.push(vec![
-                    placeholder_expr(id_placeholder),
-                    placeholder_expr(content_placeholder),
-                ]);
+                snapshot_rows.push(SnapshotInsertRow {
+                    id: id.clone(),
+                    content: content.as_str().to_string(),
+                });
                 id
             }
             None => {
@@ -258,45 +169,20 @@ pub(crate) fn build_statement_batch_from_commit_apply_input(
             }
         };
 
-        change_rows.push(vec![
-            text_param_expr(&change.id, &mut next_placeholder, &mut statement_params),
-            text_param_expr(
-                &change.entity_id,
-                &mut next_placeholder,
-                &mut statement_params,
-            ),
-            text_param_expr(
-                &change.schema_key,
-                &mut next_placeholder,
-                &mut statement_params,
-            ),
-            text_param_expr(
-                &change.schema_version,
-                &mut next_placeholder,
-                &mut statement_params,
-            ),
-            text_param_expr(
-                &change.file_id,
-                &mut next_placeholder,
-                &mut statement_params,
-            ),
-            text_param_expr(
-                &change.plugin_key,
-                &mut next_placeholder,
-                &mut statement_params,
-            ),
-            text_param_expr(&snapshot_id, &mut next_placeholder, &mut statement_params),
-            optional_text_param_expr(
-                change.metadata.as_ref().map(|value| value.as_str()),
-                &mut next_placeholder,
-                &mut statement_params,
-            ),
-            text_param_expr(
-                &change.created_at,
-                &mut next_placeholder,
-                &mut statement_params,
-            ),
-        ]);
+        change_rows.push(CanonicalChangeInsertRow {
+            id: change.id.clone(),
+            entity_id: change.entity_id.to_string(),
+            schema_key: change.schema_key.to_string(),
+            schema_version: change.schema_version.to_string(),
+            file_id: change.file_id.to_string(),
+            plugin_key: change.plugin_key.to_string(),
+            snapshot_id,
+            metadata: change
+                .metadata
+                .as_ref()
+                .map(|value| value.as_str().to_string()),
+            created_at: change.created_at.clone(),
+        });
     }
 
     for row in &derived_apply_input.live_state_rows {
@@ -313,62 +199,79 @@ pub(crate) fn build_statement_batch_from_commit_apply_input(
         )?;
         let columns = live_state_insert_columns(layout.as_ref(), is_untracked);
         let params_per_row = columns.len();
-        let values = live_state_row_values_parameterized(
-            row,
-            layout.as_ref(),
-            is_untracked,
-            &normalized_values,
-            &mut next_placeholder,
-            &mut statement_params,
-        );
         let entry = materialized_by_schema
             .entry(row.schema_key.to_string())
             .or_insert_with(|| (is_untracked, columns.clone(), Vec::new(), params_per_row));
-        entry.2.push(values);
+        entry.2.push(PreparedLiveStateInsertRow {
+            row,
+            normalized_columns: normalized_values,
+        });
     }
 
-    let mut statements = Vec::new();
+    let mut prepared = PreparedBatch { steps: Vec::new() };
 
     if ensure_no_content {
-        statements.push(make_insert_statement(
-            SNAPSHOT_TABLE,
-            vec![Ident::new("id"), Ident::new("content")],
-            vec![vec![string_expr("no-content"), null_expr()]],
-            Some(build_snapshot_on_conflict()),
-        ));
+        push_prepared_statement(
+            &mut prepared,
+            make_insert_statement(
+                SNAPSHOT_TABLE,
+                vec![Ident::new("id"), Ident::new("content")],
+                vec![vec![string_expr("no-content"), null_expr()]],
+                Some(build_snapshot_on_conflict()),
+            ),
+            Vec::new(),
+            dialect,
+        )?;
     }
 
-    if !snapshot_rows.is_empty() {
-        push_chunked_insert_statements(
-            &mut statements,
-            SNAPSHOT_TABLE,
-            vec![Ident::new("id"), Ident::new("content")],
-            snapshot_rows,
-            Some(build_snapshot_on_conflict()),
-            max_rows_per_insert_for_dialect(dialect, SNAPSHOT_INSERT_PARAM_COLUMNS),
-        );
-    }
-
-    if !change_rows.is_empty() {
-        push_chunked_insert_statements(
-            &mut statements,
-            CHANGE_TABLE,
+    push_chunked_prepared_insert_statements(
+        &mut prepared,
+        SNAPSHOT_TABLE,
+        vec![Ident::new("id"), Ident::new("content")],
+        &snapshot_rows,
+        Some(build_snapshot_on_conflict()),
+        max_rows_per_insert_for_dialect(dialect, SNAPSHOT_INSERT_PARAM_COLUMNS),
+        dialect,
+        |row, next_placeholder, params| {
             vec![
-                Ident::new("id"),
-                Ident::new("entity_id"),
-                Ident::new("schema_key"),
-                Ident::new("schema_version"),
-                Ident::new("file_id"),
-                Ident::new("plugin_key"),
-                Ident::new("snapshot_id"),
-                Ident::new("metadata"),
-                Ident::new("created_at"),
-            ],
-            change_rows,
-            None,
-            max_rows_per_insert_for_dialect(dialect, CHANGE_INSERT_PARAM_COLUMNS),
-        );
-    }
+                text_param_expr(&row.id, next_placeholder, params),
+                text_param_expr(&row.content, next_placeholder, params),
+            ]
+        },
+    )?;
+
+    push_chunked_prepared_insert_statements(
+        &mut prepared,
+        CHANGE_TABLE,
+        vec![
+            Ident::new("id"),
+            Ident::new("entity_id"),
+            Ident::new("schema_key"),
+            Ident::new("schema_version"),
+            Ident::new("file_id"),
+            Ident::new("plugin_key"),
+            Ident::new("snapshot_id"),
+            Ident::new("metadata"),
+            Ident::new("created_at"),
+        ],
+        &change_rows,
+        None,
+        max_rows_per_insert_for_dialect(dialect, CHANGE_INSERT_PARAM_COLUMNS),
+        dialect,
+        |row, next_placeholder, params| {
+            vec![
+                text_param_expr(&row.id, next_placeholder, params),
+                text_param_expr(&row.entity_id, next_placeholder, params),
+                text_param_expr(&row.schema_key, next_placeholder, params),
+                text_param_expr(&row.schema_version, next_placeholder, params),
+                text_param_expr(&row.file_id, next_placeholder, params),
+                text_param_expr(&row.plugin_key, next_placeholder, params),
+                text_param_expr(&row.snapshot_id, next_placeholder, params),
+                optional_text_param_expr(row.metadata.as_deref(), next_placeholder, params),
+                text_param_expr(&row.created_at, next_placeholder, params),
+            ]
+        },
+    )?;
 
     for (schema_key, (is_untracked, columns, rows, params_per_row)) in materialized_by_schema {
         let table_name = if is_untracked {
@@ -376,27 +279,32 @@ pub(crate) fn build_statement_batch_from_commit_apply_input(
         } else {
             tracked_live_table_name(&schema_key)
         };
-        push_chunked_insert_statements(
-            &mut statements,
+        push_chunked_prepared_insert_statements(
+            &mut prepared,
             &table_name,
             columns.clone(),
-            rows,
+            &rows,
             Some(build_live_state_on_conflict(&columns, is_untracked)),
             max_rows_per_insert_for_dialect(dialect, params_per_row),
-        );
+            dialect,
+            |row, next_placeholder, params| {
+                live_state_row_values_parameterized(
+                    row.row,
+                    None,
+                    is_untracked,
+                    &row.normalized_columns,
+                    next_placeholder,
+                    params,
+                )
+            },
+        )?;
     }
 
-    append_commit_graph_node_statements(
-        &mut statements,
-        &mut statement_params,
-        &mut next_placeholder,
-        &derived_apply_input.live_state_rows,
-    )?;
+    for row in commit_graph_rows {
+        prepared.push_statement(build_commit_graph_node_prepared_statement(row, dialect)?);
+    }
 
-    Ok(StatementBatch {
-        statements,
-        params: statement_params,
-    })
+    Ok(prepared)
 }
 
 fn max_bind_parameters_for_dialect(dialect: SqlDialect) -> usize {
@@ -404,6 +312,28 @@ fn max_bind_parameters_for_dialect(dialect: SqlDialect) -> usize {
         SqlDialect::Sqlite => SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT,
         SqlDialect::Postgres => POSTGRES_MAX_BIND_PARAMETERS_PER_STATEMENT,
     }
+}
+
+async fn load_live_layouts_for_rows_with_executor(
+    executor: &mut dyn CommitQueryExecutor,
+    rows: &[MaterializedStateRow],
+) -> Result<BTreeMap<String, crate::schema::live_layout::LiveTableLayout>, LixError> {
+    let mut layouts = BTreeMap::new();
+    let schema_keys = rows
+        .iter()
+        .map(|row| row.schema_key.clone())
+        .collect::<BTreeSet<_>>();
+    for schema_key in schema_keys {
+        if let Some(layout) = builtin_live_table_layout(&schema_key)? {
+            layouts.insert(schema_key.to_string(), layout);
+            continue;
+        }
+        layouts.insert(
+            schema_key.to_string(),
+            load_live_table_layout_with_executor(executor, &schema_key).await?,
+        );
+    }
+    Ok(layouts)
 }
 
 fn schema_uses_untracked_live_state(schema_key: &str) -> bool {
@@ -422,53 +352,74 @@ fn max_rows_per_insert_for_dialect(dialect: SqlDialect, params_per_row: usize) -
     (max_bind_parameters_for_dialect(dialect) / params_per_row).max(1)
 }
 
-fn push_chunked_insert_statements(
-    statements: &mut Vec<Statement>,
+fn push_chunked_prepared_insert_statements<Row, F>(
+    prepared: &mut PreparedBatch,
     table: &str,
     columns: Vec<Ident>,
-    rows: Vec<Vec<Expr>>,
+    rows: &[Row],
     on: Option<OnInsert>,
     max_rows_per_statement: usize,
-) {
+    dialect: SqlDialect,
+    mut build_row: F,
+) -> Result<(), LixError>
+where
+    F: FnMut(&Row, &mut usize, &mut Vec<EngineValue>) -> Vec<Expr>,
+{
     if rows.is_empty() {
-        return;
+        return Ok(());
     }
 
-    if rows.len() <= max_rows_per_statement {
-        statements.push(make_insert_statement(table, columns, rows, on));
-        return;
-    }
-
-    let mut chunk = Vec::with_capacity(max_rows_per_statement);
-    for row in rows {
-        chunk.push(row);
-        if chunk.len() == max_rows_per_statement {
-            statements.push(make_insert_statement(
-                table,
-                columns.clone(),
-                std::mem::take(&mut chunk),
-                on.clone(),
-            ));
+    for chunk in rows.chunks(max_rows_per_statement.max(1)) {
+        let mut params = Vec::new();
+        let mut next_placeholder = 1;
+        let mut chunk_rows = Vec::with_capacity(chunk.len());
+        for row in chunk {
+            chunk_rows.push(build_row(row, &mut next_placeholder, &mut params));
         }
+        push_prepared_statement(
+            prepared,
+            make_insert_statement(table, columns.clone(), chunk_rows, on.clone()),
+            params,
+            dialect,
+        )?;
     }
 
-    if !chunk.is_empty() {
-        statements.push(make_insert_statement(table, columns, chunk, on));
-    }
+    Ok(())
 }
 
-pub(crate) fn parse_single_statement_from_sql(sql: &str) -> Result<Statement, LixError> {
-    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: error.to_string(),
-    })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "expected a single statement".to_string(),
-        });
-    }
-    Ok(statements.remove(0))
+fn push_prepared_statement(
+    prepared: &mut PreparedBatch,
+    statement: Statement,
+    params: Vec<EngineValue>,
+    dialect: SqlDialect,
+) -> Result<(), LixError> {
+    let bound = bind_statement_ast(&statement, &params, dialect)?;
+    prepared.push_statement(PreparedStatement {
+        sql: bound.sql,
+        params: bound.params,
+    });
+    Ok(())
+}
+
+fn build_commit_graph_node_prepared_statement(
+    row: &CommitGraphNodeWriteRow,
+    dialect: SqlDialect,
+) -> Result<PreparedStatement, LixError> {
+    let statement = make_insert_statement(
+        COMMIT_GRAPH_NODE_TABLE,
+        vec![Ident::new("commit_id"), Ident::new("generation")],
+        vec![vec![placeholder_expr(1), placeholder_expr(2)]],
+        Some(build_commit_graph_node_on_conflict()),
+    );
+    let params = vec![
+        EngineValue::Text(row.commit_id.clone()),
+        EngineValue::Integer(row.generation),
+    ];
+    let bound = bind_statement_ast(&statement, &params, dialect)?;
+    Ok(PreparedStatement {
+        sql: bound.sql,
+        params: bound.params,
+    })
 }
 
 fn text_param_expr(
@@ -634,6 +585,46 @@ fn build_snapshot_on_conflict() -> OnInsert {
     OnInsert::OnConflict(OnConflict {
         conflict_target: Some(ConflictTarget::Columns(vec![Ident::new("id")])),
         action: OnConflictAction::DoNothing,
+    })
+}
+
+fn build_commit_graph_node_on_conflict() -> OnInsert {
+    OnInsert::OnConflict(OnConflict {
+        conflict_target: Some(ConflictTarget::Columns(vec![Ident::new("commit_id")])),
+        action: OnConflictAction::DoUpdate(DoUpdate {
+            assignments: vec![sqlparser::ast::Assignment {
+                target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
+                    ObjectNamePart::Identifier(Ident::new("generation")),
+                ])),
+                value: Expr::Case {
+                    case_token: AttachedToken::empty(),
+                    end_token: AttachedToken::empty(),
+                    operand: None,
+                    conditions: vec![sqlparser::ast::CaseWhen {
+                        condition: Expr::BinaryOp {
+                            left: Box::new(Expr::CompoundIdentifier(vec![
+                                Ident::new("excluded"),
+                                Ident::new("generation"),
+                            ])),
+                            op: sqlparser::ast::BinaryOperator::Gt,
+                            right: Box::new(Expr::CompoundIdentifier(vec![
+                                Ident::new(COMMIT_GRAPH_NODE_TABLE),
+                                Ident::new("generation"),
+                            ])),
+                        },
+                        result: Expr::CompoundIdentifier(vec![
+                            Ident::new("excluded"),
+                            Ident::new("generation"),
+                        ]),
+                    }],
+                    else_result: Some(Box::new(Expr::CompoundIdentifier(vec![
+                        Ident::new(COMMIT_GRAPH_NODE_TABLE),
+                        Ident::new("generation"),
+                    ]))),
+                },
+            }],
+            selection: None,
+        }),
     })
 }
 

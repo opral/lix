@@ -3,7 +3,6 @@ use crate::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
 };
 use crate::filesystem::history::{DirectoryHistoryRequest, FileHistoryRequest};
-use crate::filesystem::pending_file_writes::PendingFileWrite;
 use crate::schema::builtin::builtin_schema_definition;
 use crate::schema::live_layout::{
     builtin_live_table_layout, live_column_name_for_property, live_table_layout_from_schema,
@@ -14,7 +13,11 @@ use crate::sql::ast::lowering::lower_statement;
 use crate::sql::common::dependency_spec::DependencySpec;
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
-use crate::sql::execution::intent::authoritative_pending_file_write_targets;
+use crate::sql::execution::intent::authoritative_binary_blob_write_targets;
+use crate::sql::execution::runtime_effects::{
+    binary_blob_writes_from_filesystem_state, delete_targets_from_filesystem_state,
+    FilesystemTransactionState,
+};
 use crate::sql::public::backend::PushdownDecision;
 use crate::sql::public::catalog::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
@@ -474,11 +477,8 @@ pub(crate) enum PublicWriteExecutionPartition {
 pub(crate) struct TrackedWriteExecution {
     pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub(crate) domain_change_batch: Option<DomainChangeBatch>,
-    pub(crate) lazy_exact_file_updates: Vec<crate::sql::public::planner::ir::LazyExactFileUpdate>,
     pub(crate) create_preconditions: CreateCommitPreconditions,
     pub(crate) semantic_effects: PlanEffects,
-    pub(crate) persist_filesystem_payloads_before_write: bool,
-    pub(crate) filesystem_payload_changes_committed_by_write: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1929,18 +1929,8 @@ fn build_public_write_execution(
                     return Ok(None);
                 }
 
-                let lazy_exact_file_updates = partition
-                    .lazy_exact_file_update
-                    .clone()
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                let domain_change_batch = if !lazy_exact_file_updates.is_empty() {
-                    None
-                } else {
-                    let Some(domain_change_batch) = tracked_batches.next().cloned() else {
-                        return Ok(None);
-                    };
-                    Some(domain_change_batch)
+                let Some(domain_change_batch) = tracked_batches.next().cloned() else {
+                    return Ok(None);
                 };
 
                 partitions.push(PublicWriteExecutionPartition::Tracked(
@@ -1949,29 +1939,14 @@ fn build_public_write_execution(
                             schema_live_table_requirements_from_partition(partition),
                         create_preconditions: create_commit_preconditions_for_public_write(
                             planned_write,
-                            domain_change_batch.as_ref(),
+                            Some(&domain_change_batch),
                             commit_preconditions,
                         )?,
-                        semantic_effects: domain_change_batch
-                            .as_ref()
-                            .map(|domain_change_batch| {
-                                semantic_plan_effects_from_domain_changes(
-                                    &domain_change_batch.changes,
-                                    state_commit_stream_operation(
-                                        planned_write.command.operation_kind,
-                                    ),
-                                )
-                            })
-                            .transpose()?
-                            .unwrap_or_default(),
-                        persist_filesystem_payloads_before_write,
-                        filesystem_payload_changes_committed_by_write:
-                            public_write_commits_filesystem_payload_domain_changes(
-                                planned_write,
-                                partition,
-                            ),
-                        domain_change_batch,
-                        lazy_exact_file_updates,
+                        semantic_effects: semantic_plan_effects_from_domain_changes(
+                            &domain_change_batch.changes,
+                            state_commit_stream_operation(planned_write.command.operation_kind),
+                        )?,
+                        domain_change_batch: Some(domain_change_batch),
                     },
                 ));
             }
@@ -2000,8 +1975,7 @@ fn build_public_write_execution(
 pub(crate) fn finalize_public_write_execution(
     execution: &mut PublicWriteExecution,
     planned_write: &PlannedWrite,
-    pending_file_writes: &[PendingFileWrite],
-    pending_file_delete_targets: &BTreeSet<(String, String)>,
+    filesystem_state: &FilesystemTransactionState,
 ) -> Result<(), LixError> {
     for partition in &mut execution.partitions {
         let PublicWriteExecutionPartition::Untracked(untracked) = partition else {
@@ -2010,8 +1984,7 @@ pub(crate) fn finalize_public_write_execution(
         untracked.semantic_effects = semantic_plan_effects_from_untracked_public_write(
             planned_write,
             &untracked.intended_post_state,
-            pending_file_writes,
-            pending_file_delete_targets,
+            filesystem_state,
         )?;
     }
     Ok(())
@@ -2157,28 +2130,10 @@ fn public_untracked_operation_supported(planned_write: &PlannedWrite) -> bool {
     )
 }
 
-fn public_write_commits_filesystem_payload_domain_changes(
-    planned_write: &PlannedWrite,
-    partition: &crate::sql::public::planner::ir::ResolvedWritePartition,
-) -> bool {
-    matches!(
-        planned_write.command.target.descriptor.public_name.as_str(),
-        "lix_file" | "lix_file_by_version"
-    ) && partition.execution_mode == crate::sql::public::planner::ir::WriteMode::Tracked
-}
-
 fn public_write_persists_filesystem_payloads(
     planned_write: &PlannedWrite,
     partition: &crate::sql::public::planner::ir::ResolvedWritePartition,
 ) -> bool {
-    if matches!(
-        partition.lazy_exact_file_update.as_ref(),
-        Some(crate::sql::public::planner::ir::LazyExactFileUpdate::Data(
-            _
-        ))
-    ) {
-        return false;
-    }
     matches!(
         planned_write.command.target.descriptor.public_name.as_str(),
         "lix_file" | "lix_file_by_version"
@@ -2262,8 +2217,7 @@ fn create_commit_preconditions_for_public_write(
 fn semantic_plan_effects_from_untracked_public_write(
     planned_write: &PlannedWrite,
     intended_post_state: &[crate::sql::public::planner::ir::PlannedStateRow],
-    pending_file_writes: &[PendingFileWrite],
-    pending_file_delete_targets: &BTreeSet<(String, String)>,
+    filesystem_state: &FilesystemTransactionState,
 ) -> Result<PlanEffects, LixError> {
     let mut effects = PlanEffects {
         state_commit_stream_changes: state_commit_stream_changes_from_planned_rows(
@@ -2282,11 +2236,13 @@ fn semantic_plan_effects_from_untracked_public_write(
         planned_write.command.target.descriptor.public_name.as_str(),
         "lix_file" | "lix_file_by_version"
     ) {
+        let binary_blob_writes = binary_blob_writes_from_filesystem_state(filesystem_state);
+        let pending_file_delete_targets = delete_targets_from_filesystem_state(filesystem_state);
         effects.file_cache_refresh_targets =
-            authoritative_pending_file_write_targets(pending_file_writes);
+            authoritative_binary_blob_write_targets(&binary_blob_writes);
         effects
             .file_cache_refresh_targets
-            .extend(pending_file_delete_targets.iter().cloned());
+            .extend(pending_file_delete_targets);
     }
     if planned_write.command.target.descriptor.public_name != "lix_active_version" {
         return Ok(effects);

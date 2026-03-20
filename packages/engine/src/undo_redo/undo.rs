@@ -201,8 +201,7 @@ async fn undo_in_transaction(
             CreateCommitArgs {
                 timestamp: Some(timestamp.clone()),
                 changes: inverse_changes,
-                lazy_exact_file_updates: Vec::new(),
-                additional_binary_blob_payloads: Vec::new(),
+                filesystem_state: Default::default(),
                 preconditions: CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version(version_id.clone()),
                     expected_head: CreateCommitExpectedHead::CurrentHead,
@@ -213,6 +212,7 @@ async fn undo_in_transaction(
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
+                writer_key: None,
             },
             &mut functions,
             None,

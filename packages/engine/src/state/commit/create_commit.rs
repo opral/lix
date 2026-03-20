@@ -13,12 +13,16 @@ use crate::schema::live_layout::{
     LiveTableLayout,
 };
 use crate::schema::registry::load_live_table_layout_in_transaction;
+use crate::sql::execution::contracts::planned_statement::MutationRow;
 use crate::sql::execution::runtime_effects::{
-    build_binary_blob_fastcdc_write_program, BinaryBlobWriteInput,
+    build_binary_blob_fastcdc_write_program, compile_filesystem_transaction_state_from_state,
+    filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
+    BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
+    FilesystemSemanticChange, FilesystemTransactionState, FILESYSTEM_DESCRIPTOR_FILE_ID,
+    FILESYSTEM_DESCRIPTOR_PLUGIN_KEY, FILESYSTEM_FILE_SCHEMA_KEY, FILESYSTEM_FILE_SCHEMA_VERSION,
 };
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::sql::live_snapshot::live_snapshot_select_expr_for_schema;
-use crate::sql::public::planner::ir::LazyExactFileUpdate;
 use crate::state::live_state::ensure_live_state_ready_in_transaction;
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
@@ -27,9 +31,8 @@ use crate::{CanonicalSchemaKey, LixError, LixTransaction, QueryResult, Value};
 use async_trait::async_trait;
 
 use super::generate_commit::generate_commit;
-use super::runtime::{
-    bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
-};
+use super::graph_index::resolve_commit_graph_node_write_rows_with_executor;
+use super::runtime::build_prepared_batch_from_commit_apply_input;
 use super::state_source::{
     load_committed_version_head_commit_id_from_live_state,
     load_exact_committed_state_row_from_live_state_with_executor, load_version_info_for_versions,
@@ -45,10 +48,6 @@ const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
 const IDEMPOTENCY_KIND_EXACT: &str = "exact";
 const IDEMPOTENCY_KIND_CURRENT_HEAD_FINGERPRINT: &str = "current_head_fingerprint";
-const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
-const FILESYSTEM_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
-const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
-const FILESYSTEM_FILE_SCHEMA_VERSION: &str = "1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CreateCommitWriteLane {
@@ -80,11 +79,11 @@ pub(crate) struct CreateCommitPreconditions {
 pub(crate) struct CreateCommitArgs {
     pub(crate) timestamp: Option<String>,
     pub(crate) changes: Vec<ProposedDomainChange>,
-    pub(crate) lazy_exact_file_updates: Vec<LazyExactFileUpdate>,
-    pub(crate) additional_binary_blob_payloads: Vec<Vec<u8>>,
+    pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) preconditions: CreateCommitPreconditions,
     pub(crate) should_emit_observe_tick: bool,
     pub(crate) observe_tick_writer_key: Option<String>,
+    pub(crate) writer_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,17 +160,15 @@ pub(crate) async fn create_commit(
     functions: &mut dyn LixFunctionProvider,
     invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
 ) -> Result<CreateCommitResult, CreateCommitError> {
-    if args.changes.is_empty() {
-        if args.lazy_exact_file_updates.is_empty() {
-            return Err(CreateCommitError {
-                kind: CreateCommitErrorKind::EmptyBatch,
-                message: "create_commit requires at least one change".to_string(),
-            });
-        }
+    if args.changes.is_empty() && args.filesystem_state.files.is_empty() {
+        return Err(CreateCommitError {
+            kind: CreateCommitErrorKind::EmptyBatch,
+            message: "create_commit requires at least one change".to_string(),
+        });
     }
 
     let concrete_lane = concrete_lane(&args.preconditions)?;
-    validate_change_versions(&args.changes, &args.lazy_exact_file_updates, &concrete_lane)?;
+    validate_change_versions(&args.changes, &args.filesystem_state, &concrete_lane)?;
     ensure_live_state_ready_in_transaction(transaction)
         .await
         .map_err(backend_error)?;
@@ -188,7 +185,7 @@ pub(crate) async fn create_commit(
             &mut executor,
             &concrete_lane,
             &args.preconditions,
-            &args.lazy_exact_file_updates,
+            &args.filesystem_state,
             needs_deterministic_sequence,
             needs_active_accounts,
         )
@@ -279,15 +276,16 @@ pub(crate) async fn create_commit(
         invariant_checker.recheck_invariants(transaction).await?;
     }
 
-    let normalized_changes = {
-        let mut executor = TransactionCommitExecutor { transaction };
-        normalize_proposed_domain_changes(&mut executor, &args.changes).await?
-    };
-    let applied_domain_changes = resolve_proposed_domain_changes(
-        &normalized_changes,
-        &args.lazy_exact_file_updates,
+    let (applied_domain_changes, compiled_filesystem_state) = resolve_proposed_domain_changes(
+        &args.changes,
         &preflight,
+        &args.filesystem_state,
+        args.writer_key.as_deref(),
     )?;
+    let applied_domain_changes = {
+        let mut executor = TransactionCommitExecutor { transaction };
+        normalize_proposed_domain_changes(&mut executor, &applied_domain_changes).await?
+    };
     if applied_domain_changes.is_empty() {
         return Ok(CreateCommitResult {
             disposition: CreateCommitDisposition::Replay,
@@ -358,6 +356,15 @@ pub(crate) async fn create_commit(
     .await
     .map_err(backend_error)?;
     let committed_head = extract_committed_head_id(&generated_commit, &concrete_lane)?;
+    let canonical_output = generated_commit.canonical_output;
+    let derived_apply_input = generated_commit.derived_apply_input;
+    let mut executor = &mut *transaction;
+    let commit_graph_rows = resolve_commit_graph_node_write_rows_with_executor(
+        &mut executor,
+        &derived_apply_input.live_state_rows,
+    )
+    .await
+    .map_err(backend_error)?;
     let operational_apply_input = OperationalCommitApplyInput {
         idempotency_write: CommitIdempotencyWrite {
             write_lane: lane_storage_key(&concrete_lane),
@@ -375,21 +382,15 @@ pub(crate) async fn create_commit(
         }),
     };
     let applied_output = CreateCommitAppliedOutput {
-        canonical_output: generated_commit.canonical_output.clone(),
-        derived_apply_input: generated_commit.derived_apply_input.clone(),
+        canonical_output,
+        derived_apply_input,
         operational_apply_input,
     };
-    let mut prepared_batch = bind_statement_batch_for_dialect(
-        build_statement_batch_from_generate_commit_result(
-            GenerateCommitResult {
-                canonical_output: applied_output.canonical_output.clone(),
-                derived_apply_input: applied_output.derived_apply_input.clone(),
-            },
-            functions,
-            0,
-            transaction.dialect(),
-        )
-        .map_err(backend_error)?,
+    let mut prepared_batch = build_prepared_batch_from_commit_apply_input(
+        &applied_output.canonical_output,
+        &applied_output.derived_apply_input,
+        &commit_graph_rows,
+        functions,
         transaction.dialect(),
     )
     .map_err(backend_error)?;
@@ -412,26 +413,10 @@ pub(crate) async fn create_commit(
     // transactions (including merged commits) always end with a consistent
     // watermark pointing to the latest canonical change.
 
-    let payloads = args
-        .lazy_exact_file_updates
+    let payloads = compiled_filesystem_state
+        .binary_blob_writes
         .iter()
-        .filter_map(|lazy| match lazy {
-            LazyExactFileUpdate::Data(lazy) => Some(BinaryBlobWriteInput {
-                file_id: &lazy.file_id,
-                version_id: &lazy.version_id,
-                data: &lazy.data,
-            }),
-            _ => None,
-        })
-        .chain(
-            args.additional_binary_blob_payloads
-                .iter()
-                .map(|data| BinaryBlobWriteInput {
-                    file_id: "",
-                    version_id: "",
-                    data,
-                }),
-        )
+        .map(BinaryBlobWrite::as_input)
         .collect::<Vec<_>>();
     let mut write_program =
         build_binary_blob_fastcdc_write_program(transaction.dialect(), &payloads)
@@ -518,159 +503,44 @@ fn concrete_lane(
 
 fn resolve_proposed_domain_changes(
     changes: &[ProposedDomainChange],
-    lazy_exact_file_updates: &[LazyExactFileUpdate],
     preflight: &CreateCommitPreflightState,
-) -> Result<Vec<ProposedDomainChange>, CreateCommitError> {
+    filesystem_state: &FilesystemTransactionState,
+    writer_key: Option<&str>,
+) -> Result<(Vec<ProposedDomainChange>, CompiledTrackedFilesystemState), CreateCommitError> {
+    let hydrated = with_exact_filesystem_descriptors(filesystem_state, &preflight.file_descriptors);
+    let compiled_filesystem = compile_filesystem_transaction_state_from_state(
+        &hydrated,
+        writer_key,
+        &[] as &[MutationRow],
+    )
+    .map_err(backend_error)?;
+
     let mut resolved = changes.to_vec();
-    for lazy in lazy_exact_file_updates {
-        match lazy {
-            LazyExactFileUpdate::Metadata(lazy) => {
-                let current = required_exact_file_descriptor(preflight, &lazy.file_id)?;
-                let next_metadata = lazy.metadata.apply(current.metadata.clone());
-                if next_metadata == current.metadata {
-                    continue;
-                }
-                resolved.push(ProposedDomainChange {
-                    entity_id: try_identity(lazy.file_id.clone(), "lazy metadata entity_id")?,
-                    schema_key: try_identity(
-                        FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
-                        "lazy metadata schema_key",
-                    )?,
-                    schema_version: Some(try_identity(
-                        FILESYSTEM_FILE_SCHEMA_VERSION.to_string(),
-                        "lazy metadata schema_version",
-                    )?),
-                    file_id: Some(try_identity(
-                        FILESYSTEM_DESCRIPTOR_FILE_ID.to_string(),
-                        "lazy metadata file_id",
-                    )?),
-                    version_id: try_identity(lazy.version_id.clone(), "lazy metadata version_id")?,
-                    plugin_key: Some(try_identity(
-                        FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string(),
-                        "lazy metadata plugin_key",
-                    )?),
-                    snapshot_content: Some(
-                        serde_json::json!({
-                            "id": lazy.file_id,
-                            "directory_id": current.directory_id,
-                            "name": current.name,
-                            "extension": current.extension,
-                            "metadata": next_metadata,
-                            "hidden": current.hidden,
-                        })
-                        .to_string(),
-                    ),
-                    metadata: next_metadata,
-                    writer_key: None,
-                });
-            }
-            LazyExactFileUpdate::Data(lazy) => {
-                let _current = required_exact_file_descriptor(preflight, &lazy.file_id)?;
-                let next_blob_hash = crate::plugin::runtime::binary_blob_hash_hex(&lazy.data);
-                if preflight.file_blob_hashes.get(&lazy.file_id) == Some(&next_blob_hash) {
-                    continue;
-                }
-                resolved.push(ProposedDomainChange {
-                    entity_id: try_identity(lazy.file_id.clone(), "lazy data entity_id")?,
-                    schema_key: try_identity(
-                        "lix_binary_blob_ref".to_string(),
-                        "lazy data schema_key",
-                    )?,
-                    schema_version: Some(try_identity(
-                        "1".to_string(),
-                        "lazy data schema_version",
-                    )?),
-                    file_id: Some(try_identity(lazy.file_id.clone(), "lazy data file_id")?),
-                    version_id: try_identity(lazy.version_id.clone(), "lazy data version_id")?,
-                    plugin_key: Some(try_identity(
-                        FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string(),
-                        "lazy data plugin_key",
-                    )?),
-                    snapshot_content: Some(
-                        serde_json::json!({
-                            "id": lazy.file_id,
-                            "blob_hash": next_blob_hash,
-                            "size_bytes": u64::try_from(lazy.data.len()).map_err(|_| CreateCommitError {
-                                kind: CreateCommitErrorKind::Internal,
-                                message: format!(
-                                    "exact file data update exceeds supported size for '{}'",
-                                    lazy.file_id
-                                ),
-                            })?,
-                        })
-                        .to_string(),
-                    ),
-                    metadata: None,
-                    writer_key: None,
-                });
-            }
-            LazyExactFileUpdate::Delete(lazy) => {
-                for file_id in &lazy.file_ids {
-                    let Some(current) = preflight.file_descriptors.get(file_id) else {
-                        continue;
-                    };
-                    if current.untracked {
-                        return Err(CreateCommitError {
-                            kind: CreateCommitErrorKind::Internal,
-                            message:
-                                "lazy exact file update does not support untracked visible rows"
-                                    .to_string(),
-                        });
-                    }
-                    resolved.push(ProposedDomainChange {
-                        entity_id: try_identity(file_id.clone(), "lazy delete entity_id")?,
-                        schema_key: try_identity(
-                            FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
-                            "lazy delete schema_key",
-                        )?,
-                        schema_version: Some(try_identity(
-                            FILESYSTEM_FILE_SCHEMA_VERSION.to_string(),
-                            "lazy delete schema_version",
-                        )?),
-                        file_id: Some(try_identity(
-                            FILESYSTEM_DESCRIPTOR_FILE_ID.to_string(),
-                            "lazy delete file_id",
-                        )?),
-                        version_id: try_identity(
-                            lazy.version_id.clone(),
-                            "lazy delete version_id",
-                        )?,
-                        plugin_key: Some(try_identity(
-                            FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string(),
-                            "lazy delete plugin_key",
-                        )?),
-                        snapshot_content: None,
-                        metadata: None,
-                        writer_key: None,
-                    });
-                    resolved.push(ProposedDomainChange {
-                        entity_id: try_identity(file_id.clone(), "lazy delete blob entity_id")?,
-                        schema_key: try_identity(
-                            "lix_binary_blob_ref".to_string(),
-                            "lazy delete blob schema_key",
-                        )?,
-                        schema_version: Some(try_identity(
-                            "1".to_string(),
-                            "lazy delete blob schema_version",
-                        )?),
-                        file_id: Some(try_identity(file_id.clone(), "lazy delete blob file_id")?),
-                        version_id: try_identity(
-                            lazy.version_id.clone(),
-                            "lazy delete blob version_id",
-                        )?,
-                        plugin_key: Some(try_identity(
-                            FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string(),
-                            "lazy delete blob plugin_key",
-                        )?),
-                        snapshot_content: None,
-                        metadata: None,
-                        writer_key: None,
-                    });
-                }
-            }
+    let mut index_by_identity = resolved
+        .iter()
+        .enumerate()
+        .map(|(index, change)| (proposed_domain_change_identity(change), index))
+        .collect::<BTreeMap<_, _>>();
+    for compiled_change in compiled_filesystem
+        .semantic_changes
+        .iter()
+        .map(proposed_domain_change_from_filesystem_semantic_change)
+    {
+        let compiled_change = compiled_change?;
+        let identity = proposed_domain_change_identity(&compiled_change);
+        if let Some(index) = index_by_identity.get(&identity).copied() {
+            resolved[index] = compiled_change;
+        } else {
+            index_by_identity.insert(identity, resolved.len());
+            resolved.push(compiled_change);
         }
     }
-    Ok(resolved)
+    Ok((
+        resolved,
+        CompiledTrackedFilesystemState {
+            binary_blob_writes: compiled_filesystem.binary_blob_writes,
+        },
+    ))
 }
 
 async fn normalize_proposed_domain_changes(
@@ -782,27 +652,54 @@ async fn proposed_domain_change_is_noop(
     }
 }
 
-fn required_exact_file_descriptor<'a>(
-    preflight: &'a CreateCommitPreflightState,
-    file_id: &str,
-) -> Result<&'a CreateCommitPreflightFileDescriptor, CreateCommitError> {
-    let current = preflight
-        .file_descriptors
-        .get(file_id)
-        .ok_or_else(|| CreateCommitError {
-            kind: CreateCommitErrorKind::Internal,
-            message: format!(
-                "create commit preflight did not load the exact file descriptor row for '{}'",
-                file_id
-            ),
-        })?;
-    if current.untracked {
-        return Err(CreateCommitError {
-            kind: CreateCommitErrorKind::Internal,
-            message: "lazy exact file update does not support untracked visible rows".to_string(),
-        });
-    }
-    Ok(current)
+struct CompiledTrackedFilesystemState {
+    binary_blob_writes: Vec<BinaryBlobWrite>,
+}
+
+fn proposed_domain_change_from_filesystem_semantic_change(
+    change: &FilesystemSemanticChange,
+) -> Result<ProposedDomainChange, CreateCommitError> {
+    Ok(ProposedDomainChange {
+        entity_id: try_identity(change.entity_id.clone(), "filesystem semantic change entity_id")?,
+        schema_key: try_identity(change.schema_key.clone(), "filesystem semantic change schema_key")?,
+        schema_version: Some(try_identity(
+            change.schema_version.clone(),
+            "filesystem semantic change schema_version",
+        )?),
+        file_id: Some(try_identity(
+            change.file_id.clone(),
+            "filesystem semantic change file_id",
+        )?),
+        plugin_key: Some(try_identity(
+            change.plugin_key.clone(),
+            "filesystem semantic change plugin_key",
+        )?),
+        snapshot_content: change.snapshot_content.clone(),
+        metadata: change.metadata.clone(),
+        version_id: try_identity(change.version_id.clone(), "filesystem semantic change version_id")?,
+        writer_key: change.writer_key.clone(),
+    })
+}
+
+fn proposed_domain_change_identity(
+    change: &ProposedDomainChange,
+) -> (String, String, String, String, String, Option<String>) {
+    (
+        change.entity_id.to_string(),
+        change.schema_key.to_string(),
+        change.version_id.to_string(),
+        change
+            .file_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        change
+            .plugin_key
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        change.schema_version.as_ref().map(ToString::to_string),
+    )
 }
 
 fn materialize_domain_changes(
@@ -887,24 +784,14 @@ struct CreateCommitPreflightState {
     existing_replay: Option<String>,
     deterministic_sequence_start: Option<i64>,
     active_accounts: Vec<String>,
-    file_descriptors: BTreeMap<String, CreateCommitPreflightFileDescriptor>,
-    file_blob_hashes: BTreeMap<String, String>,
-}
-
-struct CreateCommitPreflightFileDescriptor {
-    directory_id: Option<String>,
-    name: String,
-    extension: Option<String>,
-    hidden: bool,
-    metadata: Option<String>,
-    untracked: bool,
+    file_descriptors: BTreeMap<String, ExactFilesystemDescriptorState>,
 }
 
 async fn load_create_commit_preflight_state_with_active_accounts(
     executor: &mut dyn CommitQueryExecutor,
     concrete_lane: &ConcreteWriteLane,
     preconditions: &CreateCommitPreconditions,
-    lazy_exact_file_updates: &[LazyExactFileUpdate],
+    filesystem_state: &FilesystemTransactionState,
     include_deterministic_sequence: bool,
     include_active_accounts: bool,
 ) -> Result<CreateCommitPreflightState, CreateCommitError> {
@@ -936,12 +823,12 @@ async fn load_create_commit_preflight_state_with_active_accounts(
     } else {
         Vec::new()
     };
-    let file_descriptors =
-        load_create_commit_file_descriptors(executor, lazy_exact_file_updates, lane_entity_id)
-            .await?;
-    let file_blob_hashes =
-        load_create_commit_file_blob_hashes(executor, lazy_exact_file_updates, lane_entity_id)
-            .await?;
+    let file_descriptors = if filesystem_transaction_state_needs_exact_descriptors(filesystem_state)
+    {
+        load_create_commit_file_descriptors(executor, filesystem_state, lane_entity_id).await?
+    } else {
+        BTreeMap::new()
+    };
 
     Ok(CreateCommitPreflightState {
         current_head,
@@ -950,7 +837,6 @@ async fn load_create_commit_preflight_state_with_active_accounts(
         deterministic_sequence_start,
         active_accounts,
         file_descriptors,
-        file_blob_hashes,
     })
 }
 
@@ -958,7 +844,7 @@ fn parse_file_descriptor_preflight_row(
     snapshot_content: &str,
     metadata: Option<String>,
     untracked: bool,
-) -> Result<CreateCommitPreflightFileDescriptor, CreateCommitError> {
+) -> Result<ExactFilesystemDescriptorState, CreateCommitError> {
     let parsed: serde_json::Value =
         serde_json::from_str(snapshot_content).map_err(|error| CreateCommitError {
             kind: CreateCommitErrorKind::Internal,
@@ -966,48 +852,35 @@ fn parse_file_descriptor_preflight_row(
                 "create commit preflight file descriptor snapshot could not be parsed: {error}"
             ),
         })?;
-    Ok(CreateCommitPreflightFileDescriptor {
-        directory_id: parsed.get("directory_id").and_then(|value| match value {
-            serde_json::Value::Null => None,
-            serde_json::Value::String(text) => Some(text.clone()),
-            _ => None,
-        }),
-        name: parsed
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        extension: parsed.get("extension").and_then(|value| match value {
-            serde_json::Value::Null => None,
-            serde_json::Value::String(text) if text.is_empty() => None,
-            serde_json::Value::String(text) => Some(text.clone()),
-            _ => None,
-        }),
-        hidden: parsed
-            .get("hidden")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        metadata,
+    Ok(ExactFilesystemDescriptorState {
+        descriptor: FilesystemDescriptorState {
+            directory_id: parsed
+                .get("directory_id")
+                .and_then(|value| match value {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+            name: parsed
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            extension: parsed.get("extension").and_then(|value| match value {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(text) if text.is_empty() => None,
+                serde_json::Value::String(text) => Some(text.clone()),
+                _ => None,
+            }),
+            hidden: parsed
+                .get("hidden")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            metadata,
+        },
         untracked,
     })
-}
-
-fn parse_file_blob_hash_preflight_row(snapshot_content: &str) -> Result<String, CreateCommitError> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(snapshot_content).map_err(|error| CreateCommitError {
-            kind: CreateCommitErrorKind::Internal,
-            message: format!(
-                "create commit preflight file blob snapshot could not be parsed: {error}"
-            ),
-        })?;
-    parsed
-        .get("blob_hash")
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string)
-        .ok_or_else(|| CreateCommitError {
-            kind: CreateCommitErrorKind::Internal,
-            message: "create commit preflight file blob snapshot is missing blob_hash".to_string(),
-        })
 }
 
 async fn load_create_commit_existing_replay(
@@ -1167,12 +1040,21 @@ async fn load_create_commit_active_accounts(
 
 async fn load_create_commit_file_descriptors(
     executor: &mut dyn CommitQueryExecutor,
-    lazy_exact_file_updates: &[LazyExactFileUpdate],
+    filesystem_state: &FilesystemTransactionState,
     lane_entity_id: &str,
-) -> Result<BTreeMap<String, CreateCommitPreflightFileDescriptor>, CreateCommitError> {
-    let exact_file_ids = lazy_exact_file_updates
-        .iter()
-        .flat_map(LazyExactFileUpdate::file_ids)
+) -> Result<BTreeMap<String, ExactFilesystemDescriptorState>, CreateCommitError> {
+    let exact_file_ids = filesystem_state
+        .files
+        .values()
+        .filter(|file| {
+            !file.deleted
+                && file.descriptor.is_none()
+                && !matches!(
+                    file.metadata_patch,
+                    crate::sql::public::planner::ir::OptionalTextPatch::Unchanged
+                )
+        })
+        .map(|file| file.file_id.as_str())
         .collect::<BTreeSet<_>>();
     let mut file_descriptors = BTreeMap::new();
     for file_id in exact_file_ids {
@@ -1186,32 +1068,11 @@ async fn load_create_commit_file_descriptors(
     Ok(file_descriptors)
 }
 
-async fn load_create_commit_file_blob_hashes(
-    executor: &mut dyn CommitQueryExecutor,
-    lazy_exact_file_updates: &[LazyExactFileUpdate],
-    lane_entity_id: &str,
-) -> Result<BTreeMap<String, String>, CreateCommitError> {
-    let exact_file_ids = lazy_exact_file_updates
-        .iter()
-        .flat_map(LazyExactFileUpdate::file_ids)
-        .collect::<BTreeSet<_>>();
-    let mut file_blob_hashes = BTreeMap::new();
-    for file_id in exact_file_ids {
-        let Some(blob_hash) =
-            load_create_commit_file_blob_hash(executor, file_id, lane_entity_id).await?
-        else {
-            continue;
-        };
-        file_blob_hashes.insert(file_id.to_string(), blob_hash);
-    }
-    Ok(file_blob_hashes)
-}
-
 async fn load_create_commit_file_descriptor(
     executor: &mut dyn CommitQueryExecutor,
     file_id: &str,
     lane_entity_id: &str,
-) -> Result<Option<CreateCommitPreflightFileDescriptor>, CreateCommitError> {
+) -> Result<Option<ExactFilesystemDescriptorState>, CreateCommitError> {
     if let Some(descriptor) =
         load_untracked_file_descriptor(executor, file_id, lane_entity_id).await?
     {
@@ -1234,7 +1095,7 @@ async fn load_untracked_file_descriptor(
     executor: &mut dyn CommitQueryExecutor,
     file_id: &str,
     version_id: &str,
-) -> Result<Option<CreateCommitPreflightFileDescriptor>, CreateCommitError> {
+) -> Result<Option<ExactFilesystemDescriptorState>, CreateCommitError> {
     let snapshot_expr =
         live_snapshot_select_expr_for_schema(FILESYSTEM_FILE_SCHEMA_KEY, executor.dialect(), None)
             .map_err(|error| CreateCommitError {
@@ -1271,7 +1132,7 @@ async fn load_tracked_file_descriptor(
     executor: &mut dyn CommitQueryExecutor,
     file_id: &str,
     version_id: &str,
-) -> Result<Option<CreateCommitPreflightFileDescriptor>, CreateCommitError> {
+) -> Result<Option<ExactFilesystemDescriptorState>, CreateCommitError> {
     let row = load_exact_committed_state_row_from_live_state_with_executor(
         executor,
         &ExactCommittedStateRowRequest {
@@ -1306,38 +1167,6 @@ async fn load_tracked_file_descriptor(
     parse_file_descriptor_preflight_row(&snapshot_content, metadata, false).map(Some)
 }
 
-async fn load_create_commit_file_blob_hash(
-    executor: &mut dyn CommitQueryExecutor,
-    file_id: &str,
-    version_id: &str,
-) -> Result<Option<String>, CreateCommitError> {
-    let row = load_exact_committed_state_row_from_live_state_with_executor(
-        executor,
-        &ExactCommittedStateRowRequest {
-            entity_id: file_id.to_string(),
-            schema_key: "lix_binary_blob_ref".to_string(),
-            version_id: version_id.to_string(),
-            exact_filters: BTreeMap::from([
-                ("file_id".to_string(), Value::Text(file_id.to_string())),
-                (
-                    "plugin_key".to_string(),
-                    Value::Text(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
-                ),
-                ("schema_version".to_string(), Value::Text("1".to_string())),
-            ]),
-        },
-    )
-    .await
-    .map_err(backend_error)?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let Some(snapshot_content) = row.values.get("snapshot_content").and_then(value_as_text) else {
-        return Ok(None);
-    };
-    parse_file_blob_hash_preflight_row(&snapshot_content).map(Some)
-}
-
 fn parse_deterministic_sequence_snapshot(snapshot_content: &str) -> Result<i64, CreateCommitError> {
     let parsed: serde_json::Value =
         serde_json::from_str(snapshot_content).map_err(|error| CreateCommitError {
@@ -1359,17 +1188,18 @@ fn parse_deterministic_sequence_snapshot(snapshot_content: &str) -> Result<i64, 
 
 fn validate_change_versions(
     changes: &[ProposedDomainChange],
-    lazy_exact_file_updates: &[LazyExactFileUpdate],
+    filesystem_state: &FilesystemTransactionState,
     concrete_lane: &ConcreteWriteLane,
 ) -> Result<(), CreateCommitError> {
-    if !lazy_exact_file_updates.is_empty() {
+    if !filesystem_state.files.is_empty() {
         let expected_version_id = match concrete_lane {
             ConcreteWriteLane::Version { version_id } => version_id,
             ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
         };
-        if lazy_exact_file_updates
-            .iter()
-            .any(|lazy| lazy.version_id() != expected_version_id)
+        if filesystem_state
+            .files
+            .values()
+            .any(|file| file.version_id != *expected_version_id)
         {
             return Err(CreateCommitError {
                 kind: CreateCommitErrorKind::Internal,
@@ -1588,7 +1418,6 @@ mod tests {
     };
     use crate::functions::LixFunctionProvider;
     use crate::schema::live_layout::{builtin_live_table_layout, normalized_live_column_values};
-    use crate::sql::public::planner::ir::{LazyExactFileDataUpdate, LazyExactFileUpdate};
     use crate::version::GLOBAL_VERSION_ID;
     use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
@@ -1934,8 +1763,7 @@ mod tests {
             CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_updates: Vec::new(),
-                additional_binary_blob_payloads: Vec::new(),
+                filesystem_state: Default::default(),
                 preconditions: CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
@@ -1943,6 +1771,7 @@ mod tests {
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
+                writer_key: None,
             },
             &mut functions,
             Some(&mut checker),
@@ -2006,8 +1835,7 @@ mod tests {
             CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_updates: Vec::new(),
-                additional_binary_blob_payloads: Vec::new(),
+                filesystem_state: Default::default(),
                 preconditions: CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
@@ -2015,6 +1843,7 @@ mod tests {
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
+                writer_key: None,
             },
             &mut functions,
             Some(&mut checker),
@@ -2050,8 +1879,7 @@ mod tests {
             CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_updates: Vec::new(),
-                additional_binary_blob_payloads: Vec::new(),
+                filesystem_state: Default::default(),
                 preconditions: CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CurrentHead,
@@ -2061,6 +1889,7 @@ mod tests {
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
+                writer_key: None,
             },
             &mut functions,
             None,
@@ -2087,8 +1916,7 @@ mod tests {
             CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_updates: Vec::new(),
-                additional_binary_blob_payloads: Vec::new(),
+                filesystem_state: Default::default(),
                 preconditions: CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
@@ -2096,6 +1924,7 @@ mod tests {
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
+                writer_key: None,
             },
             &mut functions,
             Some(&mut checker),
@@ -2117,8 +1946,7 @@ mod tests {
             CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_updates: Vec::new(),
-                additional_binary_blob_payloads: Vec::new(),
+                filesystem_state: Default::default(),
                 preconditions: CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
@@ -2126,6 +1954,7 @@ mod tests {
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
+                writer_key: None,
             },
             &mut functions,
             None,
@@ -2146,8 +1975,7 @@ mod tests {
             CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_updates: Vec::new(),
-                additional_binary_blob_payloads: Vec::new(),
+                filesystem_state: Default::default(),
                 preconditions: CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CreateIfMissing,
@@ -2155,6 +1983,7 @@ mod tests {
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
+                writer_key: None,
             },
             &mut functions,
             None,
@@ -2179,8 +2008,7 @@ mod tests {
             CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_global_change()],
-                lazy_exact_file_updates: Vec::new(),
-                additional_binary_blob_payloads: Vec::new(),
+                filesystem_state: Default::default(),
                 preconditions: CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::GlobalAdmin,
                     expected_head: CreateCommitExpectedHead::CommitId(
@@ -2190,6 +2018,7 @@ mod tests {
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
+                writer_key: None,
             },
             &mut functions,
             None,
@@ -2202,7 +2031,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lazy_exact_file_update_uses_live_descriptor_lookup() {
+    async fn exact_file_data_update_avoids_descriptor_preflight_lookup() {
         let mut transaction = FakeTransaction::default();
         transaction
             .version_heads
@@ -2214,12 +2043,22 @@ mod tests {
             CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: Vec::new(),
-                lazy_exact_file_updates: vec![LazyExactFileUpdate::Data(LazyExactFileDataUpdate {
-                    file_id: "file-1".to_string(),
-                    version_id: "version-a".to_string(),
-                    data: vec![1, 2, 3],
-                })],
-                additional_binary_blob_payloads: Vec::new(),
+                filesystem_state: crate::sql::execution::runtime_effects::FilesystemTransactionState {
+                    files: std::iter::once((
+                        ("file-1".to_string(), "version-a".to_string()),
+                        crate::sql::execution::runtime_effects::FilesystemTransactionFileState {
+                            file_id: "file-1".to_string(),
+                            version_id: "version-a".to_string(),
+                            untracked: false,
+                            descriptor: None,
+                            metadata_patch:
+                                crate::sql::public::planner::ir::OptionalTextPatch::Unchanged,
+                            data: Some(vec![1, 2, 3]),
+                            deleted: false,
+                        },
+                    ))
+                    .collect(),
+                },
                 preconditions: CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
@@ -2229,20 +2068,21 @@ mod tests {
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
+                writer_key: None,
             },
             &mut functions,
             None,
         )
         .await
-        .expect("lazy exact file update should succeed");
+        .expect("exact file data update should succeed");
 
         assert_eq!(result.disposition, CreateCommitDisposition::Applied);
         assert!(
-            transaction
+            !transaction
                 .executed_sql
                 .iter()
-                .any(|sql| { sql.contains("FROM \"lix_internal_live_v1_lix_file_descriptor\"") }),
-            "create_commit should read lazy exact file descriptors from live state"
+                .any(|sql| sql.contains("FROM \"lix_internal_live_v1_lix_file_descriptor\"")),
+            "data-only filesystem ops should not require descriptor preflight reads"
         );
     }
 
@@ -2259,8 +2099,7 @@ mod tests {
             CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_updates: Vec::new(),
-                additional_binary_blob_payloads: Vec::new(),
+                filesystem_state: Default::default(),
                 preconditions: CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
@@ -2268,6 +2107,7 @@ mod tests {
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
+                writer_key: None,
             },
             &mut functions,
             None,
@@ -2303,8 +2143,7 @@ mod tests {
             CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: vec![sample_change()],
-                lazy_exact_file_updates: Vec::new(),
-                additional_binary_blob_payloads: Vec::new(),
+                filesystem_state: Default::default(),
                 preconditions: CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
@@ -2312,6 +2151,7 @@ mod tests {
                 },
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
+                writer_key: None,
             },
             &mut functions,
             Some(&mut checker),

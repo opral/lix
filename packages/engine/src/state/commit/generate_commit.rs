@@ -1201,8 +1201,24 @@ mod tests {
 
     #[test]
     fn rejects_empty_domain_change_entity_id() {
-        let error = <crate::EntityId as TryFrom<&str>>::try_from("")
-            .expect_err("expected empty entity_id to be rejected at construction");
+        let mut versions = BTreeMap::new();
+        versions.insert("global".to_string(), version_info("global", &["P_global"]));
+
+        let args = GenerateCommitArgs {
+            timestamp: "2025-01-01T00:00:00.000Z".to_string(),
+            active_accounts: vec![],
+            changes: vec![domain_change(
+                "chg-empty-entity",
+                "",
+                "lix_key_value",
+                "global",
+                None,
+            )],
+            versions,
+        };
+
+        let error =
+            generate_commit(args, || "id".to_string()).expect_err("expected empty entity_id error");
         assert!(
             error.description.contains("entity_id must be non-empty"),
             "unexpected error: {}",

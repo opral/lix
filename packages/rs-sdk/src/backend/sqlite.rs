@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use lix_engine::{
-    collapse_prepared_batch_for_dialect, ImageChunkReader, ImageChunkWriter, LixBackend, LixError,
-    LixTransaction, PreparedBatch, QueryResult, SqlDialect, Value,
+    ImageChunkReader, ImageChunkWriter, LixBackend, LixError, LixTransaction, PreparedBatch,
+    QueryResult, SqlDialect, Value,
 };
 use rusqlite::{
     backup::{Backup, StepResult},
@@ -240,7 +240,7 @@ impl LixTransaction for SqliteTransaction<'_> {
             .conn
             .as_ref()
             .ok_or_else(sqlite_backend_destroyed_error)?;
-        execute_prepared_batch(conn, batch, self.dialect())
+        execute_prepared_batch(conn, batch)
     }
 
     async fn commit(mut self: Box<Self>) -> Result<(), LixError> {
@@ -399,24 +399,15 @@ fn execute_sql(conn: &Connection, sql: &str, params: &[Value]) -> Result<QueryRe
 fn execute_prepared_batch(
     conn: &Connection,
     batch: &PreparedBatch,
-    dialect: SqlDialect,
 ) -> Result<QueryResult, LixError> {
-    let collapsed = collapse_prepared_batch_for_dialect(batch, dialect)?;
-    if collapsed.sql.trim().is_empty() {
-        return Ok(QueryResult {
-            rows: Vec::new(),
-            columns: Vec::new(),
-        });
-    }
-
-    conn.execute_batch(&collapsed.sql).map_err(|err| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: err.to_string(),
-    })?;
-    Ok(QueryResult {
+    let mut last_result = QueryResult {
         rows: Vec::new(),
         columns: Vec::new(),
-    })
+    };
+    for statement in &batch.steps {
+        last_result = execute_sql(conn, &statement.sql, &statement.params)?;
+    }
+    Ok(last_result)
 }
 
 fn run_backup_to_completion(backup: &Backup<'_, '_>) -> Result<(), LixError> {
