@@ -249,3 +249,53 @@ simulation_test!(
         assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
     }
 );
+
+simulation_test!(
+    public_create_table_is_denied,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let mut boot_args = SimulationBootArgs::default();
+        boot_args.access_to_internal = false;
+        let engine = sim
+            .boot_simulated_engine(Some(boot_args))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.expect("init should succeed");
+
+        let error = engine
+            .execute("CREATE TABLE user_data (id TEXT)", &[])
+            .await
+            .expect_err("public CREATE TABLE should be rejected");
+
+        assert_eq!(error.code, "LIX_ERROR_PUBLIC_CREATE_TABLE_DENIED");
+        assert!(error.description.contains("CREATE TABLE is not supported"));
+        assert!(error.description.contains("lix_registered_schema"));
+        assert!(error.description.contains("queryable entity views"));
+    }
+);
+
+simulation_test!(
+    public_create_table_in_transaction_is_denied,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let mut boot_args = SimulationBootArgs::default();
+        boot_args.access_to_internal = false;
+        let engine = sim
+            .boot_simulated_engine(Some(boot_args))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.expect("init should succeed");
+
+        let mut tx = engine
+            .begin_transaction_with_options(ExecuteOptions::default())
+            .await
+            .expect("begin transaction should succeed");
+        let error = tx
+            .execute("CREATE TABLE user_data (id TEXT)", &[])
+            .await
+            .expect_err("public CREATE TABLE in transaction should be rejected");
+
+        assert_eq!(error.code, "LIX_ERROR_PUBLIC_CREATE_TABLE_DENIED");
+        tx.rollback().await.expect("rollback should succeed");
+    }
+);
