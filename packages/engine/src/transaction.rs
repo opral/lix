@@ -1,4 +1,7 @@
-use crate::engine::{reject_internal_table_writes, Engine, EngineTransaction, ExecuteOptions};
+use crate::engine::{
+    reject_internal_table_writes, reject_public_create_table, Engine, EngineTransaction,
+    ExecuteOptions,
+};
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::write_txn_runner::stamp_watermark_before_commit;
 use crate::{ExecuteResult, LixError, Value};
@@ -76,6 +79,7 @@ impl EngineTransaction<'_> {
     ) -> Result<ExecuteResult, LixError> {
         if !self.engine.access_to_internal() {
             let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
+            reject_public_create_table(&parsed_statements)?;
             reject_internal_table_writes(&parsed_statements)?;
         }
         self.execute_with_access(sql, params, self.engine.access_to_internal())
