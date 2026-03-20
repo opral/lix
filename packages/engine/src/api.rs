@@ -156,6 +156,9 @@ impl Engine {
         let prepared = shared_path::prepare_execution_with_backend(
             self,
             self.backend.as_ref(),
+            None,
+            None,
+            None,
             &parsed_statements,
             params,
             &active_version_id,

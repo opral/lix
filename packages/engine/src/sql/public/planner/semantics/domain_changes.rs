@@ -37,10 +37,7 @@ pub(crate) fn build_domain_change_batch(
     resolved
         .partitions
         .iter()
-        .filter(|partition| {
-            partition.execution_mode == WriteMode::Tracked
-                && partition.lazy_exact_file_update.is_none()
-        })
+        .filter(|partition| partition.execution_mode == WriteMode::Tracked)
         .map(|partition| build_domain_change_batch_for_partition(planned_write, partition))
         .collect()
 }
@@ -192,45 +189,7 @@ fn build_idempotency_key(
 }
 
 fn summarize_partition_rows(partition: &ResolvedWritePartition) -> JsonValue {
-    if let Some(lazy) = partition.lazy_exact_file_update.as_ref() {
-        return match lazy {
-            crate::sql::public::planner::ir::LazyExactFileUpdate::Metadata(lazy) => json!({
-                "kind": "lazy_exact_file_metadata_update",
-                "file_id": lazy.file_id,
-                "version_id": lazy.version_id,
-                "metadata": summarize_optional_text_patch(&lazy.metadata),
-            }),
-            crate::sql::public::planner::ir::LazyExactFileUpdate::Data(lazy) => json!({
-                "kind": "lazy_exact_file_data_update",
-                "file_id": lazy.file_id,
-                "version_id": lazy.version_id,
-                "data": {
-                    "sha256": crate::plugin::runtime::binary_blob_hash_hex(&lazy.data),
-                    "len": lazy.data.len(),
-                },
-            }),
-            crate::sql::public::planner::ir::LazyExactFileUpdate::Delete(lazy) => json!({
-                "kind": "lazy_exact_file_delete",
-                "file_ids": lazy.file_ids,
-                "version_id": lazy.version_id,
-            }),
-        };
-    }
     summarize_planned_rows(&partition.intended_post_state)
-}
-
-fn summarize_optional_text_patch(
-    patch: &crate::sql::public::planner::ir::OptionalTextPatch,
-) -> JsonValue {
-    match patch {
-        crate::sql::public::planner::ir::OptionalTextPatch::Unchanged => json!({
-            "kind": "unchanged",
-        }),
-        crate::sql::public::planner::ir::OptionalTextPatch::Set(value) => json!({
-            "kind": "set",
-            "value": value,
-        }),
-    }
 }
 
 fn summarize_mutation_payload(payload: &MutationPayload) -> JsonValue {

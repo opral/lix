@@ -3539,11 +3539,17 @@ simulation_test!(
             .await
             .expect("engine init should succeed");
         let main_version_id = main_version_id(&engine).await;
+        let large_payload = "FK-GUARD-DATA-123456".repeat(4096);
 
         engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('binary-fk-guard', '/assets/blob.mp4', lix_text_encode('FK-GUARD-DATA-123456'))", &[])
+                &format!(
+                    "INSERT INTO lix_file (id, path, data) \
+                     VALUES ('binary-fk-guard', '/assets/blob.mp4', lix_text_encode('{}'))",
+                    large_payload
+                ),
+                &[],
+            )
             .await
             .expect("binary write should succeed");
 

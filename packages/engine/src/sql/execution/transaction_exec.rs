@@ -1,6 +1,5 @@
 use crate::engine::{
-    dedupe_filesystem_payload_domain_changes, normalize_sql_execution_error_with_backend,
-    should_run_binary_cas_gc, DeferredTransactionSideEffects, Engine, PendingWriteTxnBuffer,
+    normalize_sql_execution_error_with_backend, DeferredTransactionSideEffects, Engine,
     SharedTransactionCore, TransactionBackendAdapter,
 };
 use crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
@@ -8,13 +7,17 @@ use crate::sql::execution::contracts::result_contract::ResultContract;
 use crate::sql::execution::execute;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path;
-use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
+use crate::sql::execution::shared_path::{
+    prepared_execution_mutates_public_surface_registry, top_level_write_target_name,
+};
 use crate::sql::execution::write_txn_plan::{
-    build_write_txn_plan, write_txn_plan_is_independent_filesystem,
-    write_txn_plans_can_continue_together, WriteTxnRunMode,
+    build_write_txn_plan, MutationJournal, WriteTxnRunMode,
 };
 use crate::sql::execution::write_txn_runner::run_write_txn_plan_with_transaction;
-use crate::sql::public::catalog::SurfaceRegistry;
+use crate::sql::public::catalog::{SurfaceFamily, SurfaceRegistry};
+use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
+use crate::sql::public::planner::canonicalize::canonicalize_write;
+use crate::sql::public::planner::semantics::write_analysis::analyze_write;
 use crate::sql::public::runtime::{
     apply_public_surface_registry_mutations, decode_public_read_result,
     execute_prepared_public_read, public_surface_registry_mutations, PublicWriteExecutionPartition,
@@ -45,7 +48,7 @@ impl Engine {
                 &mut core.public_surface_registry,
                 &mut core.public_surface_registry_dirty,
                 &mut core.active_version_id,
-                &mut core.pending_write_txn_buffer,
+                &mut core.mutation_journal,
                 &mut core.pending_state_commit_stream_changes,
                 &mut core.pending_public_commit_session,
                 &mut core.observe_tick_already_emitted,
@@ -62,7 +65,7 @@ impl Engine {
                     &mut core.public_surface_registry,
                     &mut core.public_surface_registry_dirty,
                     &mut core.active_version_id,
-                    &mut core.pending_write_txn_buffer,
+                    &mut core.mutation_journal,
                     None,
                     false,
                     &mut core.pending_state_commit_stream_changes,
@@ -83,24 +86,24 @@ impl Engine {
         Ok(result)
     }
 
-    pub(crate) async fn flush_pending_write_txn_buffer_in_transaction(
+    pub(crate) async fn flush_mutation_journal_in_transaction(
         &self,
         transaction: &mut dyn LixTransaction,
         public_surface_registry: &mut SurfaceRegistry,
         public_surface_registry_dirty: &mut bool,
         active_version_id: &mut String,
-        pending_write_txn_buffer: &mut Option<PendingWriteTxnBuffer>,
+        mutation_journal: &mut MutationJournal,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
         pending_public_commit_session: &mut Option<shared_path::PendingPublicCommitSession>,
         observe_tick_already_emitted: &mut bool,
     ) -> Result<(), LixError> {
-        let Some(pending) = pending_write_txn_buffer.take() else {
+        let Some(plan) = mutation_journal.take_staged_write_plan() else {
             return Ok(());
         };
         let execution = run_write_txn_plan_with_transaction(
             self,
             transaction,
-            &pending.plan,
+            &plan,
             WriteTxnRunMode::Borrowed,
             Some(pending_public_commit_session),
         )
@@ -135,7 +138,7 @@ impl Engine {
         public_surface_registry: &mut SurfaceRegistry,
         public_surface_registry_dirty: &mut bool,
         active_version_id: &mut String,
-        pending_write_txn_buffer: &mut Option<PendingWriteTxnBuffer>,
+        mutation_journal: &mut MutationJournal,
         deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
         skip_side_effect_collection: bool,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
@@ -154,22 +157,37 @@ impl Engine {
         let writer_key = options.writer_key.as_deref();
         let _defer_side_effects = deferred_side_effects.is_some();
         loop {
-            if let Some(pending) = pending_write_txn_buffer.as_ref() {
-                if !pending.append_safe
-                    || statement_requires_flushed_pending_buffer(&parsed_statements[0])
-                {
-                    self.flush_pending_write_txn_buffer_in_transaction(
-                        transaction,
-                        public_surface_registry,
-                        public_surface_registry_dirty,
-                        active_version_id,
-                        pending_write_txn_buffer,
-                        pending_state_commit_stream_changes,
-                        pending_public_commit_session,
-                        observe_tick_already_emitted,
-                    )
-                    .await?;
-                }
+            let pending_registered_schema_overlay =
+                mutation_journal.pending_registered_schema_overlay()?;
+            let pending_semantic_overlay = mutation_journal.pending_semantic_overlay()?;
+            let pending_filesystem_overlay = mutation_journal.pending_filesystem_overlay();
+            let pending_overlay_can_continue = statement_can_prepare_against_pending_overlay(
+                public_surface_registry,
+                transaction.dialect(),
+                &parsed_statements[0],
+                params,
+                active_version_id.as_str(),
+                writer_key,
+                pending_semantic_overlay.is_some(),
+                pending_filesystem_overlay.is_some(),
+            );
+            if !mutation_journal.is_empty()
+                && ((!mutation_journal.continuation_safe()
+                    && pending_registered_schema_overlay.is_none()
+                    && !pending_overlay_can_continue)
+                    || statement_requires_flushed_pending_buffer(&parsed_statements[0]))
+            {
+                self.flush_mutation_journal_in_transaction(
+                    transaction,
+                    public_surface_registry,
+                    public_surface_registry_dirty,
+                    active_version_id,
+                    mutation_journal,
+                    pending_state_commit_stream_changes,
+                    pending_public_commit_session,
+                    observe_tick_already_emitted,
+                )
+                .await?;
             }
 
             let prepared = {
@@ -177,12 +195,15 @@ impl Engine {
                 shared_path::prepare_execution_with_backend(
                     self,
                     &backend,
+                    pending_registered_schema_overlay.as_ref(),
+                    pending_semantic_overlay.as_ref(),
+                    pending_filesystem_overlay.as_ref(),
                     &parsed_statements,
                     params,
                     active_version_id.as_str(),
                     writer_key,
                     allow_internal_tables,
-                    Some(public_surface_registry),
+                    Some(&*public_surface_registry),
                     shared_path::PreparationPolicy {
                         skip_side_effect_collection,
                     },
@@ -207,17 +228,14 @@ impl Engine {
             if write_is_bufferable {
                 let statement_plan =
                     write_txn_plan.expect("bufferable write must have a transaction plan");
-                let continuation_safe = pending_write_txn_buffer.as_ref().map_or_else(
-                    || write_txn_plan_is_independent_filesystem(&statement_plan),
-                    |pending| write_txn_plans_can_continue_together(&pending.plan, &statement_plan),
-                );
-                if pending_write_txn_buffer.is_some() && !continuation_safe {
-                    self.flush_pending_write_txn_buffer_in_transaction(
+                let continuation_safe = mutation_journal.can_stage_write_plan(&statement_plan)?;
+                if !mutation_journal.is_empty() && !continuation_safe {
+                    self.flush_mutation_journal_in_transaction(
                         transaction,
                         public_surface_registry,
                         public_surface_registry_dirty,
                         active_version_id,
-                        pending_write_txn_buffer,
+                        mutation_journal,
                         pending_state_commit_stream_changes,
                         pending_public_commit_session,
                         observe_tick_already_emitted,
@@ -226,11 +244,7 @@ impl Engine {
                     continue;
                 }
 
-                append_pending_write_txn_buffer(
-                    pending_write_txn_buffer,
-                    statement_plan,
-                    continuation_safe,
-                );
+                mutation_journal.stage_write_plan(statement_plan)?;
                 if continuation_safe {
                     apply_buffered_write_planning_effects(
                         &prepared,
@@ -247,13 +261,13 @@ impl Engine {
                 });
             }
 
-            if pending_write_txn_buffer.is_some() {
-                self.flush_pending_write_txn_buffer_in_transaction(
+            if !mutation_journal.is_empty() {
+                self.flush_mutation_journal_in_transaction(
                     transaction,
                     public_surface_registry,
                     public_surface_registry_dirty,
                     active_version_id,
-                    pending_write_txn_buffer,
+                    mutation_journal,
                     pending_state_commit_stream_changes,
                     pending_public_commit_session,
                     observe_tick_already_emitted,
@@ -356,18 +370,23 @@ impl Engine {
                 // Internal callers can request executing SQL rewrite/validation without
                 // file side-effect collection/persistence/invalidation.
             } else if let Some(deferred) = deferred_side_effects {
-                deferred
-                    .pending_file_writes
-                    .extend(prepared.intent.pending_file_writes.clone());
+                crate::sql::execution::runtime_effects::merge_filesystem_transaction_state(
+                    &mut deferred.filesystem_state,
+                    &prepared.intent.filesystem_state,
+                );
             } else {
                 let filesystem_payload_changes_already_committed =
                     shared_path::public_write_filesystem_payload_changes_already_committed(
                         &prepared,
                     );
+                let binary_blob_writes =
+                    crate::sql::execution::runtime_effects::binary_blob_writes_from_filesystem_state(
+                        &prepared.intent.filesystem_state,
+                    );
                 if !filesystem_payload_changes_already_committed {
-                    self.persist_pending_file_data_updates_in_transaction(
+                    self.persist_binary_blob_writes_in_transaction(
                         transaction,
-                        &prepared.intent.pending_file_writes,
+                        &binary_blob_writes,
                     )
                     .await
                     .map_err(|error| LixError {
@@ -382,33 +401,30 @@ impl Engine {
                 // through the append boundary. Re-deriving payload effects from pre-commit state
                 // inside the same transaction can observe incomplete runtime state and abort the
                 // transaction on Postgres.
-                let filesystem_payload_domain_changes =
-                    if filesystem_payload_changes_already_committed {
-                        Vec::new()
-                    } else {
-                        self.collect_live_filesystem_payload_domain_changes_in_transaction(
+                let filesystem_finalization = if filesystem_payload_changes_already_committed {
+                    None
+                } else {
+                    Some(
+                        self.compile_filesystem_finalization_from_state_in_transaction(
                             transaction,
-                            &prepared.intent.pending_file_writes,
-                            &prepared.intent.pending_file_delete_targets,
+                            &prepared.intent.filesystem_state,
                             writer_key,
+                            &prepared.plan.preprocess.mutations,
                         )
                         .await
                         .map_err(|error| LixError {
                             code: error.code,
                             description: format!(
-                                "transaction filesystem payload-domain-change collection failed: {}",
+                                "transaction filesystem finalization compilation failed: {}",
                                 error.description
                             ),
-                        })?
-                    };
-                let filesystem_payload_domain_changes =
-                    dedupe_filesystem_payload_domain_changes(&filesystem_payload_domain_changes);
-                if !filesystem_payload_domain_changes.is_empty()
-                    && !filesystem_payload_changes_already_committed
-                {
+                        })?,
+                    )
+                };
+                if let Some(filesystem_finalization) = filesystem_finalization.as_ref() {
                     self.persist_filesystem_payload_domain_changes_in_transaction(
                         transaction,
-                        &filesystem_payload_domain_changes,
+                        &filesystem_finalization.payload_domain_changes(),
                     )
                     .await
                     .map_err(|error| LixError {
@@ -419,11 +435,9 @@ impl Engine {
                         ),
                     })?;
                 }
-                if !filesystem_payload_changes_already_committed
-                    && should_run_binary_cas_gc(
-                        &prepared.plan.preprocess.mutations,
-                        &filesystem_payload_domain_changes,
-                    )
+                if filesystem_finalization
+                    .as_ref()
+                    .is_some_and(|compiled| compiled.should_run_gc)
                 {
                     self.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
                         .await
@@ -468,24 +482,73 @@ impl Engine {
     }
 }
 
-pub(crate) fn append_pending_write_txn_buffer(
-    pending_write_txn_buffer: &mut Option<PendingWriteTxnBuffer>,
-    plan: crate::sql::execution::write_txn_plan::WriteTxnPlan,
-    append_safe: bool,
-) {
-    match pending_write_txn_buffer {
-        Some(pending) => {
-            pending.plan.extend(plan);
-            pending.append_safe &= append_safe;
-        }
-        None => {
-            *pending_write_txn_buffer = Some(PendingWriteTxnBuffer { plan, append_safe });
-        }
-    }
-}
-
 fn statement_requires_flushed_pending_buffer(statement: &Statement) -> bool {
     matches!(statement, Statement::Query(_) | Statement::Explain { .. })
+}
+
+pub(crate) fn statement_can_prepare_against_pending_overlay(
+    public_surface_registry: &SurfaceRegistry,
+    dialect: crate::SqlDialect,
+    statement: &Statement,
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+    allow_state_overlay: bool,
+    allow_filesystem_overlay: bool,
+) -> bool {
+    let Some(target_name) = top_level_write_target_name(statement) else {
+        return false;
+    };
+    let Some(binding) = public_surface_registry.bind_relation_name(&target_name) else {
+        return false;
+    };
+
+    if matches!(statement, Statement::Insert(_)) {
+        return match binding.descriptor.surface_family {
+            SurfaceFamily::State => allow_state_overlay,
+            SurfaceFamily::Filesystem => {
+                allow_filesystem_overlay
+                    && matches!(
+                        target_name.as_str(),
+                        "lix_file"
+                            | "lix_file_by_version"
+                            | "lix_directory"
+                            | "lix_directory_by_version"
+                    )
+            }
+            _ => false,
+        };
+    }
+
+    match binding.descriptor.surface_family {
+        SurfaceFamily::State if allow_state_overlay => {}
+        SurfaceFamily::Filesystem
+            if allow_filesystem_overlay
+                && matches!(target_name.as_str(), "lix_file" | "lix_file_by_version") => {}
+        _ => return false,
+    }
+
+    let bound_statement = BoundStatement::from_statement(
+        statement.clone(),
+        params.to_vec(),
+        ExecutionContext {
+            dialect: Some(dialect),
+            writer_key: writer_key.map(str::to_string),
+            requested_version_id: Some(active_version_id.to_string()),
+        },
+    );
+    let Ok(canonicalized) = canonicalize_write(bound_statement, public_surface_registry) else {
+        return false;
+    };
+    let Ok(planned_write) = analyze_write(&canonicalized) else {
+        return false;
+    };
+
+    matches!(
+        planned_write.command.operation_kind,
+        crate::sql::public::planner::ir::WriteOperationKind::Update
+            | crate::sql::public::planner::ir::WriteOperationKind::Delete
+    ) && planned_write.command.selector.exact_only
 }
 
 fn apply_buffered_write_planning_effects(

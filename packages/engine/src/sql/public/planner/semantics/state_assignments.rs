@@ -407,6 +407,37 @@ fn resolved_entity_state_value(
         .cloned()
         .or_else(|| semantics.state_defaults.get(key).cloned())
 }
+fn entity_id_component_from_json_value(value: &JsonValue) -> Result<String, StateAssignmentsError> {
+    match value {
+        JsonValue::Null => Err(StateAssignmentsError {
+            message: "public entity resolver cannot derive entity_id from null primary-key values"
+                .to_string(),
+        }),
+        JsonValue::String(text) if text.is_empty() => Err(StateAssignmentsError {
+            message: "public entity resolver cannot derive entity_id from empty primary-key values"
+                .to_string(),
+        }),
+        JsonValue::String(text) => Ok(text.clone()),
+        JsonValue::Bool(flag) => Ok(flag.to_string()),
+        JsonValue::Number(number) => Ok(number.to_string()),
+        JsonValue::Array(_) | JsonValue::Object(_) => Ok(value.to_string()),
+    }
+}
+
+fn json_pointer_get<'a>(value: &'a JsonValue, pointer: &[String]) -> Option<&'a JsonValue> {
+    let mut current = value;
+    for segment in pointer {
+        match current {
+            JsonValue::Object(object) => current = object.get(segment)?,
+            JsonValue::Array(array) => {
+                let index = segment.parse::<usize>().ok()?;
+                current = array.get(index)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
 fn text_from_value(value: &Value) -> Option<&str> {
     match value {
         Value::Text(value) => Some(value.as_str()),

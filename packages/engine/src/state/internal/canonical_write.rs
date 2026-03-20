@@ -62,6 +62,24 @@ impl<'a> StatementContext<'a> {
     fn take_output(&mut self, statements: Vec<Statement>) -> RewriteOutput {
         RewriteOutput {
             statements,
+            prepared_statements: Vec::new(),
+            effect_only: false,
+            params: std::mem::take(&mut self.generated_params),
+            live_table_requirements: std::mem::take(&mut self.live_table_requirements),
+            postprocess: self.postprocess.take(),
+            mutations: std::mem::take(&mut self.mutations),
+            update_validations: std::mem::take(&mut self.update_validations),
+        }
+    }
+
+    fn take_output_with_prepared(
+        &mut self,
+        statements: Vec<Statement>,
+        prepared_statements: Vec<crate::state::internal::PreparedStatement>,
+    ) -> RewriteOutput {
+        RewriteOutput {
+            statements,
+            prepared_statements,
             effect_only: false,
             params: std::mem::take(&mut self.generated_params),
             live_table_requirements: std::mem::take(&mut self.live_table_requirements),
@@ -89,6 +107,7 @@ fn merge_rewrite_output(base: &mut RewriteOutput, mut next: RewriteOutput) -> Re
         base.postprocess = next.postprocess.take();
     }
     base.statements.extend(next.statements);
+    base.prepared_statements.extend(next.prepared_statements);
     base.effect_only = base.effect_only || next.effect_only;
     base.params.extend(next.params);
     base.live_table_requirements
@@ -105,6 +124,7 @@ fn rewrite_vtable_update_output(
     match rewritten {
         Some(vtable_write::UpdateRewrite::Statement(rewrite)) => Ok(RewriteOutput {
             statements: vec![rewrite.statement],
+            prepared_statements: Vec::new(),
             effect_only: false,
             params: Vec::new(),
             live_table_requirements: Vec::new(),
@@ -117,6 +137,7 @@ fn rewrite_vtable_update_output(
             statements.push(rewrite.statement);
             Ok(RewriteOutput {
                 statements,
+                prepared_statements: Vec::new(),
                 effect_only: false,
                 params: Vec::new(),
                 live_table_requirements: Vec::new(),
@@ -130,6 +151,7 @@ fn rewrite_vtable_update_output(
             if is_allowed_internal_write_target(&target) {
                 Ok(RewriteOutput {
                     statements: vec![Statement::Update(update)],
+                    prepared_statements: Vec::new(),
                     effect_only: false,
                     params: Vec::new(),
                     live_table_requirements: Vec::new(),
@@ -171,6 +193,7 @@ fn rewrite_vtable_delete_output_from_rewrite(
     match rewritten {
         Some(vtable_write::DeleteRewrite::Statement(statement)) => Ok(RewriteOutput {
             statements: vec![statement.statement],
+            prepared_statements: Vec::new(),
             effect_only: false,
             params: Vec::new(),
             live_table_requirements: Vec::new(),
@@ -180,6 +203,7 @@ fn rewrite_vtable_delete_output_from_rewrite(
         }),
         Some(vtable_write::DeleteRewrite::Planned(rewrite)) => Ok(RewriteOutput {
             statements: vec![rewrite.statement],
+            prepared_statements: Vec::new(),
             effect_only: false,
             params: Vec::new(),
             live_table_requirements: Vec::new(),
@@ -192,6 +216,7 @@ fn rewrite_vtable_delete_output_from_rewrite(
             if is_allowed_internal_write_target(&target) {
                 Ok(RewriteOutput {
                     statements: vec![Statement::Delete(delete)],
+                    prepared_statements: Vec::new(),
                     effect_only: false,
                     params: Vec::new(),
                     live_table_requirements: Vec::new(),
@@ -250,6 +275,7 @@ where
     let mut queue = VecDeque::from([Pending::Statement(statement)]);
     let mut final_output = RewriteOutput {
         statements: Vec::new(),
+        prepared_statements: Vec::new(),
         effect_only: false,
         params: Vec::new(),
         live_table_requirements: Vec::new(),
@@ -288,7 +314,10 @@ where
         }
     }
 
-    if final_output.statements.is_empty() && !final_output.effect_only {
+    if final_output.statements.is_empty()
+        && final_output.prepared_statements.is_empty()
+        && !final_output.effect_only
+    {
         Ok(None)
     } else {
         Ok(Some(final_output))
@@ -375,6 +404,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
             other => {
                 return Ok(StatementRuleOutcome::Emit(RewriteOutput {
                     statements: vec![other],
+                    prepared_statements: Vec::new(),
                     effect_only: false,
                     params: Vec::new(),
                     live_table_requirements: Vec::new(),
@@ -437,12 +467,12 @@ where
                 }
 
                 let mut statements = Vec::new();
+                let mut prepared_statements = Vec::new();
                 if let Some(rewritten) = vtable_write::rewrite_insert_with_backend(
                     backend,
                     current_insert.clone(),
                     context.known_live_layouts.unwrap_or(&BTreeMap::new()),
                     context.params,
-                    context.generated_params.len(),
                     context.writer_key,
                     functions,
                 )
@@ -460,6 +490,27 @@ where
                     context.generated_params.extend(rewritten.params);
                     context.mutations.extend(rewritten.mutations);
                     statements = rewritten.statements;
+                    prepared_statements = rewritten.prepared_statements;
+                }
+
+                if !prepared_statements.is_empty() {
+                    for statement in statements
+                        .into_iter()
+                        .chain(supplemental_statements.into_iter())
+                    {
+                        let bound = crate::sql::ast::utils::bind_statement_ast(
+                            &statement,
+                            context.params,
+                            backend.dialect(),
+                        )?;
+                        prepared_statements.push(crate::state::internal::PreparedStatement {
+                            sql: bound.sql,
+                            params: bound.params,
+                        });
+                    }
+                    return Ok(StatementRuleOutcome::Emit(
+                        context.take_output_with_prepared(Vec::new(), prepared_statements),
+                    ));
                 }
 
                 if statements.is_empty() {
@@ -476,7 +527,9 @@ where
                 }
                 statements.extend(supplemental_statements);
 
-                return Ok(StatementRuleOutcome::Emit(context.take_output(statements)));
+                return Ok(StatementRuleOutcome::Emit(
+                    context.take_output_with_prepared(statements, prepared_statements),
+                ));
             }
             Statement::Update(update) => {
                 let rewritten = vtable_write::rewrite_update(update.clone(), context.params)?;
@@ -513,6 +566,7 @@ where
             other => {
                 return Ok(StatementRuleOutcome::Emit(RewriteOutput {
                     statements: vec![other],
+                    prepared_statements: Vec::new(),
                     effect_only: false,
                     params: Vec::new(),
                     live_table_requirements: Vec::new(),

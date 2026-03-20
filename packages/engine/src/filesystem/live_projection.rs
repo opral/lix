@@ -22,10 +22,6 @@ pub(crate) enum FilesystemProjectionScope {
     ExplicitVersion,
 }
 
-pub(crate) fn build_live_file_prefetch_projection_sql(dialect: SqlDialect) -> String {
-    build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, true, dialect)
-}
-
 pub(crate) async fn resolve_file_id_by_path_in_version(
     backend: &dyn LixBackend,
     version_id: &str,

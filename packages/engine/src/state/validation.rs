@@ -877,16 +877,9 @@ fn collect_planned_binary_blob_hashes(
     }
 
     let mut hashes = HashSet::new();
-    for payload_write in resolved.filesystem_payload_writes() {
-        hashes.insert(crate::plugin::runtime::binary_blob_hash_hex(
-            &payload_write.data,
-        ));
-    }
-    for partition in &resolved.partitions {
-        if let Some(crate::sql::public::planner::ir::LazyExactFileUpdate::Data(update)) =
-            partition.lazy_exact_file_update.as_ref()
-        {
-            hashes.insert(crate::plugin::runtime::binary_blob_hash_hex(&update.data));
+    for file in resolved.filesystem_state().files.values() {
+        if let Some(data) = file.data.as_ref() {
+            hashes.insert(crate::plugin::runtime::binary_blob_hash_hex(data));
         }
     }
     Ok(hashes)
