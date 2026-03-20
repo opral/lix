@@ -11,6 +11,7 @@ pub(crate) enum ErrorCode {
     SqlUnknownTable,
     SqlUnknownColumn,
     InternalTableAccessDenied,
+    PublicCreateTableDenied,
     ReadOnlyViewWriteDenied,
     VtableSchemaKeyRequired,
     TransactionControlStatementDenied,
@@ -29,6 +30,7 @@ impl ErrorCode {
             Self::SqlUnknownTable => "LIX_ERROR_SQL_UNKNOWN_TABLE",
             Self::SqlUnknownColumn => "LIX_ERROR_SQL_UNKNOWN_COLUMN",
             Self::InternalTableAccessDenied => "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED",
+            Self::PublicCreateTableDenied => "LIX_ERROR_PUBLIC_CREATE_TABLE_DENIED",
             Self::ReadOnlyViewWriteDenied => "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED",
             Self::VtableSchemaKeyRequired => "LIX_ERROR_VTABLE_SCHEMA_KEY_REQUIRED",
             Self::TransactionControlStatementDenied => {
@@ -50,6 +52,7 @@ impl ErrorCode {
             Self::SqlUnknownTable,
             Self::SqlUnknownColumn,
             Self::InternalTableAccessDenied,
+            Self::PublicCreateTableDenied,
             Self::ReadOnlyViewWriteDenied,
             Self::VtableSchemaKeyRequired,
             Self::TransactionControlStatementDenied,
@@ -165,6 +168,13 @@ pub(crate) fn internal_table_access_denied_error() -> LixError {
     )
 }
 
+pub(crate) fn public_create_table_denied_error() -> LixError {
+    build_error(
+        ErrorCode::PublicCreateTableDenied,
+        "CREATE TABLE is not supported in public Lix SQL. Instead, store a schema definition in `lix_registered_schema`; registered schemas become queryable entity views.",
+    )
+}
+
 pub(crate) fn mixed_public_internal_query_error(internal_tables: &[String]) -> LixError {
     let available_tables = builtin_public_surface_names().join(", ");
     let internal_tables = if internal_tables.is_empty() {
@@ -235,10 +245,10 @@ mod tests {
     use super::{
         already_initialized_error, file_data_expects_bytes_error,
         internal_table_access_denied_error, mixed_public_internal_query_error,
-        not_initialized_error, read_only_view_write_error, schema_not_registered_error,
-        sql_unknown_column_error, sql_unknown_table_error, table_not_found_read_error,
-        transaction_control_statement_denied_error, unexpected_statement_count_error,
-        vtable_schema_key_required_error, ErrorCode,
+        not_initialized_error, public_create_table_denied_error, read_only_view_write_error,
+        schema_not_registered_error, sql_unknown_column_error, sql_unknown_table_error,
+        table_not_found_read_error, transaction_control_statement_denied_error,
+        unexpected_statement_count_error, vtable_schema_key_required_error, ErrorCode,
     };
     use std::collections::HashSet;
 
@@ -273,6 +283,12 @@ mod tests {
         assert_eq!(
             internal_access.code,
             "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED"
+        );
+
+        let create_table_denied = public_create_table_denied_error();
+        assert_eq!(
+            create_table_denied.code,
+            "LIX_ERROR_PUBLIC_CREATE_TABLE_DENIED"
         );
 
         let mixed_public_internal = mixed_public_internal_query_error(&[String::from(
@@ -343,5 +359,6 @@ mod tests {
 
         let api_src = include_str!("../api.rs");
         assert!(api_src.contains("errors::transaction_control_statement_denied_error()"));
+        assert!(api_src.contains("reject_public_create_table("));
     }
 }

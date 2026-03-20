@@ -1,4 +1,6 @@
-use crate::engine::{reject_internal_table_writes, Engine, ExecuteOptions};
+use crate::engine::{
+    reject_internal_table_writes, reject_public_create_table, Engine, ExecuteOptions,
+};
 use crate::errors;
 use crate::init::init_backend;
 use crate::sql::execution::execution_program::{
@@ -95,6 +97,7 @@ impl Engine {
 
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         if !allow_internal_sql {
+            reject_public_create_table(&parsed_statements)?;
             reject_internal_table_writes(&parsed_statements)?;
         }
         let explicit_transaction_script =

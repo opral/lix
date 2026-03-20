@@ -400,6 +400,7 @@ pub(crate) struct PreparedPublicRead {
     pub(crate) optimization: Option<PublicReadOptimization>,
     pub(crate) dependency_spec: Option<DependencySpec>,
     pub(crate) execution: PreparedPublicReadExecution,
+    pub(crate) public_output_columns: Option<Vec<String>>,
     pub(crate) debug_trace: PublicExecutionDebugTrace,
 }
 

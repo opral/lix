@@ -322,6 +322,16 @@ pub(crate) fn reject_internal_table_writes(statements: &[Statement]) -> Result<(
     Ok(())
 }
 
+pub(crate) fn reject_public_create_table(statements: &[Statement]) -> Result<(), LixError> {
+    if statements
+        .iter()
+        .any(|statement| matches!(statement, Statement::CreateTable(_)))
+    {
+        return Err(crate::errors::public_create_table_denied_error());
+    }
+    Ok(())
+}
+
 fn statement_mutates_lix_internal_table(statement: &Statement) -> bool {
     match statement {
         Statement::Insert(insert) => match &insert.table {
