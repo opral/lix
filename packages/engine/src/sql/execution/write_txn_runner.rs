@@ -190,6 +190,8 @@ async fn materialize_tracked_append_phase(
                 .unwrap_or_default(),
             filesystem_state: unit.filesystem_state.clone(),
             preconditions: unit.execution.create_preconditions.clone(),
+            lane_parent_commit_ids_override: None,
+            allow_empty_commit: false,
             should_emit_observe_tick: unit.should_emit_observe_tick(),
             observe_tick_writer_key: unit.writer_key.clone(),
             writer_key: unit.writer_key.clone(),

@@ -164,6 +164,13 @@ impl Engine {
         crate::version::switch_version(self, version_id).await
     }
 
+    pub async fn merge_version(
+        &self,
+        options: crate::MergeVersionOptions,
+    ) -> Result<crate::MergeVersionResult, LixError> {
+        crate::version::merge_version(self, options).await
+    }
+
     /// Exports a portable image as SQLite3 file bytes written via chunk stream.
     pub async fn export_image(
         &self,

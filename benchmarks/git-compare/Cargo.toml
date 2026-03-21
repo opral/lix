@@ -1,0 +1,13 @@
+[package]
+name = "git_compare_benchmark"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+clap = { version = "4.5.31", features = ["derive"] }
+lix_engine = { path = "../../packages/engine" }
+lix_rs_sdk = { path = "../../packages/rs-sdk" }
+pollster = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

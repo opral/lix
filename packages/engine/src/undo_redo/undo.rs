@@ -210,6 +210,8 @@ async fn undo_in_transaction(
                         version_id, target_commit_id, current_head_commit_id
                     )),
                 },
+                lane_parent_commit_ids_override: None,
+                allow_empty_commit: false,
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
                 writer_key: None,
