@@ -86,6 +86,7 @@ pub(crate) async fn load_commit_active_accounts(
          FROM {table_name} \
          WHERE file_id = '{file_id}' \
            AND version_id = '{version_id}' \
+           AND untracked = true \
            AND account_id IS NOT NULL",
         table_name = quote_ident(&untracked_live_table_name(active_account_schema_key())),
         file_id = escape_sql_string(active_account_file_id()),
@@ -274,11 +275,7 @@ pub(crate) fn build_prepared_batch_from_commit_apply_input<'a>(
     )?;
 
     for (schema_key, (is_untracked, columns, rows, params_per_row)) in materialized_by_schema {
-        let table_name = if is_untracked {
-            untracked_live_table_name(&schema_key)
-        } else {
-            tracked_live_table_name(&schema_key)
-        };
+        let table_name = tracked_live_table_name(&schema_key);
         push_chunked_prepared_insert_statements(
             &mut prepared,
             &table_name,
@@ -459,7 +456,7 @@ fn normalized_live_column_values_for_row(
 
 fn live_state_insert_columns(
     layout: Option<&crate::schema::live_layout::LiveTableLayout>,
-    untracked: bool,
+    _untracked: bool,
 ) -> Vec<Ident> {
     let mut columns = vec![
         Ident::new("entity_id"),
@@ -469,15 +466,14 @@ fn live_state_insert_columns(
         Ident::new("version_id"),
         Ident::new("global"),
         Ident::new("plugin_key"),
+        Ident::new("change_id"),
         Ident::new("metadata"),
         Ident::new("writer_key"),
+        Ident::new("is_tombstone"),
+        Ident::new("untracked"),
         Ident::new("created_at"),
         Ident::new("updated_at"),
     ];
-    if !untracked {
-        columns.insert(7, Ident::new("change_id"));
-        columns.insert(10, Ident::new("is_tombstone"));
-    }
     if let Some(layout) = layout {
         columns.extend(
             layout
@@ -505,26 +501,26 @@ fn live_state_row_values_parameterized(
         text_param_expr(&row.lixcol_version_id, next_placeholder, params),
         boolean_expr(row.lixcol_version_id == GLOBAL_VERSION),
         text_param_expr(&row.plugin_key, next_placeholder, params),
+        if untracked {
+            null_expr()
+        } else {
+            text_param_expr(&row.id, next_placeholder, params)
+        },
         optional_text_param_expr(
             row.metadata.as_ref().map(|value| value.as_str()),
             next_placeholder,
             params,
         ),
         optional_text_param_expr(row.writer_key.as_deref(), next_placeholder, params),
+        number_expr(if !untracked && row.snapshot_content.is_none() {
+            "1"
+        } else {
+            "0"
+        }),
+        boolean_expr(untracked),
         text_param_expr(&row.created_at, next_placeholder, params),
         text_param_expr(&row.created_at, next_placeholder, params),
     ];
-    if !untracked {
-        values.insert(7, text_param_expr(&row.id, next_placeholder, params));
-        values.insert(
-            10,
-            number_expr(if row.snapshot_content.is_some() {
-                "0"
-            } else {
-                "1"
-            }),
-        );
-    }
     for (_, value) in normalized_columns {
         values.push(value_param_expr(value, next_placeholder, params));
     }
@@ -628,7 +624,7 @@ fn build_commit_graph_node_on_conflict() -> OnInsert {
     })
 }
 
-fn build_live_state_on_conflict(columns: &[Ident], untracked: bool) -> OnInsert {
+fn build_live_state_on_conflict(columns: &[Ident], _untracked: bool) -> OnInsert {
     let mut assignments = vec![
         sqlparser::ast::Assignment {
             target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
@@ -666,21 +662,25 @@ fn build_live_state_on_conflict(columns: &[Ident], untracked: bool) -> OnInsert 
             ])),
             value: Expr::Identifier(Ident::new("excluded.updated_at")),
         },
-    ];
-    if !untracked {
-        assignments.push(sqlparser::ast::Assignment {
+        sqlparser::ast::Assignment {
             target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
                 ObjectNamePart::Identifier(Ident::new("change_id")),
             ])),
             value: Expr::Identifier(Ident::new("excluded.change_id")),
-        });
-        assignments.push(sqlparser::ast::Assignment {
+        },
+        sqlparser::ast::Assignment {
             target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
                 ObjectNamePart::Identifier(Ident::new("is_tombstone")),
             ])),
             value: Expr::Identifier(Ident::new("excluded.is_tombstone")),
-        });
-    }
+        },
+        sqlparser::ast::Assignment {
+            target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
+                ObjectNamePart::Identifier(Ident::new("untracked")),
+            ])),
+            value: Expr::Identifier(Ident::new("excluded.untracked")),
+        },
+    ];
     for column in columns {
         let name = column.value.as_str();
         if matches!(
@@ -692,14 +692,14 @@ fn build_live_state_on_conflict(columns: &[Ident], untracked: bool) -> OnInsert 
                 | "version_id"
                 | "global"
                 | "plugin_key"
+                | "change_id"
                 | "metadata"
                 | "writer_key"
+                | "is_tombstone"
+                | "untracked"
                 | "created_at"
                 | "updated_at"
         ) {
-            continue;
-        }
-        if !untracked && matches!(name, "change_id" | "is_tombstone") {
             continue;
         }
         assignments.push(sqlparser::ast::Assignment {
@@ -714,6 +714,7 @@ fn build_live_state_on_conflict(columns: &[Ident], untracked: bool) -> OnInsert 
             Ident::new("entity_id"),
             Ident::new("file_id"),
             Ident::new("version_id"),
+            Ident::new("untracked"),
         ])),
         action: OnConflictAction::DoUpdate(DoUpdate {
             assignments,

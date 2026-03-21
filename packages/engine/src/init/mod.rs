@@ -56,9 +56,10 @@ const INIT_STATEMENTS: &[&str] = &[
      metadata TEXT,\
      writer_key TEXT,\
      is_tombstone INTEGER NOT NULL DEFAULT 0,\
+     untracked BOOLEAN NOT NULL DEFAULT false,\
      created_at TEXT NOT NULL,\
      updated_at TEXT NOT NULL,\
-     PRIMARY KEY (entity_id, file_id, version_id)\
+     PRIMARY KEY (entity_id, file_id, version_id, untracked)\
      )",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_registered_schema_bootstrap_version_id \
      ON lix_internal_registered_schema_bootstrap (version_id)",

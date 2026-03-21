@@ -1,6 +1,5 @@
 use crate::schema::live_layout::{
-    builtin_live_table_layout, merge_live_table_layouts, tracked_live_table_name,
-    untracked_live_table_name, LiveTableLayout,
+    builtin_live_table_layout, merge_live_table_layouts, tracked_live_table_name, LiveTableLayout,
 };
 use crate::schema::schema_from_registered_snapshot;
 use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
@@ -92,18 +91,6 @@ pub fn ensure_schema_live_table_sql_statements(
     dialect: SqlDialect,
     layout: &LiveTableLayout,
 ) -> Vec<String> {
-    let mut statements = tracked_live_table_sql_statements(schema_key, dialect, layout);
-    statements.extend(untracked_live_table_sql_statements(
-        schema_key, dialect, layout,
-    ));
-    statements
-}
-
-fn tracked_live_table_sql_statements(
-    schema_key: &str,
-    dialect: SqlDialect,
-    layout: &LiveTableLayout,
-) -> Vec<String> {
     let table_name = tracked_live_table_name(schema_key);
     let table_ident = quote_ident(&table_name);
     let mut statements = vec![format!(
@@ -115,57 +102,21 @@ fn tracked_live_table_sql_statements(
          version_id TEXT NOT NULL,\
          global BOOLEAN NOT NULL DEFAULT false,\
          plugin_key TEXT NOT NULL,\
-         change_id TEXT NOT NULL,\
+         change_id TEXT,\
          metadata TEXT,\
          writer_key TEXT,\
          is_tombstone INTEGER NOT NULL DEFAULT 0,\
+         untracked BOOLEAN NOT NULL DEFAULT false,\
          created_at TEXT NOT NULL,\
          updated_at TEXT NOT NULL{normalized_columns},\
-         PRIMARY KEY (entity_id, file_id, version_id)\
+         PRIMARY KEY (entity_id, file_id, version_id, untracked)\
          )",
         table = table_ident,
         normalized_columns = render_normalized_columns(Some(layout), dialect),
     )];
 
-    statements.extend(common_tracked_indexes(&table_name, &table_ident));
+    statements.extend(common_live_indexes(&table_name, &table_ident));
     statements.extend(normalized_column_indexes(&table_name, &table_ident, layout));
-
-    statements
-}
-
-fn untracked_live_table_sql_statements(
-    schema_key: &str,
-    dialect: SqlDialect,
-    layout: &LiveTableLayout,
-) -> Vec<String> {
-    let table_name = untracked_live_table_name(schema_key);
-    let table_ident = quote_ident(&table_name);
-    let mut statements = vec![format!(
-        "CREATE TABLE IF NOT EXISTS {table} (\
-         entity_id TEXT NOT NULL,\
-         schema_key TEXT NOT NULL,\
-         file_id TEXT NOT NULL,\
-         version_id TEXT NOT NULL,\
-         global BOOLEAN NOT NULL DEFAULT false,\
-         plugin_key TEXT NOT NULL,\
-         metadata TEXT,\
-         writer_key TEXT,\
-         schema_version TEXT NOT NULL,\
-         created_at TEXT NOT NULL,\
-         updated_at TEXT NOT NULL{normalized_columns},\
-         PRIMARY KEY (entity_id, file_id, version_id)\
-         )",
-        table = table_ident,
-        normalized_columns = render_normalized_columns(Some(layout), dialect),
-    )];
-
-    statements.extend(common_untracked_indexes(&table_name, &table_ident));
-    statements.extend(normalized_untracked_indexes(
-        &table_name,
-        &table_ident,
-        layout,
-    ));
-
     statements
 }
 
@@ -183,7 +134,7 @@ fn render_normalized_columns(layout: Option<&LiveTableLayout>, dialect: SqlDiale
     out
 }
 
-fn common_tracked_indexes(table_name: &str, table_ident: &str) -> Vec<String> {
+fn common_live_indexes(table_name: &str, table_ident: &str) -> Vec<String> {
     let mut statements = vec![
         format!(
             "CREATE INDEX IF NOT EXISTS {index} ON {table} (version_id)",
@@ -196,17 +147,17 @@ fn common_tracked_indexes(table_name: &str, table_ident: &str) -> Vec<String> {
             table = table_ident,
         ),
         format!(
-            "CREATE INDEX IF NOT EXISTS {index} ON {table} (version_id, file_id, entity_id)",
+            "CREATE INDEX IF NOT EXISTS {index} ON {table} (version_id, file_id, entity_id, untracked)",
             index = quote_ident(&format!("idx_{}_vfe", table_name)),
             table = table_ident,
         ),
         format!(
-            "CREATE INDEX IF NOT EXISTS {index} ON {table} (version_id, entity_id)",
+            "CREATE INDEX IF NOT EXISTS {index} ON {table} (version_id, entity_id, untracked)",
             index = quote_ident(&format!("idx_{}_ve", table_name)),
             table = table_ident,
         ),
         format!(
-            "CREATE INDEX IF NOT EXISTS {index} ON {table} (file_id, version_id)",
+            "CREATE INDEX IF NOT EXISTS {index} ON {table} (file_id, version_id, untracked)",
             index = quote_ident(&format!("idx_{}_fv", table_name)),
             table = table_ident,
         ),
@@ -214,38 +165,25 @@ fn common_tracked_indexes(table_name: &str, table_ident: &str) -> Vec<String> {
     statements.push(format!(
         "CREATE INDEX IF NOT EXISTS {index} \
          ON {table} (version_id, file_id, entity_id) \
-         WHERE is_tombstone = 0",
+         WHERE untracked = false AND is_tombstone = 0",
         index = quote_ident(&format!("idx_{}_live_vfe", table_name)),
         table = table_ident,
     ));
     statements.push(format!(
         "CREATE INDEX IF NOT EXISTS {index} \
          ON {table} (version_id, file_id, entity_id) \
-         WHERE is_tombstone = 1",
+         WHERE untracked = false AND is_tombstone = 1",
         index = quote_ident(&format!("idx_{}_tomb_vfe", table_name)),
         table = table_ident,
     ));
+    statements.push(format!(
+        "CREATE INDEX IF NOT EXISTS {index} \
+         ON {table} (version_id, file_id, entity_id) \
+         WHERE untracked = true",
+        index = quote_ident(&format!("idx_{}_untracked_vfe", table_name)),
+        table = table_ident,
+    ));
     statements
-}
-
-fn common_untracked_indexes(table_name: &str, table_ident: &str) -> Vec<String> {
-    vec![
-        format!(
-            "CREATE INDEX IF NOT EXISTS {index} ON {table} (version_id)",
-            index = quote_ident(&format!("idx_{}_version_id", table_name)),
-            table = table_ident,
-        ),
-        format!(
-            "CREATE INDEX IF NOT EXISTS {index} ON {table} (global, version_id)",
-            index = quote_ident(&format!("idx_{}_global_version", table_name)),
-            table = table_ident,
-        ),
-        format!(
-            "CREATE INDEX IF NOT EXISTS {index} ON {table} (version_id, file_id, entity_id)",
-            index = quote_ident(&format!("idx_{}_vfe", table_name)),
-            table = table_ident,
-        ),
-    ]
 }
 
 fn normalized_column_indexes(
@@ -260,101 +198,17 @@ fn normalized_column_indexes(
                 statements.push(format!(
                     "CREATE INDEX IF NOT EXISTS {index} \
                      ON {table}(version_id, {directory}, {name}, {extension}) \
-                     WHERE is_tombstone = 0",
+                     WHERE untracked = false AND is_tombstone = 0",
                     index = quote_ident("idx_lix_file_desc_v_dne_live"),
                     table = table_ident,
                     directory = quote_ident("directory_id"),
                     name = quote_ident("name"),
                     extension = quote_ident("extension"),
                 ));
-            }
-        }
-        "lix_directory_descriptor" => {
-            if has_columns(layout, &["parent_id", "name"]) {
                 statements.push(format!(
                     "CREATE INDEX IF NOT EXISTS {index} \
-                     ON {table}(version_id, {parent_id}, {name}) \
-                     WHERE is_tombstone = 0",
-                    index = quote_ident("idx_lix_dir_desc_v_pn_live"),
-                    table = table_ident,
-                    parent_id = quote_ident("parent_id"),
-                    name = quote_ident("name"),
-                ));
-            }
-        }
-        "lix_commit_edge" => {
-            if has_columns(layout, &["child_id"]) {
-                statements.push(format!(
-                    "CREATE INDEX IF NOT EXISTS {index} \
-                     ON {table}(version_id, {child_id}) \
-                     WHERE is_tombstone = 0",
-                    index = quote_ident("idx_lix_commit_edge_v_child_live"),
-                    table = table_ident,
-                    child_id = quote_ident("child_id"),
-                ));
-            }
-            if has_columns(layout, &["parent_id"]) {
-                statements.push(format!(
-                    "CREATE INDEX IF NOT EXISTS {index} \
-                     ON {table}(version_id, {parent_id}) \
-                     WHERE is_tombstone = 0",
-                    index = quote_ident("idx_lix_commit_edge_v_parent_live"),
-                    table = table_ident,
-                    parent_id = quote_ident("parent_id"),
-                ));
-            }
-        }
-        "lix_commit" => {
-            if has_columns(layout, &["change_set_id"]) {
-                statements.push(format!(
-                    "CREATE INDEX IF NOT EXISTS {index} \
-                     ON {table}(version_id, {change_set_id}) \
-                     WHERE is_tombstone = 0",
-                    index = quote_ident("idx_lix_commit_v_change_set_live"),
-                    table = table_ident,
-                    change_set_id = quote_ident("change_set_id"),
-                ));
-            }
-        }
-        "lix_change_set_element" => {
-            if has_columns(layout, &["change_set_id"]) {
-                statements.push(format!(
-                    "CREATE INDEX IF NOT EXISTS {index} \
-                     ON {table}(version_id, {change_set_id}) \
-                     WHERE is_tombstone = 0",
-                    index = quote_ident("idx_lix_cse_v_change_set_live"),
-                    table = table_ident,
-                    change_set_id = quote_ident("change_set_id"),
-                ));
-            }
-            if has_columns(layout, &["change_id"]) {
-                statements.push(format!(
-                    "CREATE INDEX IF NOT EXISTS {index} \
-                     ON {table}(version_id, {change_id}) \
-                     WHERE is_tombstone = 0",
-                    index = quote_ident("idx_lix_cse_v_change_live"),
-                    table = table_ident,
-                    change_id = quote_ident("change_id"),
-                ));
-            }
-        }
-        _ => {}
-    }
-    statements
-}
-
-fn normalized_untracked_indexes(
-    _table_name: &str,
-    table_ident: &str,
-    layout: &LiveTableLayout,
-) -> Vec<String> {
-    let mut statements = Vec::new();
-    match layout.schema_key.as_str() {
-        "lix_file_descriptor" => {
-            if has_columns(layout, &["directory_id", "name", "extension"]) {
-                statements.push(format!(
-                    "CREATE INDEX IF NOT EXISTS {index} \
-                     ON {table}(version_id, {directory}, {name}, {extension})",
+                     ON {table}(version_id, {directory}, {name}, {extension}) \
+                     WHERE untracked = true",
                     index = quote_ident("idx_lix_file_desc_v_dne_untracked"),
                     table = table_ident,
                     directory = quote_ident("directory_id"),
@@ -367,7 +221,17 @@ fn normalized_untracked_indexes(
             if has_columns(layout, &["parent_id", "name"]) {
                 statements.push(format!(
                     "CREATE INDEX IF NOT EXISTS {index} \
-                     ON {table}(version_id, {parent_id}, {name})",
+                     ON {table}(version_id, {parent_id}, {name}) \
+                     WHERE untracked = false AND is_tombstone = 0",
+                    index = quote_ident("idx_lix_dir_desc_v_pn_live"),
+                    table = table_ident,
+                    parent_id = quote_ident("parent_id"),
+                    name = quote_ident("name"),
+                ));
+                statements.push(format!(
+                    "CREATE INDEX IF NOT EXISTS {index} \
+                     ON {table}(version_id, {parent_id}, {name}) \
+                     WHERE untracked = true",
                     index = quote_ident("idx_lix_dir_desc_v_pn_untracked"),
                     table = table_ident,
                     parent_id = quote_ident("parent_id"),
@@ -379,7 +243,16 @@ fn normalized_untracked_indexes(
             if has_columns(layout, &["child_id"]) {
                 statements.push(format!(
                     "CREATE INDEX IF NOT EXISTS {index} \
-                     ON {table}(version_id, {child_id})",
+                     ON {table}(version_id, {child_id}) \
+                     WHERE untracked = false AND is_tombstone = 0",
+                    index = quote_ident("idx_lix_commit_edge_v_child_live"),
+                    table = table_ident,
+                    child_id = quote_ident("child_id"),
+                ));
+                statements.push(format!(
+                    "CREATE INDEX IF NOT EXISTS {index} \
+                     ON {table}(version_id, {child_id}) \
+                     WHERE untracked = true",
                     index = quote_ident("idx_lix_commit_edge_v_child_untracked"),
                     table = table_ident,
                     child_id = quote_ident("child_id"),
@@ -388,7 +261,16 @@ fn normalized_untracked_indexes(
             if has_columns(layout, &["parent_id"]) {
                 statements.push(format!(
                     "CREATE INDEX IF NOT EXISTS {index} \
-                     ON {table}(version_id, {parent_id})",
+                     ON {table}(version_id, {parent_id}) \
+                     WHERE untracked = false AND is_tombstone = 0",
+                    index = quote_ident("idx_lix_commit_edge_v_parent_live"),
+                    table = table_ident,
+                    parent_id = quote_ident("parent_id"),
+                ));
+                statements.push(format!(
+                    "CREATE INDEX IF NOT EXISTS {index} \
+                     ON {table}(version_id, {parent_id}) \
+                     WHERE untracked = true",
                     index = quote_ident("idx_lix_commit_edge_v_parent_untracked"),
                     table = table_ident,
                     parent_id = quote_ident("parent_id"),
@@ -399,7 +281,16 @@ fn normalized_untracked_indexes(
             if has_columns(layout, &["change_set_id"]) {
                 statements.push(format!(
                     "CREATE INDEX IF NOT EXISTS {index} \
-                     ON {table}(version_id, {change_set_id})",
+                     ON {table}(version_id, {change_set_id}) \
+                     WHERE untracked = false AND is_tombstone = 0",
+                    index = quote_ident("idx_lix_commit_v_change_set_live"),
+                    table = table_ident,
+                    change_set_id = quote_ident("change_set_id"),
+                ));
+                statements.push(format!(
+                    "CREATE INDEX IF NOT EXISTS {index} \
+                     ON {table}(version_id, {change_set_id}) \
+                     WHERE untracked = true",
                     index = quote_ident("idx_lix_commit_v_change_set_untracked"),
                     table = table_ident,
                     change_set_id = quote_ident("change_set_id"),
@@ -410,7 +301,16 @@ fn normalized_untracked_indexes(
             if has_columns(layout, &["change_set_id"]) {
                 statements.push(format!(
                     "CREATE INDEX IF NOT EXISTS {index} \
-                     ON {table}(version_id, {change_set_id})",
+                     ON {table}(version_id, {change_set_id}) \
+                     WHERE untracked = false AND is_tombstone = 0",
+                    index = quote_ident("idx_lix_cse_v_change_set_live"),
+                    table = table_ident,
+                    change_set_id = quote_ident("change_set_id"),
+                ));
+                statements.push(format!(
+                    "CREATE INDEX IF NOT EXISTS {index} \
+                     ON {table}(version_id, {change_set_id}) \
+                     WHERE untracked = true",
                     index = quote_ident("idx_lix_cse_v_change_set_untracked"),
                     table = table_ident,
                     change_set_id = quote_ident("change_set_id"),
@@ -419,7 +319,16 @@ fn normalized_untracked_indexes(
             if has_columns(layout, &["change_id"]) {
                 statements.push(format!(
                     "CREATE INDEX IF NOT EXISTS {index} \
-                     ON {table}(version_id, {change_id})",
+                     ON {table}(version_id, {change_id}) \
+                     WHERE untracked = false AND is_tombstone = 0",
+                    index = quote_ident("idx_lix_cse_v_change_live"),
+                    table = table_ident,
+                    change_id = quote_ident("change_id"),
+                ));
+                statements.push(format!(
+                    "CREATE INDEX IF NOT EXISTS {index} \
+                     ON {table}(version_id, {change_id}) \
+                     WHERE untracked = true",
                     index = quote_ident("idx_lix_cse_v_change_untracked"),
                     table = table_ident,
                     change_id = quote_ident("change_id"),

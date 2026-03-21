@@ -89,9 +89,10 @@ simulation_test!(
         let stored = engine
             .execute(
                 "SELECT entity_id, account_id \
-             FROM lix_internal_live_untracked_v1_lix_active_account \
+             FROM lix_internal_live_v1_lix_active_account \
              WHERE file_id = 'lix' \
-               AND version_id = 'global'",
+               AND version_id = 'global' \
+               AND untracked = true",
                 &[],
             )
             .await
@@ -136,9 +137,10 @@ simulation_test!(
         let stored = engine
             .execute(
                 "SELECT entity_id \
-             FROM lix_internal_live_untracked_v1_lix_active_account \
+             FROM lix_internal_live_v1_lix_active_account \
              WHERE file_id = 'lix' \
-               AND version_id = 'global'",
+               AND version_id = 'global' \
+               AND untracked = true",
                 &[],
             )
             .await
@@ -182,9 +184,10 @@ simulation_test!(
         let stored = engine
             .execute(
                 "SELECT entity_id \
-             FROM lix_internal_live_untracked_v1_lix_active_account \
+             FROM lix_internal_live_v1_lix_active_account \
              WHERE file_id = 'lix' \
-               AND version_id = 'global'",
+               AND version_id = 'global' \
+               AND untracked = true",
                 &[],
             )
             .await

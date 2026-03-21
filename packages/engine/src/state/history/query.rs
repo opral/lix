@@ -148,6 +148,7 @@ fn build_state_history_source_sql(dialect: SqlDialect, request: &StateHistoryReq
                FROM {active_version_table} \
                WHERE file_id = '{file_id}' \
                  AND version_id = '{storage_version_id}' \
+                 AND untracked = true \
                  AND {active_version_column} IS NOT NULL \
              ), ",
                 active_version_column = quote_ident(&active_version_column),
@@ -173,6 +174,7 @@ fn build_state_history_source_sql(dialect: SqlDialect, request: &StateHistoryReq
                WHERE vp.schema_key = '{schema_key}' \
                  AND vp.file_id = '{file_id}' \
                  AND vp.version_id = '{storage_version_id}' \
+                 AND vp.untracked = true \
              ), ",
                 version_ref_commit_id_column = version_ref_commit_id_column,
                 version_ref_table = version_ref_table,
@@ -190,6 +192,7 @@ fn build_state_history_source_sql(dialect: SqlDialect, request: &StateHistoryReq
                WHERE vp.schema_key = '{schema_key}' \
                  AND vp.file_id = '{file_id}' \
                  AND vp.version_id = '{storage_version_id}' \
+                 AND vp.untracked = true \
              ), ",
                 version_ref_commit_id_column = version_ref_commit_id_column,
                 version_ref_table = version_ref_table,

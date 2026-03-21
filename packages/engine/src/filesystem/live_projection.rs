@@ -483,6 +483,7 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
                FROM {table_name} \
                WHERE file_id = '{file_id}' \
                  AND version_id = '{storage_version_id}' \
+                 AND untracked = true \
                  AND {active_version_column} IS NOT NULL \
              )",
             active_version_column = quote_ident(active_version_column),
@@ -499,14 +500,16 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
                         format!(
                             "SELECT DISTINCT version_id \
                              FROM {quoted} \
-                             WHERE version_id <> '{global_version}'",
+                             WHERE version_id <> '{global_version}' \
+                               AND untracked = false",
                             quoted = quoted,
                             global_version = escape_sql_string(GLOBAL_VERSION_ID),
                         ),
                         format!(
                             "SELECT DISTINCT version_id \
                              FROM {untracked_table} \
-                    WHERE version_id <> '{global_version}'",
+                    WHERE version_id <> '{global_version}' \
+                      AND untracked = true",
                             untracked_table = quote_ident(&untracked_live_table_name(schema_key)),
                             global_version = escape_sql_string(GLOBAL_VERSION_ID),
                         ),
@@ -581,7 +584,7 @@ fn effective_state_candidates_sql(
            ON tv.version_id = t.version_id \
          LEFT JOIN change_commit_by_change_id cc \
            ON cc.change_id = t.change_id \
-         WHERE 1 = 1 \
+         WHERE t.untracked = false \
          UNION ALL \
          SELECT \
            t.entity_id AS entity_id, \
@@ -607,6 +610,7 @@ fn effective_state_candidates_sql(
          LEFT JOIN change_commit_by_change_id cc \
            ON cc.change_id = t.change_id \
          WHERE t.version_id = '{global_version}' \
+           AND t.untracked = false \
          UNION ALL \
          SELECT \
            u.entity_id AS entity_id, \
@@ -628,6 +632,7 @@ fn effective_state_candidates_sql(
          FROM {untracked_table} u \
          JOIN target_versions tv \
            ON tv.version_id = u.version_id \
+         WHERE u.untracked = true \
          UNION ALL \
          SELECT \
            u.entity_id AS entity_id, \
@@ -650,7 +655,8 @@ fn effective_state_candidates_sql(
          JOIN target_versions tv \
            ON tv.version_id <> '{global_version}' \
           AND u.version_id = '{global_version}' \
-         WHERE u.version_id = '{global_version}'",
+         WHERE u.version_id = '{global_version}' \
+           AND u.untracked = true",
         table_name = table_name,
         untracked_table = untracked_table,
         tracked_payload_projection = tracked_payload_projection,
@@ -786,12 +792,14 @@ fn active_version_commit_id_sql() -> String {
          FROM {live_version_ref_table} vp \
          WHERE vp.schema_key = 'lix_version_ref' \
            AND vp.version_id = '{global_version}' \
+           AND vp.untracked = true \
            AND {version_ref_commit_id_column} IS NOT NULL \
            AND vp.entity_id = (\
                SELECT {active_version_column} \
                FROM {active_version_table} \
                WHERE file_id = '{file_id}' \
                  AND version_id = '{storage_version_id}' \
+                 AND untracked = true \
                  AND {active_version_column} IS NOT NULL \
                LIMIT 1\
            ) \

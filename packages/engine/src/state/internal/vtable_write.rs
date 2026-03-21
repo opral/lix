@@ -370,7 +370,10 @@ pub fn rewrite_update(
         let mut new_update = update.clone();
         replace_table_with_schema_untracked(&mut new_update.table, &schema_key);
         new_update.assignments = filter_update_assignments(original_assignments.clone());
-        new_update.selection = try_strip_untracked_predicate(selection, params).unwrap_or(None);
+        new_update.selection = append_untracked_selection(
+            try_strip_untracked_predicate(selection, params).unwrap_or(None),
+            true,
+        );
         let validation = build_update_validation_plan(
             &new_update,
             Some(untracked_live_table_name(&schema_key)),
@@ -430,7 +433,8 @@ pub fn rewrite_update(
         let mut untracked_update = update.clone();
         replace_table_with_schema_untracked(&mut untracked_update.table, &schema_key);
         untracked_update.assignments = filter_update_assignments(original_assignments.clone());
-        untracked_update.selection = Some(stripped_selection.clone());
+        untracked_update.selection =
+            append_untracked_selection(Some(stripped_selection.clone()), true);
         if let Some(validation) = build_update_validation_plan(
             &untracked_update,
             Some(untracked_live_table_name(&schema_key)),
@@ -478,7 +482,7 @@ pub fn rewrite_update(
     } else {
         stripped_selection
     };
-    new_update.selection = Some(tracked_selection);
+    new_update.selection = append_untracked_selection(Some(tracked_selection), false);
     new_update.returning = Some(build_update_returning(&schema_key)?);
 
     if let Some(validation) = build_update_validation_plan(
@@ -545,7 +549,10 @@ pub fn rewrite_delete_with_options(
         let schema_key = extract_single_schema_key(selection, params)?;
         let mut new_delete = delete.clone();
         replace_delete_from_schema_untracked(&mut new_delete, &schema_key);
-        new_delete.selection = try_strip_untracked_predicate(selection, params).unwrap_or(None);
+        new_delete.selection = append_untracked_selection(
+            try_strip_untracked_predicate(selection, params).unwrap_or(None),
+            true,
+        );
         return Ok(Some(DeleteRewrite::Statement(VtableDeleteStatement {
             validation: build_delete_validation_plan(
                 Some(untracked_live_table_name(&schema_key)),
@@ -645,7 +652,7 @@ pub fn rewrite_delete_with_options(
             },
         ],
         from: None,
-        selection: Some(tracked_selection),
+        selection: append_untracked_selection(Some(tracked_selection), false),
         returning: Some(build_update_returning(&schema_key)?),
         or: None,
         limit: None,
@@ -711,6 +718,12 @@ fn build_normalized_untracked_on_conflict(
             )])),
             value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), Ident::new("updated_at")]),
         },
+        Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                Ident::new("untracked"),
+            )])),
+            value: Expr::CompoundIdentifier(vec![Ident::new("excluded"), Ident::new("untracked")]),
+        },
     ];
     if columns
         .iter()
@@ -742,6 +755,7 @@ fn build_normalized_untracked_on_conflict(
             Ident::new("entity_id"),
             Ident::new("file_id"),
             Ident::new("version_id"),
+            Ident::new("untracked"),
         ])),
         action: OnConflictAction::DoUpdate(DoUpdate {
             assignments,
@@ -857,6 +871,7 @@ fn build_live_state_on_conflict(columns: &[Ident]) -> OnInsert {
             Ident::new("entity_id"),
             Ident::new("file_id"),
             Ident::new("version_id"),
+            Ident::new("untracked"),
         ])),
         action: OnConflictAction::DoUpdate(DoUpdate {
             assignments,
@@ -891,15 +906,19 @@ fn split_insert_rows(
     let mut untracked_rows = Vec::new();
 
     for (row, resolved_row) in rows.iter().zip(resolved_rows.iter()) {
-        let untracked_value = untracked_index.and_then(|idx| resolved_row.get(idx));
-
-        let untracked = match untracked_value {
+        let untracked = match untracked_index {
             None => false,
-            Some(cell) => parse_untracked_bool_like_value(cell).ok_or_else(|| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "vtable insert requires literal or parameter untracked values"
-                    .to_string(),
-            })?,
+            Some(idx) => {
+                let parsed = resolved_row
+                    .get(idx)
+                    .and_then(parse_untracked_bool_like_value)
+                    .or_else(|| row.get(idx).and_then(parse_untracked_bool_like_expr));
+                parsed.ok_or_else(|| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: "vtable insert requires literal or parameter untracked values"
+                        .to_string(),
+                })?
+            }
         };
 
         if untracked {
@@ -1502,6 +1521,7 @@ fn build_untracked_insert(
             metadata_expr.clone(),
             writer_key_expr.clone(),
             string_expr(&schema_version),
+            boolean_expr(true),
             string_expr(&now),
             string_expr(&now),
         ];
@@ -1545,6 +1565,7 @@ fn build_untracked_insert(
             Ident::new("metadata"),
             Ident::new("writer_key"),
             Ident::new("schema_version"),
+            Ident::new("untracked"),
             Ident::new("created_at"),
             Ident::new("updated_at"),
         ];
@@ -1668,6 +1689,7 @@ async fn build_untracked_insert_with_backend(
             metadata_expr.clone(),
             writer_key_expr.clone(),
             string_expr(&schema_version),
+            boolean_expr(true),
             string_expr(&now),
             string_expr(&now),
         ];
@@ -1711,6 +1733,7 @@ async fn build_untracked_insert_with_backend(
             Ident::new("metadata"),
             Ident::new("writer_key"),
             Ident::new("schema_version"),
+            Ident::new("untracked"),
             Ident::new("created_at"),
             Ident::new("updated_at"),
         ];
@@ -2462,7 +2485,8 @@ fn build_not_exists_untracked_shadow_predicate(
          SELECT 1 FROM {untracked_table} AS {untracked_alias} \
          WHERE {untracked_alias}.entity_id = {entity_id_expr} \
            AND {untracked_alias}.file_id = {file_id_expr} \
-           AND {untracked_alias}.version_id = {version_id_expr}\
+           AND {untracked_alias}.version_id = {version_id_expr} \
+           AND {untracked_alias}.untracked = true\
          )",
         untracked_table = untracked_table,
         untracked_alias = untracked_alias_quoted,
@@ -2499,6 +2523,22 @@ fn find_column_index(columns: &[Ident], column: &str) -> Option<usize> {
     columns
         .iter()
         .position(|ident| ident.value.eq_ignore_ascii_case(column))
+}
+
+fn append_untracked_selection(selection: Option<Expr>, expected: bool) -> Option<Expr> {
+    let predicate = Expr::BinaryOp {
+        left: Box::new(Expr::Identifier(Ident::new("untracked"))),
+        op: BinaryOperator::Eq,
+        right: Box::new(boolean_expr(expected)),
+    };
+    Some(match selection {
+        Some(selection) => Expr::BinaryOp {
+            left: Box::new(selection),
+            op: BinaryOperator::And,
+            right: Box::new(predicate),
+        },
+        None => predicate,
+    })
 }
 
 fn assignment_target_is_untracked(target: &AssignmentTarget) -> bool {
@@ -2729,6 +2769,26 @@ fn expr_is_untracked_column(expr: &Expr) -> bool {
 fn parse_untracked_bool_like_value(cell: &ResolvedCell) -> Option<bool> {
     match cell.value.as_ref() {
         Some(EngineValue::Boolean(value)) => Some(*value),
+        Some(EngineValue::Integer(value)) => match *value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        },
+        Some(EngineValue::Text(value)) if value.eq_ignore_ascii_case("true") => Some(true),
+        Some(EngineValue::Text(value)) if value.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_untracked_bool_like_expr(expr: &Expr) -> Option<bool> {
+    let normalized = expr
+        .to_string()
+        .trim()
+        .trim_matches('\'')
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
         _ => None,
     }
 }

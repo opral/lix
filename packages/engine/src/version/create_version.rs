@@ -85,7 +85,9 @@ async fn load_create_version_source(
     }
 }
 
-async fn load_active_source_version(tx: &mut EngineTransaction<'_>) -> Result<SourceVersion, LixError> {
+async fn load_active_source_version(
+    tx: &mut EngineTransaction<'_>,
+) -> Result<SourceVersion, LixError> {
     let active_version = tx
         .execute(
             "SELECT av.version_id, v.commit_id \

@@ -1204,7 +1204,9 @@ fn effective_descriptor_sql(
                 1 AS precedence, 1 AS untracked \
          FROM {untracked_table} \
          WHERE version_id = '{version_id}' \
-           AND file_id = '{file_id}' AND {untracked_base_predicate} \
+           AND file_id = '{file_id}' \
+           AND untracked = true \
+           AND {untracked_base_predicate} \
          UNION ALL \
          SELECT entity_id, \
                 {tracked_parent_expr} AS parent_id, \
@@ -1215,6 +1217,7 @@ fn effective_descriptor_sql(
                 metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
          FROM {tracked_table} \
          WHERE version_id = '{version_id}' \
+           AND untracked = false \
            AND {tracked_base} \
          UNION ALL \
          SELECT entity_id, \
@@ -1227,7 +1230,9 @@ fn effective_descriptor_sql(
                 3 AS precedence, 1 AS untracked \
          FROM {untracked_table} \
          WHERE version_id = '{global_version_id}' \
-           AND file_id = '{file_id}' AND {untracked_base_predicate} \
+           AND file_id = '{file_id}' \
+           AND untracked = true \
+           AND {untracked_base_predicate} \
          UNION ALL \
          SELECT entity_id, \
                 {tracked_parent_expr} AS parent_id, \
@@ -1238,6 +1243,7 @@ fn effective_descriptor_sql(
                 metadata, change_id, is_tombstone, 4 AS precedence, 0 AS untracked \
          FROM {tracked_table} \
          WHERE version_id = '{global_version_id}' \
+           AND untracked = false \
            AND {tracked_base} \
          ORDER BY precedence ASC \
          LIMIT 1",
@@ -1481,6 +1487,7 @@ fn visible_directory_descriptor_rows_for_pairs_sql(
              FROM requested r \
              JOIN {untracked_table} u \
                ON u.version_id = '{version_id}' \
+              AND u.untracked = true \
               AND u.file_id = '{file_id}' \
               AND ((u.parent_id = r.lookup_parent_id) OR (u.parent_id IS NULL AND r.lookup_parent_id IS NULL)) \
               AND u.name = r.lookup_name \
@@ -1502,6 +1509,7 @@ fn visible_directory_descriptor_rows_for_pairs_sql(
              FROM requested r \
              JOIN {tracked_table} t \
                ON t.version_id = '{version_id}' \
+              AND t.untracked = false \
               AND t.file_id = '{file_id}' \
               AND ((t.parent_id = r.lookup_parent_id) OR (t.parent_id IS NULL AND r.lookup_parent_id IS NULL)) \
               AND t.name = r.lookup_name \
@@ -1578,6 +1586,7 @@ fn visible_file_descriptor_rows_for_triplets_sql(
              FROM requested r \
              JOIN {untracked_table} u \
                ON u.version_id = '{version_id}' \
+              AND u.untracked = true \
               AND u.file_id = '{file_id}' \
               AND ((u.directory_id = r.lookup_directory_id) OR (u.directory_id IS NULL AND r.lookup_directory_id IS NULL)) \
               AND u.name = r.lookup_name \
@@ -1601,6 +1610,7 @@ fn visible_file_descriptor_rows_for_triplets_sql(
              FROM requested r \
              JOIN {tracked_table} t \
                ON t.version_id = '{version_id}' \
+              AND t.untracked = false \
               AND t.file_id = '{file_id}' \
               AND ((t.directory_id = r.lookup_directory_id) OR (t.directory_id IS NULL AND r.lookup_directory_id IS NULL)) \
               AND t.name = r.lookup_name \
@@ -1756,7 +1766,10 @@ fn visible_descriptor_sql(
                 metadata, NULL AS change_id, 0 AS is_tombstone, \
                 1 AS precedence, 1 AS untracked \
          FROM {untracked_table} \
-         WHERE version_id = '{version_id}' AND file_id = '{file_id}' AND {untracked_base_predicate} \
+         WHERE version_id = '{version_id}' \
+           AND file_id = '{file_id}' \
+           AND untracked = true \
+           AND {untracked_base_predicate} \
          UNION ALL \
          SELECT entity_id, \
                 {tracked_parent_expr} AS parent_id, \
@@ -1767,6 +1780,7 @@ fn visible_descriptor_sql(
                 metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
          FROM {tracked_table} \
          WHERE version_id = '{version_id}' \
+           AND untracked = false \
            AND {tracked_base} \
          ORDER BY precedence ASC \
          LIMIT 1",
@@ -1839,7 +1853,10 @@ fn merged_visible_descriptor_sql(
                     metadata, NULL AS change_id, 0 AS is_tombstone, \
                     1 AS precedence, 1 AS untracked, 0 AS version_rank \
              FROM {untracked_table} \
-             WHERE version_id = '{version_id}' AND file_id = '{file_id}' AND {untracked_base_predicate} \
+             WHERE version_id = '{version_id}' \
+               AND file_id = '{file_id}' \
+               AND untracked = true \
+               AND {untracked_base_predicate} \
              UNION ALL \
              SELECT entity_id, \
                     {tracked_parent_expr} AS parent_id, \
@@ -1849,7 +1866,9 @@ fn merged_visible_descriptor_sql(
                     {tracked_hidden_expr} AS hidden, \
                     metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked, 1 AS version_rank \
              FROM {tracked_table} \
-             WHERE version_id = '{version_id}' AND {tracked_base} \
+             WHERE version_id = '{version_id}' \
+               AND untracked = false \
+               AND {tracked_base} \
              UNION ALL \
              SELECT entity_id, \
                     {untracked_parent_expr} AS parent_id, \
@@ -1860,7 +1879,10 @@ fn merged_visible_descriptor_sql(
                     metadata, NULL AS change_id, 0 AS is_tombstone, \
                     1 AS precedence, 1 AS untracked, 2 AS version_rank \
              FROM {untracked_table} \
-             WHERE version_id = '{global}' AND file_id = '{file_id}' AND {untracked_base_predicate} \
+             WHERE version_id = '{global}' \
+               AND file_id = '{file_id}' \
+               AND untracked = true \
+               AND {untracked_base_predicate} \
              UNION ALL \
              SELECT entity_id, \
                     {tracked_parent_expr} AS parent_id, \
@@ -1870,7 +1892,9 @@ fn merged_visible_descriptor_sql(
                     {tracked_hidden_expr} AS hidden, \
                     metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked, 3 AS version_rank \
              FROM {tracked_table} \
-             WHERE version_id = '{global}' AND {tracked_base} \
+             WHERE version_id = '{global}' \
+               AND untracked = false \
+               AND {tracked_base} \
            ) candidates \
          ) ranked \
          WHERE rn = 1 AND is_tombstone = 0 \
@@ -1929,7 +1953,10 @@ fn visible_descriptor_rows_sql(
                 metadata, NULL AS change_id, 0 AS is_tombstone, \
                 1 AS precedence, 1 AS untracked \
          FROM {untracked_table} \
-         WHERE version_id = '{version_id}' AND file_id = '{file_id}' AND ({untracked_base_predicate}) \
+         WHERE version_id = '{version_id}' \
+           AND file_id = '{file_id}' \
+           AND untracked = true \
+           AND ({untracked_base_predicate}) \
          UNION ALL \
          SELECT entity_id, \
                 {tracked_parent_expr} AS parent_id, \
@@ -1940,6 +1967,7 @@ fn visible_descriptor_rows_sql(
                 metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
          FROM {tracked_table} \
          WHERE version_id = '{version_id}' \
+           AND untracked = false \
            AND {tracked_base} \
          ORDER BY precedence ASC",
         untracked_table = untracked_table,
@@ -2004,11 +2032,13 @@ fn version_shadow_sql(
                 1 AS precedence, 1 AS untracked \
          FROM {untracked_table} \
          WHERE version_id = '{version_id}' \
+           AND untracked = true \
            AND {untracked_base} \
          UNION ALL \
          SELECT entity_id, NULL AS snapshot_content, metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
          FROM {tracked_table} \
          WHERE version_id = '{version_id}' \
+           AND untracked = false \
            AND {tracked_base} \
          ORDER BY precedence ASC \
          LIMIT 1",
@@ -2046,11 +2076,13 @@ fn version_shadow_rows_sql(
                 1 AS precedence, 1 AS untracked \
          FROM {untracked_table} \
          WHERE version_id = '{version_id}' \
+           AND untracked = true \
            AND {untracked_base} \
          UNION ALL \
          SELECT entity_id, NULL AS snapshot_content, metadata, change_id, is_tombstone, 2 AS precedence, 0 AS untracked \
          FROM {tracked_table} \
          WHERE version_id = '{version_id}' \
+           AND untracked = false \
            AND {tracked_base} \
          ORDER BY entity_id ASC, precedence ASC",
         untracked_table = quote_ident(&untracked_live_table_name(schema_key)),

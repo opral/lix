@@ -1076,6 +1076,7 @@ simulation_test!(
                    AND entity_id = 'effective-entity-u' \
                    AND file_id = 'test-file' \
                    AND version_id = 'version-a' \
+                   AND untracked = false \
                    AND is_tombstone = 0",
                 &[],
             )
