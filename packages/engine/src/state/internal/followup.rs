@@ -308,6 +308,7 @@ async fn build_update_followup_statement_batch(
             active_accounts,
             changes: domain_changes,
             versions,
+            force_commit_versions: std::collections::BTreeSet::new(),
         },
         || functions.uuid_v7(),
     )?;
@@ -437,6 +438,7 @@ async fn build_delete_followup_statement_batch(
             active_accounts,
             changes: domain_changes,
             versions,
+            force_commit_versions: std::collections::BTreeSet::new(),
         },
         || functions.uuid_v7(),
     )?;

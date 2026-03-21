@@ -91,7 +91,11 @@ where
             .push(*change);
     }
 
-    let versions_to_commit: BTreeSet<String> = domain_by_version.keys().cloned().collect();
+    let versions_to_commit: BTreeSet<String> = domain_by_version
+        .keys()
+        .cloned()
+        .chain(args.force_commit_versions.iter().cloned())
+        .collect();
     let mut meta_by_version: BTreeMap<String, VersionMeta> = BTreeMap::new();
     for version_id in versions_to_commit {
         let version_info = args.versions.get(&version_id).ok_or_else(|| LixError {
@@ -749,6 +753,7 @@ mod tests {
                 Some("writer:test"),
             )],
             versions,
+            force_commit_versions: BTreeSet::new(),
         };
 
         let mut n = 0u64;
@@ -849,6 +854,7 @@ mod tests {
                 None,
             )],
             versions,
+            force_commit_versions: BTreeSet::new(),
         };
 
         let mut n = 0u64;
@@ -973,6 +979,7 @@ mod tests {
                 domain_change("chg_main", "kv_main", "lix_key_value", "version-main", None),
             ],
             versions,
+            force_commit_versions: BTreeSet::new(),
         };
 
         let mut n = 0u64;
@@ -1111,6 +1118,7 @@ mod tests {
                 domain_change("chg_a2", "entity-a", "lix_key_value", "global", None),
             ],
             versions,
+            force_commit_versions: BTreeSet::new(),
         };
 
         let mut n = 0u64;
@@ -1188,6 +1196,7 @@ mod tests {
                 domain_change("dup", "entity-b", "lix_key_value", "global", None),
             ],
             versions,
+            force_commit_versions: BTreeSet::new(),
         };
 
         let error =
@@ -1226,6 +1235,7 @@ mod tests {
                 None,
             )],
             versions,
+            force_commit_versions: BTreeSet::new(),
         };
 
         let error = generate_commit(args, || "id".to_string())
@@ -1257,6 +1267,7 @@ mod tests {
                 Some("writer:test"),
             )],
             versions,
+            force_commit_versions: BTreeSet::new(),
         };
 
         let mut n = 0u64;

@@ -81,6 +81,8 @@ pub(crate) struct CreateCommitArgs {
     pub(crate) changes: Vec<ProposedDomainChange>,
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) preconditions: CreateCommitPreconditions,
+    pub(crate) lane_parent_commit_ids_override: Option<Vec<String>>,
+    pub(crate) allow_empty_commit: bool,
     pub(crate) should_emit_observe_tick: bool,
     pub(crate) observe_tick_writer_key: Option<String>,
     pub(crate) writer_key: Option<String>,
@@ -160,7 +162,8 @@ pub(crate) async fn create_commit(
     functions: &mut dyn LixFunctionProvider,
     invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
 ) -> Result<CreateCommitResult, CreateCommitError> {
-    if args.changes.is_empty() && args.filesystem_state.files.is_empty() {
+    if args.changes.is_empty() && args.filesystem_state.files.is_empty() && !args.allow_empty_commit
+    {
         return Err(CreateCommitError {
             kind: CreateCommitErrorKind::EmptyBatch,
             message: "create_commit requires at least one change".to_string(),
@@ -286,7 +289,10 @@ pub(crate) async fn create_commit(
         let mut executor = TransactionCommitExecutor { transaction };
         normalize_proposed_domain_changes(&mut executor, &applied_domain_changes).await?
     };
-    if applied_domain_changes.is_empty() {
+    if applied_domain_changes.is_empty()
+        && compiled_filesystem_state.binary_blob_writes.is_empty()
+        && !args.allow_empty_commit
+    {
         return Ok(CreateCommitResult {
             disposition: CreateCommitDisposition::Replay,
             committed_head: current_head.unwrap_or_default(),
@@ -319,7 +325,10 @@ pub(crate) async fn create_commit(
         versions.insert(
             version_id.clone(),
             VersionInfo {
-                parent_commit_ids: current_head.clone().into_iter().collect(),
+                parent_commit_ids: args
+                    .lane_parent_commit_ids_override
+                    .clone()
+                    .unwrap_or_else(|| current_head.clone().into_iter().collect()),
                 snapshot: VersionSnapshot {
                     id: try_identity(version_id.clone(), "lane version snapshot id")?,
                 },
@@ -345,6 +354,14 @@ pub(crate) async fn create_commit(
             active_accounts: preflight.active_accounts,
             changes: domain_changes,
             versions,
+            force_commit_versions: if args.allow_empty_commit {
+                lane_version_id
+                    .clone()
+                    .into_iter()
+                    .collect::<BTreeSet<String>>()
+            } else {
+                BTreeSet::new()
+            },
         },
         || functions.uuid_v7(),
     )
@@ -1778,6 +1795,8 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                lane_parent_commit_ids_override: None,
+                allow_empty_commit: false,
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
                 writer_key: None,
@@ -1850,6 +1869,8 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                lane_parent_commit_ids_override: None,
+                allow_empty_commit: false,
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
                 writer_key: None,
@@ -1896,6 +1917,8 @@ mod tests {
                         "fp-1".to_string(),
                     ),
                 },
+                lane_parent_commit_ids_override: None,
+                allow_empty_commit: false,
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
                 writer_key: None,
@@ -1931,6 +1954,8 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                lane_parent_commit_ids_override: None,
+                allow_empty_commit: false,
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
                 writer_key: None,
@@ -1961,6 +1986,8 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                lane_parent_commit_ids_override: None,
+                allow_empty_commit: false,
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
                 writer_key: None,
@@ -1990,6 +2017,8 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CreateIfMissing,
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-create".to_string()),
                 },
+                lane_parent_commit_ids_override: None,
+                allow_empty_commit: false,
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
                 writer_key: None,
@@ -2025,6 +2054,8 @@ mod tests {
                     ),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-global".to_string()),
                 },
+                lane_parent_commit_ids_override: None,
+                allow_empty_commit: false,
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
                 writer_key: None,
@@ -2075,6 +2106,8 @@ mod tests {
                         "idem-file-data".to_string(),
                     ),
                 },
+                lane_parent_commit_ids_override: None,
+                allow_empty_commit: false,
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
                 writer_key: None,
@@ -2114,6 +2147,8 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                lane_parent_commit_ids_override: None,
+                allow_empty_commit: false,
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
                 writer_key: None,
@@ -2158,6 +2193,8 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                lane_parent_commit_ids_override: None,
+                allow_empty_commit: false,
                 should_emit_observe_tick: false,
                 observe_tick_writer_key: None,
                 writer_key: None,
