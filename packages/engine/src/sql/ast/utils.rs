@@ -18,6 +18,21 @@ pub(crate) struct BoundSql {
     pub(crate) state: PlaceholderState,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct BoundStatementAst {
+    pub(crate) statement: Statement,
+    pub(crate) params: Vec<Value>,
+    pub(crate) state: PlaceholderState,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StatementBindingTemplate {
+    pub(crate) statement: Statement,
+    pub(crate) used_source_indices: Vec<usize>,
+    pub(crate) minimum_param_count: usize,
+    pub(crate) state: PlaceholderState,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedCell {
     pub(crate) value: Option<Value>,
@@ -155,14 +170,39 @@ pub(crate) fn bind_statement_ast_with_state(
     statement: &Statement,
     params: &[Value],
     dialect: SqlDialect,
-    mut state: PlaceholderState,
+    state: PlaceholderState,
 ) -> Result<BoundSql, LixError> {
+    let bound = bind_statement_ast_for_execution_with_state(statement, params, dialect, state)?;
+    Ok(BoundSql {
+        sql: bound.statement.to_string(),
+        params: bound.params,
+        state: bound.state,
+    })
+}
+
+pub(crate) fn bind_statement_ast_for_execution_with_state(
+    statement: &Statement,
+    params: &[Value],
+    dialect: SqlDialect,
+    state: PlaceholderState,
+) -> Result<BoundStatementAst, LixError> {
+    let template =
+        compile_statement_binding_template_with_state(statement, params.len(), dialect, state)?;
+    bind_statement_binding_template(&template, params)
+}
+
+pub(crate) fn compile_statement_binding_template_with_state(
+    statement: &Statement,
+    params_len: usize,
+    dialect: SqlDialect,
+    mut state: PlaceholderState,
+) -> Result<StatementBindingTemplate, LixError> {
     let mut statement = statement.clone();
     let mut used_source_indices = Vec::new();
     let mut source_to_dense: HashMap<usize, usize> = HashMap::new();
 
     let mut visitor = PlaceholderBinder {
-        params_len: params.len(),
+        params_len,
         dialect,
         state: &mut state,
         source_to_dense: &mut source_to_dense,
@@ -172,15 +212,43 @@ pub(crate) fn bind_statement_ast_with_state(
         return Err(error);
     }
 
-    let bound_params = used_source_indices
-        .into_iter()
-        .map(|source_index| params[source_index].clone())
-        .collect();
+    let minimum_param_count = used_source_indices
+        .iter()
+        .max()
+        .map(|index| index + 1)
+        .unwrap_or(0);
 
-    Ok(BoundSql {
-        sql: statement.to_string(),
-        params: bound_params,
+    Ok(StatementBindingTemplate {
+        statement,
+        used_source_indices,
+        minimum_param_count,
         state,
+    })
+}
+
+pub(crate) fn bind_statement_binding_template(
+    template: &StatementBindingTemplate,
+    params: &[Value],
+) -> Result<BoundStatementAst, LixError> {
+    if params.len() < template.minimum_param_count {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "statement binding expected at least {} params, got {}",
+                template.minimum_param_count,
+                params.len()
+            ),
+        ));
+    }
+
+    Ok(BoundStatementAst {
+        statement: template.statement.clone(),
+        params: template
+            .used_source_indices
+            .iter()
+            .map(|source_index| params[*source_index].clone())
+            .collect(),
+        state: template.state.clone(),
     })
 }
 

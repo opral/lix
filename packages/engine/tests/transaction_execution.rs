@@ -1345,6 +1345,120 @@ simulation_test!(
 );
 
 simulation_test!(
+    transaction_path_repeated_parameterized_filesystem_writes_preserve_pending_visibility,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let before_commit_count = public_commit_count(&engine).await;
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    let insert_sql = "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)";
+                    tx.execute(
+                        insert_sql,
+                        &[
+                            Value::Text("tx-template-a".to_string()),
+                            Value::Text("/tx-template-a-before.md".to_string()),
+                            Value::Blob(b"before-a".to_vec()),
+                        ],
+                    )
+                    .await?;
+                    tx.execute(
+                        insert_sql,
+                        &[
+                            Value::Text("tx-template-b".to_string()),
+                            Value::Text("/tx-template-b-before.md".to_string()),
+                            Value::Blob(b"before-b".to_vec()),
+                        ],
+                    )
+                    .await?;
+
+                    let update_sql = "UPDATE lix_file SET path = $1, data = $2 WHERE id = $3";
+                    tx.execute(
+                        update_sql,
+                        &[
+                            Value::Text("/tx-template-a-after.md".to_string()),
+                            Value::Blob(b"after-a".to_vec()),
+                            Value::Text("tx-template-a".to_string()),
+                        ],
+                    )
+                    .await?;
+                    tx.execute(
+                        update_sql,
+                        &[
+                            Value::Text("/tx-template-b-after.md".to_string()),
+                            Value::Blob(b"after-b".to_vec()),
+                            Value::Text("tx-template-b".to_string()),
+                        ],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM lix_file WHERE id = $1",
+                        &[Value::Text("tx-template-b".to_string())],
+                    )
+                    .await?;
+
+                    let pending = tx
+                        .execute(
+                            "SELECT id, path, data \
+                             FROM lix_file \
+                             WHERE id IN ($1, $2) \
+                             ORDER BY id",
+                            &[
+                                Value::Text("tx-template-a".to_string()),
+                                Value::Text("tx-template-b".to_string()),
+                            ],
+                        )
+                        .await?;
+                    assert_eq!(pending.statements[0].rows.len(), 1);
+                    assert_eq!(
+                        pending.statements[0].rows[0][0],
+                        Value::Text("tx-template-a".to_string())
+                    );
+                    assert_eq!(
+                        pending.statements[0].rows[0][1],
+                        Value::Text("/tx-template-a-after.md".to_string())
+                    );
+                    assert_blob_text(&pending.statements[0].rows[0][2], "after-a");
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let after_commit_count = public_commit_count(&engine).await;
+        assert_eq!(after_commit_count - before_commit_count, 1);
+
+        let rows = engine
+            .execute(
+                "SELECT id, path, data \
+                 FROM lix_file \
+                 WHERE id IN ('tx-template-a', 'tx-template-b') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_eq!(
+            rows.statements[0].rows[0][0],
+            Value::Text("tx-template-a".to_string())
+        );
+        assert_eq!(
+            rows.statements[0].rows[0][1],
+            Value::Text("/tx-template-a-after.md".to_string())
+        );
+        assert_blob_text(&rows.statements[0].rows[0][2], "after-a");
+    }
+);
+
+simulation_test!(
     transaction_script_path_preprocesses_lix_file_statements,
     simulations = [sqlite, postgres],
     |sim| async move {
