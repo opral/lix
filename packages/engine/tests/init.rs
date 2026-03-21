@@ -454,7 +454,7 @@ fn reopen_after_bare_multi_statement_write_succeeds_sqlite() {
     }
 }
 
-simulation_test!(init_creates_untracked_table, |sim| async move {
+simulation_test!(init_creates_active_version_live_table, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)
         .await
@@ -464,7 +464,7 @@ simulation_test!(init_creates_untracked_table, |sim| async move {
 
     let result = engine
         .execute(
-            "SELECT 1 FROM lix_internal_live_untracked_v1_lix_active_version LIMIT 1",
+            "SELECT 1 FROM lix_internal_live_v1_lix_active_version WHERE untracked = true LIMIT 1",
             &[],
         )
         .await

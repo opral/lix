@@ -1506,6 +1506,7 @@ async fn load_active_version_id_for_public_read(
                  FROM {} \
                  WHERE file_id = $1 \
                    AND version_id = $2 \
+                   AND untracked = true \
                    AND {payload_version_column} IS NOT NULL \
                  ORDER BY updated_at DESC \
                  LIMIT 1",
@@ -2788,7 +2789,7 @@ mod tests {
                     },
                 });
             }
-            if sql.contains("FROM lix_internal_live_untracked_v1_lix_active_version") {
+            if query_targets_table(sql, "lix_internal_live_v1_lix_active_version") {
                 let rows = self
                     .active_version_rows
                     .iter()
@@ -2804,7 +2805,7 @@ mod tests {
                     columns: vec!["entity_id".to_string(), "snapshot_content".to_string()],
                 });
             }
-            if sql.contains("FROM lix_internal_live_untracked_v1_lix_active_account") {
+            if query_targets_table(sql, "lix_internal_live_v1_lix_active_account") {
                 let rows = self
                     .active_account_rows
                     .iter()
@@ -2822,7 +2823,12 @@ mod tests {
                     columns: vec!["entity_id".to_string(), "snapshot_content".to_string()],
                 });
             }
-            if sql.contains("FROM lix_internal_live_untracked_v1_") {
+            if sql.contains("FROM lix_internal_live_v1_")
+                && sql.contains("untracked = true")
+                && !sql.contains("lix_active_version")
+                && !sql.contains("lix_active_account")
+                && !sql.contains("lix_version_ref")
+            {
                 return Ok(QueryResult {
                     rows: self.untracked_rows.clone(),
                     columns: vec![
@@ -2917,7 +2923,7 @@ mod tests {
                     },
                 });
             }
-            if query_targets_table(sql, "lix_internal_live_untracked_v1_lix_version_ref") {
+            if query_targets_table(sql, "lix_internal_live_v1_lix_version_ref") {
                 let rows = self
                     .version_ref_rows
                     .iter()
@@ -2937,6 +2943,7 @@ mod tests {
                         "version_id".to_string(),
                         "plugin_key".to_string(),
                         "metadata".to_string(),
+                        "change_id".to_string(),
                         "commit_id".to_string(),
                         "id".to_string(),
                     ],
@@ -3221,6 +3228,7 @@ mod tests {
             Value::Text(crate::version::version_ref_file_id().to_string()),
             Value::Text(crate::version::version_ref_storage_version_id().to_string()),
             Value::Text(crate::version::version_ref_plugin_key().to_string()),
+            Value::Null,
             Value::Null,
             Value::Text(commit_id.to_string()),
             Value::Text(version_id.to_string()),
@@ -4271,7 +4279,8 @@ mod tests {
             .lowered_sql
             .first()
             .expect("joined admin read should lower");
-        assert!(lowered_sql.contains("lix_internal_live_untracked_v1_lix_active_version"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_active_version"));
+        assert!(lowered_sql.contains("untracked = true"));
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
     }
 
@@ -4305,7 +4314,8 @@ mod tests {
             .first()
             .expect("mixed read should lower");
         assert!(lowered_sql.contains("app_versions"));
-        assert!(lowered_sql.contains("lix_internal_live_untracked_v1_lix_active_version"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_active_version"));
+        assert!(lowered_sql.contains("untracked = true"));
     }
 
     #[tokio::test]
@@ -4316,7 +4326,7 @@ mod tests {
             &parse_one(
                 "SELECT av.version_id \
                  FROM lix_active_version av \
-                 JOIN lix_internal_live_untracked_v1_lix_active_version u ON u.entity_id = av.id",
+                 JOIN lix_internal_live_v1_lix_active_version u ON u.entity_id = av.id",
             ),
             &[],
             "main",
@@ -4328,7 +4338,7 @@ mod tests {
         assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
         assert!(error
             .description
-            .contains("lix_internal_live_untracked_v1_lix_active_version"));
+            .contains("lix_internal_live_v1_lix_active_version"));
     }
 
     #[tokio::test]
@@ -4339,7 +4349,7 @@ mod tests {
             &parse_one(
                 "SELECT av.version_id \
                  FROM lix_active_version av \
-                 JOIN lix_internal_live_untracked_v1_lix_active_version u ON u.entity_id = av.id",
+                 JOIN lix_internal_live_v1_lix_active_version u ON u.entity_id = av.id",
             ),
             &[],
             "main",
@@ -4360,7 +4370,8 @@ mod tests {
             .lowered_sql
             .first()
             .expect("public/internal mixed read should lower");
-        assert!(lowered_sql.contains("lix_internal_live_untracked_v1_lix_active_version"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_active_version"));
+        assert!(lowered_sql.contains("untracked = true"));
     }
 
     #[tokio::test]
@@ -4590,7 +4601,8 @@ mod tests {
             .expect("nested public-subquery read should lower");
         assert!(!lowered_sql.contains("FROM lix_active_version"));
         assert!(!lowered_sql.contains("FROM lix_version"));
-        assert!(lowered_sql.contains("lix_internal_live_untracked_v1_lix_version_ref"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
+        assert!(lowered_sql.contains("untracked = true"));
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
     }
 }

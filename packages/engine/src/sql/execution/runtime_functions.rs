@@ -99,11 +99,10 @@ impl Engine {
             };
             let sequence_end = functions.with_lock(|provider| provider.next_sequence());
             if sequence_end > sequence_start {
+                let batch =
+                    build_persist_sequence_highest_batch(sequence_end - 1, transaction.dialect())?;
                 let mut program = WriteProgram::new();
-                program.push_batch(build_persist_sequence_highest_batch(
-                    sequence_end - 1,
-                    transaction.dialect(),
-                )?);
+                program.push_batch(batch);
                 execute_write_program_with_transaction(transaction, program).await?;
             }
         }

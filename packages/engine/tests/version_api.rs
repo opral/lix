@@ -260,14 +260,14 @@ simulation_test!(
         engine.initialize().await.expect("init should succeed");
 
         let created = engine
-        .create_version(CreateVersionOptions {
-            id: Some("branch-alpha".to_string()),
-            name: Some("Branch Alpha".to_string()),
-            source_version_id: None,
-            hidden: true,
-        })
-        .await
-        .expect("create_version should succeed");
+            .create_version(CreateVersionOptions {
+                id: Some("branch-alpha".to_string()),
+                name: Some("Branch Alpha".to_string()),
+                source_version_id: None,
+                hidden: true,
+            })
+            .await
+            .expect("create_version should succeed");
         assert_eq!(created.id, "branch-alpha");
         assert_eq!(created.name, "Branch Alpha");
 

@@ -2250,7 +2250,7 @@ pub(crate) async fn mirror_public_registered_schema_bootstrap_rows(
              entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
              ) VALUES (\
              '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', {snapshot_content}, '{change_id}', {metadata}, {writer_key}, {is_tombstone}, '{created_at}', '{updated_at}'\
-             ) ON CONFLICT (entity_id, file_id, version_id) DO UPDATE SET \
+             ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
              schema_key = excluded.schema_key, \
              schema_version = excluded.schema_version, \
              global = excluded.global, \

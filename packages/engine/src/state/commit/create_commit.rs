@@ -1004,6 +1004,7 @@ async fn load_create_commit_deterministic_sequence_start(
          WHERE file_id = '{file_id}' \
            AND entity_id = 'lix_deterministic_sequence_number' \
            AND version_id = '{version_id}' \
+           AND untracked = true \
            AND {value_column} IS NOT NULL \
          ORDER BY updated_at DESC \
          LIMIT 1",
@@ -1077,6 +1078,7 @@ async fn load_create_commit_active_accounts(
          FROM {table_name} \
          WHERE file_id = '{file_id}' \
            AND version_id = '{version_id}' \
+           AND untracked = true \
            AND {account_id_column} IS NOT NULL",
         account_id_column = quote_ident(account_id_column),
         table_name = quote_ident(&untracked_live_table_name(active_account_schema_key())),
@@ -1164,6 +1166,7 @@ async fn load_untracked_file_descriptor(
          WHERE entity_id = '{entity_id}' \
            AND file_id = '{file_id}' \
            AND version_id = '{version_id}' \
+           AND untracked = true \
            AND {snapshot_expr} IS NOT NULL \
          ORDER BY updated_at DESC \
          LIMIT 1",
@@ -1491,6 +1494,7 @@ mod tests {
             Value::Text(crate::version::version_ref_storage_version_id().to_string()),
             Value::Text(crate::version::version_ref_plugin_key().to_string()),
             Value::Null,
+            Value::Null,
             Value::Text(commit_id.to_string()),
             Value::Text(version_id.to_string()),
         ]
@@ -1592,7 +1596,7 @@ mod tests {
                 });
             }
 
-            if query_targets_table(sql, "lix_internal_live_untracked_v1_lix_version_ref") {
+            if query_targets_table(sql, "lix_internal_live_v1_lix_version_ref") {
                 let rows = self
                     .version_heads
                     .iter()
@@ -1609,6 +1613,7 @@ mod tests {
                         "version_id".to_string(),
                         "plugin_key".to_string(),
                         "metadata".to_string(),
+                        "change_id".to_string(),
                         "commit_id".to_string(),
                         "id".to_string(),
                     ],

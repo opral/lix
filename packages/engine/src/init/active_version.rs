@@ -102,6 +102,7 @@ impl Engine {
                      FROM {table_name} \
                      WHERE file_id = $1 \
                        AND version_id = $2 \
+                       AND untracked = true \
                        AND {payload_version_column} IS NOT NULL \
                      ORDER BY updated_at DESC \
                      LIMIT 1",

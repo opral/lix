@@ -721,7 +721,7 @@ mod tests {
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             if sql.contains("FROM \"lix_internal_live_v1_lix_file_descriptor\"")
-                || sql.contains("FROM lix_internal_live_untracked_v1_lix_version_ref")
+                || sql.contains("FROM lix_internal_live_v1_lix_version_ref")
             {
                 return Err(LixError::new("LIX_ERROR_UNKNOWN", "no such table"));
             }

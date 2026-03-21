@@ -155,6 +155,7 @@ impl Engine {
                      FROM {table_name} \
                      WHERE file_id = $1 \
                        AND version_id = $2 \
+                       AND untracked = true \
                        AND {payload_version_column} IS NOT NULL \
                      ORDER BY updated_at DESC \
                      LIMIT 1",
@@ -749,6 +750,8 @@ impl Engine {
             return Ok(());
         };
 
+        ensure_schema_live_table(self.backend.as_ref(), active_account_schema_key()).await?;
+
         let exists = self
             .execute_internal(
                 "SELECT 1 \
@@ -794,37 +797,50 @@ impl Engine {
             .await?;
         }
 
-        self.execute_internal(
-            "DELETE FROM lix_internal_state_vtable \
-             WHERE untracked = true \
-               AND schema_key = $1 \
-               AND file_id = $2 \
-               AND version_id = $3",
-            &[
-                Value::Text(active_account_schema_key().to_string()),
-                Value::Text(active_account_file_id().to_string()),
-                Value::Text(active_account_storage_version_id().to_string()),
-            ],
-            ExecuteOptions::default(),
-        )
-        .await?;
+        let table_name = untracked_live_table_name(active_account_schema_key());
+        let timestamp = self.generate_runtime_timestamp().await?;
+        let snapshot_content = active_account_snapshot_content(&account.id);
+        let normalized_values =
+            normalized_seed_values(active_account_schema_key(), Some(&snapshot_content))?;
+        self.backend
+            .execute(
+                &format!(
+                    "DELETE FROM {table_name} \
+                     WHERE schema_key = '{schema_key}' \
+                       AND file_id = '{file_id}' \
+                       AND version_id = '{version_id}' \
+                       AND untracked = true",
+                    table_name = quote_ident(&table_name),
+                    schema_key = escape_sql_string(active_account_schema_key()),
+                    file_id = escape_sql_string(active_account_file_id()),
+                    version_id = escape_sql_string(active_account_storage_version_id()),
+                ),
+                &[],
+            )
+            .await?;
 
-        self.execute_internal(
-            "INSERT INTO lix_internal_state_vtable (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, true)",
-            &[
-                Value::Text(account.id.clone()),
-                Value::Text(active_account_schema_key().to_string()),
-                Value::Text(active_account_file_id().to_string()),
-                Value::Text(active_account_storage_version_id().to_string()),
-                Value::Text(active_account_plugin_key().to_string()),
-                Value::Text(active_account_snapshot_content(&account.id)),
-                Value::Text(active_account_schema_version().to_string()),
-            ],
-            ExecuteOptions::default(),
-        )
-        .await?;
+        self.backend
+            .execute(
+                &format!(
+                    "INSERT INTO {table_name} (\
+                     entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, writer_key, untracked, created_at, updated_at{normalized_columns}\
+                     ) VALUES (\
+                     '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', NULL, NULL, true, '{timestamp}', '{timestamp}'{normalized_literals}\
+                     )",
+                    table_name = quote_ident(&table_name),
+                    entity_id = escape_sql_string(&account.id),
+                    schema_key = escape_sql_string(active_account_schema_key()),
+                    schema_version = escape_sql_string(active_account_schema_version()),
+                    file_id = escape_sql_string(active_account_file_id()),
+                    version_id = escape_sql_string(active_account_storage_version_id()),
+                    plugin_key = escape_sql_string(active_account_plugin_key()),
+                    timestamp = escape_sql_string(&timestamp),
+                    normalized_columns = normalized_insert_columns_sql(&normalized_values),
+                    normalized_literals = normalized_insert_literals_sql(&normalized_values),
+                ),
+                &[],
+            )
+            .await?;
 
         Ok(())
     }
@@ -1101,9 +1117,9 @@ impl Engine {
                 normalized_seed_values(version_ref_schema_key(), Some(&snapshot_content))?;
             let insert_sql = format!(
                 "INSERT INTO {table} (\
-                 entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, writer_key, created_at, updated_at{normalized_columns}\
+                 entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, writer_key, untracked, created_at, updated_at{normalized_columns}\
                  ) VALUES (\
-                 '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', NULL, NULL, '{timestamp}', '{timestamp}'{normalized_literals}\
+                 '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', NULL, NULL, true, '{timestamp}', '{timestamp}'{normalized_literals}\
                  )",
                 table = quote_ident(&table),
                 entity_id = escape_sql_string(entity_id),
@@ -1509,9 +1525,9 @@ impl Engine {
             normalized_seed_values(active_version_schema_key(), Some(&snapshot_content))?;
         let insert_sql = format!(
             "INSERT INTO {table_name} (\
-             entity_id, schema_key, file_id, version_id, global, plugin_key, schema_version, created_at, updated_at{normalized_columns}\
+             entity_id, schema_key, file_id, version_id, global, plugin_key, schema_version, untracked, created_at, updated_at{normalized_columns}\
              ) VALUES (\
-             '{entity_id}', '{schema_key}', '{file_id}', '{storage_version_id}', true, '{plugin_key}', '{schema_version}', '{timestamp}', '{timestamp}'{normalized_literals}\
+             '{entity_id}', '{schema_key}', '{file_id}', '{storage_version_id}', true, '{plugin_key}', '{schema_version}', true, '{timestamp}', '{timestamp}'{normalized_literals}\
              )",
             table_name = quote_ident(&untracked_live_table_name(active_version_schema_key())),
             entity_id = escape_sql_string(&entity_id),

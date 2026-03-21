@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::deterministic_mode::DeterministicSettings;
 use crate::engine::Engine;
 use crate::functions::LixFunctionProvider;
-use crate::schema::live_layout::{normalized_live_column_values, untracked_live_table_name};
+use crate::schema::live_layout::{normalized_live_column_values, tracked_live_table_name};
 use crate::schema::registry::{
     coalesce_live_table_requirements, ensure_schema_live_table_in_transaction,
     ensure_schema_live_table_with_requirement_in_transaction,
@@ -563,17 +563,20 @@ async fn apply_public_untracked_upsert(
     let normalized_update_sql = normalized_update_assignments_sql(&normalized_values);
     let sql = format!(
         "INSERT INTO {table} (\
-         entity_id, schema_key, file_id, version_id, global, plugin_key, metadata, writer_key, schema_version, created_at, updated_at{normalized_columns}\
+         entity_id, schema_key, file_id, version_id, global, plugin_key, change_id, metadata, writer_key, schema_version, is_tombstone, untracked, created_at, updated_at{normalized_columns}\
          ) VALUES (\
-         '{entity_id}', '{schema_key}', '{file_id}', '{version_id}', {global}, '{plugin_key}', {metadata}, {writer_key}, '{schema_version}', '{timestamp}', '{timestamp}'{normalized_values}\
-         ) ON CONFLICT (entity_id, file_id, version_id) DO UPDATE SET \
+         '{entity_id}', '{schema_key}', '{file_id}', '{version_id}', {global}, '{plugin_key}', NULL, {metadata}, {writer_key}, '{schema_version}', 0, true, '{timestamp}', '{timestamp}'{normalized_values}\
+         ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
          global = excluded.global, \
+         change_id = excluded.change_id, \
          plugin_key = excluded.plugin_key, \
          metadata = excluded.metadata, \
          writer_key = excluded.writer_key, \
          schema_version = excluded.schema_version, \
+         is_tombstone = excluded.is_tombstone, \
+         untracked = excluded.untracked, \
          updated_at = excluded.updated_at{normalized_updates}",
-        table = quote_ident(&untracked_live_table_name(&row.schema_key)),
+        table = quote_ident(&tracked_live_table_name(&row.schema_key)),
         entity_id = escape_sql_string(&row.entity_id),
         schema_key = escape_sql_string(&row.schema_key),
         file_id = escape_sql_string(file_id),
@@ -603,8 +606,9 @@ async fn apply_public_untracked_delete(
         "DELETE FROM {table} \
          WHERE entity_id = '{entity_id}' \
            AND file_id = '{file_id}' \
-           AND version_id = '{version_id}'",
-        table = quote_ident(&untracked_live_table_name(&row.schema_key)),
+           AND version_id = '{version_id}' \
+           AND untracked = true",
+        table = quote_ident(&tracked_live_table_name(&row.schema_key)),
         entity_id = escape_sql_string(&row.entity_id),
         file_id = escape_sql_string(file_id),
         version_id = escape_sql_string(row.version_id.as_deref().unwrap_or(GLOBAL_VERSION_ID)),

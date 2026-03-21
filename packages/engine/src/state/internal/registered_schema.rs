@@ -304,6 +304,7 @@ fn build_on_conflict_do_nothing() -> OnInsert {
             Ident::new("entity_id"),
             Ident::new("file_id"),
             Ident::new("version_id"),
+            Ident::new("untracked"),
         ])),
         action: OnConflictAction::DoNothing,
     })

@@ -102,7 +102,7 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
              entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, is_tombstone, created_at, updated_at{normalized_columns}\
              ) VALUES (\
              '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{change_id}', {metadata}, {is_tombstone}, '{created_at}', '{updated_at}'{normalized_values}\
-             ) ON CONFLICT (entity_id, file_id, version_id) DO UPDATE SET \
+             ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
              schema_key = excluded.schema_key, \
              schema_version = excluded.schema_version, \
              global = excluded.global, \
@@ -161,12 +161,16 @@ async fn clear_scope_rows(
         let (count_sql, delete_sql) = if let Some(in_list) = version_filter.as_ref() {
             (
                 format!(
-                    "SELECT COUNT(*) FROM {table_name} WHERE version_id IN ({in_list})",
+                    "SELECT COUNT(*) FROM {table_name} \
+                     WHERE version_id IN ({in_list}) \
+                       AND untracked = false",
                     table_name = quote_ident(&table_name),
                     in_list = in_list,
                 ),
                 format!(
-                    "DELETE FROM {table_name} WHERE version_id IN ({in_list})",
+                    "DELETE FROM {table_name} \
+                     WHERE version_id IN ({in_list}) \
+                       AND untracked = false",
                     table_name = quote_ident(&table_name),
                     in_list = in_list,
                 ),
@@ -174,11 +178,11 @@ async fn clear_scope_rows(
         } else {
             (
                 format!(
-                    "SELECT COUNT(*) FROM {table_name}",
+                    "SELECT COUNT(*) FROM {table_name} WHERE untracked = false",
                     table_name = quote_ident(&table_name),
                 ),
                 format!(
-                    "DELETE FROM {table_name}",
+                    "DELETE FROM {table_name} WHERE untracked = false",
                     table_name = quote_ident(&table_name),
                 ),
             )

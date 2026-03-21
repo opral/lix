@@ -4,7 +4,7 @@ use crate::backend::QueryExecutor;
 use crate::errors::classification::is_missing_relation_error;
 use crate::schema::live_layout::{
     json_value_from_live_row_cell, load_live_row_access_with_executor, tracked_live_table_name,
-    untracked_live_table_name, LiveColumnKind, LiveRowAccess,
+    LiveColumnKind, LiveRowAccess,
 };
 use crate::{LixError, Value};
 
@@ -66,7 +66,8 @@ pub(crate) async fn tracked_live_row_exists_with_executor(
     let mut sql = format!(
         "SELECT 1 \
          FROM {table_name} \
-         WHERE schema_key = '{schema_key}'",
+         WHERE schema_key = '{schema_key}' \
+           AND untracked = false",
         table_name = quote_ident(&table_name),
         schema_key = escape_sql_string(schema_key),
     );
@@ -97,27 +98,24 @@ pub(crate) async fn load_live_rows_with_executor(
 ) -> Result<Vec<LoadedLiveRow>, LixError> {
     let access = load_live_row_access_with_executor(executor, schema_key).await?;
     let normalized_projection = access.normalized_projection_sql(None);
-    let envelope_projection = match scope {
-        LiveRowScope::Tracked => {
-            "entity_id, schema_key, schema_version, file_id, version_id, plugin_key, metadata, change_id"
-        }
-        LiveRowScope::Untracked => {
-            "entity_id, schema_key, schema_version, file_id, version_id, plugin_key, metadata"
-        }
-    };
-    let table_name = match scope {
-        LiveRowScope::Tracked => tracked_live_table_name(schema_key),
-        LiveRowScope::Untracked => untracked_live_table_name(schema_key),
-    };
+    let envelope_projection =
+        "entity_id, schema_key, schema_version, file_id, version_id, plugin_key, metadata, change_id";
+    let table_name = tracked_live_table_name(schema_key);
 
     let mut sql = format!(
         "SELECT {envelope_projection}{normalized_projection} \
          FROM {table_name} \
-         WHERE schema_key = '{schema_key}'",
+         WHERE schema_key = '{schema_key}' \
+           AND untracked = {untracked}",
         envelope_projection = envelope_projection,
         normalized_projection = normalized_projection,
         table_name = quote_ident(&table_name),
         schema_key = escape_sql_string(schema_key),
+        untracked = if matches!(scope, LiveRowScope::Untracked) {
+            "true"
+        } else {
+            "false"
+        },
     );
     if matches!(scope, LiveRowScope::Tracked) {
         sql.push_str(" AND is_tombstone = 0");
@@ -216,11 +214,12 @@ pub(crate) async fn load_untracked_live_rows_by_property_with_executor(
         .to_string();
     let normalized_projection = access.normalized_projection_sql(None);
     let mut sql = format!(
-        "SELECT entity_id, schema_key, schema_version, file_id, version_id, plugin_key, metadata{normalized_projection} \
+        "SELECT entity_id, schema_key, schema_version, file_id, version_id, plugin_key, metadata, change_id{normalized_projection} \
          FROM {table_name} \
-         WHERE schema_key = '{schema_key}'",
+         WHERE schema_key = '{schema_key}' \
+           AND untracked = true",
         normalized_projection = normalized_projection,
-        table_name = quote_ident(&untracked_live_table_name(schema_key)),
+        table_name = quote_ident(&tracked_live_table_name(schema_key)),
         schema_key = escape_sql_string(schema_key),
     );
     for (column, value) in filters {
@@ -278,10 +277,7 @@ fn decode_loaded_live_row(
         LiveRowScope::Tracked => row.get(7).and_then(text_from_value),
         LiveRowScope::Untracked => None,
     };
-    let normalized_start_index = match scope {
-        LiveRowScope::Tracked => 8,
-        LiveRowScope::Untracked => 7,
-    };
+    let normalized_start_index = 8;
     let mut values = BTreeMap::new();
     for (offset, column) in access.columns().iter().enumerate() {
         let value = row.get(normalized_start_index + offset).ok_or_else(|| {

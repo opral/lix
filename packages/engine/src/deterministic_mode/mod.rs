@@ -266,14 +266,15 @@ pub(crate) fn build_persist_sequence_highest_sql(highest_seen: i64) -> String {
 
     format!(
         "INSERT INTO {table_name} \
-         (entity_id, schema_key, file_id, version_id, global, plugin_key, metadata, writer_key, schema_version, created_at, updated_at, {key_column}, {value_column}) \
-         VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', FALSE, '{plugin_key}', NULL, NULL, '{schema_version}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{key_value}', '{value_json}') \
-         ON CONFLICT (entity_id, file_id, version_id) DO UPDATE SET \
+         (entity_id, schema_key, file_id, version_id, global, plugin_key, metadata, writer_key, schema_version, untracked, created_at, updated_at, {key_column}, {value_column}) \
+         VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', FALSE, '{plugin_key}', NULL, NULL, '{schema_version}', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{key_value}', '{value_json}') \
+         ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
            global = excluded.global, \
            plugin_key = excluded.plugin_key, \
            metadata = excluded.metadata, \
            writer_key = excluded.writer_key, \
            schema_version = excluded.schema_version, \
+           untracked = excluded.untracked, \
            {key_column} = excluded.{key_column}, \
            {value_column} = excluded.{value_column}, \
            updated_at = CURRENT_TIMESTAMP",
@@ -314,12 +315,14 @@ async fn load_key_value_payloads(
            FROM {untracked_table} u \
            WHERE entity_id IN ({in_list}) \
              AND version_id = '{version_id}' \
+             AND u.untracked = true \
              AND {untracked_value_expr} IS NOT NULL \
            UNION ALL \
            SELECT t.entity_id, {tracked_value_expr} AS value_json, 1 AS precedence \
            FROM {table_name} t \
            WHERE entity_id IN ({in_list}) \
              AND version_id = '{version_id}' \
+             AND t.untracked = false \
              AND {tracked_value_expr} IS NOT NULL \
              AND is_tombstone = 0\
          ) visible_key_values \

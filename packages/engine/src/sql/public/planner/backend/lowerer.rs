@@ -933,7 +933,8 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
              FROM {table_name} \
              WHERE file_id = '{file_id}' \
                AND {active_version_column} IS NOT NULL \
-               AND version_id = '{storage_version_id}'",
+               AND version_id = '{storage_version_id}' \
+               AND untracked = true",
             active_version_column = quote_ident(active_version_column),
             table_name = quote_ident(&untracked_live_table_name(active_version_schema_key())),
             file_id = escape_sql_string(active_version_file_id()),
@@ -946,6 +947,7 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
              FROM {table_name} \
              WHERE file_id = '{file_id}' \
                AND version_id = '{storage_version_id}' \
+               AND untracked = true \
                AND account_id IS NOT NULL",
             table_name = quote_ident(&untracked_live_table_name(active_account_schema_key())),
             file_id = escape_sql_string(active_account_file_id()),
@@ -971,6 +973,7 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
                    ) AS rn \
                  FROM {version_ref_table} \
                  WHERE schema_key = 'lix_version_ref' \
+                   AND untracked = true \
                    AND commit_id IS NOT NULL \
                ) ranked_version_refs \
                WHERE rn = 1 \
@@ -1203,7 +1206,8 @@ fn explicit_target_versions_cte_sql(
             format!(
                 "SELECT DISTINCT version_id \
                  FROM {table_name} \
-                 WHERE version_id <> '{global_version}'",
+                 WHERE version_id <> '{global_version}' \
+                   AND untracked = false",
                 table_name = quote_ident(&tracked_live_table_name(schema_key)),
                 global_version = escape_sql_string(GLOBAL_VERSION_ID),
             )
@@ -1212,7 +1216,8 @@ fn explicit_target_versions_cte_sql(
             format!(
                 "SELECT DISTINCT version_id \
                  FROM {table_name} \
-                 WHERE version_id <> '{global_version}'",
+                 WHERE version_id <> '{global_version}' \
+                   AND untracked = true",
                 table_name = quote_ident(&untracked_live_table_name(schema_key)),
                 global_version = escape_sql_string(GLOBAL_VERSION_ID),
             )
@@ -1367,7 +1372,7 @@ fn effective_state_schema_winner_rows_sql(
                        ON tv.version_id = t.version_id \
                      LEFT JOIN change_commit_by_change_id cc \
                        ON cc.change_id = t.change_id \
-                     WHERE 1 = 1{tracked_predicates} \
+                     WHERE t.untracked = false{tracked_predicates} \
                      UNION ALL \
                      SELECT \
                        t.entity_id AS effective_entity_id, \
@@ -1392,7 +1397,8 @@ fn effective_state_schema_winner_rows_sql(
                       AND t.version_id = '{global_version}' \
                      LEFT JOIN change_commit_by_change_id cc \
                        ON cc.change_id = t.change_id \
-                     WHERE t.version_id = '{global_version}'{tracked_predicates} \
+                     WHERE t.version_id = '{global_version}' \
+                       AND t.untracked = false{tracked_predicates} \
                      UNION ALL \
                      SELECT \
                        u.entity_id AS effective_entity_id, \
@@ -1414,7 +1420,7 @@ fn effective_state_schema_winner_rows_sql(
                      FROM {untracked_table} u \
                      JOIN target_versions tv \
                        ON tv.version_id = u.version_id \
-                     WHERE 1 = 1{untracked_predicates} \
+                     WHERE u.untracked = true{untracked_predicates} \
                      UNION ALL \
                      SELECT \
                        u.entity_id AS effective_entity_id, \
@@ -1437,7 +1443,8 @@ fn effective_state_schema_winner_rows_sql(
                      JOIN target_versions tv \
                        ON tv.version_id <> '{global_version}' \
                       AND u.version_id = '{global_version}' \
-                     WHERE u.version_id = '{global_version}'{untracked_predicates} \
+                     WHERE u.version_id = '{global_version}' \
+                       AND u.untracked = true{untracked_predicates} \
                    ) AS c \
                  ) AS ranked \
                  WHERE ranked.rn = 1 \
@@ -2518,7 +2525,8 @@ mod tests {
 
         assert!(lowered_sql.contains("FROM (SELECT"));
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
-        assert!(lowered_sql.contains("lix_internal_live_untracked_v1_lix_key_value"));
+        assert!(lowered_sql.contains("untracked = false"));
+        assert!(lowered_sql.contains("untracked = true"));
         assert!(lowered_sql.contains("file_id = 'lix'"));
         assert!(lowered_sql.contains("plugin_key = 'lix'"));
         assert_eq!(
@@ -2599,7 +2607,7 @@ mod tests {
 
         assert!(lowered_sql.contains("FROM lix_state"));
         assert!(!lowered_sql.contains("lix_internal_live_v1_"));
-        assert!(!lowered_sql.contains("FROM lix_internal_live_untracked_v1_"));
+        assert!(!lowered_sql.contains("untracked = true"));
     }
 
     #[test]
@@ -2786,7 +2794,8 @@ mod tests {
         .expect("active version read should lower");
         let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered_sql.contains("lix_internal_live_untracked_v1_lix_active_version"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_active_version"));
+        assert!(lowered_sql.contains("untracked = true"));
         assert!(lowered_sql.contains("file_id = 'lix'"));
         assert!(lowered_sql.contains("version_id = 'global'"));
         assert_eq!(
@@ -2809,7 +2818,8 @@ mod tests {
         .expect("active account read should lower");
         let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered_sql.contains("lix_internal_live_untracked_v1_lix_active_account"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_active_account"));
+        assert!(lowered_sql.contains("untracked = true"));
         assert!(!lowered_sql.contains("FROM lix_active_account"));
         assert_eq!(
             lowered.pushdown_decision.accepted_predicates,
@@ -2832,7 +2842,8 @@ mod tests {
         let lowered_sql = lowered.statements[0].to_string();
 
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
-        assert!(lowered_sql.contains("lix_internal_live_untracked_v1_lix_version_ref"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
+        assert!(lowered_sql.contains("untracked = true"));
         assert!(!lowered_sql.contains("FROM lix_version"));
         assert_eq!(
             lowered.pushdown_decision.accepted_predicates,

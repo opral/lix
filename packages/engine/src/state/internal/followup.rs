@@ -457,7 +457,7 @@ async fn delete_effective_scope_untracked_rows(
     params: &[EngineValue],
 ) -> Result<(), LixError> {
     let sql = format!(
-        "DELETE FROM {table} WHERE {selection_sql}",
+        "DELETE FROM {table} WHERE untracked = true AND ({selection_sql})",
         table = quote_ident(&untracked_live_table_name(schema_key)),
     );
     let bound = bind_sql_with_state(&sql, params, executor.dialect(), PlaceholderState::new())?;

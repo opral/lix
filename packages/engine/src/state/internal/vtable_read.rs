@@ -11,7 +11,6 @@ use crate::schema::builtin::builtin_schema_keys;
 use crate::schema::live_layout::{
     builtin_live_table_layout, live_schema_key_for_table_name, load_live_row_access_with_backend,
     tracked_live_table_name, untracked_live_table_name, LiveRowAccess, TRACKED_LIVE_TABLE_PREFIX,
-    UNTRACKED_LIVE_TABLE_PREFIX,
 };
 use crate::sql::live_snapshot::{live_snapshot_select_expr, live_snapshot_select_expr_for_schema};
 use crate::state::internal::param_context::{
@@ -402,7 +401,7 @@ fn build_schema_winner_query(
             }
         })
         .transpose()?
-        .map(|predicate| format!(" WHERE ({predicate})"))
+        .map(|predicate| format!(" AND ({predicate})"))
         .unwrap_or_default();
 
     let tracked_where = stripped_predicate
@@ -422,7 +421,7 @@ fn build_schema_winner_query(
             }
         })
         .transpose()?
-        .map(|predicate| format!(" WHERE ({predicate})"))
+        .map(|predicate| format!(" AND ({predicate})"))
         .unwrap_or_default();
 
     let partition_version_expr = if has_version_predicate {
@@ -466,11 +465,13 @@ fn build_schema_winner_query(
             FROM (\
                 SELECT entity_id, schema_key, file_id, version_id, plugin_key, metadata, schema_version, \
                        created_at, updated_at, global, 'untracked' AS change_id, writer_key, true AS untracked, 0 AS is_tombstone{untracked_full_projection}, 1 AS priority \
-                FROM {untracked_table} u{untracked_where} \
+                FROM {untracked_table} u \
+                WHERE u.untracked = true{untracked_where} \
                 UNION ALL \
                 SELECT entity_id, schema_key, file_id, version_id, plugin_key, metadata, schema_version, \
                        created_at, updated_at, global, change_id, writer_key, false AS untracked, is_tombstone{tracked_full_projection}, 2 AS priority \
-                FROM {tracked_table} t{tracked_where} \
+                FROM {tracked_table} t \
+                WHERE t.untracked = false{tracked_where} \
             ) AS schema_union\
          ) AS ranked \
          WHERE rn = 1",
@@ -1135,7 +1136,8 @@ async fn fetch_schema_keys_for_plugins(
         union_parts.push(format!(
             "SELECT DISTINCT schema_key \
              FROM {untracked_table} \
-             WHERE plugin_key IN ({plugin_placeholders})",
+             WHERE untracked = true \
+               AND plugin_key IN ({plugin_placeholders})",
             untracked_table = untracked_table,
             plugin_placeholders = changes_placeholders,
         ));
@@ -1170,7 +1172,6 @@ async fn fetch_materialized_state_schema_keys(
     backend: &dyn LixBackend,
 ) -> Result<Vec<String>, LixError> {
     let tracked_like = format!("{TRACKED_LIVE_TABLE_PREFIX}%");
-    let untracked_like = format!("{UNTRACKED_LIVE_TABLE_PREFIX}%");
     let table_rows = match backend.dialect() {
         crate::SqlDialect::Sqlite => {
             backend
@@ -1179,7 +1180,7 @@ async fn fetch_materialized_state_schema_keys(
                         "SELECT name \
                          FROM sqlite_master \
                          WHERE type = 'table' \
-                           AND (name LIKE '{tracked_like}' OR name LIKE '{untracked_like}')"
+                           AND name LIKE '{tracked_like}'"
                     ),
                     &[],
                 )
@@ -1192,7 +1193,7 @@ async fn fetch_materialized_state_schema_keys(
                         "SELECT table_name \
                          FROM information_schema.tables \
                          WHERE table_schema = current_schema() \
-                           AND (table_name LIKE '{tracked_like}' OR table_name LIKE '{untracked_like}')"
+                           AND table_name LIKE '{tracked_like}'"
                     ),
                     &[],
                 )

@@ -2,7 +2,6 @@ use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const TRACKED_LIVE_TABLE_PREFIX: &str = "lix_internal_live_v1_";
-pub(crate) const UNTRACKED_LIVE_TABLE_PREFIX: &str = "lix_internal_live_untracked_v1_";
 
 use crate::backend::QueryExecutor;
 use crate::schema::builtin::builtin_schema_definition;
@@ -446,11 +445,11 @@ pub(crate) fn tracked_live_table_name(schema_key: &str) -> String {
 }
 
 pub(crate) fn untracked_live_table_name(schema_key: &str) -> String {
-    format!("{UNTRACKED_LIVE_TABLE_PREFIX}{schema_key}")
+    tracked_live_table_name(schema_key)
 }
 
-pub(crate) fn is_untracked_live_table(name: &str) -> bool {
-    name.starts_with(UNTRACKED_LIVE_TABLE_PREFIX)
+pub(crate) fn is_untracked_live_table(_name: &str) -> bool {
+    false
 }
 
 pub(crate) fn live_column_name_for_property<'a>(
@@ -643,9 +642,7 @@ fn quote_ident_fragment(value: &str) -> String {
 }
 
 pub(crate) fn live_schema_key_for_table_name(table_name: &str) -> Option<&str> {
-    table_name
-        .strip_prefix(TRACKED_LIVE_TABLE_PREFIX)
-        .or_else(|| table_name.strip_prefix(UNTRACKED_LIVE_TABLE_PREFIX))
+    table_name.strip_prefix(TRACKED_LIVE_TABLE_PREFIX)
 }
 
 const REGISTERED_SCHEMA_BOOTSTRAP_LAYOUT_SQL: &str = "SELECT snapshot_content \
