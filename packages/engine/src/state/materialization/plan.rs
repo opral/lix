@@ -2,10 +2,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde_json::json;
 
+use crate::backend::QueryExecutor;
 use crate::schema::builtin::types::LixVersionRef;
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
 use crate::schema::live_store::load_untracked_live_rows_by_property_with_executor;
-use crate::state::materialization::loader::{load_data, ChangeRecord, LoadedData};
+use crate::state::materialization::loader::{load_data_with_executor, ChangeRecord, LoadedData};
 use crate::state::materialization::types::{
     LatestVisibleWinnerDebugRow, LiveStateRebuildDebugMode, LiveStateRebuildDebugTrace,
     LiveStateRebuildPlan, LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning,
@@ -71,13 +72,21 @@ pub(crate) async fn live_state_rebuild_plan_internal(
     backend: &dyn LixBackend,
     req: &LiveStateRebuildRequest,
 ) -> Result<LiveStateRebuildPlan, LixError> {
-    let data = load_data(backend).await?;
+    let mut executor = backend;
+    live_state_rebuild_plan_with_executor(&mut executor, req).await
+}
+
+pub(crate) async fn live_state_rebuild_plan_with_executor(
+    executor: &mut dyn QueryExecutor,
+    req: &LiveStateRebuildRequest,
+) -> Result<LiveStateRebuildPlan, LixError> {
+    let data = load_data_with_executor(executor).await?;
     let mut stats = Vec::new();
     let mut warnings = Vec::new();
 
     let all_commit_edges = build_all_commit_edges(&data, &mut stats);
     let version_refs =
-        load_version_heads_from_untracked(backend, &mut warnings, &mut stats).await?;
+        load_version_heads_from_untracked(executor, &mut warnings, &mut stats).await?;
     let commit_graph = build_commit_graph(&version_refs, &all_commit_edges, &mut stats);
 
     let latest_visible_state = build_latest_visible_state(
@@ -760,13 +769,12 @@ fn build_global_projection_rows(
 }
 
 async fn load_version_heads_from_untracked(
-    backend: &dyn LixBackend,
+    executor: &mut dyn QueryExecutor,
     warnings: &mut Vec<LiveStateRebuildWarning>,
     stats: &mut Vec<StageStat>,
 ) -> Result<BTreeMap<String, Vec<String>>, LixError> {
-    let mut executor = backend;
     let rows = load_untracked_live_rows_by_property_with_executor(
-        &mut executor,
+        executor,
         "lix_version_ref",
         "commit_id",
         &BTreeMap::new(),
@@ -779,7 +787,7 @@ async fn load_version_heads_from_untracked(
     for row in rows {
         let Some(snapshot_raw) = crate::schema::live_store::logical_snapshot_text(
             &crate::schema::live_layout::load_live_row_access_with_executor(
-                &mut executor,
+                executor,
                 "lix_version_ref",
             )
             .await?,

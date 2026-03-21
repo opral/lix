@@ -289,10 +289,10 @@ pub(crate) async fn create_commit(
         let mut executor = TransactionCommitExecutor { transaction };
         normalize_proposed_domain_changes(&mut executor, &applied_domain_changes).await?
     };
-    if applied_domain_changes.is_empty()
-        && compiled_filesystem_state.binary_blob_writes.is_empty()
-        && !args.allow_empty_commit
-    {
+    // Binary CAS writes are only meaningful when a surviving semantic change still
+    // points at them. If normalization removed every domain change, any staged blob
+    // payload writes are unreachable and the whole operation is a replay/noop.
+    if applied_domain_changes.is_empty() && !args.allow_empty_commit {
         return Ok(CreateCommitResult {
             disposition: CreateCommitDisposition::Replay,
             committed_head: current_head.unwrap_or_default(),

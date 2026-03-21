@@ -26,6 +26,14 @@ pub struct CreateVersionCommand {
     #[arg(long)]
     pub name: Option<String>,
 
+    /// Source version id to branch from. Defaults to the active version.
+    #[arg(long, conflicts_with = "from_name")]
+    pub from_id: Option<String>,
+
+    /// Source version name to branch from. Defaults to the active version.
+    #[arg(long, conflicts_with = "from_id")]
+    pub from_name: Option<String>,
+
     /// Hide the version from default listings.
     #[arg(long, default_value_t = false)]
     pub hidden: bool,
@@ -33,17 +41,30 @@ pub struct CreateVersionCommand {
 
 #[derive(Debug, Args)]
 pub struct MergeVersionCommand {
-    /// Source version to merge from.
-    #[arg(long)]
-    pub source: String,
+    /// Source version id to merge from.
+    #[arg(long, conflicts_with = "source_name", required_unless_present = "source_name")]
+    pub source_id: Option<String>,
 
-    /// Target version to merge into.
-    #[arg(long)]
-    pub target: String,
+    /// Source version name to merge from.
+    #[arg(long, conflicts_with = "source_id", required_unless_present = "source_id")]
+    pub source_name: Option<String>,
+
+    /// Target version id to merge into.
+    #[arg(long, conflicts_with = "target_name", required_unless_present = "target_name")]
+    pub target_id: Option<String>,
+
+    /// Target version name to merge into.
+    #[arg(long, conflicts_with = "target_id", required_unless_present = "target_id")]
+    pub target_name: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct SwitchVersionCommand {
     /// Version id to make active.
-    pub version_id: String,
+    #[arg(long, conflicts_with = "name", required_unless_present = "name")]
+    pub id: Option<String>,
+
+    /// Version name to make active.
+    #[arg(long, conflicts_with = "id", required_unless_present = "id")]
+    pub name: Option<String>,
 }

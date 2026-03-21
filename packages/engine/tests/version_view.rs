@@ -943,6 +943,7 @@ simulation_test!(
             .create_version(lix_engine::CreateVersionOptions {
                 id: Some("version-baseline-delete".to_string()),
                 name: Some("version-baseline-delete".to_string()),
+                source_version_id: None,
                 hidden: false,
             })
             .await

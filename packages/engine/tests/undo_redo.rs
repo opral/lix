@@ -521,6 +521,7 @@ simulation_test!(
             .create_version(CreateVersionOptions {
                 id: Some("undo-target-branch".to_string()),
                 name: Some("Undo Target Branch".to_string()),
+                source_version_id: None,
                 hidden: false,
             })
             .await

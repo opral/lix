@@ -3,6 +3,9 @@ mod loader;
 mod plan;
 mod types;
 
+pub(crate) use apply::apply_live_state_scope_in_transaction;
+pub(crate) use plan::live_state_rebuild_plan_with_executor;
+
 pub use types::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
