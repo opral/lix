@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "benchmarks/git-compare",
   "packages/engine",
   "packages/js-sdk",
   "packages/text-plugin",

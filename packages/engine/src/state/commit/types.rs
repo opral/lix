@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::schema::live_layout::LiveTableLayout;
 use crate::{
@@ -51,6 +51,7 @@ pub struct GenerateCommitArgs {
     pub active_accounts: Vec<String>,
     pub changes: Vec<DomainChangeInput>,
     pub versions: BTreeMap<String, VersionInfo>,
+    pub force_commit_versions: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
