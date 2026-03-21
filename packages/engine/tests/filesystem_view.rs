@@ -2490,6 +2490,104 @@ simulation_test!(
 );
 
 simulation_test!(
+    directory_parent_rename_does_not_rewrite_descendant_descriptors,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path, parent_id, name) VALUES \
+                 ('dir-stable-parent', '/docs/', NULL, 'docs'), \
+                 ('dir-stable-child', '/docs/guides/', 'dir-stable-parent', 'guides')",
+                &[],
+            )
+            .await
+            .expect("seed directory insert should succeed");
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES \
+                 ('file-stable-child', '/docs/guides/note.md', X'41')",
+                &[],
+            )
+            .await
+            .expect("seed child file insert should succeed");
+
+        let before = engine
+            .execute(
+                "SELECT \
+                    (SELECT lixcol_change_id FROM lix_directory WHERE id = 'dir-stable-parent'), \
+                    (SELECT lixcol_change_id FROM lix_directory WHERE id = 'dir-stable-child'), \
+                    (SELECT lixcol_change_id FROM lix_file WHERE id = 'file-stable-child')",
+                &[],
+            )
+            .await
+            .expect("before query should succeed");
+        assert_eq!(before.statements[0].rows.len(), 1);
+        let before_parent_change_id = match &before.statements[0].rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected parent change id as text, got {other:?}"),
+        };
+        let before_child_dir_change_id = match &before.statements[0].rows[0][1] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected child directory change id as text, got {other:?}"),
+        };
+        let before_child_file_change_id = match &before.statements[0].rows[0][2] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected child file change id as text, got {other:?}"),
+        };
+
+        engine
+            .execute(
+                "UPDATE lix_directory SET name = 'renamed' WHERE id = 'dir-stable-parent'",
+                &[],
+            )
+            .await
+            .expect("parent rename should succeed");
+
+        let after = engine
+            .execute(
+                "SELECT \
+                    (SELECT path FROM lix_directory WHERE id = 'dir-stable-parent'), \
+                    (SELECT path FROM lix_directory WHERE id = 'dir-stable-child'), \
+                    (SELECT path FROM lix_file WHERE id = 'file-stable-child'), \
+                    (SELECT lixcol_change_id FROM lix_directory WHERE id = 'dir-stable-parent'), \
+                    (SELECT lixcol_change_id FROM lix_directory WHERE id = 'dir-stable-child'), \
+                    (SELECT lixcol_change_id FROM lix_file WHERE id = 'file-stable-child')",
+                &[],
+            )
+            .await
+            .expect("after query should succeed");
+        assert_eq!(after.statements[0].rows.len(), 1);
+
+        assert_text(&after.statements[0].rows[0][0], "/renamed/");
+        assert_text(&after.statements[0].rows[0][1], "/renamed/guides/");
+        assert_text(&after.statements[0].rows[0][2], "/renamed/guides/note.md");
+
+        let after_parent_change_id = match &after.statements[0].rows[0][3] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected parent change id as text, got {other:?}"),
+        };
+        let after_child_dir_change_id = match &after.statements[0].rows[0][4] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected child directory change id as text, got {other:?}"),
+        };
+        let after_child_file_change_id = match &after.statements[0].rows[0][5] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected child file change id as text, got {other:?}"),
+        };
+
+        assert_ne!(before_parent_change_id, after_parent_change_id);
+        assert_eq!(before_child_dir_change_id, after_child_dir_change_id);
+        assert_eq!(before_child_file_change_id, after_child_file_change_id);
+    }
+);
+
+simulation_test!(
     directory_duplicate_global_path_is_rejected_in_child_version,
     |sim| async move {
         let engine = sim
