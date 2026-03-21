@@ -1287,6 +1287,7 @@ async fn rewrite_tracked_rows_with_backend(
             active_accounts,
             changes: domain_changes,
             versions,
+            force_commit_versions: BTreeSet::new(),
         },
         || functions.uuid_v7(),
     )?;
