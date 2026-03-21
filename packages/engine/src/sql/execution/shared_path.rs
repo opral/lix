@@ -1657,6 +1657,7 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
             active_accounts: active_accounts.clone(),
             changes: domain_changes.clone(),
             versions,
+            force_commit_versions: BTreeSet::new(),
         },
         || functions.uuid_v7(),
     )?;

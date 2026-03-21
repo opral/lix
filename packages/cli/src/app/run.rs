@@ -19,6 +19,7 @@ pub fn run() -> Result<(), CliError> {
         Command::Redo(redo_command) => commands::redo::run(&context, redo_command),
         Command::Sql(sql_command) => commands::sql::run(&context, sql_command),
         Command::Undo(undo_command) => commands::undo::run(&context, undo_command),
+        Command::Version(version_command) => commands::version::run(&context, version_command),
     }?;
 
     if !no_hints {

@@ -142,6 +142,8 @@ pub(crate) async fn run_tracked_write_txn_plan_with_transaction(
                 .unwrap_or_default(),
             filesystem_state: plan.filesystem_state.clone(),
             preconditions: plan.execution.create_preconditions.clone(),
+            lane_parent_commit_ids_override: None,
+            allow_empty_commit: false,
             should_emit_observe_tick: plan.should_emit_observe_tick(),
             observe_tick_writer_key: plan.writer_key.clone(),
             writer_key: plan.writer_key.clone(),

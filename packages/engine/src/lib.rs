@@ -64,5 +64,8 @@ pub use state::stream::{
 };
 pub use types::{ExecuteResult, QueryResult, Value};
 pub use undo_redo::{RedoOptions, RedoResult, UndoOptions, UndoResult};
-pub use version::{CreateVersionOptions, CreateVersionResult};
+pub use version::{
+    CreateVersionOptions, CreateVersionResult, ExpectedVersionHeads, MergeOutcome,
+    MergeVersionOptions, MergeVersionResult,
+};
 pub use wasm_runtime::{NoopWasmRuntime, WasmComponentInstance, WasmLimits, WasmRuntime};
