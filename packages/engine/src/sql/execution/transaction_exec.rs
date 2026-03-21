@@ -1,8 +1,9 @@
 use crate::engine::{DeferredTransactionSideEffects, Engine, TransactionBackendAdapter};
 use crate::sql::execution::execution_program::{
     execute_compiled_execution_step_with_transaction, execute_execution_program_with_transaction,
-    CompiledExecution, CompiledExecutionRoute, CompiledExecutionStepResult, ExecutionContext,
-    ExecutionProgram,
+    BoundStatementTemplateInstance, CompiledExecution, CompiledExecutionRoute,
+    CompiledExecutionStepResult, ExecutionContext, ExecutionProgram, StatementTemplate,
+    StatementTemplateCacheKey,
 };
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path;
@@ -71,6 +72,7 @@ impl Engine {
             let backend = TransactionBackendAdapter::new(transaction);
             context.public_surface_registry =
                 SurfaceRegistry::bootstrap_with_backend(&backend).await?;
+            context.bump_public_surface_registry_generation();
         }
         Ok(())
     }
@@ -94,18 +96,60 @@ impl Engine {
                         .to_string(),
             });
         }
+        let cache_key = StatementTemplateCacheKey::new(
+            sql,
+            transaction.dialect(),
+            allow_internal_tables,
+            context.public_surface_registry_generation,
+        );
+        let template = match context.statement_template_cache.get(&cache_key) {
+            Some(template) => template.clone(),
+            None => {
+                let template = StatementTemplate::compile_with_registry(
+                    parsed_statements[0].clone(),
+                    &context.public_surface_registry,
+                    transaction.dialect(),
+                    params.len(),
+                )?;
+                context
+                    .statement_template_cache
+                    .insert(cache_key, template.clone());
+                template
+            }
+        };
+        let bound_template = template.bind(params)?;
+        self.execute_bound_statement_template_instance_in_transaction(
+            transaction,
+            &bound_template,
+            allow_internal_tables,
+            context,
+            deferred_side_effects,
+            skip_side_effect_collection,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_bound_statement_template_instance_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        bound_statement_template: &BoundStatementTemplateInstance,
+        allow_internal_tables: bool,
+        context: &mut ExecutionContext,
+        deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
+        skip_side_effect_collection: bool,
+    ) -> Result<QueryResult, LixError> {
         let writer_key = context.options.writer_key.clone();
         let _defer_side_effects = deferred_side_effects.is_some();
+        let parsed_statements = std::slice::from_ref(bound_statement_template.statement());
         loop {
             let pending_transaction_view = context.mutation_journal.pending_transaction_view()?;
             let program = {
                 let backend = TransactionBackendAdapter::new(transaction);
-                shared_path::compile_execution_step_with_backend(
+                shared_path::compile_execution_step_from_template_instance_with_backend(
                     self,
                     &backend,
                     pending_transaction_view.as_ref(),
-                    &parsed_statements,
-                    params,
+                    bound_statement_template,
                     context.active_version_id.as_str(),
                     writer_key.as_deref(),
                     allow_internal_tables,
@@ -135,7 +179,8 @@ impl Engine {
                 }
             };
             let has_materialization_plan = program.has_materialization_plan();
-            let write_is_bufferable = program.is_bufferable_write(&parsed_statements[0]);
+            let write_is_bufferable =
+                program.is_bufferable_write(bound_statement_template.statement());
             if write_is_bufferable {
                 let statement_delta = program
                     .txn_delta()
@@ -156,6 +201,7 @@ impl Engine {
                     apply_buffered_write_planning_effects(
                         program.execution(),
                         &mut context.public_surface_registry,
+                        &mut context.public_surface_registry_generation,
                         &mut context.public_surface_registry_dirty,
                         &mut context.active_version_id,
                     )?;
@@ -164,6 +210,7 @@ impl Engine {
                     refresh_public_surface_registry_from_pending_transaction_view(
                         transaction,
                         &mut context.public_surface_registry,
+                        &mut context.public_surface_registry_generation,
                         &mut context.public_surface_registry_dirty,
                         &context.mutation_journal,
                     )
@@ -216,7 +263,7 @@ impl Engine {
 
             if execution.plan_effects_override.is_none()
                 && !matches!(
-                    parsed_statements[0],
+                    bound_statement_template.statement(),
                     sqlparser::ast::Statement::Query(_) | sqlparser::ast::Statement::Explain { .. }
                 )
             {
@@ -229,12 +276,14 @@ impl Engine {
                     &mut context.public_surface_registry,
                     &mutations,
                 )? {
+                    context.bump_public_surface_registry_generation();
                     context.public_surface_registry_dirty = true;
                 }
             } else if prepared_execution_mutates_public_surface_registry(program.execution())? {
                 let backend = TransactionBackendAdapter::new(transaction);
                 context.public_surface_registry =
                     SurfaceRegistry::bootstrap_with_backend(&backend).await?;
+                context.bump_public_surface_registry_generation();
                 context.public_surface_registry_dirty = true;
             }
 
@@ -381,6 +430,7 @@ impl Engine {
 async fn refresh_public_surface_registry_from_pending_transaction_view(
     transaction: &mut dyn LixTransaction,
     public_surface_registry: &mut SurfaceRegistry,
+    public_surface_registry_generation: &mut u64,
     public_surface_registry_dirty: &mut bool,
     mutation_journal: &MutationJournal,
 ) -> Result<(), LixError> {
@@ -392,6 +442,7 @@ async fn refresh_public_surface_registry_from_pending_transaction_view(
             pending_transaction_view.as_ref(),
         )
         .await?;
+    *public_surface_registry_generation += 1;
     *public_surface_registry_dirty = true;
     Ok(())
 }
@@ -399,12 +450,14 @@ async fn refresh_public_surface_registry_from_pending_transaction_view(
 fn apply_buffered_write_planning_effects(
     execution: &CompiledExecution,
     public_surface_registry: &mut SurfaceRegistry,
+    public_surface_registry_generation: &mut u64,
     public_surface_registry_dirty: &mut bool,
     active_version_id: &mut String,
 ) -> Result<(), LixError> {
     if let Some(public_write) = execution.public_write() {
         let mutations = public_surface_registry_mutations(public_write)?;
         if apply_public_surface_registry_mutations(public_surface_registry, &mutations)? {
+            *public_surface_registry_generation += 1;
             *public_surface_registry_dirty = true;
         }
         if let Some(next_active_version_id) =

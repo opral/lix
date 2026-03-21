@@ -981,21 +981,21 @@ pub(crate) async fn load_directory_descriptors_by_parent_name_pairs(
     if pairs.is_empty() {
         return Ok(Vec::new());
     }
-    load_scoped_descriptor_rows_for_keys(
-        backend,
-        &tracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
-        FILESYSTEM_DIRECTORY_SCHEMA_KEY,
-        &visible_directory_descriptor_rows_for_pairs_sql(backend.dialect(), version_id, pairs),
-        &visible_directory_descriptor_rows_for_pairs_sql(
-            backend.dialect(),
-            GLOBAL_VERSION_ID,
-            pairs,
-        ),
-        version_id,
-        scope,
-        |row| (row.parent_id.clone(), row.name.clone()),
-    )
-    .await
+    let mut rows = Vec::with_capacity(pairs.len());
+    for (parent_id, name) in pairs {
+        if let Some(row) = load_directory_descriptor_by_parent_and_name(
+            backend,
+            version_id,
+            parent_id.as_deref(),
+            name,
+            scope,
+        )
+        .await?
+        {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
 }
 
 pub(crate) async fn load_file_descriptors_by_directory_name_extension_triplets(
@@ -1007,27 +1007,22 @@ pub(crate) async fn load_file_descriptors_by_directory_name_extension_triplets(
     if triplets.is_empty() {
         return Ok(Vec::new());
     }
-    load_scoped_descriptor_rows_for_keys(
-        backend,
-        &tracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY),
-        FILESYSTEM_FILE_SCHEMA_KEY,
-        &visible_file_descriptor_rows_for_triplets_sql(backend.dialect(), version_id, triplets),
-        &visible_file_descriptor_rows_for_triplets_sql(
-            backend.dialect(),
-            GLOBAL_VERSION_ID,
-            triplets,
-        ),
-        version_id,
-        scope,
-        |row| {
-            (
-                row.directory_id.clone(),
-                row.name.clone(),
-                row.extension.clone().filter(|value| !value.is_empty()),
-            )
-        },
-    )
-    .await
+    let mut rows = Vec::with_capacity(triplets.len());
+    for (directory_id, name, extension) in triplets {
+        if let Some(row) = load_file_descriptor_by_path_components(
+            backend,
+            version_id,
+            directory_id.as_deref(),
+            name,
+            extension.as_deref(),
+            scope,
+        )
+        .await?
+        {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
 }
 
 async fn load_directory_descriptor_by_id(
@@ -1036,14 +1031,16 @@ async fn load_directory_descriptor_by_id(
     directory_id: &str,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
-    let sql = effective_directory_descriptor_sql(
-        backend.dialect(),
+    load_scoped_descriptor_row(
+        backend,
+        &tracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
+        FILESYSTEM_DIRECTORY_SCHEMA_KEY,
         &format!("entity_id = '{}'", escape_sql_string(directory_id)),
         &format!("entity_id = '{}'", escape_sql_string(directory_id)),
         version_id,
         scope,
-    );
-    load_effective_descriptor_row(backend, &sql).await
+    )
+    .await
 }
 
 async fn load_directory_descriptor_by_parent_and_name(
@@ -1081,14 +1078,16 @@ async fn load_file_descriptor_by_id(
     file_id: &str,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
-    let sql = effective_file_descriptor_sql(
-        backend.dialect(),
+    load_scoped_descriptor_row(
+        backend,
+        &tracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY),
+        FILESYSTEM_FILE_SCHEMA_KEY,
         &format!("entity_id = '{}'", escape_sql_string(file_id)),
         &format!("entity_id = '{}'", escape_sql_string(file_id)),
         version_id,
         scope,
-    );
-    load_effective_descriptor_row(backend, &sql).await
+    )
+    .await
 }
 
 async fn load_file_descriptor_by_path_components(
@@ -1283,15 +1282,45 @@ async fn load_scoped_descriptor_row(
         .await;
     }
 
-    let sql = merged_visible_descriptor_sql(
-        backend.dialect(),
+    if let Some(local_row) = load_visible_descriptor_row_for_version(
+        backend,
         tracked_table,
         schema_key,
         tracked_base_predicate,
         untracked_base_predicate,
         version_id,
-    );
-    load_effective_descriptor_row(backend, &sql).await
+    )
+    .await?
+    {
+        return Ok(Some(local_row));
+    }
+
+    let Some(global_row) = load_visible_descriptor_row_for_version(
+        backend,
+        tracked_table,
+        schema_key,
+        tracked_base_predicate,
+        untracked_base_predicate,
+        GLOBAL_VERSION_ID,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    if version_has_tombstone_for_entity(
+        backend,
+        tracked_table,
+        schema_key,
+        version_id,
+        &global_row.id,
+    )
+    .await?
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(global_row))
 }
 
 async fn load_scoped_descriptor_rows_for_keys<K, F>(

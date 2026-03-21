@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::engine::{
@@ -8,14 +8,18 @@ use crate::functions::SharedFunctionProvider;
 use crate::schema::registry::{
     coalesce_live_table_requirements, ensure_schema_live_table_with_requirement_in_transaction,
 };
+use crate::sql::ast::utils::{
+    bind_statement_binding_template, compile_statement_binding_template_with_state,
+    PlaceholderState, StatementBindingTemplate,
+};
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::contracts::executor_error::ExecutorError;
 use crate::sql::execution::contracts::planned_statement::{
     MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
 use crate::sql::execution::contracts::prepared_statement::PreparedStatement;
+use crate::sql::execution::contracts::requirements::PlanRequirements;
 use crate::sql::execution::contracts::result_contract::ResultContract;
-use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path::{
     self, PendingPublicCommitSession, PendingTransactionView,
 };
@@ -24,11 +28,11 @@ use crate::sql::execution::write_txn_runner::{
     run_txn_delta_with_transaction, stamp_watermark_before_commit,
 };
 use crate::sql::public::catalog::SurfaceRegistry;
-use crate::sql::public::runtime::PreparedPublicRead;
-use crate::state::internal::followup::execute_internal_postprocess_with_transaction;
-use crate::state::internal::script::{
-    coalesce_vtable_inserts_in_transactions, prepare_statement_script_sql_statements,
+use crate::sql::public::runtime::{
+    classify_public_execution_route_with_registry, PreparedPublicRead, PublicExecutionRoute,
 };
+use crate::state::internal::followup::execute_internal_postprocess_with_transaction;
+use crate::state::internal::script::coalesce_vtable_inserts_in_transactions;
 use crate::state::internal::PostprocessPlan;
 use crate::state::stream::StateCommitStreamChange;
 use crate::{ExecuteResult, LixError, LixTransaction, QueryResult, SqlDialect, Value};
@@ -42,6 +46,7 @@ pub(crate) struct ExecutionProgram {
 pub(crate) struct ExecutionContext {
     pub(crate) options: ExecuteOptions,
     pub(crate) public_surface_registry: SurfaceRegistry,
+    pub(crate) public_surface_registry_generation: u64,
     pub(crate) active_version_id: String,
     pub(crate) active_version_changed: bool,
     pub(crate) installed_plugins_cache_invalidation_pending: bool,
@@ -50,6 +55,7 @@ pub(crate) struct ExecutionContext {
     pub(crate) observe_tick_already_emitted: bool,
     pub(crate) pending_public_commit_session: Option<PendingPublicCommitSession>,
     pub(crate) mutation_journal: crate::sql::execution::write_txn_plan::MutationJournal,
+    pub(crate) statement_template_cache: BTreeMap<StatementTemplateCacheKey, StatementTemplate>,
 }
 
 impl ExecutionContext {
@@ -61,6 +67,7 @@ impl ExecutionContext {
         Self {
             options,
             public_surface_registry,
+            public_surface_registry_generation: 0,
             active_version_id,
             active_version_changed: false,
             installed_plugins_cache_invalidation_pending: false,
@@ -69,7 +76,12 @@ impl ExecutionContext {
             observe_tick_already_emitted: false,
             pending_public_commit_session: None,
             mutation_journal: Default::default(),
+            statement_template_cache: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn bump_public_surface_registry_generation(&mut self) {
+        self.public_surface_registry_generation += 1;
     }
 }
 
@@ -79,8 +91,162 @@ enum ExecutionProgramStep {
 }
 
 struct ExecutionProgramStatement {
+    bound_template: BoundStatementTemplateInstance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatementTemplateOwnership {
+    PublicRead,
+    PublicWrite,
+    Internal,
+}
+
+#[derive(Clone)]
+pub(crate) struct StatementTemplate {
+    binding_template: StatementBindingTemplate,
+    ownership_hint: Option<StatementTemplateOwnership>,
+    plan_requirements: PlanRequirements,
+    requires_generated_filesystem_insert_id: bool,
+}
+
+impl StatementTemplate {
+    pub(crate) fn compile(
+        statement: Statement,
+        dialect: SqlDialect,
+        params_len: usize,
+        placeholder_state: PlaceholderState,
+    ) -> Result<(Self, PlaceholderState), LixError> {
+        Self::build(statement, None, dialect, params_len, placeholder_state)
+    }
+
+    pub(crate) fn compile_with_registry(
+        statement: Statement,
+        registry: &SurfaceRegistry,
+        dialect: SqlDialect,
+        params_len: usize,
+    ) -> Result<Self, LixError> {
+        let ownership_hint = Some(
+            match classify_public_execution_route_with_registry(
+                registry,
+                std::slice::from_ref(&statement),
+            ) {
+                Some(PublicExecutionRoute::Read) => StatementTemplateOwnership::PublicRead,
+                Some(PublicExecutionRoute::Write) => StatementTemplateOwnership::PublicWrite,
+                None => StatementTemplateOwnership::Internal,
+            },
+        );
+        let (template, _) = Self::build(
+            statement,
+            ownership_hint,
+            dialect,
+            params_len,
+            PlaceholderState::new(),
+        )?;
+        Ok(template)
+    }
+
+    fn build(
+        statement: Statement,
+        ownership_hint: Option<StatementTemplateOwnership>,
+        dialect: SqlDialect,
+        params_len: usize,
+        placeholder_state: PlaceholderState,
+    ) -> Result<(Self, PlaceholderState), LixError> {
+        let binding_template = compile_statement_binding_template_with_state(
+            &statement,
+            params_len,
+            dialect,
+            placeholder_state,
+        )?;
+        let next_placeholder_state = binding_template.state.clone();
+        Ok((
+            Self {
+                binding_template,
+                plan_requirements:
+                    crate::sql::execution::derive_requirements::derive_plan_requirements(
+                        std::slice::from_ref(&statement),
+                    ),
+                requires_generated_filesystem_insert_id:
+                    crate::filesystem::statements_require_generated_filesystem_insert_ids(
+                        std::slice::from_ref(&statement),
+                    ),
+                ownership_hint,
+            },
+            next_placeholder_state,
+        ))
+    }
+
+    pub(crate) fn bind(
+        &self,
+        params: &[Value],
+    ) -> Result<BoundStatementTemplateInstance, LixError> {
+        let bound = bind_statement_binding_template(&self.binding_template, params)?;
+        Ok(BoundStatementTemplateInstance {
+            statement: bound.statement,
+            params: bound.params,
+            ownership_hint: self.ownership_hint,
+            plan_requirements: self.plan_requirements.clone(),
+            requires_generated_filesystem_insert_id: self.requires_generated_filesystem_insert_id,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct BoundStatementTemplateInstance {
     statement: Statement,
     params: Vec<Value>,
+    ownership_hint: Option<StatementTemplateOwnership>,
+    plan_requirements: PlanRequirements,
+    requires_generated_filesystem_insert_id: bool,
+}
+
+impl BoundStatementTemplateInstance {
+    pub(crate) fn statement(&self) -> &Statement {
+        &self.statement
+    }
+
+    pub(crate) fn params(&self) -> &[Value] {
+        &self.params
+    }
+
+    pub(crate) fn ownership_hint(&self) -> Option<StatementTemplateOwnership> {
+        self.ownership_hint
+    }
+
+    pub(crate) fn plan_requirements(&self) -> &PlanRequirements {
+        &self.plan_requirements
+    }
+
+    pub(crate) fn requires_generated_filesystem_insert_id(&self) -> bool {
+        self.requires_generated_filesystem_insert_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct StatementTemplateCacheKey {
+    sql: String,
+    dialect: u8,
+    allow_internal_tables: bool,
+    public_surface_registry_generation: u64,
+}
+
+impl StatementTemplateCacheKey {
+    pub(crate) fn new(
+        sql: &str,
+        dialect: SqlDialect,
+        allow_internal_tables: bool,
+        public_surface_registry_generation: u64,
+    ) -> Self {
+        Self {
+            sql: sql.to_string(),
+            dialect: match dialect {
+                SqlDialect::Sqlite => 1,
+                SqlDialect::Postgres => 2,
+            },
+            allow_internal_tables,
+            public_surface_registry_generation,
+        }
+    }
 }
 
 impl ExecutionProgram {
@@ -90,36 +256,20 @@ impl ExecutionProgram {
         dialect: SqlDialect,
     ) -> Result<Self, LixError> {
         let source_statements = coalesce_vtable_inserts_in_transactions(original_statements)?;
-        let bound_statements =
-            prepare_statement_script_sql_statements(source_statements.clone(), params, dialect)?;
-        if source_statements.len() != bound_statements.len() {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "execution program compilation produced a mismatched statement count"
-                    .to_string(),
-            });
-        }
-
         let mut steps = Vec::with_capacity(source_statements.len());
-        for (statement, (sql, params)) in source_statements.iter().cloned().zip(bound_statements) {
+        let mut placeholder_state = PlaceholderState::new();
+        for statement in source_statements.iter().cloned() {
             if is_transaction_control(&statement) {
                 steps.push(ExecutionProgramStep::TransactionControl);
                 continue;
             }
 
-            let parsed = parse_sql(&sql).map_err(LixError::from)?;
-            let [statement] = parsed.as_slice() else {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
-                        "execution program step compilation expected exactly one statement, got {}",
-                        parsed.len()
-                    ),
-                });
-            };
+            let (template, next_placeholder_state) =
+                StatementTemplate::compile(statement, dialect, params.len(), placeholder_state)?;
+            let bound_template = template.bind(params)?;
+            placeholder_state = next_placeholder_state;
             steps.push(ExecutionProgramStep::Statement(ExecutionProgramStatement {
-                statement: statement.clone(),
-                params,
+                bound_template,
             }));
         }
 
@@ -301,10 +451,9 @@ pub(crate) async fn execute_execution_program_with_transaction(
             ExecutionProgramStep::TransactionControl => {}
             ExecutionProgramStep::Statement(step) => {
                 let result = engine
-                    .execute_with_options_in_transaction(
+                    .execute_bound_statement_template_instance_in_transaction(
                         transaction,
-                        &step.statement.to_string(),
-                        &step.params,
+                        &step.bound_template,
                         allow_internal_tables,
                         context,
                         None,
