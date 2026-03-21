@@ -1,8 +1,7 @@
 use sqlparser::ast::{Expr, Insert, SetExpr, Statement, TableObject, Value as SqlAstValue};
 
 use crate::sql::ast::walk::object_name_matches;
-use crate::state::internal::bind_once::bind_script_placeholders_once;
-use crate::{LixError, SqlDialect, Value};
+use crate::{LixError, Value};
 
 pub(crate) fn extract_explicit_transaction_script_from_statements(
     statements: &[Statement],
@@ -79,21 +78,6 @@ pub(crate) fn coalesce_vtable_inserts_in_transactions(
 
     flush_pending_insert(&mut result, &mut pending_insert);
     Ok(result)
-}
-
-pub(crate) fn prepare_statement_script_sql_statements(
-    original_statements: Vec<Statement>,
-    params: &[Value],
-    dialect: SqlDialect,
-) -> Result<Vec<(String, Vec<Value>)>, LixError> {
-    if params.is_empty() {
-        return Ok(original_statements
-            .into_iter()
-            .map(|statement| (statement.to_string(), Vec::new()))
-            .collect());
-    }
-
-    bind_script_placeholders_once(&original_statements, params, dialect).map_err(LixError::from)
 }
 
 fn flush_pending_insert(result: &mut Vec<Statement>, pending_insert: &mut Option<Insert>) {
