@@ -171,12 +171,6 @@ pub(crate) fn requires_single_statement_postprocess(plan: Option<&PostprocessPla
     matches!(plan, Some(PostprocessPlan::VtableDelete(_)))
 }
 
-pub(crate) fn requires_single_statement_internal_state_plan(
-    plan: Option<&InternalStatePlan>,
-) -> bool {
-    requires_single_statement_postprocess(plan.and_then(|plan| plan.postprocess.as_ref()))
-}
-
 pub(crate) fn validate_internal_state_plan(
     plan: Option<&InternalStatePlan>,
 ) -> Result<(), LixError> {

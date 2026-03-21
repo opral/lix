@@ -3,31 +3,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::functions::SharedFunctionProvider;
 use crate::sql::execution::contracts::effects::PlanEffects;
+use crate::sql::execution::execution_program::{CompiledExecution, CompiledInternalExecution};
 use crate::sql::execution::runtime_effects::{
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
     FilesystemTransactionFileState, FilesystemTransactionState,
 };
-use crate::sql::execution::shared_path::PreparedExecutionContext;
+use crate::sql::execution::shared_path::PendingTransactionView;
 use crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch;
 use crate::sql::public::runtime::{
-    build_tracked_write_txn_plan, PublicWriteExecutionPartition, TrackedWriteTxnPlan,
-    UntrackedWriteExecution,
+    build_tracked_txn_unit, PublicWriteExecutionPartition, TrackedTxnUnit, UntrackedWriteExecution,
 };
 use crate::LixError;
-
-use super::contracts::execution_plan::ExecutionPlan;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const GLOBAL_VERSION_ID: &str = "global";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WriteTxnRunMode {
-    Owned,
-    Borrowed,
-}
-
 #[derive(Clone)]
-pub(crate) struct PublicUntrackedWriteTxnPlan {
+pub(crate) struct PublicUntrackedTxnUnit {
     pub(crate) execution: UntrackedWriteExecution,
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) functions: SharedFunctionProvider<RuntimeFunctionProvider>,
@@ -37,8 +29,10 @@ pub(crate) struct PublicUntrackedWriteTxnPlan {
 }
 
 #[derive(Clone)]
-pub(crate) struct InternalWriteTxnPlan {
-    pub(crate) plan: ExecutionPlan,
+pub(crate) struct InternalTxnUnit {
+    pub(crate) execution: CompiledInternalExecution,
+    pub(crate) effects: PlanEffects,
+    pub(crate) result_contract: crate::sql::execution::contracts::result_contract::ResultContract,
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) functions: SharedFunctionProvider<RuntimeFunctionProvider>,
     pub(crate) settings: DeterministicSettings,
@@ -47,57 +41,32 @@ pub(crate) struct InternalWriteTxnPlan {
 }
 
 #[derive(Clone)]
-pub(crate) enum WriteTxnUnit {
-    PublicTracked(TrackedWriteTxnPlan),
-    PublicUntracked(PublicUntrackedWriteTxnPlan),
-    Internal(InternalWriteTxnPlan),
+pub(crate) enum TxnMaterializationUnit {
+    PublicTracked(TrackedTxnUnit),
+    PublicUntracked(PublicUntrackedTxnUnit),
+    Internal(InternalTxnUnit),
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct WriteTxnPlan {
-    pub(crate) units: Vec<WriteTxnUnit>,
+pub(crate) struct TxnMaterializationPlan {
+    pub(crate) units: Vec<TxnMaterializationUnit>,
 }
 
-impl WriteTxnPlan {
-    pub(crate) fn extend(&mut self, other: WriteTxnPlan) {
+impl TxnMaterializationPlan {
+    pub(crate) fn extend(&mut self, other: TxnMaterializationPlan) {
         self.units.extend(other.units);
         self.coalesce_filesystem_tracked_units();
-    }
-
-    pub(crate) fn bind_runtime(
-        &mut self,
-        settings: DeterministicSettings,
-        sequence_start: i64,
-        functions: SharedFunctionProvider<RuntimeFunctionProvider>,
-    ) {
-        for unit in &mut self.units {
-            match unit {
-                WriteTxnUnit::PublicTracked(tracked) => {
-                    tracked.functions = functions.clone();
-                }
-                WriteTxnUnit::PublicUntracked(untracked) => {
-                    untracked.settings = settings;
-                    untracked.sequence_start = sequence_start;
-                    untracked.functions = functions.clone();
-                }
-                WriteTxnUnit::Internal(internal) => {
-                    internal.settings = settings;
-                    internal.sequence_start = sequence_start;
-                    internal.functions = functions.clone();
-                }
-            }
-        }
     }
 
     pub(crate) fn coalesce_filesystem_tracked_units(&mut self) {
         let mut coalesced = Vec::with_capacity(self.units.len());
         for unit in std::mem::take(&mut self.units) {
             match unit {
-                WriteTxnUnit::PublicTracked(next)
+                TxnMaterializationUnit::PublicTracked(next)
                     if coalesced
                         .last_mut()
                         .and_then(|current| match current {
-                            WriteTxnUnit::PublicTracked(current) => Some(current),
+                            TxnMaterializationUnit::PublicTracked(current) => Some(current),
                             _ => None,
                         })
                         .is_some_and(|current| {
@@ -111,120 +80,157 @@ impl WriteTxnPlan {
 }
 
 #[derive(Clone)]
-pub(crate) enum TxnOp {
-    WritePlan(WriteTxnPlan),
+pub(crate) struct TxnDelta {
+    materialization_plan: TxnMaterializationPlan,
+    registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
+    semantic_overlay: Option<PendingSemanticOverlay>,
+    filesystem_overlay: Option<PendingFilesystemOverlay>,
+}
+
+impl TxnDelta {
+    pub(crate) fn from_materialization_plan(
+        materialization_plan: TxnMaterializationPlan,
+    ) -> Result<Self, LixError> {
+        let semantic_overlay =
+            pending_semantic_overlay_for_materialization_plan(&materialization_plan)?;
+        let filesystem_overlay =
+            pending_filesystem_overlay_for_materialization_plan(&materialization_plan);
+        let registered_schema_overlay = semantic_overlay
+            .as_ref()
+            .and_then(PendingSemanticOverlay::registered_schema_overlay);
+        Ok(Self {
+            materialization_plan,
+            registered_schema_overlay,
+            semantic_overlay,
+            filesystem_overlay,
+        })
+    }
+
+    pub(crate) fn materialization_plan(&self) -> &TxnMaterializationPlan {
+        &self.materialization_plan
+    }
+
+    pub(crate) fn registered_schema_overlay(&self) -> Option<PendingRegisteredSchemaOverlay> {
+        self.registered_schema_overlay.clone()
+    }
+
+    pub(crate) fn semantic_overlay(&self) -> Option<PendingSemanticOverlay> {
+        self.semantic_overlay.clone()
+    }
+
+    pub(crate) fn filesystem_overlay(&self) -> Option<PendingFilesystemOverlay> {
+        self.filesystem_overlay.clone()
+    }
+
+    pub(crate) fn pending_transaction_view(&self) -> Option<PendingTransactionView> {
+        PendingTransactionView::new(
+            self.registered_schema_overlay(),
+            self.semantic_overlay(),
+            self.filesystem_overlay(),
+        )
+    }
+
+    fn supports_registered_schema_overlay(&self) -> bool {
+        self.registered_schema_overlay.is_some()
+    }
+
+    pub(crate) fn extend(&mut self, incoming: TxnDelta) -> Result<(), LixError> {
+        self.materialization_plan
+            .extend(incoming.materialization_plan);
+        self.semantic_overlay = match (self.semantic_overlay.take(), incoming.semantic_overlay) {
+            (Some(mut current), Some(incoming)) => {
+                merge_pending_semantic_overlay(&mut current, incoming);
+                Some(current)
+            }
+            (Some(current), None) => Some(current),
+            (None, Some(incoming)) => Some(incoming),
+            (None, None) => None,
+        };
+        self.filesystem_overlay =
+            match (self.filesystem_overlay.take(), incoming.filesystem_overlay) {
+                (Some(mut current), Some(incoming)) => {
+                    merge_pending_filesystem_overlay(&mut current, incoming);
+                    Some(current)
+                }
+                (Some(current), None) => Some(current),
+                (None, Some(incoming)) => Some(incoming),
+                (None, None) => None,
+            };
+        self.registered_schema_overlay = self
+            .semantic_overlay
+            .as_ref()
+            .and_then(PendingSemanticOverlay::registered_schema_overlay);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct MutationJournal {
-    ops: Vec<TxnOp>,
+    staged_delta: Option<TxnDelta>,
     continuation_safe: bool,
-    pending_registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
-    pending_semantic_overlay: Option<PendingSemanticOverlay>,
-    pending_filesystem_overlay: Option<PendingFilesystemOverlay>,
 }
 
 impl MutationJournal {
     pub(crate) fn is_empty(&self) -> bool {
-        self.ops.is_empty()
+        self.staged_delta.is_none()
     }
 
-    pub(crate) fn continuation_safe(&self) -> bool {
-        self.continuation_safe
-    }
-
-    pub(crate) fn can_stage_write_plan(&self, plan: &WriteTxnPlan) -> Result<bool, LixError> {
-        let current_supports_registered_schema_overlay =
-            self.pending_registered_schema_overlay.is_some();
+    pub(crate) fn can_stage_delta(&self, delta: &TxnDelta) -> Result<bool, LixError> {
+        let plan = delta.materialization_plan();
+        let current_supports_registered_schema_overlay = self
+            .staged_delta
+            .as_ref()
+            .is_some_and(TxnDelta::supports_registered_schema_overlay);
         if current_supports_registered_schema_overlay {
             return Ok(true);
         }
 
         let incoming_supports_registered_schema_overlay =
-            pending_registered_schema_overlay_for_write_plan(plan)?.is_some();
+            delta.supports_registered_schema_overlay();
 
-        Ok(self.current_write_plan().map_or_else(
+        Ok(self.current_materialization_plan().map_or_else(
             || {
-                write_txn_plan_is_independent_filesystem(plan)
+                txn_materialization_plan_is_independent_filesystem(plan)
                     || incoming_supports_registered_schema_overlay
             },
-            |current| write_txn_plans_can_continue_together(current, plan),
+            |current| txn_materialization_plans_can_continue_together(current, plan),
         ))
     }
 
-    pub(crate) fn stage_write_plan(&mut self, plan: WriteTxnPlan) -> Result<(), LixError> {
-        let continuation_safe = self.can_stage_write_plan(&plan)?;
-        self.apply_plan_to_pending_overlays(&plan)?;
-        match self.ops.first_mut() {
-            Some(TxnOp::WritePlan(current)) => {
-                current.extend(plan);
+    pub(crate) fn stage_delta(&mut self, incoming: TxnDelta) -> Result<(), LixError> {
+        let continuation_safe = self.can_stage_delta(&incoming)?;
+        match self.staged_delta.as_mut() {
+            Some(current) => {
+                current.extend(incoming)?;
                 self.continuation_safe &= continuation_safe;
             }
             None => {
                 self.continuation_safe = continuation_safe;
-                self.ops.push(TxnOp::WritePlan(plan));
+                self.staged_delta = Some(incoming);
             }
         }
         Ok(())
     }
 
-    pub(crate) fn take_staged_write_plan(&mut self) -> Option<WriteTxnPlan> {
-        let plan = match self.ops.pop()? {
-            TxnOp::WritePlan(plan) => plan,
-        };
+    pub(crate) fn take_staged_delta(&mut self) -> Option<TxnDelta> {
+        let delta = self.staged_delta.take()?;
         self.continuation_safe = false;
-        self.pending_registered_schema_overlay = None;
-        self.pending_semantic_overlay = None;
-        self.pending_filesystem_overlay = None;
-        Some(plan)
+        Some(delta)
     }
 
-    pub(crate) fn pending_registered_schema_overlay(
+    pub(crate) fn pending_transaction_view(
         &self,
-    ) -> Result<Option<PendingRegisteredSchemaOverlay>, LixError> {
-        Ok(self.pending_registered_schema_overlay.clone())
-    }
-
-    pub(crate) fn pending_semantic_overlay(
-        &self,
-    ) -> Result<Option<PendingSemanticOverlay>, LixError> {
-        Ok(self.pending_semantic_overlay.clone())
-    }
-
-    pub(crate) fn pending_filesystem_overlay(&self) -> Option<PendingFilesystemOverlay> {
-        self.pending_filesystem_overlay.clone()
-    }
-
-    fn current_write_plan(&self) -> Option<&WriteTxnPlan> {
-        match self.ops.first() {
-            Some(TxnOp::WritePlan(plan)) => Some(plan),
-            None => None,
-        }
-    }
-
-    fn apply_plan_to_pending_overlays(&mut self, plan: &WriteTxnPlan) -> Result<(), LixError> {
-        if self.ops.is_empty() {
-            self.pending_semantic_overlay = pending_semantic_overlay_for_write_plan(plan)?;
-            self.pending_filesystem_overlay = pending_filesystem_overlay_for_write_plan(plan);
-        } else {
-            self.pending_semantic_overlay = match self.pending_semantic_overlay.take() {
-                Some(mut overlay) => {
-                    collect_semantic_overlay_from_plan(plan, &mut overlay)?.then_some(overlay)
-                }
-                None => None,
-            };
-            self.pending_filesystem_overlay = match self.pending_filesystem_overlay.take() {
-                Some(mut overlay) => {
-                    collect_filesystem_overlay_from_plan(plan, &mut overlay).then_some(overlay)
-                }
-                None => None,
-            };
-        }
-        self.pending_registered_schema_overlay = self
-            .pending_semantic_overlay
+    ) -> Result<Option<PendingTransactionView>, LixError> {
+        Ok(self
+            .staged_delta
             .as_ref()
-            .and_then(PendingSemanticOverlay::registered_schema_overlay);
-        Ok(())
+            .and_then(TxnDelta::pending_transaction_view))
+    }
+
+    fn current_materialization_plan(&self) -> Option<&TxnMaterializationPlan> {
+        self.staged_delta
+            .as_ref()
+            .map(TxnDelta::materialization_plan)
     }
 }
 
@@ -336,15 +342,8 @@ impl PendingSemanticOverlay {
     }
 }
 
-pub(crate) fn pending_registered_schema_overlay_for_write_plan(
-    plan: &WriteTxnPlan,
-) -> Result<Option<PendingRegisteredSchemaOverlay>, LixError> {
-    Ok(pending_semantic_overlay_for_write_plan(plan)?
-        .and_then(|overlay| overlay.registered_schema_overlay()))
-}
-
-pub(crate) fn pending_semantic_overlay_for_write_plan(
-    plan: &WriteTxnPlan,
+pub(crate) fn pending_semantic_overlay_for_materialization_plan(
+    plan: &TxnMaterializationPlan,
 ) -> Result<Option<PendingSemanticOverlay>, LixError> {
     let mut overlay = PendingSemanticOverlay::default();
     if !collect_semantic_overlay_from_plan(plan, &mut overlay)? {
@@ -353,8 +352,8 @@ pub(crate) fn pending_semantic_overlay_for_write_plan(
     Ok((!overlay.rows.is_empty()).then_some(overlay))
 }
 
-pub(crate) fn pending_filesystem_overlay_for_write_plan(
-    plan: &WriteTxnPlan,
+pub(crate) fn pending_filesystem_overlay_for_materialization_plan(
+    plan: &TxnMaterializationPlan,
 ) -> Option<PendingFilesystemOverlay> {
     let mut overlay = PendingFilesystemOverlay::default();
     if !collect_filesystem_overlay_from_plan(plan, &mut overlay) {
@@ -363,30 +362,51 @@ pub(crate) fn pending_filesystem_overlay_for_write_plan(
     (!overlay.directory_rows.is_empty() || !overlay.files.is_empty()).then_some(overlay)
 }
 
-pub(crate) fn write_txn_plan_is_independent_filesystem(plan: &WriteTxnPlan) -> bool {
+fn merge_pending_semantic_overlay(
+    current: &mut PendingSemanticOverlay,
+    incoming: PendingSemanticOverlay,
+) {
+    current.rows.extend(incoming.rows);
+}
+
+fn merge_pending_filesystem_overlay(
+    current: &mut PendingFilesystemOverlay,
+    incoming: PendingFilesystemOverlay,
+) {
+    current.directory_rows.extend(incoming.directory_rows);
+    current.files.extend(incoming.files);
+}
+
+pub(crate) fn txn_materialization_plan_is_independent_filesystem(
+    plan: &TxnMaterializationPlan,
+) -> bool {
     !plan.units.is_empty()
         && plan.units.iter().all(|unit| match unit {
-            WriteTxnUnit::PublicTracked(tracked) => tracked_plan_is_coalescible_filesystem(tracked),
-            WriteTxnUnit::PublicUntracked(_) | WriteTxnUnit::Internal(_) => false,
+            TxnMaterializationUnit::PublicTracked(tracked) => {
+                tracked_plan_is_coalescible_filesystem(tracked)
+            }
+            TxnMaterializationUnit::PublicUntracked(_) | TxnMaterializationUnit::Internal(_) => {
+                false
+            }
         })
 }
 
-pub(crate) fn write_txn_plans_can_continue_together(
-    left: &WriteTxnPlan,
-    right: &WriteTxnPlan,
+pub(crate) fn txn_materialization_plans_can_continue_together(
+    left: &TxnMaterializationPlan,
+    right: &TxnMaterializationPlan,
 ) -> bool {
-    if !write_txn_plan_is_independent_filesystem(left)
-        || !write_txn_plan_is_independent_filesystem(right)
+    if !txn_materialization_plan_is_independent_filesystem(left)
+        || !txn_materialization_plan_is_independent_filesystem(right)
     {
         return false;
     }
 
     left.units.iter().all(|left_unit| {
-        let WriteTxnUnit::PublicTracked(left_tracked) = left_unit else {
+        let TxnMaterializationUnit::PublicTracked(left_tracked) = left_unit else {
             return false;
         };
         right.units.iter().all(|right_unit| {
-            let WriteTxnUnit::PublicTracked(right_tracked) = right_unit else {
+            let TxnMaterializationUnit::PublicTracked(right_tracked) = right_unit else {
                 return false;
             };
             filesystem_tracked_plans_are_buffer_compatible(left_tracked, right_tracked)
@@ -394,41 +414,44 @@ pub(crate) fn write_txn_plans_can_continue_together(
     })
 }
 
-pub(crate) fn build_write_txn_plan(
-    prepared: &PreparedExecutionContext,
+pub(crate) fn build_txn_materialization_plan(
+    prepared: &CompiledExecution,
     writer_key: Option<&str>,
-) -> Option<WriteTxnPlan> {
+) -> Option<TxnMaterializationPlan> {
     let mut units = Vec::new();
 
-    if let Some(public_write) = prepared.public_write.as_ref() {
-        if let Some(execution) = public_write.execution.as_ref() {
+    if let Some(public_write) = prepared.public_write() {
+        if let Some(execution) = public_write.materialization() {
             for partition in &execution.partitions {
                 match partition {
                     PublicWriteExecutionPartition::Tracked(tracked) => {
-                        let tracked_plan = build_tracked_write_txn_plan(
-                            public_write,
-                            tracked,
-                            prepared,
-                            writer_key,
-                        );
-                        units.push(WriteTxnUnit::PublicTracked(tracked_plan));
+                        let tracked_plan =
+                            build_tracked_txn_unit(public_write, tracked, prepared, writer_key);
+                        units.push(TxnMaterializationUnit::PublicTracked(tracked_plan));
                     }
                     PublicWriteExecutionPartition::Untracked(untracked) => {
-                        units.push(WriteTxnUnit::PublicUntracked(PublicUntrackedWriteTxnPlan {
-                            execution: untracked.clone(),
-                            filesystem_state: prepared.intent.filesystem_state.clone(),
-                            functions: prepared.functions.clone(),
-                            settings: prepared.settings,
-                            sequence_start: prepared.sequence_start,
-                            writer_key: writer_key.map(str::to_string),
-                        }));
+                        units.push(TxnMaterializationUnit::PublicUntracked(
+                            PublicUntrackedTxnUnit {
+                                execution: untracked.clone(),
+                                filesystem_state: prepared.intent.filesystem_state.clone(),
+                                functions: prepared.functions.clone(),
+                                settings: prepared.settings,
+                                sequence_start: prepared.sequence_start,
+                                writer_key: writer_key.map(str::to_string),
+                            },
+                        ));
                     }
                 }
             }
         }
-    } else if !prepared.plan.requirements.read_only_query {
-        units.push(WriteTxnUnit::Internal(InternalWriteTxnPlan {
-            plan: prepared.plan.clone(),
+    } else if !prepared.read_only_query {
+        let Some(internal_execution) = prepared.internal_execution().cloned() else {
+            return None;
+        };
+        units.push(TxnMaterializationUnit::Internal(InternalTxnUnit {
+            execution: internal_execution,
+            effects: prepared.effects.clone(),
+            result_contract: prepared.result_contract,
             filesystem_state: prepared.intent.filesystem_state.clone(),
             functions: prepared.functions.clone(),
             settings: prepared.settings,
@@ -440,14 +463,23 @@ pub(crate) fn build_write_txn_plan(
     if units.is_empty() {
         None
     } else {
-        let mut plan = WriteTxnPlan { units };
+        let mut plan = TxnMaterializationPlan { units };
         plan.coalesce_filesystem_tracked_units();
         Some(plan)
     }
 }
 
+pub(crate) fn build_txn_delta(
+    prepared: &CompiledExecution,
+    writer_key: Option<&str>,
+) -> Result<Option<TxnDelta>, LixError> {
+    build_txn_materialization_plan(prepared, writer_key)
+        .map(TxnDelta::from_materialization_plan)
+        .transpose()
+}
+
 fn collect_semantic_overlay_from_plan(
-    plan: &WriteTxnPlan,
+    plan: &TxnMaterializationPlan,
     overlay: &mut PendingSemanticOverlay,
 ) -> Result<bool, LixError> {
     if plan.units.is_empty() {
@@ -456,7 +488,7 @@ fn collect_semantic_overlay_from_plan(
 
     for unit in &plan.units {
         let unit_supported = match unit {
-            WriteTxnUnit::PublicTracked(tracked) => {
+            TxnMaterializationUnit::PublicTracked(tracked) => {
                 !filesystem_transaction_state_has_binary_payloads(&tracked.filesystem_state)
                     && tracked
                         .public_writes
@@ -468,7 +500,7 @@ fn collect_semantic_overlay_from_plan(
                             collect_semantic_overlay_from_public_write(public_write, overlay)
                         })?
             }
-            WriteTxnUnit::PublicUntracked(untracked) => {
+            TxnMaterializationUnit::PublicUntracked(untracked) => {
                 untracked.filesystem_state.files.is_empty()
                     && collect_semantic_overlay_from_planned_rows(
                         untracked.execution.intended_post_state.iter(),
@@ -476,14 +508,14 @@ fn collect_semantic_overlay_from_plan(
                         overlay,
                     )?
             }
-            WriteTxnUnit::Internal(internal) => {
+            TxnMaterializationUnit::Internal(internal) => {
                 internal.filesystem_state.files.is_empty()
-                    && internal.plan.preprocess.internal_state.is_none()
+                    && internal.execution.postprocess.is_none()
                     && collect_semantic_overlay_from_mutation_rows(
-                        &internal.plan.preprocess.mutations,
+                        &internal.execution.mutations,
                         overlay,
                     )?
-                    && internal.plan.preprocess.update_validations.is_empty()
+                    && internal.execution.update_validations.is_empty()
             }
         };
 
@@ -496,7 +528,7 @@ fn collect_semantic_overlay_from_plan(
 }
 
 fn collect_filesystem_overlay_from_plan(
-    plan: &WriteTxnPlan,
+    plan: &TxnMaterializationPlan,
     overlay: &mut PendingFilesystemOverlay,
 ) -> bool {
     if plan.units.is_empty() {
@@ -506,10 +538,12 @@ fn collect_filesystem_overlay_from_plan(
     let mut saw_entry = false;
     for unit in &plan.units {
         let unit_supported = match unit {
-            WriteTxnUnit::PublicTracked(tracked) => {
+            TxnMaterializationUnit::PublicTracked(tracked) => {
                 collect_filesystem_overlay_from_tracked_plan(tracked, overlay, &mut saw_entry)
             }
-            WriteTxnUnit::PublicUntracked(_) | WriteTxnUnit::Internal(_) => false,
+            TxnMaterializationUnit::PublicUntracked(_) | TxnMaterializationUnit::Internal(_) => {
+                false
+            }
         };
         if !unit_supported {
             return false;
@@ -520,7 +554,7 @@ fn collect_filesystem_overlay_from_plan(
 }
 
 fn collect_filesystem_overlay_from_tracked_plan(
-    tracked: &TrackedWriteTxnPlan,
+    tracked: &TrackedTxnUnit,
     overlay: &mut PendingFilesystemOverlay,
     saw_entry: &mut bool,
 ) -> bool {
@@ -781,10 +815,7 @@ fn collect_semantic_overlay_from_mutation_rows(
     Ok(true)
 }
 
-fn try_merge_filesystem_tracked_plans(
-    current: &mut TrackedWriteTxnPlan,
-    next: &TrackedWriteTxnPlan,
-) -> bool {
+fn try_merge_filesystem_tracked_plans(current: &mut TrackedTxnUnit, next: &TrackedTxnUnit) -> bool {
     if !filesystem_tracked_plans_are_buffer_compatible(current, next) {
         return false;
     }
@@ -815,8 +846,8 @@ fn try_merge_filesystem_tracked_plans(
 }
 
 fn filesystem_tracked_plans_are_buffer_compatible(
-    current: &TrackedWriteTxnPlan,
-    next: &TrackedWriteTxnPlan,
+    current: &TrackedTxnUnit,
+    next: &TrackedTxnUnit,
 ) -> bool {
     if !tracked_plan_is_coalescible_filesystem(current)
         || !tracked_plan_is_coalescible_filesystem(next)
@@ -847,7 +878,7 @@ fn filesystem_tracked_plans_are_buffer_compatible(
         && tracked_plan_entity_targets_disjoint(current, next)
 }
 
-fn tracked_plan_is_coalescible_filesystem(plan: &TrackedWriteTxnPlan) -> bool {
+fn tracked_plan_is_coalescible_filesystem(plan: &TrackedTxnUnit) -> bool {
     matches!(
         plan.public_write
             .planned_write
@@ -881,10 +912,7 @@ fn create_commit_expected_head_compatible(
     }
 }
 
-fn tracked_plan_entity_targets_disjoint(
-    left: &TrackedWriteTxnPlan,
-    right: &TrackedWriteTxnPlan,
-) -> bool {
+fn tracked_plan_entity_targets_disjoint(left: &TrackedTxnUnit, right: &TrackedTxnUnit) -> bool {
     let left_targets = tracked_plan_entity_targets(left);
     let right_targets = tracked_plan_entity_targets(right);
     left_targets.is_disjoint(&right_targets)
@@ -902,7 +930,7 @@ fn merge_plan_effects(current: &mut PlanEffects, next: &PlanEffects) {
         .extend(next.file_cache_refresh_targets.clone());
 }
 
-fn tracked_plan_entity_targets(plan: &TrackedWriteTxnPlan) -> BTreeSet<(String, String, String)> {
+fn tracked_plan_entity_targets(plan: &TrackedTxnUnit) -> BTreeSet<(String, String, String)> {
     let mut targets = BTreeSet::new();
     if let Some(batch) = plan.execution.domain_change_batch.as_ref() {
         for change in &batch.changes {

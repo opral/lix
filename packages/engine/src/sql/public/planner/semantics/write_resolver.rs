@@ -7,20 +7,27 @@ use crate::schema::live_store::{
     load_exact_live_row_with_executor, load_untracked_live_rows_by_property_with_executor,
     LiveRowScope,
 };
+use crate::sql::execution::shared_path::{
+    bootstrap_public_surface_registry_with_pending_transaction_view,
+    execute_prepared_public_read_with_pending_transaction_view, PendingTransactionView,
+};
 use crate::sql::public::catalog::SurfaceFamily;
 use crate::sql::public::planner::ir::{
-    InsertOnConflictAction, MutationPayload, PlannedStateRow, PlannedWrite, ResolvedRowRef,
-    ResolvedWritePartition, ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, TargetSetProof,
-    WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
+    CanonicalStateSelector, InsertOnConflictAction, MutationPayload, PlannedStateRow, PlannedWrite,
+    ResolvedRowRef, ResolvedWritePartition, ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof,
+    TargetSetProof, WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
 };
 use crate::sql::public::planner::semantics::effective_state_resolver::{
-    resolve_exact_effective_state_row, ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
+    ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
 };
 use crate::sql::public::planner::semantics::filesystem_assignments::FilesystemAssignmentsError;
 use crate::sql::public::planner::semantics::filesystem_planning::FilesystemPlanningError;
 use crate::sql::public::planner::semantics::filesystem_queries::FilesystemQueryError;
 use crate::sql::public::planner::semantics::state_assignments::StateAssignmentsError;
-use crate::sql::public::planner::semantics::surface_semantics::OverlayLane;
+use crate::sql::public::planner::semantics::surface_semantics::{
+    public_selector_column_name, public_selector_version_column, OverlayLane,
+};
+use crate::sql::public::runtime::try_prepare_public_read_with_registry_and_internal_access;
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
     active_version_schema_version, active_version_snapshot_content,
@@ -31,16 +38,20 @@ use crate::version::{
     version_ref_schema_version, version_ref_snapshot_content, version_ref_storage_version_id,
     GLOBAL_VERSION_ID,
 };
-use crate::{LixBackend, Value};
+use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
+use sqlparser::ast::helpers::attached_token::AttachedToken;
+use sqlparser::ast::{
+    BinaryOperator, Expr, GroupByExpr, Ident, ObjectName, ObjectNamePart, Query, Select,
+    SelectFlavor, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value as SqlValue,
+    ValueWithSpan,
+};
 use std::collections::BTreeMap;
 
 mod filesystem_writes;
-mod selector_queries;
 mod state_backed_writes;
 
 use filesystem_writes::resolve_filesystem_write;
-use selector_queries::query_text_selector_values_for_write_selector;
 use state_backed_writes::{resolve_entity_write, resolve_state_write};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,12 +201,19 @@ impl ResolvedWritePlanBuilder {
 pub(crate) async fn resolve_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let resolved = match planned_write.command.target.descriptor.surface_family {
-        SurfaceFamily::State => resolve_state_write(backend, planned_write).await,
-        SurfaceFamily::Entity => resolve_entity_write(backend, planned_write).await,
+        SurfaceFamily::State => {
+            resolve_state_write(backend, planned_write, pending_transaction_view).await
+        }
+        SurfaceFamily::Entity => {
+            resolve_entity_write(backend, planned_write, pending_transaction_view).await
+        }
         SurfaceFamily::Admin => resolve_admin_write(backend, planned_write).await,
-        SurfaceFamily::Filesystem => resolve_filesystem_write(backend, planned_write).await,
+        SurfaceFamily::Filesystem => {
+            resolve_filesystem_write(backend, planned_write, pending_transaction_view).await
+        }
         SurfaceFamily::Change => Err(WriteResolveError {
             message: format!(
                 "public write resolver does not support '{}' writes",
@@ -316,6 +334,7 @@ async fn resolve_active_version_update_write_plan(
     let matching_ids = query_text_selector_values_for_write_selector(
         backend,
         planned_write,
+        None,
         "id",
         "public active-version selector resolver expected id text rows",
     )
@@ -456,6 +475,7 @@ async fn resolve_active_account_delete_write_plan(
     let matching_account_ids = query_text_selector_values_for_write_selector(
         backend,
         planned_write,
+        None,
         "account_id",
         "public active-account selector resolver expected account_id text rows",
     )
@@ -739,6 +759,7 @@ async fn resolve_existing_version_write(
     let version_ids = query_text_selector_values_for_write_selector(
         backend,
         planned_write,
+        None,
         "id",
         "public version selector resolver expected id text rows",
     )
@@ -1487,6 +1508,227 @@ fn write_resolve_to_lix_error(error: WriteResolveError) -> crate::LixError {
     crate::LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: error.message,
+    }
+}
+
+pub(super) async fn query_text_selector_values_for_write_selector(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    selector_column: &str,
+    error_message: &str,
+) -> Result<Vec<String>, WriteResolveError> {
+    let selector = canonical_state_selector(planned_write);
+    let query_result = execute_public_selector_query_strict(
+        backend,
+        planned_write,
+        pending_transaction_view,
+        build_public_selector_query(
+            &planned_write.command.target.descriptor.public_name,
+            &selector,
+            &[selector_column],
+        ),
+    )
+    .await
+    .map_err(write_resolve_backend_error)?;
+
+    let mut values = Vec::new();
+    for row in query_result.rows {
+        let Some(value) = row.first().and_then(text_from_value) else {
+            return Err(WriteResolveError {
+                message: error_message.to_string(),
+            });
+        };
+        if !values.iter().any(|existing| existing == &value) {
+            values.push(value);
+        }
+    }
+    Ok(values)
+}
+
+pub(super) fn canonical_state_selector(planned_write: &PlannedWrite) -> CanonicalStateSelector {
+    let predicates = if planned_write.command.selector.exact_only {
+        exact_selector_predicates(planned_write)
+            .unwrap_or_else(|| planned_write.command.selector.residual_predicates.clone())
+    } else {
+        planned_write.command.selector.residual_predicates.clone()
+    };
+    let version_column = planned_write
+        .command
+        .target
+        .implicit_overrides
+        .expose_version_id
+        .then(|| {
+            public_selector_version_column(planned_write.command.target.descriptor.surface_family)
+                .to_string()
+        });
+    CanonicalStateSelector {
+        predicates,
+        version_column,
+    }
+}
+
+pub(super) async fn execute_public_selector_query_strict(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    query: Query,
+) -> Result<QueryResult, LixError> {
+    if pending_transaction_view.is_none() {
+        return crate::sql::public::runtime::execute_public_read_query_strict(
+            backend,
+            query,
+            &planned_write.command.bound_parameters,
+        )
+        .await;
+    }
+
+    let registry = bootstrap_public_surface_registry_with_pending_transaction_view(
+        backend,
+        pending_transaction_view,
+    )
+    .await?;
+    let active_version_id = planned_write
+        .command
+        .execution_context
+        .requested_version_id
+        .as_deref()
+        .unwrap_or(GLOBAL_VERSION_ID);
+    let statement = Statement::Query(Box::new(query));
+    let prepared = try_prepare_public_read_with_registry_and_internal_access(
+        backend,
+        &registry,
+        &[statement],
+        &planned_write.command.bound_parameters,
+        active_version_id,
+        planned_write
+            .command
+            .execution_context
+            .writer_key
+            .as_deref(),
+        false,
+    )
+    .await?;
+    let Some(public_read) = prepared else {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "public write selector resolver expected a public read plan",
+        ));
+    };
+    execute_prepared_public_read_with_pending_transaction_view(
+        backend,
+        pending_transaction_view,
+        &public_read,
+    )
+    .await
+}
+
+fn exact_selector_predicates(planned_write: &PlannedWrite) -> Option<Vec<Expr>> {
+    let mut predicates = Vec::with_capacity(planned_write.command.selector.exact_filters.len());
+    for (column, value) in &planned_write.command.selector.exact_filters {
+        let public_column = public_selector_column_name(
+            planned_write.command.target.descriptor.surface_family,
+            column,
+        )?;
+        predicates.push(Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new(public_column))),
+            op: BinaryOperator::Eq,
+            right: Box::new(engine_value_to_sql_expr(value)),
+        });
+    }
+    Some(predicates)
+}
+
+fn engine_value_to_sql_expr(value: &Value) -> Expr {
+    match value {
+        Value::Null => Expr::Value(ValueWithSpan::from(SqlValue::Null)),
+        Value::Boolean(value) => Expr::Value(ValueWithSpan::from(SqlValue::Boolean(*value))),
+        Value::Text(value) => Expr::Value(ValueWithSpan::from(SqlValue::SingleQuotedString(
+            value.clone(),
+        ))),
+        Value::Json(value) => Expr::Value(ValueWithSpan::from(SqlValue::SingleQuotedString(
+            value.to_string(),
+        ))),
+        Value::Integer(value) => Expr::Value(ValueWithSpan::from(SqlValue::Number(
+            value.to_string(),
+            false,
+        ))),
+        Value::Real(value) => Expr::Value(ValueWithSpan::from(SqlValue::Number(
+            value.to_string(),
+            false,
+        ))),
+        Value::Blob(value) => Expr::Value(ValueWithSpan::from(
+            SqlValue::SingleQuotedByteStringLiteral(String::from_utf8_lossy(value).to_string()),
+        )),
+    }
+}
+
+fn build_public_selector_query(
+    surface_name: &str,
+    selector: &CanonicalStateSelector,
+    selector_columns: &[&str],
+) -> Query {
+    let selection = selector
+        .predicates
+        .iter()
+        .cloned()
+        .reduce(|left, right| Expr::BinaryOp {
+            left: Box::new(left),
+            op: BinaryOperator::And,
+            right: Box::new(right),
+        });
+
+    Query {
+        with: None,
+        body: Box::new(SetExpr::Select(Box::new(Select {
+            select_token: AttachedToken::empty(),
+            distinct: None,
+            top: None,
+            top_before_distinct: false,
+            projection: selector_columns
+                .iter()
+                .map(|column| SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(*column))))
+                .collect(),
+            exclude: None,
+            into: None,
+            from: vec![TableWithJoins {
+                relation: TableFactor::Table {
+                    name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(surface_name))]),
+                    alias: None,
+                    args: None,
+                    with_hints: vec![],
+                    version: None,
+                    with_ordinality: false,
+                    partitions: vec![],
+                    json_path: None,
+                    sample: None,
+                    index_hints: vec![],
+                },
+                joins: Vec::new(),
+            }],
+            lateral_views: Vec::new(),
+            prewhere: None,
+            selection,
+            group_by: GroupByExpr::Expressions(Vec::new(), Vec::new()),
+            cluster_by: Vec::new(),
+            distribute_by: Vec::new(),
+            sort_by: Vec::new(),
+            having: None,
+            named_window: Vec::new(),
+            qualify: None,
+            window_before_qualify: false,
+            value_table_mode: None,
+            connect_by: None,
+            flavor: SelectFlavor::Standard,
+        }))),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
     }
 }
 

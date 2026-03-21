@@ -1210,8 +1210,8 @@ mod tests {
 
     #[test]
     fn rejects_empty_domain_change_entity_id() {
-        let error =
-            crate::EntityId::try_from("").expect_err("expected empty entity_id constructor error");
+        let error = crate::EntityId::try_from("")
+            .expect_err("expected empty entity_id to be rejected before commit generation");
         assert!(
             error.description.contains("entity_id must be non-empty"),
             "unexpected error: {}",

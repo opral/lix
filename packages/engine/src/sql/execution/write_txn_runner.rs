@@ -1,68 +1,54 @@
 use std::collections::BTreeSet;
 
+use crate::deterministic_mode::DeterministicSettings;
 use crate::engine::Engine;
 use crate::functions::LixFunctionProvider;
 use crate::schema::live_layout::{normalized_live_column_values, untracked_live_table_name};
 use crate::schema::registry::{
-    ensure_schema_live_table_in_transaction, load_live_table_layout_in_transaction,
+    coalesce_live_table_requirements, ensure_schema_live_table_in_transaction,
+    ensure_schema_live_table_with_requirement_in_transaction,
+    load_live_table_layout_in_transaction,
 };
 use crate::sql::execution::contracts::effects::PlanEffects;
-use crate::sql::execution::execute::{self, SqlExecutionOutcome};
+use crate::sql::execution::execution_program::{
+    execute_internal_execution_with_transaction, SqlExecutionOutcome,
+};
 use crate::sql::execution::runtime_effects::build_filesystem_payload_domain_changes_insert;
 use crate::sql::execution::shared_path::{
-    empty_public_write_execution_outcome, PendingPublicCommitSession,
+    apply_public_version_last_checkpoint_side_effects, build_pending_public_commit_session,
+    create_commit_error_to_lix_error, empty_public_write_execution_outcome,
+    merge_public_domain_change_batch_into_pending_commit,
+    mirror_public_registered_schema_bootstrap_rows, pending_session_matches_create_commit,
+    PendingPublicCommitSession, PublicCommitInvariantChecker,
 };
-use crate::sql::execution::tracked_write_runner::run_tracked_write_txn_plan_with_transaction;
 use crate::sql::execution::write_txn_plan::{
-    InternalWriteTxnPlan, PublicUntrackedWriteTxnPlan, WriteTxnPlan, WriteTxnRunMode, WriteTxnUnit,
+    InternalTxnUnit, PublicUntrackedTxnUnit, TxnDelta, TxnMaterializationUnit,
 };
+use crate::sql::public::planner::ir::WriteLane;
+use crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch;
 use crate::sql::storage::sql_text::escape_sql_string;
+use crate::state::commit::{
+    create_commit, CreateCommitArgs, CreateCommitDisposition, CreateCommitInvariantChecker,
+    CreateCommitWriteLane,
+};
 use crate::state::live_state::{
     build_mark_live_state_ready_sql, load_latest_canonical_watermark_in_transaction,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, LixTransaction, QueryResult, Value};
 
-pub(crate) async fn run_write_txn_plan_with_backend(
-    engine: &Engine,
-    plan: &WriteTxnPlan,
-    pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
-) -> Result<SqlExecutionOutcome, LixError> {
-    let mut transaction = engine.begin_write_unit().await?;
-    let result = run_write_txn_plan_with_transaction(
-        engine,
-        transaction.as_mut(),
-        plan,
-        WriteTxnRunMode::Owned,
-        pending_commit_session,
-    )
-    .await;
-    match result {
-        Ok(result) => {
-            stamp_watermark_before_commit(transaction.as_mut()).await?;
-            transaction.commit().await?;
-            Ok(result)
-        }
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            Err(error)
-        }
-    }
-}
-
-pub(crate) async fn run_write_txn_plan_with_transaction(
+pub(crate) async fn run_txn_delta_with_transaction(
     engine: &Engine,
     transaction: &mut dyn LixTransaction,
-    plan: &WriteTxnPlan,
-    mode: WriteTxnRunMode,
+    delta: &TxnDelta,
     mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
 ) -> Result<SqlExecutionOutcome, LixError> {
     let mut combined = None;
 
-    for unit in &plan.units {
+    for unit in &delta.materialization_plan().units {
         let outcome = match unit {
-            WriteTxnUnit::PublicTracked(tracked) => {
-                run_tracked_write_txn_plan_with_transaction(
+            TxnMaterializationUnit::PublicTracked(tracked) => {
+                materialize_tracked_append_phase(
                     engine,
                     transaction,
                     tracked,
@@ -70,17 +56,12 @@ pub(crate) async fn run_write_txn_plan_with_transaction(
                 )
                 .await?
             }
-            WriteTxnUnit::PublicUntracked(untracked) => {
-                run_public_untracked_write_txn_with_transaction(
-                    engine,
-                    transaction,
-                    untracked,
-                    mode,
-                )
-                .await?
+            TxnMaterializationUnit::PublicUntracked(untracked) => {
+                run_public_untracked_write_txn_with_transaction(engine, transaction, untracked)
+                    .await?
             }
-            WriteTxnUnit::Internal(internal) => {
-                run_internal_write_txn_with_transaction(engine, transaction, internal, mode).await?
+            TxnMaterializationUnit::Internal(internal) => {
+                run_internal_write_txn_with_transaction(engine, transaction, internal).await?
             }
         };
 
@@ -92,11 +73,258 @@ pub(crate) async fn run_write_txn_plan_with_transaction(
     Ok(combined.unwrap_or_else(empty_public_write_execution_outcome))
 }
 
+async fn materialize_tracked_append_phase(
+    engine: &Engine,
+    transaction: &mut dyn LixTransaction,
+    unit: &crate::sql::public::runtime::TrackedTxnUnit,
+    mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
+) -> Result<Option<SqlExecutionOutcome>, LixError> {
+    for requirement in
+        coalesce_live_table_requirements(&unit.execution.schema_live_table_requirements)
+    {
+        ensure_schema_live_table_with_requirement_in_transaction(transaction, &requirement)
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "public tracked write schema live-table ensure failed for '{}': {}",
+                    requirement.schema_key, error.description
+                ),
+            })?;
+    }
+
+    if unit
+        .execution
+        .domain_change_batch
+        .as_ref()
+        .is_some_and(|batch| batch.changes.is_empty())
+        && !unit.has_compiler_only_filesystem_changes()
+    {
+        return Ok(Some(empty_public_write_execution_outcome()));
+    }
+
+    let mut create_commit_functions = unit.functions.clone();
+    if let Some(session_slot) = pending_commit_session.as_mut() {
+        let can_merge = !unit.has_compiler_only_filesystem_changes()
+            && session_slot.as_ref().is_some_and(|session| {
+                pending_session_matches_create_commit(session, &unit.execution.create_preconditions)
+            });
+        if can_merge {
+            let binary_blob_writes =
+                crate::sql::execution::runtime_effects::binary_blob_writes_from_filesystem_state(
+                    &unit.filesystem_state,
+                );
+            engine
+                .ensure_runtime_sequence_initialized_in_transaction(
+                    transaction,
+                    &create_commit_functions,
+                )
+                .await?;
+            let timestamp = create_commit_functions.timestamp();
+            let mut invariant_checker =
+                PublicCommitInvariantChecker::new(&unit.public_write.planned_write);
+            invariant_checker
+                .recheck_invariants(transaction)
+                .await
+                .map_err(create_commit_error_to_lix_error)?;
+            let session = session_slot
+                .as_mut()
+                .expect("session should exist when can_merge is true");
+            merge_public_domain_change_batch_into_pending_commit(
+                transaction,
+                session,
+                unit.execution
+                    .domain_change_batch
+                    .as_ref()
+                    .expect("merged tracked writes should have a domain change batch"),
+                &binary_blob_writes,
+                &mut create_commit_functions,
+                &timestamp,
+            )
+            .await?;
+            if create_commit_functions
+                .deterministic_sequence_persist_highest_seen()
+                .is_some()
+            {
+                let mut settings = DeterministicSettings::disabled();
+                settings.enabled = create_commit_functions.deterministic_sequence_enabled();
+                engine
+                    .persist_runtime_sequence_in_transaction(
+                        transaction,
+                        settings,
+                        0,
+                        &create_commit_functions,
+                    )
+                    .await?;
+            }
+
+            return Ok(Some(SqlExecutionOutcome {
+                public_result: QueryResult {
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                },
+                postprocess_file_cache_targets: BTreeSet::new(),
+                plugin_changes_committed: true,
+                plan_effects_override: Some(unit.execution.semantic_effects.clone()),
+                state_commit_stream_changes: Vec::new(),
+                observe_tick_emitted: false,
+            }));
+        }
+    }
+
+    let mut invariant_checker = PublicCommitInvariantChecker::new(&unit.public_write.planned_write);
+    let invariant_checker = if unit.is_merged_transaction_plan() {
+        None
+    } else {
+        Some(&mut invariant_checker as &mut dyn CreateCommitInvariantChecker)
+    };
+    let create_result = create_commit(
+        transaction,
+        CreateCommitArgs {
+            timestamp: None,
+            changes: unit
+                .execution
+                .domain_change_batch
+                .as_ref()
+                .map(|batch| batch.changes.clone())
+                .unwrap_or_default(),
+            filesystem_state: unit.filesystem_state.clone(),
+            preconditions: unit.execution.create_preconditions.clone(),
+            lane_parent_commit_ids_override: None,
+            allow_empty_commit: false,
+            should_emit_observe_tick: unit.should_emit_observe_tick(),
+            observe_tick_writer_key: unit.writer_key.clone(),
+            writer_key: unit.writer_key.clone(),
+        },
+        &mut create_commit_functions,
+        invariant_checker,
+    )
+    .await
+    .map_err(create_commit_error_to_lix_error)?;
+
+    if let Some(applied_output) = create_result.applied_output.as_ref() {
+        mirror_public_registered_schema_bootstrap_rows(
+            transaction,
+            &crate::state::commit::GenerateCommitResult {
+                canonical_output: applied_output.canonical_output.clone(),
+                derived_apply_input: applied_output.derived_apply_input.clone(),
+            },
+        )
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "public tracked write registered-schema bootstrap mirroring failed: {}",
+                error.description
+            ),
+        })?;
+    }
+
+    let applied_domain_change_batch =
+        if matches!(create_result.disposition, CreateCommitDisposition::Applied) {
+            Some(DomainChangeBatch {
+                changes: create_result.applied_domain_changes.clone(),
+                write_lane: unit
+                    .execution
+                    .domain_change_batch
+                    .as_ref()
+                    .map(|batch| batch.write_lane.clone())
+                    .unwrap_or_else(|| match &unit.execution.create_preconditions.write_lane {
+                        CreateCommitWriteLane::Version(version_id) => {
+                            WriteLane::SingleVersion(version_id.clone())
+                        }
+                        CreateCommitWriteLane::GlobalAdmin => WriteLane::GlobalAdmin,
+                    }),
+                writer_key: unit
+                    .execution
+                    .domain_change_batch
+                    .as_ref()
+                    .and_then(|batch| batch.writer_key.clone())
+                    .or_else(|| {
+                        unit.public_write
+                            .planned_write
+                            .command
+                            .execution_context
+                            .writer_key
+                            .clone()
+                    }),
+                semantic_effects: Vec::new(),
+            })
+        } else {
+            None
+        };
+    if let Some(applied_domain_change_batch) = applied_domain_change_batch.as_ref() {
+        apply_public_version_last_checkpoint_side_effects(
+            transaction,
+            &unit.public_write,
+            applied_domain_change_batch,
+        )
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "public tracked write version checkpoint side effects failed: {}",
+                error.description
+            ),
+        })?;
+    }
+
+    let plugin_changes_committed =
+        matches!(create_result.disposition, CreateCommitDisposition::Applied);
+    if let Some(session_slot) = pending_commit_session.as_mut() {
+        **session_slot = if plugin_changes_committed {
+            if let Some(applied_output) = create_result.applied_output.as_ref() {
+                Some(
+                    build_pending_public_commit_session(
+                        transaction,
+                        unit.execution.create_preconditions.write_lane.clone(),
+                        &crate::state::commit::GenerateCommitResult {
+                            canonical_output: applied_output.canonical_output.clone(),
+                            derived_apply_input: applied_output.derived_apply_input.clone(),
+                        },
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    }
+
+    let plan_effects_override = if plugin_changes_committed {
+        if unit.has_compiler_only_filesystem_changes() {
+            crate::sql::public::runtime::semantic_plan_effects_from_domain_changes(
+                &create_result.applied_domain_changes,
+                crate::sql::public::runtime::state_commit_stream_operation(
+                    unit.public_write.planned_write.command.operation_kind,
+                ),
+            )?
+        } else {
+            unit.execution.semantic_effects.clone()
+        }
+    } else {
+        PlanEffects::default()
+    };
+
+    Ok(Some(SqlExecutionOutcome {
+        public_result: QueryResult {
+            rows: Vec::new(),
+            columns: Vec::new(),
+        },
+        postprocess_file_cache_targets: BTreeSet::new(),
+        plugin_changes_committed,
+        plan_effects_override: Some(plan_effects_override),
+        state_commit_stream_changes: Vec::new(),
+        observe_tick_emitted: plugin_changes_committed && unit.should_emit_observe_tick(),
+    }))
+}
+
 async fn run_public_untracked_write_txn_with_transaction(
     engine: &Engine,
     transaction: &mut dyn LixTransaction,
-    plan: &PublicUntrackedWriteTxnPlan,
-    mode: WriteTxnRunMode,
+    plan: &PublicUntrackedTxnUnit,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
     let mut runtime_functions = plan.functions.clone();
     let timestamp = runtime_functions.timestamp();
@@ -160,18 +388,6 @@ async fn run_public_untracked_write_txn_with_transaction(
             ),
         })?;
 
-    if matches!(mode, WriteTxnRunMode::Owned)
-        && !plan
-            .execution
-            .semantic_effects
-            .state_commit_stream_changes
-            .is_empty()
-    {
-        engine
-            .append_observe_tick_in_transaction(transaction, plan.writer_key.as_deref())
-            .await?;
-    }
-
     Ok(Some(SqlExecutionOutcome {
         public_result: QueryResult {
             rows: Vec::new(),
@@ -181,25 +397,19 @@ async fn run_public_untracked_write_txn_with_transaction(
         plugin_changes_committed: false,
         plan_effects_override: Some(plan.execution.semantic_effects.clone()),
         state_commit_stream_changes: Vec::new(),
-        observe_tick_emitted: matches!(mode, WriteTxnRunMode::Owned)
-            && !plan
-                .execution
-                .semantic_effects
-                .state_commit_stream_changes
-                .is_empty(),
+        observe_tick_emitted: false,
     }))
 }
 
 async fn run_internal_write_txn_with_transaction(
     engine: &Engine,
     transaction: &mut dyn LixTransaction,
-    plan: &InternalWriteTxnPlan,
-    mode: WriteTxnRunMode,
+    plan: &InternalTxnUnit,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    let mut execution = execute::execute_plan_sql_with_transaction(
+    let mut execution = execute_internal_execution_with_transaction(
         transaction,
-        &plan.plan,
-        plan.plan.requirements.should_refresh_file_cache,
+        &plan.execution,
+        plan.result_contract,
         &plan.functions,
         plan.writer_key.as_deref(),
     )
@@ -211,7 +421,7 @@ async fn run_internal_write_txn_with_transaction(
             transaction,
             &plan.filesystem_state,
             plan.writer_key.as_deref(),
-            &plan.plan.preprocess.mutations,
+            &plan.execution.mutations,
         )
         .await?;
     if !filesystem_finalization.binary_blob_writes.is_empty() {
@@ -252,17 +462,11 @@ async fn run_internal_write_txn_with_transaction(
     let active_effects = execution
         .plan_effects_override
         .as_ref()
-        .unwrap_or(&plan.plan.effects);
+        .unwrap_or(&plan.effects);
     let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
     state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());
-    if matches!(mode, WriteTxnRunMode::Owned) && !state_commit_stream_changes.is_empty() {
-        engine
-            .append_observe_tick_in_transaction(transaction, plan.writer_key.as_deref())
-            .await?;
-    }
-
     if execution.plan_effects_override.is_none() {
-        execution.plan_effects_override = Some(plan.plan.effects.clone());
+        execution.plan_effects_override = Some(plan.effects.clone());
     }
 
     Ok(Some(execution))

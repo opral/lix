@@ -31,20 +31,20 @@ impl Engine {
         ensure_valid_wasm_binary(&parsed.wasm_bytes)?;
 
         let mut transaction = self.begin_write_unit().await?;
-        let mut core = self.new_shared_transaction_core(ExecuteOptions::default())?;
+        let mut context = self.new_execution_context(ExecuteOptions::default())?;
 
         let install_result = install_plugin_in_transaction(
             self,
             transaction.as_mut(),
             &parsed,
             archive_bytes,
-            &mut core,
+            &mut context,
         )
         .await;
 
         match install_result {
             Ok(()) => {
-                self.prepare_transaction_core_for_commit(transaction.as_mut(), &mut core)
+                self.prepare_execution_context_for_commit(transaction.as_mut(), &mut context)
                     .await?;
                 transaction.commit().await?
             }
@@ -54,9 +54,9 @@ impl Engine {
             }
         }
 
-        core.public_surface_registry_dirty = true;
-        core.installed_plugins_cache_invalidation_pending = true;
-        self.finalize_committed_transaction_core(core).await?;
+        context.public_surface_registry_dirty = true;
+        context.installed_plugins_cache_invalidation_pending = true;
+        self.finalize_committed_execution_context(context).await?;
         Ok(())
     }
 }
@@ -66,7 +66,7 @@ async fn install_plugin_in_transaction(
     transaction: &mut dyn LixTransaction,
     parsed: &ParsedPluginArchive,
     archive_bytes: &[u8],
-    core: &mut crate::engine::SharedTransactionCore,
+    context: &mut crate::sql::execution::execution_program::ExecutionContext,
 ) -> Result<(), LixError> {
     for schema in &parsed.schemas {
         engine
@@ -74,17 +74,10 @@ async fn install_plugin_in_transaction(
                 transaction,
                 INSTALL_REGISTERED_SCHEMA_SQL,
                 &[Value::Text(schema.normalized_schema_json.clone())],
-                &core.options,
                 false,
-                &mut core.public_surface_registry,
-                &mut core.public_surface_registry_dirty,
-                &mut core.active_version_id,
-                &mut core.mutation_journal,
+                context,
                 None,
                 false,
-                &mut core.pending_state_commit_stream_changes,
-                &mut core.pending_public_commit_session,
-                &mut core.observe_tick_already_emitted,
             )
             .await?;
     }
@@ -100,17 +93,10 @@ async fn install_plugin_in_transaction(
              WHERE lixcol_version_id = 'global' \
                AND id = $1",
             &[Value::Text(archive_id.clone())],
-            &core.options,
             false,
-            &mut core.public_surface_registry,
-            &mut core.public_surface_registry_dirty,
-            &mut core.active_version_id,
-            &mut core.mutation_journal,
+            context,
             None,
             false,
-            &mut core.pending_state_commit_stream_changes,
-            &mut core.pending_public_commit_session,
-            &mut core.observe_tick_already_emitted,
         )
         .await?;
 
@@ -125,17 +111,10 @@ async fn install_plugin_in_transaction(
                 Value::Text(archive_path),
                 Value::Blob(archive_bytes.to_vec()),
             ],
-            &core.options,
             false,
-            &mut core.public_surface_registry,
-            &mut core.public_surface_registry_dirty,
-            &mut core.active_version_id,
-            &mut core.mutation_journal,
+            context,
             None,
             false,
-            &mut core.pending_state_commit_stream_changes,
-            &mut core.pending_public_commit_session,
-            &mut core.observe_tick_already_emitted,
         )
         .await?;
 

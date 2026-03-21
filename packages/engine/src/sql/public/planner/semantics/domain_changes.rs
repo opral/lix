@@ -445,7 +445,7 @@ mod tests {
             canonicalize_write(bound, &registry).expect("write should canonicalize");
         let mut planned_write =
             analyze_write(&canonicalized).expect("write analysis should succeed");
-        let resolved_write_plan = resolve_write_plan(&FakeBackend::default(), &planned_write)
+        let resolved_write_plan = resolve_write_plan(&FakeBackend::default(), &planned_write, None)
             .await
             .expect("write should resolve");
         planned_write.resolved_write_plan = Some(resolved_write_plan);

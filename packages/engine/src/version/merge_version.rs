@@ -316,7 +316,7 @@ async fn merge_version_in_transaction(
     .await
     .map_err(create_commit_error_to_lix_error)?;
 
-    tx.core
+    tx.context
         .pending_state_commit_stream_changes
         .extend(stream_changes);
 

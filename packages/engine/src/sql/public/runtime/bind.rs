@@ -9,6 +9,11 @@ pub(super) struct BoundPublicQuery {
     pub(super) params: Vec<Value>,
 }
 
+pub(super) struct BoundPublicStatement {
+    pub(super) sql: String,
+    pub(super) params: Vec<Value>,
+}
+
 pub(super) fn bind_public_query(
     query: Query,
     params: &[Value],
@@ -17,6 +22,18 @@ pub(super) fn bind_public_query(
     let mut statement = Statement::Query(Box::new(query));
     let params = bind_public_statement(&mut statement, params, dialect)?;
     Ok(BoundPublicQuery {
+        sql: statement.to_string(),
+        params,
+    })
+}
+
+pub(super) fn bind_public_statement_sql(
+    mut statement: Statement,
+    params: &[Value],
+    dialect: SqlDialect,
+) -> Result<BoundPublicStatement, LixError> {
+    let params = bind_public_statement(&mut statement, params, dialect)?;
+    Ok(BoundPublicStatement {
         sql: statement.to_string(),
         params,
     })

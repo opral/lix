@@ -151,13 +151,7 @@ impl Engine {
             return crate::errors::already_initialized_error();
         }
         if is_init_locked_error(&error.description) {
-            return match load_live_state_mode_with_backend(self.backend.as_ref()).await {
-                Ok(LiveStateMode::Bootstrapping)
-                | Ok(
-                    LiveStateMode::Ready | LiveStateMode::NeedsRebuild | LiveStateMode::Rebuilding,
-                ) => crate::errors::already_initialized_error(),
-                _ => error,
-            };
+            return crate::errors::already_initialized_error();
         }
         error
     }
