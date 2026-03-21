@@ -1,25 +1,27 @@
-use lix_engine::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
-use sqlx::{Column, Executor, Row, SqlitePool, ValueRef};
+use lix_engine::{
+    LixBackend, LixError, LixTransaction, PreparedBatch, QueryResult, SqlDialect, Value,
+};
+use rusqlite::{params_from_iter, Connection, Row};
 use std::path::Path;
-use tokio::sync::OnceCell;
+use std::sync::{Mutex, MutexGuard};
 
 pub struct BenchSqliteBackend {
-    conn: String,
-    pool: OnceCell<SqlitePool>,
+    conn: Mutex<Connection>,
 }
 
-struct BenchSqliteTransaction {
-    conn: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+struct BenchSqliteTransaction<'a> {
+    conn: MutexGuard<'a, Connection>,
+    finalized: bool,
     savepoint_name: Option<String>,
 }
 
 impl BenchSqliteBackend {
     #[allow(dead_code)]
-    pub fn in_memory() -> Self {
-        Self {
-            conn: "sqlite::memory:".to_string(),
-            pool: OnceCell::const_new(),
-        }
+    pub fn in_memory() -> Result<Self, LixError> {
+        let conn = Connection::open_in_memory().map_err(sqlite_error)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn file_backed(path: &Path) -> Result<Self, LixError> {
@@ -33,57 +35,17 @@ impl BenchSqliteBackend {
             })?;
         }
 
-        if !path.exists() {
-            std::fs::File::create(path).map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "failed to create sqlite benchmark file {}: {error}",
-                    path.display()
-                ),
-            })?;
-        }
-
-        let conn = format!("sqlite://{}", path.display());
+        let conn = Connection::open(path).map_err(sqlite_error)?;
         Ok(Self {
-            conn,
-            pool: OnceCell::const_new(),
+            conn: Mutex::new(conn),
         })
     }
 
-    async fn pool(&self) -> Result<&SqlitePool, LixError> {
-        self.pool
-            .get_or_try_init(|| async {
-                SqlitePool::connect(&self.conn)
-                    .await
-                    .map_err(|error| LixError {
-                        code: "LIX_ERROR_UNKNOWN".to_string(),
-                        description: error.to_string(),
-                    })
-            })
-            .await
-    }
-
-    async fn begin_scoped_transaction(
-        &self,
-        begin_sql: &str,
-        savepoint_name: Option<String>,
-    ) -> Result<Box<dyn LixTransaction + '_>, LixError> {
-        let pool = self.pool().await?;
-        let mut conn = pool.acquire().await.map_err(|error| LixError {
+    fn lock_conn(&self) -> Result<MutexGuard<'_, Connection>, LixError> {
+        self.conn.lock().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: error.to_string(),
-        })?;
-        sqlx::query(begin_sql)
-            .execute(&mut *conn)
-            .await
-            .map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: error.to_string(),
-            })?;
-        Ok(Box::new(BenchSqliteTransaction {
-            conn,
-            savepoint_name,
-        }))
+            description: "sqlite benchmark mutex poisoned".to_string(),
+        })
     }
 }
 
@@ -94,200 +56,185 @@ impl LixBackend for BenchSqliteBackend {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let pool = self.pool().await?;
-
-        if params.is_empty() && sql.contains(';') {
-            pool.execute(sql).await.map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: error.to_string(),
-            })?;
-            return Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            });
-        }
-
-        let mut query = sqlx::query(sql);
-        for param in params {
-            query = bind_sqlite(query, param);
-        }
-
-        let rows = query.fetch_all(pool).await.map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: error.to_string(),
-        })?;
-        let columns = rows
-            .first()
-            .map(|row| {
-                row.columns()
-                    .iter()
-                    .map(|column| column.name().to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        let mut out_rows = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut out = Vec::with_capacity(row.columns().len());
-            for idx in 0..row.columns().len() {
-                out.push(map_sqlite_value(&row, idx)?);
-            }
-            out_rows.push(out);
-        }
-        Ok(QueryResult {
-            rows: out_rows,
-            columns,
-        })
+        let conn = self.lock_conn()?;
+        execute_sql(&conn, sql, params)
     }
 
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
-        self.begin_scoped_transaction("BEGIN", None).await
+        let conn = self.lock_conn()?;
+        let savepoint_name = if conn.is_autocommit() {
+            conn.execute_batch("BEGIN IMMEDIATE")
+                .map_err(sqlite_error)?;
+            None
+        } else {
+            let name = fallback_savepoint_name();
+            conn.execute_batch(&format!("SAVEPOINT {}", quote_savepoint_name(&name)))
+                .map_err(sqlite_error)?;
+            Some(name)
+        };
+
+        Ok(Box::new(BenchSqliteTransaction {
+            conn,
+            finalized: false,
+            savepoint_name,
+        }))
     }
 
     async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
-        let quoted = name.replace('"', "\"\"");
-        let sql = format!("BEGIN; SAVEPOINT \"{quoted}\"");
-        self.begin_scoped_transaction(&sql, Some(name.to_string()))
-            .await
+        let conn = self.lock_conn()?;
+        conn.execute_batch(&format!("SAVEPOINT {}", quote_savepoint_name(name)))
+            .map_err(sqlite_error)?;
+
+        Ok(Box::new(BenchSqliteTransaction {
+            conn,
+            finalized: false,
+            savepoint_name: Some(name.to_string()),
+        }))
     }
 }
 
 #[async_trait::async_trait(?Send)]
-impl LixTransaction for BenchSqliteTransaction {
+impl LixTransaction for BenchSqliteTransaction<'_> {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        if params.is_empty() && sql.contains(';') {
-            self.conn.execute(sql).await.map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: error.to_string(),
-            })?;
-            return Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            });
-        }
+        execute_sql(&self.conn, sql, params)
+    }
 
-        let mut query = sqlx::query(sql);
-        for param in params {
-            query = bind_sqlite(query, param);
-        }
-
-        let rows = query
-            .fetch_all(&mut *self.conn)
-            .await
-            .map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: error.to_string(),
-            })?;
-        let columns = rows
-            .first()
-            .map(|row| {
-                row.columns()
-                    .iter()
-                    .map(|column| column.name().to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        let mut out_rows = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut out = Vec::with_capacity(row.columns().len());
-            for idx in 0..row.columns().len() {
-                out.push(map_sqlite_value(&row, idx)?);
-            }
-            out_rows.push(out);
-        }
-        Ok(QueryResult {
-            rows: out_rows,
-            columns,
-        })
+    async fn execute_batch(&mut self, batch: &PreparedBatch) -> Result<QueryResult, LixError> {
+        execute_prepared_batch(&self.conn, batch)
     }
 
     async fn commit(mut self: Box<Self>) -> Result<(), LixError> {
-        let commit_sql = self
-            .savepoint_name
-            .as_ref()
-            .map(|name| {
-                format!(
-                    "RELEASE SAVEPOINT \"{}\"; COMMIT",
-                    name.replace('"', "\"\"")
-                )
-            })
-            .unwrap_or_else(|| "COMMIT".to_string());
-        sqlx::query(&commit_sql)
-            .execute(&mut *self.conn)
-            .await
-            .map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: error.to_string(),
-            })?;
+        let sql = match &self.savepoint_name {
+            Some(name) => format!("RELEASE SAVEPOINT {}", quote_savepoint_name(name)),
+            None => "COMMIT".to_string(),
+        };
+        self.conn.execute_batch(&sql).map_err(sqlite_error)?;
+        self.finalized = true;
         Ok(())
     }
 
     async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
-        let rollback_sql = self
-            .savepoint_name
-            .as_ref()
-            .map(|name| {
-                format!(
-                    "ROLLBACK TO SAVEPOINT \"{}\"; ROLLBACK",
-                    name.replace('"', "\"\"")
-                )
-            })
-            .unwrap_or_else(|| "ROLLBACK".to_string());
-        sqlx::query(&rollback_sql)
-            .execute(&mut *self.conn)
-            .await
-            .map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: error.to_string(),
-            })?;
+        let sql = match &self.savepoint_name {
+            Some(name) => format!(
+                "ROLLBACK TO SAVEPOINT {quoted}; RELEASE SAVEPOINT {quoted}",
+                quoted = quote_savepoint_name(name)
+            ),
+            None => "ROLLBACK".to_string(),
+        };
+        self.conn.execute_batch(&sql).map_err(sqlite_error)?;
+        self.finalized = true;
         Ok(())
     }
 }
 
-fn bind_sqlite<'q>(
-    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
-    param: &'q Value,
-) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
-    match param {
-        Value::Null => query.bind(Option::<i64>::None),
-        Value::Boolean(v) => query.bind(*v),
-        Value::Integer(v) => query.bind(*v),
-        Value::Real(v) => query.bind(*v),
-        Value::Text(v) => query.bind(v.as_str()),
-        Value::Json(v) => query.bind(v.to_string()),
-        Value::Blob(v) => query.bind(v.as_slice()),
+impl Drop for BenchSqliteTransaction<'_> {
+    fn drop(&mut self) {
+        if self.finalized || std::thread::panicking() {
+            return;
+        }
+
+        let sql = match &self.savepoint_name {
+            Some(name) => format!(
+                "ROLLBACK TO SAVEPOINT {quoted}; RELEASE SAVEPOINT {quoted}",
+                quoted = quote_savepoint_name(name)
+            ),
+            None => "ROLLBACK".to_string(),
+        };
+        let _ = self.conn.execute_batch(&sql);
     }
 }
 
-fn map_sqlite_value(row: &sqlx::sqlite::SqliteRow, index: usize) -> Result<Value, LixError> {
-    if row
-        .try_get_raw(index)
-        .map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: error.to_string(),
-        })?
-        .is_null()
-    {
-        return Ok(Value::Null);
+fn execute_sql(conn: &Connection, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+    if params.is_empty() && sql.contains(';') {
+        conn.execute_batch(sql).map_err(sqlite_error)?;
+        return Ok(QueryResult {
+            rows: Vec::new(),
+            columns: Vec::new(),
+        });
     }
 
-    if let Ok(value) = row.try_get::<i64, _>(index) {
-        return Ok(Value::Integer(value));
-    }
-    if let Ok(value) = row.try_get::<f64, _>(index) {
-        return Ok(Value::Real(value));
-    }
-    if let Ok(value) = row.try_get::<String, _>(index) {
-        return Ok(Value::Text(value));
-    }
-    if let Ok(value) = row.try_get::<Vec<u8>, _>(index) {
-        return Ok(Value::Blob(value));
+    let mut stmt = conn.prepare(sql).map_err(sqlite_error)?;
+    let columns = stmt
+        .column_names()
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    let bound_params = params.iter().cloned().map(to_sql_value);
+    let mut rows = stmt
+        .query(params_from_iter(bound_params))
+        .map_err(sqlite_error)?;
+
+    let mut result_rows = Vec::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        result_rows.push(map_row(row)?);
     }
 
-    Ok(Value::Null)
+    Ok(QueryResult {
+        rows: result_rows,
+        columns,
+    })
+}
+
+fn execute_prepared_batch(
+    conn: &Connection,
+    batch: &PreparedBatch,
+) -> Result<QueryResult, LixError> {
+    let mut last_result = QueryResult {
+        rows: Vec::new(),
+        columns: Vec::new(),
+    };
+    for statement in &batch.steps {
+        last_result = execute_sql(conn, &statement.sql, &statement.params)?;
+    }
+    Ok(last_result)
+}
+
+fn map_row(row: &Row<'_>) -> Result<Vec<Value>, LixError> {
+    let mut values = Vec::with_capacity(row.as_ref().column_count());
+    for index in 0..row.as_ref().column_count() {
+        let value = row.get_ref(index).map_err(sqlite_error)?;
+        values.push(match value {
+            rusqlite::types::ValueRef::Null => Value::Null,
+            rusqlite::types::ValueRef::Integer(value) => Value::Integer(value),
+            rusqlite::types::ValueRef::Real(value) => Value::Real(value),
+            rusqlite::types::ValueRef::Text(value) => {
+                Value::Text(String::from_utf8_lossy(value).to_string())
+            }
+            rusqlite::types::ValueRef::Blob(value) => Value::Blob(value.to_vec()),
+        });
+    }
+    Ok(values)
+}
+
+fn to_sql_value(value: Value) -> rusqlite::types::Value {
+    match value {
+        Value::Null => rusqlite::types::Value::Null,
+        Value::Boolean(value) => rusqlite::types::Value::Integer(if value { 1 } else { 0 }),
+        Value::Integer(value) => rusqlite::types::Value::Integer(value),
+        Value::Real(value) => rusqlite::types::Value::Real(value),
+        Value::Text(value) => rusqlite::types::Value::Text(value),
+        Value::Json(value) => rusqlite::types::Value::Text(value.to_string()),
+        Value::Blob(value) => rusqlite::types::Value::Blob(value),
+    }
+}
+
+fn quote_savepoint_name(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn fallback_savepoint_name() -> String {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    format!("sp_auto_{id}")
+}
+
+fn sqlite_error(error: impl std::fmt::Display) -> LixError {
+    LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: error.to_string(),
+    }
 }
