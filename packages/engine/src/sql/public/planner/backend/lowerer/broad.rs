@@ -1230,7 +1230,7 @@ fn build_supported_public_read_surface_query(
         SurfaceFamily::State => {
             build_public_state_surface_query(&surface_binding, registry, dialect)
         }
-        SurfaceFamily::Entity => build_builtin_entity_surface_query(&surface_binding).map(Some),
+        SurfaceFamily::Entity => build_builtin_entity_surface_query(&surface_binding),
         SurfaceFamily::Filesystem => {
             build_nested_filesystem_surface_query(dialect, &surface_binding.descriptor.public_name)
         }
@@ -1247,10 +1247,18 @@ fn build_public_state_surface_query(
     let Some(state_scan) = CanonicalStateScan::from_surface_binding(surface_binding.clone()) else {
         return Ok(None);
     };
-    let schema_set = registry
+    let schema_set: BTreeSet<String> = registry
         .registered_state_backed_schema_keys()
         .into_iter()
         .collect();
+    if !schema_set.iter().all(|schema_key| {
+        builtin_live_table_layout(schema_key)
+            .ok()
+            .flatten()
+            .is_some()
+    }) {
+        return Ok(None);
+    }
     let request = EffectiveStateRequest {
         schema_set,
         version_scope: state_scan.version_scope,
@@ -1284,7 +1292,9 @@ fn build_public_change_surface_query(
     Ok(None)
 }
 
-fn build_builtin_entity_surface_query(surface_binding: &SurfaceBinding) -> Result<Query, LixError> {
+fn build_builtin_entity_surface_query(
+    surface_binding: &SurfaceBinding,
+) -> Result<Option<Query>, LixError> {
     let Some(schema_key) = surface_binding.implicit_overrides.fixed_schema_key.clone() else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -1294,6 +1304,9 @@ fn build_builtin_entity_surface_query(surface_binding: &SurfaceBinding) -> Resul
             ),
         });
     };
+    if builtin_live_table_layout(&schema_key)?.is_none() {
+        return Ok(None);
+    }
     let Some(state_scan) = CanonicalStateScan::from_surface_binding(surface_binding.clone()) else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -1319,6 +1332,7 @@ fn build_builtin_entity_surface_query(surface_binding: &SurfaceBinding) -> Resul
         &[],
         &BTreeMap::new(),
     )?
+    .map(Some)
     .ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!(

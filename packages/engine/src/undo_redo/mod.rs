@@ -44,7 +44,7 @@ pub(crate) async fn resolve_target_version_id(
         return Ok(version_id.to_string());
     }
 
-    Ok(tx.core.active_version_id.clone())
+    Ok(tx.context.active_version_id.clone())
 }
 
 async fn ensure_version_exists(

@@ -1,4 +1,4 @@
-use super::bind::bind_public_query;
+use super::bind::{bind_public_query, bind_public_statement_sql};
 use super::*;
 use crate::errors::classification::sanitize_lowered_public_sql_error_description;
 use crate::filesystem::history::{
@@ -36,7 +36,7 @@ pub(crate) struct LoweredPublicReadQuery {
     pub(crate) public_output_columns: Option<Vec<String>>,
 }
 
-pub(super) async fn execute_public_read_query_strict(
+pub(crate) async fn execute_public_read_query_strict(
     backend: &dyn LixBackend,
     mut query: Query,
     params: &[Value],
@@ -151,11 +151,18 @@ pub(crate) async fn execute_prepared_public_read(
 ) -> Result<QueryResult, LixError> {
     let result = match &prepared.execution {
         PreparedPublicReadExecution::LoweredSql(lowered) => {
+            let bound_params = prepared
+                .debug_trace
+                .bound_statements
+                .first()
+                .map(|statement| statement.bound_parameters.as_slice())
+                .unwrap_or(&[]);
             execute_lowered_public_read(
                 backend,
                 lowered,
                 prepared.dependency_spec.as_ref(),
                 &prepared.debug_trace.surface_bindings,
+                bound_params,
             )
             .await
         }
@@ -171,6 +178,7 @@ async fn execute_lowered_public_read(
     lowered: &LoweredReadProgram,
     dependency_spec: Option<&DependencySpec>,
     public_surfaces: &[String],
+    params: &[Value],
 ) -> Result<QueryResult, LixError> {
     for schema_key in required_schema_keys_from_dependency_spec(dependency_spec) {
         crate::schema::registry::ensure_schema_live_table(backend, &schema_key).await?;
@@ -182,8 +190,9 @@ async fn execute_lowered_public_read(
     };
     for statement in lowered.statements.iter().cloned() {
         let statement = lower_statement(statement, backend.dialect())?;
+        let bound = bind_public_statement_sql(statement, params, backend.dialect())?;
         result = backend
-            .execute(&statement.to_string(), &[])
+            .execute(&bound.sql, &bound.params)
             .await
             .map_err(|error| translate_lowered_public_read_error(error, public_surfaces))?;
     }
@@ -1102,6 +1111,7 @@ async fn lower_public_read_query_with_details(
         let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
         let known_live_layouts = load_known_live_layouts_for_public_read(
             backend,
+            &structured_read,
             dependency_spec.as_ref(),
             effective_state.as_ref().map(|(request, _)| request),
         )
@@ -1203,11 +1213,29 @@ async fn load_known_live_layouts_for_dependency_spec(
 
 async fn load_known_live_layouts_for_public_read(
     backend: &dyn LixBackend,
+    structured_read: &StructuredPublicRead,
     dependency_spec: Option<&DependencySpec>,
     effective_state_request: Option<&EffectiveStateRequest>,
 ) -> Result<BTreeMap<String, LiveTableLayout>, LixError> {
     let mut layouts = load_known_live_layouts_for_dependency_spec(backend, dependency_spec).await?;
     if let Some(request) = effective_state_request {
+        if let Some(schema_key) = structured_read
+            .surface_binding
+            .implicit_overrides
+            .fixed_schema_key
+            .as_ref()
+        {
+            if !layouts.contains_key(schema_key) {
+                if let Some(layout) =
+                    crate::schema::live_layout::builtin_live_table_layout(schema_key)?
+                {
+                    layouts.insert(schema_key.clone(), layout);
+                } else {
+                    let layout = load_live_table_layout_with_backend(backend, schema_key).await?;
+                    layouts.insert(schema_key.clone(), layout);
+                }
+            }
+        }
         for schema_key in &request.schema_set {
             if layouts.contains_key(schema_key) {
                 continue;
@@ -5155,6 +5183,38 @@ enum SpecializedPublicReadPreparation {
     Declined { reason: String },
 }
 
+fn parse_public_read_unknown_column_name(message: &str) -> Option<String> {
+    let prefix = "strict rewrite violation: unknown column '";
+    let start = message.find(prefix)? + prefix.len();
+    let end = message[start..].find('\'')? + start;
+    let column = &message[start..end];
+    (!column.is_empty()).then(|| column.to_string())
+}
+
+fn public_read_preparation_error(bindings: &[SurfaceBinding], message: &str) -> Option<LixError> {
+    let missing_column = parse_public_read_unknown_column_name(message)?;
+    let binding = if bindings.len() == 1 {
+        bindings.first()
+    } else {
+        bindings
+            .iter()
+            .find(|binding| message.contains(&format!("on '{}'", binding.descriptor.public_name)))
+    }?;
+    let available_columns = binding
+        .descriptor
+        .visible_columns
+        .iter()
+        .chain(binding.descriptor.hidden_columns.iter())
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    Some(crate::errors::sql_unknown_column_error(
+        &missing_column,
+        Some(&binding.descriptor.public_name),
+        available_columns.as_slice(),
+        None,
+    ))
+}
+
 async fn try_prepare_public_read_via_specialized_optimization(
     backend: &dyn LixBackend,
     bound_statement: BoundStatement,
@@ -5216,6 +5276,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
     let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
     let known_live_layouts = load_known_live_layouts_for_public_read(
         backend,
+        &structured_read,
         dependency_spec.as_ref(),
         effective_state.as_ref().map(|(request, _)| request),
     )
@@ -5694,6 +5755,11 @@ async fn try_prepare_public_read_with_internal_access(
                     return Ok(Some(prepared));
                 }
             }
+            if let Some(error) =
+                public_read_preparation_error(&read_summary.bound_surface_bindings, &reason)
+            {
+                return Err(error);
+            }
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!("public read preparation failed: {reason}"),
@@ -5733,11 +5799,20 @@ async fn prepare_public_read_via_surface_lowering(
     }
 
     let mut rewritten_statement = bound_statement.statement.clone();
-    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_dialect(
-        &mut rewritten_statement,
-        registry,
-        backend.dialect(),
-    )?;
+    if let Err(error) =
+        rewrite_supported_public_read_surfaces_in_statement_with_registry_and_dialect(
+            &mut rewritten_statement,
+            registry,
+            backend.dialect(),
+        )
+    {
+        if let Some(mapped) =
+            public_read_preparation_error(&read_summary.bound_surface_bindings, &error.description)
+        {
+            return Err(mapped);
+        }
+        return Err(error);
+    }
     if statement_references_public_surface(registry, &rewritten_statement) {
         return Ok(None);
     }

@@ -30,7 +30,7 @@ impl Engine {
         Ok(EngineTransaction {
             engine: self,
             transaction: Some(transaction),
-            core: self.new_shared_transaction_core(options)?,
+            context: self.new_execution_context(options)?,
         })
     }
 
@@ -109,10 +109,9 @@ impl EngineTransaction<'_> {
             .execute_parsed_statements_in_transaction_core(
                 transaction.as_mut(),
                 parsed_statements,
-                sql,
                 params,
                 allow_internal_tables,
-                &mut self.core,
+                &mut self.context,
             )
             .await
     }
@@ -123,16 +122,18 @@ impl EngineTransaction<'_> {
             description: "transaction is no longer active".to_string(),
         })?;
         self.engine
-            .prepare_transaction_core_for_commit(transaction.as_mut(), &mut self.core)
+            .prepare_execution_context_for_commit(transaction.as_mut(), &mut self.context)
             .await?;
         stamp_watermark_before_commit(transaction.as_mut()).await?;
         transaction.commit().await?;
-        let core = std::mem::replace(
-            &mut self.core,
+        let context = std::mem::replace(
+            &mut self.context,
             self.engine
-                .new_shared_transaction_core(ExecuteOptions::default())?,
+                .new_execution_context(ExecuteOptions::default())?,
         );
-        self.engine.finalize_committed_transaction_core(core).await
+        self.engine
+            .finalize_committed_execution_context(context)
+            .await
     }
 
     pub async fn rollback(mut self) -> Result<(), LixError> {

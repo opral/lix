@@ -975,41 +975,6 @@ impl Engine {
         Ok(())
     }
 
-    async fn upsert_registered_schema_bootstrap_row(
-        &self,
-        entity_id: &str,
-        snapshot_content: &str,
-        change_id: &str,
-        timestamp: &str,
-    ) -> Result<(), LixError> {
-        self.backend
-            .execute(
-                "INSERT INTO lix_internal_registered_schema_bootstrap (\
-                 entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
-                 ) VALUES (\
-                 $1, 'lix_registered_schema', '1', 'lix', 'global', true, 'lix', $2, $3, NULL, NULL, 0, $4, $4\
-                 ) ON CONFLICT (entity_id, file_id, version_id) DO UPDATE SET \
-                 schema_key = excluded.schema_key, \
-                 schema_version = excluded.schema_version, \
-                 global = excluded.global, \
-                 plugin_key = excluded.plugin_key, \
-                 snapshot_content = excluded.snapshot_content, \
-                 change_id = excluded.change_id, \
-                 metadata = excluded.metadata, \
-                 writer_key = excluded.writer_key, \
-                 is_tombstone = excluded.is_tombstone, \
-                 updated_at = excluded.updated_at",
-                &[
-                    Value::Text(entity_id.to_string()),
-                    Value::Text(snapshot_content.to_string()),
-                    Value::Text(change_id.to_string()),
-                    Value::Text(timestamp.to_string()),
-                ],
-            )
-            .await?;
-        Ok(())
-    }
-
     async fn insert_change_row_for_snapshot(
         &self,
         entity_id: &str,

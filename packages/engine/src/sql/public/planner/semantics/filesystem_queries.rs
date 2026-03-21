@@ -5,9 +5,13 @@ use crate::filesystem::live_projection::{
 use crate::filesystem::path::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
 use crate::schema::live_layout::{tracked_live_table_name, untracked_live_table_name};
 use crate::sql::common::ast::{lower_statement, parse_sql_statements};
+use crate::sql::execution::runtime_effects::FilesystemTransactionFileState;
+use crate::sql::execution::shared_path::PendingTransactionView;
+use crate::sql::execution::write_txn_plan::{PendingSemanticRow, PendingSemanticStorage};
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, SqlDialect, Value};
+use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 
 const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
@@ -312,6 +316,205 @@ pub(crate) async fn load_file_row_by_id_without_path(
     }))
 }
 
+pub(crate) async fn load_directory_row_by_id_with_pending_transaction_view(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    version_id: &str,
+    directory_id: &str,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
+    if let Some(row) = pending_directory_row_by_id(
+        backend,
+        pending_transaction_view,
+        version_id,
+        directory_id,
+        scope,
+    )
+    .await?
+    {
+        return Ok(Some(row));
+    }
+
+    let Some(base_row) = load_directory_row_by_id(backend, version_id, directory_id, scope).await?
+    else {
+        return Ok(None);
+    };
+
+    if pending_directory_row_is_hidden(pending_transaction_view, version_id, &base_row.id) {
+        return Ok(None);
+    }
+
+    Ok(Some(base_row))
+}
+
+pub(crate) async fn load_directory_row_by_path_with_pending_transaction_view(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    version_id: &str,
+    path: &NormalizedDirectoryPath,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
+    if let Some(row) =
+        pending_directory_row_by_path(backend, pending_transaction_view, version_id, path, scope)
+            .await?
+    {
+        return Ok(Some(row));
+    }
+
+    let Some(base_row) = load_directory_row_by_path(backend, version_id, path, scope).await? else {
+        return Ok(None);
+    };
+
+    if pending_directory_row_is_hidden(pending_transaction_view, version_id, &base_row.id) {
+        return Ok(None);
+    }
+
+    Ok(Some(base_row))
+}
+
+pub(crate) async fn load_file_row_by_path_with_pending_transaction_view(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    version_id: &str,
+    path: &ParsedFilePath,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+    if let Some(row) =
+        pending_file_row_by_path(backend, pending_transaction_view, version_id, path, scope).await?
+    {
+        return Ok(Some(row));
+    }
+
+    let Some(base_row) = load_file_row_by_path(backend, version_id, path, scope).await? else {
+        return Ok(None);
+    };
+
+    if pending_file_row_is_hidden(pending_transaction_view, version_id, &base_row.id) {
+        return Ok(None);
+    }
+
+    Ok(Some(base_row))
+}
+
+pub(crate) async fn load_file_row_by_id_with_pending_transaction_view(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    version_id: &str,
+    file_id: &str,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+    if let Some(row) = pending_file_row_by_id(
+        backend,
+        pending_transaction_view,
+        version_id,
+        file_id,
+        scope,
+    )
+    .await?
+    {
+        return Ok(Some(row));
+    }
+
+    let Some(mut base_row) = load_file_row_by_id(backend, version_id, file_id, scope).await? else {
+        return Ok(None);
+    };
+
+    let Some(overlay) =
+        pending_transaction_view.and_then(PendingTransactionView::filesystem_overlay)
+    else {
+        return Ok(Some(base_row));
+    };
+    let Some(pending) = overlay
+        .visible_files()
+        .find(|pending| pending.version_id == version_id && pending.file_id == file_id)
+    else {
+        return Ok(Some(base_row));
+    };
+    if pending.deleted {
+        return Ok(None);
+    }
+    if pending.descriptor.is_none() {
+        base_row.metadata = pending.metadata_patch.apply(base_row.metadata.take());
+    }
+    Ok(Some(base_row))
+}
+
+pub(crate) async fn load_file_row_by_id_without_path_with_pending_transaction_view(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    version_id: &str,
+    file_id: &str,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+    if let Some(mut row) = load_file_row_by_id_with_pending_transaction_view(
+        backend,
+        pending_transaction_view,
+        version_id,
+        file_id,
+        scope,
+    )
+    .await?
+    {
+        row.path.clear();
+        return Ok(Some(row));
+    }
+    Ok(None)
+}
+
+pub(crate) async fn lookup_directory_id_by_path_with_pending_transaction_view(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    version_id: &str,
+    path: &NormalizedDirectoryPath,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<String>, FilesystemQueryError> {
+    Ok(load_directory_row_by_path_with_pending_transaction_view(
+        backend,
+        pending_transaction_view,
+        version_id,
+        path,
+        scope,
+    )
+    .await?
+    .map(|row| row.id))
+}
+
+pub(crate) async fn lookup_file_id_by_path_with_pending_transaction_view(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    version_id: &str,
+    path: &ParsedFilePath,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<String>, FilesystemQueryError> {
+    Ok(load_file_row_by_path_with_pending_transaction_view(
+        backend,
+        pending_transaction_view,
+        version_id,
+        path,
+        scope,
+    )
+    .await?
+    .map(|row| row.id))
+}
+
+pub(crate) async fn lookup_directory_path_by_id_with_pending_transaction_view(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    version_id: &str,
+    directory_id: &str,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<String>, FilesystemQueryError> {
+    Ok(load_directory_row_by_id_with_pending_transaction_view(
+        backend,
+        pending_transaction_view,
+        version_id,
+        directory_id,
+        scope,
+    )
+    .await?
+    .map(|row| row.path))
+}
+
 pub(crate) async fn load_directory_rows_under_path(
     backend: &dyn LixBackend,
     version_id: &str,
@@ -403,6 +606,256 @@ pub(crate) async fn load_file_rows_by_paths(
         path_list = path_list,
     );
     load_file_rows_from_sql(backend, &sql).await
+}
+
+async fn pending_directory_row_by_id(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    version_id: &str,
+    directory_id: &str,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
+    let Some(overlay) =
+        pending_transaction_view.and_then(PendingTransactionView::filesystem_overlay)
+    else {
+        return Ok(None);
+    };
+    let Some(pending) = overlay
+        .visible_directory_rows(
+            PendingSemanticStorage::Tracked,
+            FILESYSTEM_DIRECTORY_SCHEMA_KEY,
+        )
+        .find(|row| row.version_id == version_id && row.entity_id == directory_id)
+    else {
+        return Ok(None);
+    };
+    if pending.tombstone {
+        return Ok(None);
+    }
+
+    build_pending_directory_row(backend, pending_transaction_view, pending, scope).await
+}
+
+async fn pending_directory_row_by_path(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    version_id: &str,
+    path: &NormalizedDirectoryPath,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
+    let Some(overlay) =
+        pending_transaction_view.and_then(PendingTransactionView::filesystem_overlay)
+    else {
+        return Ok(None);
+    };
+
+    for pending in overlay.visible_directory_rows(
+        PendingSemanticStorage::Tracked,
+        FILESYSTEM_DIRECTORY_SCHEMA_KEY,
+    ) {
+        if pending.version_id != version_id || pending.tombstone {
+            continue;
+        }
+        let Some(row) =
+            build_pending_directory_row(backend, pending_transaction_view, pending, scope).await?
+        else {
+            continue;
+        };
+        if row.path == path.as_str() {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
+async fn pending_file_row_by_id(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    version_id: &str,
+    file_id: &str,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+    let Some(overlay) =
+        pending_transaction_view.and_then(PendingTransactionView::filesystem_overlay)
+    else {
+        return Ok(None);
+    };
+    let Some(pending) = overlay
+        .visible_files()
+        .find(|pending| pending.version_id == version_id && pending.file_id == file_id)
+    else {
+        return Ok(None);
+    };
+    if pending.deleted {
+        return Ok(None);
+    }
+    build_pending_file_row(backend, pending_transaction_view, pending, scope).await
+}
+
+async fn pending_file_row_by_path(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    version_id: &str,
+    path: &ParsedFilePath,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+    let Some(overlay) =
+        pending_transaction_view.and_then(PendingTransactionView::filesystem_overlay)
+    else {
+        return Ok(None);
+    };
+
+    for pending in overlay.visible_files() {
+        if pending.version_id != version_id || pending.deleted {
+            continue;
+        }
+        let Some(row) =
+            build_pending_file_row(backend, pending_transaction_view, pending, scope).await?
+        else {
+            continue;
+        };
+        if row.path == path.normalized_path.as_str() {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
+fn pending_directory_row_is_hidden(
+    pending_transaction_view: Option<&PendingTransactionView>,
+    version_id: &str,
+    directory_id: &str,
+) -> bool {
+    pending_transaction_view
+        .and_then(PendingTransactionView::filesystem_overlay)
+        .and_then(|overlay| {
+            overlay
+                .visible_directory_rows(
+                    PendingSemanticStorage::Tracked,
+                    FILESYSTEM_DIRECTORY_SCHEMA_KEY,
+                )
+                .find(|row| row.version_id == version_id && row.entity_id == directory_id)
+        })
+        .is_some_and(|row| row.tombstone)
+}
+
+fn pending_file_row_is_hidden(
+    pending_transaction_view: Option<&PendingTransactionView>,
+    version_id: &str,
+    file_id: &str,
+) -> bool {
+    pending_transaction_view
+        .and_then(PendingTransactionView::filesystem_overlay)
+        .and_then(|overlay| {
+            overlay
+                .visible_files()
+                .find(|pending| pending.version_id == version_id && pending.file_id == file_id)
+        })
+        .is_some_and(|pending| pending.deleted || pending.descriptor.is_some())
+}
+
+async fn build_pending_directory_row(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    row: &PendingSemanticRow,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
+    let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+        return Ok(None);
+    };
+    let snapshot: JsonValue =
+        serde_json::from_str(snapshot_content).map_err(|error| FilesystemQueryError {
+            message: format!("filesystem pending directory snapshot invalid JSON: {error}"),
+        })?;
+    let parent_id = snapshot
+        .get("parent_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let name = snapshot
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let hidden = snapshot
+        .get("hidden")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let path = match parent_id.as_deref() {
+        Some(parent_id) => {
+            let Some(parent_path) =
+                Box::pin(lookup_directory_path_by_id_with_pending_transaction_view(
+                    backend,
+                    pending_transaction_view,
+                    &row.version_id,
+                    parent_id,
+                    scope,
+                ))
+                .await?
+            else {
+                return Ok(None);
+            };
+            compose_directory_path(&parent_path, &name).map_err(filesystem_query_backend_error)?
+        }
+        None => compose_directory_path("/", &name).map_err(filesystem_query_backend_error)?,
+    };
+
+    Ok(Some(DirectoryFilesystemRow {
+        id: row.entity_id.clone(),
+        parent_id,
+        name,
+        path,
+        hidden,
+        version_id: row.version_id.clone(),
+        untracked: false,
+        metadata: row.metadata.clone(),
+        change_id: None,
+    }))
+}
+
+async fn build_pending_file_row(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    row: &FilesystemTransactionFileState,
+    scope: FilesystemProjectionScope,
+) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+    let Some(descriptor) = row.descriptor.as_ref() else {
+        return Ok(None);
+    };
+    let path = match descriptor.directory_id.as_str() {
+        "" => compose_file_path("/", &descriptor.name, descriptor.extension.as_deref()),
+        directory_id => {
+            let Some(parent_path) = lookup_directory_path_by_id_with_pending_transaction_view(
+                backend,
+                pending_transaction_view,
+                &row.version_id,
+                directory_id,
+                scope,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            compose_file_path(
+                &parent_path,
+                &descriptor.name,
+                descriptor.extension.as_deref(),
+            )
+        }
+    };
+
+    Ok(Some(FileFilesystemRow {
+        id: row.file_id.clone(),
+        directory_id: (!descriptor.directory_id.is_empty())
+            .then(|| descriptor.directory_id.clone()),
+        name: descriptor.name.clone(),
+        extension: descriptor.extension.clone(),
+        path,
+        hidden: descriptor.hidden,
+        version_id: row.version_id.clone(),
+        untracked: row.untracked,
+        metadata: descriptor.metadata.clone(),
+        change_id: None,
+    }))
 }
 
 async fn load_directory_row_from_sql(

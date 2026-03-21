@@ -541,10 +541,6 @@ fn guardrail_exact_row_targeting_stays_shared_between_read_and_write() {
         root.join("src/sql/public/planner/semantics/write_resolver/state_backed_writes.rs"),
     )
     .expect("state_backed_writes.rs should be readable");
-    let selector_queries = fs::read_to_string(
-        root.join("src/sql/public/planner/semantics/write_resolver/selector_queries.rs"),
-    )
-    .expect("selector_queries.rs should be readable");
     let effective_state_resolver = fs::read_to_string(
         root.join("src/sql/public/planner/semantics/effective_state_resolver.rs"),
     )
@@ -561,7 +557,7 @@ fn guardrail_exact_row_targeting_stays_shared_between_read_and_write() {
 
     for required in [
         "CanonicalStateRowKey",
-        "resolve_exact_effective_state_row(",
+        "resolve_exact_effective_state_row_with_pending_transaction_view(",
         "ExactEffectiveStateRowRequest {",
         "targets_single_effective_row(",
     ] {
@@ -570,10 +566,15 @@ fn guardrail_exact_row_targeting_stays_shared_between_read_and_write() {
             "state_backed_writes.rs must share canonical exact-row targeting through {required}"
         );
     }
-    for required in ["CanonicalStateSelector", "canonical_state_selector("] {
+    for required in [
+        "CanonicalStateSelector",
+        "canonical_state_selector(",
+        "execute_public_selector_query_strict(",
+        "build_public_selector_query(",
+    ] {
         assert!(
-            selector_queries.contains(required),
-            "selector_queries.rs must own shared selector-query construction through {required}"
+            write_resolver.contains(required),
+            "write_resolver.rs must own shared selector-query construction through {required}"
         );
     }
 
