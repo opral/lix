@@ -46,6 +46,9 @@ use super::types::{
 const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
 const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
+const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
+const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";
 const IDEMPOTENCY_KIND_EXACT: &str = "exact";
 const IDEMPOTENCY_KIND_CURRENT_HEAD_FINGERPRINT: &str = "current_head_fingerprint";
 
@@ -279,7 +282,7 @@ pub(crate) async fn create_commit(
         invariant_checker.recheck_invariants(transaction).await?;
     }
 
-    let (applied_domain_changes, compiled_filesystem_state) = resolve_proposed_domain_changes(
+    let (applied_domain_changes, mut compiled_filesystem_state) = resolve_proposed_domain_changes(
         &args.changes,
         &preflight,
         &args.filesystem_state,
@@ -289,6 +292,13 @@ pub(crate) async fn create_commit(
         let mut executor = TransactionCommitExecutor { transaction };
         normalize_proposed_domain_changes(&mut executor, &applied_domain_changes).await?
     };
+    let applied_change_identities = applied_domain_changes
+        .iter()
+        .map(proposed_domain_change_identity)
+        .collect::<BTreeSet<_>>();
+    compiled_filesystem_state
+        .binary_blob_writes
+        .retain(|write| binary_blob_write_still_needed(write, &applied_change_identities));
     if applied_domain_changes.is_empty()
         && compiled_filesystem_state.binary_blob_writes.is_empty()
         && !args.allow_empty_commit
@@ -726,6 +736,23 @@ fn proposed_domain_change_identity(
             .unwrap_or_default(),
         change.schema_version.as_ref().map(ToString::to_string),
     )
+}
+
+fn binary_blob_write_still_needed(
+    write: &BinaryBlobWrite,
+    applied_change_identities: &BTreeSet<(String, String, String, String, String, Option<String>)>,
+) -> bool {
+    let Some(file_id) = write.file_id.as_ref() else {
+        return true;
+    };
+    applied_change_identities.contains(&(
+        file_id.clone(),
+        BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
+        write.version_id.clone(),
+        file_id.clone(),
+        INTERNAL_FILESYSTEM_PLUGIN_KEY.to_string(),
+        Some(BINARY_BLOB_REF_SCHEMA_VERSION.to_string()),
+    ))
 }
 
 fn materialize_domain_changes(

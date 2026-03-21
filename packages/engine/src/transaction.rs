@@ -7,6 +7,7 @@ use crate::sql::execution::write_txn_runner::stamp_watermark_before_commit;
 use crate::{ExecuteResult, LixError, Value};
 use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
+use sqlparser::ast::Statement;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -77,12 +78,12 @@ impl EngineTransaction<'_> {
         sql: &str,
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
+        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         if !self.engine.access_to_internal() {
-            let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
             reject_public_create_table(&parsed_statements)?;
             reject_internal_table_writes(&parsed_statements)?;
         }
-        self.execute_with_access(sql, params, self.engine.access_to_internal())
+        self.execute_parsed_with_access(parsed_statements, params, self.engine.access_to_internal())
             .await
     }
 
@@ -91,16 +92,17 @@ impl EngineTransaction<'_> {
         sql: &str,
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
-        self.execute_with_access(sql, params, true).await
+        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
+        self.execute_parsed_with_access(parsed_statements, params, true)
+            .await
     }
 
-    async fn execute_with_access(
+    async fn execute_parsed_with_access(
         &mut self,
-        sql: &str,
+        parsed_statements: Vec<Statement>,
         params: &[Value],
         allow_internal_tables: bool,
     ) -> Result<ExecuteResult, LixError> {
-        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         let transaction = self.transaction.as_mut().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),

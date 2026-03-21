@@ -1,4 +1,3 @@
-pub(crate) mod bind_once;
 mod canonical_write;
 pub(crate) mod defaults;
 pub(crate) mod followup;
