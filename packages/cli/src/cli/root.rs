@@ -103,14 +103,20 @@ mod tests {
     #[test]
     fn parses_version_merge_command() {
         let cli = Cli::try_parse_from([
-            "lix", "version", "merge", "--source", "draft-a", "--target", "main",
+            "lix",
+            "version",
+            "merge",
+            "--source-name",
+            "draft-a",
+            "--target-id",
+            "main",
         ])
         .expect("parse succeeds");
         match cli.command {
             Command::Version(command) => match command.command {
                 VersionSubcommand::Merge(args) => {
-                    assert_eq!(args.source, "draft-a");
-                    assert_eq!(args.target, "main");
+                    assert_eq!(args.source_name.as_deref(), Some("draft-a"));
+                    assert_eq!(args.target_id.as_deref(), Some("main"));
                 }
                 _ => panic!("expected version merge command"),
             },
@@ -121,7 +127,16 @@ mod tests {
     #[test]
     fn parses_version_create_command() {
         let cli = Cli::try_parse_from([
-            "lix", "version", "create", "--id", "branch-a", "--name", "Branch A", "--hidden",
+            "lix",
+            "version",
+            "create",
+            "--id",
+            "branch-a",
+            "--name",
+            "Branch A",
+            "--from-name",
+            "main",
+            "--hidden",
         ])
         .expect("parse succeeds");
         match cli.command {
@@ -129,6 +144,7 @@ mod tests {
                 VersionSubcommand::Create(args) => {
                     assert_eq!(args.id.as_deref(), Some("branch-a"));
                     assert_eq!(args.name.as_deref(), Some("Branch A"));
+                    assert_eq!(args.from_name.as_deref(), Some("main"));
                     assert!(args.hidden);
                 }
                 _ => panic!("expected version create command"),
@@ -139,16 +155,25 @@ mod tests {
 
     #[test]
     fn parses_version_switch_command() {
-        let cli =
-            Cli::try_parse_from(["lix", "version", "switch", "branch-a"]).expect("parse succeeds");
+        let cli = Cli::try_parse_from(["lix", "version", "switch", "--name", "branch-a"])
+            .expect("parse succeeds");
         match cli.command {
             Command::Version(command) => match command.command {
                 VersionSubcommand::Switch(args) => {
-                    assert_eq!(args.version_id, "branch-a");
+                    assert_eq!(args.name.as_deref(), Some("branch-a"));
                 }
                 _ => panic!("expected version switch command"),
             },
             _ => panic!("expected version command"),
         }
+    }
+
+    #[test]
+    fn rejects_version_switch_without_reference_flag() {
+        let error =
+            Cli::try_parse_from(["lix", "version", "switch"]).expect_err("parse should fail");
+        let message = error.to_string();
+        assert!(message.contains("--id"));
+        assert!(message.contains("--name"));
     }
 }

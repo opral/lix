@@ -4,6 +4,7 @@ use crate::{errors, Engine, EngineTransaction, ExecuteOptions, LixError, Value};
 pub struct CreateVersionOptions {
     pub id: Option<String>,
     pub name: Option<String>,
+    pub source_version_id: Option<String>,
     #[serde(default)]
     pub hidden: bool,
 }
@@ -12,6 +13,8 @@ pub struct CreateVersionOptions {
 pub struct CreateVersionResult {
     pub id: String,
     pub name: String,
+    pub parent_version_id: String,
+    pub parent_commit_id: String,
 }
 
 pub async fn create_version(
@@ -29,6 +32,60 @@ async fn create_version_in_transaction(
     tx: &mut EngineTransaction<'_>,
     options: CreateVersionOptions,
 ) -> Result<CreateVersionResult, LixError> {
+    let SourceVersion {
+        version_id: parent_version_id,
+        commit_id: parent_commit_id,
+    } = load_create_version_source(tx, options.source_version_id.as_deref()).await?;
+
+    let id =
+        normalize_optional_non_empty_text(options.id, "id")?.unwrap_or(generate_uuid(tx).await?);
+    let name = normalize_optional_non_empty_text(options.name, "name")?.unwrap_or(id.clone());
+    if id == crate::version::GLOBAL_VERSION_ID {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "version id 'global' is reserved".to_string(),
+        });
+    }
+    let hidden = options.hidden;
+
+    tx.execute(
+        "INSERT INTO lix_version (\
+         id, name, hidden, commit_id\
+         ) VALUES ($1, $2, $3, $4)",
+        &[
+            Value::Text(id.clone()),
+            Value::Text(name.clone()),
+            Value::Boolean(hidden),
+            Value::Text(parent_commit_id.clone()),
+        ],
+    )
+    .await?;
+
+    Ok(CreateVersionResult {
+        id,
+        name,
+        parent_version_id,
+        parent_commit_id,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceVersion {
+    version_id: String,
+    commit_id: String,
+}
+
+async fn load_create_version_source(
+    tx: &mut EngineTransaction<'_>,
+    source_version_id: Option<&str>,
+) -> Result<SourceVersion, LixError> {
+    match source_version_id {
+        Some(source_version_id) => load_explicit_source_version(tx, source_version_id).await,
+        None => load_active_source_version(tx).await,
+    }
+}
+
+async fn load_active_source_version(tx: &mut EngineTransaction<'_>) -> Result<SourceVersion, LixError> {
     let active_version = tx
         .execute(
             "SELECT av.version_id, v.commit_id \
@@ -52,35 +109,44 @@ async fn create_version_in_transaction(
             description: "missing active version row".to_string(),
         });
     };
-    let active_version_id = text_at(row, 0, "active_version.version_id")?;
-    let active_commit_id = text_at(row, 1, "lix_version.commit_id")?;
+    Ok(SourceVersion {
+        version_id: text_at(row, 0, "active_version.version_id")?,
+        commit_id: text_at(row, 1, "lix_version.commit_id")?,
+    })
+}
 
-    let id =
-        normalize_optional_non_empty_text(options.id, "id")?.unwrap_or(generate_uuid(tx).await?);
-    let name = normalize_optional_non_empty_text(options.name, "name")?.unwrap_or(id.clone());
-    if id == crate::version::GLOBAL_VERSION_ID {
+async fn load_explicit_source_version(
+    tx: &mut EngineTransaction<'_>,
+    source_version_id: &str,
+) -> Result<SourceVersion, LixError> {
+    let source_version_id = normalize_optional_non_empty_text(
+        Some(source_version_id.to_string()),
+        "source_version_id",
+    )?
+    .expect("source_version_id should remain present after normalization");
+    let source = tx
+        .execute(
+            "SELECT id, commit_id FROM lix_version WHERE id = $1 LIMIT 1",
+            &[Value::Text(source_version_id.clone())],
+        )
+        .await?;
+    let [statement] = source.statements.as_slice() else {
+        return Err(errors::unexpected_statement_count_error(
+            "create version source query",
+            1,
+            source.statements.len(),
+        ));
+    };
+    let Some(row) = statement.rows.first() else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "version id 'global' is reserved".to_string(),
+            description: format!("source version '{source_version_id}' does not exist"),
         });
-    }
-    let hidden = options.hidden;
-
-    tx.execute(
-        "INSERT INTO lix_version (\
-         id, name, hidden, commit_id\
-         ) VALUES ($1, $2, $3, $4)",
-        &[
-            Value::Text(id.clone()),
-            Value::Text(name.clone()),
-            Value::Boolean(hidden),
-            Value::Text(active_commit_id.clone()),
-        ],
-    )
-    .await?;
-
-    let _ = active_version_id;
-    Ok(CreateVersionResult { id, name })
+    };
+    Ok(SourceVersion {
+        version_id: text_at(row, 0, "lix_version.id")?,
+        commit_id: text_at(row, 1, "lix_version.commit_id")?,
+    })
 }
 
 async fn generate_uuid(tx: &mut EngineTransaction<'_>) -> Result<String, LixError> {
@@ -143,6 +209,7 @@ mod tests {
         let options: CreateVersionOptions =
             serde_json::from_str(r#"{"id":"test-version"}"#).expect("deserialization should work");
         assert_eq!(options.id.as_deref(), Some("test-version"));
+        assert_eq!(options.source_version_id, None);
         assert!(!options.hidden);
     }
 }

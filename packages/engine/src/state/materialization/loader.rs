@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
+use crate::backend::QueryExecutor;
 use crate::schema::builtin::types::{LixCommit, LixCommitEdge, LixVersionDescriptor};
 
-use crate::{CanonicalJson, LixBackend, LixError, Value};
+use crate::{CanonicalJson, LixError, Value};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ChangeRecord {
@@ -52,11 +53,13 @@ pub(crate) struct LoadedData {
     pub commit_edges: Vec<CommitEdgeRecord>,
 }
 
-pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, LixError> {
+pub(crate) async fn load_data_with_executor(
+    executor: &mut dyn QueryExecutor,
+) -> Result<LoadedData, LixError> {
     let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at \
                FROM lix_internal_change c \
                LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id";
-    let result = backend.execute(sql, &[]).await?;
+    let result = executor.execute(sql, &[]).await?;
 
     let mut changes = BTreeMap::new();
     let mut commits = BTreeMap::new();

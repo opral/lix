@@ -114,6 +114,8 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
 
     assert!(!created.id.is_empty());
     assert_eq!(created.name, created.id);
+    assert_eq!(created.parent_version_id, active_version_id);
+    assert_eq!(created.parent_commit_id, active_commit_id);
 
     let created_row = engine
         .execute(
@@ -258,13 +260,14 @@ simulation_test!(
         engine.initialize().await.expect("init should succeed");
 
         let created = engine
-            .create_version(CreateVersionOptions {
-                id: Some("branch-alpha".to_string()),
-                name: Some("Branch Alpha".to_string()),
-                hidden: true,
-            })
-            .await
-            .expect("create_version should succeed");
+        .create_version(CreateVersionOptions {
+            id: Some("branch-alpha".to_string()),
+            name: Some("Branch Alpha".to_string()),
+            source_version_id: None,
+            hidden: true,
+        })
+        .await
+        .expect("create_version should succeed");
         assert_eq!(created.id, "branch-alpha");
         assert_eq!(created.name, "Branch Alpha");
 
@@ -320,6 +323,98 @@ simulation_test!(switch_version_rejects_invalid_inputs, |sim| async move {
         .expect_err("unknown version id should fail");
     assert!(missing.description.contains("does not exist"));
 });
+
+simulation_test!(
+    create_version_can_target_explicit_source_without_switching_active,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.expect("init should succeed");
+        let main_version_id = engine
+            .execute(
+                "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("active version query should succeed");
+        let main_version_id = value_as_text(&main_version_id.statements[0].rows[0][0]);
+
+        engine
+            .create_version(CreateVersionOptions {
+                id: Some("source-branch".to_string()),
+                name: Some("Source Branch".to_string()),
+                source_version_id: None,
+                hidden: false,
+            })
+            .await
+            .expect("source version should be created");
+        engine
+            .switch_version("source-branch".to_string())
+            .await
+            .expect("switch to source should succeed");
+        engine
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('source-only-key', 'source-only')",
+                &[],
+            )
+            .await
+            .expect("source branch write should succeed");
+
+        let source_head = version_commit_id(&engine, "source-branch").await;
+
+        engine
+            .switch_version(main_version_id.clone())
+            .await
+            .expect("switch back to main should succeed");
+        let active_before = engine
+            .execute(
+                "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("active version query should succeed");
+        assert_eq!(
+            value_as_text(&active_before.statements[0].rows[0][0]),
+            main_version_id
+        );
+
+        let created = engine
+            .create_version(CreateVersionOptions {
+                id: Some("child-of-source".to_string()),
+                name: Some("Child Of Source".to_string()),
+                source_version_id: Some("source-branch".to_string()),
+                hidden: false,
+            })
+            .await
+            .expect("create_version with explicit source should succeed");
+
+        assert_eq!(created.parent_version_id, "source-branch");
+        assert_eq!(created.parent_commit_id, source_head);
+
+        let active_after = engine
+            .execute(
+                "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("active version query should succeed");
+        assert_eq!(
+            value_as_text(&active_after.statements[0].rows[0][0]),
+            main_version_id
+        );
+
+        engine
+            .switch_version("child-of-source".to_string())
+            .await
+            .expect("switch to child should succeed");
+        assert_eq!(
+            version_commit_id(&engine, "child-of-source").await,
+            source_head
+        );
+    }
+);
 
 simulation_test!(create_version_switch_then_checkpoint, |sim| async move {
     let engine = sim

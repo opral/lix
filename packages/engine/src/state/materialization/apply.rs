@@ -25,6 +25,45 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
             &[],
         )
         .await?;
+    let (rows_deleted, tables_touched) =
+        apply_live_state_scope_in_transaction(transaction.as_mut(), plan).await?;
+
+    if matches!(plan.scope, LiveStateRebuildScope::Full) {
+        let Some(watermark) =
+            load_latest_canonical_watermark_in_transaction(transaction.as_mut()).await?
+        else {
+            transaction.rollback().await?;
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "live-state rebuild expected canonical watermark for full rebuild",
+            ));
+        };
+        transaction
+            .execute(&build_mark_live_state_ready_sql(&watermark), &[])
+            .await?;
+    } else {
+        transaction
+            .execute(
+                &build_set_live_state_mode_sql(LiveStateMode::NeedsRebuild),
+                &[],
+            )
+            .await?;
+    }
+
+    transaction.commit().await?;
+
+    Ok(LiveStateApplyReport {
+        run_id: plan.run_id.clone(),
+        rows_written: plan.writes.len(),
+        rows_deleted,
+        tables_touched: tables_touched.into_iter().collect(),
+    })
+}
+
+pub(crate) async fn apply_live_state_scope_in_transaction(
+    transaction: &mut dyn LixTransaction,
+    plan: &LiveStateRebuildPlan,
+) -> Result<(usize, BTreeSet<String>), LixError> {
     let mut tables_touched = BTreeSet::new();
 
     let mut schema_keys = BTreeSet::new();
@@ -32,13 +71,8 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
         schema_keys.insert(write.schema_key.to_string());
     }
 
-    let rows_deleted = clear_scope_rows(
-        transaction.as_mut(),
-        &schema_keys,
-        &plan.scope,
-        &mut tables_touched,
-    )
-    .await?;
+    let rows_deleted =
+        clear_scope_rows(transaction, &schema_keys, &plan.scope, &mut tables_touched).await?;
 
     for write in &plan.writes {
         let table_name = tracked_live_table_name(&write.schema_key);
@@ -54,8 +88,7 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
             .as_ref()
             .map(|value| format!("'{}'", escape_sql_string(value.as_str())))
             .unwrap_or_else(|| "NULL".to_string());
-        let layout =
-            load_live_table_layout_in_transaction(transaction.as_mut(), &write.schema_key).await?;
+        let layout = load_live_table_layout_in_transaction(transaction, &write.schema_key).await?;
         let normalized_values = normalized_live_column_values_for_write(
             Some(&layout),
             write.snapshot_content.as_deref(),
@@ -100,36 +133,7 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
         transaction.execute(&sql, &[]).await?;
     }
 
-    if matches!(plan.scope, LiveStateRebuildScope::Full) {
-        let Some(watermark) =
-            load_latest_canonical_watermark_in_transaction(transaction.as_mut()).await?
-        else {
-            transaction.rollback().await?;
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "live-state rebuild expected canonical watermark for full rebuild",
-            ));
-        };
-        transaction
-            .execute(&build_mark_live_state_ready_sql(&watermark), &[])
-            .await?;
-    } else {
-        transaction
-            .execute(
-                &build_set_live_state_mode_sql(LiveStateMode::NeedsRebuild),
-                &[],
-            )
-            .await?;
-    }
-
-    transaction.commit().await?;
-
-    Ok(LiveStateApplyReport {
-        run_id: plan.run_id.clone(),
-        rows_written: plan.writes.len(),
-        rows_deleted,
-        tables_touched: tables_touched.into_iter().collect(),
-    })
+    Ok((rows_deleted, tables_touched))
 }
 
 async fn clear_scope_rows(

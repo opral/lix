@@ -581,6 +581,7 @@ simulation_test!(
             .create_version(lix_engine::CreateVersionOptions {
                 id: Some(branch_version.clone()),
                 name: Some(branch_version.clone()),
+                source_version_id: None,
                 hidden: false,
             })
             .await

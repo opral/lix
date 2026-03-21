@@ -10,7 +10,8 @@ use crate::state::commit::{
     ExactCommittedStateRowRequest,
 };
 use crate::state::materialization::{
-    LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
+    apply_live_state_scope_in_transaction, live_state_rebuild_plan_with_executor,
+    LiveStateRebuildRequest, LiveStateRebuildScope,
 };
 use crate::state::stream::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::{ExecuteOptions, LixError, Value};
@@ -77,27 +78,12 @@ pub async fn merge_version(
     engine: &Engine,
     options: MergeVersionOptions,
 ) -> Result<MergeVersionResult, LixError> {
-    let target_version_id = options.target_version_id.clone();
-    let result = engine
+    engine
         .transaction(ExecuteOptions::default(), move |tx| {
             let options = options.clone();
             Box::pin(async move { merge_version_in_transaction(tx, options).await })
         })
-        .await?;
-
-    if result.outcome == MergeOutcome::FastForwarded {
-        let mut versions = BTreeSet::new();
-        versions.insert(target_version_id);
-        engine
-            .rebuild_live_state(&LiveStateRebuildRequest {
-                scope: LiveStateRebuildScope::Versions(versions),
-                debug: LiveStateRebuildDebugMode::Off,
-                debug_row_limit: 0,
-            })
-            .await?;
-    }
-
-    Ok(result)
+        .await
 }
 
 async fn merge_version_in_transaction(
@@ -161,6 +147,30 @@ async fn merge_version_in_transaction(
             ],
         )
         .await?;
+
+        let transaction = tx
+            .transaction
+            .as_mut()
+            .map(|transaction| transaction.as_mut())
+            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
+        tx.engine
+            .prepare_execution_context_for_commit(transaction, &mut tx.context)
+            .await?;
+        let mut versions = BTreeSet::new();
+        versions.insert(target_version_id.clone());
+        let plan = {
+            let mut executor = &mut *transaction;
+            live_state_rebuild_plan_with_executor(
+                &mut executor,
+                &LiveStateRebuildRequest {
+                    scope: LiveStateRebuildScope::Versions(versions),
+                    debug: crate::state::materialization::LiveStateRebuildDebugMode::Off,
+                    debug_row_limit: 0,
+                },
+            )
+            .await?
+        };
+        let _ = apply_live_state_scope_in_transaction(transaction, &plan).await?;
 
         return Ok(MergeVersionResult {
             outcome: MergeOutcome::FastForwarded,

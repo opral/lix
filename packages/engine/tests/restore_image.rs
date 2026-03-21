@@ -446,6 +446,7 @@ async fn run_restore_from_image_refreshes_active_version_cache_sqlite() {
         .create_version(CreateVersionOptions {
             id: Some("after".to_string()),
             name: Some("after".to_string()),
+            source_version_id: None,
             hidden: false,
         })
         .await
@@ -466,6 +467,7 @@ async fn run_restore_from_image_refreshes_active_version_cache_sqlite() {
         .create_version(CreateVersionOptions {
             id: Some("before".to_string()),
             name: Some("before".to_string()),
+            source_version_id: None,
             hidden: false,
         })
         .await
