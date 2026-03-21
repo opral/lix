@@ -6,8 +6,9 @@ use serde_json::Value as JsonValue;
 use crate::{
     boot::EngineConfig, observe::observe_owned, BootKeyValue, CreateCheckpointResult,
     CreateVersionOptions, CreateVersionResult, Engine, ExecuteOptions, ExecuteResult,
-    ImageChunkWriter, LixBackend, LixError, ObserveEventsOwned, ObserveQuery, RedoOptions,
-    RedoResult, UndoOptions, UndoResult, Value, WasmRuntime,
+    ImageChunkWriter, LixBackend, LixError, MergeVersionOptions, MergeVersionResult,
+    ObserveEventsOwned, ObserveQuery, RedoOptions, RedoResult, UndoOptions, UndoResult, Value,
+    WasmRuntime,
 };
 
 pub struct LixConfig {
@@ -91,6 +92,13 @@ impl Lix {
 
     pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
         self.engine.switch_version(version_id).await
+    }
+
+    pub async fn merge_version(
+        &self,
+        options: MergeVersionOptions,
+    ) -> Result<MergeVersionResult, LixError> {
+        self.engine.merge_version(options).await
     }
 
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointResult, LixError> {

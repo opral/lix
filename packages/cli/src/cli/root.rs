@@ -3,6 +3,7 @@ use super::init::InitCommand;
 use super::redo::RedoCommand;
 use super::sql::SqlCommand;
 use super::undo::UndoCommand;
+use super::version::VersionCommand;
 use clap::{Parser, Subcommand, ValueHint};
 use std::path::PathBuf;
 
@@ -36,12 +37,15 @@ pub enum Command {
     Sql(SqlCommand),
     /// Undo the most recent committed change unit.
     Undo(UndoCommand),
+    /// Version operations such as merging branches.
+    Version(VersionCommand),
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Cli, Command};
     use crate::cli::sql::SqlSubcommand;
+    use crate::cli::version::VersionSubcommand;
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -93,6 +97,58 @@ mod tests {
         match cli.command {
             Command::Redo(command) => assert_eq!(command.version, None),
             _ => panic!("expected redo command"),
+        }
+    }
+
+    #[test]
+    fn parses_version_merge_command() {
+        let cli = Cli::try_parse_from([
+            "lix", "version", "merge", "--source", "draft-a", "--target", "main",
+        ])
+        .expect("parse succeeds");
+        match cli.command {
+            Command::Version(command) => match command.command {
+                VersionSubcommand::Merge(args) => {
+                    assert_eq!(args.source, "draft-a");
+                    assert_eq!(args.target, "main");
+                }
+                _ => panic!("expected version merge command"),
+            },
+            _ => panic!("expected version command"),
+        }
+    }
+
+    #[test]
+    fn parses_version_create_command() {
+        let cli = Cli::try_parse_from([
+            "lix", "version", "create", "--id", "branch-a", "--name", "Branch A", "--hidden",
+        ])
+        .expect("parse succeeds");
+        match cli.command {
+            Command::Version(command) => match command.command {
+                VersionSubcommand::Create(args) => {
+                    assert_eq!(args.id.as_deref(), Some("branch-a"));
+                    assert_eq!(args.name.as_deref(), Some("Branch A"));
+                    assert!(args.hidden);
+                }
+                _ => panic!("expected version create command"),
+            },
+            _ => panic!("expected version command"),
+        }
+    }
+
+    #[test]
+    fn parses_version_switch_command() {
+        let cli =
+            Cli::try_parse_from(["lix", "version", "switch", "branch-a"]).expect("parse succeeds");
+        match cli.command {
+            Command::Version(command) => match command.command {
+                VersionSubcommand::Switch(args) => {
+                    assert_eq!(args.version_id, "branch-a");
+                }
+                _ => panic!("expected version switch command"),
+            },
+            _ => panic!("expected version command"),
         }
     }
 }
