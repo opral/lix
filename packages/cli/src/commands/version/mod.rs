@@ -67,9 +67,7 @@ fn resolve_version_by_id(lix: &Lix, id: &str) -> Result<ResolvedVersionRef, CliE
     .map_err(|error| CliError::msg(error.to_string()))?;
     let rows = statement_rows(&result)?;
     let Some(row) = rows.first() else {
-        return Err(CliError::msg(format!(
-            "no version exists with id '{id}'"
-        )));
+        return Err(CliError::msg(format!("no version exists with id '{id}'")));
     };
 
     Ok(ResolvedVersionRef {
