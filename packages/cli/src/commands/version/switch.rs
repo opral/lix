@@ -23,6 +23,9 @@ pub fn run(context: &AppContext, command: SwitchVersionCommand) -> Result<Comman
     pollster::block_on(lix.switch_version(resolved.id.clone()))
         .map_err(|error| CliError::msg(error.to_string()))?;
 
-    println!("Switched active version to {} ({})", resolved.name, resolved.id);
+    println!(
+        "Switched active version to {} ({})",
+        resolved.name, resolved.id
+    );
     Ok(CommandOutput::empty())
 }

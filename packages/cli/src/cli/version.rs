@@ -42,19 +42,35 @@ pub struct CreateVersionCommand {
 #[derive(Debug, Args)]
 pub struct MergeVersionCommand {
     /// Source version id to merge from.
-    #[arg(long, conflicts_with = "source_name", required_unless_present = "source_name")]
+    #[arg(
+        long,
+        conflicts_with = "source_name",
+        required_unless_present = "source_name"
+    )]
     pub source_id: Option<String>,
 
     /// Source version name to merge from.
-    #[arg(long, conflicts_with = "source_id", required_unless_present = "source_id")]
+    #[arg(
+        long,
+        conflicts_with = "source_id",
+        required_unless_present = "source_id"
+    )]
     pub source_name: Option<String>,
 
     /// Target version id to merge into.
-    #[arg(long, conflicts_with = "target_name", required_unless_present = "target_name")]
+    #[arg(
+        long,
+        conflicts_with = "target_name",
+        required_unless_present = "target_name"
+    )]
     pub target_id: Option<String>,
 
     /// Target version name to merge into.
-    #[arg(long, conflicts_with = "target_id", required_unless_present = "target_id")]
+    #[arg(
+        long,
+        conflicts_with = "target_id",
+        required_unless_present = "target_id"
+    )]
     pub target_name: Option<String>,
 }
 

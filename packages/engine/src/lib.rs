@@ -12,6 +12,7 @@ mod functions;
 mod identity;
 mod init;
 mod key_value;
+pub mod live_tracked_state;
 mod lix;
 mod observe;
 mod plugin;
