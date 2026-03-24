@@ -1,0 +1,149 @@
+use std::collections::BTreeSet;
+
+use crate::schema::live_layout::{
+    load_live_table_layout_with_executor, normalized_live_column_values, tracked_live_table_name,
+};
+use crate::schema::registry::{ensure_schema_live_table, ensure_schema_live_table_in_transaction};
+use crate::{LixBackend, LixError, LixTransaction};
+
+use super::contracts::{TrackedWriteOperation, TrackedWriteRow};
+use super::shared::{
+    escape_sql_string, normalized_insert_columns_sql, normalized_insert_values_sql,
+    normalized_update_assignments_sql, quote_ident, sql_literal_text,
+};
+
+pub async fn ensure_storage_with_backend(
+    backend: &dyn LixBackend,
+    schema_key: &str,
+) -> Result<(), LixError> {
+    ensure_schema_live_table(backend, schema_key).await
+}
+
+pub async fn apply_write_batch_with_backend(
+    backend: &dyn LixBackend,
+    batch: &[TrackedWriteRow],
+) -> Result<(), LixError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let mut transaction = backend.begin_transaction().await?;
+    let result = apply_write_batch_in_transaction(transaction.as_mut(), batch).await;
+    match result {
+        Ok(()) => transaction.commit().await,
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+pub(crate) async fn apply_write_batch_in_transaction(
+    transaction: &mut dyn LixTransaction,
+    batch: &[TrackedWriteRow],
+) -> Result<(), LixError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let mut schemas = BTreeSet::new();
+    for row in batch {
+        schemas.insert(row.schema_key.clone());
+    }
+    for schema_key in schemas {
+        ensure_schema_live_table_in_transaction(transaction, &schema_key).await?;
+    }
+
+    for row in batch {
+        match row.operation {
+            TrackedWriteOperation::Upsert => {
+                let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        &format!(
+                            "tracked upsert for schema '{}' entity '{}' requires snapshot_content",
+                            row.schema_key, row.entity_id
+                        ),
+                    )
+                })?;
+                apply_materialized_row_in_transaction(
+                    transaction,
+                    row,
+                    Some(snapshot_content),
+                    false,
+                )
+                .await?;
+            }
+            TrackedWriteOperation::Tombstone => {
+                apply_materialized_row_in_transaction(transaction, row, None, true).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn apply_materialized_row_in_transaction(
+    transaction: &mut dyn LixTransaction,
+    row: &TrackedWriteRow,
+    snapshot_content: Option<&str>,
+    is_tombstone: bool,
+) -> Result<(), LixError> {
+    let layout = {
+        let mut executor = &mut *transaction;
+        load_live_table_layout_with_executor(&mut executor, &row.schema_key).await?
+    };
+    let normalized_values = normalized_live_column_values(&layout, snapshot_content)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let normalized_columns = normalized_insert_columns_sql(&normalized_values);
+    let normalized_values_sql = normalized_insert_values_sql(&normalized_values);
+    let normalized_updates = normalized_update_assignments_sql(&normalized_values);
+    let created_at = row.created_at.as_deref().unwrap_or(&row.updated_at);
+    let metadata_sql = row
+        .metadata
+        .as_deref()
+        .map(sql_literal_text)
+        .unwrap_or_else(|| "NULL".to_string());
+    let writer_key_sql = row
+        .writer_key
+        .as_deref()
+        .map(sql_literal_text)
+        .unwrap_or_else(|| "NULL".to_string());
+    let sql = format!(
+        "INSERT INTO {table} (\
+         entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, writer_key, is_tombstone, created_at, updated_at{normalized_columns}\
+         ) VALUES (\
+         '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{change_id}', {metadata}, {writer_key}, {is_tombstone}, '{created_at}', '{updated_at}'{normalized_values}\
+         ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
+         schema_key = excluded.schema_key, \
+         schema_version = excluded.schema_version, \
+         global = excluded.global, \
+         plugin_key = excluded.plugin_key, \
+         change_id = excluded.change_id, \
+         metadata = excluded.metadata, \
+         writer_key = excluded.writer_key, \
+         is_tombstone = excluded.is_tombstone, \
+         created_at = excluded.created_at, \
+         updated_at = excluded.updated_at{normalized_updates}",
+        table = quote_ident(&tracked_live_table_name(&row.schema_key)),
+        entity_id = escape_sql_string(&row.entity_id),
+        schema_key = escape_sql_string(&row.schema_key),
+        schema_version = escape_sql_string(&row.schema_version),
+        file_id = escape_sql_string(&row.file_id),
+        version_id = escape_sql_string(&row.version_id),
+        global = if row.global { "true" } else { "false" },
+        plugin_key = escape_sql_string(&row.plugin_key),
+        change_id = escape_sql_string(&row.change_id),
+        metadata = metadata_sql,
+        writer_key = writer_key_sql,
+        is_tombstone = if is_tombstone { "1" } else { "0" },
+        created_at = escape_sql_string(created_at),
+        updated_at = escape_sql_string(&row.updated_at),
+        normalized_columns = normalized_columns,
+        normalized_values = normalized_values_sql,
+        normalized_updates = normalized_updates,
+    );
+    transaction.execute(&sql, &[]).await?;
+    Ok(())
+}
