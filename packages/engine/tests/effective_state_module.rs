@@ -4,11 +4,11 @@ use async_trait::async_trait;
 use lix_engine::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 use lix_engine::effective_state::{
     overlay_lanes_for_version, resolve_effective_row, resolve_effective_rows, EffectiveRowRequest,
-    EffectiveRowState, EffectiveRowsRequest, OverlayLane, ReadContext, TrackedTombstoneMarker,
-    TrackedTombstoneView,
+    EffectiveRowState, EffectiveRowsRequest, OverlayLane, ReadContext,
 };
 use lix_engine::live_tracked_state::{
-    BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedReadView, TrackedRow, TrackedScanRequest,
+    BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedReadView, TrackedRow,
+    TrackedScanRequest, TrackedTombstoneMarker, TrackedTombstoneView,
 };
 use lix_engine::live_untracked_state::{
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedReadView, UntrackedRow,
