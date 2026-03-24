@@ -182,6 +182,12 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
 
     let mut write_tx = WriteTransaction::new(backend_txn, read_context);
     write_tx
+        .register_schema("lix_commit_edge")
+        .expect("tracked schema registration should stage");
+    write_tx
+        .register_schema("lix_version_ref")
+        .expect("untracked schema registration should stage");
+    write_tx
         .stage(TransactionDelta {
             tracked_writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
             untracked_writes: vec![version_ref_write_row("main", "commit-1", timestamp)],
@@ -194,10 +200,6 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
     let outcome = write_tx.commit().await.expect("commit should succeed");
     assert_eq!(outcome.tracked_upserts, 1);
     assert_eq!(outcome.untracked_upserts, 1);
-    assert_eq!(
-        outcome.ensured_untracked_schemas,
-        vec!["lix_version_ref".to_string()]
-    );
 
     let tracked = load_exact_row_with_backend(
         &backend,
@@ -244,6 +246,9 @@ async fn isolated_transaction_rejects_staging_after_execute() {
 
     let mut write_tx = WriteTransaction::new(backend_txn, read_context);
     write_tx
+        .register_schema("lix_commit_edge")
+        .expect("tracked schema registration should stage");
+    write_tx
         .stage(TransactionDelta {
             tracked_writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
             untracked_writes: Vec::<UntrackedWriteRow>::new(),
@@ -274,6 +279,12 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
         .expect("begin transaction should succeed");
 
     let mut write_tx = WriteTransaction::new(backend_txn, read_context);
+    write_tx
+        .register_schema("lix_commit_edge")
+        .expect("tracked schema registration should stage");
+    write_tx
+        .register_schema("lix_version_ref")
+        .expect("untracked schema registration should stage");
     write_tx
         .stage(TransactionDelta {
             tracked_writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],

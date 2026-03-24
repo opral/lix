@@ -1,12 +1,15 @@
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use lix_engine::live_state::install as install_live_state;
 use lix_engine::live_state::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 use lix_engine::live_state::tracked::{
-    apply_write_batch_with_backend, load_exact_row_with_backend, load_exact_rows_with_backend,
-    scan_rows_with_backend, BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedScanRequest,
-    TrackedWriteOperation, TrackedWriteRow,
+    load_exact_row_with_backend, load_exact_rows_with_backend, scan_rows_with_backend,
+    BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedScanRequest, TrackedWriteOperation,
+    TrackedWriteRow,
 };
+use lix_engine::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use lix_engine::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
@@ -38,7 +41,8 @@ impl LixBackend for SqliteBackend {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        lix_engine::execute_auto_transactional(self, sql, params).await
+        let connection = self.connection.lock().expect("sqlite connection lock");
+        execute_sql(&connection, sql, params)
     }
 
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
@@ -172,20 +176,44 @@ fn tracked_row(
     }
 }
 
+async fn commit_tracked_rows(
+    backend: &SqliteBackend,
+    rows: Vec<TrackedWriteRow>,
+) -> Result<(), LixError> {
+    let read_context = ReadContext::new(backend, backend);
+    let backend_txn = backend.begin_transaction().await?;
+    let mut write_tx = WriteTransaction::new(backend_txn, read_context);
+    let schema_keys = rows
+        .iter()
+        .map(|row| row.schema_key.clone())
+        .collect::<BTreeSet<_>>();
+    for schema_key in schema_keys {
+        write_tx.register_schema(schema_key)?;
+    }
+    write_tx.stage(TransactionDelta {
+        tracked_writes: rows,
+        untracked_writes: Vec::new(),
+    })?;
+    write_tx.commit().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn live_tracked_state_roundtrips_rows() {
     let backend = SqliteBackend::new();
     let timestamp = "2026-03-24T00:00:00Z";
-
-    apply_write_batch_with_backend(
+    install_live_state(&backend)
+        .await
+        .expect("live_state install should succeed");
+    commit_tracked_rows(
         &backend,
-        &[
+        vec![
             tracked_row("edge-1", "child-1", "change-1", timestamp),
             tracked_row("edge-2", "child-2", "change-2", timestamp),
         ],
     )
     .await
-    .expect("tracked writes should succeed");
+    .expect("tracked transaction should succeed");
 
     let exact = load_exact_row_with_backend(
         &backend,
@@ -267,17 +295,19 @@ async fn live_tracked_state_tombstones_hide_rows() {
     let backend = SqliteBackend::new();
     let timestamp = "2026-03-24T00:00:00Z";
     let tombstone_time = "2026-03-24T00:05:00Z";
-
-    apply_write_batch_with_backend(
+    install_live_state(&backend)
+        .await
+        .expect("live_state install should succeed");
+    commit_tracked_rows(
         &backend,
-        &[tracked_row("edge-1", "child-1", "change-1", timestamp)],
+        vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
     )
     .await
-    .expect("initial tracked write should succeed");
+    .expect("initial tracked transaction should succeed");
 
-    apply_write_batch_with_backend(
+    commit_tracked_rows(
         &backend,
-        &[TrackedWriteRow {
+        vec![TrackedWriteRow {
             entity_id: "edge-1".to_string(),
             schema_key: "lix_commit_edge".to_string(),
             schema_version: "1".to_string(),
@@ -295,7 +325,7 @@ async fn live_tracked_state_tombstones_hide_rows() {
         }],
     )
     .await
-    .expect("tracked tombstone should succeed");
+    .expect("tracked tombstone transaction should succeed");
 
     let exact = load_exact_row_with_backend(
         &backend,

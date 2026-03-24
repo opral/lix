@@ -1,12 +1,11 @@
 use crate::backend::QueryExecutor;
 use crate::errors::classification::is_missing_relation_error;
-use crate::schema::live_layout::{load_live_row_access_with_executor, tracked_live_table_name};
-use crate::{LixBackend, LixError, Value};
 use crate::live_state::shared::query::{batch_row_constraints, exact_row_constraints};
-use crate::live_state::shared::relational_read::{
-    build_partitioned_scan_sql, required_bool_cell, required_text_cell, selected_columns,
-    selected_projection_sql, text_from_value, ScanSqlRequest,
+use crate::live_state::storage::{
+    build_partitioned_scan_sql, load_live_row_access_with_executor, required_bool_cell,
+    required_text_cell, selected_columns, selected_projection_sql, text_from_value, ScanSqlRequest,
 };
+use crate::{LixBackend, LixError, Value};
 
 use super::contracts::{
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedRow, UntrackedScanRequest,
@@ -99,11 +98,9 @@ async fn scan_rows_with_limit_and_order(
     let access = load_live_row_access_with_executor(executor, &request.schema_key).await?;
     let selected_columns = selected_columns(&access, &request.required_columns, "untracked")?;
     let projection = selected_projection_sql(&selected_columns);
-    let table_name = tracked_live_table_name(&request.schema_key);
     let sql = build_partitioned_scan_sql(ScanSqlRequest {
         select_prefix:
             "SELECT entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, writer_key, created_at, updated_at",
-        table_name: &table_name,
         schema_key: &request.schema_key,
         version_id: &request.version_id,
         projection: &projection,
@@ -128,7 +125,7 @@ async fn scan_rows_with_limit_and_order(
 
 pub(crate) fn decode_untracked_row(
     row: &[Value],
-    selected_columns: &[&crate::schema::live_layout::LiveColumnSpec],
+    selected_columns: &[&crate::live_state::storage::LiveColumnSpec],
     schema_key: &str,
 ) -> Result<UntrackedRow, LixError> {
     let entity_id = required_text_cell(row, 0, schema_key, "entity_id", "untracked")?;

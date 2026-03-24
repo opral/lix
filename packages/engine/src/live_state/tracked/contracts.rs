@@ -30,7 +30,7 @@ impl TrackedRow {
     pub fn property_text(&self, property_name: &str) -> Option<String> {
         self.values
             .get(property_name)
-            .and_then(crate::live_state::shared::relational_read::text_from_value)
+            .and_then(crate::live_state::storage::text_from_value)
     }
 }
 

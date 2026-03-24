@@ -1,49 +1,11 @@
-use std::collections::BTreeSet;
-
-use crate::schema::live_layout::{
-    load_live_table_layout_with_executor, normalized_live_column_values, tracked_live_table_name,
-};
-use crate::schema::registry::{ensure_schema_live_table, ensure_schema_live_table_in_transaction};
-use crate::live_state::shared::relational_write::{
+use crate::live_state::storage::{
+    load_live_table_layout_with_executor, normalized_live_column_values,
     normalized_insert_columns_sql, normalized_insert_values_sql,
-    normalized_update_assignments_sql,
+    normalized_update_assignments_sql, quoted_live_table_name,
 };
-use crate::{LixBackend, LixError, LixTransaction};
+use crate::{LixError, LixTransaction};
 
 use super::contracts::{UntrackedWriteOperation, UntrackedWriteRow};
-
-pub async fn ensure_storage_with_backend(
-    backend: &dyn LixBackend,
-    schema_key: &str,
-) -> Result<(), LixError> {
-    ensure_schema_live_table(backend, schema_key).await
-}
-
-pub async fn apply_write_batch_with_backend(
-    backend: &dyn LixBackend,
-    batch: &[UntrackedWriteRow],
-) -> Result<(), LixError> {
-    if batch.is_empty() {
-        return Ok(());
-    }
-
-    let mut transaction = backend.begin_transaction().await?;
-    let result = apply_write_batch_in_transaction(transaction.as_mut(), batch).await;
-    match result {
-        Ok(()) => transaction.commit().await,
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            Err(error)
-        }
-    }
-}
-
-pub(crate) async fn ensure_storage_in_transaction(
-    transaction: &mut dyn LixTransaction,
-    schema_key: &str,
-) -> Result<(), LixError> {
-    ensure_schema_live_table_in_transaction(transaction, schema_key).await
-}
 
 pub(crate) async fn apply_write_batch_in_transaction(
     transaction: &mut dyn LixTransaction,
@@ -51,14 +13,6 @@ pub(crate) async fn apply_write_batch_in_transaction(
 ) -> Result<(), LixError> {
     if batch.is_empty() {
         return Ok(());
-    }
-
-    let mut schemas = BTreeSet::new();
-    for row in batch {
-        schemas.insert(row.schema_key.clone());
-    }
-    for schema_key in schemas {
-        ensure_storage_in_transaction(transaction, &schema_key).await?;
     }
 
     for row in batch {
@@ -114,7 +68,7 @@ async fn apply_upsert_in_transaction(
          metadata = excluded.metadata, \
          writer_key = excluded.writer_key, \
          updated_at = excluded.updated_at{normalized_updates}",
-        table = crate::live_state::constraints::quote_ident(&tracked_live_table_name(&row.schema_key)),
+        table = quoted_live_table_name(&row.schema_key),
         entity_id = crate::live_state::constraints::escape_sql_string(&row.entity_id),
         schema_key = crate::live_state::constraints::escape_sql_string(&row.schema_key),
         schema_version = crate::live_state::constraints::escape_sql_string(&row.schema_version),
@@ -144,7 +98,7 @@ async fn apply_delete_in_transaction(
            AND file_id = '{file_id}' \
            AND version_id = '{version_id}' \
            AND untracked = true",
-        table = crate::live_state::constraints::quote_ident(&tracked_live_table_name(&row.schema_key)),
+        table = quoted_live_table_name(&row.schema_key),
         entity_id = crate::live_state::constraints::escape_sql_string(&row.entity_id),
         file_id = crate::live_state::constraints::escape_sql_string(&row.file_id),
         version_id = crate::live_state::constraints::escape_sql_string(&row.version_id),

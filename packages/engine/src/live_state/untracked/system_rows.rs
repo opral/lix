@@ -1,7 +1,9 @@
 use crate::backend::QueryExecutor;
 use crate::errors::classification::is_missing_relation_error;
-use crate::schema::live_layout::{load_live_row_access_with_executor, tracked_live_table_name};
-use crate::live_state::shared::relational_read::{selected_columns, selected_projection_sql};
+use crate::live_state::storage::{
+    load_live_row_access_with_executor, quoted_live_table_name, selected_columns,
+    selected_projection_sql,
+};
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
     active_version_schema_version, active_version_snapshot_content,
@@ -96,7 +98,7 @@ pub(crate) async fn load_active_version_with_executor(
          ORDER BY updated_at DESC \
          LIMIT 1",
         projection = projection,
-        table_name = crate::live_state::constraints::quote_ident(&tracked_live_table_name(active_version_schema_key())),
+        table_name = quoted_live_table_name(active_version_schema_key()),
         schema_key = crate::live_state::constraints::escape_sql_string(active_version_schema_key()),
         file_id = crate::live_state::constraints::escape_sql_string(active_version_file_id()),
         version_id = crate::live_state::constraints::escape_sql_string(active_version_storage_version_id()),
