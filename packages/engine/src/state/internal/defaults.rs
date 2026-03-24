@@ -216,7 +216,9 @@ mod tests {
             panic!("defaulting should resolve schema from pending in-request inserts")
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
+        async fn begin_transaction(
+            &self,
+        ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             panic!("defaulting should not open transactions in this test backend")
         }
 

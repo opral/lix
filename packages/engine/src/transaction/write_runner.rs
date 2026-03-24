@@ -1,6 +1,6 @@
 use crate::live_state::tracked::{TrackedWriteOperation, TrackedWriteRow};
 use crate::live_state::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
-use crate::{LixError, LixBackendTransaction};
+use crate::{LixBackendTransaction, LixError};
 
 use super::contracts::CommitOutcome;
 use super::write_plan::{TxnMaterializationPlan, TxnMaterializationUnit};

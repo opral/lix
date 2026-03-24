@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
+use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::tracked::TrackedWriteRow;
 use crate::live_state::untracked::UntrackedWriteRow;
-use crate::live_state::shared::identity::RowIdentity;
 use crate::LixError;
 
 use super::contracts::TransactionDelta;
@@ -100,7 +100,8 @@ impl TxnDelta {
             self.public_delta.clone(),
             incoming.public_delta,
         ));
-        self.materialization_plan.extend(incoming.materialization_plan);
+        self.materialization_plan
+            .extend(incoming.materialization_plan);
         self.pending_txn_participants
             .merge(incoming.pending_txn_participants);
     }
@@ -151,7 +152,9 @@ impl MutationJournal {
     }
 
     pub(crate) fn materialization_plan(&self) -> Option<&TxnMaterializationPlan> {
-        self.staged_delta.as_ref().map(TxnDelta::materialization_plan)
+        self.staged_delta
+            .as_ref()
+            .map(TxnDelta::materialization_plan)
     }
 
     pub(crate) fn pending_txn_participants(&self) -> Option<&PendingTxnParticipants> {

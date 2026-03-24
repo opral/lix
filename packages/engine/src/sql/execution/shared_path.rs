@@ -27,7 +27,7 @@ use crate::state::validation::{
 };
 use crate::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, LixBackend,
-    LixError, LixBackendTransaction, QueryResult, Value, VersionId,
+    LixBackendTransaction, LixError, QueryResult, Value, VersionId,
 };
 
 use crate::schema::live_layout::{

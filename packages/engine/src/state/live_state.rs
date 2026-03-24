@@ -1,12 +1,12 @@
 use crate::errors::classification::is_missing_relation_error;
-use crate::{LixBackend, LixError, LixBackendTransaction, QueryResult, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
 pub(crate) const LIVE_STATE_SCHEMA_EPOCH: &str = "1";
 pub(crate) const LIVE_STATE_STATUS_TABLE: &str = "lix_internal_live_state_status";
 const LIVE_STATE_STATUS_SINGLETON_ID: i64 = 1;
 
 pub(crate) const LIVE_STATE_STATUS_CREATE_TABLE_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS lix_internal_live_state_status (\
+    "CREATE TABLE lix_internal_live_state_status (\
      singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),\
      mode TEXT NOT NULL,\
      latest_change_id TEXT,\

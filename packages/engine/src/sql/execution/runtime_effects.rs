@@ -10,7 +10,7 @@ use crate::sql::storage::queries::{
 };
 use crate::sql::storage::tables;
 use crate::state::internal::write_program::WriteProgram;
-use crate::{LixError, LixBackendTransaction, QueryResult, SqlDialect, Value};
+use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";

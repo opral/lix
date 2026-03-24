@@ -10,7 +10,7 @@ use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
 use crate::plugin::types::PluginManifest;
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
-use crate::{LixError, LixBackendTransaction, Value};
+use crate::{LixBackendTransaction, LixError, Value};
 
 const INSTALL_REGISTERED_SCHEMA_SQL: &str =
     "INSERT INTO lix_registered_schema (value) VALUES (lix_json(?))";

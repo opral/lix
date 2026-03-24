@@ -3,7 +3,7 @@ use crate::schema::live_layout::{
 };
 use crate::schema::schema_from_registered_snapshot;
 use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
-use crate::{LixBackend, LixError, LixBackendTransaction, SqlDialect};
+use crate::{LixBackend, LixBackendTransaction, LixError, SqlDialect};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 

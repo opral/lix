@@ -1,5 +1,5 @@
 use crate::sql::storage::sql_text::escape_sql_string;
-use crate::{LixError, LixBackendTransaction, Value};
+use crate::{LixBackendTransaction, LixError, Value};
 
 use super::types::{UndoRedoOperationKind, UndoRedoOperationRecord};
 

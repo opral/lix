@@ -13,7 +13,10 @@ use crate::version::{
 };
 use crate::{LixBackend, LixError};
 
-use super::contracts::{ActiveVersionRow, ExactUntrackedRowRequest, UntrackedWriteOperation, UntrackedWriteRow, VersionRefRow};
+use super::contracts::{
+    ActiveVersionRow, ExactUntrackedRowRequest, UntrackedWriteOperation, UntrackedWriteRow,
+    VersionRefRow,
+};
 use super::read::{decode_untracked_row, load_exact_row_with_executor};
 
 pub async fn load_active_version_with_backend(

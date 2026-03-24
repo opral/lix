@@ -1,12 +1,12 @@
 use crate::deterministic_mode::{
     build_persist_sequence_highest_batch, load_runtime_sequence_start, load_runtime_settings,
-    persist_sequence_highest, DeterministicSettings, RuntimeFunctionProvider,
+    DeterministicSettings, RuntimeFunctionProvider,
 };
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::state::internal::write_program::WriteProgram;
-use crate::{LixBackend, LixError, LixBackendTransaction};
+use crate::{LixBackend, LixBackendTransaction, LixError};
 
 impl Engine {
     pub(crate) async fn prepare_runtime_functions_with_backend(
@@ -65,26 +65,6 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) async fn persist_runtime_sequence_with_backend(
-        &self,
-        backend: &dyn LixBackend,
-        settings: DeterministicSettings,
-        _sequence_start: i64,
-        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
-    ) -> Result<(), LixError> {
-        if settings.enabled {
-            let Some(sequence_start) = functions.with_lock(|provider| provider.sequence_start())
-            else {
-                return Ok(());
-            };
-            let sequence_end = functions.with_lock(|provider| provider.next_sequence());
-            if sequence_end > sequence_start {
-                persist_sequence_highest(backend, sequence_end - 1).await?;
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) async fn persist_runtime_sequence_in_transaction(
         &self,
         transaction: &mut dyn LixBackendTransaction,
@@ -138,7 +118,9 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
+        async fn begin_transaction(
+            &self,
+        ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "transactions are not needed in this test",

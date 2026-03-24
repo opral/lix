@@ -2,7 +2,6 @@ use crate::engine::{
     reject_internal_table_writes, reject_public_create_table, Engine, ExecuteOptions,
 };
 use crate::errors;
-use crate::init::init_backend;
 use crate::sql::execution::execution_program::{
     execute_execution_program_with_backend, ExecutionProgram,
 };
@@ -16,7 +15,7 @@ use crate::state::materialization::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
 };
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{ExecuteResult, LixError, LixBackendTransaction, QueryResult, Value};
+use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 use sqlparser::ast::Statement;
 
 impl Engine {
@@ -75,15 +74,6 @@ impl Engine {
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
         self.execute_impl_sql(sql, params, options, false).await
-    }
-
-    pub(crate) async fn execute_internal(
-        &self,
-        sql: &str,
-        params: &[Value],
-        options: ExecuteOptions,
-    ) -> Result<ExecuteResult, LixError> {
-        self.execute_impl_sql(sql, params, options, true).await
     }
 
     pub(crate) async fn execute_impl_sql(
@@ -184,7 +174,6 @@ impl Engine {
         reader: &mut dyn crate::ImageChunkReader,
     ) -> Result<(), LixError> {
         self.backend.restore_from_image(reader).await?;
-        init_backend(self.backend.as_ref()).await?;
         ensure_live_state_ready(self.backend.as_ref()).await?;
         self.load_and_cache_active_version().await?;
         self.refresh_public_surface_registry().await?;

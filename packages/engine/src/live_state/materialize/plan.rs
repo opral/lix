@@ -788,8 +788,7 @@ async fn load_version_heads_from_untracked(
             .await?;
     let mut heads = BTreeMap::<String, Vec<String>>::new();
     for row in rows {
-        let Some(snapshot_raw) = logical_snapshot_text(&access, &row)?
-        else {
+        let Some(snapshot_raw) = logical_snapshot_text(&access, &row)? else {
             continue;
         };
         match serde_json::from_str::<LixVersionRef>(&snapshot_raw) {
@@ -1412,9 +1411,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::loader::{CommitEdgeRecord, CommitRecord, VersionDescriptorRecord};
     use super::*;
     use crate::schema::builtin::types::LixCommit;
-    use super::super::loader::{CommitEdgeRecord, CommitRecord, VersionDescriptorRecord};
 
     fn change_record(
         id: &str,

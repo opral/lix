@@ -9,7 +9,7 @@ use crate::state::stream::{
 };
 use crate::state::validation::SchemaCache;
 use crate::WasmRuntime;
-use crate::{LixBackend, LixError, LixBackendTransaction, QueryResult, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
 use std::collections::{BTreeMap, BTreeSet};
@@ -202,10 +202,6 @@ impl Engine {
     pub(crate) fn reset_init_state(&self) {
         self.init_state
             .store(INIT_STATE_NOT_STARTED, Ordering::SeqCst);
-    }
-
-    pub(crate) fn set_in_init_transaction(&self, active: bool) {
-        self.in_init_transaction.store(active, Ordering::SeqCst);
     }
 
     pub(crate) async fn prepare_execution_context_for_commit(
@@ -471,7 +467,10 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
         })
     }
 
-    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_savepoint(
+        &self,
+        _name: &str,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "savepoints are not supported via TransactionBackendAdapter".to_string(),

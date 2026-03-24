@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::errors::classification::is_missing_relation_error;
-use crate::{LixBackend, LixError, LixBackendTransaction, QueryResult, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
 pub(crate) const LIVE_STATE_SCHEMA_EPOCH: &str = "1";
 pub(crate) const LIVE_STATE_STATUS_TABLE: &str = "lix_internal_live_state_status";
@@ -159,7 +159,9 @@ pub(crate) async fn load_live_state_snapshot(
 }
 
 pub async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    backend.execute(LIVE_STATE_STATUS_CREATE_TABLE_SQL, &[]).await?;
+    backend
+        .execute(LIVE_STATE_STATUS_CREATE_TABLE_SQL, &[])
+        .await?;
     backend.execute(LIVE_STATE_STATUS_SEED_ROW_SQL, &[]).await?;
     Ok(())
 }
@@ -184,15 +186,15 @@ pub(crate) async fn require_ready_in_transaction(
     }
 }
 
-pub async fn finalize_commit(
-    backend: &dyn LixBackend,
-) -> Result<CanonicalWatermark, LixError> {
-    let watermark = load_latest_canonical_watermark(backend).await?.ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "live_state::finalize_commit expected a canonical watermark",
-        )
-    })?;
+pub async fn finalize_commit(backend: &dyn LixBackend) -> Result<CanonicalWatermark, LixError> {
+    let watermark = load_latest_canonical_watermark(backend)
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "live_state::finalize_commit expected a canonical watermark",
+            )
+        })?;
     mark_live_state_ready_with_backend(backend, &watermark).await?;
     Ok(watermark)
 }

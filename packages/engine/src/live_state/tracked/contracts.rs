@@ -6,7 +6,7 @@ pub use crate::live_state::shared::query::{
     BatchRowRequest as BatchTrackedRowRequest, ExactRowRequest as ExactTrackedRowRequest,
     ScanRequest as TrackedScanRequest,
 };
-use crate::{LixBackend, LixError, LixBackendTransaction, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
 /// Decoded tracked live row.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

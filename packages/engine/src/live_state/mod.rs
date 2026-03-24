@@ -13,12 +13,12 @@ pub mod constraints;
 pub mod effective;
 mod lifecycle;
 mod materialize;
-mod storage;
 pub(crate) mod shared;
+mod storage;
 pub mod tracked;
 pub mod untracked;
 
-use crate::{LixBackend, LixError, LixBackendTransaction};
+use crate::{LixBackend, LixBackendTransaction, LixError};
 use serde_json::Value as JsonValue;
 
 pub use lifecycle::{CanonicalWatermark, LiveStateMode, LiveStateReadiness};
@@ -71,9 +71,7 @@ pub async fn register_schema(
     storage::register_schema(backend, &registration).await
 }
 
-pub async fn finalize_commit(
-    backend: &dyn LixBackend,
-) -> Result<CanonicalWatermark, LixError> {
+pub async fn finalize_commit(backend: &dyn LixBackend) -> Result<CanonicalWatermark, LixError> {
     lifecycle::finalize_commit(backend).await
 }
 

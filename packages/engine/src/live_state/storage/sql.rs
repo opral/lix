@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use crate::live_state::constraints::{quote_ident as constraint_quote_ident, render_constraint_sql, sql_literal, ScanConstraint};
+use crate::live_state::constraints::{
+    quote_ident as constraint_quote_ident, render_constraint_sql, sql_literal, ScanConstraint,
+};
 use crate::{LixError, SqlDialect, Value};
 
 use super::layout::{LiveColumnSpec, LiveRowAccess, LiveTableLayout};

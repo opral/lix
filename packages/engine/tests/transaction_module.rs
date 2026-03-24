@@ -9,7 +9,7 @@ use lix_engine::live_state::untracked::{
     ExactUntrackedRowRequest, UntrackedWriteRow,
 };
 use lix_engine::transaction::{ReadContext, TransactionDelta, WriteTransaction};
-use lix_engine::{LixBackend, LixError, LixBackendTransaction, QueryResult, SqlDialect, Value};
+use lix_engine::{LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
 #[derive(Clone)]
@@ -54,7 +54,10 @@ impl LixBackend for SqliteBackend {
         }))
     }
 
-    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_savepoint(
+        &self,
+        _name: &str,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         self.begin_transaction().await
     }
 }
@@ -149,7 +152,12 @@ fn sqlite_error(error: rusqlite::Error) -> LixError {
     }
 }
 
-fn tracked_row(entity_id: &str, child_id: &str, change_id: &str, timestamp: &str) -> TrackedWriteRow {
+fn tracked_row(
+    entity_id: &str,
+    child_id: &str,
+    change_id: &str,
+    timestamp: &str,
+) -> TrackedWriteRow {
     TrackedWriteRow {
         entity_id: entity_id.to_string(),
         schema_key: "lix_commit_edge".to_string(),
@@ -214,7 +222,10 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
     .expect("tracked lookup should succeed")
     .expect("tracked row should exist");
     assert_eq!(tracked.change_id.as_deref(), Some("change-1"));
-    assert_eq!(tracked.property_text("child_id").as_deref(), Some("child-1"));
+    assert_eq!(
+        tracked.property_text("child_id").as_deref(),
+        Some("child-1")
+    );
 
     let version_ref = load_exact_untracked_row_with_backend(
         &backend,
@@ -292,10 +303,7 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
         })
         .expect("staging should succeed");
 
-    write_tx
-        .rollback()
-        .await
-        .expect("rollback should succeed");
+    write_tx.rollback().await.expect("rollback should succeed");
 
     let tracked = load_exact_row_with_backend(
         &backend,
