@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::effective_state::{resolve_effective_rows, EffectiveRowsRequest};
-use crate::{LixError, LixTransaction, Value};
+use crate::live_state::effective::{resolve_effective_rows, EffectiveRowsRequest};
+use crate::live_state::shared::query::entity_id_in_constraint;
+use crate::{LixError, LixTransaction};
 
 use super::contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
 use super::read_context::ReadContext;
@@ -95,15 +95,7 @@ pub(crate) async fn prepare_materialization_plan(
         let constraints = if entity_ids.is_empty() {
             Vec::new()
         } else {
-            vec![ScanConstraint {
-                field: ScanField::EntityId,
-                operator: ScanOperator::In(
-                    entity_ids
-                        .into_iter()
-                        .map(Value::Text)
-                        .collect::<Vec<_>>(),
-                ),
-            }]
+            vec![entity_id_in_constraint(entity_ids.into_iter().collect::<Vec<_>>())]
         };
         let _ = resolve_effective_rows(
             &EffectiveRowsRequest {
@@ -149,12 +141,12 @@ mod tests {
     use std::cell::Cell;
     use async_trait::async_trait;
 
-    use crate::live_tracked_state::{
+    use crate::live_state::tracked::{
         BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedReadView, TrackedRow,
         TrackedScanRequest, TrackedTombstoneMarker, TrackedTombstoneView,
         TrackedWriteOperation, TrackedWriteRow,
     };
-    use crate::live_untracked_state::{
+    use crate::live_state::untracked::{
         BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedReadView, UntrackedRow,
         UntrackedScanRequest, UntrackedWriteOperation, UntrackedWriteRow,
     };

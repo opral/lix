@@ -2,7 +2,6 @@
 
 mod contracts;
 mod read;
-mod shared;
 mod write;
 
 pub use contracts::{

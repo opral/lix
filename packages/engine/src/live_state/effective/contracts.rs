@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 
-use crate::constraints::ScanConstraint;
-use crate::live_tracked_state::{TrackedReadView, TrackedTombstoneView};
-use crate::live_untracked_state::UntrackedReadView;
+use crate::live_state::constraints::ScanConstraint;
+pub use crate::live_state::shared::views::ReadViews as ReadContext;
 use crate::Value;
 
 #[derive(
@@ -109,30 +108,6 @@ impl EffectiveRow {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct EffectiveRowSet {
     pub rows: Vec<EffectiveRow>,
-}
-
-pub struct ReadContext<'a> {
-    pub tracked: &'a dyn TrackedReadView,
-    pub untracked: &'a dyn UntrackedReadView,
-    pub tracked_tombstones: Option<&'a dyn TrackedTombstoneView>,
-}
-
-impl<'a> ReadContext<'a> {
-    pub fn new(tracked: &'a dyn TrackedReadView, untracked: &'a dyn UntrackedReadView) -> Self {
-        Self {
-            tracked,
-            untracked,
-            tracked_tombstones: None,
-        }
-    }
-
-    pub fn with_tracked_tombstones(
-        mut self,
-        tracked_tombstones: &'a dyn TrackedTombstoneView,
-    ) -> Self {
-        self.tracked_tombstones = Some(tracked_tombstones);
-        self
-    }
 }
 
 fn text_from_value(value: &Value) -> Option<String> {

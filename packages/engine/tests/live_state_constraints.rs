@@ -1,4 +1,4 @@
-use lix_engine::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
+use lix_engine::live_state::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 use lix_engine::Value;
 
 #[test]

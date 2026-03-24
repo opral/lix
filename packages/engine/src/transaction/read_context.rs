@@ -2,32 +2,30 @@ use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 
-use crate::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::effective_state;
-use crate::live_tracked_state::{
+use crate::live_state::constraints::matches_constraints;
+use crate::live_state::effective as effective;
+use crate::live_state::tracked::{
     BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedReadView, TrackedRow,
     TrackedScanRequest, TrackedTombstoneMarker, TrackedTombstoneView,
 };
-use crate::live_untracked_state::{
+use crate::live_state::untracked::{
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedReadView, UntrackedRow,
     UntrackedScanRequest,
 };
-use crate::{LixError, Value};
+use crate::live_state::shared::identity::RowIdentity;
+use crate::live_state::shared::views::ReadViews;
+use crate::LixError;
 
-use super::participants::{PendingTxnParticipants, RowIdentity};
+use super::overlay::PendingTxnParticipants;
 
 pub struct ReadContext<'a> {
-    tracked: &'a dyn TrackedReadView,
-    untracked: &'a dyn UntrackedReadView,
-    tracked_tombstones: Option<&'a dyn TrackedTombstoneView>,
+    base: ReadViews<'a>,
 }
 
 impl<'a> ReadContext<'a> {
     pub fn new(tracked: &'a dyn TrackedReadView, untracked: &'a dyn UntrackedReadView) -> Self {
         Self {
-            tracked,
-            untracked,
-            tracked_tombstones: None,
+            base: ReadViews::new(tracked, untracked),
         }
     }
 
@@ -35,7 +33,7 @@ impl<'a> ReadContext<'a> {
         mut self,
         tracked_tombstones: &'a dyn TrackedTombstoneView,
     ) -> Self {
-        self.tracked_tombstones = Some(tracked_tombstones);
+        self.base = self.base.with_tracked_tombstones(tracked_tombstones);
         self
     }
 
@@ -45,15 +43,15 @@ impl<'a> ReadContext<'a> {
     ) -> PendingReadContext<'b> {
         PendingReadContext {
             tracked: PendingTrackedReadView {
-                base: self.tracked,
+                base: self.base.tracked,
                 pending,
             },
             untracked: PendingUntrackedReadView {
-                base: self.untracked,
+                base: self.base.untracked,
                 pending,
             },
             tracked_tombstones: PendingTrackedTombstoneView {
-                base: self.tracked_tombstones,
+                base: self.base.tracked_tombstones,
                 pending,
             },
         }
@@ -67,8 +65,8 @@ pub(crate) struct PendingReadContext<'a> {
 }
 
 impl<'a> PendingReadContext<'a> {
-    pub(crate) fn effective_state_context(&'a self) -> effective_state::ReadContext<'a> {
-        let context = effective_state::ReadContext::new(&self.tracked, &self.untracked);
+    pub(crate) fn effective_state_context(&'a self) -> effective::ReadContext<'a> {
+        let context = effective::ReadContext::new(&self.tracked, &self.untracked);
         if self.tracked_tombstones.has_source() {
             context.with_tracked_tombstones(&self.tracked_tombstones)
         } else {
@@ -304,26 +302,14 @@ impl TrackedTombstoneView for PendingTrackedTombstoneView<'_> {
 }
 
 fn matches_tracked_batch_request(identity: &RowIdentity, request: &BatchTrackedRowRequest) -> bool {
-    identity.schema_key == request.schema_key
-        && identity.version_id == request.version_id
-        && request.entity_ids.contains(&identity.entity_id)
-        && request
-            .file_id
-            .as_ref()
-            .is_none_or(|file_id| identity.file_id == *file_id)
+    identity.matches_batch(request)
 }
 
 fn matches_untracked_batch_request(
     identity: &RowIdentity,
     request: &BatchUntrackedRowRequest,
 ) -> bool {
-    identity.schema_key == request.schema_key
-        && identity.version_id == request.version_id
-        && request.entity_ids.contains(&identity.entity_id)
-        && request
-            .file_id
-            .as_ref()
-            .is_none_or(|file_id| identity.file_id == *file_id)
+    identity.matches_batch(request)
 }
 
 fn matches_tracked_scan_request(
@@ -357,74 +343,11 @@ fn matches_untracked_scan_request(
 }
 
 fn matches_tracked_scan_identity(identity: &RowIdentity, request: &TrackedScanRequest) -> bool {
-    identity.schema_key == request.schema_key && identity.version_id == request.version_id
+    identity.matches_scan_partition(request)
 }
 
 fn matches_untracked_scan_identity(identity: &RowIdentity, request: &UntrackedScanRequest) -> bool {
-    identity.schema_key == request.schema_key && identity.version_id == request.version_id
-}
-
-fn matches_constraints(
-    entity_id: &str,
-    file_id: &str,
-    plugin_key: &str,
-    schema_version: &str,
-    constraints: &[ScanConstraint],
-) -> bool {
-    constraints.iter().all(|constraint| {
-        let candidate = match constraint.field {
-            ScanField::EntityId => entity_id,
-            ScanField::FileId => file_id,
-            ScanField::PluginKey => plugin_key,
-            ScanField::SchemaVersion => schema_version,
-        };
-        matches_constraint(candidate, &constraint.operator)
-    })
-}
-
-fn matches_constraint(candidate: &str, operator: &ScanOperator) -> bool {
-    match operator {
-        ScanOperator::Eq(value) => text_value(value).is_some_and(|value| value == candidate),
-        ScanOperator::In(values) => values
-            .iter()
-            .filter_map(text_value)
-            .any(|value| value == candidate),
-        ScanOperator::Range { lower, upper } => {
-            lower
-                .as_ref()
-                .is_none_or(|bound| compare_lower(candidate, &bound.value, bound.inclusive))
-                && upper
-                    .as_ref()
-                    .is_none_or(|bound| compare_upper(candidate, &bound.value, bound.inclusive))
-        }
-    }
-}
-
-fn compare_lower(candidate: &str, bound: &Value, inclusive: bool) -> bool {
-    text_value(bound).is_some_and(|value| {
-        if inclusive {
-            candidate >= value
-        } else {
-            candidate > value
-        }
-    })
-}
-
-fn compare_upper(candidate: &str, bound: &Value, inclusive: bool) -> bool {
-    text_value(bound).is_some_and(|value| {
-        if inclusive {
-            candidate <= value
-        } else {
-            candidate < value
-        }
-    })
-}
-
-fn text_value(value: &Value) -> Option<&str> {
-    match value {
-        Value::Text(value) => Some(value.as_str()),
-        _ => None,
-    }
+    identity.matches_scan_partition(request)
 }
 
 fn sort_tracked_rows(rows: &mut [TrackedRow]) {
@@ -442,7 +365,7 @@ fn pending_tracked_row<'a>(
     pending
         .tracked_rows()
         .iter()
-        .find(|(identity, _)| matches_exact_identity(identity, &request.schema_key, &request.version_id, &request.entity_id, request.file_id.as_deref()))
+        .find(|(identity, _)| identity.matches_exact(request))
         .map(|(_, row)| row)
 }
 
@@ -453,7 +376,7 @@ fn pending_tracked_tombstone<'a>(
     pending
         .tracked_tombstones()
         .iter()
-        .find(|(identity, _)| matches_exact_identity(identity, &request.schema_key, &request.version_id, &request.entity_id, request.file_id.as_deref()))
+        .find(|(identity, _)| identity.matches_exact(request))
         .map(|(_, row)| row)
 }
 
@@ -464,7 +387,7 @@ fn pending_untracked_row<'a>(
     pending
         .untracked_rows()
         .iter()
-        .find(|(identity, _)| matches_exact_identity(identity, &request.schema_key, &request.version_id, &request.entity_id, request.file_id.as_deref()))
+        .find(|(identity, _)| identity.matches_exact(request))
         .map(|(_, row)| row)
 }
 
@@ -475,18 +398,5 @@ fn pending_untracked_delete(
     pending
         .untracked_deletes()
         .iter()
-        .any(|identity| matches_exact_identity(identity, &request.schema_key, &request.version_id, &request.entity_id, request.file_id.as_deref()))
-}
-
-fn matches_exact_identity(
-    identity: &RowIdentity,
-    schema_key: &str,
-    version_id: &str,
-    entity_id: &str,
-    file_id: Option<&str>,
-) -> bool {
-    identity.schema_key == schema_key
-        && identity.version_id == version_id
-        && identity.entity_id == entity_id
-        && file_id.is_none_or(|file_id| identity.file_id == file_id)
+        .any(|identity| identity.matches_exact(request))
 }

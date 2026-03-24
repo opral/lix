@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use lix_engine::constraints::{ScanConstraint, ScanField, ScanOperator};
-use lix_engine::live_untracked_state::{
+use lix_engine::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
+use lix_engine::live_state::untracked::{
     active_version_write_row, apply_write_batch_with_backend, load_active_version_with_backend,
     load_exact_row_with_backend, load_exact_rows_with_backend, load_version_ref_with_backend,
     scan_rows_with_backend, version_ref_write_row, BatchUntrackedRowRequest,
@@ -227,11 +227,11 @@ async fn live_untracked_state_roundtrips_helper_rows() {
                 ScanConstraint {
                     field: ScanField::SchemaVersion,
                     operator: ScanOperator::Range {
-                        lower: Some(lix_engine::constraints::Bound {
+                        lower: Some(lix_engine::live_state::constraints::Bound {
                             value: Value::Text("1".to_string()),
                             inclusive: true,
                         }),
-                        upper: Some(lix_engine::constraints::Bound {
+                        upper: Some(lix_engine::live_state::constraints::Bound {
                             value: Value::Text("1".to_string()),
                             inclusive: true,
                         }),

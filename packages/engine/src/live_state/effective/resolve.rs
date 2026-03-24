@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 
-use crate::effective_state::contracts::{
+use crate::live_state::effective::contracts::{
     EffectiveRow, EffectiveRowIdentity, EffectiveRowRequest, EffectiveRowSet, EffectiveRowState,
     EffectiveRowsRequest, LaneResult, OverlayLane, ReadContext,
 };
-use crate::live_tracked_state::{
+use crate::live_state::tracked::{
     BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedRow, TrackedScanRequest,
     TrackedTombstoneMarker,
 };
-use crate::live_untracked_state::{
+use crate::live_state::untracked::{
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedRow, UntrackedScanRequest,
 };
 use crate::version::GLOBAL_VERSION_ID;
