@@ -15,13 +15,13 @@ use crate::sql::public::runtime::{
     apply_public_surface_registry_mutations, public_surface_registry_mutations,
     PublicWriteExecutionPartition,
 };
-use crate::{LixError, LixTransaction, QueryResult, Value};
+use crate::{LixError, LixBackendTransaction, QueryResult, Value};
 use sqlparser::ast::Statement;
 
 impl Engine {
     pub(crate) async fn execute_parsed_statements_in_transaction_core(
         &self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
         parsed_statements: Vec<Statement>,
         params: &[Value],
         allow_internal_tables: bool,
@@ -40,7 +40,7 @@ impl Engine {
 
     pub(crate) async fn flush_mutation_journal_in_transaction(
         &self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
         context: &mut ExecutionContext,
     ) -> Result<(), LixError> {
         let Some(delta) = context.mutation_journal.take_staged_delta() else {
@@ -79,7 +79,7 @@ impl Engine {
 
     pub(crate) async fn execute_with_options_in_transaction(
         &self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
         sql: &str,
         params: &[Value],
         allow_internal_tables: bool,
@@ -131,7 +131,7 @@ impl Engine {
 
     pub(crate) async fn execute_bound_statement_template_instance_in_transaction(
         &self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
         bound_statement_template: &BoundStatementTemplateInstance,
         allow_internal_tables: bool,
         context: &mut ExecutionContext,
@@ -428,7 +428,7 @@ impl Engine {
 }
 
 async fn refresh_public_surface_registry_from_pending_transaction_view(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     public_surface_registry: &mut SurfaceRegistry,
     public_surface_registry_generation: &mut u64,
     public_surface_registry_dirty: &mut bool,

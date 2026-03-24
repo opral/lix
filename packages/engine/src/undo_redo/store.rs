@@ -1,12 +1,12 @@
 use crate::sql::storage::sql_text::escape_sql_string;
-use crate::{LixError, LixTransaction, Value};
+use crate::{LixError, LixBackendTransaction, Value};
 
 use super::types::{UndoRedoOperationKind, UndoRedoOperationRecord};
 
 const UNDO_REDO_OPERATION_TABLE: &str = "lix_internal_undo_redo_operation";
 
 pub(crate) async fn insert_undo_redo_operation_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     record: &UndoRedoOperationRecord,
 ) -> Result<(), LixError> {
     let sql = format!(
@@ -25,7 +25,7 @@ pub(crate) async fn insert_undo_redo_operation_in_transaction(
 }
 
 pub(crate) async fn load_undo_redo_operations_for_version_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     version_id: &str,
 ) -> Result<Vec<UndoRedoOperationRecord>, LixError> {
     let sql = format!(

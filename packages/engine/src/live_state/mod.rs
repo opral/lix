@@ -18,7 +18,7 @@ pub(crate) mod shared;
 pub mod tracked;
 pub mod untracked;
 
-use crate::{LixBackend, LixError, LixTransaction};
+use crate::{LixBackend, LixError, LixBackendTransaction};
 use serde_json::Value as JsonValue;
 
 pub use lifecycle::{CanonicalWatermark, LiveStateMode, LiveStateReadiness};
@@ -100,13 +100,13 @@ pub async fn rebuild(
 
 #[allow(dead_code)]
 pub(crate) async fn require_ready_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
 ) -> Result<(), LixError> {
     lifecycle::require_ready_in_transaction(transaction).await
 }
 
 pub(crate) async fn register_schema_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     registration: impl Into<SchemaRegistration>,
 ) -> Result<(), LixError> {
     let registration = registration.into();
@@ -114,7 +114,7 @@ pub(crate) async fn register_schema_in_transaction(
 }
 
 pub(crate) async fn finalize_commit_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
 ) -> Result<CanonicalWatermark, LixError> {
     lifecycle::finalize_commit_in_transaction(transaction).await
 }

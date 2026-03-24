@@ -35,7 +35,7 @@ pub use schema::{
 pub use backend::execute_auto_transactional;
 pub use backend::execute_statement_with_backend;
 pub use backend::LixBackend;
-pub use backend::LixTransaction;
+pub use backend::LixBackendTransaction;
 pub use backend::SqlDialect;
 pub use canonical_json::CanonicalJson;
 #[doc(hidden)]

@@ -27,7 +27,7 @@ use crate::state::live_state::ensure_live_state_ready_in_transaction;
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::SqlDialect;
-use crate::{CanonicalSchemaKey, LixError, LixTransaction, QueryResult, Value};
+use crate::{CanonicalSchemaKey, LixError, LixBackendTransaction, QueryResult, Value};
 use async_trait::async_trait;
 
 use super::generate_commit::generate_commit;
@@ -155,12 +155,12 @@ pub(crate) struct CreateCommitError {
 pub(crate) trait CreateCommitInvariantChecker {
     async fn recheck_invariants(
         &mut self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
     ) -> Result<(), CreateCommitError>;
 }
 
 pub(crate) async fn create_commit(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     args: CreateCommitArgs,
     functions: &mut dyn LixFunctionProvider,
     invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
@@ -465,7 +465,7 @@ pub(crate) async fn create_commit(
 }
 
 async fn load_live_layouts_for_rows_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     rows: &[crate::state::commit::MaterializedStateRow],
 ) -> Result<BTreeMap<String, LiveTableLayout>, LixError> {
     let mut layouts = BTreeMap::new();
@@ -506,7 +506,7 @@ enum ConcreteWriteLane {
 }
 
 struct TransactionCommitExecutor<'a> {
-    transaction: &'a mut dyn LixTransaction,
+    transaction: &'a mut dyn LixBackendTransaction,
 }
 
 #[async_trait(?Send)]
@@ -1478,7 +1478,7 @@ mod tests {
     use crate::functions::LixFunctionProvider;
     use crate::schema::live_layout::{builtin_live_table_layout, normalized_live_column_values};
     use crate::version::GLOBAL_VERSION_ID;
-    use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value};
+    use crate::{LixError, LixBackendTransaction, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor};
     use sqlparser::dialect::GenericDialect;
@@ -1567,7 +1567,7 @@ mod tests {
     }
 
     #[async_trait(?Send)]
-    impl LixTransaction for FakeTransaction {
+    impl LixBackendTransaction for FakeTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
         }
@@ -1800,7 +1800,7 @@ mod tests {
     impl CreateCommitInvariantChecker for RecordingInvariantChecker {
         async fn recheck_invariants(
             &mut self,
-            _transaction: &mut dyn LixTransaction,
+            _transaction: &mut dyn LixBackendTransaction,
         ) -> Result<(), CreateCommitError> {
             self.calls += 1;
             if let Some(error) = self.failure.clone() {

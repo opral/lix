@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::live_state::effective::{resolve_effective_rows, EffectiveRowsRequest};
 use crate::live_state::shared::query::entity_id_in_constraint;
 use crate::live_state::{CanonicalWatermark, SchemaRegistration};
-use crate::{LixError, LixTransaction};
+use crate::{LixError, LixBackendTransaction};
 
 use super::contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
 use super::read_context::ReadContext;
@@ -11,7 +11,7 @@ use super::write_plan::TxnMaterializationPlan;
 use super::write_runner::run_materialization_plan;
 
 pub struct WriteTransaction<'a> {
-    backend_txn: Option<Box<dyn LixTransaction + 'a>>,
+    backend_txn: Option<Box<dyn LixBackendTransaction + 'a>>,
     read_context: ReadContext<'a>,
     journal: TransactionJournal,
     registered_schemas: BTreeMap<String, SchemaRegistration>,
@@ -20,7 +20,7 @@ pub struct WriteTransaction<'a> {
 }
 
 impl<'a> WriteTransaction<'a> {
-    pub fn new(backend_txn: Box<dyn LixTransaction + 'a>, read_context: ReadContext<'a>) -> Self {
+    pub fn new(backend_txn: Box<dyn LixBackendTransaction + 'a>, read_context: ReadContext<'a>) -> Self {
         Self {
             backend_txn: Some(backend_txn),
             read_context,

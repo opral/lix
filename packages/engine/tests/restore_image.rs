@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use lix_engine::{
     boot, collapse_prepared_batch_for_dialect, BootArgs, CreateVersionOptions, Engine,
-    ImageChunkReader, ImageChunkWriter, LixBackend, LixError, LixTransaction, NoopWasmRuntime,
+    ImageChunkReader, ImageChunkWriter, LixBackend, LixError, LixBackendTransaction, NoopWasmRuntime,
     PreparedBatch, QueryResult, SqlDialect, Value, WasmRuntime,
 };
 use rusqlite::{
@@ -96,7 +96,7 @@ impl LixBackend for TestImageSqliteBackend {
         lix_engine::execute_auto_transactional(self, sql, params).await
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let conn = self.conn.lock().map_err(|_| {
             LixError::new("LIX_ERROR_UNKNOWN", "sqlite test backend mutex poisoned")
         })?;
@@ -195,13 +195,13 @@ impl LixBackend for TestImageSqliteBackend {
         restore_result
     }
 
-    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         self.begin_transaction().await
     }
 }
 
 #[async_trait(?Send)]
-impl LixTransaction for TestImageSqliteTransaction<'_> {
+impl LixBackendTransaction for TestImageSqliteTransaction<'_> {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
     }

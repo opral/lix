@@ -10,7 +10,7 @@ use crate::live_state::storage::{
     normalized_update_assignments_sql, quoted_live_table_name,
 };
 use crate::live_state::{finalize_commit_in_transaction, register_schema_in_transaction};
-use crate::{LixBackend, LixError, LixTransaction, Value};
+use crate::{LixBackend, LixError, LixBackendTransaction, Value};
 
 pub(crate) async fn apply_live_state_rebuild_plan_internal(
     backend: &dyn LixBackend,
@@ -48,7 +48,7 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
 }
 
 pub(crate) async fn apply_live_state_scope_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     plan: &LiveStateRebuildPlan,
 ) -> Result<(usize, BTreeSet<String>), LixError> {
     let mut tables_touched = BTreeSet::new();
@@ -125,7 +125,7 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
 }
 
 async fn clear_scope_rows(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     schema_keys: &BTreeSet<String>,
     scope: &LiveStateRebuildScope,
     tables_touched: &mut BTreeSet<String>,

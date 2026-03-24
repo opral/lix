@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use lix_engine::{
-    boot, BootArgs, BootKeyValue, Engine, LixBackend, LixError, LixTransaction, NoopWasmRuntime,
+    boot, BootArgs, BootKeyValue, Engine, LixBackend, LixError, LixBackendTransaction, NoopWasmRuntime,
     QueryResult, SqlDialect, Value,
 };
 use serde_json::json;
@@ -114,7 +114,7 @@ struct TracingBenchBackend {
 }
 
 struct TracingBenchTransaction<'a> {
-    inner: Box<dyn LixTransaction + 'a>,
+    inner: Box<dyn LixBackendTransaction + 'a>,
     collector: Arc<SqlTraceCollector>,
 }
 
@@ -334,7 +334,7 @@ impl LixBackend for TracingBenchBackend {
         result
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let started = std::time::Instant::now();
         let tx = self.inner.begin_transaction().await?;
         self.collector.push(
@@ -348,7 +348,7 @@ impl LixBackend for TracingBenchBackend {
         }))
     }
 
-    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let started = std::time::Instant::now();
         let tx = self.inner.begin_savepoint(name).await?;
         self.collector.push(
@@ -364,7 +364,7 @@ impl LixBackend for TracingBenchBackend {
 }
 
 #[async_trait(?Send)]
-impl LixTransaction for TracingBenchTransaction<'_> {
+impl LixBackendTransaction for TracingBenchTransaction<'_> {
     fn dialect(&self) -> SqlDialect {
         self.inner.dialect()
     }

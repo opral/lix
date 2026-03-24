@@ -6,7 +6,7 @@ use super::layout::{
 use super::sql::ensure_schema_live_table_sql_statements;
 use crate::schema::schema_from_registered_snapshot;
 use crate::live_state::SchemaRegistration;
-use crate::{LixBackend, LixError, LixTransaction, Value};
+use crate::{LixBackend, LixError, LixBackendTransaction, Value};
 use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +24,7 @@ pub(in crate::live_state) async fn register_schema(
 }
 
 pub(in crate::live_state) async fn register_schema_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     registration: &SchemaRegistration,
 ) -> Result<(), LixError> {
     ensure_schema_live_table_with_requirement_in_transaction(
@@ -51,7 +51,7 @@ pub(in crate::live_state) async fn ensure_schema_live_table_with_requirement(
 }
 
 pub(in crate::live_state) async fn ensure_schema_live_table_with_requirement_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     requirement: &LiveTableRequirement,
 ) -> Result<(), LixError> {
     let layout = match requirement.layout.as_ref() {
@@ -77,7 +77,7 @@ pub(in crate::live_state) async fn load_live_table_layout_with_backend(
 }
 
 pub(in crate::live_state) async fn load_live_table_layout_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     schema_key: &str,
 ) -> Result<LiveTableLayout, LixError> {
     let mut provider = TransactionSchemaLayoutProvider { transaction };
@@ -105,7 +105,7 @@ impl RegisteredSchemaLayoutProvider for BackendSchemaLayoutProvider<'_> {
 }
 
 struct TransactionSchemaLayoutProvider<'a> {
-    transaction: &'a mut dyn LixTransaction,
+    transaction: &'a mut dyn LixBackendTransaction,
 }
 
 #[async_trait(?Send)]

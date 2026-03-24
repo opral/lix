@@ -19,7 +19,7 @@ use crate::version::{
     version_descriptor_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{
-    CanonicalJson, LixError, LixTransaction, QueryResult, SqlDialect, Value as EngineValue,
+    CanonicalJson, LixError, LixBackendTransaction, QueryResult, SqlDialect, Value as EngineValue,
 };
 
 use crate::sql::ast::lowering::lower_statement;
@@ -53,7 +53,7 @@ pub(crate) struct PostprocessExecutionOutcome {
 }
 
 pub(crate) async fn execute_internal_postprocess_with_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     prepared_statements: &[PreparedStatement],
     postprocess_plan: Option<&PostprocessPlan>,
     should_refresh_file_cache: bool,
@@ -81,7 +81,7 @@ pub(crate) async fn execute_internal_postprocess_with_transaction(
 }
 
 pub(crate) async fn execute_postprocess_with_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     prepared_statements: &[PreparedStatement],
     postprocess_plan: &PostprocessPlan,
     should_refresh_file_cache: bool,
@@ -173,7 +173,7 @@ trait SqlExecutor {
 }
 
 struct TransactionExecutor<'a> {
-    transaction: &'a mut dyn LixTransaction,
+    transaction: &'a mut dyn LixBackendTransaction,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -211,7 +211,7 @@ impl CommitQueryExecutor for CommitExecutorAdapter<'_> {
 }
 
 pub(crate) async fn build_update_followup_statements(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     plan: &VtableUpdatePlan,
     rows: &[Vec<EngineValue>],
     writer_key: Option<&str>,
@@ -222,7 +222,7 @@ pub(crate) async fn build_update_followup_statements(
 }
 
 pub(crate) async fn build_delete_followup_statements(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
     params: &[EngineValue],

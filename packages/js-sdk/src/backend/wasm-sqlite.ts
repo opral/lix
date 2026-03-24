@@ -8,7 +8,7 @@ import type {
 	LixBackend,
 	LixRuntimeQueryResult,
 	LixRuntimeValue,
-	LixTransaction,
+	LixBackendTransaction,
 } from "../types.js";
 
 type SqliteWasmDatabase = Database & {
@@ -103,7 +103,7 @@ export async function createWasmSqliteBackend(): Promise<LixBackend> {
 		}
 	};
 
-	const createTransaction = (): LixTransaction => {
+	const createTransaction = (): LixBackendTransaction => {
 		let transactionClosed = false;
 
 		return {
@@ -151,7 +151,7 @@ export async function createWasmSqliteBackend(): Promise<LixBackend> {
 		): Promise<LixRuntimeQueryResult> {
 			return runSerialized(() => runQuery(sql, params));
 		},
-		async beginTransaction(): Promise<LixTransaction> {
+		async beginTransaction(): Promise<LixBackendTransaction> {
 			return runSerialized(() => {
 				ensureBackendOpen();
 				runQuery("BEGIN", []);

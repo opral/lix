@@ -6,7 +6,7 @@ use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::state::internal::write_program::WriteProgram;
-use crate::{LixBackend, LixError, LixTransaction};
+use crate::{LixBackend, LixError, LixBackendTransaction};
 
 impl Engine {
     pub(crate) async fn prepare_runtime_functions_with_backend(
@@ -50,7 +50,7 @@ impl Engine {
 
     pub(crate) async fn ensure_runtime_sequence_initialized_in_transaction(
         &self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
         functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
     ) -> Result<(), LixError> {
         if !functions.deterministic_sequence_enabled()
@@ -87,7 +87,7 @@ impl Engine {
 
     pub(crate) async fn persist_runtime_sequence_in_transaction(
         &self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
         settings: DeterministicSettings,
         _sequence_start: i64,
         functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
@@ -138,7 +138,7 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
+        async fn begin_transaction(&self) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "transactions are not needed in this test",
@@ -148,7 +148,7 @@ mod tests {
         async fn begin_savepoint(
             &self,
             _name: &str,
-        ) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
+        ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "begin_savepoint not supported in test backend",

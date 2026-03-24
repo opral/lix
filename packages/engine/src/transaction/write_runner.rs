@@ -1,12 +1,12 @@
 use crate::live_state::tracked::{TrackedWriteOperation, TrackedWriteRow};
 use crate::live_state::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
-use crate::{LixError, LixTransaction};
+use crate::{LixError, LixBackendTransaction};
 
 use super::contracts::CommitOutcome;
 use super::write_plan::{TxnMaterializationPlan, TxnMaterializationUnit};
 
 pub(crate) async fn run_materialization_plan(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     plan: &TxnMaterializationPlan,
 ) -> Result<CommitOutcome, LixError> {
     let mut outcome = CommitOutcome::default();

@@ -3,7 +3,7 @@ use crate::schema::live_layout::{
 };
 use crate::schema::schema_from_registered_snapshot;
 use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
-use crate::{LixBackend, LixError, LixTransaction, SqlDialect};
+use crate::{LixBackend, LixError, LixBackendTransaction, SqlDialect};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
@@ -22,7 +22,7 @@ pub async fn ensure_schema_live_table(
 }
 
 pub async fn ensure_schema_live_table_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     schema_key: &str,
 ) -> Result<(), LixError> {
     ensure_schema_live_table_with_requirement_in_transaction(
@@ -52,7 +52,7 @@ pub async fn ensure_schema_live_table_with_requirement(
 }
 
 pub async fn ensure_schema_live_table_with_requirement_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     requirement: &SchemaLiveTableRequirement,
 ) -> Result<(), LixError> {
     let layout = match requirement.layout.as_ref() {
@@ -375,7 +375,7 @@ pub(crate) async fn load_live_table_layout_with_backend(
 }
 
 pub(crate) async fn load_live_table_layout_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     schema_key: &str,
 ) -> Result<LiveTableLayout, LixError> {
     if let Some(layout) = builtin_live_table_layout(schema_key)? {

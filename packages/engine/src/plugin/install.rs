@@ -10,7 +10,7 @@ use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
 use crate::plugin::types::PluginManifest;
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
-use crate::{LixError, LixTransaction, Value};
+use crate::{LixError, LixBackendTransaction, Value};
 
 const INSTALL_REGISTERED_SCHEMA_SQL: &str =
     "INSERT INTO lix_registered_schema (value) VALUES (lix_json(?))";
@@ -63,7 +63,7 @@ impl Engine {
 
 async fn install_plugin_in_transaction(
     engine: &Engine,
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     parsed: &ParsedPluginArchive,
     archive_bytes: &[u8],
     context: &mut crate::sql::execution::execution_program::ExecutionContext,
