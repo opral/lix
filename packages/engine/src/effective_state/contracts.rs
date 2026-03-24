@@ -1,11 +1,9 @@
 use std::collections::BTreeMap;
 
-use async_trait::async_trait;
-
 use crate::constraints::ScanConstraint;
-use crate::live_tracked_state::{ExactTrackedRowRequest, TrackedReadView, TrackedScanRequest};
+use crate::live_tracked_state::{TrackedReadView, TrackedTombstoneView};
 use crate::live_untracked_state::UntrackedReadView;
-use crate::{LixError, Value};
+use crate::Value;
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -111,35 +109,6 @@ impl EffectiveRow {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct EffectiveRowSet {
     pub rows: Vec<EffectiveRow>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct TrackedTombstoneMarker {
-    pub entity_id: String,
-    pub schema_key: String,
-    pub file_id: String,
-    pub version_id: String,
-    pub global: bool,
-    pub schema_version: Option<String>,
-    pub plugin_key: Option<String>,
-    pub metadata: Option<String>,
-    pub writer_key: Option<String>,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
-    pub change_id: Option<String>,
-}
-
-#[async_trait(?Send)]
-pub trait TrackedTombstoneView {
-    async fn load_exact_tombstone(
-        &self,
-        request: &ExactTrackedRowRequest,
-    ) -> Result<Option<TrackedTombstoneMarker>, LixError>;
-
-    async fn scan_tombstones(
-        &self,
-        request: &TrackedScanRequest,
-    ) -> Result<Vec<TrackedTombstoneMarker>, LixError>;
 }
 
 pub struct ReadContext<'a> {

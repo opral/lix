@@ -61,6 +61,22 @@ impl TrackedRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TrackedTombstoneMarker {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub global: bool,
+    pub schema_version: Option<String>,
+    pub plugin_key: Option<String>,
+    pub metadata: Option<String>,
+    pub writer_key: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub change_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TrackedWriteOperation {
     Upsert,
     Tombstone,
@@ -103,6 +119,19 @@ pub trait TrackedReadView {
 }
 
 #[async_trait(?Send)]
+pub trait TrackedTombstoneView {
+    async fn load_exact_tombstone(
+        &self,
+        request: &ExactTrackedRowRequest,
+    ) -> Result<Option<TrackedTombstoneMarker>, LixError>;
+
+    async fn scan_tombstones(
+        &self,
+        request: &TrackedScanRequest,
+    ) -> Result<Vec<TrackedTombstoneMarker>, LixError>;
+}
+
+#[async_trait(?Send)]
 impl<T> TrackedReadView for T
 where
     T: LixBackend,
@@ -139,6 +168,13 @@ impl<T> TrackedWriteParticipant for T
 where
     T: LixTransaction,
 {
+    async fn apply_write_batch(&mut self, batch: &[TrackedWriteRow]) -> Result<(), LixError> {
+        super::write::apply_write_batch_in_transaction(self, batch).await
+    }
+}
+
+#[async_trait(?Send)]
+impl TrackedWriteParticipant for dyn LixTransaction + '_ {
     async fn apply_write_batch(&mut self, batch: &[TrackedWriteRow]) -> Result<(), LixError> {
         super::write::apply_write_batch_in_transaction(self, batch).await
     }

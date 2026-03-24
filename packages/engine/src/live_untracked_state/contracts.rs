@@ -165,3 +165,14 @@ where
         super::write::apply_write_batch_in_transaction(self, batch).await
     }
 }
+
+#[async_trait(?Send)]
+impl UntrackedWriteParticipant for dyn LixTransaction + '_ {
+    async fn ensure_storage_for_schema(&mut self, schema_key: &str) -> Result<(), LixError> {
+        super::write::ensure_storage_in_transaction(self, schema_key).await
+    }
+
+    async fn apply_write_batch(&mut self, batch: &[UntrackedWriteRow]) -> Result<(), LixError> {
+        super::write::apply_write_batch_in_transaction(self, batch).await
+    }
+}
