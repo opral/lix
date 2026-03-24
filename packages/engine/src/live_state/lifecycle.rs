@@ -158,7 +158,7 @@ pub(crate) async fn load_live_state_snapshot(
     load_live_state_snapshot_with_backend(backend).await
 }
 
-pub async fn install(backend: &dyn LixBackend) -> Result<(), LixError> {
+pub async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
     backend.execute(LIVE_STATE_STATUS_CREATE_TABLE_SQL, &[]).await?;
     backend.execute(LIVE_STATE_STATUS_SEED_ROW_SQL, &[]).await?;
     Ok(())
