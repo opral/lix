@@ -1,5 +1,5 @@
 use crate::errors::classification::is_missing_relation_error;
-use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
+use crate::{LixBackend, LixError, LixBackendTransaction, QueryResult, Value};
 
 pub(crate) const LIVE_STATE_SCHEMA_EPOCH: &str = "1";
 pub(crate) const LIVE_STATE_STATUS_TABLE: &str = "lix_internal_live_state_status";
@@ -166,7 +166,7 @@ pub(crate) async fn ensure_live_state_ready(backend: &dyn LixBackend) -> Result<
 }
 
 pub(crate) async fn ensure_live_state_ready_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
 ) -> Result<(), LixError> {
     let snapshot = load_live_state_snapshot_in_transaction(transaction).await?;
     match evaluate_live_state_transaction_eligibility(&snapshot) {
@@ -238,7 +238,7 @@ pub(crate) async fn load_latest_canonical_watermark(
 }
 
 pub(crate) async fn load_latest_canonical_watermark_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
 ) -> Result<Option<CanonicalWatermark>, LixError> {
     let result = transaction
         .execute(
@@ -328,7 +328,7 @@ async fn load_live_state_snapshot_with_backend(
 }
 
 async fn load_live_state_snapshot_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
 ) -> Result<LiveStateSnapshot, LixError> {
     let result = transaction
         .execute(&build_load_live_state_snapshot_sql(), &[])
@@ -629,7 +629,7 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "transactions not used in fake backend",
@@ -639,7 +639,7 @@ mod tests {
         async fn begin_savepoint(
             &self,
             _name: &str,
-        ) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "begin_savepoint not supported in test backend",
@@ -653,7 +653,7 @@ mod tests {
     }
 
     #[async_trait(?Send)]
-    impl LixTransaction for FakeTransaction {
+    impl LixBackendTransaction for FakeTransaction {
         fn dialect(&self) -> crate::SqlDialect {
             crate::SqlDialect::Sqlite
         }

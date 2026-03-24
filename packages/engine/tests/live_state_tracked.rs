@@ -10,7 +10,7 @@ use lix_engine::live_state::tracked::{
     TrackedWriteRow,
 };
 use lix_engine::transaction::{ReadContext, TransactionDelta, WriteTransaction};
-use lix_engine::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
+use lix_engine::{LixBackend, LixError, LixBackendTransaction, QueryResult, SqlDialect, Value};
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
 #[derive(Clone)]
@@ -45,7 +45,7 @@ impl LixBackend for SqliteBackend {
         execute_sql(&connection, sql, params)
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         {
             let connection = self.connection.lock().expect("sqlite connection lock");
             connection.execute_batch("BEGIN").map_err(sqlite_error)?;
@@ -55,13 +55,13 @@ impl LixBackend for SqliteBackend {
         }))
     }
 
-    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         self.begin_transaction().await
     }
 }
 
 #[async_trait(?Send)]
-impl LixTransaction for SqliteTransaction {
+impl LixBackendTransaction for SqliteTransaction {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
     }

@@ -2380,7 +2380,7 @@ fn filesystem_query_backend_error(error: crate::LixError) -> FilesystemQueryErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{LixTransaction, SqlDialect};
+    use crate::backend::{LixBackendTransaction, SqlDialect};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -2473,20 +2473,20 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, crate::LixError> {
+        async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, crate::LixError> {
             Ok(Box::new(UnusedTransaction))
         }
 
         async fn begin_savepoint(
             &self,
             _name: &str,
-        ) -> Result<Box<dyn LixTransaction + '_>, crate::LixError> {
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, crate::LixError> {
             self.begin_transaction().await
         }
     }
 
     #[async_trait(?Send)]
-    impl LixTransaction for UnusedTransaction {
+    impl LixBackendTransaction for UnusedTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
         }

@@ -16,7 +16,7 @@ use crate::state::materialization::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
 };
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{ExecuteResult, LixError, LixTransaction, QueryResult, Value};
+use crate::{ExecuteResult, LixError, LixBackendTransaction, QueryResult, Value};
 use sqlparser::ast::Statement;
 
 impl Engine {
@@ -54,7 +54,7 @@ impl Engine {
 
     pub(crate) async fn append_observe_tick_in_transaction(
         &self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
         writer_key: Option<&str>,
     ) -> Result<(), LixError> {
         let mut program = WriteProgram::new();

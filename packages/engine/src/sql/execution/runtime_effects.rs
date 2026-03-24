@@ -10,7 +10,7 @@ use crate::sql::storage::queries::{
 };
 use crate::sql::storage::tables;
 use crate::state::internal::write_program::WriteProgram;
-use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value};
+use crate::{LixError, LixBackendTransaction, QueryResult, SqlDialect, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";
@@ -344,7 +344,7 @@ struct TrackedFilesystemPayloadBatch {
 }
 
 async fn resolve_binary_blob_write_file_id_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     write: &BinaryBlobWrite,
 ) -> Result<String, LixError> {
     if let Some(file_id) = write.file_id.as_ref() {
@@ -484,7 +484,7 @@ fn binary_blob_ref_tombstone_change_for_target(
 impl Engine {
     pub(crate) async fn persist_filesystem_payload_domain_changes_in_transaction(
         &self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
         changes: &[FilesystemPayloadDomainChange],
     ) -> Result<(), LixError> {
         self.persist_filesystem_payload_domain_changes_partitioned_in_transaction(
@@ -496,7 +496,7 @@ impl Engine {
 
     async fn persist_filesystem_payload_domain_changes_partitioned_in_transaction(
         &self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
         changes: &[FilesystemPayloadDomainChange],
     ) -> Result<(), LixError> {
         let tracked = changes
@@ -532,7 +532,7 @@ impl Engine {
 
     pub(crate) async fn persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
         &self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
         changes: &[FilesystemPayloadDomainChange],
         untracked: bool,
     ) -> Result<(), LixError> {
@@ -550,7 +550,7 @@ impl Engine {
 
     pub(crate) async fn compile_filesystem_finalization_from_state_in_transaction(
         &self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
         filesystem_state: &FilesystemTransactionState,
         writer_key: Option<&str>,
         mutations: &[MutationRow],
@@ -570,7 +570,7 @@ impl Engine {
 
     pub(crate) async fn persist_binary_blob_writes_in_transaction(
         &self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
         writes: &[BinaryBlobWrite],
     ) -> Result<(), LixError> {
         let mut latest_index_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
@@ -603,14 +603,14 @@ impl Engine {
 
     pub(crate) async fn garbage_collect_unreachable_binary_cas_in_transaction(
         &self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
     ) -> Result<(), LixError> {
         garbage_collect_unreachable_binary_cas_in_transaction(transaction).await
     }
 }
 
 async fn load_exact_filesystem_descriptors_for_state_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     filesystem_state: &FilesystemTransactionState,
 ) -> Result<BTreeMap<String, ExactFilesystemDescriptorState>, LixError> {
     let targets = filesystem_state
@@ -783,7 +783,7 @@ trait BinaryCasExecutor {
 }
 
 struct TransactionBinaryCasExecutor<'a> {
-    transaction: &'a mut dyn LixTransaction,
+    transaction: &'a mut dyn LixBackendTransaction,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1110,7 +1110,7 @@ fn compress_binary_chunk_payload(chunk_data: &[u8]) -> Result<Vec<u8>, LixError>
 }
 
 async fn garbage_collect_unreachable_binary_cas_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
 ) -> Result<(), LixError> {
     let mut executor = TransactionBinaryCasExecutor { transaction };
     garbage_collect_unreachable_binary_cas_with_executor(&mut executor).await
@@ -1159,7 +1159,7 @@ async fn garbage_collect_unreachable_binary_cas_with_executor(
 }
 
 async fn binary_blob_ref_relation_exists_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
 ) -> Result<bool, LixError> {
     match transaction.dialect() {
         SqlDialect::Sqlite => {

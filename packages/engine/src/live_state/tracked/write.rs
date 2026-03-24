@@ -3,12 +3,12 @@ use crate::live_state::storage::{
     normalized_insert_columns_sql, normalized_insert_values_sql,
     normalized_update_assignments_sql, quoted_live_table_name,
 };
-use crate::{LixError, LixTransaction};
+use crate::{LixError, LixBackendTransaction};
 
 use super::contracts::{TrackedWriteOperation, TrackedWriteRow};
 
 pub(crate) async fn apply_write_batch_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     batch: &[TrackedWriteRow],
 ) -> Result<(), LixError> {
     if batch.is_empty() {
@@ -45,7 +45,7 @@ pub(crate) async fn apply_write_batch_in_transaction(
 }
 
 async fn apply_materialized_row_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     row: &TrackedWriteRow,
     snapshot_content: Option<&str>,
     is_tombstone: bool,

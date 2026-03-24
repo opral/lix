@@ -6,7 +6,7 @@ use sqlx::{Column, Executor, Row, SqlitePool, ValueRef};
 use tokio::sync::OnceCell;
 
 use lix_engine::{
-    collapse_prepared_batch_for_dialect, LixBackend, LixError, LixTransaction, PreparedBatch,
+    collapse_prepared_batch_for_dialect, LixBackend, LixError, LixBackendTransaction, PreparedBatch,
     QueryResult, SqlDialect, Value,
 };
 
@@ -42,7 +42,7 @@ struct SqliteBackend {
     pool: OnceCell<SqlitePool>,
 }
 
-struct SqliteBackendTransaction {
+struct SqliteLixBackendTransaction {
     conn: sqlx::pool::PoolConnection<sqlx::Sqlite>,
 }
 
@@ -102,7 +102,7 @@ impl LixBackend for SqliteBackend {
         lix_engine::execute_auto_transactional(self, sql, params).await
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let pool = self.pool().await?;
         let mut conn = pool.acquire().await.map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -115,16 +115,16 @@ impl LixBackend for SqliteBackend {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
             })?;
-        Ok(Box::new(SqliteBackendTransaction { conn }))
+        Ok(Box::new(SqliteLixBackendTransaction { conn }))
     }
 
-    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         self.begin_transaction().await
     }
 }
 
 #[async_trait::async_trait(?Send)]
-impl LixTransaction for SqliteBackendTransaction {
+impl LixBackendTransaction for SqliteLixBackendTransaction {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
     }

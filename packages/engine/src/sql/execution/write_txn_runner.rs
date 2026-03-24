@@ -35,11 +35,11 @@ use crate::state::live_state::{
     build_mark_live_state_ready_sql, load_latest_canonical_watermark_in_transaction,
 };
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{LixError, LixTransaction, QueryResult, Value};
+use crate::{LixError, LixBackendTransaction, QueryResult, Value};
 
 pub(crate) async fn run_txn_delta_with_transaction(
     engine: &Engine,
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     delta: &TxnDelta,
     mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
 ) -> Result<SqlExecutionOutcome, LixError> {
@@ -75,7 +75,7 @@ pub(crate) async fn run_txn_delta_with_transaction(
 
 async fn materialize_tracked_append_phase(
     engine: &Engine,
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     unit: &crate::sql::public::runtime::TrackedTxnUnit,
     mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
@@ -323,7 +323,7 @@ async fn materialize_tracked_append_phase(
 
 async fn run_public_untracked_write_txn_with_transaction(
     engine: &Engine,
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     plan: &PublicUntrackedTxnUnit,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
     let mut runtime_functions = plan.functions.clone();
@@ -403,7 +403,7 @@ async fn run_public_untracked_write_txn_with_transaction(
 
 async fn run_internal_write_txn_with_transaction(
     engine: &Engine,
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     plan: &InternalTxnUnit,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
     let mut execution = execute_internal_execution_with_transaction(
@@ -516,7 +516,7 @@ fn merge_plan_effects_override(existing: &mut Option<PlanEffects>, next: Option<
 }
 
 async fn apply_public_untracked_rows(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     rows: &[crate::sql::public::planner::ir::PlannedStateRow],
     timestamp: &str,
 ) -> Result<(), LixError> {
@@ -531,7 +531,7 @@ async fn apply_public_untracked_rows(
 }
 
 async fn apply_public_untracked_upsert(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     row: &crate::sql::public::planner::ir::PlannedStateRow,
     timestamp: &str,
 ) -> Result<(), LixError> {
@@ -596,7 +596,7 @@ async fn apply_public_untracked_upsert(
 }
 
 async fn apply_public_untracked_delete(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     row: &crate::sql::public::planner::ir::PlannedStateRow,
 ) -> Result<(), LixError> {
     ensure_schema_live_table_in_transaction(transaction, &row.schema_key).await?;
@@ -743,7 +743,7 @@ fn quote_ident(value: &str) -> String {
 /// watermark is always consistent regardless of how many statements or
 /// merged commits ran inside the transaction.
 pub(crate) async fn stamp_watermark_before_commit(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
 ) -> Result<(), LixError> {
     if let Some(watermark) = load_latest_canonical_watermark_in_transaction(transaction).await? {
         transaction
@@ -754,7 +754,7 @@ pub(crate) async fn stamp_watermark_before_commit(
 }
 
 async fn persist_filesystem_payload_domain_changes_direct(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     changes: &[crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange],
 ) -> Result<(), LixError> {
     let tracked = changes

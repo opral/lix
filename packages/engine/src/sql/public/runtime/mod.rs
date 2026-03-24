@@ -2991,7 +2991,7 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
+        async fn begin_transaction(&self) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "transactions are not needed in this test backend".to_string(),
@@ -3001,7 +3001,7 @@ mod tests {
         async fn begin_savepoint(
             &self,
             _name: &str,
-        ) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
+        ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "begin_savepoint not supported in test backend",

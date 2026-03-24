@@ -9,7 +9,7 @@ use crate::state::stream::{
 };
 use crate::state::validation::SchemaCache;
 use crate::WasmRuntime;
-use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
+use crate::{LixBackend, LixError, LixBackendTransaction, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
 use std::collections::{BTreeMap, BTreeSet};
@@ -63,7 +63,7 @@ pub struct Engine {
 #[must_use = "EngineTransaction must be committed or rolled back"]
 pub struct EngineTransaction<'a> {
     pub(crate) engine: &'a Engine,
-    pub(crate) transaction: Option<Box<dyn LixTransaction + 'a>>,
+    pub(crate) transaction: Option<Box<dyn LixBackendTransaction + 'a>>,
     pub(crate) context: ExecutionContext,
 }
 
@@ -210,7 +210,7 @@ impl Engine {
 
     pub(crate) async fn prepare_execution_context_for_commit(
         &self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
         context: &mut ExecutionContext,
     ) -> Result<(), LixError> {
         let active_version_before_flush = context.active_version_id.clone();
@@ -257,7 +257,7 @@ impl Engine {
     /// this uses a savepoint instead to avoid nested `BEGIN` errors.
     pub(crate) async fn begin_write_unit(
         &self,
-    ) -> Result<Box<dyn crate::LixTransaction + '_>, crate::LixError> {
+    ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, crate::LixError> {
         if self.in_init_transaction.load(Ordering::SeqCst) {
             let id = self.savepoint_counter.fetch_add(1, Ordering::SeqCst);
             self.backend.begin_savepoint(&format!("sp_{id}")).await
@@ -304,7 +304,7 @@ impl Engine {
 
 pub(crate) struct TransactionBackendAdapter<'a> {
     dialect: crate::SqlDialect,
-    transaction: Mutex<*mut (dyn LixTransaction + 'a)>,
+    transaction: Mutex<*mut (dyn LixBackendTransaction + 'a)>,
     _lifetime: PhantomData<&'a ()>,
 }
 
@@ -421,10 +421,10 @@ unsafe impl<'a> Send for TransactionBackendAdapter<'a> {}
 unsafe impl<'a> Sync for TransactionBackendAdapter<'a> {}
 
 impl<'a> TransactionBackendAdapter<'a> {
-    pub(crate) fn new(transaction: &'a mut dyn LixTransaction) -> Self {
+    pub(crate) fn new(transaction: &'a mut dyn LixBackendTransaction) -> Self {
         Self {
             dialect: transaction.dialect(),
-            transaction: Mutex::new(transaction as *mut (dyn LixTransaction + 'a)),
+            transaction: Mutex::new(transaction as *mut (dyn LixBackendTransaction + 'a)),
             _lifetime: PhantomData,
         }
     }
@@ -441,7 +441,7 @@ impl<'a> crate::backend::QueryExecutor for TransactionBackendAdapter<'a> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction adapter lock poisoned".to_string(),
         })?;
-        // SAFETY: the pointer is created from a live `&mut dyn LixTransaction` and
+        // SAFETY: the pointer is created from a live `&mut dyn LixBackendTransaction` and
         // this mutex serializes all calls so the mutable borrow is not aliased.
         unsafe { (&mut **guard).execute(sql, params).await }
     }
@@ -458,12 +458,12 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction adapter lock poisoned".to_string(),
         })?;
-        // SAFETY: the pointer is created from a live `&mut dyn LixTransaction` and
+        // SAFETY: the pointer is created from a live `&mut dyn LixBackendTransaction` and
         // this mutex serializes all calls so the mutable borrow is not aliased.
         unsafe { (&mut **guard).execute(sql, params).await }
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "nested transactions are not supported via TransactionBackendAdapter"
@@ -471,7 +471,7 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
         })
     }
 
-    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "savepoints are not supported via TransactionBackendAdapter".to_string(),
@@ -645,7 +645,7 @@ mod tests {
     use super::{
         boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
-    use crate::backend::{LixBackend, LixTransaction, SqlDialect};
+    use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect};
     use crate::schema::live_layout::untracked_live_table_name;
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
     use crate::sql::analysis::state_resolution::effects::active_version_from_update_validations;
@@ -692,7 +692,7 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             Ok(Box::new(TestTransaction {
                 commit_called: Arc::clone(&self.commit_called),
                 rollback_called: Arc::clone(&self.rollback_called),
@@ -702,13 +702,13 @@ mod tests {
         async fn begin_savepoint(
             &self,
             _name: &str,
-        ) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             self.begin_transaction().await
         }
     }
 
     #[async_trait(?Send)]
-    impl LixTransaction for TestTransaction {
+    impl LixBackendTransaction for TestTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
         }

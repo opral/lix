@@ -18,7 +18,7 @@ use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_storage_version_id,
 };
-use crate::{EngineTransaction, LixError, LixTransaction};
+use crate::{EngineTransaction, LixError, LixBackendTransaction};
 
 pub use types::{RedoOptions, RedoResult, UndoOptions, UndoResult};
 pub(crate) use types::{SemanticUndoRedoStacks, UndoRedoOperationKind, UndoRedoOperationRecord};
@@ -83,7 +83,7 @@ async fn ensure_version_exists(
 }
 
 pub(crate) async fn rebuild_semantic_undo_redo_stacks(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     version_id: &str,
 ) -> Result<SemanticUndoRedoStacks, LixError> {
     let mut executor = crate::engine::TransactionBackendAdapter::new(transaction);
@@ -183,7 +183,7 @@ where
 }
 
 pub(crate) async fn load_target_commit_change_effects(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     version_id: &str,
     target_commit_id: &str,
 ) -> Result<Vec<TargetCommitChangeEffect>, LixError> {

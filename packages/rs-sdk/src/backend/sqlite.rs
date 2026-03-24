@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use lix_engine::{
-    ImageChunkReader, ImageChunkWriter, LixBackend, LixError, LixTransaction, PreparedBatch,
+    ImageChunkReader, ImageChunkWriter, LixBackend, LixError, LixBackendTransaction, PreparedBatch,
     QueryResult, SqlDialect, Value,
 };
 use rusqlite::{
@@ -80,7 +80,7 @@ impl LixBackend for SqliteBackend {
         execute_sql(conn, sql, params)
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let mut conn = self.lock_conn()?;
         let inner = conn.as_mut().ok_or_else(sqlite_backend_destroyed_error)?;
         if inner.is_autocommit() {
@@ -116,7 +116,7 @@ impl LixBackend for SqliteBackend {
         }
     }
 
-    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let mut conn = self.lock_conn()?;
         let inner = conn.as_mut().ok_or_else(sqlite_backend_destroyed_error)?;
         inner
@@ -222,7 +222,7 @@ impl LixBackend for SqliteBackend {
 }
 
 #[async_trait(?Send)]
-impl LixTransaction for SqliteTransaction<'_> {
+impl LixBackendTransaction for SqliteTransaction<'_> {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
     }

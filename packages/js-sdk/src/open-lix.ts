@@ -23,7 +23,7 @@ export type {
 	LixCanonicalQueryResult,
 	LixCanonicalValue,
 	LixSqlDialect,
-	LixTransaction,
+	LixBackendTransaction,
 	LixRuntimeExecuteResult,
 	LixRuntimeQueryResult,
 	LixRuntimeValue,

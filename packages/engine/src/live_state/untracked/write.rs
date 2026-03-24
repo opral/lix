@@ -3,12 +3,12 @@ use crate::live_state::storage::{
     normalized_insert_columns_sql, normalized_insert_values_sql,
     normalized_update_assignments_sql, quoted_live_table_name,
 };
-use crate::{LixError, LixTransaction};
+use crate::{LixError, LixBackendTransaction};
 
 use super::contracts::{UntrackedWriteOperation, UntrackedWriteRow};
 
 pub(crate) async fn apply_write_batch_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     batch: &[UntrackedWriteRow],
 ) -> Result<(), LixError> {
     if batch.is_empty() {
@@ -30,7 +30,7 @@ pub(crate) async fn apply_write_batch_in_transaction(
 }
 
 async fn apply_upsert_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     row: &UntrackedWriteRow,
 ) -> Result<(), LixError> {
     let layout = {
@@ -89,7 +89,7 @@ async fn apply_upsert_in_transaction(
 }
 
 async fn apply_delete_in_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     row: &UntrackedWriteRow,
 ) -> Result<(), LixError> {
     let sql = format!(

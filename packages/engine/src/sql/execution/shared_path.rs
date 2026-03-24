@@ -27,7 +27,7 @@ use crate::state::validation::{
 };
 use crate::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, LixBackend,
-    LixError, LixTransaction, QueryResult, Value, VersionId,
+    LixError, LixBackendTransaction, QueryResult, Value, VersionId,
 };
 
 use crate::schema::live_layout::{
@@ -266,7 +266,7 @@ impl<'a> PublicCommitInvariantChecker<'a> {
 impl CreateCommitInvariantChecker for PublicCommitInvariantChecker<'_> {
     async fn recheck_invariants(
         &mut self,
-        transaction: &mut dyn LixTransaction,
+        transaction: &mut dyn LixBackendTransaction,
     ) -> Result<(), CreateCommitError> {
         let backend = TransactionBackendAdapter::new(transaction);
         validate_commit_time_write(&backend, &self.schema_cache, self.planned_write)
@@ -279,7 +279,7 @@ impl CreateCommitInvariantChecker for PublicCommitInvariantChecker<'_> {
 }
 
 struct TransactionCommitExecutor<'a> {
-    transaction: &'a mut dyn LixTransaction,
+    transaction: &'a mut dyn LixBackendTransaction,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1726,7 +1726,7 @@ pub(crate) fn pending_session_matches_create_commit(
 }
 
 pub(crate) async fn build_pending_public_commit_session(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     lane: CreateCommitWriteLane,
     commit_result: &GenerateCommitResult,
 ) -> Result<PendingPublicCommitSession, LixError> {
@@ -1820,7 +1820,7 @@ pub(crate) async fn build_pending_public_commit_session(
 }
 
 pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     session: &mut PendingPublicCommitSession,
     batch: &crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch,
     binary_blob_writes: &[BinaryBlobWrite],
@@ -1954,7 +1954,7 @@ fn canonicalize_optional_json_text(
 }
 
 async fn load_version_info_for_domain_changes(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     domain_changes: &[DomainChangeInput],
 ) -> Result<BTreeMap<String, VersionInfo>, LixError> {
     let affected_versions = domain_changes
@@ -2159,7 +2159,7 @@ where
 }
 
 async fn execute_generated_commit_result(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     result: GenerateCommitResult,
     binary_blob_writes: &[BinaryBlobWrite],
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
@@ -2220,7 +2220,7 @@ pub(crate) fn create_commit_error_to_lix_error(
 }
 
 pub(crate) async fn mirror_public_registered_schema_bootstrap_rows(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     commit_result: &crate::state::commit::GenerateCommitResult,
 ) -> Result<(), LixError> {
     for row in &commit_result.derived_apply_input.live_state_rows {
@@ -2284,7 +2284,7 @@ pub(crate) async fn mirror_public_registered_schema_bootstrap_rows(
 }
 
 pub(crate) async fn apply_public_version_last_checkpoint_side_effects(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     public_write: &PreparedPublicWrite,
     batch: &crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch,
 ) -> Result<(), LixError> {
@@ -2413,7 +2413,7 @@ fn version_ids_from_resolved_write(
 }
 
 async fn upsert_last_checkpoint_rows(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     rows: &[(String, String)],
     update_existing: bool,
 ) -> Result<(), LixError> {
@@ -2447,7 +2447,7 @@ async fn upsert_last_checkpoint_rows(
 }
 
 async fn delete_last_checkpoint_rows(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     version_ids: &[String],
 ) -> Result<(), LixError> {
     if version_ids.is_empty() {

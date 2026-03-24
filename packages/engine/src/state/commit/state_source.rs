@@ -567,7 +567,7 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::LixTransaction;
+    use crate::backend::LixBackendTransaction;
     use crate::schema::live_layout::builtin_live_table_layout;
     use crate::QueryResult;
     use async_trait::async_trait;
@@ -631,20 +631,20 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             Ok(Box::new(UnusedTransaction))
         }
 
         async fn begin_savepoint(
             &self,
             _name: &str,
-        ) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             self.begin_transaction().await
         }
     }
 
     #[async_trait(?Send)]
-    impl LixTransaction for UnusedTransaction {
+    impl LixBackendTransaction for UnusedTransaction {
         fn dialect(&self) -> crate::SqlDialect {
             crate::SqlDialect::Sqlite
         }
@@ -771,14 +771,14 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             Ok(Box::new(UnusedTransaction))
         }
 
         async fn begin_savepoint(
             &self,
             _name: &str,
-        ) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             self.begin_transaction().await
         }
     }

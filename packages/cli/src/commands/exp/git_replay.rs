@@ -3,7 +3,7 @@ use crate::db;
 use crate::error::CliError;
 use async_trait::async_trait;
 use lix_rs_sdk::{
-    BootKeyValue, Lix, LixBackend, LixConfig, LixError, LixTransaction,
+    BootKeyValue, Lix, LixBackend, LixConfig, LixError, LixBackendTransaction,
     PreparedBatch as EnginePreparedBatch, QueryResult, SqlDialect, SqliteBackend, Value,
     WasmtimeRuntime,
 };
@@ -263,7 +263,7 @@ struct TracingSqliteBackend {
 }
 
 struct TracingSqliteTransaction<'a> {
-    inner: Box<dyn LixTransaction + 'a>,
+    inner: Box<dyn LixBackendTransaction + 'a>,
     collector: Arc<ReplaySqlTraceCollector>,
 }
 
@@ -283,11 +283,11 @@ impl LixBackend for TracingSqliteBackend {
         self.inner.execute(sql, params).await
     }
 
-    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         self.inner.begin_savepoint(name).await
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let started = Instant::now();
         let result = self.inner.begin_transaction().await;
         match result {
@@ -327,7 +327,7 @@ impl LixBackend for TracingSqliteBackend {
 }
 
 #[async_trait(?Send)]
-impl LixTransaction for TracingSqliteTransaction<'_> {
+impl LixBackendTransaction for TracingSqliteTransaction<'_> {
     fn dialect(&self) -> SqlDialect {
         self.inner.dialect()
     }

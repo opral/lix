@@ -6,7 +6,7 @@ pub use crate::live_state::shared::query::{
     BatchRowRequest as BatchUntrackedRowRequest, ExactRowRequest as ExactUntrackedRowRequest,
     ScanRequest as UntrackedScanRequest,
 };
-use crate::{LixBackend, LixError, LixTransaction, Value};
+use crate::{LixBackend, LixError, LixBackendTransaction, Value};
 
 /// Decoded untracked/helper live row.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -127,7 +127,7 @@ pub trait UntrackedWriteParticipant {
 #[async_trait(?Send)]
 impl<T> UntrackedWriteParticipant for T
 where
-    T: LixTransaction,
+    T: LixBackendTransaction,
 {
     async fn apply_write_batch(&mut self, batch: &[UntrackedWriteRow]) -> Result<(), LixError> {
         super::write::apply_write_batch_in_transaction(self, batch).await
@@ -135,7 +135,7 @@ where
 }
 
 #[async_trait(?Send)]
-impl UntrackedWriteParticipant for dyn LixTransaction + '_ {
+impl UntrackedWriteParticipant for dyn LixBackendTransaction + '_ {
     async fn apply_write_batch(&mut self, batch: &[UntrackedWriteRow]) -> Result<(), LixError> {
         super::write::apply_write_batch_in_transaction(self, batch).await
     }

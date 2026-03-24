@@ -29,7 +29,7 @@ export type LixRuntimeExecuteResult = {
 
 export type LixSqlDialect = "sqlite" | "postgres";
 
-export type LixTransaction = {
+export type LixBackendTransaction = {
 	dialect?: LixSqlDialect | (() => LixSqlDialect);
 	execute(
 		sql: string,
@@ -45,7 +45,7 @@ export type LixBackend = {
 		sql: string,
 		params: ReadonlyArray<LixRuntimeValue>,
 	): Promise<LixRuntimeQueryResult> | LixRuntimeQueryResult;
-	beginTransaction?: () => Promise<LixTransaction> | LixTransaction;
+	beginTransaction?: () => Promise<LixBackendTransaction> | LixBackendTransaction;
 	export_image?: () =>
 		| Promise<Uint8Array | ArrayBuffer>
 		| Uint8Array

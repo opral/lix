@@ -835,7 +835,7 @@ mod tests {
     use super::{
         observe_source_key, ObserveEvent, ObserveEvents, ObserveQuery, OBSERVE_TICK_POLL_INTERVAL,
     };
-    use crate::backend::{LixBackend, LixTransaction, SqlDialect};
+    use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect};
     use crate::{boot, BootArgs, LixError, NoopWasmRuntime, QueryResult, Value};
     use async_trait::async_trait;
     use std::future::Future;
@@ -905,7 +905,7 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             Ok(Box::new(CountingObserveTransaction {
                 observe_query_hits: Arc::clone(&self.observe_query_hits),
             }))
@@ -914,13 +914,13 @@ mod tests {
         async fn begin_savepoint(
             &self,
             _name: &str,
-        ) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             self.begin_transaction().await
         }
     }
 
     #[async_trait(?Send)]
-    impl LixTransaction for CountingObserveTransaction {
+    impl LixBackendTransaction for CountingObserveTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
         }

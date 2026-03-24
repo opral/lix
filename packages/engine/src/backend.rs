@@ -24,14 +24,14 @@ pub trait LixBackend: Send + Sync {
     ///
     /// The returned handle holds exclusive access to the connection.
     /// All SQL must go through the handle until commit/rollback.
-    async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError>;
+    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError>;
 
     /// Begin a named savepoint within an active transaction.
     ///
     /// Returns a handle that commits via `RELEASE SAVEPOINT`
     /// and rolls back via `ROLLBACK TO SAVEPOINT`.
     /// The caller provides the name.
-    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixTransaction + '_>, LixError>;
+    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError>;
 
     /// Exports the current Lix database snapshot as a SQLite database file payload.
     async fn export_image(&self, _writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
@@ -119,7 +119,7 @@ where
 }
 
 #[async_trait(?Send)]
-impl QueryExecutor for Box<dyn LixTransaction + '_> {
+impl QueryExecutor for Box<dyn LixBackendTransaction + '_> {
     fn dialect(&self) -> SqlDialect {
         self.as_ref().dialect()
     }
@@ -132,7 +132,7 @@ impl QueryExecutor for Box<dyn LixTransaction + '_> {
 #[async_trait(?Send)]
 impl<T> QueryExecutor for &mut T
 where
-    T: LixTransaction + ?Sized,
+    T: LixBackendTransaction + ?Sized,
 {
     fn dialect(&self) -> SqlDialect {
         (**self).dialect()
@@ -144,7 +144,7 @@ where
 }
 
 #[async_trait(?Send)]
-pub trait LixTransaction {
+pub trait LixBackendTransaction {
     fn dialect(&self) -> SqlDialect;
 
     /// Executes one SQL statement inside the current transaction.

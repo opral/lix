@@ -35,7 +35,7 @@ use crate::state::internal::followup::execute_internal_postprocess_with_transact
 use crate::state::internal::script::coalesce_vtable_inserts_in_transactions;
 use crate::state::internal::PostprocessPlan;
 use crate::state::stream::StateCommitStreamChange;
-use crate::{ExecuteResult, LixError, LixTransaction, QueryResult, SqlDialect, Value};
+use crate::{ExecuteResult, LixError, LixBackendTransaction, QueryResult, SqlDialect, Value};
 use sqlparser::ast::Statement;
 
 pub(crate) struct ExecutionProgram {
@@ -438,7 +438,7 @@ pub(crate) async fn execute_execution_program_with_backend(
 
 pub(crate) async fn execute_execution_program_with_transaction(
     engine: &Engine,
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     program: &ExecutionProgram,
     allow_internal_tables: bool,
     context: &mut ExecutionContext,
@@ -481,7 +481,7 @@ pub(crate) async fn execute_execution_program_with_transaction(
 
 pub(crate) async fn execute_compiled_execution_step_with_transaction(
     engine: &Engine,
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     step: &CompiledExecutionStep,
     parsed_statements: &[Statement],
     pending_transaction_view: Option<&PendingTransactionView>,
@@ -572,7 +572,7 @@ pub(crate) struct SqlExecutionOutcome {
 }
 
 pub(crate) async fn execute_internal_execution_with_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     internal: &CompiledInternalExecution,
     result_contract: ResultContract,
     functions: &SharedFunctionProvider<RuntimeFunctionProvider>,

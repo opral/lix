@@ -3,7 +3,7 @@ import type {
 	LixBackend,
 	LixRuntimeQueryResult,
 	LixRuntimeValue,
-	LixTransaction,
+	LixBackendTransaction,
 } from "@lix-js/sdk";
 type BetterSqlite3Options = {
 	filename?: string;
@@ -69,7 +69,7 @@ export async function createBetterSqlite3Backend(
 		}
 	};
 
-	const createTransaction = (): LixTransaction => {
+	const createTransaction = (): LixBackendTransaction => {
 		let transactionClosed = false;
 		return {
 			dialect: "sqlite",
@@ -103,7 +103,7 @@ export async function createBetterSqlite3Backend(
 		): Promise<LixRuntimeQueryResult> {
 			return runQuery(sql, params);
 		},
-		async beginTransaction(): Promise<LixTransaction> {
+		async beginTransaction(): Promise<LixBackendTransaction> {
 			runQuery("BEGIN", []);
 			return createTransaction();
 		},

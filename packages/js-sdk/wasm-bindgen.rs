@@ -8,7 +8,7 @@ mod wasm {
         BootKeyValue, CreateCheckpointResult, CreateVersionOptions, CreateVersionResult,
         ExecuteOptions, ExecuteResult as EngineExecuteResult, ImageChunkWriter,
         InitResult as EngineInitResult, Lix as CoreLix, LixBackend, LixConfig, LixError,
-        LixTransaction, ObserveEvent as EngineObserveEvent,
+        LixBackendTransaction, ObserveEvent as EngineObserveEvent,
         ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
         QueryResult as EngineQueryResult, RedoOptions, RedoResult, SqlDialect, UndoOptions,
         UndoResult, Value as EngineValue, WasmComponentInstance, WasmLimits, WasmRuntime,
@@ -41,7 +41,7 @@ export type LixExecuteResult = {
   statements: LixQueryResult[];
 };
 
-export type LixTransaction = {
+export type LixBackendTransaction = {
   dialect?: LixSqlDialect | (() => LixSqlDialect);
   execute(
     sql: string,
@@ -57,7 +57,7 @@ export type LixBackend = {
     sql: string,
     params: LixValue[],
   ): Promise<LixQueryResult> | LixQueryResult;
-  beginTransaction?: () => Promise<LixTransaction> | LixTransaction;
+  beginTransaction?: () => Promise<LixBackendTransaction> | LixBackendTransaction;
   // Should return a SQLite database file payload.
   export_image?: () => Promise<Uint8Array | ArrayBuffer> | Uint8Array | ArrayBuffer;
 };
@@ -1025,7 +1025,7 @@ export type LixObserveEvents = {
             self.execute_raw(sql, params).await
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             let begin_transaction = Self::get_optional_method(&self.backend, "beginTransaction")?
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_JS_SDK_BACKEND_BEGIN_TRANSACTION_REQUIRED".to_string(),
@@ -1065,7 +1065,7 @@ export type LixObserveEvents = {
     }
 
     #[async_trait(?Send)]
-    impl LixTransaction for JsTransaction<'_> {
+    impl LixBackendTransaction for JsTransaction<'_> {
         fn dialect(&self) -> SqlDialect {
             match &self.kind {
                 JsTransactionKind::Js { transaction } => {

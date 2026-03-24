@@ -4,7 +4,7 @@ use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, Prepar
 use crate::state::internal::write_program::{
     PreparedParam, PreparedProgram, ProgramSlot, ProgramSlotId, SlotShape, WriteProgram, WriteStep,
 };
-use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
+use crate::{LixBackend, LixError, LixBackendTransaction, QueryResult, Value};
 
 pub(crate) async fn execute_write_program_with_backend(
     backend: &dyn LixBackend,
@@ -25,14 +25,14 @@ pub(crate) async fn execute_write_program_with_backend(
 }
 
 pub(crate) async fn execute_write_program_with_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     program: WriteProgram,
 ) -> Result<QueryResult, LixError> {
     execute_write_program_steps_with_transaction(transaction, program).await
 }
 
 async fn execute_write_program_steps_with_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     program: WriteProgram,
 ) -> Result<QueryResult, LixError> {
     let mut batch = PreparedBatch { steps: Vec::new() };
@@ -49,7 +49,7 @@ async fn execute_write_program_steps_with_transaction(
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn execute_prepared_program_with_transaction(
-    transaction: &mut dyn LixTransaction,
+    transaction: &mut dyn LixBackendTransaction,
     program: &PreparedProgram,
 ) -> Result<QueryResult, LixError> {
     let slot_defs = program
@@ -284,7 +284,7 @@ mod tests {
         PreparedParam, PreparedProgram, PreparedStep, ProgramSlot, ProgramSlotId, SlotColumn,
         SlotShape, SlotValueType, WriteProgram,
     };
-    use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
+    use crate::{LixBackend, LixError, LixBackendTransaction, QueryResult, SqlDialect, Value};
 
     #[derive(Default)]
     struct FakeBackend {
@@ -311,7 +311,7 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             self.log.lock().unwrap().push("begin".to_string());
             Ok(Box::new(FakeTransaction {
                 log: std::sync::Arc::clone(&self.log),
@@ -322,13 +322,13 @@ mod tests {
         async fn begin_savepoint(
             &self,
             _name: &str,
-        ) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             self.begin_transaction().await
         }
     }
 
     #[async_trait(?Send)]
-    impl LixTransaction for FakeTransaction {
+    impl LixBackendTransaction for FakeTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
         }
