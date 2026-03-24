@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use lix_engine::{
-    boot, BootArgs, BootKeyValue, Engine, LixBackend, LixError, LixBackendTransaction, NoopWasmRuntime,
-    QueryResult, SqlDialect, Value,
+    boot, BootArgs, BootKeyValue, Engine, LixBackend, LixBackendTransaction, LixError,
+    NoopWasmRuntime, QueryResult, SqlDialect, Value,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -434,7 +434,10 @@ impl LixBackend for TracingBenchBackend {
         }))
     }
 
-    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_savepoint(
+        &self,
+        name: &str,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let started = std::time::Instant::now();
         let tx = self.inner.begin_savepoint(name).await?;
         self.collector.push(

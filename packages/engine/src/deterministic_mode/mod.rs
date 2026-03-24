@@ -177,6 +177,7 @@ pub(crate) fn parse_deterministic_settings_value(mode_value: &JsonValue) -> Dete
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn persist_sequence_highest(
     backend: &dyn LixBackend,
     highest_seen: i64,

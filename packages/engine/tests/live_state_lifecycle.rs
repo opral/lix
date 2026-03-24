@@ -2,15 +2,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use lix_engine::live_state::{
-    apply_rebuild_plan, finalize_commit, init as init_live_state, register_schema,
-    require_ready, LiveStateRebuildPlan, LiveStateRebuildScope, SchemaRegistration,
-};
 use lix_engine::live_state::tracked::{load_exact_row_with_backend, ExactTrackedRowRequest};
 use lix_engine::live_state::untracked::{
     load_exact_row_with_backend as load_exact_untracked_row_with_backend, ExactUntrackedRowRequest,
 };
-use lix_engine::{LixBackend, LixError, LixBackendTransaction, QueryResult, SqlDialect, Value};
+use lix_engine::live_state::{
+    apply_rebuild_plan, finalize_commit, init as init_live_state, register_schema, require_ready,
+    LiveStateRebuildPlan, LiveStateRebuildScope, SchemaRegistration,
+};
+use lix_engine::{LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
 #[derive(Clone)]
@@ -55,7 +55,10 @@ impl LixBackend for SqliteBackend {
         }))
     }
 
-    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_savepoint(
+        &self,
+        _name: &str,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         self.begin_transaction().await
     }
 }
@@ -288,9 +291,12 @@ async fn rebuild_apply_controls_ready_vs_needs_rebuild_mode() {
     create_change_table(&backend).await;
     insert_canonical_change(&backend, "change-1", "2026-03-24T00:00:00Z").await;
 
-    apply_rebuild_plan(&backend, &empty_rebuild_plan(LiveStateRebuildScope::Versions([
-        "main".to_string()
-    ].into_iter().collect())))
+    apply_rebuild_plan(
+        &backend,
+        &empty_rebuild_plan(LiveStateRebuildScope::Versions(
+            ["main".to_string()].into_iter().collect(),
+        )),
+    )
     .await
     .expect("partial rebuild apply should succeed");
 
@@ -301,7 +307,10 @@ async fn rebuild_apply_controls_ready_vs_needs_rebuild_mode() {
         )
         .await
         .expect("partial mode query should succeed");
-    assert_eq!(partial_mode.rows[0][0], Value::Text("needs_rebuild".to_string()));
+    assert_eq!(
+        partial_mode.rows[0][0],
+        Value::Text("needs_rebuild".to_string())
+    );
 
     apply_rebuild_plan(&backend, &empty_rebuild_plan(LiveStateRebuildScope::Full))
         .await

@@ -19,7 +19,7 @@ use crate::version::{
     version_descriptor_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{
-    CanonicalJson, LixError, LixBackendTransaction, QueryResult, SqlDialect, Value as EngineValue,
+    CanonicalJson, LixBackendTransaction, LixError, QueryResult, SqlDialect, Value as EngineValue,
 };
 
 use crate::sql::ast::lowering::lower_statement;

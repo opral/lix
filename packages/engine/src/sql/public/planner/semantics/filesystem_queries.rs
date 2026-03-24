@@ -2473,7 +2473,9 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, crate::LixError> {
+        async fn begin_transaction(
+            &self,
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, crate::LixError> {
             Ok(Box::new(UnusedTransaction))
         }
 

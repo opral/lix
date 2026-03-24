@@ -35,7 +35,7 @@ use crate::state::internal::followup::execute_internal_postprocess_with_transact
 use crate::state::internal::script::coalesce_vtable_inserts_in_transactions;
 use crate::state::internal::PostprocessPlan;
 use crate::state::stream::StateCommitStreamChange;
-use crate::{ExecuteResult, LixError, LixBackendTransaction, QueryResult, SqlDialect, Value};
+use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
 use sqlparser::ast::Statement;
 
 pub(crate) struct ExecutionProgram {

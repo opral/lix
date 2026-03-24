@@ -16,15 +16,14 @@ pub(crate) use layout::{
 #[allow(unused_imports)]
 pub(in crate::live_state) use registry::{
     compile_registered_live_layout, ensure_schema_live_table_with_requirement,
-    ensure_schema_live_table_with_requirement_in_transaction, load_live_table_layout_in_transaction,
-    load_live_table_layout_with_backend, register_schema, register_schema_in_transaction,
-    LiveTableRequirement,
+    ensure_schema_live_table_with_requirement_in_transaction,
+    load_live_table_layout_in_transaction, load_live_table_layout_with_backend, register_schema,
+    register_schema_in_transaction, LiveTableRequirement,
 };
 #[allow(unused_imports)]
 pub(crate) use sql::{
-    build_partitioned_scan_sql, ensure_schema_live_table_sql_statements,
-    is_untracked_live_table, live_schema_key_for_table_name, normalized_insert_columns_sql,
-    normalized_insert_values_sql, normalized_update_assignments_sql, quoted_live_table_name,
-    quote_ident, required_bool_cell, required_text_cell, selected_columns,
-    selected_projection_sql, text_from_value, ScanSqlRequest,
+    build_partitioned_scan_sql, ensure_schema_live_table_sql_statements, is_untracked_live_table,
+    live_schema_key_for_table_name, normalized_insert_columns_sql, normalized_insert_values_sql,
+    normalized_update_assignments_sql, quote_ident, quoted_live_table_name, required_bool_cell,
+    required_text_cell, selected_columns, selected_projection_sql, text_from_value, ScanSqlRequest,
 };

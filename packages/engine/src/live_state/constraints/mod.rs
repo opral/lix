@@ -43,4 +43,6 @@ pub enum ScanOperator {
 }
 
 pub(crate) use eval::matches_constraints;
-pub(crate) use sql::{escape_sql_string, quote_ident, render_constraint_sql, sql_literal, sql_literal_text};
+pub(crate) use sql::{
+    escape_sql_string, quote_ident, render_constraint_sql, sql_literal, sql_literal_text,
+};

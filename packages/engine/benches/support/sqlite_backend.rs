@@ -1,5 +1,5 @@
 use lix_engine::{
-    LixBackend, LixError, LixBackendTransaction, PreparedBatch, QueryResult, SqlDialect, Value,
+    LixBackend, LixBackendTransaction, LixError, PreparedBatch, QueryResult, SqlDialect, Value,
 };
 use rusqlite::{params_from_iter, Connection, Row};
 use std::path::Path;
@@ -80,7 +80,10 @@ impl LixBackend for BenchSqliteBackend {
         }))
     }
 
-    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_savepoint(
+        &self,
+        name: &str,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let conn = self.lock_conn()?;
         conn.execute_batch(&format!("SAVEPOINT {}", quote_savepoint_name(name)))
             .map_err(sqlite_error)?;

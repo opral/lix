@@ -1,12 +1,12 @@
-use async_trait::async_trait;
 use super::layout::{
     builtin_live_table_layout, live_table_layout_from_schema, merge_live_table_layouts,
     LiveTableLayout,
 };
 use super::sql::ensure_schema_live_table_sql_statements;
-use crate::schema::schema_from_registered_snapshot;
 use crate::live_state::SchemaRegistration;
-use crate::{LixBackend, LixError, LixBackendTransaction, Value};
+use crate::schema::schema_from_registered_snapshot;
+use crate::{LixBackend, LixBackendTransaction, LixError, Value};
+use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,8 +19,11 @@ pub(in crate::live_state) async fn register_schema(
     backend: &dyn LixBackend,
     registration: &SchemaRegistration,
 ) -> Result<(), LixError> {
-    ensure_schema_live_table_with_requirement(backend, &requirement_from_registration(registration)?)
-        .await
+    ensure_schema_live_table_with_requirement(
+        backend,
+        &requirement_from_registration(registration)?,
+    )
+    .await
 }
 
 pub(in crate::live_state) async fn register_schema_in_transaction(
@@ -232,7 +235,8 @@ mod tests {
             .to_string(),
         )]];
 
-        let layout = compile_registered_live_layout("profile", rows).expect("layout should compile");
+        let layout =
+            compile_registered_live_layout("profile", rows).expect("layout should compile");
         assert_eq!(layout.schema_key, "profile");
         assert_eq!(layout.columns.len(), 1);
         assert_eq!(layout.columns[0].column_name, "name");

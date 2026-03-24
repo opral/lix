@@ -15,7 +15,7 @@ use crate::sql::public::runtime::{
     apply_public_surface_registry_mutations, public_surface_registry_mutations,
     PublicWriteExecutionPartition,
 };
-use crate::{LixError, LixBackendTransaction, QueryResult, Value};
+use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 use sqlparser::ast::Statement;
 
 impl Engine {

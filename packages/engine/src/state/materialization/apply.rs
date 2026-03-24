@@ -12,7 +12,7 @@ use crate::state::live_state::{
 use crate::state::materialization::types::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildScope, LiveStateWriteOp,
 };
-use crate::{LixBackend, LixError, LixBackendTransaction, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
 pub(crate) async fn apply_live_state_rebuild_plan_internal(
     backend: &dyn LixBackend,

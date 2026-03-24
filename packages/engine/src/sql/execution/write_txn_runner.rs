@@ -35,7 +35,7 @@ use crate::state::live_state::{
     build_mark_live_state_ready_sql, load_latest_canonical_watermark_in_transaction,
 };
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{LixError, LixBackendTransaction, QueryResult, Value};
+use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
 pub(crate) async fn run_txn_delta_with_transaction(
     engine: &Engine,

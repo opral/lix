@@ -31,7 +31,10 @@ pub trait LixBackend: Send + Sync {
     /// Returns a handle that commits via `RELEASE SAVEPOINT`
     /// and rolls back via `ROLLBACK TO SAVEPOINT`.
     /// The caller provides the name.
-    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError>;
+    async fn begin_savepoint(
+        &self,
+        name: &str,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError>;
 
     /// Exports the current Lix database snapshot as a SQLite database file payload.
     async fn export_image(&self, _writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {

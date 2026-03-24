@@ -1,85 +1,13 @@
 use crate::engine::Engine;
 use crate::schema::live_layout::{
-    builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
-    untracked_live_table_name,
+    builtin_live_table_layout, live_column_name_for_property, untracked_live_table_name,
 };
-use crate::state::commit::load_committed_version_head_commit_id_from_live_state;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    GLOBAL_VERSION_ID,
 };
 use crate::{LixError, Value};
 
 impl Engine {
-    pub(crate) async fn load_latest_commit_id(&self) -> Result<Option<String>, LixError> {
-        let mut executor = &*self.backend;
-        if let Some(commit_id) =
-            load_committed_version_head_commit_id_from_live_state(&mut executor, GLOBAL_VERSION_ID)
-                .await?
-        {
-            return Ok(Some(commit_id));
-        }
-
-        let commit_table = tracked_live_table_name("lix_commit");
-        let has_commits = self
-            .backend
-            .execute(
-                &format!(
-                    "SELECT 1 \
-                     FROM {commit_table} \
-                     WHERE schema_key = 'lix_commit' \
-                       AND version_id = 'global' \
-                       AND is_tombstone = 0 \
-                     LIMIT 1"
-                ),
-                &[],
-            )
-            .await?
-            .rows
-            .first()
-            .is_some();
-        if has_commits {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description:
-                    "init invariant violation: commits exist but hidden global version ref is missing"
-                        .to_string(),
-            });
-        }
-
-        Ok(None)
-    }
-
-    pub(crate) async fn generate_runtime_uuid(&self) -> Result<String, LixError> {
-        let (settings, sequence_start, functions) = self
-            .prepare_runtime_functions_with_backend(self.backend.as_ref(), false)
-            .await?;
-        let uuid = functions.call_uuid_v7();
-        self.persist_runtime_sequence_with_backend(
-            self.backend.as_ref(),
-            settings,
-            sequence_start,
-            &functions,
-        )
-        .await?;
-        Ok(uuid)
-    }
-
-    pub(crate) async fn generate_runtime_timestamp(&self) -> Result<String, LixError> {
-        let (settings, sequence_start, functions) = self
-            .prepare_runtime_functions_with_backend(self.backend.as_ref(), false)
-            .await?;
-        let timestamp = functions.call_timestamp();
-        self.persist_runtime_sequence_with_backend(
-            self.backend.as_ref(),
-            settings,
-            sequence_start,
-            &functions,
-        )
-        .await?;
-        Ok(timestamp)
-    }
-
     pub(crate) async fn load_and_cache_active_version(&self) -> Result<(), LixError> {
         let layout = builtin_live_table_layout(active_version_schema_key())?.ok_or_else(|| {
             LixError::new(

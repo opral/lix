@@ -1,9 +1,9 @@
 use crate::live_state::storage::{
-    load_live_table_layout_with_executor, normalized_live_column_values,
-    normalized_insert_columns_sql, normalized_insert_values_sql,
-    normalized_update_assignments_sql, quoted_live_table_name,
+    load_live_table_layout_with_executor, normalized_insert_columns_sql,
+    normalized_insert_values_sql, normalized_live_column_values, normalized_update_assignments_sql,
+    quoted_live_table_name,
 };
-use crate::{LixError, LixBackendTransaction};
+use crate::{LixBackendTransaction, LixError};
 
 use super::contracts::{TrackedWriteOperation, TrackedWriteRow};
 

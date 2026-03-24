@@ -18,7 +18,7 @@ use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_storage_version_id,
 };
-use crate::{EngineTransaction, LixError, LixBackendTransaction};
+use crate::{EngineTransaction, LixBackendTransaction, LixError};
 
 pub use types::{RedoOptions, RedoResult, UndoOptions, UndoResult};
 pub(crate) use types::{SemanticUndoRedoStacks, UndoRedoOperationKind, UndoRedoOperationRecord};

@@ -4,8 +4,9 @@ use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, Prepar
 use crate::state::internal::write_program::{
     PreparedParam, PreparedProgram, ProgramSlot, ProgramSlotId, SlotShape, WriteProgram, WriteStep,
 };
-use crate::{LixBackend, LixError, LixBackendTransaction, QueryResult, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn execute_write_program_with_backend(
     backend: &dyn LixBackend,
     program: WriteProgram,
@@ -284,7 +285,7 @@ mod tests {
         PreparedParam, PreparedProgram, PreparedStep, ProgramSlot, ProgramSlotId, SlotColumn,
         SlotShape, SlotValueType, WriteProgram,
     };
-    use crate::{LixBackend, LixError, LixBackendTransaction, QueryResult, SqlDialect, Value};
+    use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
 
     #[derive(Default)]
     struct FakeBackend {

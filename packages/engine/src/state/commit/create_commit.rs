@@ -27,7 +27,7 @@ use crate::state::live_state::ensure_live_state_ready_in_transaction;
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::SqlDialect;
-use crate::{CanonicalSchemaKey, LixError, LixBackendTransaction, QueryResult, Value};
+use crate::{CanonicalSchemaKey, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
 
 use super::generate_commit::generate_commit;
@@ -1478,7 +1478,7 @@ mod tests {
     use crate::functions::LixFunctionProvider;
     use crate::schema::live_layout::{builtin_live_table_layout, normalized_live_column_values};
     use crate::version::GLOBAL_VERSION_ID;
-    use crate::{LixError, LixBackendTransaction, QueryResult, SqlDialect, Value};
+    use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor};
     use sqlparser::dialect::GenericDialect;

@@ -3,7 +3,9 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 
 use crate::live_state::constraints::matches_constraints;
-use crate::live_state::effective as effective;
+use crate::live_state::effective;
+use crate::live_state::shared::identity::RowIdentity;
+use crate::live_state::shared::views::ReadViews;
 use crate::live_state::tracked::{
     BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedReadView, TrackedRow,
     TrackedScanRequest, TrackedTombstoneMarker, TrackedTombstoneView,
@@ -12,8 +14,6 @@ use crate::live_state::untracked::{
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedReadView, UntrackedRow,
     UntrackedScanRequest,
 };
-use crate::live_state::shared::identity::RowIdentity;
-use crate::live_state::shared::views::ReadViews;
 use crate::LixError;
 
 use super::overlay::PendingTxnParticipants;
@@ -138,7 +138,9 @@ impl TrackedReadView for PendingTrackedReadView<'_> {
                 .map(|(_, row)| row.clone()),
         );
         sort_tracked_rows(&mut rows);
-        rows.dedup_by(|left, right| RowIdentity::from_tracked_row(left) == RowIdentity::from_tracked_row(right));
+        rows.dedup_by(|left, right| {
+            RowIdentity::from_tracked_row(left) == RowIdentity::from_tracked_row(right)
+        });
         Ok(rows)
     }
 

@@ -5,12 +5,12 @@ use super::types::{
 };
 use crate::live_state::lifecycle::{build_set_live_state_mode_sql, LiveStateMode};
 use crate::live_state::storage::{
-    load_live_table_layout_in_transaction, normalized_live_column_values,
-    normalized_insert_columns_sql, normalized_insert_values_sql,
-    normalized_update_assignments_sql, quoted_live_table_name,
+    load_live_table_layout_in_transaction, normalized_insert_columns_sql,
+    normalized_insert_values_sql, normalized_live_column_values, normalized_update_assignments_sql,
+    quoted_live_table_name,
 };
 use crate::live_state::{finalize_commit_in_transaction, register_schema_in_transaction};
-use crate::{LixBackend, LixError, LixBackendTransaction, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
 pub(crate) async fn apply_live_state_rebuild_plan_internal(
     backend: &dyn LixBackend,
@@ -81,9 +81,10 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
             })
             .unwrap_or_else(|| "NULL".to_string());
         let layout = load_live_table_layout_in_transaction(transaction, &write.schema_key).await?;
-        let normalized_values = normalized_live_column_values(&layout, write.snapshot_content.as_deref())?
-            .into_iter()
-            .collect::<Vec<_>>();
+        let normalized_values =
+            normalized_live_column_values(&layout, write.snapshot_content.as_deref())?
+                .into_iter()
+                .collect::<Vec<_>>();
 
         let sql = format!(
             "INSERT INTO {table} (\
@@ -213,7 +214,12 @@ fn parse_count_result(rows: &[Vec<Value>]) -> Result<usize, LixError> {
 fn in_clause_values(values: &BTreeSet<String>) -> String {
     values
         .iter()
-        .map(|value| format!("'{}'", crate::live_state::constraints::escape_sql_string(value)))
+        .map(|value| {
+            format!(
+                "'{}'",
+                crate::live_state::constraints::escape_sql_string(value)
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }

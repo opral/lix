@@ -4,7 +4,7 @@ use crate::account::{
     active_account_plugin_key, active_account_schema_key, active_account_schema_version,
     active_account_snapshot_content, active_account_storage_version_id,
 };
-use crate::engine::{builtin_schema_entity_id, Engine, ExecuteOptions};
+use crate::engine::{builtin_schema_entity_id, Engine, ExecuteOptions, TransactionBackendAdapter};
 use crate::errors;
 use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
@@ -15,7 +15,8 @@ use crate::schema::live_layout::{
     builtin_live_table_layout, live_column_name_for_property, normalized_live_column_values,
     tracked_live_table_name, untracked_live_table_name,
 };
-use crate::schema::registry::ensure_schema_live_table;
+use crate::sql::execution::execution_program::ExecutionContext;
+use crate::sql::execution::parse::parse_sql;
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::checkpoint::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot, CHECKPOINT_LABEL_ID,
@@ -33,7 +34,7 @@ use crate::version::{
     version_ref_schema_version, version_ref_snapshot_content, version_ref_storage_version_id,
     GLOBAL_VERSION_ID,
 };
-use crate::{LixError, Value};
+use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 
 const SYSTEM_ROOT_DIRECTORY_PATH: &str = "/.lix/";
@@ -41,12 +42,145 @@ const SYSTEM_APP_DATA_DIRECTORY_PATH: &str = "/.lix/app_data/";
 const SYSTEM_PLUGIN_DIRECTORY_PATH: &str = "/.lix/plugins/";
 const LIX_ID_KEY: &str = "lix_id";
 
-impl Engine {
-    pub(crate) async fn ensure_builtin_schemas_installed(&self) -> Result<(), LixError> {
-        for schema_key in builtin_schema_keys() {
-            ensure_schema_live_table(self.backend.as_ref(), schema_key).await?;
+pub(crate) struct InitExecutor<'engine, 'tx> {
+    engine: &'engine Engine,
+    transaction: &'tx mut dyn LixBackendTransaction,
+    context: ExecutionContext,
+}
+
+impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
+    pub(crate) fn new(
+        engine: &'engine Engine,
+        transaction: &'tx mut dyn LixBackendTransaction,
+    ) -> Result<Self, LixError> {
+        Ok(Self {
+            engine,
+            transaction,
+            context: engine.new_execution_context_with_active_version(
+                ExecuteOptions::default(),
+                GLOBAL_VERSION_ID.to_string(),
+            ),
+        })
+    }
+
+    fn boot_key_values(&self) -> &[crate::BootKeyValue] {
+        self.engine.boot_key_values()
+    }
+
+    fn boot_active_account(&self) -> Option<&crate::BootAccount> {
+        self.engine.boot_active_account()
+    }
+
+    async fn execute_internal(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<crate::ExecuteResult, LixError> {
+        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
+        let result = self
+            .engine
+            .execute_parsed_statements_in_transaction_core(
+                self.transaction,
+                parsed_statements,
+                params,
+                true,
+                &mut self.context,
+            )
+            .await?;
+        self.engine
+            .flush_mutation_journal_in_transaction(self.transaction, &mut self.context)
+            .await?;
+        Ok(result)
+    }
+
+    async fn execute_backend(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, LixError> {
+        self.transaction.execute(sql, params).await
+    }
+
+    async fn generate_runtime_uuid(&mut self) -> Result<String, LixError> {
+        let (settings, sequence_start, functions) = {
+            let backend = TransactionBackendAdapter::new(self.transaction);
+            self.engine
+                .prepare_runtime_functions_with_backend(&backend, false)
+                .await?
+        };
+        let uuid = functions.call_uuid_v7();
+        self.engine
+            .persist_runtime_sequence_in_transaction(
+                self.transaction,
+                settings,
+                sequence_start,
+                &functions,
+            )
+            .await?;
+        Ok(uuid)
+    }
+
+    async fn generate_runtime_timestamp(&mut self) -> Result<String, LixError> {
+        let (settings, sequence_start, functions) = {
+            let backend = TransactionBackendAdapter::new(self.transaction);
+            self.engine
+                .prepare_runtime_functions_with_backend(&backend, false)
+                .await?
+        };
+        let timestamp = functions.call_timestamp();
+        self.engine
+            .persist_runtime_sequence_in_transaction(
+                self.transaction,
+                settings,
+                sequence_start,
+                &functions,
+            )
+            .await?;
+        Ok(timestamp)
+    }
+
+    async fn load_latest_commit_id(&mut self) -> Result<Option<String>, LixError> {
+        let mut backend = TransactionBackendAdapter::new(self.transaction);
+        if let Some(commit_id) =
+            crate::state::commit::load_committed_version_head_commit_id_from_live_state(
+                &mut backend,
+                GLOBAL_VERSION_ID,
+            )
+            .await?
+        {
+            return Ok(Some(commit_id));
         }
 
+        let commit_table = tracked_live_table_name("lix_commit");
+        let has_commits = self
+            .execute_backend(
+                &format!(
+                    "SELECT 1 \
+                     FROM {commit_table} \
+                     WHERE schema_key = 'lix_commit' \
+                       AND version_id = 'global' \
+                       AND is_tombstone = 0 \
+                     LIMIT 1"
+                ),
+                &[],
+            )
+            .await?
+            .rows
+            .first()
+            .is_some();
+        if has_commits {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description:
+                    "init invariant violation: commits exist but hidden global version ref is missing"
+                        .to_string(),
+            });
+        }
+
+        Ok(None)
+    }
+
+    pub(crate) async fn seed_builtin_schemas(&mut self) -> Result<(), LixError> {
         for schema_key in builtin_schema_keys() {
             let schema = builtin_schema_definition(schema_key).ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -63,7 +197,6 @@ impl Engine {
                        AND snapshot_content IS NOT NULL \
                      LIMIT 1",
                     &[Value::Text(entity_id.clone())],
-                    ExecuteOptions::default(),
                 )
                 .await?;
             let [statement] = existing.statements.as_slice() else {
@@ -88,17 +221,16 @@ impl Engine {
                 &[
                     Value::Text(entity_id),
                     Value::Text(snapshot_content),
-                ],
-                ExecuteOptions::default(),
-            )
+                ]
+                )
             .await?;
         }
 
         Ok(())
     }
 
-    pub(crate) async fn seed_boot_key_values(&self) -> Result<(), LixError> {
-        for key_value in self.boot_key_values() {
+    pub(crate) async fn seed_boot_key_values(&mut self) -> Result<(), LixError> {
+        for key_value in self.boot_key_values().to_vec() {
             let version_id = if key_value.lixcol_global.unwrap_or(false) {
                 KEY_VALUE_GLOBAL_VERSION.to_string()
             } else {
@@ -124,16 +256,15 @@ impl Engine {
                     Value::Text(snapshot_content),
                     Value::Text(key_value_schema_version().to_string()),
                     Value::Boolean(untracked),
-                ],
-                ExecuteOptions::default(),
-            )
+                ]
+                )
             .await?;
         }
 
         Ok(())
     }
 
-    async fn load_boot_active_version_id(&self) -> Result<String, LixError> {
+    async fn load_boot_active_version_id(&mut self) -> Result<String, LixError> {
         let layout = builtin_live_table_layout(active_version_schema_key())?.ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -148,8 +279,7 @@ impl Engine {
                 )
             })?;
         let result = self
-            .backend
-            .execute(
+            .execute_backend(
                 &format!(
                     "SELECT {payload_version_column} \
                      FROM {table_name} \
@@ -187,8 +317,7 @@ impl Engine {
         }
     }
 
-    pub(crate) async fn seed_global_system_directories(&self) -> Result<(), LixError> {
-        ensure_schema_live_table(self.backend.as_ref(), "lix_directory_descriptor").await?;
+    pub(crate) async fn seed_global_system_directories(&mut self) -> Result<(), LixError> {
         let bootstrap_commit_id = self.load_global_version_commit_id().await?;
         let root_id = self
             .ensure_seeded_system_directory(&bootstrap_commit_id, SYSTEM_ROOT_DIRECTORY_PATH, None)
@@ -210,7 +339,7 @@ impl Engine {
     }
 
     async fn ensure_seeded_system_directory(
-        &self,
+        &mut self,
         bootstrap_commit_id: &str,
         path: &str,
         parent_id: Option<&str>,
@@ -219,10 +348,9 @@ impl Engine {
         let name = system_directory_name(path);
         let existing = match parent_id {
             Some(parent_id) => {
-                self.backend
-                    .execute(
-                        &format!(
-                            "SELECT entity_id \
+                self.execute_backend(
+                    &format!(
+                        "SELECT entity_id \
                          FROM {table_name} \
                          WHERE file_id = 'lix' \
                            AND version_id = 'global' \
@@ -230,19 +358,18 @@ impl Engine {
                            AND parent_id = $2 \
                          ORDER BY updated_at DESC, created_at DESC \
                          LIMIT 1",
-                        ),
-                        &[
-                            Value::Text(name.clone()),
-                            Value::Text(parent_id.to_string()),
-                        ],
-                    )
-                    .await?
+                    ),
+                    &[
+                        Value::Text(name.clone()),
+                        Value::Text(parent_id.to_string()),
+                    ],
+                )
+                .await?
             }
             None => {
-                self.backend
-                    .execute(
-                        &format!(
-                            "SELECT entity_id \
+                self.execute_backend(
+                    &format!(
+                        "SELECT entity_id \
                          FROM {table_name} \
                          WHERE file_id = 'lix' \
                            AND version_id = 'global' \
@@ -250,10 +377,10 @@ impl Engine {
                            AND parent_id IS NULL \
                          ORDER BY updated_at DESC, created_at DESC \
                          LIMIT 1"
-                        ),
-                        &[Value::Text(name.clone())],
-                    )
-                    .await?
+                    ),
+                    &[Value::Text(name.clone())],
+                )
+                .await?
             }
         };
         if let Some(row) = existing.rows.first() {
@@ -284,7 +411,7 @@ impl Engine {
         Ok(entity_id)
     }
 
-    pub(crate) async fn seed_default_checkpoint_label(&self) -> Result<(), LixError> {
+    pub(crate) async fn seed_default_checkpoint_label(&mut self) -> Result<(), LixError> {
         let bootstrap_commit_id = self.load_global_version_commit_id().await?;
         let existing = self
             .execute_internal(
@@ -298,7 +425,6 @@ impl Engine {
                  ORDER BY updated_at DESC, created_at DESC, change_id DESC \
                  LIMIT 1",
                 &[Value::Text(CHECKPOINT_LABEL_ID.to_string())],
-                ExecuteOptions::default(),
             )
             .await?;
         let [statement] = existing.statements.as_slice() else {
@@ -358,7 +484,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn load_global_version_commit_id(&self) -> Result<String, LixError> {
+    async fn load_global_version_commit_id(&mut self) -> Result<String, LixError> {
         let rows = self
             .execute_internal(
                 "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
@@ -371,7 +497,6 @@ impl Engine {
                  ORDER BY updated_at DESC, created_at DESC, change_id DESC \
                  LIMIT 1",
                 &[],
-                ExecuteOptions::default(),
             )
             .await?;
         let [statement] = rows.statements.as_slice() else {
@@ -392,7 +517,7 @@ impl Engine {
     }
 
     async fn ensure_checkpoint_label_on_bootstrap_commit(
-        &self,
+        &mut self,
         bootstrap_commit_id: &str,
         label_id: &str,
     ) -> Result<(), LixError> {
@@ -408,7 +533,6 @@ impl Engine {
                    AND snapshot_content IS NOT NULL \
                  LIMIT 1",
                 &[Value::Text(entity_label_id.clone())],
-                ExecuteOptions::default(),
             )
             .await?;
         let [statement] = existing.statements.as_slice() else {
@@ -445,13 +569,12 @@ impl Engine {
     }
 
     async fn add_change_id_to_commit(
-        &self,
+        &mut self,
         commit_id: &str,
         change_id: &str,
     ) -> Result<(), LixError> {
         let snapshot_row = self
-            .backend
-            .execute(
+            .execute_backend(
                 "SELECT s.content \
                  FROM lix_internal_change c \
                  JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
@@ -508,8 +631,7 @@ impl Engine {
 
         // Update the canonical snapshot
         let snapshot_id_row = self
-            .backend
-            .execute(
+            .execute_backend(
                 "SELECT c.snapshot_id \
                  FROM lix_internal_change c \
                  WHERE c.entity_id = $1 \
@@ -537,15 +659,14 @@ impl Engine {
                 )
             })?;
 
-        self.backend
-            .execute(
-                "UPDATE lix_internal_snapshot SET content = $1 WHERE id = $2",
-                &[
-                    Value::Text(updated_snapshot.clone()),
-                    Value::Text(snapshot_id),
-                ],
-            )
-            .await?;
+        self.execute_backend(
+            "UPDATE lix_internal_snapshot SET content = $1 WHERE id = $2",
+            &[
+                Value::Text(updated_snapshot.clone()),
+                Value::Text(snapshot_id),
+            ],
+        )
+        .await?;
 
         let normalized_values = normalized_seed_values("lix_commit", Some(&updated_snapshot))?;
         let set_sql = normalized_values
@@ -553,27 +674,25 @@ impl Engine {
             .map(|(column, value)| format!("{} = {}", quote_ident(column), sql_literal(value)))
             .collect::<Vec<_>>()
             .join(", ");
-        self.backend
-            .execute(
-                &format!(
-                    "UPDATE {table} \
+        self.execute_backend(
+            &format!(
+                "UPDATE {table} \
                      SET {set_sql} \
                      WHERE entity_id = $1 \
                        AND schema_key = 'lix_commit' \
                        AND file_id = 'lix' \
                        AND version_id = 'global'",
-                    table = quote_ident(&tracked_live_table_name("lix_commit")),
-                    set_sql = set_sql,
-                ),
-                &[Value::Text(commit_id.to_string())],
-            )
-            .await?;
+                table = quote_ident(&tracked_live_table_name("lix_commit")),
+                set_sql = set_sql,
+            ),
+            &[Value::Text(commit_id.to_string())],
+        )
+        .await?;
 
         Ok(())
     }
 
-    pub(crate) async fn seed_lix_id(&self) -> Result<(), LixError> {
-        ensure_schema_live_table(self.backend.as_ref(), key_value_schema_key()).await?;
+    pub(crate) async fn seed_lix_id(&mut self) -> Result<(), LixError> {
         let table = tracked_live_table_name(key_value_schema_key());
         let check_sql = format!(
             "SELECT 1 \
@@ -588,7 +707,7 @@ impl Engine {
             entity_id = escape_sql_string(LIX_ID_KEY),
             file_id = escape_sql_string(key_value_file_id()),
         );
-        let existing = self.backend.execute(&check_sql, &[]).await?;
+        let existing = self.execute_backend(&check_sql, &[]).await?;
         if !existing.rows.is_empty() {
             return Ok(());
         }
@@ -623,7 +742,7 @@ impl Engine {
             normalized_columns = normalized_insert_columns_sql(&normalized_values),
             normalized_literals = normalized_insert_literals_sql(&normalized_values),
         );
-        self.backend.execute(&insert_sql, &[]).await?;
+        self.execute_backend(&insert_sql, &[]).await?;
 
         self.insert_change_row_for_snapshot(
             LIX_ID_KEY,
@@ -639,7 +758,7 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) async fn seed_default_versions(&self) -> Result<String, LixError> {
+    pub(crate) async fn seed_default_versions(&mut self) -> Result<String, LixError> {
         // Bootstrap commit + change set must be seeded first so that
         // `add_change_id_to_commit` can find the canonical snapshot.
         let bootstrap_commit_id = match self.load_latest_commit_id().await? {
@@ -705,10 +824,9 @@ impl Engine {
         Ok(main_version_id)
     }
 
-    pub(crate) async fn seed_commit_graph_nodes(&self) -> Result<(), LixError> {
+    pub(crate) async fn seed_commit_graph_nodes(&mut self) -> Result<(), LixError> {
         let graph_count_result = self
-            .backend
-            .execute(
+            .execute_backend(
                 &format!("SELECT COUNT(*) FROM {COMMIT_GRAPH_NODE_TABLE}"),
                 &[],
             )
@@ -721,8 +839,7 @@ impl Engine {
 
         let commit_table = tracked_live_table_name("lix_commit");
         let commit_count_result = self
-            .backend
-            .execute(
+            .execute_backend(
                 &format!(
                     "SELECT COUNT(*) \
                      FROM {commit_table} \
@@ -738,19 +855,16 @@ impl Engine {
             return Ok(());
         }
 
-        self.backend
-            .execute(&build_commit_generation_seed_sql(), &[])
+        self.execute_backend(&build_commit_generation_seed_sql(), &[])
             .await?;
 
         Ok(())
     }
 
-    pub(crate) async fn seed_boot_account(&self) -> Result<(), LixError> {
-        let Some(account) = self.boot_active_account() else {
+    pub(crate) async fn seed_boot_account(&mut self) -> Result<(), LixError> {
+        let Some(account) = self.boot_active_account().cloned() else {
             return Ok(());
         };
-
-        ensure_schema_live_table(self.backend.as_ref(), active_account_schema_key()).await?;
 
         let exists = self
             .execute_internal(
@@ -768,7 +882,6 @@ impl Engine {
                     Value::Text(account_file_id().to_string()),
                     Value::Text(account_storage_version_id().to_string()),
                 ],
-                ExecuteOptions::default(),
             )
             .await?;
         let [statement] = exists.statements.as_slice() else {
@@ -791,9 +904,8 @@ impl Engine {
                     Value::Text(account_plugin_key().to_string()),
                     Value::Text(account_snapshot_content(&account.id, &account.name)),
                     Value::Text(account_schema_version().to_string()),
-                ],
-                ExecuteOptions::default(),
-            )
+                ]
+                )
             .await?;
         }
 
@@ -802,25 +914,23 @@ impl Engine {
         let snapshot_content = active_account_snapshot_content(&account.id);
         let normalized_values =
             normalized_seed_values(active_account_schema_key(), Some(&snapshot_content))?;
-        self.backend
-            .execute(
-                &format!(
-                    "DELETE FROM {table_name} \
+        self.execute_backend(
+            &format!(
+                "DELETE FROM {table_name} \
                      WHERE schema_key = '{schema_key}' \
                        AND file_id = '{file_id}' \
                        AND version_id = '{version_id}' \
                        AND untracked = true",
-                    table_name = quote_ident(&table_name),
-                    schema_key = escape_sql_string(active_account_schema_key()),
-                    file_id = escape_sql_string(active_account_file_id()),
-                    version_id = escape_sql_string(active_account_storage_version_id()),
-                ),
-                &[],
-            )
-            .await?;
+                table_name = quote_ident(&table_name),
+                schema_key = escape_sql_string(active_account_schema_key()),
+                file_id = escape_sql_string(active_account_file_id()),
+                version_id = escape_sql_string(active_account_storage_version_id()),
+            ),
+            &[],
+        )
+        .await?;
 
-        self.backend
-            .execute(
+        self.execute_backend(
                 &format!(
                     "INSERT INTO {table_name} (\
                      entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, writer_key, untracked, created_at, updated_at{normalized_columns}\
@@ -846,12 +956,11 @@ impl Engine {
     }
 
     pub(crate) async fn seed_materialized_version_descriptor(
-        &self,
+        &mut self,
         entity_id: &str,
         name: &str,
         change_id: &str,
     ) -> Result<(), LixError> {
-        ensure_schema_live_table(self.backend.as_ref(), version_descriptor_schema_key()).await?;
         let table = tracked_live_table_name(version_descriptor_schema_key());
         let check_sql = format!(
             "SELECT 1 \
@@ -867,7 +976,7 @@ impl Engine {
             file_id = escape_sql_string(version_descriptor_file_id()),
             version_id = escape_sql_string(version_descriptor_storage_version_id()),
         );
-        let existing = self.backend.execute(&check_sql, &[]).await?;
+        let existing = self.execute_backend(&check_sql, &[]).await?;
         if !existing.rows.is_empty() {
             return Ok(());
         }
@@ -901,13 +1010,13 @@ impl Engine {
             normalized_columns = normalized_insert_columns_sql(&normalized_values),
             normalized_literals = normalized_insert_literals_sql(&normalized_values),
         );
-        self.backend.execute(&insert_sql, &[]).await?;
+        self.execute_backend(&insert_sql, &[]).await?;
 
         Ok(())
     }
 
     pub(crate) async fn seed_canonical_version_descriptor(
-        &self,
+        &mut self,
         bootstrap_commit_id: &str,
         entity_id: &str,
         name: &str,
@@ -933,7 +1042,7 @@ impl Engine {
     }
 
     async fn insert_bootstrap_tracked_row(
-        &self,
+        &mut self,
         attach_to_commit_id: Option<&str>,
         entity_id: &str,
         schema_key: &str,
@@ -943,7 +1052,6 @@ impl Engine {
         plugin_key: &str,
         snapshot_content: &str,
     ) -> Result<(), LixError> {
-        ensure_schema_live_table(self.backend.as_ref(), schema_key).await?;
         let change_id = self.generate_runtime_uuid().await?;
         let timestamp = self.generate_runtime_timestamp().await?;
         let normalized_values = normalized_seed_values(schema_key, Some(snapshot_content))?;
@@ -970,7 +1078,7 @@ impl Engine {
             normalized_columns = normalized_insert_columns_sql(&normalized_values),
             normalized_literals = normalized_insert_literals_sql(&normalized_values),
         );
-        self.backend.execute(&insert_sql, &[]).await?;
+        self.execute_backend(&insert_sql, &[]).await?;
 
         self.insert_change_row_for_snapshot(
             entity_id,
@@ -992,7 +1100,7 @@ impl Engine {
     }
 
     async fn insert_change_row_for_snapshot(
-        &self,
+        &mut self,
         entity_id: &str,
         schema_key: &str,
         schema_version: &str,
@@ -1003,19 +1111,17 @@ impl Engine {
         created_at: &str,
     ) -> Result<(), LixError> {
         let snapshot_id = format!("{change_id}~snapshot");
-        self.backend
-            .execute(
-                "INSERT INTO lix_internal_snapshot (id, content) \
+        self.execute_backend(
+            "INSERT INTO lix_internal_snapshot (id, content) \
                  SELECT $1, $2 \
                  WHERE NOT EXISTS (SELECT 1 FROM lix_internal_snapshot WHERE id = $1)",
-                &[
-                    Value::Text(snapshot_id.clone()),
-                    Value::Text(snapshot_content.to_string()),
-                ],
-            )
-            .await?;
-        self.backend
-            .execute(
+            &[
+                Value::Text(snapshot_id.clone()),
+                Value::Text(snapshot_content.to_string()),
+            ],
+        )
+        .await?;
+        self.execute_backend(
                 "INSERT INTO lix_internal_change (\
                  id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
                  ) \
@@ -1037,7 +1143,7 @@ impl Engine {
     }
 
     pub(crate) async fn find_version_id_by_name(
-        &self,
+        &mut self,
         name: &str,
     ) -> Result<Option<String>, LixError> {
         let table = tracked_live_table_name(version_descriptor_schema_key());
@@ -1059,7 +1165,7 @@ impl Engine {
             file_id = escape_sql_string(version_descriptor_file_id()),
             version_id = escape_sql_string(version_descriptor_storage_version_id()),
         );
-        let result = self.backend.execute(&sql, &[]).await?;
+        let result = self.execute_backend(&sql, &[]).await?;
 
         for row in result.rows {
             if row.len() < 2 {
@@ -1083,11 +1189,10 @@ impl Engine {
     }
 
     pub(crate) async fn seed_materialized_version_ref(
-        &self,
+        &mut self,
         entity_id: &str,
         commit_id: &str,
     ) -> Result<(), LixError> {
-        ensure_schema_live_table(self.backend.as_ref(), version_ref_schema_key()).await?;
         let snapshot_content = version_ref_snapshot_content(entity_id, commit_id);
         let table = untracked_live_table_name(version_ref_schema_key());
         builtin_live_table_layout(version_ref_schema_key())?.ok_or_else(|| {
@@ -1110,7 +1215,7 @@ impl Engine {
             file_id = escape_sql_string(version_ref_file_id()),
             version_id = escape_sql_string(version_ref_storage_version_id()),
         );
-        let existing = self.backend.execute(&check_sql, &[]).await?;
+        let existing = self.execute_backend(&check_sql, &[]).await?;
         if existing.rows.is_empty() {
             let timestamp = self.generate_runtime_timestamp().await?;
             let normalized_values =
@@ -1132,38 +1237,36 @@ impl Engine {
                 normalized_columns = normalized_insert_columns_sql(&normalized_values),
                 normalized_literals = normalized_insert_literals_sql(&normalized_values),
             );
-            self.backend.execute(&insert_sql, &[]).await?;
+            self.execute_backend(&insert_sql, &[]).await?;
         }
 
         Ok(())
     }
 
     pub(crate) async fn insert_last_checkpoint_for_version(
-        &self,
+        &mut self,
         version_id: &str,
         checkpoint_commit_id: &str,
     ) -> Result<(), LixError> {
-        self.backend
-            .execute(
-                "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
+        self.execute_backend(
+            "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
                  VALUES ($1, $2)",
-                &[
-                    Value::Text(version_id.to_string()),
-                    Value::Text(checkpoint_commit_id.to_string()),
-                ],
-            )
-            .await?;
+            &[
+                Value::Text(version_id.to_string()),
+                Value::Text(checkpoint_commit_id.to_string()),
+            ],
+        )
+        .await?;
         Ok(())
     }
 
-    pub(crate) async fn rebuild_internal_last_checkpoint(&self) -> Result<(), LixError> {
+    pub(crate) async fn rebuild_internal_last_checkpoint(&mut self) -> Result<(), LixError> {
         let versions = self
             .execute_internal(
                 "SELECT id, commit_id \
                  FROM lix_version \
                  ORDER BY id",
                 &[],
-                ExecuteOptions::default(),
             )
             .await?;
         let [statement] = versions.statements.as_slice() else {
@@ -1174,8 +1277,7 @@ impl Engine {
             ));
         };
 
-        self.backend
-            .execute("DELETE FROM lix_internal_last_checkpoint", &[])
+        self.execute_backend("DELETE FROM lix_internal_last_checkpoint", &[])
             .await?;
 
         let global_commit_id = self.load_global_version_commit_id().await?;
@@ -1204,7 +1306,7 @@ impl Engine {
     }
 
     async fn resolve_last_checkpoint_commit_id_for_tip(
-        &self,
+        &mut self,
         head_commit_id: &str,
     ) -> Result<Option<String>, LixError> {
         let commit_edge_layout =
@@ -1280,7 +1382,6 @@ impl Engine {
                 .replace("__PARENT_ID__", commit_edge_parent)
                 .replace("__CHILD_ID__", commit_edge_child),
                 &[Value::Text(head_commit_id.to_string())],
-                ExecuteOptions::default(),
             )
             .await?;
         let [statement] = rows.statements.as_slice() else {
@@ -1297,7 +1398,7 @@ impl Engine {
     }
 
     pub(crate) async fn seed_bootstrap_commit(
-        &self,
+        &mut self,
         commit_id: &str,
         change_set_id: &str,
     ) -> Result<(), LixError> {
@@ -1312,7 +1413,6 @@ impl Engine {
                    AND snapshot_content IS NOT NULL \
                  LIMIT 1",
                 &[Value::Text(commit_id.to_string())],
-                ExecuteOptions::default(),
             )
             .await?;
         let [statement] = existing.statements.as_slice() else {
@@ -1348,7 +1448,7 @@ impl Engine {
     }
 
     pub(crate) async fn seed_bootstrap_change_set(
-        &self,
+        &mut self,
         change_set_id: &str,
     ) -> Result<(), LixError> {
         let existing = self
@@ -1362,7 +1462,6 @@ impl Engine {
                    AND snapshot_content IS NOT NULL \
                  LIMIT 1",
                 &[Value::Text(change_set_id.to_string())],
-                ExecuteOptions::default(),
             )
             .await?;
         let [statement] = existing.statements.as_slice() else {
@@ -1395,7 +1494,7 @@ impl Engine {
     }
 
     pub(crate) async fn assert_commit_change_set_integrity(
-        &self,
+        &mut self,
         commit_id: &str,
     ) -> Result<(), LixError> {
         let commit_row = self
@@ -1410,7 +1509,6 @@ impl Engine {
                  ORDER BY updated_at DESC, created_at DESC, change_id DESC \
                  LIMIT 1",
                 &[Value::Text(commit_id.to_string())],
-                ExecuteOptions::default(),
             )
             .await?;
         let [statement] = commit_row.statements.as_slice() else {
@@ -1456,7 +1554,6 @@ impl Engine {
                    AND snapshot_content IS NOT NULL \
                  LIMIT 1",
                 &[Value::Text(change_set_id.clone())],
-                ExecuteOptions::default(),
             )
             .await?;
         let [statement] = existing.statements.as_slice() else {
@@ -1477,10 +1574,9 @@ impl Engine {
     }
 
     pub(crate) async fn seed_default_active_version(
-        &self,
+        &mut self,
         version_id: &str,
     ) -> Result<(), LixError> {
-        ensure_schema_live_table(self.backend.as_ref(), active_version_schema_key()).await?;
         let layout = builtin_live_table_layout(active_version_schema_key())?.ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -1507,7 +1603,7 @@ impl Engine {
             storage_version_id = escape_sql_string(active_version_storage_version_id()),
             payload_version_column = quote_ident(payload_version_column),
         );
-        let existing = self.backend.execute(&check_sql, &[]).await?;
+        let existing = self.execute_backend(&check_sql, &[]).await?;
         if !existing.rows.is_empty() {
             return Ok(());
         }
@@ -1540,7 +1636,7 @@ impl Engine {
             normalized_columns = normalized_insert_columns_sql(&normalized_values),
             normalized_literals = normalized_insert_literals_sql(&normalized_values),
         );
-        self.backend.execute(&insert_sql, &[]).await?;
+        self.execute_backend(&insert_sql, &[]).await?;
         Ok(())
     }
 }

@@ -1,6 +1,4 @@
-use crate::live_state::tracked::{
-    TrackedRow, TrackedTombstoneMarker, TrackedWriteRow,
-};
+use crate::live_state::tracked::{TrackedRow, TrackedTombstoneMarker, TrackedWriteRow};
 use crate::live_state::untracked::{UntrackedRow, UntrackedWriteRow};
 
 use super::query::{BatchRowRequest, ExactRowRequest, ScanRequest};

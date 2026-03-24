@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use lix_engine::{
     boot, collapse_prepared_batch_for_dialect, BootArgs, CreateVersionOptions, Engine,
-    ImageChunkReader, ImageChunkWriter, LixBackend, LixError, LixBackendTransaction, NoopWasmRuntime,
-    PreparedBatch, QueryResult, SqlDialect, Value, WasmRuntime,
+    ImageChunkReader, ImageChunkWriter, LixBackend, LixBackendTransaction, LixError,
+    NoopWasmRuntime, PreparedBatch, QueryResult, SqlDialect, Value, WasmRuntime,
 };
 use rusqlite::{
     backup::{Backup, StepResult},
@@ -195,7 +195,10 @@ impl LixBackend for TestImageSqliteBackend {
         restore_result
     }
 
-    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_savepoint(
+        &self,
+        _name: &str,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         self.begin_transaction().await
     }
 }

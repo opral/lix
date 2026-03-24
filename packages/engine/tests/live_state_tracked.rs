@@ -2,15 +2,15 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use lix_engine::live_state::init as init_live_state;
 use lix_engine::live_state::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
+use lix_engine::live_state::init as init_live_state;
 use lix_engine::live_state::tracked::{
     load_exact_row_with_backend, load_exact_rows_with_backend, scan_rows_with_backend,
     BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedScanRequest, TrackedWriteOperation,
     TrackedWriteRow,
 };
 use lix_engine::transaction::{ReadContext, TransactionDelta, WriteTransaction};
-use lix_engine::{LixBackend, LixError, LixBackendTransaction, QueryResult, SqlDialect, Value};
+use lix_engine::{LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
 #[derive(Clone)]
@@ -55,7 +55,10 @@ impl LixBackend for SqliteBackend {
         }))
     }
 
-    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_savepoint(
+        &self,
+        _name: &str,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         self.begin_transaction().await
     }
 }

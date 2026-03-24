@@ -8,8 +8,8 @@ use sqlx::{Column, Executor, PgPool, Row, ValueRef};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
 use lix_engine::{
-    collapse_prepared_batch_for_dialect, LixBackend, LixError, LixBackendTransaction, PreparedBatch,
-    QueryResult, SqlDialect, Value,
+    collapse_prepared_batch_for_dialect, LixBackend, LixBackendTransaction, LixError,
+    PreparedBatch, QueryResult, SqlDialect, Value,
 };
 
 use crate::support::simulation_test::{Simulation, SimulationBehavior};
@@ -237,7 +237,10 @@ impl LixBackend for PostgresBackend {
         Ok(Box::new(PostgresLixBackendTransaction { conn }))
     }
 
-    async fn begin_savepoint(&self, _name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_savepoint(
+        &self,
+        _name: &str,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         self.begin_transaction().await
     }
 }

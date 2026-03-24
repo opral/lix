@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::live_state::effective::{resolve_effective_rows, EffectiveRowsRequest};
 use crate::live_state::shared::query::entity_id_in_constraint;
 use crate::live_state::{CanonicalWatermark, SchemaRegistration};
-use crate::{LixError, LixBackendTransaction};
+use crate::{LixBackendTransaction, LixError};
 
 use super::contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
 use super::read_context::ReadContext;
@@ -20,7 +20,10 @@ pub struct WriteTransaction<'a> {
 }
 
 impl<'a> WriteTransaction<'a> {
-    pub fn new(backend_txn: Box<dyn LixBackendTransaction + 'a>, read_context: ReadContext<'a>) -> Self {
+    pub fn new(
+        backend_txn: Box<dyn LixBackendTransaction + 'a>,
+        read_context: ReadContext<'a>,
+    ) -> Self {
         Self {
             backend_txn: Some(backend_txn),
             read_context,
@@ -125,7 +128,9 @@ pub(crate) async fn prepare_materialization_plan(
         let constraints = if entity_ids.is_empty() {
             Vec::new()
         } else {
-            vec![entity_id_in_constraint(entity_ids.into_iter().collect::<Vec<_>>())]
+            vec![entity_id_in_constraint(
+                entity_ids.into_iter().collect::<Vec<_>>(),
+            )]
         };
         let _ = resolve_effective_rows(
             &EffectiveRowsRequest {
@@ -168,13 +173,13 @@ fn inactive_error() -> LixError {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use async_trait::async_trait;
+    use std::cell::Cell;
 
     use crate::live_state::tracked::{
         BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedReadView, TrackedRow,
-        TrackedScanRequest, TrackedTombstoneMarker, TrackedTombstoneView,
-        TrackedWriteOperation, TrackedWriteRow,
+        TrackedScanRequest, TrackedTombstoneMarker, TrackedTombstoneView, TrackedWriteOperation,
+        TrackedWriteRow,
     };
     use crate::live_state::untracked::{
         BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedReadView, UntrackedRow,
@@ -267,7 +272,8 @@ mod tests {
         let tracked = CountingTrackedView::default();
         let untracked = CountingUntrackedView::default();
         let tombstones = EmptyTombstones;
-        let read_context = ReadContext::new(&tracked, &untracked).with_tracked_tombstones(&tombstones);
+        let read_context =
+            ReadContext::new(&tracked, &untracked).with_tracked_tombstones(&tombstones);
         let mut journal = TransactionJournal::default();
         journal
             .stage(TransactionDelta {

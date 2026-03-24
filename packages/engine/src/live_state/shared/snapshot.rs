@@ -40,11 +40,7 @@ fn value_from_json(value: serde_json::Value) -> Value {
             }
         }
         serde_json::Value::String(value) => Value::Text(value),
-        serde_json::Value::Array(value) => {
-            Value::Json(serde_json::Value::Array(value))
-        }
-        serde_json::Value::Object(value) => {
-            Value::Json(serde_json::Value::Object(value))
-        }
+        serde_json::Value::Array(value) => Value::Json(serde_json::Value::Array(value)),
+        serde_json::Value::Object(value) => Value::Json(serde_json::Value::Object(value)),
     }
 }
