@@ -29,7 +29,7 @@ impl UntrackedRow {
     pub fn property_text(&self, property_name: &str) -> Option<String> {
         self.values
             .get(property_name)
-            .and_then(crate::live_state::shared::relational_read::text_from_value)
+            .and_then(crate::live_state::storage::text_from_value)
     }
 }
 
@@ -121,8 +121,6 @@ where
 
 #[async_trait(?Send)]
 pub trait UntrackedWriteParticipant {
-    async fn ensure_storage_for_schema(&mut self, schema_key: &str) -> Result<(), LixError>;
-
     async fn apply_write_batch(&mut self, batch: &[UntrackedWriteRow]) -> Result<(), LixError>;
 }
 
@@ -131,10 +129,6 @@ impl<T> UntrackedWriteParticipant for T
 where
     T: LixTransaction,
 {
-    async fn ensure_storage_for_schema(&mut self, schema_key: &str) -> Result<(), LixError> {
-        super::write::ensure_storage_in_transaction(self, schema_key).await
-    }
-
     async fn apply_write_batch(&mut self, batch: &[UntrackedWriteRow]) -> Result<(), LixError> {
         super::write::apply_write_batch_in_transaction(self, batch).await
     }
@@ -142,10 +136,6 @@ where
 
 #[async_trait(?Send)]
 impl UntrackedWriteParticipant for dyn LixTransaction + '_ {
-    async fn ensure_storage_for_schema(&mut self, schema_key: &str) -> Result<(), LixError> {
-        super::write::ensure_storage_in_transaction(self, schema_key).await
-    }
-
     async fn apply_write_batch(&mut self, batch: &[UntrackedWriteRow]) -> Result<(), LixError> {
         super::write::apply_write_batch_in_transaction(self, batch).await
     }

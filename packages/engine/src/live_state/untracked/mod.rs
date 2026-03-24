@@ -17,4 +17,3 @@ pub use system_rows::{
     active_version_write_row, load_active_version_with_backend, load_version_ref_with_backend,
     version_ref_write_row,
 };
-pub use write::{apply_write_batch_with_backend, ensure_storage_with_backend};

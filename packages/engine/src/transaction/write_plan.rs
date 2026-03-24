@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::live_state::tracked::TrackedWriteRow;
 use crate::live_state::untracked::UntrackedWriteRow;
@@ -10,7 +10,6 @@ use super::overlay::PendingTxnParticipants;
 
 #[derive(Debug, Clone)]
 pub(crate) enum TxnMaterializationUnit {
-    EnsureUntrackedStorage { schema_keys: Vec<String> },
     ApplyTracked { writes: Vec<TrackedWriteRow> },
     ApplyUntracked { writes: Vec<UntrackedWriteRow> },
 }
@@ -23,16 +22,6 @@ pub(crate) struct TxnMaterializationPlan {
 impl TxnMaterializationPlan {
     pub(crate) fn from_public_delta(delta: &TransactionDelta) -> Self {
         let mut units = Vec::new();
-        if !delta.untracked_writes.is_empty() {
-            let schema_keys = delta
-                .untracked_writes
-                .iter()
-                .map(|row| row.schema_key.clone())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            units.push(TxnMaterializationUnit::EnsureUntrackedStorage { schema_keys });
-        }
         if !delta.tracked_writes.is_empty() {
             units.push(TxnMaterializationUnit::ApplyTracked {
                 writes: delta.tracked_writes.clone(),
@@ -55,20 +44,6 @@ impl TxnMaterializationPlan {
         let mut coalesced = Vec::with_capacity(self.units.len());
         for unit in std::mem::take(&mut self.units) {
             match unit {
-                TxnMaterializationUnit::EnsureUntrackedStorage { schema_keys } => {
-                    if let Some(TxnMaterializationUnit::EnsureUntrackedStorage {
-                        schema_keys: current,
-                    }) = coalesced.last_mut()
-                    {
-                        current.extend(schema_keys);
-                        current.sort();
-                        current.dedup();
-                    } else {
-                        coalesced.push(TxnMaterializationUnit::EnsureUntrackedStorage {
-                            schema_keys,
-                        });
-                    }
-                }
                 TxnMaterializationUnit::ApplyTracked { writes } => {
                     if let Some(TxnMaterializationUnit::ApplyTracked { writes: current }) =
                         coalesced.last_mut()

@@ -1,13 +1,16 @@
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use lix_engine::live_state::install as install_live_state;
 use lix_engine::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use lix_engine::live_state::untracked::{
-    active_version_write_row, apply_write_batch_with_backend, load_active_version_with_backend,
-    load_exact_row_with_backend, load_exact_rows_with_backend, load_version_ref_with_backend,
-    scan_rows_with_backend, version_ref_write_row, BatchUntrackedRowRequest,
+    active_version_write_row, load_active_version_with_backend, load_exact_row_with_backend,
+    load_exact_rows_with_backend, load_version_ref_with_backend, scan_rows_with_backend,
+    version_ref_write_row, BatchUntrackedRowRequest,
     ExactUntrackedRowRequest, UntrackedScanRequest, UntrackedWriteOperation, UntrackedWriteRow,
 };
+use lix_engine::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use lix_engine::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
@@ -39,7 +42,8 @@ impl LixBackend for SqliteBackend {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        lix_engine::execute_auto_transactional(self, sql, params).await
+        let connection = self.connection.lock().expect("sqlite connection lock");
+        execute_sql(&connection, sql, params)
     }
 
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
@@ -147,21 +151,45 @@ fn sqlite_error(error: rusqlite::Error) -> LixError {
     }
 }
 
+async fn commit_untracked_rows(
+    backend: &SqliteBackend,
+    rows: Vec<UntrackedWriteRow>,
+) -> Result<(), LixError> {
+    let read_context = ReadContext::new(backend, backend);
+    let backend_txn = backend.begin_transaction().await?;
+    let mut write_tx = WriteTransaction::new(backend_txn, read_context);
+    let schema_keys = rows
+        .iter()
+        .map(|row| row.schema_key.clone())
+        .collect::<BTreeSet<_>>();
+    for schema_key in schema_keys {
+        write_tx.register_schema(schema_key)?;
+    }
+    write_tx.stage(TransactionDelta {
+        tracked_writes: Vec::new(),
+        untracked_writes: rows,
+    })?;
+    write_tx.commit().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn live_untracked_state_roundtrips_helper_rows() {
     let backend = SqliteBackend::new();
     let timestamp = "2026-03-24T00:00:00Z";
-
-    apply_write_batch_with_backend(
+    install_live_state(&backend)
+        .await
+        .expect("live_state install should succeed");
+    commit_untracked_rows(
         &backend,
-        &[
+        vec![
             active_version_write_row("active-row", "main", timestamp),
             version_ref_write_row("main", "commit-1", timestamp),
             version_ref_write_row("other", "commit-2", timestamp),
         ],
     )
     .await
-    .expect("helper row writes should succeed");
+    .expect("helper row transaction should succeed");
 
     let active_version = load_active_version_with_backend(&backend)
         .await
@@ -257,17 +285,19 @@ async fn live_untracked_state_roundtrips_helper_rows() {
 async fn live_untracked_state_delete_removes_rows() {
     let backend = SqliteBackend::new();
     let timestamp = "2026-03-24T00:00:00Z";
-
-    apply_write_batch_with_backend(
+    install_live_state(&backend)
+        .await
+        .expect("live_state install should succeed");
+    commit_untracked_rows(
         &backend,
-        &[version_ref_write_row("main", "commit-1", timestamp)],
+        vec![version_ref_write_row("main", "commit-1", timestamp)],
     )
     .await
-    .expect("initial version ref write should succeed");
+    .expect("initial version ref transaction should succeed");
 
-    apply_write_batch_with_backend(
+    commit_untracked_rows(
         &backend,
-        &[UntrackedWriteRow {
+        vec![UntrackedWriteRow {
             entity_id: "main".to_string(),
             schema_key: "lix_version_ref".to_string(),
             schema_version: "1".to_string(),
@@ -284,7 +314,7 @@ async fn live_untracked_state_delete_removes_rows() {
         }],
     )
     .await
-    .expect("delete write should succeed");
+    .expect("delete transaction should succeed");
 
     let version_ref = load_version_ref_with_backend(&backend, "main")
         .await

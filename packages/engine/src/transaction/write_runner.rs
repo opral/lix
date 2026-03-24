@@ -13,15 +13,6 @@ pub(crate) async fn run_materialization_plan(
 
     for unit in &plan.units {
         match unit {
-            TxnMaterializationUnit::EnsureUntrackedStorage { schema_keys } => {
-                ensure_untracked_storage(transaction, schema_keys).await?;
-                let mut ensured = schema_keys.clone();
-                ensured.sort();
-                ensured.dedup();
-                outcome.ensured_untracked_schemas.extend(ensured);
-                outcome.ensured_untracked_schemas.sort();
-                outcome.ensured_untracked_schemas.dedup();
-            }
             TxnMaterializationUnit::ApplyTracked { writes } => {
                 crate::live_state::tracked::TrackedWriteParticipant::apply_write_batch(
                     transaction,
@@ -42,20 +33,6 @@ pub(crate) async fn run_materialization_plan(
     }
 
     Ok(outcome)
-}
-
-async fn ensure_untracked_storage(
-    transaction: &mut dyn LixTransaction,
-    schema_keys: &[String],
-) -> Result<(), LixError> {
-    for schema_key in schema_keys {
-        crate::live_state::untracked::UntrackedWriteParticipant::ensure_storage_for_schema(
-            transaction,
-            schema_key,
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 #[allow(dead_code)]

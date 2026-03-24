@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::live_state::effective::{resolve_effective_rows, EffectiveRowsRequest};
 use crate::live_state::shared::query::entity_id_in_constraint;
+use crate::live_state::{CanonicalWatermark, SchemaRegistration};
 use crate::{LixError, LixTransaction};
 
 use super::contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
@@ -13,6 +14,7 @@ pub struct WriteTransaction<'a> {
     backend_txn: Option<Box<dyn LixTransaction + 'a>>,
     read_context: ReadContext<'a>,
     journal: TransactionJournal,
+    registered_schemas: BTreeMap<String, SchemaRegistration>,
     outcome: CommitOutcome,
     executed: bool,
 }
@@ -23,6 +25,7 @@ impl<'a> WriteTransaction<'a> {
             backend_txn: Some(backend_txn),
             read_context,
             journal: TransactionJournal::default(),
+            registered_schemas: BTreeMap::new(),
             outcome: CommitOutcome::default(),
             executed: false,
         }
@@ -43,18 +46,45 @@ impl<'a> WriteTransaction<'a> {
         self.journal.stage(delta)
     }
 
+    pub fn register_schema(
+        &mut self,
+        registration: impl Into<SchemaRegistration>,
+    ) -> Result<(), LixError> {
+        if self.executed {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "cannot register schema after execute()",
+            ));
+        }
+        self.ensure_active()?;
+        let registration = registration.into();
+        self.registered_schemas
+            .insert(registration.schema_key.clone(), registration);
+        Ok(())
+    }
+
     pub async fn execute(&mut self) -> Result<(), LixError> {
         self.ensure_active()?;
         if self.executed {
             return Ok(());
         }
 
-        let plan = prepare_materialization_plan(&self.read_context, &self.journal).await?;
         let transaction = self.backend_txn.as_deref_mut().ok_or_else(inactive_error)?;
+        for registration in self.registered_schemas.values() {
+            crate::live_state::register_schema_in_transaction(transaction, registration.clone())
+                .await?;
+        }
+        let plan = prepare_materialization_plan(&self.read_context, &self.journal).await?;
         self.outcome
             .merge(run_materialization_plan(transaction, &plan).await?);
         self.executed = true;
         Ok(())
+    }
+
+    pub async fn finalize_live_state(&mut self) -> Result<CanonicalWatermark, LixError> {
+        self.ensure_active()?;
+        let transaction = self.backend_txn.as_deref_mut().ok_or_else(inactive_error)?;
+        crate::live_state::finalize_commit_in_transaction(transaction).await
     }
 
     pub async fn commit(mut self) -> Result<CommitOutcome, LixError> {
@@ -299,7 +329,7 @@ mod tests {
 
         assert_eq!(tracked.scans.get(), 3);
         assert_eq!(untracked.scans.get(), 3);
-        assert_eq!(plan.units.len(), 3);
+        assert_eq!(plan.units.len(), 2);
     }
 
     #[tokio::test]

@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use crate::live_state::tracked::{TrackedWriteOperation, TrackedWriteRow};
 use crate::live_state::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
 use crate::LixError;
@@ -70,8 +68,6 @@ pub struct CommitOutcome {
     pub tracked_tombstones: usize,
     pub untracked_upserts: usize,
     pub untracked_deletes: usize,
-    #[serde(default)]
-    pub ensured_untracked_schemas: Vec<String>,
 }
 
 impl CommitOutcome {
@@ -80,13 +76,6 @@ impl CommitOutcome {
         self.tracked_tombstones += other.tracked_tombstones;
         self.untracked_upserts += other.untracked_upserts;
         self.untracked_deletes += other.untracked_deletes;
-        let mut ensured = self
-            .ensured_untracked_schemas
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        ensured.extend(other.ensured_untracked_schemas);
-        self.ensured_untracked_schemas = ensured.into_iter().collect();
     }
 
     pub(crate) fn from_tracked_writes(writes: &[TrackedWriteRow]) -> Self {
