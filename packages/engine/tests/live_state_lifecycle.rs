@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::live_state::{
-    apply_rebuild_plan, finalize_commit, install as install_live_state, register_schema,
+    apply_rebuild_plan, finalize_commit, init as init_live_state, register_schema,
     require_ready, LiveStateRebuildPlan, LiveStateRebuildScope, SchemaRegistration,
 };
 use lix_engine::live_state::tracked::{load_exact_row_with_backend, ExactTrackedRowRequest};
@@ -202,12 +202,12 @@ fn empty_rebuild_plan(scope: LiveStateRebuildScope) -> LiveStateRebuildPlan {
 }
 
 #[tokio::test]
-async fn install_and_register_schema_use_explicit_lifecycle_entrypoints() {
+async fn init_and_register_schema_use_explicit_lifecycle_entrypoints() {
     let backend = SqliteBackend::new();
 
-    install_live_state(&backend)
+    init_live_state(&backend)
         .await
-        .expect("live_state install should succeed");
+        .expect("live_state init should succeed");
     register_schema(&backend, "lix_commit_edge")
         .await
         .expect("builtin schema registration should succeed");
@@ -227,9 +227,9 @@ async fn install_and_register_schema_use_explicit_lifecycle_entrypoints() {
 async fn register_schema_accepts_runtime_registered_snapshot_without_owning_schema_catalog() {
     let backend = SqliteBackend::new();
 
-    install_live_state(&backend)
+    init_live_state(&backend)
         .await
-        .expect("live_state install should succeed");
+        .expect("live_state init should succeed");
     register_schema(
         &backend,
         SchemaRegistration {
@@ -262,9 +262,9 @@ async fn register_schema_accepts_runtime_registered_snapshot_without_owning_sche
 #[tokio::test]
 async fn require_ready_stays_not_ready_until_finalize_commit_updates_watermark() {
     let backend = SqliteBackend::new();
-    install_live_state(&backend)
+    init_live_state(&backend)
         .await
-        .expect("live_state install should succeed");
+        .expect("live_state init should succeed");
     create_change_table(&backend).await;
 
     assert!(require_ready(&backend).await.is_err());
@@ -282,9 +282,9 @@ async fn require_ready_stays_not_ready_until_finalize_commit_updates_watermark()
 #[tokio::test]
 async fn rebuild_apply_controls_ready_vs_needs_rebuild_mode() {
     let backend = SqliteBackend::new();
-    install_live_state(&backend)
+    init_live_state(&backend)
         .await
-        .expect("live_state install should succeed");
+        .expect("live_state init should succeed");
     create_change_table(&backend).await;
     insert_canonical_change(&backend, "change-1", "2026-03-24T00:00:00Z").await;
 
@@ -321,9 +321,9 @@ async fn rebuild_apply_controls_ready_vs_needs_rebuild_mode() {
 #[tokio::test]
 async fn reads_do_not_auto_create_storage() {
     let backend = SqliteBackend::new();
-    install_live_state(&backend)
+    init_live_state(&backend)
         .await
-        .expect("live_state install should succeed");
+        .expect("live_state init should succeed");
 
     let tracked = load_exact_row_with_backend(
         &backend,

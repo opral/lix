@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use lix_engine::live_state::install as install_live_state;
+use lix_engine::live_state::init as init_live_state;
 use lix_engine::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use lix_engine::live_state::untracked::{
     active_version_write_row, load_active_version_with_backend, load_exact_row_with_backend,
@@ -177,9 +177,9 @@ async fn commit_untracked_rows(
 async fn live_untracked_state_roundtrips_helper_rows() {
     let backend = SqliteBackend::new();
     let timestamp = "2026-03-24T00:00:00Z";
-    install_live_state(&backend)
+    init_live_state(&backend)
         .await
-        .expect("live_state install should succeed");
+        .expect("live_state init should succeed");
     commit_untracked_rows(
         &backend,
         vec![
@@ -285,9 +285,9 @@ async fn live_untracked_state_roundtrips_helper_rows() {
 async fn live_untracked_state_delete_removes_rows() {
     let backend = SqliteBackend::new();
     let timestamp = "2026-03-24T00:00:00Z";
-    install_live_state(&backend)
+    init_live_state(&backend)
         .await
-        .expect("live_state install should succeed");
+        .expect("live_state init should succeed");
     commit_untracked_rows(
         &backend,
         vec![version_ref_write_row("main", "commit-1", timestamp)],

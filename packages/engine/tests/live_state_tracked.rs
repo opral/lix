@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use lix_engine::live_state::install as install_live_state;
+use lix_engine::live_state::init as init_live_state;
 use lix_engine::live_state::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 use lix_engine::live_state::tracked::{
     load_exact_row_with_backend, load_exact_rows_with_backend, scan_rows_with_backend,
@@ -202,9 +202,9 @@ async fn commit_tracked_rows(
 async fn live_tracked_state_roundtrips_rows() {
     let backend = SqliteBackend::new();
     let timestamp = "2026-03-24T00:00:00Z";
-    install_live_state(&backend)
+    init_live_state(&backend)
         .await
-        .expect("live_state install should succeed");
+        .expect("live_state init should succeed");
     commit_tracked_rows(
         &backend,
         vec![
@@ -295,9 +295,9 @@ async fn live_tracked_state_tombstones_hide_rows() {
     let backend = SqliteBackend::new();
     let timestamp = "2026-03-24T00:00:00Z";
     let tombstone_time = "2026-03-24T00:05:00Z";
-    install_live_state(&backend)
+    init_live_state(&backend)
         .await
-        .expect("live_state install should succeed");
+        .expect("live_state init should succeed");
     commit_tracked_rows(
         &backend,
         vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],

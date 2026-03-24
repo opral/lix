@@ -1,8 +1,8 @@
 //! Live-state subsystem boundary.
 //!
 //! `live_state` owns:
-//! - lifecycle installation and readiness checks
-//! - schema-scoped storage installation
+//! - lifecycle initialization and readiness checks
+//! - schema-scoped storage initialization
 //! - tracked, untracked, and effective row access
 //! - rebuild planning and apply
 //!
@@ -55,8 +55,8 @@ impl From<String> for SchemaRegistration {
     }
 }
 
-pub async fn install(backend: &dyn LixBackend) -> Result<(), LixError> {
-    lifecycle::install(backend).await
+pub async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
+    lifecycle::init(backend).await
 }
 
 pub async fn require_ready(backend: &dyn LixBackend) -> Result<(), LixError> {
