@@ -4,13 +4,13 @@ use crate::schema::live_layout::{
     load_live_table_layout_with_executor, normalized_live_column_values, tracked_live_table_name,
 };
 use crate::schema::registry::{ensure_schema_live_table, ensure_schema_live_table_in_transaction};
+use crate::live_state::shared::relational_write::{
+    normalized_insert_columns_sql, normalized_insert_values_sql,
+    normalized_update_assignments_sql,
+};
 use crate::{LixBackend, LixError, LixTransaction};
 
 use super::contracts::{TrackedWriteOperation, TrackedWriteRow};
-use super::shared::{
-    escape_sql_string, normalized_insert_columns_sql, normalized_insert_values_sql,
-    normalized_update_assignments_sql, quote_ident, sql_literal_text,
-};
 
 pub async fn ensure_storage_with_backend(
     backend: &dyn LixBackend,
@@ -103,12 +103,12 @@ async fn apply_materialized_row_in_transaction(
     let metadata_sql = row
         .metadata
         .as_deref()
-        .map(sql_literal_text)
+        .map(crate::live_state::constraints::sql_literal_text)
         .unwrap_or_else(|| "NULL".to_string());
     let writer_key_sql = row
         .writer_key
         .as_deref()
-        .map(sql_literal_text)
+        .map(crate::live_state::constraints::sql_literal_text)
         .unwrap_or_else(|| "NULL".to_string());
     let sql = format!(
         "INSERT INTO {table} (\
@@ -126,20 +126,20 @@ async fn apply_materialized_row_in_transaction(
          is_tombstone = excluded.is_tombstone, \
          created_at = excluded.created_at, \
          updated_at = excluded.updated_at{normalized_updates}",
-        table = quote_ident(&tracked_live_table_name(&row.schema_key)),
-        entity_id = escape_sql_string(&row.entity_id),
-        schema_key = escape_sql_string(&row.schema_key),
-        schema_version = escape_sql_string(&row.schema_version),
-        file_id = escape_sql_string(&row.file_id),
-        version_id = escape_sql_string(&row.version_id),
+        table = crate::live_state::constraints::quote_ident(&tracked_live_table_name(&row.schema_key)),
+        entity_id = crate::live_state::constraints::escape_sql_string(&row.entity_id),
+        schema_key = crate::live_state::constraints::escape_sql_string(&row.schema_key),
+        schema_version = crate::live_state::constraints::escape_sql_string(&row.schema_version),
+        file_id = crate::live_state::constraints::escape_sql_string(&row.file_id),
+        version_id = crate::live_state::constraints::escape_sql_string(&row.version_id),
         global = if row.global { "true" } else { "false" },
-        plugin_key = escape_sql_string(&row.plugin_key),
-        change_id = escape_sql_string(&row.change_id),
+        plugin_key = crate::live_state::constraints::escape_sql_string(&row.plugin_key),
+        change_id = crate::live_state::constraints::escape_sql_string(&row.change_id),
         metadata = metadata_sql,
         writer_key = writer_key_sql,
         is_tombstone = if is_tombstone { "1" } else { "0" },
-        created_at = escape_sql_string(created_at),
-        updated_at = escape_sql_string(&row.updated_at),
+        created_at = crate::live_state::constraints::escape_sql_string(created_at),
+        updated_at = crate::live_state::constraints::escape_sql_string(&row.updated_at),
         normalized_columns = normalized_columns,
         normalized_values = normalized_values_sql,
         normalized_updates = normalized_updates,

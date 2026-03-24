@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-use crate::live_tracked_state::{TrackedWriteOperation, TrackedWriteRow};
-use crate::live_untracked_state::{UntrackedWriteOperation, UntrackedWriteRow};
+use crate::live_state::tracked::{TrackedWriteOperation, TrackedWriteRow};
+use crate::live_state::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
 use crate::LixError;
 
 use super::write_plan::{MutationJournal, TxnDelta};

@@ -1,16 +1,16 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use lix_engine::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
-use lix_engine::effective_state::{
+use lix_engine::live_state::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
+use lix_engine::live_state::effective::{
     overlay_lanes_for_version, resolve_effective_row, resolve_effective_rows, EffectiveRowRequest,
     EffectiveRowState, EffectiveRowsRequest, OverlayLane, ReadContext,
 };
-use lix_engine::live_tracked_state::{
+use lix_engine::live_state::tracked::{
     BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedReadView, TrackedRow,
     TrackedScanRequest, TrackedTombstoneMarker, TrackedTombstoneView,
 };
-use lix_engine::live_untracked_state::{
+use lix_engine::live_state::untracked::{
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedReadView, UntrackedRow,
     UntrackedScanRequest,
 };

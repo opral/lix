@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::live_tracked_state::TrackedWriteRow;
-use crate::live_untracked_state::UntrackedWriteRow;
+use crate::live_state::tracked::TrackedWriteRow;
+use crate::live_state::untracked::UntrackedWriteRow;
+use crate::live_state::shared::identity::RowIdentity;
 use crate::LixError;
 
 use super::contracts::TransactionDelta;
-use super::participants::{PendingTxnParticipants, RowIdentity};
+use super::overlay::PendingTxnParticipants;
 
 #[derive(Debug, Clone)]
 pub(crate) enum TxnMaterializationUnit {

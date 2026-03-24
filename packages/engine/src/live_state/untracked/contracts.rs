@@ -2,37 +2,11 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 
-use crate::constraints::ScanConstraint;
+pub use crate::live_state::shared::query::{
+    BatchRowRequest as BatchUntrackedRowRequest, ExactRowRequest as ExactUntrackedRowRequest,
+    ScanRequest as UntrackedScanRequest,
+};
 use crate::{LixBackend, LixError, LixTransaction, Value};
-
-/// Point lookup by full key.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ExactUntrackedRowRequest {
-    pub schema_key: String,
-    pub version_id: String,
-    pub entity_id: String,
-    pub file_id: Option<String>,
-}
-
-/// Batch point lookup by entity IDs.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub struct BatchUntrackedRowRequest {
-    pub schema_key: String,
-    pub version_id: String,
-    pub entity_ids: Vec<String>,
-    pub file_id: Option<String>,
-}
-
-/// Bounded scan with structured constraints.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
-pub struct UntrackedScanRequest {
-    pub schema_key: String,
-    pub version_id: String,
-    #[serde(default)]
-    pub constraints: Vec<ScanConstraint>,
-    #[serde(default)]
-    pub required_columns: Vec<String>,
-}
 
 /// Decoded untracked/helper live row.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -55,7 +29,7 @@ impl UntrackedRow {
     pub fn property_text(&self, property_name: &str) -> Option<String> {
         self.values
             .get(property_name)
-            .and_then(super::shared::text_from_value)
+            .and_then(crate::live_state::shared::relational_read::text_from_value)
     }
 }
 

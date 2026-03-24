@@ -1,67 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::live_tracked_state::{
+use crate::live_state::tracked::{
     TrackedRow, TrackedTombstoneMarker, TrackedWriteOperation, TrackedWriteRow,
 };
-use crate::live_untracked_state::{UntrackedRow, UntrackedWriteOperation, UntrackedWriteRow};
-use crate::{LixError, Value};
+use crate::live_state::untracked::{UntrackedRow, UntrackedWriteOperation, UntrackedWriteRow};
+use crate::live_state::shared::identity::RowIdentity;
+use crate::live_state::shared::snapshot::values_from_snapshot_content;
+use crate::LixError;
 
 use super::contracts::TransactionDelta;
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct RowIdentity {
-    pub(crate) schema_key: String,
-    pub(crate) version_id: String,
-    pub(crate) entity_id: String,
-    pub(crate) file_id: String,
-}
-
-impl RowIdentity {
-    pub(crate) fn from_tracked_write(row: &TrackedWriteRow) -> Self {
-        Self {
-            schema_key: row.schema_key.clone(),
-            version_id: row.version_id.clone(),
-            entity_id: row.entity_id.clone(),
-            file_id: row.file_id.clone(),
-        }
-    }
-
-    pub(crate) fn from_untracked_write(row: &UntrackedWriteRow) -> Self {
-        Self {
-            schema_key: row.schema_key.clone(),
-            version_id: row.version_id.clone(),
-            entity_id: row.entity_id.clone(),
-            file_id: row.file_id.clone(),
-        }
-    }
-
-    pub(crate) fn from_tracked_row(row: &TrackedRow) -> Self {
-        Self {
-            schema_key: row.schema_key.clone(),
-            version_id: row.version_id.clone(),
-            entity_id: row.entity_id.clone(),
-            file_id: row.file_id.clone(),
-        }
-    }
-
-    pub(crate) fn from_untracked_row(row: &UntrackedRow) -> Self {
-        Self {
-            schema_key: row.schema_key.clone(),
-            version_id: row.version_id.clone(),
-            entity_id: row.entity_id.clone(),
-            file_id: row.file_id.clone(),
-        }
-    }
-
-    pub(crate) fn from_tombstone(row: &TrackedTombstoneMarker) -> Self {
-        Self {
-            schema_key: row.schema_key.clone(),
-            version_id: row.version_id.clone(),
-            entity_id: row.entity_id.clone(),
-            file_id: row.file_id.clone(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PendingTxnParticipants {
@@ -228,45 +175,4 @@ fn untracked_row_from_write(row: &UntrackedWriteRow) -> Result<UntrackedRow, Lix
         updated_at: row.updated_at.clone(),
         values: values_from_snapshot_content(row.snapshot_content.as_deref())?,
     })
-}
-
-fn values_from_snapshot_content(snapshot_content: Option<&str>) -> Result<BTreeMap<String, Value>, LixError> {
-    let Some(snapshot_content) = snapshot_content else {
-        return Ok(BTreeMap::new());
-    };
-
-    let parsed = serde_json::from_str::<serde_json::Value>(snapshot_content).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            &format!("failed to decode transaction snapshot content: {error}"),
-        )
-    })?;
-
-    let serde_json::Value::Object(object) = parsed else {
-        return Ok(BTreeMap::new());
-    };
-
-    Ok(object
-        .into_iter()
-        .map(|(key, value)| (key, value_from_json(value)))
-        .collect())
-}
-
-fn value_from_json(value: serde_json::Value) -> Value {
-    match value {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(value) => Value::Boolean(value),
-        serde_json::Value::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                Value::Integer(value)
-            } else if let Some(value) = value.as_f64() {
-                Value::Real(value)
-            } else {
-                Value::Json(serde_json::Value::Number(value))
-            }
-        }
-        serde_json::Value::String(value) => Value::Text(value),
-        serde_json::Value::Array(value) => Value::Json(serde_json::Value::Array(value)),
-        serde_json::Value::Object(value) => Value::Json(serde_json::Value::Object(value)),
-    }
 }

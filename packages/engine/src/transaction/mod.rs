@@ -2,7 +2,7 @@
 
 mod contracts;
 mod execution;
-mod participants;
+mod overlay;
 mod read_context;
 mod write_plan;
 mod write_runner;

@@ -1,5 +1,8 @@
 //! Shared SQL-free vocabulary for structured scan constraints.
 
+mod eval;
+mod sql;
+
 use crate::Value;
 
 /// Which indexed field a scan constraint applies to.
@@ -38,3 +41,6 @@ pub enum ScanOperator {
         upper: Option<Bound>,
     },
 }
+
+pub(crate) use eval::matches_constraints;
+pub(crate) use sql::{escape_sql_string, quote_ident, render_constraint_sql, sql_literal, sql_literal_text};

@@ -1,5 +1,5 @@
-use crate::live_tracked_state::{TrackedWriteOperation, TrackedWriteRow};
-use crate::live_untracked_state::{UntrackedWriteOperation, UntrackedWriteRow};
+use crate::live_state::tracked::{TrackedWriteOperation, TrackedWriteRow};
+use crate::live_state::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
 use crate::{LixError, LixTransaction};
 
 use super::contracts::CommitOutcome;
@@ -23,7 +23,7 @@ pub(crate) async fn run_materialization_plan(
                 outcome.ensured_untracked_schemas.dedup();
             }
             TxnMaterializationUnit::ApplyTracked { writes } => {
-                crate::live_tracked_state::TrackedWriteParticipant::apply_write_batch(
+                crate::live_state::tracked::TrackedWriteParticipant::apply_write_batch(
                     transaction,
                     writes,
                 )
@@ -31,7 +31,7 @@ pub(crate) async fn run_materialization_plan(
                 outcome.merge(CommitOutcome::from_tracked_writes(writes));
             }
             TxnMaterializationUnit::ApplyUntracked { writes } => {
-                crate::live_untracked_state::UntrackedWriteParticipant::apply_write_batch(
+                crate::live_state::untracked::UntrackedWriteParticipant::apply_write_batch(
                     transaction,
                     writes,
                 )
@@ -49,7 +49,7 @@ async fn ensure_untracked_storage(
     schema_keys: &[String],
 ) -> Result<(), LixError> {
     for schema_key in schema_keys {
-        crate::live_untracked_state::UntrackedWriteParticipant::ensure_storage_for_schema(
+        crate::live_state::untracked::UntrackedWriteParticipant::ensure_storage_for_schema(
             transaction,
             schema_key,
         )
