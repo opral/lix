@@ -4,6 +4,7 @@ mod backend;
 mod boot;
 mod canonical_json;
 mod cel;
+pub mod constraints;
 mod deterministic_mode;
 mod engine;
 mod errors;
