@@ -498,7 +498,7 @@ where
                         .into_iter()
                         .chain(supplemental_statements.into_iter())
                     {
-                        let bound = crate::sql::ast::utils::bind_statement_ast(
+                        let bound = crate::sql_support::binding::bind_statement_ast(
                             &statement,
                             context.params,
                             backend.dialect(),

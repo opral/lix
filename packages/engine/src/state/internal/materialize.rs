@@ -4,7 +4,7 @@ use sqlparser::ast::{
 
 use crate::live_state::register_schema;
 use crate::sql::ast::lowering::lower_statement;
-use crate::sql::ast::utils::{bind_sql, parse_sql_statements};
+use crate::sql_support::binding::{bind_sql, parse_sql_statements};
 use crate::sql::ast::walk::object_name_matches;
 use crate::sql::public::runtime::lower_public_read_query_with_backend;
 use crate::{LixBackend, LixError, Value};

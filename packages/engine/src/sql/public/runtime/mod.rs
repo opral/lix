@@ -14,7 +14,7 @@ use crate::sql::common::dependency_spec::DependencySpec;
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::sql::execution::intent::authoritative_binary_blob_write_targets;
-use crate::sql::execution::runtime_effects::{
+use crate::filesystem::runtime::{
     binary_blob_writes_from_filesystem_state, delete_targets_from_filesystem_state,
     FilesystemTransactionState,
 };

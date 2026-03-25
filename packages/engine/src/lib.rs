@@ -9,7 +9,6 @@ mod change_view;
 mod deterministic_mode;
 mod engine;
 mod errors;
-mod execution_support;
 mod filesystem;
 mod functions;
 mod identity;
@@ -21,6 +20,7 @@ mod observe;
 mod plugin;
 mod schema;
 pub(crate) mod sql;
+mod sql_support;
 pub(crate) mod state;
 pub mod transaction;
 mod types;
@@ -57,7 +57,7 @@ pub use live_state::{
 };
 pub use lix::{InitResult, Lix, LixConfig};
 pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
-pub use sql::execution::contracts::prepared_statement::{
+pub use backend::prepared::{
     collapse_prepared_batch_for_dialect, PreparedBatch, PreparedStatement,
 };
 pub use state::checkpoint::CreateCheckpointResult;

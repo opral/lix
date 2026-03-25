@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::sql::execution::contracts::prepared_statement::PreparedBatch;
+use crate::backend::prepared::PreparedBatch;
 use crate::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

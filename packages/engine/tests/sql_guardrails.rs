@@ -666,8 +666,8 @@ fn guardrail_legacy_filesystem_mutation_rewrite_is_removed() {
 #[test]
 fn guardrail_sql_side_effects_stays_off_legacy_filesystem_update_detector() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let side_effects_source = fs::read_to_string(root.join("src/sql/execution/runtime_effects.rs"))
-        .expect("runtime_effects readable");
+    let side_effects_source = fs::read_to_string(root.join("src/filesystem/runtime.rs"))
+        .expect("filesystem/runtime.rs readable");
     let intent_source =
         fs::read_to_string(root.join("src/sql/execution/intent.rs")).expect("intent readable");
     let shared_path_source = fs::read_to_string(root.join("src/sql/execution/shared_path.rs"))
@@ -705,8 +705,8 @@ fn guardrail_legacy_query_pipeline_context_is_removed_and_validator_is_filesyste
 #[test]
 fn guardrail_side_effect_placeholder_advancement_is_ast_based() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let ast_utils_source = fs::read_to_string(root.join("src/sql/ast/utils.rs"))
-        .expect("sql_ast/utils.rs should be readable");
+    let ast_utils_source = fs::read_to_string(root.join("src/sql_support/binding.rs"))
+        .expect("sql_support/binding.rs should be readable");
 
     assert!(
         ast_utils_source.contains("advance_placeholder_state_for_statement_ast"),
@@ -763,8 +763,8 @@ fn guardrail_filesystem_noop_sql_synthesis_stays_removed() {
 #[test]
 fn guardrail_live_filesystem_intent_path_has_no_plugin_detection_branch() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let side_effects_source = fs::read_to_string(root.join("src/sql/execution/runtime_effects.rs"))
-        .expect("runtime_effects.rs should be readable");
+    let side_effects_source = fs::read_to_string(root.join("src/filesystem/runtime.rs"))
+        .expect("filesystem/runtime.rs should be readable");
     let shared_path_source = fs::read_to_string(root.join("src/sql/execution/shared_path.rs"))
         .expect("shared_path.rs should be readable");
     let intent_source = fs::read_to_string(root.join("src/sql/execution/intent.rs"))

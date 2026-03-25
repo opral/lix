@@ -2,10 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
 
-use crate::execution_support::{bind_sql, escape_sql_string};
 use crate::schema::live_layout::{
     builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
 };
+use crate::sql_support::binding::bind_sql;
+use crate::sql_support::text::escape_sql_string;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::Value as EngineValue;
 use crate::{LixError, SqlDialect};

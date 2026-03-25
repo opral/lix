@@ -1,7 +1,7 @@
 use crate::live_state::register_schema;
 use crate::schema::builtin::builtin_schema_keys;
 use crate::schema::live_layout::tracked_live_table_name;
-use crate::sql::live_snapshot::live_snapshot_select_expr_for_schema;
+use crate::live_state::shared::snapshot_sql::live_snapshot_select_expr_for_schema;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 const INIT_STATEMENTS: &[&str] = &[

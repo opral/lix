@@ -10,7 +10,7 @@ use crate::schema::live_layout::{
     builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
     untracked_live_table_name, LiveRowAccess, LiveTableLayout,
 };
-use crate::sql::live_snapshot::live_snapshot_select_expr;
+use crate::live_state::shared::snapshot_sql::live_snapshot_select_expr;
 use crate::sql::public::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::public::catalog::{
     SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,

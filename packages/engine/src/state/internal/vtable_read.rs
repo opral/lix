@@ -12,7 +12,7 @@ use crate::schema::live_layout::{
     builtin_live_table_layout, live_schema_key_for_table_name, load_live_row_access_with_backend,
     tracked_live_table_name, untracked_live_table_name, LiveRowAccess, TRACKED_LIVE_TABLE_PREFIX,
 };
-use crate::sql::live_snapshot::{live_snapshot_select_expr, live_snapshot_select_expr_for_schema};
+use crate::live_state::shared::snapshot_sql::{live_snapshot_select_expr, live_snapshot_select_expr_for_schema};
 use crate::state::internal::param_context::{
     expr_last_identifier_eq, extract_string_column_values_from_expr, normalize_query_placeholders,
     PlaceholderOrdinalState,

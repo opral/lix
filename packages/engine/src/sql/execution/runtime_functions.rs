@@ -4,8 +4,8 @@ use crate::deterministic_mode::{
 };
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
-use crate::state::internal::write_program::WriteProgram;
+use crate::backend::program_runner::execute_write_program_with_transaction;
+use crate::backend::program::WriteProgram;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 
 impl Engine {

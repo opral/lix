@@ -1,4 +1,4 @@
-use crate::sql::ast::utils::{
+use crate::sql_support::binding::{
     bind_sql, parse_sql_statements, resolve_placeholder_index, PlaceholderState,
 };
 use crate::{LixError, SqlDialect, Value};

@@ -4,7 +4,7 @@ use crate::schema::live_layout::{
     untracked_live_table_name,
 };
 use crate::sql::public::planner::semantics::filesystem_queries::lookup_file_id_by_path;
-use crate::sql::storage::sql_text::escape_sql_string;
+use crate::sql_support::text::escape_sql_string;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     version_descriptor_schema_key, GLOBAL_VERSION_ID,

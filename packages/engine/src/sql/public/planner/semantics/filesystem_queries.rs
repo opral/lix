@@ -5,9 +5,9 @@ use crate::filesystem::live_projection::{
 use crate::filesystem::path::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
 use crate::schema::live_layout::{tracked_live_table_name, untracked_live_table_name};
 use crate::sql::common::ast::{lower_statement, parse_sql_statements};
-use crate::sql::execution::runtime_effects::FilesystemTransactionFileState;
+use crate::filesystem::runtime::FilesystemTransactionFileState;
 use crate::sql::execution::shared_path::PendingTransactionView;
-use crate::sql::storage::sql_text::escape_sql_string;
+use crate::sql_support::text::escape_sql_string;
 use crate::transaction::{PendingSemanticRow, PendingSemanticStorage};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, SqlDialect, Value};

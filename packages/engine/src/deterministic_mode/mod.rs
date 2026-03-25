@@ -10,10 +10,10 @@ use crate::schema::live_layout::{
     builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
     untracked_live_table_name,
 };
-use crate::sql::ast::utils::parse_sql_statements;
-use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
+use crate::sql_support::binding::parse_sql_statements;
+use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::sql::execution::preprocess::preprocess_statements_with_provider_to_plan as preprocess_statements_with_provider;
-use crate::sql::storage::sql_text::escape_sql_string;
+use crate::sql_support::text::escape_sql_string;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";

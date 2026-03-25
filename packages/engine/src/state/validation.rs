@@ -20,7 +20,7 @@ use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
     SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,
 };
-use crate::sql::ast::utils::bind_sql;
+use crate::sql_support::binding::bind_sql;
 use crate::sql::execution::contracts::planned_statement::{
     MutationOperation, MutationRow, UpdateValidationKind, UpdateValidationPlan,
 };

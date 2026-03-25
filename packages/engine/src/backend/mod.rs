@@ -1,6 +1,10 @@
+pub(crate) mod prepared;
+pub(crate) mod program;
+pub(crate) mod program_runner;
+
 use async_trait::async_trait;
 
-use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
+use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::{ImageChunkReader, ImageChunkWriter, LixError, QueryResult, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

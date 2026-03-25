@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::engine::{Engine, ExecuteOptions};
-use crate::sql::ast::utils::{
+use crate::sql_support::binding::{
     bind_statement_binding_template, compile_statement_binding_template_with_state,
     PlaceholderState, StatementBindingTemplate,
 };

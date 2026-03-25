@@ -1,17 +1,18 @@
 use crate::engine::{dedupe_filesystem_payload_domain_changes, Engine, TransactionBackendAdapter};
 use crate::filesystem::live_projection::FilesystemProjectionScope;
 use crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange;
-use crate::sql::execution::contracts::planned_statement::MutationRow;
-use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
-use crate::sql::public::planner::ir::OptionalTextPatch;
+use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::sql::public::planner::semantics::filesystem_queries::load_file_row_by_id_without_path;
 use crate::sql::storage::queries::{
     filesystem as filesystem_queries, history as history_queries, state as state_queries,
 };
 use crate::sql::storage::tables;
-use crate::state::internal::write_program::WriteProgram;
+use crate::backend::program::WriteProgram;
 use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
 use std::collections::{BTreeMap, BTreeSet};
+
+pub(crate) use crate::sql::execution::contracts::planned_statement::MutationRow;
+pub(crate) use crate::sql::public::planner::ir::OptionalTextPatch;
 
 const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";
 pub(crate) const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";

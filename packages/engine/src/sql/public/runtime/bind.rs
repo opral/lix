@@ -1,4 +1,4 @@
-use crate::sql::common::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::{Query, Statement, Value as SqlValue, VisitMut, VisitorMut};
 use std::collections::BTreeMap;

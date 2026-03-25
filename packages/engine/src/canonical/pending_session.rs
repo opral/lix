@@ -1,12 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::backend::program::WriteProgram;
+use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::canonical_json::CanonicalJson;
-use crate::execution_support::{
-    build_binary_blob_fastcdc_write_program, execute_write_program_with_transaction,
-    BinaryBlobWrite,
-};
+use crate::filesystem::runtime::{build_binary_blob_fastcdc_write_program, BinaryBlobWrite};
 use crate::functions::LixFunctionProvider;
-use crate::state::internal::write_program::WriteProgram;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
