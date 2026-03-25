@@ -1,18 +1,18 @@
-use std::collections::BTreeMap;
-
 use crate::live_state::{CanonicalWatermark, SchemaRegistration};
 use crate::{LixBackendTransaction, LixError};
 
+use super::contracts::SchemaRegistrationSet;
+
 pub(crate) struct TransactionCoordinator<'a> {
     backend_txn: Option<Box<dyn LixBackendTransaction + 'a>>,
-    registered_schemas: BTreeMap<String, SchemaRegistration>,
+    registered_schemas: SchemaRegistrationSet,
 }
 
 impl<'a> TransactionCoordinator<'a> {
     pub(crate) fn new(backend_txn: Box<dyn LixBackendTransaction + 'a>) -> Self {
         Self {
             backend_txn: Some(backend_txn),
-            registered_schemas: BTreeMap::new(),
+            registered_schemas: SchemaRegistrationSet::default(),
         }
     }
 
@@ -21,23 +21,14 @@ impl<'a> TransactionCoordinator<'a> {
         registration: impl Into<SchemaRegistration>,
     ) -> Result<(), LixError> {
         self.ensure_active()?;
-        let registration = registration.into();
-        self.registered_schemas
-            .insert(registration.schema_key().to_string(), registration);
+        self.registered_schemas.insert(registration);
         Ok(())
     }
 
     pub(crate) async fn register_staged_schemas(&mut self) -> Result<(), LixError> {
-        let registrations = self
-            .registered_schemas
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let registrations = self.registered_schemas.clone();
         let transaction = self.backend_transaction_mut()?;
-        for registration in registrations {
-            crate::live_state::register_schema_in_transaction(transaction, registration).await?;
-        }
-        Ok(())
+        apply_schema_registrations_in_transaction(transaction, &registrations).await
     }
 
     pub(crate) async fn finalize_live_state(&mut self) -> Result<CanonicalWatermark, LixError> {
@@ -88,4 +79,17 @@ impl<'a> TransactionCoordinator<'a> {
 
 pub(crate) fn inactive_error() -> LixError {
     LixError::new("LIX_ERROR_UNKNOWN", "transaction is no longer active")
+}
+
+pub(crate) async fn apply_schema_registrations_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    registrations: &SchemaRegistrationSet,
+) -> Result<(), LixError> {
+    if registrations.is_empty() {
+        return Ok(());
+    }
+    for registration in registrations.values().cloned() {
+        crate::live_state::register_schema_in_transaction(transaction, registration).await?;
+    }
+    Ok(())
 }

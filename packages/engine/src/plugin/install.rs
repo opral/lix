@@ -47,11 +47,12 @@ impl Engine {
 
         match install_result {
             Ok(()) => {
-                context.public_surface_registry_dirty = true;
-                context.installed_plugins_cache_invalidation_pending = true;
-                write_transaction
+                write_transaction.mark_public_surface_registry_refresh_pending();
+                write_transaction.mark_installed_plugins_cache_invalidation_pending();
+                let outcome = write_transaction
                     .commit_buffered_write(self, context)
                     .await?;
+                self.apply_transaction_commit_outcome(outcome).await?;
             }
             Err(error) => {
                 let _ = write_transaction.rollback_buffered_write().await;
