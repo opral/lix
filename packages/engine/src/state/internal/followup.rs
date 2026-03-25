@@ -25,12 +25,12 @@ use crate::{
 };
 
 use crate::sql::ast::lowering::lower_statement;
-use crate::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
-use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
+use crate::sql_support::binding::{bind_sql_with_state, PlaceholderState};
+use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::sql::execution::execute_prepared::execute_prepared_with_transaction;
-use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
-use crate::sql::storage::sql_text::escape_sql_string;
-use crate::state::internal::write_program::WriteProgram;
+use crate::backend::program_runner::execute_write_program_with_transaction;
+use crate::sql_support::text::escape_sql_string;
+use crate::backend::program::WriteProgram;
 use crate::state::internal::{PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "entity_id",

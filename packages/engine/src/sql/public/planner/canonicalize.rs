@@ -1,4 +1,4 @@
-use crate::sql::common::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::public::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
 use crate::sql::public::core::contracts::{BoundStatement, StatementKind};
 use crate::sql::public::planner::ir::{

@@ -3,25 +3,25 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
 };
+use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::canonical_json::CanonicalJson;
 use crate::deterministic_mode::build_persist_sequence_highest_sql;
-use crate::execution_support::{
+use crate::filesystem::runtime::{
     build_binary_blob_fastcdc_write_program, compile_filesystem_transaction_state_from_state,
-    execute_write_program_with_transaction,
-    filesystem_transaction_state_needs_exact_descriptors, live_snapshot_select_expr_for_schema,
-    with_exact_filesystem_descriptors, BinaryBlobWrite, ExactFilesystemDescriptorState,
-    FilesystemDescriptorState, FilesystemSemanticChange, FilesystemTransactionState, MutationRow,
-    OptionalTextPatch,
+    filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
+    BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
+    FilesystemSemanticChange, FilesystemTransactionState, MutationRow, OptionalTextPatch,
     FILESYSTEM_DESCRIPTOR_FILE_ID, FILESYSTEM_DESCRIPTOR_PLUGIN_KEY, FILESYSTEM_FILE_SCHEMA_KEY,
     FILESYSTEM_FILE_SCHEMA_VERSION,
 };
 #[cfg(test)]
-use crate::execution_support::{
-    collapse_prepared_batch_for_dialect, FilesystemTransactionFileState, PreparedBatch,
-};
+use crate::backend::prepared::{collapse_prepared_batch_for_dialect, PreparedBatch};
+#[cfg(test)]
+use crate::filesystem::runtime::FilesystemTransactionFileState;
 use crate::functions::LixFunctionProvider;
 use crate::key_value::key_value_schema_key;
 use crate::live_state::require_ready_in_transaction;
+use crate::live_state::shared::snapshot_sql::live_snapshot_select_expr_for_schema;
 use crate::schema::builtin::types::LixVersionRef;
 use crate::schema::live_layout::{
     builtin_live_table_layout, live_column_name_for_property, untracked_live_table_name,

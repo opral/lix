@@ -7,7 +7,7 @@ use crate::state::internal::InternalStatePlan;
 use crate::{LixError, Value};
 use sqlparser::ast::Expr;
 
-use super::prepared_statement::PreparedStatement;
+use crate::backend::prepared::PreparedStatement;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SchemaLiveTableRequirement {

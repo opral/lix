@@ -9,7 +9,7 @@ use crate::filesystem::history::{
 use crate::live_state::register_schema;
 use crate::schema::live_layout::LiveTableLayout;
 use crate::schema::registry::load_live_table_layout_with_backend;
-use crate::sql::common::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::public::catalog::SurfaceBinding;
 use crate::sql::public::planner::backend::lowerer::{
     lower_read_for_execution_with_layouts,

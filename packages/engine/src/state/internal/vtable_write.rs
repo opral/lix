@@ -18,9 +18,9 @@ use crate::schema::live_layout::{
     tracked_live_table_name, untracked_live_table_name, LiveColumnKind, LiveTableLayout,
 };
 use crate::schema::registry::load_live_table_layout_with_backend;
-use crate::sql::ast::utils::bind_statement_ast;
+use crate::sql_support::binding::bind_statement_ast;
 use crate::sql::execution::contracts::planned_statement::UpdateValidationKind;
-use crate::sql::execution::contracts::prepared_statement::PreparedStatement;
+use crate::backend::prepared::PreparedStatement;
 use crate::canonical::readers::CommitQueryExecutor;
 use crate::canonical::runtime::{
     build_prepared_batch_from_generate_commit_result_with_executor,
@@ -2045,7 +2045,7 @@ fn advance_placeholder_state_for_expr(
                 return std::ops::ControlFlow::Continue(());
             };
 
-            if let Err(error) = crate::sql::ast::utils::resolve_placeholder_index(
+            if let Err(error) = crate::sql_support::binding::resolve_placeholder_index(
                 token,
                 self.params_len,
                 self.state,

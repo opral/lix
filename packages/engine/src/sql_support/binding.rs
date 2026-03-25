@@ -8,7 +8,8 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-pub(crate) use crate::sql::common::placeholders::{resolve_placeholder_index, PlaceholderState};
+pub(crate) use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::sql_support::placeholders::{parse_placeholder_ref, resolve_placeholder_ref};
 use crate::{LixError, SqlDialect, Value};
 
 #[derive(Debug, Clone)]
@@ -347,7 +348,11 @@ impl VisitorMut for PlaceholderStateAdvancer<'_> {
         let SqlValue::Placeholder(token) = value else {
             return ControlFlow::Continue(());
         };
-        match resolve_placeholder_index(token, self.params_len, self.state) {
+        let placeholder = match parse_placeholder_ref(token) {
+            Ok(placeholder) => placeholder,
+            Err(error) => return ControlFlow::Break(error),
+        };
+        match resolve_placeholder_ref(placeholder, self.params_len, self.state) {
             Ok(_) => ControlFlow::Continue(()),
             Err(error) => ControlFlow::Break(error),
         }
@@ -361,7 +366,11 @@ impl VisitorMut for PlaceholderBinder<'_> {
         let SqlValue::Placeholder(token) = value else {
             return ControlFlow::Continue(());
         };
-        let source_index = match resolve_placeholder_index(token, self.params_len, self.state) {
+        let placeholder = match parse_placeholder_ref(token) {
+            Ok(placeholder) => placeholder,
+            Err(error) => return ControlFlow::Break(error),
+        };
+        let source_index = match resolve_placeholder_ref(placeholder, self.params_len, self.state) {
             Ok(index) => index,
             Err(error) => return ControlFlow::Break(error),
         };
@@ -415,7 +424,8 @@ fn resolve_expr(
 
     match &value.value {
         SqlValue::Placeholder(token) => {
-            let index = resolve_placeholder_index(token, params.len(), state)?;
+            let placeholder = parse_placeholder_ref(token)?;
+            let index = resolve_placeholder_ref(placeholder, params.len(), state)?;
             Ok(ResolvedCell {
                 value: Some(params[index].clone()),
                 placeholder_index: Some(index),

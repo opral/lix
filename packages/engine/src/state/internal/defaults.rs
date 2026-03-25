@@ -6,7 +6,7 @@ use crate::cel::CelEvaluator;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::defaults::apply_defaults_to_snapshot;
 use crate::schema::{OverlaySchemaProvider, SchemaKey, SchemaProvider};
-use crate::sql::ast::utils::{insert_values_rows_mut, resolve_insert_rows, ResolvedCell};
+use crate::sql_support::binding::{insert_values_rows_mut, resolve_insert_rows, ResolvedCell};
 use crate::sql::ast::walk::object_name_matches;
 use crate::{LixBackend, LixError, Value};
 
@@ -198,7 +198,7 @@ mod tests {
 
     use crate::cel::CelEvaluator;
     use crate::functions::{SharedFunctionProvider, SystemFunctionProvider};
-    use crate::sql::ast::utils::parse_sql_statements;
+    use crate::sql_support::binding::parse_sql_statements;
     use crate::{QueryResult, SqlDialect};
 
     use super::apply_vtable_insert_defaults;

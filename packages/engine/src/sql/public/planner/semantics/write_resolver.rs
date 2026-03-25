@@ -72,7 +72,7 @@ struct ResolvedWritePartitionBuilder {
     intended_post_state: Vec<PlannedStateRow>,
     tombstones: Vec<ResolvedRowRef>,
     lineage: Vec<RowLineage>,
-    filesystem_state: crate::sql::execution::runtime_effects::FilesystemTransactionState,
+    filesystem_state: crate::filesystem::runtime::FilesystemTransactionState,
 }
 
 impl ResolvedWritePartitionBuilder {

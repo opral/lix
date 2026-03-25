@@ -4,7 +4,7 @@ use crate::schema::live_layout::{normalized_live_column_values, tracked_live_tab
 use crate::schema::registry::{
     ensure_schema_live_table_in_transaction, load_live_table_layout_in_transaction,
 };
-use crate::sql::storage::sql_text::escape_sql_string;
+use crate::sql_support::text::escape_sql_string;
 use crate::state::live_state::{
     build_mark_live_state_ready_sql, build_set_live_state_mode_sql,
     load_latest_canonical_watermark_in_transaction, LiveStateMode,

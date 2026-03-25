@@ -1,5 +1,5 @@
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::sql::ast::utils::insert_values_rows_mut;
+use crate::sql_support::binding::insert_values_rows_mut;
 use crate::LixError;
 use sqlparser::ast::{
     Expr, ObjectName, ObjectNamePart, Statement, TableObject, Value as AstValue, ValueWithSpan,
@@ -8,6 +8,7 @@ use sqlparser::ast::{
 pub(crate) mod history;
 pub(crate) mod live_projection;
 pub(crate) mod path;
+pub(crate) mod runtime;
 
 pub(crate) fn statements_require_generated_filesystem_insert_ids(statements: &[Statement]) -> bool {
     statements

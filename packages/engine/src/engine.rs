@@ -474,7 +474,7 @@ pub(crate) struct TransactionBackendAdapter<'a> {
 
 #[derive(Default)]
 pub(crate) struct DeferredTransactionSideEffects {
-    pub(crate) filesystem_state: crate::sql::execution::runtime_effects::FilesystemTransactionState,
+    pub(crate) filesystem_state: crate::filesystem::runtime::FilesystemTransactionState,
 }
 
 pub(crate) fn reject_internal_table_writes(statements: &[Statement]) -> Result<(), LixError> {
@@ -817,7 +817,7 @@ mod tests {
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
     use crate::sql::analysis::state_resolution::effects::active_version_from_update_validations;
     use crate::sql::analysis::state_resolution::optimize::should_refresh_file_cache_for_statements;
-    use crate::sql::ast::utils::{
+    use crate::sql_support::binding::{
         advance_placeholder_state_for_statement_ast, bind_sql_with_state, parse_sql_statements,
         PlaceholderState,
     };

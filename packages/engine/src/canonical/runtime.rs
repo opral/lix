@@ -8,13 +8,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
 };
-use crate::execution_support::{
-    bind_statement_ast, escape_sql_string, PreparedBatch, PreparedStatement,
-};
+use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::functions::LixFunctionProvider;
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
 use crate::schema::live_layout::load_live_table_layout_with_executor;
 use crate::state::internal::quote_ident;
+use crate::sql_support::binding::bind_statement_ast;
+use crate::sql_support::text::escape_sql_string;
 
 use crate::schema::live_layout::{
     builtin_live_table_layout, normalized_live_column_values, tracked_live_table_name,

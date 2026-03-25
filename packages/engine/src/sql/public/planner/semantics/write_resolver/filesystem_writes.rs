@@ -4,8 +4,8 @@ use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
-use crate::sql::common::placeholders::{resolve_placeholder_index, PlaceholderState};
-use crate::sql::execution::runtime_effects::{
+use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::filesystem::runtime::{
     FilesystemDescriptorState, FilesystemTransactionFileState, FilesystemTransactionState,
 };
 use crate::sql::execution::shared_path::PendingTransactionView;

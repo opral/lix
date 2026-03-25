@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::engine::Engine;
-use crate::sql::common::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::public::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::sql::public::runtime::{
     decode_public_read_result, execute_prepared_public_read, finalize_public_write_execution,
@@ -12,7 +12,7 @@ use crate::sql::public::runtime::{
     try_prepare_public_write_with_registry, PreparedPublicExecution, PreparedPublicRead,
     PreparedPublicWrite, PublicWriteExecutionPartition,
 };
-use crate::sql::storage::sql_text::escape_sql_string;
+use crate::sql_support::text::escape_sql_string;
 use crate::state::validation::{validate_batch_local_write, validate_inserts, validate_updates};
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -32,7 +32,7 @@ use crate::sql::execution::intent::{
     collect_execution_intent_with_backend, ExecutionIntent, IntentCollectionPolicy,
 };
 use crate::sql::execution::preprocess::preprocess_with_surfaces_to_plan;
-use crate::sql::execution::runtime_effects::FilesystemTransactionFileState;
+use crate::filesystem::runtime::FilesystemTransactionFileState;
 use crate::transaction::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
     PendingSemanticRow, PendingSemanticStorage,
@@ -1605,7 +1605,7 @@ pub(crate) fn top_level_write_target_name(statement: &Statement) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::top_level_write_target_name;
-    use crate::sql::ast::utils::parse_sql_statements;
+    use crate::sql_support::binding::parse_sql_statements;
 
     #[test]
     fn detects_top_level_write_targets() {

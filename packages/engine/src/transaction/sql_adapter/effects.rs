@@ -1,6 +1,6 @@
 use crate::engine::{DeferredTransactionSideEffects, Engine, TransactionBackendAdapter};
 use crate::sql::execution::execution_program::ExecutionContext;
-use crate::sql::execution::runtime_effects::merge_filesystem_transaction_state;
+use crate::filesystem::runtime::merge_filesystem_transaction_state;
 use crate::sql::execution::shared_path::{
     self, prepared_execution_mutates_public_surface_registry, PendingTransactionView,
     PreparedPublicReadTransactionMode,
@@ -150,7 +150,7 @@ pub(super) async fn complete_sql_command_execution(
                 command.compiled.execution(),
             );
         let binary_blob_writes =
-            crate::sql::execution::runtime_effects::binary_blob_writes_from_filesystem_state(
+            crate::filesystem::runtime::binary_blob_writes_from_filesystem_state(
                 &command.compiled.execution().intent.filesystem_state,
             );
         if !filesystem_payload_changes_already_committed {

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
-use crate::state::internal::write_program::{
+use crate::backend::prepared::{PreparedBatch, PreparedStatement};
+use crate::backend::program::{
     PreparedParam, PreparedProgram, ProgramSlot, ProgramSlotId, SlotShape, WriteProgram, WriteStep,
 };
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
@@ -281,7 +281,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{execute_prepared_program_with_transaction, execute_write_program_with_backend};
-    use crate::state::internal::write_program::{
+    use crate::backend::program::{
         PreparedParam, PreparedProgram, PreparedStep, ProgramSlot, ProgramSlotId, SlotColumn,
         SlotShape, SlotValueType, WriteProgram,
     };

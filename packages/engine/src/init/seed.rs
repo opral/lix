@@ -17,7 +17,7 @@ use crate::schema::live_layout::{
 };
 use crate::sql::execution::execution_program::ExecutionContext;
 use crate::sql::execution::parse::parse_sql;
-use crate::sql::storage::sql_text::escape_sql_string;
+use crate::sql_support::text::escape_sql_string;
 use crate::state::checkpoint::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot, CHECKPOINT_LABEL_ID,
     CHECKPOINT_LABEL_NAME,

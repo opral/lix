@@ -12,7 +12,7 @@ use crate::sql::execution::contracts::executor_error::ExecutorError;
 use crate::sql::execution::contracts::planned_statement::{
     MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
-use crate::sql::execution::contracts::prepared_statement::PreparedStatement;
+use crate::backend::prepared::PreparedStatement;
 use crate::sql::execution::contracts::result_contract::ResultContract;
 use crate::canonical::pending_session::PendingPublicCommitSession;
 use crate::sql::execution::shared_path::{self, PendingTransactionView};

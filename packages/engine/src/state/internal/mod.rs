@@ -9,7 +9,6 @@ pub(crate) mod registered_schema;
 pub(crate) mod script;
 pub(crate) mod vtable_read;
 pub(crate) mod vtable_write;
-pub(crate) mod write_program;
 
 use crate::cel::CelEvaluator;
 use crate::functions::LixFunctionProvider;
@@ -26,8 +25,8 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use crate::sql::ast::lowering::lower_statement;
-pub(crate) use crate::sql::ast::utils::PlaceholderState;
-pub(crate) use crate::sql::ast::utils::{
+pub(crate) use crate::sql_support::binding::PlaceholderState;
+pub(crate) use crate::sql_support::binding::{
     resolve_expr_cell_with_state, ResolvedCell, RowSourceResolver,
 };
 pub(crate) use crate::sql::ast::walk::object_name_matches;
@@ -39,7 +38,7 @@ pub(crate) type MutationRow = crate::sql::execution::contracts::planned_statemen
 pub(crate) type UpdateValidationPlan =
     crate::sql::execution::contracts::planned_statement::UpdateValidationPlan;
 pub(crate) type PreparedStatement =
-    crate::sql::execution::contracts::prepared_statement::PreparedStatement;
+    crate::backend::prepared::PreparedStatement;
 use canonical_write as canonical;
 pub(crate) use postprocess::{PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
 
@@ -627,7 +626,7 @@ fn render_statements_with_params(
                 statement,
                 appended_params,
             } => {
-                let bound = crate::sql::ast::utils::bind_sql_with_state_and_appended_params(
+                let bound = crate::sql_support::binding::bind_sql_with_state_and_appended_params(
                     &statement.to_string(),
                     base_params,
                     appended_params.as_slice(),

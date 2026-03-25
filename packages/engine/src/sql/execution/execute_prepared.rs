@@ -1,4 +1,4 @@
-use crate::sql::execution::contracts::prepared_statement::PreparedStatement;
+use crate::backend::prepared::PreparedStatement;
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
 pub(crate) async fn execute_prepared_with_transaction(

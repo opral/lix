@@ -11,7 +11,7 @@ pub(crate) use crate::sql::execution::contracts::effects::{
 pub(crate) use crate::sql::execution::contracts::planned_statement::MutationRow;
 pub(crate) use crate::sql::execution::contracts::result_contract::ResultContract;
 pub(crate) use crate::sql::execution::execution_program::ExecutionContext;
-pub(crate) use crate::sql::execution::runtime_effects::{
+pub(crate) use crate::filesystem::runtime::{
     binary_blob_writes_from_filesystem_state, build_filesystem_payload_domain_changes_insert,
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
     FilesystemTransactionFileState, FilesystemTransactionState,
@@ -29,7 +29,7 @@ pub(crate) use crate::sql::public::runtime::{
     state_commit_stream_operation, PreparedPublicWrite, PublicWriteExecutionPartition,
     TrackedTxnUnit, UntrackedWriteExecution,
 };
-pub(crate) use crate::sql::storage::sql_text::escape_sql_string;
+pub(crate) use crate::sql_support::text::escape_sql_string;
 pub(crate) use crate::canonical::pending_session::{
     build_pending_public_commit_session, merge_public_domain_change_batch_into_pending_commit,
     pending_session_matches_create_commit, PendingPublicCommitSession,
