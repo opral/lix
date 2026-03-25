@@ -1,16 +1,14 @@
 use crate::engine::Engine;
 use crate::live_state::{CanonicalWatermark, SchemaRegistration};
-use crate::sql::execution::execution_program::{
-    execute_execution_program_with_write_transaction, ExecutionContext, ExecutionProgram,
-};
-use crate::sql::execution::shared_path::{PendingPublicCommitSession, PendingTransactionView};
-use crate::{ExecuteOptions, ExecuteResult, LixBackendTransaction, LixError};
+use crate::state::stream::StateCommitStreamChange;
+use crate::{LixBackendTransaction, LixError};
 
 use super::buffered_write_state::BufferedWriteState;
-use super::contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
+use super::contracts::{CommitOutcome, TransactionCommitOutcome, TransactionDelta, TransactionJournal};
 use super::coordinator::TransactionCoordinator;
 use super::live_state_write_state::LiveStateWriteState;
 use super::read_context::ReadContext;
+use super::sql_adapter::{ExecutionContext, PendingPublicCommitSession, PendingTransactionView};
 use super::write_plan::PlannedWriteDelta;
 
 pub struct WriteTransaction<'a> {
@@ -101,12 +99,20 @@ impl<'a> WriteTransaction<'a> {
         mut self,
         engine: &Engine,
         mut context: ExecutionContext,
-    ) -> Result<(), LixError> {
+    ) -> Result<TransactionCommitOutcome, LixError> {
+        let initial_active_version_id = context.active_version_id.clone();
         self.prepare_buffered_write_commit(engine, &mut context)
             .await?;
+        let mut outcome = self
+            .buffered_write_state()
+            .map(BufferedWriteState::commit_outcome)
+            .unwrap_or_default();
+        if context.active_version_id != initial_active_version_id {
+            outcome.next_active_version_id = Some(context.active_version_id.clone());
+        }
         self.finalize_live_state_for_commit().await?;
         self.coordinator.commit().await?;
-        engine.finalize_committed_execution_context(context).await
+        Ok(outcome)
     }
 
     pub async fn rollback(mut self) -> Result<(), LixError> {
@@ -131,7 +137,7 @@ impl<'a> WriteTransaction<'a> {
 
     pub(crate) fn buffered_write_pending_transaction_view(
         &self,
-    ) -> Result<Option<crate::sql::execution::shared_path::PendingTransactionView>, LixError> {
+    ) -> Result<Option<PendingTransactionView>, LixError> {
         self.buffered_write_state()?.pending_transaction_view()
     }
 
@@ -157,10 +163,16 @@ impl<'a> WriteTransaction<'a> {
 
     pub(crate) fn pending_public_commit_session_mut(
         &mut self,
-    ) -> &mut Option<crate::sql::execution::shared_path::PendingPublicCommitSession> {
+    ) -> &mut Option<PendingPublicCommitSession> {
         self.buffered_write_state_mut()
             .expect("pending_public_commit_session_mut only applies to the buffered write state")
             .pending_public_commit_session_mut()
+    }
+
+    pub(crate) fn buffered_write_commit_outcome_mut(&mut self) -> &mut TransactionCommitOutcome {
+        self.buffered_write_state_mut()
+            .expect("buffered_write_commit_outcome_mut only applies to the buffered write state")
+            .commit_outcome_mut()
     }
 
     pub(crate) async fn flush_buffered_write_journal(
@@ -168,6 +180,7 @@ impl<'a> WriteTransaction<'a> {
         engine: &Engine,
         context: &mut ExecutionContext,
     ) -> Result<(), LixError> {
+        self.coordinator.register_staged_schemas().await?;
         let transaction = self.coordinator.backend_transaction_mut()?;
         let write_state = self.buffered_write_state.as_mut().ok_or_else(|| {
             LixError::new(
@@ -183,6 +196,7 @@ impl<'a> WriteTransaction<'a> {
         engine: &Engine,
         context: &mut ExecutionContext,
     ) -> Result<(), LixError> {
+        self.coordinator.register_staged_schemas().await?;
         let transaction = self.coordinator.backend_transaction_mut()?;
         let write_state = self.buffered_write_state.as_mut().ok_or_else(|| {
             LixError::new(
@@ -193,6 +207,27 @@ impl<'a> WriteTransaction<'a> {
         write_state
             .prepare_commit(transaction, engine, context)
             .await
+    }
+
+    pub(crate) fn mark_public_surface_registry_refresh_pending(&mut self) {
+        if let Some(write_state) = self.buffered_write_state.as_mut() {
+            write_state.mark_public_surface_registry_refresh_pending();
+        }
+    }
+
+    pub(crate) fn mark_installed_plugins_cache_invalidation_pending(&mut self) {
+        if let Some(write_state) = self.buffered_write_state.as_mut() {
+            write_state.mark_installed_plugins_cache_invalidation_pending();
+        }
+    }
+
+    pub(crate) fn record_state_commit_stream_changes(
+        &mut self,
+        changes: Vec<StateCommitStreamChange>,
+    ) {
+        if let Some(write_state) = self.buffered_write_state.as_mut() {
+            write_state.record_state_commit_stream_changes(changes);
+        }
     }
 
     fn live_state_write_state(&self) -> Result<&LiveStateWriteState<'a>, LixError> {
@@ -291,38 +326,14 @@ impl<'tx> BorrowedWriteTransaction<'tx> {
             .flush(backend_txn, engine, context)
             .await
     }
-}
 
-pub(crate) async fn execute_program_with_new_write_transaction(
-    engine: &Engine,
-    program: &ExecutionProgram,
-    options: ExecuteOptions,
-    active_version_id: String,
-    allow_internal_tables: bool,
-) -> Result<ExecuteResult, LixError> {
-    let transaction = engine.begin_write_unit().await?;
-    let mut write_transaction = WriteTransaction::new_buffered_write(transaction);
-    let mut context = engine.new_execution_context_with_active_version(options, active_version_id);
-    let result = execute_execution_program_with_write_transaction(
-        engine,
-        &mut write_transaction,
-        program,
-        allow_internal_tables,
-        &mut context,
-    )
-    .await;
+    pub(crate) fn buffered_write_commit_outcome_mut(&mut self) -> &mut TransactionCommitOutcome {
+        self.buffered_write_state.commit_outcome_mut()
+    }
 
-    match result {
-        Ok(result) => {
-            write_transaction
-                .commit_buffered_write(engine, context)
-                .await?;
-            Ok(result)
-        }
-        Err(error) => {
-            let _ = write_transaction.rollback_buffered_write().await;
-            Err(error)
-        }
+    pub(crate) fn mark_installed_plugins_cache_invalidation_pending(&mut self) {
+        self.buffered_write_state
+            .mark_installed_plugins_cache_invalidation_pending();
     }
 }
 

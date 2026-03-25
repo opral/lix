@@ -322,9 +322,7 @@ async fn merge_version_in_transaction(
     .await
     .map_err(create_commit_error_to_lix_error)?;
 
-    tx.context
-        .pending_state_commit_stream_changes
-        .extend(stream_changes);
+    tx.record_state_commit_stream_changes(stream_changes)?;
 
     Ok(MergeVersionResult {
         outcome: MergeOutcome::MergeCommitted,

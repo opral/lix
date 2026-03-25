@@ -1,5 +1,9 @@
+use std::collections::BTreeMap;
+
+use crate::live_state::SchemaRegistration;
 use crate::live_state::tracked::{TrackedWriteOperation, TrackedWriteRow};
 use crate::live_state::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
+use crate::state::stream::StateCommitStreamChange;
 use crate::LixError;
 
 use super::write_plan::{WriteDelta, WriteJournal};
@@ -99,5 +103,58 @@ impl CommitOutcome {
             }
         }
         outcome
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SchemaRegistrationSet {
+    inner: BTreeMap<String, SchemaRegistration>,
+}
+
+impl SchemaRegistrationSet {
+    pub(crate) fn insert(&mut self, registration: impl Into<SchemaRegistration>) {
+        let registration = registration.into();
+        self.inner
+            .insert(registration.schema_key().to_string(), registration);
+    }
+
+    pub(crate) fn extend(&mut self, other: SchemaRegistrationSet) {
+        self.inner.extend(other.inner);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &SchemaRegistration> {
+        self.inner.values()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct TransactionCommitOutcome {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_active_version_id: Option<String>,
+    #[serde(default)]
+    pub invalidate_deterministic_settings_cache: bool,
+    #[serde(default)]
+    pub invalidate_installed_plugins_cache: bool,
+    #[serde(default)]
+    pub refresh_public_surface_registry: bool,
+    #[serde(default)]
+    pub state_commit_stream_changes: Vec<StateCommitStreamChange>,
+}
+
+impl TransactionCommitOutcome {
+    pub(crate) fn merge(&mut self, other: TransactionCommitOutcome) {
+        if other.next_active_version_id.is_some() {
+            self.next_active_version_id = other.next_active_version_id;
+        }
+        self.invalidate_deterministic_settings_cache |=
+            other.invalidate_deterministic_settings_cache;
+        self.invalidate_installed_plugins_cache |= other.invalidate_installed_plugins_cache;
+        self.refresh_public_surface_registry |= other.refresh_public_surface_registry;
+        self.state_commit_stream_changes
+            .extend(other.state_commit_stream_changes);
     }
 }

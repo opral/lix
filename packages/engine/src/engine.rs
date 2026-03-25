@@ -10,7 +10,9 @@ use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
 use crate::state::validation::SchemaCache;
-use crate::transaction::{execute_parsed_statements_in_write_transaction, WriteTransaction};
+use crate::transaction::{
+    execute_parsed_statements_in_write_transaction, TransactionCommitOutcome, WriteTransaction,
+};
 use crate::WasmRuntime;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use futures_util::FutureExt;
@@ -259,21 +261,24 @@ impl Engine {
             .store(INIT_STATE_NOT_STARTED, Ordering::SeqCst);
     }
 
-    pub(crate) async fn finalize_committed_execution_context(
+    pub(crate) async fn apply_transaction_commit_outcome(
         &self,
-        mut context: ExecutionContext,
+        mut outcome: TransactionCommitOutcome,
     ) -> Result<(), LixError> {
-        if context.active_version_changed {
-            self.set_active_version_id(std::mem::take(&mut context.active_version_id));
+        if let Some(version_id) = outcome.next_active_version_id.take() {
+            self.set_active_version_id(version_id);
         }
-        if context.installed_plugins_cache_invalidation_pending {
+        if outcome.invalidate_deterministic_settings_cache {
+            self.invalidate_deterministic_settings_cache();
+        }
+        if outcome.invalidate_installed_plugins_cache {
             self.invalidate_installed_plugins_cache()?;
         }
-        if context.public_surface_registry_dirty {
+        if outcome.refresh_public_surface_registry {
             self.refresh_public_surface_registry().await?;
         }
         self.emit_state_commit_stream_changes(std::mem::take(
-            &mut context.pending_state_commit_stream_changes,
+            &mut outcome.state_commit_stream_changes,
         ));
         Ok(())
     }
@@ -298,21 +303,17 @@ impl Engine {
         self.state_commit_stream_bus.emit(changes);
     }
 
-    pub(crate) fn maybe_invalidate_deterministic_settings_cache(
+    pub(crate) fn should_invalidate_deterministic_settings_cache(
         &self,
         mutations: &[MutationRow],
         state_commit_stream_changes: &[StateCommitStreamChange],
-    ) {
-        let touched = mutations.iter().any(|row| {
+    ) -> bool {
+        mutations.iter().any(|row| {
             row.schema_key == key_value_schema_key() && row.entity_id == deterministic_mode_key()
         }) || state_commit_stream_changes.iter().any(|change| {
             change.schema_key == key_value_schema_key()
                 && change.entity_id == deterministic_mode_key()
-        });
-
-        if touched {
-            self.invalidate_deterministic_settings_cache();
-        }
+        })
     }
 
     pub(crate) fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
@@ -331,6 +332,28 @@ impl Engine {
 }
 
 impl<'a> EngineTransaction<'a> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn mark_installed_plugins_cache_invalidation_pending(
+        &mut self,
+    ) -> Result<(), LixError> {
+        self.write_transaction
+            .as_mut()
+            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?
+            .mark_installed_plugins_cache_invalidation_pending();
+        Ok(())
+    }
+
+    pub(crate) fn record_state_commit_stream_changes(
+        &mut self,
+        changes: Vec<StateCommitStreamChange>,
+    ) -> Result<(), LixError> {
+        self.write_transaction
+            .as_mut()
+            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?
+            .record_state_commit_stream_changes(changes);
+        Ok(())
+    }
+
     pub async fn register_schema(&mut self, schema: &JsonValue) -> Result<(), LixError> {
         let snapshot = serde_json::json!({ "value": schema });
         let (schema_key, _) = schema_from_registered_snapshot(&snapshot)?;
@@ -407,9 +430,10 @@ impl<'a> EngineTransaction<'a> {
             self.engine
                 .new_execution_context(ExecuteOptions::default())?,
         );
-        write_transaction
+        let outcome = write_transaction
             .commit_buffered_write(self.engine, context)
-            .await
+            .await?;
+        self.engine.apply_transaction_commit_outcome(outcome).await
     }
 
     pub async fn rollback(mut self) -> Result<(), LixError> {
@@ -1038,7 +1062,8 @@ mod tests {
             .begin_transaction_with_options(ExecuteOptions::default())
             .await
             .expect("begin transaction");
-        tx.context.installed_plugins_cache_invalidation_pending = true;
+        tx.mark_installed_plugins_cache_invalidation_pending()
+            .expect("mark plugin cache invalidation");
 
         assert!(
             engine
@@ -1087,7 +1112,8 @@ mod tests {
             .begin_transaction_with_options(ExecuteOptions::default())
             .await
             .expect("begin transaction");
-        tx.context.installed_plugins_cache_invalidation_pending = true;
+        tx.mark_installed_plugins_cache_invalidation_pending()
+            .expect("mark plugin cache invalidation");
         tx.rollback().await.expect("rollback should succeed");
 
         assert!(!commit_called.load(Ordering::SeqCst));

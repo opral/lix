@@ -40,8 +40,7 @@ use crate::sql::execution::contracts::result_contract::ResultContract;
 use crate::sql::execution::derive_effects::derive_plan_effects;
 use crate::sql::execution::derive_requirements::derive_plan_requirements;
 use crate::sql::execution::execution_program::{
-    BoundStatementTemplateInstance, CompiledExecution, CompiledExecutionStep,
-    CompiledInternalExecution, SqlExecutionOutcome, StatementTemplateOwnership,
+    BoundStatementTemplateInstance, StatementTemplateOwnership,
 };
 use crate::sql::execution::intent::{
     collect_execution_intent_with_backend, ExecutionIntent, IntentCollectionPolicy,
@@ -55,6 +54,10 @@ use crate::state::internal::write_program::WriteProgram;
 use crate::transaction::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
     PendingSemanticRow, PendingSemanticStorage,
+};
+use crate::transaction::sql_adapter::{
+    CompiledExecution, CompiledExecutionBody, CompiledExecutionStep, CompiledInternalExecution,
+    SqlExecutionOutcome,
 };
 use crate::CanonicalJson;
 use serde_json::{json, Value as JsonValue};
@@ -477,18 +480,10 @@ async fn compile_execution_with_backend(
     }
 
     let body = match (public_read, public_write, internal_execution) {
-        (Some(public_read), None, None) => {
-            crate::sql::execution::execution_program::CompiledExecutionBody::PublicRead(public_read)
-        }
-        (None, Some(public_write), None) => {
-            crate::sql::execution::execution_program::CompiledExecutionBody::PublicWrite(
-                public_write,
-            )
-        }
+        (Some(public_read), None, None) => CompiledExecutionBody::PublicRead(public_read),
+        (None, Some(public_write), None) => CompiledExecutionBody::PublicWrite(public_write),
         (None, None, Some(internal_execution)) => {
-            crate::sql::execution::execution_program::CompiledExecutionBody::Internal(
-                internal_execution,
-            )
+            CompiledExecutionBody::Internal(internal_execution)
         }
         (public_read, public_write, internal_execution) => {
             return Err(LixError::new(

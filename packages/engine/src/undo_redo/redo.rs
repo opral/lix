@@ -160,8 +160,6 @@ async fn redo_in_transaction(
         )
     };
 
-    tx.context
-        .pending_state_commit_stream_changes
-        .extend(state_commit_stream_changes);
+    tx.record_state_commit_stream_changes(state_commit_stream_changes)?;
     Ok(result)
 }

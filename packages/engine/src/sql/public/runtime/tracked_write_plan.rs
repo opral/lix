@@ -1,7 +1,7 @@
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::functions::SharedFunctionProvider;
-use crate::sql::execution::execution_program::CompiledExecution;
 use crate::sql::execution::runtime_effects::FilesystemTransactionState;
+use crate::transaction::sql_adapter::CompiledExecution;
 
 use super::{PreparedPublicWrite, TrackedWriteExecution};
 
