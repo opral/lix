@@ -1,11 +1,10 @@
 use crate::engine::Engine;
 use crate::functions::LixFunctionProvider;
-use crate::sql::execution::shared_path::create_commit_error_to_lix_error;
-use crate::state::commit::{
-    create_commit, load_committed_version_head_commit_id_from_live_state, CreateCommitArgs,
-    CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitPreconditions,
-    CreateCommitWriteLane,
+use crate::canonical::append::{
+    append_tracked, CreateCommitArgs, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
+    CreateCommitPreconditions, CreateCommitWriteLane,
 };
+use crate::canonical::readers::load_committed_version_head_commit_id_from_live_state;
 use crate::{EngineTransaction, LixError};
 
 use super::store::insert_undo_redo_operation_in_transaction;
@@ -192,7 +191,7 @@ async fn undo_in_transaction(
                         version_id
                     ))
                 })?;
-        let create_result = create_commit(
+        let create_result = append_tracked(
             transaction,
             CreateCommitArgs {
                 timestamp: Some(timestamp.clone()),
@@ -215,8 +214,7 @@ async fn undo_in_transaction(
             &mut functions,
             None,
         )
-        .await
-        .map_err(create_commit_error_to_lix_error)?;
+        .await?;
         let inverse_commit_id = create_result.committed_head;
         insert_undo_redo_operation_in_transaction(
             transaction,

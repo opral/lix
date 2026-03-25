@@ -21,11 +21,12 @@ use crate::schema::registry::load_live_table_layout_with_backend;
 use crate::sql::ast::utils::bind_statement_ast;
 use crate::sql::execution::contracts::planned_statement::UpdateValidationKind;
 use crate::sql::execution::contracts::prepared_statement::PreparedStatement;
-use crate::state::commit::{
-    build_prepared_batch_from_generate_commit_result_with_executor, load_commit_active_accounts,
-    load_version_info_for_versions, CommitQueryExecutor,
+use crate::canonical::readers::CommitQueryExecutor;
+use crate::canonical::runtime::{
+    build_prepared_batch_from_generate_commit_result_with_executor,
+    generate_commit_result_from_domain_changes_with_executor,
 };
-use crate::state::commit::{generate_commit, DomainChangeInput, GenerateCommitArgs};
+use crate::canonical::DomainChangeInput;
 use crate::state::internal::param_context::{
     expr_last_identifier_eq, extract_string_column_values_from_expr, match_bool_column_equality,
 };
@@ -1298,25 +1299,22 @@ async fn rewrite_tracked_rows_with_backend(
     }
 
     let mut executor = BackendExecutor { backend };
-    let versions = load_version_info_for_versions(&mut executor, &affected_versions).await?;
-    let active_accounts = load_commit_active_accounts(&mut executor, &domain_changes).await?;
-    let mut commit_result = generate_commit(
-        GenerateCommitArgs {
-            timestamp: timestamp.clone(),
-            active_accounts,
-            changes: domain_changes,
-            versions,
-            force_commit_versions: BTreeSet::new(),
-        },
-        || functions.uuid_v7(),
-    )?;
+    let mut commit_result = generate_commit_result_from_domain_changes_with_executor(
+        &mut executor,
+        timestamp.clone(),
+        domain_changes,
+        &affected_versions,
+        functions,
+    )
+    .await?;
+    // Keep live-table requirements aligned with the generated tracked apply rows before
+    // returning the prepared batch steps.
     commit_result.derived_apply_input.live_layouts = load_live_layouts_for_rows_with_backend(
         backend,
         known_live_layouts,
         &commit_result.derived_apply_input.live_state_rows,
     )
     .await?;
-
     for row in &commit_result.derived_apply_input.live_state_rows {
         let layout = commit_result
             .derived_apply_input
@@ -1393,7 +1391,7 @@ async fn required_live_table_layout_for_schema_with_backend(
 async fn load_live_layouts_for_rows_with_backend(
     backend: &dyn LixBackend,
     known_live_layouts: &BTreeMap<String, crate::schema::live_layout::LiveTableLayout>,
-    rows: &[crate::state::commit::MaterializedStateRow],
+    rows: &[crate::canonical::MaterializedStateRow],
 ) -> Result<BTreeMap<String, crate::schema::live_layout::LiveTableLayout>, LixError> {
     let schema_keys = rows
         .iter()

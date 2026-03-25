@@ -22,7 +22,8 @@ use crate::state::checkpoint::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot, CHECKPOINT_LABEL_ID,
     CHECKPOINT_LABEL_NAME,
 };
-use crate::state::commit::{build_commit_generation_seed_sql, COMMIT_GRAPH_NODE_TABLE};
+use crate::canonical::graph::{build_commit_generation_seed_sql, COMMIT_GRAPH_NODE_TABLE};
+use crate::canonical::readers::load_committed_version_head_commit_id_from_live_state;
 use crate::transaction::{
     execute_parsed_statements_in_borrowed_write_transaction, BorrowedWriteTransaction,
 };
@@ -150,11 +151,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let mut backend =
             TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
         if let Some(commit_id) =
-            crate::state::commit::load_committed_version_head_commit_id_from_live_state(
-                &mut backend,
-                GLOBAL_VERSION_ID,
-            )
-            .await?
+            load_committed_version_head_commit_id_from_live_state(&mut backend, GLOBAL_VERSION_ID)
+                .await?
         {
             return Ok(Some(commit_id));
         }

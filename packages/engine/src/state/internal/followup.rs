@@ -9,7 +9,9 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::live_layout::{
     logical_live_snapshot_from_row_with_layout, tracked_live_table_name, untracked_live_table_name,
 };
-use crate::state::commit::{generate_commit, DomainChangeInput, GenerateCommitArgs};
+use crate::canonical::runtime::build_prepared_batch_from_domain_changes_with_executor;
+use crate::canonical::readers::CommitQueryExecutor;
+use crate::canonical::DomainChangeInput;
 use crate::state::stream::{
     state_commit_stream_changes_from_postprocess_rows, StateCommitStreamChange,
     StateCommitStreamOperation,
@@ -28,10 +30,6 @@ use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, Prepar
 use crate::sql::execution::execute_prepared::execute_prepared_with_transaction;
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::sql::storage::sql_text::escape_sql_string;
-use crate::state::commit::{
-    build_prepared_batch_from_generate_commit_result_with_executor, load_commit_active_accounts,
-    load_version_info_for_versions, CommitQueryExecutor,
-};
 use crate::state::internal::write_program::WriteProgram;
 use crate::state::internal::{PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
@@ -299,22 +297,11 @@ async fn build_update_followup_statement_batch(
     }
 
     let mut commit_executor = CommitExecutorAdapter { executor };
-    let versions = load_version_info_for_versions(&mut commit_executor, &affected_versions).await?;
-    let active_accounts =
-        load_commit_active_accounts(&mut commit_executor, &domain_changes).await?;
-    let commit_result = generate_commit(
-        GenerateCommitArgs {
-            timestamp,
-            active_accounts,
-            changes: domain_changes,
-            versions,
-            force_commit_versions: std::collections::BTreeSet::new(),
-        },
-        || functions.uuid_v7(),
-    )?;
-    build_prepared_batch_from_generate_commit_result_with_executor(
+    build_prepared_batch_from_domain_changes_with_executor(
         &mut commit_executor,
-        commit_result,
+        timestamp,
+        domain_changes,
+        &affected_versions,
         functions,
     )
     .await
@@ -429,22 +416,11 @@ async fn build_delete_followup_statement_batch(
     }
 
     let mut commit_executor = CommitExecutorAdapter { executor };
-    let versions = load_version_info_for_versions(&mut commit_executor, &affected_versions).await?;
-    let active_accounts =
-        load_commit_active_accounts(&mut commit_executor, &domain_changes).await?;
-    let commit_result = generate_commit(
-        GenerateCommitArgs {
-            timestamp,
-            active_accounts,
-            changes: domain_changes,
-            versions,
-            force_commit_versions: std::collections::BTreeSet::new(),
-        },
-        || functions.uuid_v7(),
-    )?;
-    build_prepared_batch_from_generate_commit_result_with_executor(
+    build_prepared_batch_from_domain_changes_with_executor(
         &mut commit_executor,
-        commit_result,
+        timestamp,
+        domain_changes,
+        &affected_versions,
         functions,
     )
     .await

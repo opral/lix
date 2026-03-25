@@ -2,9 +2,56 @@ use crate::sql::public::planner::ir::{
     CommitPreconditions, ExpectedHead, IdempotencyKey, MutationPayload, PlannedStateRow,
     PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode,
 };
-use crate::state::commit::ProposedDomainChange;
+use crate::change_view::TrackedDomainChangeView;
 use crate::{LixBackend, LixError};
 use serde_json::{json, Map, Value as JsonValue};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublicDomainChange {
+    pub(crate) entity_id: String,
+    pub(crate) schema_key: String,
+    pub(crate) schema_version: Option<String>,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
+    pub(crate) snapshot_content: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) version_id: String,
+    pub(crate) writer_key: Option<String>,
+}
+
+impl TrackedDomainChangeView for PublicDomainChange {
+    fn entity_id(&self) -> &str {
+        &self.entity_id
+    }
+
+    fn schema_key(&self) -> &str {
+        &self.schema_key
+    }
+
+    fn schema_version(&self) -> Option<&str> {
+        self.schema_version.as_deref()
+    }
+
+    fn file_id(&self) -> Option<&str> {
+        self.file_id.as_deref()
+    }
+
+    fn plugin_key(&self) -> Option<&str> {
+        self.plugin_key.as_deref()
+    }
+
+    fn snapshot_content(&self) -> Option<&str> {
+        self.snapshot_content.as_deref()
+    }
+
+    fn version_id(&self) -> &str {
+        &self.version_id
+    }
+
+    fn writer_key(&self) -> Option<&str> {
+        self.writer_key.as_deref()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SemanticEffect {
@@ -14,7 +61,7 @@ pub(crate) struct SemanticEffect {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DomainChangeBatch {
-    pub(crate) changes: Vec<ProposedDomainChange>,
+    pub(crate) changes: Vec<PublicDomainChange>,
     pub(crate) write_lane: WriteLane,
     pub(crate) writer_key: Option<String>,
     pub(crate) semantic_effects: Vec<SemanticEffect>,
@@ -109,34 +156,53 @@ fn build_domain_change_batch_for_partition(
         } else {
             "state.upsert"
         };
-        changes.push(ProposedDomainChange {
-            entity_id: require_identity(row.entity_id.clone(), "public domain-change entity_id")?,
-            schema_key: require_identity(
+        changes.push(PublicDomainChange {
+            entity_id: require_identity::<crate::EntityId>(
+                row.entity_id.clone(),
+                "public domain-change entity_id",
+            )?
+            .into_inner(),
+            schema_key: require_identity::<crate::CanonicalSchemaKey>(
                 row.schema_key.clone(),
                 "public domain-change schema_key",
-            )?,
+            )?
+            .into_inner(),
             schema_version: text_value(&row.values, "schema_version")
-                .map(|value| require_identity(value, "public domain-change schema_version"))
-                .transpose()?,
+                .map(|value| {
+                    require_identity::<crate::CanonicalSchemaVersion>(
+                        value,
+                        "public domain-change schema_version",
+                    )
+                })
+                .transpose()?
+                .map(|value| value.into_inner()),
             file_id: text_value(&row.values, "file_id")
-                .map(|value| require_identity(value, "public domain-change file_id"))
-                .transpose()?,
+                .map(|value| require_identity::<crate::FileId>(value, "public domain-change file_id"))
+                .transpose()?
+                .map(|value| value.into_inner()),
             plugin_key: text_value(&row.values, "plugin_key")
-                .map(|value| require_identity(value, "public domain-change plugin_key"))
-                .transpose()?,
+                .map(|value| {
+                    require_identity::<crate::CanonicalPluginKey>(
+                        value,
+                        "public domain-change plugin_key",
+                    )
+                })
+                .transpose()?
+                .map(|value| value.into_inner()),
             snapshot_content: if row.tombstone {
                 None
             } else {
                 serialized_value(&row.values, "snapshot_content")
             },
             metadata: serialized_value(&row.values, "metadata"),
-            version_id: require_identity(
+            version_id: require_identity::<crate::VersionId>(
                 row.version_id.clone().ok_or_else(|| DomainChangeError {
                     message: "public domain-change derivation requires a concrete version_id"
                         .to_string(),
                 })?,
                 "public domain-change version_id",
-            )?,
+            )?
+            .into_inner(),
             writer_key,
         });
         semantic_effects.push(SemanticEffect {

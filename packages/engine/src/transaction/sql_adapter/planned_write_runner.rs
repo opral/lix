@@ -2,28 +2,63 @@ use std::collections::BTreeSet;
 
 use crate::deterministic_mode::DeterministicSettings;
 use crate::engine::Engine;
+use crate::engine::TransactionBackendAdapter;
 use crate::functions::LixFunctionProvider;
 use crate::schema::live_layout::{normalized_live_column_values, tracked_live_table_name};
 use crate::schema::registry::load_live_table_layout_in_transaction;
-use crate::state::commit::{
-    create_commit, CreateCommitArgs, CreateCommitDisposition, CreateCommitInvariantChecker,
-    CreateCommitWriteLane,
+use crate::state::validation::{validate_commit_time_write, SchemaCache};
+use crate::canonical::append::{
+    append_tracked, CreateCommitArgs, CreateCommitDisposition, CreateCommitError,
+    CreateCommitErrorKind, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
+    CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
 };
+use crate::canonical::pending_session::create_commit_error_to_lix_error;
+use crate::canonical::ProposedDomainChange;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
 use super::{
     apply_public_version_last_checkpoint_side_effects, binary_blob_writes_from_filesystem_state,
     build_filesystem_payload_domain_changes_insert, build_pending_public_commit_session,
-    create_commit_error_to_lix_error, empty_public_write_execution_outcome, escape_sql_string,
+    empty_public_write_execution_outcome, escape_sql_string,
     execute_internal_execution_with_transaction,
     merge_public_domain_change_batch_into_pending_commit,
     mirror_public_registered_schema_bootstrap_rows, pending_session_matches_create_commit,
     semantic_plan_effects_from_domain_changes, state_commit_stream_operation, DomainChangeBatch,
     PendingPublicCommitSession, PlanEffects, PlannedInternalWriteUnit,
     PlannedPublicUntrackedWriteUnit, PlannedStateRow, PlannedWriteDelta, PlannedWriteUnit,
-    PublicCommitInvariantChecker, SqlExecutionOutcome, WriteLane,
+    SqlExecutionOutcome, WriteLane,
 };
+
+struct PublicCommitInvariantChecker<'a> {
+    planned_write: &'a crate::sql::public::planner::ir::PlannedWrite,
+    schema_cache: SchemaCache,
+}
+
+impl<'a> PublicCommitInvariantChecker<'a> {
+    fn new(planned_write: &'a crate::sql::public::planner::ir::PlannedWrite) -> Self {
+        Self {
+            planned_write,
+            schema_cache: SchemaCache::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl CreateCommitInvariantChecker for PublicCommitInvariantChecker<'_> {
+    async fn recheck_invariants(
+        &mut self,
+        transaction: &mut dyn LixBackendTransaction,
+    ) -> Result<(), CreateCommitError> {
+        let backend = TransactionBackendAdapter::new(transaction);
+        validate_commit_time_write(&backend, &self.schema_cache, self.planned_write)
+            .await
+            .map_err(|error| CreateCommitError {
+                kind: CreateCommitErrorKind::Internal,
+                message: error.description,
+            })
+    }
+}
 
 pub(crate) async fn execute_planned_write_delta(
     engine: &Engine,
@@ -78,10 +113,11 @@ async fn materialize_tracked_append_phase(
     }
 
     let mut create_commit_functions = unit.functions.clone();
+    let canonical_preconditions = canonical_create_commit_preconditions_for_tracked_unit(unit)?;
     if let Some(session_slot) = pending_commit_session.as_mut() {
         let can_merge = !unit.has_compiler_only_filesystem_changes()
             && session_slot.as_ref().is_some_and(|session| {
-                pending_session_matches_create_commit(session, &unit.execution.create_preconditions)
+                pending_session_matches_create_commit(session, &canonical_preconditions)
             });
         if can_merge {
             let binary_blob_writes =
@@ -102,13 +138,17 @@ async fn materialize_tracked_append_phase(
             let session = session_slot
                 .as_mut()
                 .expect("session should exist when can_merge is true");
+            let merged_changes = public_domain_changes_to_proposed(
+                &unit.execution
+                    .domain_change_batch
+                    .as_ref()
+                    .expect("merged tracked writes should have a domain change batch")
+                    .changes,
+            )?;
             merge_public_domain_change_batch_into_pending_commit(
                 transaction,
                 session,
-                unit.execution
-                    .domain_change_batch
-                    .as_ref()
-                    .expect("merged tracked writes should have a domain change batch"),
+                &merged_changes,
                 &binary_blob_writes,
                 &mut create_commit_functions,
                 &timestamp,
@@ -150,7 +190,7 @@ async fn materialize_tracked_append_phase(
     } else {
         Some(&mut invariant_checker as &mut dyn CreateCommitInvariantChecker)
     };
-    let create_result = create_commit(
+    let create_result = append_tracked(
         transaction,
         CreateCommitArgs {
             timestamp: None,
@@ -158,10 +198,11 @@ async fn materialize_tracked_append_phase(
                 .execution
                 .domain_change_batch
                 .as_ref()
-                .map(|batch| batch.changes.clone())
+                .map(|batch| public_domain_changes_to_proposed(&batch.changes))
+                .transpose()?
                 .unwrap_or_default(),
             filesystem_state: unit.filesystem_state.clone(),
-            preconditions: unit.execution.create_preconditions.clone(),
+            preconditions: canonical_preconditions.clone(),
             lane_parent_commit_ids_override: None,
             allow_empty_commit: false,
             should_emit_observe_tick: unit.should_emit_observe_tick(),
@@ -171,18 +212,11 @@ async fn materialize_tracked_append_phase(
         &mut create_commit_functions,
         invariant_checker,
     )
-    .await
-    .map_err(create_commit_error_to_lix_error)?;
+    .await?;
 
     if let Some(applied_output) = create_result.applied_output.as_ref() {
-        mirror_public_registered_schema_bootstrap_rows(
-            transaction,
-            &crate::state::commit::GenerateCommitResult {
-                canonical_output: applied_output.canonical_output.clone(),
-                derived_apply_input: applied_output.derived_apply_input.clone(),
-            },
-        )
-        .await
+        mirror_public_registered_schema_bootstrap_rows(transaction, applied_output)
+            .await
         .map_err(|error| LixError {
             code: error.code,
             description: format!(
@@ -195,17 +229,22 @@ async fn materialize_tracked_append_phase(
     let applied_domain_change_batch =
         if matches!(create_result.disposition, CreateCommitDisposition::Applied) {
             Some(DomainChangeBatch {
-                changes: create_result.applied_domain_changes.clone(),
+                changes: public_domain_changes_from_proposed(&create_result.applied_domain_changes),
                 write_lane: unit
                     .execution
                     .domain_change_batch
                     .as_ref()
                     .map(|batch| batch.write_lane.clone())
                     .unwrap_or_else(|| match &unit.execution.create_preconditions.write_lane {
-                        CreateCommitWriteLane::Version(version_id) => {
+                        crate::sql::public::planner::ir::WriteLane::SingleVersion(version_id) => {
                             WriteLane::SingleVersion(version_id.clone())
                         }
-                        CreateCommitWriteLane::GlobalAdmin => WriteLane::GlobalAdmin,
+                        crate::sql::public::planner::ir::WriteLane::ActiveVersion => {
+                            WriteLane::ActiveVersion
+                        }
+                        crate::sql::public::planner::ir::WriteLane::GlobalAdmin => {
+                            WriteLane::GlobalAdmin
+                        }
                     }),
                 writer_key: unit
                     .execution
@@ -249,11 +288,8 @@ async fn materialize_tracked_append_phase(
                 Some(
                     build_pending_public_commit_session(
                         transaction,
-                        unit.execution.create_preconditions.write_lane.clone(),
-                        &crate::state::commit::GenerateCommitResult {
-                            canonical_output: applied_output.canonical_output.clone(),
-                            derived_apply_input: applied_output.derived_apply_input.clone(),
-                        },
+                        canonical_preconditions.write_lane.clone(),
+                        applied_output,
                     )
                     .await?,
                 )
@@ -718,4 +754,127 @@ async fn persist_filesystem_payload_domain_changes_direct(
     }
 
     Ok(())
+}
+
+fn canonical_create_commit_preconditions_for_tracked_unit(
+    unit: &super::TrackedTxnUnit,
+) -> Result<CreateCommitPreconditions, LixError> {
+    canonical_create_commit_preconditions_from_public_write(
+        &unit.execution.create_preconditions,
+        unit.execution.domain_change_batch.as_ref(),
+        &unit.public_write,
+    )
+}
+
+fn canonical_create_commit_preconditions_from_public_write(
+    commit_preconditions: &crate::sql::public::planner::ir::CommitPreconditions,
+    batch: Option<&DomainChangeBatch>,
+    public_write: &super::PreparedPublicWrite,
+) -> Result<CreateCommitPreconditions, LixError> {
+    let write_lane = match &commit_preconditions.write_lane {
+        crate::sql::public::planner::ir::WriteLane::SingleVersion(version_id) => {
+            CreateCommitWriteLane::Version(version_id.clone())
+        }
+        crate::sql::public::planner::ir::WriteLane::ActiveVersion => {
+            let version_id = batch
+                .into_iter()
+                .flat_map(|batch| batch.changes.first())
+                .map(|change| change.version_id.clone())
+                .next()
+                .or_else(|| {
+                    public_write
+                        .planned_write
+                        .command
+                        .execution_context
+                        .requested_version_id
+                        .clone()
+                })
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "public commit execution requires a concrete active version id",
+                    )
+                })?;
+            CreateCommitWriteLane::Version(version_id)
+        }
+        crate::sql::public::planner::ir::WriteLane::GlobalAdmin => {
+            CreateCommitWriteLane::GlobalAdmin
+        }
+    };
+    let expected_head = match &commit_preconditions.expected_head {
+        crate::sql::public::planner::ir::ExpectedHead::CurrentHead => {
+            CreateCommitExpectedHead::CurrentHead
+        }
+        crate::sql::public::planner::ir::ExpectedHead::CommitId(commit_id) => {
+            CreateCommitExpectedHead::CommitId(commit_id.clone())
+        }
+        crate::sql::public::planner::ir::ExpectedHead::CreateIfMissing => {
+            CreateCommitExpectedHead::CreateIfMissing
+        }
+    };
+
+    Ok(CreateCommitPreconditions {
+        write_lane,
+        expected_head,
+        idempotency_key: match &commit_preconditions.expected_head {
+            crate::sql::public::planner::ir::ExpectedHead::CurrentHead => {
+                CreateCommitIdempotencyKey::CurrentHeadFingerprint(
+                    commit_preconditions.idempotency_key.0.clone(),
+                )
+            }
+            _ => CreateCommitIdempotencyKey::Exact(commit_preconditions.idempotency_key.0.clone()),
+        },
+    })
+}
+
+fn public_domain_changes_to_proposed(
+    changes: &[crate::sql::public::planner::semantics::domain_changes::PublicDomainChange],
+) -> Result<Vec<ProposedDomainChange>, LixError> {
+    changes
+        .iter()
+        .map(public_domain_change_to_proposed)
+        .collect()
+}
+
+fn public_domain_change_to_proposed(
+    change: &crate::sql::public::planner::semantics::domain_changes::PublicDomainChange,
+) -> Result<ProposedDomainChange, LixError> {
+    Ok(ProposedDomainChange {
+        entity_id: crate::EntityId::new(change.entity_id.clone())?,
+        schema_key: crate::CanonicalSchemaKey::new(change.schema_key.clone())?,
+        schema_version: change
+            .schema_version
+            .clone()
+            .map(crate::CanonicalSchemaVersion::new)
+            .transpose()?,
+        file_id: change.file_id.clone().map(crate::FileId::new).transpose()?,
+        plugin_key: change
+            .plugin_key
+            .clone()
+            .map(crate::CanonicalPluginKey::new)
+            .transpose()?,
+        snapshot_content: change.snapshot_content.clone(),
+        metadata: change.metadata.clone(),
+        version_id: crate::VersionId::new(change.version_id.clone())?,
+        writer_key: change.writer_key.clone(),
+    })
+}
+
+fn public_domain_changes_from_proposed(
+    changes: &[ProposedDomainChange],
+) -> Vec<crate::sql::public::planner::semantics::domain_changes::PublicDomainChange> {
+    changes
+        .iter()
+        .map(|change| crate::sql::public::planner::semantics::domain_changes::PublicDomainChange {
+            entity_id: change.entity_id.to_string(),
+            schema_key: change.schema_key.to_string(),
+            schema_version: change.schema_version.as_ref().map(ToString::to_string),
+            file_id: change.file_id.as_ref().map(ToString::to_string),
+            plugin_key: change.plugin_key.as_ref().map(ToString::to_string),
+            snapshot_content: change.snapshot_content.clone(),
+            metadata: change.metadata.clone(),
+            version_id: change.version_id.to_string(),
+            writer_key: change.writer_key.clone(),
+        })
+        .collect()
 }
