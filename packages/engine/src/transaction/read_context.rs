@@ -16,7 +16,7 @@ use crate::live_state::untracked::{
 };
 use crate::LixError;
 
-use super::overlay::PendingTxnParticipants;
+use super::overlay::PendingWriteOverlay;
 
 pub struct ReadContext<'a> {
     base: ReadViews<'a>,
@@ -39,7 +39,7 @@ impl<'a> ReadContext<'a> {
 
     pub(crate) fn with_pending<'b>(
         &'b self,
-        pending: &'b PendingTxnParticipants,
+        pending: &'b PendingWriteOverlay,
     ) -> PendingReadContext<'b> {
         PendingReadContext {
             tracked: PendingTrackedReadView {
@@ -77,17 +77,17 @@ impl<'a> PendingReadContext<'a> {
 
 struct PendingTrackedReadView<'a> {
     base: &'a dyn TrackedReadView,
-    pending: &'a PendingTxnParticipants,
+    pending: &'a PendingWriteOverlay,
 }
 
 struct PendingUntrackedReadView<'a> {
     base: &'a dyn UntrackedReadView,
-    pending: &'a PendingTxnParticipants,
+    pending: &'a PendingWriteOverlay,
 }
 
 struct PendingTrackedTombstoneView<'a> {
     base: Option<&'a dyn TrackedTombstoneView>,
-    pending: &'a PendingTxnParticipants,
+    pending: &'a PendingWriteOverlay,
 }
 
 impl PendingTrackedTombstoneView<'_> {
@@ -361,7 +361,7 @@ fn sort_untracked_rows(rows: &mut [UntrackedRow]) {
 }
 
 fn pending_tracked_row<'a>(
-    pending: &'a PendingTxnParticipants,
+    pending: &'a PendingWriteOverlay,
     request: &ExactTrackedRowRequest,
 ) -> Option<&'a TrackedRow> {
     pending
@@ -372,7 +372,7 @@ fn pending_tracked_row<'a>(
 }
 
 fn pending_tracked_tombstone<'a>(
-    pending: &'a PendingTxnParticipants,
+    pending: &'a PendingWriteOverlay,
     request: &ExactTrackedRowRequest,
 ) -> Option<&'a TrackedTombstoneMarker> {
     pending
@@ -383,7 +383,7 @@ fn pending_tracked_tombstone<'a>(
 }
 
 fn pending_untracked_row<'a>(
-    pending: &'a PendingTxnParticipants,
+    pending: &'a PendingWriteOverlay,
     request: &ExactUntrackedRowRequest,
 ) -> Option<&'a UntrackedRow> {
     pending
@@ -394,7 +394,7 @@ fn pending_untracked_row<'a>(
 }
 
 fn pending_untracked_delete(
-    pending: &PendingTxnParticipants,
+    pending: &PendingWriteOverlay,
     request: &ExactUntrackedRowRequest,
 ) -> bool {
     pending

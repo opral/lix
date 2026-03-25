@@ -39,11 +39,7 @@ async fn undo_in_transaction(
     let engine = tx.engine;
     let version_id = resolve_target_version_id(tx, options.version_id.as_deref()).await?;
     let (result, state_commit_stream_changes) = {
-        let transaction = tx
-            .transaction
-            .as_mut()
-            .map(|transaction| transaction.as_mut())
-            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
+        let transaction = tx.backend_transaction_mut()?;
         let stacks = rebuild_semantic_undo_redo_stacks(transaction, &version_id).await?;
         let target_commit_id = stacks.undo_stack.last().cloned().ok_or_else(|| {
             LixError::new(

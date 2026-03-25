@@ -51,12 +51,7 @@ async fn ensure_version_exists(
     tx: &mut EngineTransaction<'_>,
     version_id: &str,
 ) -> Result<(), LixError> {
-    let transaction = tx
-        .transaction
-        .as_mut()
-        .map(|transaction| transaction.as_mut())
-        .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
-    let mut executor = transaction;
+    let mut executor = tx.backend_transaction_mut()?;
     let row = load_exact_row_with_executor(
         &mut executor,
         RawStorage::Tracked,

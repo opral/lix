@@ -7,8 +7,8 @@ use crate::schema::live_layout::{tracked_live_table_name, untracked_live_table_n
 use crate::sql::common::ast::{lower_statement, parse_sql_statements};
 use crate::sql::execution::runtime_effects::FilesystemTransactionFileState;
 use crate::sql::execution::shared_path::PendingTransactionView;
-use crate::sql::execution::write_txn_plan::{PendingSemanticRow, PendingSemanticStorage};
 use crate::sql::storage::sql_text::escape_sql_string;
+use crate::transaction::{PendingSemanticRow, PendingSemanticStorage};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, SqlDialect, Value};
 use serde_json::Value as JsonValue;

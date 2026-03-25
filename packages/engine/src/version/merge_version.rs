@@ -113,11 +113,7 @@ async fn merge_version_in_transaction(
         &target_version_id,
     )?;
 
-    let mut executor = tx
-        .transaction
-        .as_mut()
-        .map(|transaction| TransactionBackendAdapter::new(transaction.as_mut()))
-        .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
+    let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
 
     let source_depths = load_commit_depths(&mut executor, &source_head).await?;
     let target_depths = load_commit_depths(&mut executor, &target_head).await?;
@@ -148,14 +144,18 @@ async fn merge_version_in_transaction(
         )
         .await?;
 
-        let transaction = tx
-            .transaction
-            .as_mut()
-            .map(|transaction| transaction.as_mut())
-            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
-        tx.engine
-            .prepare_execution_context_for_commit(transaction, &mut tx.context)
-            .await?;
+        {
+            let engine = tx.engine;
+            let write_transaction = tx
+                .write_transaction
+                .as_mut()
+                .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
+            let context = &mut tx.context;
+            write_transaction
+                .prepare_buffered_write_commit(engine, context)
+                .await?;
+        }
+        let transaction = tx.backend_transaction_mut()?;
         let mut versions = BTreeSet::new();
         versions.insert(target_version_id.clone());
         let plan = {
@@ -286,17 +286,13 @@ async fn merge_version_in_transaction(
         ));
     }
 
-    let transaction = tx
-        .transaction
-        .as_mut()
-        .map(|transaction| transaction.as_mut())
-        .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
+    let engine = tx.engine;
+    let transaction = tx.backend_transaction_mut()?;
     let backend = TransactionBackendAdapter::new(transaction);
-    let (_settings, _sequence_start, functions) = tx
-        .engine
+    let (_settings, _sequence_start, functions) = engine
         .prepare_runtime_functions_with_backend(&backend, true)
         .await?;
-    tx.engine
+    engine
         .ensure_runtime_sequence_initialized_in_transaction(transaction, &functions)
         .await?;
     let mut functions = functions;

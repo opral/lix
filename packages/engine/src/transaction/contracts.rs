@@ -2,7 +2,7 @@ use crate::live_state::tracked::{TrackedWriteOperation, TrackedWriteRow};
 use crate::live_state::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
 use crate::LixError;
 
-use super::write_plan::{MutationJournal, TxnDelta};
+use super::write_plan::{WriteDelta, WriteJournal};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct TransactionDelta {
@@ -20,7 +20,7 @@ impl TransactionDelta {
 
 #[derive(Clone, Default)]
 pub struct TransactionJournal {
-    inner: MutationJournal,
+    inner: WriteJournal,
 }
 
 impl std::fmt::Debug for TransactionJournal {
@@ -38,7 +38,8 @@ impl TransactionJournal {
         if delta.is_empty() {
             return Ok(());
         }
-        self.inner.stage_delta(TxnDelta::from_public_delta(delta)?)
+        self.inner
+            .stage_delta(WriteDelta::from_public_delta(delta)?)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -57,7 +58,7 @@ impl TransactionJournal {
         self.inner.aggregated_public_delta()
     }
 
-    pub(crate) fn mutation_journal(&self) -> &MutationJournal {
+    pub(crate) fn write_journal(&self) -> &WriteJournal {
         &self.inner
     }
 }
