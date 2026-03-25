@@ -45,14 +45,7 @@ pub use errors::LixError;
 pub use identity::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
 };
-pub use lix::{InitResult, Lix, LixConfig};
-pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
-pub use sql::execution::contracts::prepared_statement::{
-    collapse_prepared_batch_for_dialect, PreparedBatch, PreparedStatement,
-};
-pub use state::checkpoint::CreateCheckpointResult;
-pub use state::image::{ImageChunkReader, ImageChunkWriter};
-pub use state::materialization::{
+pub use live_state::{
     apply_live_state_rebuild_plan, live_state_rebuild_plan, rebuild_live_state,
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
@@ -60,6 +53,13 @@ pub use state::materialization::{
     LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
     TraversedEdgeDebugRow, VersionAncestryDebugRow, VersionHeadDebugRow,
 };
+pub use lix::{InitResult, Lix, LixConfig};
+pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
+pub use sql::execution::contracts::prepared_statement::{
+    collapse_prepared_batch_for_dialect, PreparedBatch, PreparedStatement,
+};
+pub use state::checkpoint::CreateCheckpointResult;
+pub use state::image::{ImageChunkReader, ImageChunkWriter};
 pub use state::stream::{
     StateCommitStream, StateCommitStreamBatch, StateCommitStreamChange, StateCommitStreamFilter,
     StateCommitStreamOperation,

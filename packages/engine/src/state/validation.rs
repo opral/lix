@@ -9,14 +9,13 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use crate::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
-use crate::schema::live_layout::{
+use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
+use crate::live_state::raw::{scan_rows_with_backend, snapshot_json, RawRow, RawStorage};
+use crate::live_state::{
     is_untracked_live_table, load_live_row_access_for_table_name,
     load_live_row_access_with_backend, logical_snapshot_from_projected_row,
-    tracked_live_table_name, untracked_live_table_name,
 };
-use crate::schema::live_store::{
-    load_live_rows_with_executor, logical_snapshot_text, LiveRowScope,
-};
+use crate::schema::live_layout::{tracked_live_table_name, untracked_live_table_name};
 use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
     SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,
@@ -1658,52 +1657,42 @@ async fn query_committed_scope_rows(
         return Ok(Vec::new());
     }
     let access = load_live_row_access_with_backend(backend, &scope.schema_key).await?;
-    let scope_kind = match scope.storage {
-        ConstraintStorageKind::Tracked => LiveRowScope::Tracked,
-        ConstraintStorageKind::Untracked => LiveRowScope::Untracked,
-    };
-    let filters = BTreeMap::from([
-        ("version_id", scope.version_id.clone()),
-        ("file_id", scope.file_id.clone()),
-    ]);
-    let rows = load_live_rows_with_executor(
-        &mut &*backend,
-        scope_kind,
-        &scope.schema_key,
-        &filters,
-        &[],
-        None,
-    )
-    .await?;
+    let required_columns = access
+        .columns()
+        .iter()
+        .map(|column| column.property_name.clone())
+        .collect::<Vec<_>>();
+    let constraints = vec![ScanConstraint {
+        field: ScanField::FileId,
+        operator: ScanOperator::Eq(Value::Text(scope.file_id.clone())),
+    }];
 
-    rows.into_iter()
-        .map(|row| {
-            let snapshot = logical_snapshot_text(&access, &row)?
-                .map(|snapshot| serde_json::from_str(&snapshot))
-                .transpose()
-                .map_err(|error| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!(
-                            "failed to parse logical live snapshot for schema '{}': {error}",
-                            scope.schema_key
-                        ),
-                    )
-                })?
-                .unwrap_or(JsonValue::Object(JsonMap::new()));
-
-            Ok(ConstraintCommittedRow {
-                identity: ConstraintRowIdentity {
-                    entity_id: row.entity_id,
-                    schema_key: scope.schema_key.clone(),
-                    file_id: scope.file_id.clone(),
-                    version_id: scope.version_id.clone(),
-                },
-                schema_version: row.schema_version,
-                snapshot,
-            })
-        })
-        .collect()
+    match scope.storage {
+        ConstraintStorageKind::Tracked => scan_rows_with_backend(
+            backend,
+            RawStorage::Tracked,
+            &scope.schema_key,
+            &scope.version_id,
+            &constraints,
+            &required_columns,
+        )
+        .await?
+        .into_iter()
+        .map(|row| committed_row_from_raw(&scope.schema_key, &scope.version_id, &access, row))
+        .collect(),
+        ConstraintStorageKind::Untracked => scan_rows_with_backend(
+            backend,
+            RawStorage::Untracked,
+            &scope.schema_key,
+            &scope.version_id,
+            &constraints,
+            &required_columns,
+        )
+        .await?
+        .into_iter()
+        .map(|row| committed_row_from_raw(&scope.schema_key, &scope.version_id, &access, row))
+        .collect(),
+    }
 }
 
 async fn query_committed_schema_version_rows(
@@ -1718,49 +1707,56 @@ async fn query_committed_schema_version_rows(
         return Ok(Vec::new());
     }
     let access = load_live_row_access_with_backend(backend, &scope.schema_key).await?;
-    let scope_kind = match scope.storage {
-        ConstraintStorageKind::Tracked => LiveRowScope::Tracked,
-        ConstraintStorageKind::Untracked => LiveRowScope::Untracked,
-    };
-    let filters = BTreeMap::from([("version_id", scope.version_id.clone())]);
-    let rows = load_live_rows_with_executor(
-        &mut &*backend,
-        scope_kind,
-        &scope.schema_key,
-        &filters,
-        &[],
-        None,
-    )
-    .await?;
+    let required_columns = access
+        .columns()
+        .iter()
+        .map(|column| column.property_name.clone())
+        .collect::<Vec<_>>();
 
-    rows.into_iter()
-        .map(|row| {
-            let snapshot = logical_snapshot_text(&access, &row)?
-                .map(|snapshot| serde_json::from_str(&snapshot))
-                .transpose()
-                .map_err(|error| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!(
-                            "failed to parse logical live snapshot for schema '{}': {error}",
-                            scope.schema_key
-                        ),
-                    )
-                })?
-                .unwrap_or(JsonValue::Object(JsonMap::new()));
+    match scope.storage {
+        ConstraintStorageKind::Tracked => scan_rows_with_backend(
+            backend,
+            RawStorage::Tracked,
+            &scope.schema_key,
+            &scope.version_id,
+            &[],
+            &required_columns,
+        )
+        .await?
+        .into_iter()
+        .map(|row| committed_row_from_raw(&scope.schema_key, &scope.version_id, &access, row))
+        .collect(),
+        ConstraintStorageKind::Untracked => scan_rows_with_backend(
+            backend,
+            RawStorage::Untracked,
+            &scope.schema_key,
+            &scope.version_id,
+            &[],
+            &required_columns,
+        )
+        .await?
+        .into_iter()
+        .map(|row| committed_row_from_raw(&scope.schema_key, &scope.version_id, &access, row))
+        .collect(),
+    }
+}
 
-            Ok(ConstraintCommittedRow {
-                identity: ConstraintRowIdentity {
-                    entity_id: row.entity_id,
-                    schema_key: scope.schema_key.clone(),
-                    file_id: row.file_id,
-                    version_id: scope.version_id.clone(),
-                },
-                schema_version: row.schema_version,
-                snapshot,
-            })
-        })
-        .collect()
+fn committed_row_from_raw(
+    schema_key: &str,
+    version_id: &str,
+    access: &crate::live_state::LiveRowAccess,
+    row: RawRow,
+) -> Result<ConstraintCommittedRow, LixError> {
+    Ok(ConstraintCommittedRow {
+        identity: ConstraintRowIdentity {
+            entity_id: row.entity_id().to_string(),
+            schema_key: schema_key.to_string(),
+            file_id: row.file_id().to_string(),
+            version_id: version_id.to_string(),
+        },
+        schema_version: row.schema_version().to_string(),
+        snapshot: snapshot_json(access, &row)?,
+    })
 }
 
 async fn relation_exists(backend: &dyn LixBackend, relation_name: &str) -> Result<bool, LixError> {

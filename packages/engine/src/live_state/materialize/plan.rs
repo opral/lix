@@ -10,11 +10,14 @@ use super::types::{
     TraversedEdgeDebugRow, VersionAncestryDebugRow, VersionHeadDebugRow,
 };
 use crate::backend::QueryExecutor;
+use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
+use crate::live_state::raw::{scan_rows_with_executor, snapshot_text, RawStorage};
 use crate::schema::builtin::types::LixVersionRef;
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
-use crate::schema::live_store::load_untracked_live_rows_by_property_with_executor;
-use crate::version::GLOBAL_VERSION_ID;
-use crate::{CanonicalJson, LixBackend, LixError};
+use crate::version::{
+    version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id, GLOBAL_VERSION_ID,
+};
+use crate::{CanonicalJson, LixBackend, LixError, Value};
 
 #[derive(Debug, Clone)]
 struct VisibleRow {
@@ -773,24 +776,36 @@ async fn load_version_heads_from_untracked(
     warnings: &mut Vec<LiveStateRebuildWarning>,
     stats: &mut Vec<StageStat>,
 ) -> Result<BTreeMap<String, Vec<String>>, LixError> {
-    let rows = load_untracked_live_rows_by_property_with_executor(
-        executor,
-        "lix_version_ref",
-        "commit_id",
-        &BTreeMap::new(),
-        true,
-        &["entity_id"],
-    )
-    .await?;
-
     let access =
         crate::live_state::storage::load_live_row_access_with_executor(executor, "lix_version_ref")
             .await?;
+    let constraints = vec![ScanConstraint {
+        field: ScanField::FileId,
+        operator: ScanOperator::Eq(Value::Text(version_ref_file_id().to_string())),
+    }];
+    let required_columns = access
+        .columns()
+        .iter()
+        .map(|column| column.property_name.clone())
+        .collect::<Vec<_>>();
+    let rows = scan_rows_with_executor(
+        executor,
+        RawStorage::Untracked,
+        version_ref_schema_key(),
+        version_ref_storage_version_id(),
+        &constraints,
+        &required_columns,
+    )
+    .await?;
     let mut heads = BTreeMap::<String, Vec<String>>::new();
     for row in rows {
-        let Some(snapshot_raw) = logical_snapshot_text(&access, &row)? else {
+        if row.property_text("commit_id").is_none() {
             continue;
-        };
+        }
+        let snapshot_raw = snapshot_text(&access, &row)?;
+        if snapshot_raw.is_empty() {
+            continue;
+        }
         match serde_json::from_str::<LixVersionRef>(&snapshot_raw) {
             Ok(snapshot) if !snapshot.id.is_empty() && !snapshot.commit_id.is_empty() => {
                 heads
@@ -803,7 +818,8 @@ async fn load_version_heads_from_untracked(
                 code: "invalid_version_ref_snapshot".to_string(),
                 message: format!(
                     "untracked lix_version_ref '{}' has invalid snapshot JSON: {}",
-                    row.entity_id, error
+                    row.entity_id(),
+                    error
                 ),
             }),
         }
@@ -821,49 +837,6 @@ async fn load_version_heads_from_untracked(
     });
 
     Ok(heads)
-}
-
-fn logical_snapshot_text(
-    access: &crate::live_state::storage::LiveRowAccess,
-    row: &crate::schema::live_store::LoadedLiveRow,
-) -> Result<Option<String>, LixError> {
-    let mut object = serde_json::Map::new();
-    for column in access.columns() {
-        let Some(value) = row.values.get(&column.property_name) else {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                &format!(
-                    "loaded live row for schema '{}' missing property '{}'",
-                    row.schema_key, column.property_name
-                ),
-            ));
-        };
-        let json_value = crate::live_state::storage::json_value_from_live_row_cell(
-            value,
-            column.kind,
-            &row.schema_key,
-            &column.column_name,
-        )?;
-        if !json_value.is_null() {
-            object.insert(column.property_name.clone(), json_value);
-        }
-    }
-
-    if object.is_empty() {
-        return Ok(None);
-    }
-
-    serde_json::to_string(&serde_json::Value::Object(object))
-        .map(Some)
-        .map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                &format!(
-                    "failed to serialize logical live snapshot for schema '{}': {error}",
-                    row.schema_key
-                ),
-            )
-        })
 }
 
 fn resolve_projection_candidates(

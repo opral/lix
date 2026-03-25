@@ -133,6 +133,28 @@ where
 }
 
 #[async_trait(?Send)]
+impl<T> TrackedTombstoneView for T
+where
+    T: LixBackend,
+{
+    async fn load_exact_tombstone(
+        &self,
+        request: &ExactTrackedRowRequest,
+    ) -> Result<Option<TrackedTombstoneMarker>, LixError> {
+        let mut executor = self;
+        super::read::load_exact_tombstone_with_executor(&mut executor, request).await
+    }
+
+    async fn scan_tombstones(
+        &self,
+        request: &TrackedScanRequest,
+    ) -> Result<Vec<TrackedTombstoneMarker>, LixError> {
+        let mut executor = self;
+        super::read::scan_tombstones_with_executor(&mut executor, request).await
+    }
+}
+
+#[async_trait(?Send)]
 pub trait TrackedWriteParticipant {
     async fn apply_write_batch(&mut self, batch: &[TrackedWriteRow]) -> Result<(), LixError>;
 }

@@ -2,6 +2,7 @@ use sqlparser::ast::{
     Expr, Insert, Query, SetExpr, Statement, TableObject, Value as SqlValue, Values,
 };
 
+use crate::live_state::register_schema;
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::ast::utils::{bind_sql, parse_sql_statements};
 use crate::sql::ast::walk::object_name_matches;
@@ -38,7 +39,7 @@ pub(crate) async fn materialize_vtable_insert_select_sources(
             ))
             .await?;
             for schema_key in &rewritten_source.required_schema_keys {
-                crate::schema::registry::ensure_schema_live_table(backend, schema_key).await?;
+                register_schema(backend, schema_key.clone()).await?;
             }
             let lowered_source = lower_statement(
                 Statement::Query(Box::new(rewritten_source.query)),

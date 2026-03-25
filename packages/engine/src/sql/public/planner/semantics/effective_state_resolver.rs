@@ -1,9 +1,12 @@
-use crate::schema::live_layout::{
-    load_live_row_access_with_backend, normalized_live_column_values,
+use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
+use crate::live_state::raw::{
+    scan_rows_with_executor as scan_raw_rows_with_executor, RawRow, RawStorage,
 };
-use crate::schema::live_store::{
-    load_exact_live_row_with_executor, tracked_live_row_exists_with_executor, LiveRowScope,
+use crate::live_state::tracked::{
+    load_exact_tombstone_with_executor, scan_tombstones_with_executor, ExactTrackedRowRequest,
+    TrackedScanRequest, TrackedTombstoneMarker,
 };
+use crate::live_state::{load_live_row_access_with_backend, normalized_live_column_values};
 use crate::sql::common::dependency_spec::DependencySpec;
 use crate::sql::execution::shared_path::PendingTransactionView;
 use crate::sql::execution::write_txn_plan::{PendingSemanticRow, PendingSemanticStorage};
@@ -362,21 +365,32 @@ async fn tracked_exact_row_exists_including_tombstones(
     request: &ExactEffectiveStateRowRequest,
     version_id: &str,
 ) -> Result<bool, LixError> {
-    let mut filters = BTreeMap::from([("version_id", version_id.to_string())]);
-    for column in [
-        "entity_id",
-        "file_id",
-        "plugin_key",
-        "schema_version",
-        "writer_key",
-    ] {
-        if let Some(value) = row_key_text_value(&request.row_key, column) {
-            filters.insert(column, value.to_string());
-        }
+    let mut executor = backend;
+    let exact_request = ExactTrackedRowRequest {
+        schema_key: request.schema_key.clone(),
+        version_id: version_id.to_string(),
+        entity_id: request.row_key.entity_id.clone(),
+        file_id: request.row_key.file_id.clone(),
+    };
+    if let Some(tombstone) =
+        load_exact_tombstone_with_executor(&mut executor, &exact_request).await?
+    {
+        return Ok(tombstone_matches_row_key(&tombstone, &request.row_key));
     }
 
-    let mut executor = backend;
-    tracked_live_row_exists_with_executor(&mut executor, &request.schema_key, &filters).await
+    let tombstones = scan_tombstones_with_executor(
+        &mut executor,
+        &TrackedScanRequest {
+            schema_key: request.schema_key.clone(),
+            version_id: version_id.to_string(),
+            constraints: row_key_constraints(&request.row_key),
+            required_columns: Vec::new(),
+        },
+    )
+    .await?;
+    Ok(tombstones
+        .iter()
+        .any(|tombstone| tombstone_matches_row_key(tombstone, &request.row_key)))
 }
 
 async fn load_exact_tracked_effective_row(
@@ -498,61 +512,113 @@ async fn load_exact_untracked_state_row(
     executor: &mut dyn CommitQueryExecutor,
     request: &ExactUntrackedStateRowRequest,
 ) -> Result<Option<ExactUntrackedStateRow>, LixError> {
-    let mut filters = BTreeMap::from([("version_id", request.version_id.clone())]);
-    for column in [
-        "entity_id",
-        "file_id",
-        "plugin_key",
-        "schema_version",
-        "writer_key",
-    ] {
-        if let Some(value) = row_key_text_value(&request.row_key, column) {
-            filters.insert(column, value.to_string());
-        }
-    }
-
-    let Some(row) = load_exact_live_row_with_executor(
+    let mut rows = scan_raw_rows_with_executor(
         executor,
-        LiveRowScope::Untracked,
+        RawStorage::Untracked,
         &request.schema_key,
-        &filters,
+        &request.version_id,
+        &row_key_constraints(&request.row_key),
+        &[],
     )
-    .await?
-    else {
+    .await?;
+    rows.retain(|row| untracked_row_matches_row_key(row, &request.row_key));
+    let Some(row) = rows.into_iter().next() else {
         return Ok(None);
     };
 
     let mut values = BTreeMap::new();
-    values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
+    values.insert(
+        "entity_id".to_string(),
+        Value::Text(row.entity_id().to_string()),
+    );
     values.insert(
         "schema_key".to_string(),
-        Value::Text(row.schema_key.clone()),
+        Value::Text(row.schema_key().to_string()),
     );
     values.insert(
         "schema_version".to_string(),
-        Value::Text(row.schema_version.clone()),
+        Value::Text(row.schema_version().to_string()),
     );
-    values.insert("file_id".to_string(), Value::Text(row.file_id.clone()));
+    values.insert(
+        "file_id".to_string(),
+        Value::Text(row.file_id().to_string()),
+    );
     values.insert(
         "version_id".to_string(),
-        Value::Text(row.version_id.clone()),
+        Value::Text(row.version_id().to_string()),
     );
     values.insert(
         "plugin_key".to_string(),
-        Value::Text(row.plugin_key.clone()),
+        Value::Text(row.plugin_key().to_string()),
     );
-    if let Some(metadata) = row.metadata.clone() {
-        values.insert("metadata".to_string(), Value::Text(metadata));
+    if let Some(metadata) = row.metadata() {
+        values.insert("metadata".to_string(), Value::Text(metadata.to_string()));
     }
-    values.extend(row.values.clone());
+    values.extend(row.values().clone());
 
     Ok(Some(ExactUntrackedStateRow {
-        entity_id: row.entity_id,
-        schema_key: row.schema_key,
-        file_id: row.file_id,
-        version_id: row.version_id,
+        entity_id: row.entity_id().to_string(),
+        schema_key: row.schema_key().to_string(),
+        file_id: row.file_id().to_string(),
+        version_id: row.version_id().to_string(),
         values,
     }))
+}
+
+fn row_key_constraints(row_key: &CanonicalStateRowKey) -> Vec<ScanConstraint> {
+    let mut constraints = vec![ScanConstraint {
+        field: ScanField::EntityId,
+        operator: ScanOperator::Eq(Value::Text(row_key.entity_id.clone())),
+    }];
+    if let Some(file_id) = row_key.file_id.as_ref() {
+        constraints.push(ScanConstraint {
+            field: ScanField::FileId,
+            operator: ScanOperator::Eq(Value::Text(file_id.clone())),
+        });
+    }
+    if let Some(plugin_key) = row_key.plugin_key.as_ref() {
+        constraints.push(ScanConstraint {
+            field: ScanField::PluginKey,
+            operator: ScanOperator::Eq(Value::Text(plugin_key.clone())),
+        });
+    }
+    if let Some(schema_version) = row_key.schema_version.as_ref() {
+        constraints.push(ScanConstraint {
+            field: ScanField::SchemaVersion,
+            operator: ScanOperator::Eq(Value::Text(schema_version.clone())),
+        });
+    }
+    constraints
+}
+
+fn tombstone_matches_row_key(row: &TrackedTombstoneMarker, row_key: &CanonicalStateRowKey) -> bool {
+    row_key
+        .writer_key
+        .as_deref()
+        .is_none_or(|writer_key| row.writer_key.as_deref() == Some(writer_key))
+        && row_key
+            .plugin_key
+            .as_deref()
+            .is_none_or(|plugin_key| row.plugin_key.as_deref() == Some(plugin_key))
+        && row_key
+            .schema_version
+            .as_deref()
+            .is_none_or(|schema_version| row.schema_version.as_deref() == Some(schema_version))
+}
+
+fn untracked_row_matches_row_key(row: &RawRow, row_key: &CanonicalStateRowKey) -> bool {
+    row_key
+        .writer_key
+        .as_deref()
+        .is_none_or(|writer_key| row.writer_key() == Some(writer_key))
+        && row_key
+            .plugin_key
+            .as_deref()
+            .is_none_or(|plugin_key| row.plugin_key() == plugin_key)
+        && row_key
+            .schema_version
+            .as_deref()
+            .is_none_or(|schema_version| row.schema_version() == schema_version)
 }
 
 fn lane_matches_global_filter(lane: OverlayLane, requested_global: Option<bool>) -> bool {

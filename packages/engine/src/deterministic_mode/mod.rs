@@ -13,9 +13,7 @@ use crate::schema::live_layout::{
 use crate::sql::ast::utils::parse_sql_statements;
 use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
 use crate::sql::execution::preprocess::preprocess_statements_with_provider_to_plan as preprocess_statements_with_provider;
-use crate::sql::execution::write_program_runner::execute_write_program_with_backend;
 use crate::sql::storage::sql_text::escape_sql_string;
-use crate::state::internal::write_program::WriteProgram;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
@@ -175,22 +173,6 @@ pub(crate) fn parse_deterministic_settings_value(mode_value: &JsonValue) -> Dete
         timestamp_enabled,
         timestamp_shuffle_enabled,
     }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub async fn persist_sequence_highest(
-    backend: &dyn LixBackend,
-    highest_seen: i64,
-) -> Result<(), LixError> {
-    let batch = build_persist_sequence_highest_batch(highest_seen, backend.dialect())?;
-    let mut program = WriteProgram::new();
-    program.push_batch(batch);
-    match execute_write_program_with_backend(backend, program).await {
-        Ok(_) => {}
-        Err(err) if is_missing_relation_error(&err) => return Ok(()),
-        Err(err) => return Err(err),
-    }
-    Ok(())
 }
 
 pub(crate) async fn load_runtime_settings(

@@ -3,7 +3,6 @@ pub(crate) mod defaults;
 mod definition;
 mod key;
 pub(crate) mod live_layout;
-pub(crate) mod live_store;
 mod overlay;
 mod provider;
 pub(crate) mod registry;

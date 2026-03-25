@@ -30,12 +30,9 @@ use crate::{
     LixBackendTransaction, LixError, QueryResult, Value, VersionId,
 };
 
-use crate::schema::live_layout::{
-    load_live_row_access_with_backend, normalized_live_column_values,
-};
-use crate::schema::live_store::{
-    load_live_rows_with_executor, logical_snapshot_text, LiveRowScope, LoadedLiveRow,
-};
+use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
+use crate::live_state::raw::{scan_rows_with_backend, snapshot_text, RawRow, RawStorage};
+use crate::live_state::{load_live_row_access_with_backend, normalized_live_column_values};
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::contracts::planned_statement::PlannedStatementSet;
 use crate::sql::execution::contracts::requirements::PlanRequirements;
@@ -691,6 +688,7 @@ pub(crate) fn prepared_public_read_transaction_mode(
 struct LiveTableOverlayQuery {
     storage: PendingSemanticStorage,
     schema_key: String,
+    version_id: String,
     projections: Vec<LiveProjection>,
     filters: Vec<LiveFilter>,
     order_by: Vec<LiveOrderClause>,
@@ -801,34 +799,38 @@ impl<'a> TransactionReadModel<'a> {
         query: &LiveTableOverlayQuery,
     ) -> Result<QueryResult, LixError> {
         let access = load_live_row_access_with_backend(self.base, &query.schema_key).await?;
-        let mut text_filters = BTreeMap::new();
-        for filter in &query.filters {
-            if let LiveFilter::Equals(column, value) = filter {
-                if let Some(text) = overlay_filter_text(value) {
-                    text_filters.insert(column.as_str(), text);
-                }
-            }
-        }
-        let mut rows = match load_live_rows_with_executor(
-            &mut &*self.base,
-            match query.storage {
-                PendingSemanticStorage::Tracked => LiveRowScope::Tracked,
-                PendingSemanticStorage::Untracked => LiveRowScope::Untracked,
-            },
-            &query.schema_key,
-            &text_filters,
-            &[],
-            None,
-        )
-        .await
-        {
-            Ok(rows) => rows,
-            Err(error) if error.description.contains("is not stored") => Vec::new(),
-            Err(error) => return Err(error),
-        }
-        .into_iter()
-        .map(|row| visible_live_row_from_loaded(&access, query.storage, row))
-        .collect::<Result<Vec<_>, _>>()?;
+        let constraints = scan_constraints_from_live_filters(&query.filters);
+        let required_columns = access
+            .columns()
+            .iter()
+            .map(|column| column.property_name.clone())
+            .collect::<Vec<_>>();
+        let mut rows = match query.storage {
+            PendingSemanticStorage::Tracked => scan_rows_with_backend(
+                self.base,
+                RawStorage::Tracked,
+                &query.schema_key,
+                &query.version_id,
+                &constraints,
+                &required_columns,
+            )
+            .await?
+            .into_iter()
+            .map(|row| visible_live_row_from_raw(&access, row))
+            .collect::<Result<Vec<_>, _>>()?,
+            PendingSemanticStorage::Untracked => scan_rows_with_backend(
+                self.base,
+                RawStorage::Untracked,
+                &query.schema_key,
+                &query.version_id,
+                &constraints,
+                &required_columns,
+            )
+            .await?
+            .into_iter()
+            .map(|row| visible_live_row_from_raw(&access, row))
+            .collect::<Result<Vec<_>, _>>()?,
+        };
         let mut by_identity = rows
             .drain(..)
             .map(|row| (visible_live_row_identity(&row), row))
@@ -905,7 +907,7 @@ impl<'a> TransactionReadModel<'a> {
     fn apply_filesystem_overlay_to_rows(
         &self,
         query: &LiveTableOverlayQuery,
-        access: &crate::schema::live_layout::LiveRowAccess,
+        access: &crate::live_state::LiveRowAccess,
         rows: &mut BTreeMap<OverlayVisibleLiveRowIdentity, OverlayVisibleLiveRow>,
     ) {
         let Some(overlay) = self.filesystem_overlay.as_ref() else {
@@ -1021,6 +1023,11 @@ fn live_table_query_from_prepared_public_read(
                     .then(|| request.schema_set.iter().next().cloned())
                     .flatten()
             })?,
+        version_id: structured_read
+            .bound_statement
+            .execution_context
+            .requested_version_id
+            .clone()?,
         projections: structured_read
             .query
             .projection
@@ -1293,32 +1300,28 @@ fn sql_value_as_engine_value(value: &sqlparser::ast::ValueWithSpan) -> Option<Va
     }
 }
 
-fn visible_live_row_from_loaded(
-    access: &crate::schema::live_layout::LiveRowAccess,
-    _storage: PendingSemanticStorage,
-    row: LoadedLiveRow,
+fn visible_live_row_from_raw(
+    access: &crate::live_state::LiveRowAccess,
+    row: RawRow,
 ) -> Result<OverlayVisibleLiveRow, LixError> {
-    let snapshot_content = logical_snapshot_text(access, &row)?;
+    let snapshot_content = snapshot_text(access, &row)?;
     Ok(OverlayVisibleLiveRow {
-        entity_id: row.entity_id,
-        schema_key: row.schema_key,
-        schema_version: row.schema_version,
-        file_id: row.file_id,
-        version_id: row.version_id,
-        plugin_key: row.plugin_key,
-        metadata: row.metadata,
-        change_id: row.change_id,
-        normalized_values: normalized_live_column_values(
-            access.layout(),
-            snapshot_content.as_deref(),
-        )?,
-        snapshot_content,
+        entity_id: row.entity_id().to_string(),
+        schema_key: row.schema_key().to_string(),
+        schema_version: row.schema_version().to_string(),
+        file_id: row.file_id().to_string(),
+        version_id: row.version_id().to_string(),
+        plugin_key: row.plugin_key().to_string(),
+        metadata: row.metadata().map(ToOwned::to_owned),
+        change_id: row.change_id().map(ToOwned::to_owned),
+        normalized_values: row.values().clone(),
+        snapshot_content: Some(snapshot_content),
         is_tombstone: false,
     })
 }
 
 fn visible_live_row_from_pending(
-    access: &crate::schema::live_layout::LiveRowAccess,
+    access: &crate::live_state::LiveRowAccess,
     row: &PendingSemanticRow,
 ) -> Result<OverlayVisibleLiveRow, LixError> {
     Ok(OverlayVisibleLiveRow {
@@ -1340,7 +1343,7 @@ fn visible_live_row_from_pending(
 }
 
 fn visible_live_row_from_pending_filesystem_state(
-    access: &crate::schema::live_layout::LiveRowAccess,
+    access: &crate::live_state::LiveRowAccess,
     row: &FilesystemTransactionFileState,
 ) -> Option<OverlayVisibleLiveRow> {
     let descriptor = row.descriptor.as_ref()?;
@@ -1382,6 +1385,28 @@ fn visible_live_row_identity(row: &OverlayVisibleLiveRow) -> OverlayVisibleLiveR
         version_id: row.version_id.clone(),
         plugin_key: row.plugin_key.clone(),
     }
+}
+
+fn scan_constraints_from_live_filters(filters: &[LiveFilter]) -> Vec<ScanConstraint> {
+    filters
+        .iter()
+        .filter_map(|filter| match filter {
+            LiveFilter::Equals(column, value) => {
+                let field = match column.as_str() {
+                    "entity_id" => ScanField::EntityId,
+                    "file_id" => ScanField::FileId,
+                    "plugin_key" => ScanField::PluginKey,
+                    "schema_version" => ScanField::SchemaVersion,
+                    _ => return None,
+                };
+                Some(ScanConstraint {
+                    field,
+                    operator: ScanOperator::Eq(value.clone()),
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn live_filter_matches_row(filter: &LiveFilter, row: &OverlayVisibleLiveRow) -> bool {

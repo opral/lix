@@ -1,6 +1,6 @@
+use crate::live_state::register_schema;
 use crate::schema::builtin::builtin_schema_keys;
 use crate::schema::live_layout::tracked_live_table_name;
-use crate::schema::registry::ensure_schema_live_table;
 use crate::sql::live_snapshot::live_snapshot_select_expr_for_schema;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
@@ -39,8 +39,6 @@ const INIT_STATEMENTS: &[&str] = &[
      ON lix_internal_commit_idempotency (commit_id)",
     "CREATE INDEX idx_lix_internal_commit_idempotency_legacy \
      ON lix_internal_commit_idempotency (write_lane, idempotency_key)",
-    crate::state::live_state::LIVE_STATE_STATUS_CREATE_TABLE_SQL,
-    crate::state::live_state::LIVE_STATE_STATUS_SEED_ROW_SQL,
     "CREATE TABLE lix_internal_registered_schema_bootstrap (\
      entity_id TEXT NOT NULL,\
      schema_key TEXT NOT NULL,\
@@ -268,7 +266,7 @@ async fn create_live_table_for_schema(
     backend: &dyn LixBackend,
     schema_key: &str,
 ) -> Result<(), LixError> {
-    ensure_schema_live_table(backend, schema_key).await
+    register_schema(backend, schema_key).await
 }
 
 async fn seed_registered_schema_bootstrap_rows(backend: &dyn LixBackend) -> Result<(), LixError> {

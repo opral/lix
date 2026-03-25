@@ -5,7 +5,7 @@ mod undo;
 
 use std::collections::BTreeMap;
 
-use crate::schema::live_store::{load_exact_live_row_with_executor, LiveRowScope};
+use crate::live_state::raw::{load_exact_row_with_executor, RawStorage};
 use crate::state::commit::ProposedDomainChange;
 use crate::state::commit::{
     load_canonical_change_row_by_id, load_committed_version_head_commit_id_from_live_state,
@@ -56,24 +56,20 @@ async fn ensure_version_exists(
         .as_mut()
         .map(|transaction| transaction.as_mut())
         .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
-    let mut executor = crate::engine::TransactionBackendAdapter::new(transaction);
-    let filters = BTreeMap::from([
-        ("entity_id", version_id.to_string()),
-        ("file_id", version_descriptor_file_id().to_string()),
-        ("plugin_key", version_descriptor_plugin_key().to_string()),
-        (
-            "version_id",
-            version_descriptor_storage_version_id().to_string(),
-        ),
-    ]);
-    let row = load_exact_live_row_with_executor(
+    let mut executor = transaction;
+    let row = load_exact_row_with_executor(
         &mut executor,
-        LiveRowScope::Tracked,
+        RawStorage::Tracked,
         version_descriptor_schema_key(),
-        &filters,
+        version_descriptor_storage_version_id(),
+        version_id,
+        Some(version_descriptor_file_id()),
     )
     .await?;
-    if row.is_none() {
+    if row
+        .as_ref()
+        .is_none_or(|row| row.plugin_key() != version_descriptor_plugin_key())
+    {
         return Err(LixError::unknown(format!(
             "version '{}' does not exist",
             version_id

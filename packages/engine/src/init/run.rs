@@ -1,10 +1,10 @@
 use std::time::Duration;
 
 use crate::engine::{Engine, TransactionBackendAdapter};
-use crate::state::live_state::{
-    load_latest_canonical_watermark, load_live_state_mode_with_backend,
-    mark_live_state_mode_with_backend, mark_live_state_ready_with_backend,
-    try_claim_live_state_bootstrap_with_backend, LiveStateMode, LIVE_STATE_STATUS_SEED_ROW_SQL,
+use crate::live_state::{
+    init as init_live_state, load_latest_canonical_watermark, load_mode_with_backend,
+    mark_mode_with_backend, mark_ready_with_backend, try_claim_bootstrap_with_backend,
+    LiveStateMode,
 };
 use crate::LixError;
 
@@ -14,9 +14,7 @@ use super::tables::{create_backend_tables, create_builtin_schema_tables};
 pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
     engine.try_mark_init_in_progress()?;
 
-    if load_live_state_mode_with_backend(engine.backend.as_ref()).await?
-        != LiveStateMode::Uninitialized
-    {
+    if load_mode_with_backend(engine.backend.as_ref()).await? != LiveStateMode::Uninitialized {
         engine.reset_init_state();
         return Err(crate::errors::already_initialized_error());
     }
@@ -29,10 +27,13 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             create_backend_tables(&backend)
                 .await
                 .map_err(|error| init_step_error("create_backend_tables", error))?;
+            init_live_state(&backend)
+                .await
+                .map_err(|error| init_step_error("live_state::init", error))?;
         }
         {
             let backend = TransactionBackendAdapter::new(transaction.as_mut());
-            if !claim_live_state_bootstrap_with_repair(&backend).await? {
+            if !try_claim_bootstrap_with_backend(&backend).await? {
                 return Err(crate::errors::already_initialized_error());
             }
         }
@@ -79,7 +80,7 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             .map_err(|error| init_step_error("seed_boot_account", error))?;
         {
             let backend = TransactionBackendAdapter::new(transaction.as_mut());
-            mark_live_state_mode_with_backend(&backend, LiveStateMode::Rebuilding)
+            mark_mode_with_backend(&backend, LiveStateMode::Rebuilding)
                 .await
                 .map_err(|error| init_step_error("mark_live_state_rebuilding", error))?;
             let watermark = load_latest_canonical_watermark(&backend)
@@ -90,7 +91,7 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
                         "initialize expected canonical watermark after bootstrap seeding",
                     )
                 })?;
-            mark_live_state_ready_with_backend(&backend, &watermark).await
+            mark_ready_with_backend(&backend, &watermark).await
         }
     }
     .await;
@@ -145,10 +146,7 @@ impl Engine {
     }
 
     async fn backend_has_been_initialized(&self) -> Result<bool, LixError> {
-        Ok(
-            load_live_state_mode_with_backend(self.backend.as_ref()).await?
-                != LiveStateMode::Uninitialized,
-        )
+        Ok(load_mode_with_backend(self.backend.as_ref()).await? != LiveStateMode::Uninitialized)
     }
 
     async fn normalize_init_error(&self, error: LixError) -> LixError {
@@ -169,7 +167,7 @@ impl Engine {
         const DELAY_MS: u64 = 50;
 
         for attempt in 0..ATTEMPTS {
-            match load_live_state_mode_with_backend(self.backend.as_ref()).await? {
+            match load_mode_with_backend(self.backend.as_ref()).await? {
                 LiveStateMode::Ready => return Ok(()),
                 LiveStateMode::Bootstrapping => {
                     if attempt + 1 == ATTEMPTS {
@@ -189,20 +187,6 @@ impl Engine {
         }
         Err(crate::errors::live_state_not_ready_error())
     }
-}
-
-async fn claim_live_state_bootstrap_with_repair(
-    backend: &dyn crate::LixBackend,
-) -> Result<bool, LixError> {
-    if try_claim_live_state_bootstrap_with_backend(backend).await? {
-        return Ok(true);
-    }
-    let mode = load_live_state_mode_with_backend(backend).await?;
-    if mode != LiveStateMode::Uninitialized {
-        return Ok(false);
-    }
-    backend.execute(LIVE_STATE_STATUS_SEED_ROW_SQL, &[]).await?;
-    try_claim_live_state_bootstrap_with_backend(backend).await
 }
 
 fn init_step_error(step: &str, error: LixError) -> LixError {

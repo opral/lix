@@ -62,7 +62,7 @@ impl<'a> WriteTransaction<'a> {
         self.ensure_active()?;
         let registration = registration.into();
         self.registered_schemas
-            .insert(registration.schema_key.clone(), registration);
+            .insert(registration.schema_key().to_string(), registration);
         Ok(())
     }
 

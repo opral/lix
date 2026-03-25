@@ -9,6 +9,7 @@ use crate::{LixBackend, LixError, Value};
 
 use super::contracts::{
     BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedRow, TrackedScanRequest,
+    TrackedTombstoneMarker,
 };
 
 pub async fn load_exact_row_with_backend(
@@ -64,6 +65,35 @@ pub(crate) async fn load_exact_row_with_executor(
     Ok(rows.into_iter().next())
 }
 
+pub(crate) async fn load_exact_tombstone_with_executor(
+    executor: &mut dyn QueryExecutor,
+    request: &ExactTrackedRowRequest,
+) -> Result<Option<TrackedTombstoneMarker>, LixError> {
+    let scan_request = TrackedScanRequest {
+        schema_key: request.schema_key.clone(),
+        version_id: request.version_id.clone(),
+        constraints: exact_row_constraints(request),
+        required_columns: Vec::new(),
+    };
+    let rows = scan_tombstones_with_limit_and_order(
+        executor,
+        &scan_request,
+        Some(2),
+        &["updated_at DESC", "created_at DESC", "change_id DESC"],
+    )
+    .await?;
+    if rows.len() > 1 {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            &format!(
+                "expected at most one tracked tombstone for schema '{}' entity '{}' version '{}'",
+                request.schema_key, request.entity_id, request.version_id
+            ),
+        ));
+    }
+    Ok(rows.into_iter().next())
+}
+
 pub(crate) async fn load_exact_rows_with_executor(
     executor: &mut dyn QueryExecutor,
     request: &BatchTrackedRowRequest,
@@ -91,6 +121,14 @@ pub(crate) async fn scan_rows_with_executor(
     request: &TrackedScanRequest,
 ) -> Result<Vec<TrackedRow>, LixError> {
     scan_rows_with_limit_and_order(executor, request, None, &["entity_id ASC", "file_id ASC"]).await
+}
+
+pub(crate) async fn scan_tombstones_with_executor(
+    executor: &mut dyn QueryExecutor,
+    request: &TrackedScanRequest,
+) -> Result<Vec<TrackedTombstoneMarker>, LixError> {
+    scan_tombstones_with_limit_and_order(executor, request, None, &["entity_id ASC", "file_id ASC"])
+        .await
 }
 
 async fn scan_rows_with_limit_and_order(
@@ -124,6 +162,37 @@ async fn scan_rows_with_limit_and_order(
         .rows
         .iter()
         .map(|row| decode_tracked_row(row, &selected_columns, &request.schema_key))
+        .collect()
+}
+
+async fn scan_tombstones_with_limit_and_order(
+    executor: &mut dyn QueryExecutor,
+    request: &TrackedScanRequest,
+    limit: Option<usize>,
+    order_by: &[&str],
+) -> Result<Vec<TrackedTombstoneMarker>, LixError> {
+    let sql = build_partitioned_scan_sql(ScanSqlRequest {
+        select_prefix:
+            "SELECT entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, change_id, writer_key, created_at, updated_at",
+        schema_key: &request.schema_key,
+        version_id: &request.version_id,
+        projection: "",
+        fixed_predicates: &["untracked = false", "is_tombstone = 1"],
+        constraints: &request.constraints,
+        order_by,
+        limit,
+    })?;
+
+    let result = match executor.execute(&sql, &[]).await {
+        Ok(result) => result,
+        Err(error) if is_missing_relation_error(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+
+    result
+        .rows
+        .iter()
+        .map(|row| decode_tracked_tombstone(row, &request.schema_key))
         .collect()
 }
 
@@ -173,5 +242,37 @@ fn decode_tracked_row(
         created_at,
         updated_at,
         values,
+    })
+}
+
+fn decode_tracked_tombstone(
+    row: &[Value],
+    schema_key: &str,
+) -> Result<TrackedTombstoneMarker, LixError> {
+    Ok(TrackedTombstoneMarker {
+        entity_id: required_text_cell(row, 0, schema_key, "entity_id", "tracked tombstone")?,
+        schema_key: required_text_cell(row, 1, schema_key, "schema_key", "tracked tombstone")?,
+        schema_version: Some(required_text_cell(
+            row,
+            2,
+            schema_key,
+            "schema_version",
+            "tracked tombstone",
+        )?),
+        file_id: required_text_cell(row, 3, schema_key, "file_id", "tracked tombstone")?,
+        version_id: required_text_cell(row, 4, schema_key, "version_id", "tracked tombstone")?,
+        global: required_bool_cell(row, 5, schema_key, "global", "tracked tombstone")?,
+        plugin_key: Some(required_text_cell(
+            row,
+            6,
+            schema_key,
+            "plugin_key",
+            "tracked tombstone",
+        )?),
+        metadata: row.get(7).and_then(text_from_value),
+        change_id: row.get(8).and_then(text_from_value),
+        writer_key: row.get(9).and_then(text_from_value),
+        created_at: row.get(10).and_then(text_from_value),
+        updated_at: row.get(11).and_then(text_from_value),
     })
 }

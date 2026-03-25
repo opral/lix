@@ -7,6 +7,7 @@ use crate::canonical_json::CanonicalJson;
 use crate::deterministic_mode::build_persist_sequence_highest_sql;
 use crate::functions::LixFunctionProvider;
 use crate::key_value::key_value_schema_key;
+use crate::live_state::require_ready_in_transaction;
 use crate::schema::builtin::types::LixVersionRef;
 use crate::schema::live_layout::{
     builtin_live_table_layout, live_column_name_for_property, untracked_live_table_name,
@@ -23,7 +24,6 @@ use crate::sql::execution::runtime_effects::{
 };
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
 use crate::sql::live_snapshot::live_snapshot_select_expr_for_schema;
-use crate::state::live_state::ensure_live_state_ready_in_transaction;
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::SqlDialect;
@@ -175,7 +175,7 @@ pub(crate) async fn create_commit(
 
     let concrete_lane = concrete_lane(&args.preconditions)?;
     validate_change_versions(&args.changes, &args.filesystem_state, &concrete_lane)?;
-    ensure_live_state_ready_in_transaction(transaction)
+    require_ready_in_transaction(transaction)
         .await
         .map_err(backend_error)?;
 
@@ -1486,18 +1486,34 @@ mod tests {
     use std::collections::HashMap;
 
     fn fake_version_ref_live_row(version_id: &str, commit_id: &str) -> Vec<Value> {
-        vec![
+        let snapshot = crate::version::version_ref_snapshot_content(version_id, commit_id);
+        let layout = builtin_live_table_layout(crate::version::version_ref_schema_key())
+            .expect("builtin layout should load")
+            .expect("version ref layout should exist");
+        let normalized = normalized_live_column_values(&layout, Some(&snapshot))
+            .expect("snapshot should normalize");
+        let mut row = vec![
             Value::Text(version_id.to_string()),
             Value::Text(crate::version::version_ref_schema_key().to_string()),
             Value::Text(crate::version::version_ref_schema_version().to_string()),
             Value::Text(crate::version::version_ref_file_id().to_string()),
             Value::Text(crate::version::version_ref_storage_version_id().to_string()),
+            Value::Boolean(true),
             Value::Text(crate::version::version_ref_plugin_key().to_string()),
             Value::Null,
             Value::Null,
-            Value::Text(commit_id.to_string()),
-            Value::Text(version_id.to_string()),
-        ]
+            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
+            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
+        ];
+        for column in &layout.columns {
+            row.push(
+                normalized
+                    .get(&column.column_name)
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+        }
+        row
     }
 
     fn fake_file_descriptor_live_row() -> Vec<Value> {
@@ -1521,9 +1537,13 @@ mod tests {
             Value::Text("1".to_string()),
             Value::Text("lix".to_string()),
             Value::Text("version-a".to_string()),
+            Value::Boolean(false),
             Value::Text("lix".to_string()),
             Value::Null,
             Value::Text("change-file-1".to_string()),
+            Value::Null,
+            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
+            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
         ];
         for column in &layout.columns {
             row.push(
@@ -1585,7 +1605,7 @@ mod tests {
                         ),
                         Value::Null,
                         Value::Null,
-                        Value::Text(crate::state::live_state::LIVE_STATE_SCHEMA_EPOCH.to_string()),
+                        Value::Text(crate::live_state::LIVE_STATE_SCHEMA_EPOCH.to_string()),
                     ]],
                     columns: vec![
                         "mode".to_string(),
@@ -1611,9 +1631,12 @@ mod tests {
                         "schema_version".to_string(),
                         "file_id".to_string(),
                         "version_id".to_string(),
+                        "global".to_string(),
                         "plugin_key".to_string(),
                         "metadata".to_string(),
-                        "change_id".to_string(),
+                        "writer_key".to_string(),
+                        "created_at".to_string(),
+                        "updated_at".to_string(),
                         "commit_id".to_string(),
                         "id".to_string(),
                     ],
@@ -1628,9 +1651,13 @@ mod tests {
                         "schema_version".to_string(),
                         "file_id".to_string(),
                         "version_id".to_string(),
+                        "global".to_string(),
                         "plugin_key".to_string(),
                         "metadata".to_string(),
                         "change_id".to_string(),
+                        "writer_key".to_string(),
+                        "created_at".to_string(),
+                        "updated_at".to_string(),
                         "directory_id".to_string(),
                         "extension".to_string(),
                         "hidden".to_string(),

@@ -2723,6 +2723,7 @@ mod tests {
         prepare_public_read_strict, DirectPublicReadPlan, PreparedPublicExecution,
         PreparedPublicReadExecution,
     };
+    use crate::schema::live_layout::{builtin_live_table_layout, normalized_live_column_values};
     use crate::state::history::StateHistoryRootScope;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
@@ -2941,9 +2942,12 @@ mod tests {
                         "schema_version".to_string(),
                         "file_id".to_string(),
                         "version_id".to_string(),
+                        "global".to_string(),
                         "plugin_key".to_string(),
                         "metadata".to_string(),
-                        "change_id".to_string(),
+                        "writer_key".to_string(),
+                        "created_at".to_string(),
+                        "updated_at".to_string(),
                         "commit_id".to_string(),
                         "id".to_string(),
                     ],
@@ -3217,24 +3221,33 @@ mod tests {
     }
 
     fn build_version_ref_live_row(version_id: &str, snapshot: &str) -> Vec<Value> {
-        let parsed: serde_json::Value =
-            serde_json::from_str(snapshot).expect("version ref test snapshot must be valid JSON");
-        let commit_id = parsed
-            .get("commit_id")
-            .and_then(serde_json::Value::as_str)
-            .expect("version ref test snapshot must include commit_id");
-        vec![
+        let layout = builtin_live_table_layout(crate::version::version_ref_schema_key())
+            .expect("builtin layout should load")
+            .expect("version ref layout should exist");
+        let normalized = normalized_live_column_values(&layout, Some(snapshot))
+            .expect("version ref test snapshot must normalize");
+        let mut row = vec![
             Value::Text(version_id.to_string()),
             Value::Text(crate::version::version_ref_schema_key().to_string()),
             Value::Text(crate::version::version_ref_schema_version().to_string()),
             Value::Text(crate::version::version_ref_file_id().to_string()),
             Value::Text(crate::version::version_ref_storage_version_id().to_string()),
+            Value::Boolean(true),
             Value::Text(crate::version::version_ref_plugin_key().to_string()),
             Value::Null,
             Value::Null,
-            Value::Text(commit_id.to_string()),
-            Value::Text(version_id.to_string()),
-        ]
+            Value::Text("2026-03-06T18:00:02Z".to_string()),
+            Value::Text("2026-03-06T18:00:02Z".to_string()),
+        ];
+        for column in &layout.columns {
+            row.push(
+                normalized
+                    .get(&column.column_name)
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+        }
+        row
     }
 
     fn run_with_large_stack<T, F>(run: F) -> T

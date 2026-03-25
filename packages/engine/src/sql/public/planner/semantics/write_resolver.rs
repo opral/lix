@@ -3,10 +3,9 @@ use crate::account::{
     active_account_schema_version, active_account_snapshot_content,
     active_account_storage_version_id,
 };
-use crate::schema::live_store::{
-    load_exact_live_row_with_executor, load_untracked_live_rows_by_property_with_executor,
-    LiveRowScope,
-};
+use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
+use crate::live_state::raw::{load_exact_row_with_backend, scan_rows_with_backend, RawStorage};
+use crate::live_state::system::load_version_ref_with_backend;
 use crate::sql::execution::shared_path::{
     bootstrap_public_surface_registry_with_pending_transaction_view,
     execute_prepared_public_read_with_pending_transaction_view, PendingTransactionView,
@@ -35,8 +34,7 @@ use crate::version::{
     version_descriptor_schema_key, version_descriptor_schema_version,
     version_descriptor_snapshot_content, version_descriptor_storage_version_id,
     version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-    version_ref_schema_version, version_ref_snapshot_content, version_ref_storage_version_id,
-    GLOBAL_VERSION_ID,
+    version_ref_schema_version, version_ref_snapshot_content, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
@@ -534,21 +532,18 @@ async fn resolve_active_account_delete_write_plan(
 async fn load_active_version_admin_rows(
     backend: &dyn LixBackend,
 ) -> Result<Vec<ActiveVersionAdminRow>, crate::LixError> {
-    let mut executor = backend;
-    let filters = BTreeMap::from([
-        ("file_id", active_version_file_id().to_string()),
-        (
-            "version_id",
-            active_version_storage_version_id().to_string(),
-        ),
-    ]);
-    let rows = load_untracked_live_rows_by_property_with_executor(
-        &mut executor,
+    let constraints = vec![ScanConstraint {
+        field: ScanField::FileId,
+        operator: ScanOperator::Eq(Value::Text(active_version_file_id().to_string())),
+    }];
+    let required_columns = vec!["version_id".to_string()];
+    let rows = scan_rows_with_backend(
+        backend,
+        RawStorage::Untracked,
         active_version_schema_key(),
-        "version_id",
-        &filters,
-        true,
-        &["updated_at", "entity_id"],
+        active_version_storage_version_id(),
+        &constraints,
+        &required_columns,
     )
     .await?;
     Ok(rows
@@ -556,7 +551,7 @@ async fn load_active_version_admin_rows(
         .filter_map(|row| {
             row.property_text("version_id")
                 .map(|version_id| ActiveVersionAdminRow {
-                    id: row.entity_id,
+                    id: row.entity_id().to_string(),
                     version_id,
                 })
         })
@@ -613,21 +608,18 @@ fn active_version_admin_row(id: &str, version_id: &str) -> PlannedStateRow {
 async fn load_active_account_admin_rows(
     backend: &dyn LixBackend,
 ) -> Result<Vec<ActiveAccountAdminRow>, crate::LixError> {
-    let mut executor = backend;
-    let filters = BTreeMap::from([
-        ("file_id", active_account_file_id().to_string()),
-        (
-            "version_id",
-            active_account_storage_version_id().to_string(),
-        ),
-    ]);
-    let rows = load_untracked_live_rows_by_property_with_executor(
-        &mut executor,
+    let constraints = vec![ScanConstraint {
+        field: ScanField::FileId,
+        operator: ScanOperator::Eq(Value::Text(active_account_file_id().to_string())),
+    }];
+    let required_columns = vec!["account_id".to_string()];
+    let rows = scan_rows_with_backend(
+        backend,
+        RawStorage::Untracked,
         active_account_schema_key(),
-        "account_id",
-        &filters,
-        true,
-        &["updated_at", "entity_id"],
+        active_account_storage_version_id(),
+        &constraints,
+        &required_columns,
     )
     .await?;
     Ok(rows
@@ -915,39 +907,20 @@ async fn load_version_admin_row(
     backend: &dyn LixBackend,
     version_id: &str,
 ) -> Result<Option<VersionAdminRow>, crate::LixError> {
-    let mut executor = backend;
-    let descriptor_filters = BTreeMap::from([
-        ("entity_id", version_id.to_string()),
-        ("file_id", version_descriptor_file_id().to_string()),
-        ("plugin_key", version_descriptor_plugin_key().to_string()),
-        (
-            "version_id",
-            version_descriptor_storage_version_id().to_string(),
-        ),
-    ]);
-    let Some(descriptor_row) = load_exact_live_row_with_executor(
-        &mut executor,
-        LiveRowScope::Tracked,
+    let Some(descriptor_row) = load_exact_row_with_backend(
+        backend,
+        RawStorage::Tracked,
         version_descriptor_schema_key(),
-        &descriptor_filters,
+        version_descriptor_storage_version_id(),
+        version_id,
+        Some(version_descriptor_file_id()),
     )
     .await?
-    else {
+    .filter(|row| row.plugin_key() == version_descriptor_plugin_key())
+    .and_then(|row| row.into_tracked()) else {
         return Ok(None);
     };
-    let pointer_filters = BTreeMap::from([
-        ("entity_id", version_id.to_string()),
-        ("file_id", version_ref_file_id().to_string()),
-        ("plugin_key", version_ref_plugin_key().to_string()),
-        ("version_id", version_ref_storage_version_id().to_string()),
-    ]);
-    let pointer_row = load_exact_live_row_with_executor(
-        &mut executor,
-        LiveRowScope::Untracked,
-        version_ref_schema_key(),
-        &pointer_filters,
-    )
-    .await?;
+    let pointer_row = load_version_ref_with_backend(backend, version_id).await?;
     Ok(Some(VersionAdminRow {
         id: version_id.to_string(),
         name: descriptor_row.property_text("name").unwrap_or_default(),
@@ -958,7 +931,7 @@ async fn load_version_admin_row(
             .unwrap_or(false),
         commit_id: pointer_row
             .as_ref()
-            .and_then(|row| row.property_text("commit_id"))
+            .map(|row| row.commit_id.clone())
             .unwrap_or_default(),
         descriptor_change_id: descriptor_row.change_id,
         pointer_change_id: None,

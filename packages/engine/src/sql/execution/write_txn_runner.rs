@@ -3,11 +3,12 @@ use std::collections::BTreeSet;
 use crate::deterministic_mode::DeterministicSettings;
 use crate::engine::Engine;
 use crate::functions::LixFunctionProvider;
+use crate::live_state::{
+    finalize_commit_in_transaction, register_schema_in_transaction, SchemaRegistration,
+};
 use crate::schema::live_layout::{normalized_live_column_values, tracked_live_table_name};
 use crate::schema::registry::{
-    coalesce_live_table_requirements, ensure_schema_live_table_in_transaction,
-    ensure_schema_live_table_with_requirement_in_transaction,
-    load_live_table_layout_in_transaction,
+    coalesce_live_table_requirements, load_live_table_layout_in_transaction,
 };
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::execution_program::{
@@ -30,9 +31,6 @@ use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::commit::{
     create_commit, CreateCommitArgs, CreateCommitDisposition, CreateCommitInvariantChecker,
     CreateCommitWriteLane,
-};
-use crate::state::live_state::{
-    build_mark_live_state_ready_sql, load_latest_canonical_watermark_in_transaction,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
@@ -82,7 +80,13 @@ async fn materialize_tracked_append_phase(
     for requirement in
         coalesce_live_table_requirements(&unit.execution.schema_live_table_requirements)
     {
-        ensure_schema_live_table_with_requirement_in_transaction(transaction, &requirement)
+        let registration = match requirement.layout.as_ref() {
+            Some(layout) => {
+                SchemaRegistration::with_legacy_layout(requirement.schema_key.clone(), layout)
+            }
+            None => SchemaRegistration::new(requirement.schema_key.clone()),
+        };
+        register_schema_in_transaction(transaction, registration)
             .await
             .map_err(|error| LixError {
                 code: error.code,
@@ -535,7 +539,7 @@ async fn apply_public_untracked_upsert(
     row: &crate::sql::public::planner::ir::PlannedStateRow,
     timestamp: &str,
 ) -> Result<(), LixError> {
-    ensure_schema_live_table_in_transaction(transaction, &row.schema_key).await?;
+    register_schema_in_transaction(transaction, row.schema_key.clone()).await?;
 
     let file_id = planned_row_text_value(row, "file_id")?;
     let plugin_key = planned_row_text_value(row, "plugin_key")?;
@@ -599,7 +603,7 @@ async fn apply_public_untracked_delete(
     transaction: &mut dyn LixBackendTransaction,
     row: &crate::sql::public::planner::ir::PlannedStateRow,
 ) -> Result<(), LixError> {
-    ensure_schema_live_table_in_transaction(transaction, &row.schema_key).await?;
+    register_schema_in_transaction(transaction, row.schema_key.clone()).await?;
 
     let file_id = planned_row_text_value(row, "file_id")?;
     let sql = format!(
@@ -745,12 +749,16 @@ fn quote_ident(value: &str) -> String {
 pub(crate) async fn stamp_watermark_before_commit(
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<(), LixError> {
-    if let Some(watermark) = load_latest_canonical_watermark_in_transaction(transaction).await? {
-        transaction
-            .execute(&build_mark_live_state_ready_sql(&watermark), &[])
-            .await?;
+    match finalize_commit_in_transaction(transaction).await {
+        Ok(_) => Ok(()),
+        Err(error)
+            if error.description
+                == "live_state::finalize_commit expected a canonical watermark" =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
-    Ok(())
 }
 
 async fn persist_filesystem_payload_domain_changes_direct(

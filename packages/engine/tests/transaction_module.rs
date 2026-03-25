@@ -1,12 +1,13 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use lix_engine::live_state::system::version_ref_write_row;
 use lix_engine::live_state::tracked::{
     load_exact_row_with_backend, ExactTrackedRowRequest, TrackedWriteOperation, TrackedWriteRow,
 };
 use lix_engine::live_state::untracked::{
-    load_exact_row_with_backend as load_exact_untracked_row_with_backend, version_ref_write_row,
-    ExactUntrackedRowRequest, UntrackedWriteRow,
+    load_exact_row_with_backend as load_exact_untracked_row_with_backend, ExactUntrackedRowRequest,
+    UntrackedWriteRow,
 };
 use lix_engine::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use lix_engine::{LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};

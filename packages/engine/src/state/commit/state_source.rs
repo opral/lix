@@ -1,20 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::errors::classification::is_missing_relation_error;
-use crate::schema::builtin::types::LixVersionRef;
-use crate::schema::live_store::{
-    load_exact_live_row_with_executor, logical_snapshot_text, LiveRowScope,
-};
-use crate::version::{
-    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-    version_ref_storage_version_id, GLOBAL_VERSION_ID,
-};
+use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
+use crate::live_state::load_live_row_access_with_executor;
+use crate::live_state::raw::{scan_rows_with_executor, snapshot_text, RawStorage};
+use crate::live_state::system::load_version_ref_with_executor;
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value, VersionId};
 
 use super::types::{VersionInfo, VersionSnapshot};
-
-#[cfg(test)]
-use crate::schema::live_layout::LiveRowAccess;
 
 const CANONICAL_FALLBACK_MAX_COMMIT_DEPTH: usize = 2048;
 
@@ -62,23 +56,7 @@ pub(crate) async fn load_committed_version_head_commit_id_from_live_state(
     executor: &mut dyn CommitQueryExecutor,
     version_id: &str,
 ) -> Result<Option<String>, LixError> {
-    let snapshot_content = match load_current_pointer_snapshot_content(
-        executor,
-        version_ref_schema_key(),
-        version_id,
-        version_ref_file_id(),
-        version_ref_plugin_key(),
-        version_ref_storage_version_id(),
-    )
-    .await?
-    {
-        Some(snapshot_content) => Some(snapshot_content),
-        None => None,
-    };
-    if let Some(snapshot_content) = snapshot_content {
-        let Some(pointer) = parse_version_ref_snapshot(&snapshot_content)? else {
-            return Ok(None);
-        };
+    if let Some(pointer) = load_version_ref_with_executor(executor, version_id).await? {
         if pointer.commit_id.is_empty() {
             return Ok(None);
         }
@@ -146,32 +124,6 @@ pub(crate) async fn load_version_info_for_versions(
     Ok(versions)
 }
 
-async fn load_current_pointer_snapshot_content(
-    executor: &mut dyn CommitQueryExecutor,
-    schema_key: &str,
-    entity_id: &str,
-    file_id: &str,
-    plugin_key: &str,
-    storage_version_id: &str,
-) -> Result<Option<Value>, LixError> {
-    let filters = BTreeMap::from([
-        ("entity_id", entity_id.to_string()),
-        ("file_id", file_id.to_string()),
-        ("plugin_key", plugin_key.to_string()),
-        ("version_id", storage_version_id.to_string()),
-    ]);
-    let Some(row) =
-        load_exact_live_row_with_executor(executor, LiveRowScope::Untracked, schema_key, &filters)
-            .await?
-    else {
-        return Ok(None);
-    };
-    let access =
-        crate::schema::live_layout::load_live_row_access_with_executor(executor, schema_key)
-            .await?;
-    logical_snapshot_text(&access, &row).map(|snapshot| snapshot.map(Value::Text))
-}
-
 pub(crate) async fn load_exact_committed_state_row_from_live_state(
     backend: &dyn LixBackend,
     request: &ExactCommittedStateRowRequest,
@@ -184,33 +136,73 @@ pub(crate) async fn load_exact_committed_state_row_from_live_state_with_executor
     executor: &mut dyn CommitQueryExecutor,
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    let mut filters = BTreeMap::from([
-        ("entity_id", request.entity_id.clone()),
-        ("version_id", request.version_id.clone()),
-    ]);
-    for column in ["file_id", "plugin_key", "schema_version"] {
-        let Some(expected) = request.exact_filters.get(column).and_then(text_from_value) else {
-            continue;
-        };
-        filters.insert(column, expected);
+    let access = load_live_row_access_with_executor(executor, &request.schema_key).await?;
+    let mut constraints = vec![ScanConstraint {
+        field: ScanField::EntityId,
+        operator: ScanOperator::Eq(Value::Text(request.entity_id.clone())),
+    }];
+    if let Some(file_id) = request
+        .exact_filters
+        .get("file_id")
+        .and_then(text_from_value)
+    {
+        constraints.push(ScanConstraint {
+            field: ScanField::FileId,
+            operator: ScanOperator::Eq(Value::Text(file_id.to_string())),
+        });
     }
-    let Some(row) = load_exact_live_row_with_executor(
+    if let Some(plugin_key) = request
+        .exact_filters
+        .get("plugin_key")
+        .and_then(text_from_value)
+    {
+        constraints.push(ScanConstraint {
+            field: ScanField::PluginKey,
+            operator: ScanOperator::Eq(Value::Text(plugin_key.to_string())),
+        });
+    }
+    if let Some(schema_version) = request
+        .exact_filters
+        .get("schema_version")
+        .and_then(text_from_value)
+    {
+        constraints.push(ScanConstraint {
+            field: ScanField::SchemaVersion,
+            operator: ScanOperator::Eq(Value::Text(schema_version.to_string())),
+        });
+    }
+    let mut rows = scan_rows_with_executor(
         executor,
-        LiveRowScope::Tracked,
+        RawStorage::Tracked,
         &request.schema_key,
-        &filters,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    let access = crate::schema::live_layout::load_live_row_access_with_executor(
-        executor,
-        &request.schema_key,
+        &request.version_id,
+        &constraints,
+        &access
+            .columns()
+            .iter()
+            .map(|column| column.property_name.clone())
+            .collect::<Vec<_>>(),
     )
     .await?;
-    let Some(snapshot_content) = logical_snapshot_text(&access, &row)? else {
+    if rows.is_empty() {
         return Ok(None);
+    }
+    if rows.len() > 1 {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            &format!(
+                "expected at most one committed tracked row for schema '{}' entity '{}' version '{}'",
+                request.schema_key, request.entity_id, request.version_id
+            ),
+        ));
+    }
+    let row = rows.remove(0);
+    let snapshot_content = snapshot_text(&access, &row)?;
+    let Some(row) = row.into_tracked() else {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked committed-state lookup returned untracked row",
+        ));
     };
     let mut values = BTreeMap::new();
     values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
@@ -384,33 +376,55 @@ pub(crate) async fn load_commit_lineage_entry_by_id(
     executor: &mut dyn CommitQueryExecutor,
     commit_id: &str,
 ) -> Result<Option<CommitLineageEntry>, LixError> {
-    let filters = BTreeMap::from([
-        ("entity_id", commit_id.to_string()),
-        ("file_id", "lix".to_string()),
-        ("plugin_key", "lix".to_string()),
-        ("version_id", GLOBAL_VERSION_ID.to_string()),
-    ]);
-    let mut row =
-        load_exact_live_row_with_executor(executor, LiveRowScope::Tracked, "lix_commit", &filters)
-            .await?;
-    if row.is_none() {
-        row = load_exact_live_row_with_executor(
+    let access = load_live_row_access_with_executor(executor, "lix_commit").await?;
+    let constraints = vec![
+        ScanConstraint {
+            field: ScanField::EntityId,
+            operator: ScanOperator::Eq(Value::Text(commit_id.to_string())),
+        },
+        ScanConstraint {
+            field: ScanField::FileId,
+            operator: ScanOperator::Eq(Value::Text("lix".to_string())),
+        },
+        ScanConstraint {
+            field: ScanField::PluginKey,
+            operator: ScanOperator::Eq(Value::Text("lix".to_string())),
+        },
+    ];
+    let required_columns = access
+        .columns()
+        .iter()
+        .map(|column| column.property_name.clone())
+        .collect::<Vec<_>>();
+    let mut tracked_rows = scan_rows_with_executor(
+        executor,
+        RawStorage::Tracked,
+        "lix_commit",
+        GLOBAL_VERSION_ID,
+        &constraints,
+        &required_columns,
+    )
+    .await?;
+    let snapshot_content = if let Some(row) = tracked_rows.pop() {
+        snapshot_text(&access, &row)?
+    } else {
+        let mut untracked_rows = scan_rows_with_executor(
             executor,
-            LiveRowScope::Untracked,
+            RawStorage::Untracked,
             "lix_commit",
-            &filters,
+            GLOBAL_VERSION_ID,
+            &constraints,
+            &required_columns,
         )
         .await?;
+        let Some(row) = untracked_rows.pop() else {
+            return Ok(None);
+        };
+        snapshot_text(&access, &row)?
+    };
+    if snapshot_content.is_empty() {
+        return Ok(None);
     }
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let access =
-        crate::schema::live_layout::load_live_row_access_with_executor(executor, "lix_commit")
-            .await?;
-    let Some(snapshot_content) = logical_snapshot_text(&access, &row)? else {
-        return Ok(None);
-    };
     let parsed: crate::schema::builtin::types::LixCommit = serde_json::from_str(&snapshot_content)
         .map_err(|error| {
             LixError::unknown(format!(
@@ -498,6 +512,13 @@ pub(crate) async fn reconstruct_exact_committed_state_row_from_canonical(
         .await
 }
 
+#[cfg(test)]
+use crate::schema::builtin::types::LixVersionRef;
+
+#[cfg(test)]
+use crate::version::{version_ref_file_id, version_ref_plugin_key, version_ref_schema_key};
+
+#[cfg(test)]
 fn parse_version_ref_snapshot(value: &Value) -> Result<Option<LixVersionRef>, LixError> {
     let raw_snapshot = match value {
         Value::Text(value) => value,
@@ -568,7 +589,7 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
 mod tests {
     use super::*;
     use crate::backend::LixBackendTransaction;
-    use crate::schema::live_layout::builtin_live_table_layout;
+    use crate::schema::live_layout::{builtin_live_table_layout, LiveRowAccess};
     use crate::QueryResult;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -585,9 +606,13 @@ mod tests {
             Value::Text("1".to_string()),
             Value::Text("lix".to_string()),
             Value::Text("v1".to_string()),
+            Value::Boolean(false),
             Value::Text("lix".to_string()),
             Value::Text("{\"k\":\"v\"}".to_string()),
             Value::Text("change-1".to_string()),
+            Value::Null,
+            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
+            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
         ];
         for column in &layout.columns {
             let value = if column.property_name == "id" {
@@ -598,7 +623,7 @@ mod tests {
             row.push(value);
         }
         let snapshot = access
-            .logical_snapshot_text_from_row(&row, 8)
+            .logical_snapshot_text_from_row(&row, 12)
             .expect("live snapshot reconstruction should succeed")
             .expect("live snapshot should be present");
         (row, snapshot)
