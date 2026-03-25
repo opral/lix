@@ -5,9 +5,8 @@ use crate::engine::{
     normalize_sql_execution_error_with_backend, Engine, ExecuteOptions, TransactionBackendAdapter,
 };
 use crate::functions::SharedFunctionProvider;
-use crate::schema::registry::{
-    coalesce_live_table_requirements, ensure_schema_live_table_with_requirement_in_transaction,
-};
+use crate::live_state::{register_schema_in_transaction, SchemaRegistration};
+use crate::schema::registry::coalesce_live_table_requirements;
 use crate::sql::ast::utils::{
     bind_statement_binding_template, compile_statement_binding_template_with_state,
     PlaceholderState, StatementBindingTemplate,
@@ -579,7 +578,13 @@ pub(crate) async fn execute_internal_execution_with_transaction(
     writer_key: Option<&str>,
 ) -> Result<SqlExecutionOutcome, ExecutorError> {
     for registration in coalesce_live_table_requirements(&internal.live_table_requirements) {
-        ensure_schema_live_table_with_requirement_in_transaction(transaction, &registration)
+        let registration = match registration.layout.as_ref() {
+            Some(layout) => {
+                SchemaRegistration::with_legacy_layout(registration.schema_key.clone(), layout)
+            }
+            None => SchemaRegistration::new(registration.schema_key.clone()),
+        };
+        register_schema_in_transaction(transaction, registration)
             .await
             .map_err(ExecutorError::execute)?;
     }

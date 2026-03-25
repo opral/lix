@@ -8,7 +8,7 @@ use crate::schema::builtin::builtin_schema_definition;
 use crate::schema::registry::{
     compile_registered_live_layout, load_live_table_layout_with_backend,
 };
-use crate::{LixBackend, LixError, SqlDialect, Value};
+use crate::{LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveColumnKind {
@@ -38,18 +38,6 @@ pub(crate) struct LiveRowAccess {
 }
 
 impl LiveColumnSpec {
-    pub(crate) fn sql_type(&self, dialect: SqlDialect) -> &'static str {
-        match self.kind {
-            LiveColumnKind::String | LiveColumnKind::JsonText => "TEXT",
-            LiveColumnKind::Integer => "BIGINT",
-            LiveColumnKind::Boolean => "BOOLEAN",
-            LiveColumnKind::Number => match dialect {
-                SqlDialect::Sqlite => "REAL",
-                SqlDialect::Postgres => "DOUBLE PRECISION",
-            },
-        }
-    }
-
     pub(crate) fn value_from_snapshot(
         &self,
         snapshot: Option<&JsonValue>,
@@ -198,14 +186,6 @@ impl LiveRowAccess {
         Self { layout }
     }
 
-    pub(crate) fn columns(&self) -> &[LiveColumnSpec] {
-        &self.layout.columns
-    }
-
-    pub(crate) fn payload_column_name(&self, property_name: &str) -> Option<&str> {
-        live_column_name_for_property(&self.layout, property_name)
-    }
-
     pub(crate) fn normalized_projection_sql(&self, table_alias: Option<&str>) -> String {
         render_normalized_live_projection_sql(&self.layout, table_alias)
     }
@@ -250,55 +230,6 @@ impl LiveRowAccess {
     }
 }
 
-pub(crate) fn logical_snapshot_from_projected_row(
-    access: Option<&LiveRowAccess>,
-    schema_key: &str,
-    row: &[Value],
-    snapshot_index: usize,
-    normalized_start_index: usize,
-) -> Result<Option<JsonValue>, LixError> {
-    match access {
-        Some(access) => logical_live_snapshot_from_row_with_layout(
-            Some(&access.layout),
-            schema_key,
-            row,
-            snapshot_index,
-            normalized_start_index,
-        ),
-        None => snapshot_value_from_row(row, snapshot_index, schema_key),
-    }
-}
-
-pub(crate) async fn load_live_row_access_with_backend(
-    backend: &dyn LixBackend,
-    schema_key: &str,
-) -> Result<LiveRowAccess, LixError> {
-    Ok(LiveRowAccess::new(
-        load_live_table_layout_with_backend(backend, schema_key).await?,
-    ))
-}
-
-pub(crate) async fn load_live_row_access_with_executor(
-    executor: &mut dyn QueryExecutor,
-    schema_key: &str,
-) -> Result<LiveRowAccess, LixError> {
-    Ok(LiveRowAccess::new(
-        load_live_table_layout_with_executor(executor, schema_key).await?,
-    ))
-}
-
-pub(crate) async fn load_live_row_access_for_table_name(
-    backend: &dyn LixBackend,
-    table_name: &str,
-) -> Result<Option<LiveRowAccess>, LixError> {
-    let Some(schema_key) = live_schema_key_for_table_name(table_name) else {
-        return Ok(None);
-    };
-    Ok(Some(
-        load_live_row_access_with_backend(backend, schema_key).await?,
-    ))
-}
-
 pub(crate) async fn load_live_table_layout_with_executor(
     executor: &mut dyn QueryExecutor,
     schema_key: &str,
@@ -310,6 +241,15 @@ pub(crate) async fn load_live_table_layout_with_executor(
         .execute(REGISTERED_SCHEMA_BOOTSTRAP_LAYOUT_SQL, &[])
         .await?;
     compile_registered_live_layout(schema_key, result.rows)
+}
+
+pub(crate) async fn load_live_row_access_with_backend(
+    backend: &dyn LixBackend,
+    schema_key: &str,
+) -> Result<LiveRowAccess, LixError> {
+    Ok(LiveRowAccess::new(
+        load_live_table_layout_with_backend(backend, schema_key).await?,
+    ))
 }
 
 fn live_envelope_column_names() -> BTreeSet<&'static str> {

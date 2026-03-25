@@ -1,6 +1,4 @@
-use std::collections::BTreeMap;
-
-use crate::schema::live_store::{load_exact_live_row_with_executor, LiveRowScope};
+use crate::live_state::raw::{load_exact_row_with_executor, RawStorage};
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_storage_version_id,
@@ -46,23 +44,20 @@ async fn ensure_version_exists(
             "switch_version expected an open transaction",
         )
     })?;
-    let filters = BTreeMap::from([
-        ("entity_id", version_id.to_string()),
-        ("file_id", version_descriptor_file_id().to_string()),
-        ("plugin_key", version_descriptor_plugin_key().to_string()),
-        (
-            "version_id",
-            version_descriptor_storage_version_id().to_string(),
-        ),
-    ]);
-    let row = load_exact_live_row_with_executor(
-        transaction,
-        LiveRowScope::Tracked,
+    let mut executor = transaction.as_mut();
+    let row = load_exact_row_with_executor(
+        &mut executor,
+        RawStorage::Tracked,
         version_descriptor_schema_key(),
-        &filters,
+        version_descriptor_storage_version_id(),
+        version_id,
+        Some(version_descriptor_file_id()),
     )
     .await?;
-    if row.is_none() {
+    if row
+        .as_ref()
+        .is_none_or(|row| row.plugin_key() != version_descriptor_plugin_key())
+    {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("version '{version_id}' does not exist"),

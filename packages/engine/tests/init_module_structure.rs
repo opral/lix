@@ -22,15 +22,15 @@ fn seed_module_does_not_own_table_creation() {
 }
 
 #[test]
-fn run_module_stays_on_legacy_live_state_path() {
+fn run_module_uses_new_live_state_boundary() {
     let source = read_engine_source("init/run.rs");
     assert!(
-        source.contains("crate::state::live_state::"),
-        "run.rs should stay on the legacy live_state path in this cleanup pass"
+        source.contains("crate::live_state::"),
+        "run.rs should target the new live_state boundary after the hook-in cut"
     );
     assert!(
-        !source.contains("crate::live_state::"),
-        "run.rs must not hook the new live_state module into init yet"
+        !source.contains("crate::state::live_state::"),
+        "run.rs should not depend on the legacy live_state module anymore"
     );
 }
 

@@ -1,0 +1,361 @@
+use std::collections::BTreeMap;
+
+use crate::backend::QueryExecutor;
+use crate::live_state::constraints::ScanConstraint;
+use crate::live_state::storage::{json_value_from_live_row_cell, LiveRowAccess};
+use crate::live_state::tracked::{
+    load_exact_row_with_executor as load_exact_tracked_row_with_executor,
+    scan_rows_with_executor as scan_tracked_rows_with_executor, ExactTrackedRowRequest, TrackedRow,
+    TrackedScanRequest,
+};
+use crate::live_state::untracked::{
+    load_exact_row_with_executor as load_exact_untracked_row_with_executor,
+    scan_rows_with_executor as scan_untracked_rows_with_executor, ExactUntrackedRowRequest,
+    UntrackedRow, UntrackedScanRequest,
+};
+use crate::{LixBackend, LixError, Value};
+use serde_json::Value as JsonValue;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum RawStorage {
+    Tracked,
+    Untracked,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum RawRow {
+    Tracked(TrackedRow),
+    Untracked(UntrackedRow),
+}
+
+impl RawRow {
+    pub(crate) fn entity_id(&self) -> &str {
+        match self {
+            Self::Tracked(row) => &row.entity_id,
+            Self::Untracked(row) => &row.entity_id,
+        }
+    }
+
+    pub(crate) fn schema_key(&self) -> &str {
+        match self {
+            Self::Tracked(row) => &row.schema_key,
+            Self::Untracked(row) => &row.schema_key,
+        }
+    }
+
+    pub(crate) fn schema_version(&self) -> &str {
+        match self {
+            Self::Tracked(row) => &row.schema_version,
+            Self::Untracked(row) => &row.schema_version,
+        }
+    }
+
+    pub(crate) fn file_id(&self) -> &str {
+        match self {
+            Self::Tracked(row) => &row.file_id,
+            Self::Untracked(row) => &row.file_id,
+        }
+    }
+
+    pub(crate) fn version_id(&self) -> &str {
+        match self {
+            Self::Tracked(row) => &row.version_id,
+            Self::Untracked(row) => &row.version_id,
+        }
+    }
+
+    pub(crate) fn plugin_key(&self) -> &str {
+        match self {
+            Self::Tracked(row) => &row.plugin_key,
+            Self::Untracked(row) => &row.plugin_key,
+        }
+    }
+
+    pub(crate) fn metadata(&self) -> Option<&str> {
+        match self {
+            Self::Tracked(row) => row.metadata.as_deref(),
+            Self::Untracked(row) => row.metadata.as_deref(),
+        }
+    }
+
+    pub(crate) fn writer_key(&self) -> Option<&str> {
+        match self {
+            Self::Tracked(row) => row.writer_key.as_deref(),
+            Self::Untracked(row) => row.writer_key.as_deref(),
+        }
+    }
+
+    pub(crate) fn updated_at(&self) -> &str {
+        match self {
+            Self::Tracked(row) => &row.updated_at,
+            Self::Untracked(row) => &row.updated_at,
+        }
+    }
+
+    pub(crate) fn values(&self) -> &BTreeMap<String, Value> {
+        match self {
+            Self::Tracked(row) => &row.values,
+            Self::Untracked(row) => &row.values,
+        }
+    }
+
+    pub(crate) fn property_text(&self, property_name: &str) -> Option<String> {
+        match self {
+            Self::Tracked(row) => row.property_text(property_name),
+            Self::Untracked(row) => row.property_text(property_name),
+        }
+    }
+
+    pub(crate) fn change_id(&self) -> Option<&str> {
+        match self {
+            Self::Tracked(row) => row.change_id.as_deref(),
+            Self::Untracked(_) => None,
+        }
+    }
+
+    pub(crate) fn into_tracked(self) -> Option<TrackedRow> {
+        match self {
+            Self::Tracked(row) => Some(row),
+            Self::Untracked(_) => None,
+        }
+    }
+}
+
+pub(crate) async fn load_exact_row_with_backend(
+    backend: &dyn LixBackend,
+    storage: RawStorage,
+    schema_key: &str,
+    version_id: &str,
+    entity_id: &str,
+    file_id: Option<&str>,
+) -> Result<Option<RawRow>, LixError> {
+    let mut executor = backend;
+    load_exact_row_with_executor(
+        &mut executor,
+        storage,
+        schema_key,
+        version_id,
+        entity_id,
+        file_id,
+    )
+    .await
+}
+
+pub(crate) async fn load_exact_row_with_executor(
+    executor: &mut dyn QueryExecutor,
+    storage: RawStorage,
+    schema_key: &str,
+    version_id: &str,
+    entity_id: &str,
+    file_id: Option<&str>,
+) -> Result<Option<RawRow>, LixError> {
+    match storage {
+        RawStorage::Tracked => load_exact_tracked_row_with_executor(
+            executor,
+            &ExactTrackedRowRequest {
+                schema_key: schema_key.to_string(),
+                version_id: version_id.to_string(),
+                entity_id: entity_id.to_string(),
+                file_id: file_id.map(ToOwned::to_owned),
+            },
+        )
+        .await
+        .map(|row| row.map(RawRow::Tracked)),
+        RawStorage::Untracked => load_exact_untracked_row_with_executor(
+            executor,
+            &ExactUntrackedRowRequest {
+                schema_key: schema_key.to_string(),
+                version_id: version_id.to_string(),
+                entity_id: entity_id.to_string(),
+                file_id: file_id.map(ToOwned::to_owned),
+            },
+        )
+        .await
+        .map(|row| row.map(RawRow::Untracked)),
+    }
+}
+
+pub(crate) async fn scan_rows_with_backend(
+    backend: &dyn LixBackend,
+    storage: RawStorage,
+    schema_key: &str,
+    version_id: &str,
+    constraints: &[ScanConstraint],
+    required_columns: &[String],
+) -> Result<Vec<RawRow>, LixError> {
+    let mut executor = backend;
+    scan_rows_with_executor(
+        &mut executor,
+        storage,
+        schema_key,
+        version_id,
+        constraints,
+        required_columns,
+    )
+    .await
+}
+
+pub(crate) async fn scan_rows_with_executor(
+    executor: &mut dyn QueryExecutor,
+    storage: RawStorage,
+    schema_key: &str,
+    version_id: &str,
+    constraints: &[ScanConstraint],
+    required_columns: &[String],
+) -> Result<Vec<RawRow>, LixError> {
+    match storage {
+        RawStorage::Tracked => scan_tracked_rows_with_executor(
+            executor,
+            &TrackedScanRequest {
+                schema_key: schema_key.to_string(),
+                version_id: version_id.to_string(),
+                constraints: constraints.to_vec(),
+                required_columns: required_columns.to_vec(),
+            },
+        )
+        .await
+        .map(|rows| rows.into_iter().map(RawRow::Tracked).collect()),
+        RawStorage::Untracked => scan_untracked_rows_with_executor(
+            executor,
+            &UntrackedScanRequest {
+                schema_key: schema_key.to_string(),
+                version_id: version_id.to_string(),
+                constraints: constraints.to_vec(),
+                required_columns: required_columns.to_vec(),
+            },
+        )
+        .await
+        .map(|rows| rows.into_iter().map(RawRow::Untracked).collect()),
+    }
+}
+
+pub(crate) fn snapshot_json(access: &LiveRowAccess, row: &RawRow) -> Result<JsonValue, LixError> {
+    snapshot_json_from_values(access, row.schema_key(), row.values())
+}
+
+pub(crate) fn snapshot_text(access: &LiveRowAccess, row: &RawRow) -> Result<String, LixError> {
+    serde_json::to_string(&snapshot_json(access, row)?).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            &format!(
+                "failed to serialize live snapshot for schema '{}': {error}",
+                row.schema_key()
+            ),
+        )
+    })
+}
+
+pub(crate) fn snapshot_json_from_values(
+    access: &LiveRowAccess,
+    schema_key: &str,
+    values: &BTreeMap<String, Value>,
+) -> Result<JsonValue, LixError> {
+    let mut object = serde_json::Map::new();
+    for column in access.columns() {
+        let Some(value) = values.get(&column.property_name) else {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                &format!(
+                    "live row for schema '{}' is missing property '{}'",
+                    schema_key, column.property_name
+                ),
+            ));
+        };
+        let json_value =
+            json_value_from_live_row_cell(value, column.kind, schema_key, &column.column_name)?;
+        if !json_value.is_null() {
+            object.insert(column.property_name.clone(), json_value);
+        }
+    }
+    Ok(JsonValue::Object(object))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{snapshot_json, RawRow};
+    use crate::live_state::storage::{
+        LiveColumnKind, LiveColumnSpec, LiveRowAccess, LiveTableLayout,
+    };
+    use crate::live_state::tracked::TrackedRow;
+    use crate::live_state::untracked::UntrackedRow;
+    use crate::Value;
+    use std::collections::BTreeMap;
+
+    fn test_access() -> LiveRowAccess {
+        LiveRowAccess::new(LiveTableLayout {
+            schema_key: "profile".to_string(),
+            columns: vec![LiveColumnSpec {
+                property_name: "name".to_string(),
+                column_name: "name".to_string(),
+                kind: LiveColumnKind::String,
+            }],
+        })
+    }
+
+    #[test]
+    fn raw_row_preserves_lane_identity() {
+        let tracked = RawRow::Tracked(TrackedRow {
+            entity_id: "row-1".to_string(),
+            schema_key: "profile".to_string(),
+            schema_version: "1".to_string(),
+            file_id: "file".to_string(),
+            version_id: "main".to_string(),
+            global: false,
+            plugin_key: "plug".to_string(),
+            metadata: None,
+            change_id: Some("chg-1".to_string()),
+            writer_key: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            values: BTreeMap::from([("name".to_string(), Value::Text("Ada".to_string()))]),
+        });
+        let untracked = RawRow::Untracked(UntrackedRow {
+            entity_id: "row-2".to_string(),
+            schema_key: "profile".to_string(),
+            schema_version: "1".to_string(),
+            file_id: "file".to_string(),
+            version_id: "main".to_string(),
+            global: false,
+            plugin_key: "plug".to_string(),
+            metadata: None,
+            writer_key: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            values: BTreeMap::from([("name".to_string(), Value::Text("Bea".to_string()))]),
+        });
+
+        assert_eq!(tracked.change_id(), Some("chg-1"));
+        assert_eq!(untracked.change_id(), None);
+        assert_eq!(tracked.writer_key(), None);
+        assert!(tracked.clone().into_tracked().is_some());
+        assert!(matches!(untracked, RawRow::Untracked(_)));
+    }
+
+    #[test]
+    fn snapshot_json_uses_row_values_without_lane_specific_logic() {
+        let access = test_access();
+        let row = RawRow::Tracked(TrackedRow {
+            entity_id: "row-1".to_string(),
+            schema_key: "profile".to_string(),
+            schema_version: "1".to_string(),
+            file_id: "file".to_string(),
+            version_id: "main".to_string(),
+            global: false,
+            plugin_key: "plug".to_string(),
+            metadata: None,
+            change_id: None,
+            writer_key: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            values: BTreeMap::from([("name".to_string(), Value::Text("Ada".to_string()))]),
+        });
+
+        let snapshot = snapshot_json(&access, &row).expect("snapshot should build");
+        assert_eq!(
+            snapshot,
+            serde_json::json!({
+                "name": "Ada"
+            })
+        );
+    }
+}

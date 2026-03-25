@@ -2,6 +2,10 @@ use crate::engine::{
     reject_internal_table_writes, reject_public_create_table, Engine, ExecuteOptions,
 };
 use crate::errors;
+use crate::live_state::{
+    mark_mode_with_backend, require_ready, LiveStateApplyReport, LiveStateMode,
+    LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
+};
 use crate::sql::execution::execution_program::{
     execute_execution_program_with_backend, ExecutionProgram,
 };
@@ -10,10 +14,6 @@ use crate::sql::execution::write_program_runner::execute_write_program_with_tran
 use crate::sql::storage::sql_text::escape_sql_string;
 use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
 use crate::state::internal::write_program::WriteProgram;
-use crate::state::live_state::ensure_live_state_ready;
-use crate::state::materialization::{
-    LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
-};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 use sqlparser::ast::Statement;
@@ -37,7 +37,7 @@ impl Engine {
         if !self.is_initialized().await? {
             return Err(errors::not_initialized_error());
         }
-        ensure_live_state_ready(self.backend.as_ref()).await?;
+        require_ready(self.backend.as_ref()).await?;
         self.load_and_cache_active_version().await?;
         self.refresh_public_surface_registry().await?;
         Ok(())
@@ -174,7 +174,7 @@ impl Engine {
         reader: &mut dyn crate::ImageChunkReader,
     ) -> Result<(), LixError> {
         self.backend.restore_from_image(reader).await?;
-        ensure_live_state_ready(self.backend.as_ref()).await?;
+        require_ready(self.backend.as_ref()).await?;
         self.load_and_cache_active_version().await?;
         self.refresh_public_surface_registry().await?;
         self.invalidate_installed_plugins_cache()?;
@@ -185,29 +185,22 @@ impl Engine {
         &self,
         req: &LiveStateRebuildRequest,
     ) -> Result<LiveStateRebuildPlan, LixError> {
-        crate::state::materialization::live_state_rebuild_plan(self.backend.as_ref(), req).await
+        crate::live_state::rebuild_plan(self.backend.as_ref(), req).await
     }
 
     pub async fn apply_live_state_rebuild_plan(
         &self,
         plan: &LiveStateRebuildPlan,
     ) -> Result<LiveStateApplyReport, LixError> {
-        crate::state::materialization::apply_live_state_rebuild_plan(self.backend.as_ref(), plan)
-            .await
+        crate::live_state::apply_rebuild_plan(self.backend.as_ref(), plan).await
     }
 
     pub async fn rebuild_live_state(
         &self,
         req: &LiveStateRebuildRequest,
     ) -> Result<LiveStateRebuildReport, LixError> {
-        let plan =
-            crate::state::materialization::live_state_rebuild_plan(self.backend.as_ref(), req)
-                .await?;
-        let apply = crate::state::materialization::apply_live_state_rebuild_plan(
-            self.backend.as_ref(),
-            &plan,
-        )
-        .await?;
+        let plan = crate::live_state::rebuild_plan(self.backend.as_ref(), req).await?;
+        let apply = crate::live_state::apply_rebuild_plan(self.backend.as_ref(), &plan).await?;
 
         if let Err(error) = crate::plugin::runtime::materialize_file_data_with_plugins(
             self.backend.as_ref(),
@@ -216,11 +209,8 @@ impl Engine {
         )
         .await
         {
-            let _ = crate::state::live_state::mark_live_state_mode_with_backend(
-                self.backend.as_ref(),
-                crate::state::live_state::LiveStateMode::NeedsRebuild,
-            )
-            .await;
+            let _ =
+                mark_mode_with_backend(self.backend.as_ref(), LiveStateMode::NeedsRebuild).await;
             return Err(error);
         }
 

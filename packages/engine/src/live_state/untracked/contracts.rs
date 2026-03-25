@@ -59,18 +59,6 @@ pub struct UntrackedWriteRow {
 
 pub type UntrackedWriteBatch = Vec<UntrackedWriteRow>;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ActiveVersionRow {
-    pub entity_id: String,
-    pub version_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct VersionRefRow {
-    pub version_id: String,
-    pub commit_id: String,
-}
-
 #[async_trait(?Send)]
 pub trait UntrackedReadView {
     async fn load_exact_row(

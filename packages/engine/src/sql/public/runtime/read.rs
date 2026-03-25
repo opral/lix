@@ -6,6 +6,7 @@ use crate::filesystem::history::{
     DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
     FileHistoryRootScope, FileHistoryRow, FileHistoryVersionScope,
 };
+use crate::live_state::register_schema;
 use crate::schema::live_layout::LiveTableLayout;
 use crate::schema::registry::load_live_table_layout_with_backend;
 use crate::sql::common::placeholders::{resolve_placeholder_index, PlaceholderState};
@@ -54,7 +55,7 @@ pub(crate) async fn execute_public_read_query_strict(
     let mut required_schema_keys = lowered.required_schema_keys;
     required_schema_keys.extend(nested_required_schema_keys);
     for schema_key in &required_schema_keys {
-        crate::schema::registry::ensure_schema_live_table(backend, schema_key).await?;
+        register_schema(backend, schema_key.clone()).await?;
     }
     let bound = bind_public_query(lowered.query, params, backend.dialect())?;
     let result = backend
@@ -181,7 +182,7 @@ async fn execute_lowered_public_read(
     params: &[Value],
 ) -> Result<QueryResult, LixError> {
     for schema_key in required_schema_keys_from_dependency_spec(dependency_spec) {
-        crate::schema::registry::ensure_schema_live_table(backend, &schema_key).await?;
+        register_schema(backend, schema_key).await?;
     }
 
     let mut result = QueryResult {

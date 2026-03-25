@@ -235,9 +235,9 @@ async fn register_schema_accepts_runtime_registered_snapshot_without_owning_sche
         .expect("live_state init should succeed");
     register_schema(
         &backend,
-        SchemaRegistration {
-            schema_key: "runtime_profile".to_string(),
-            registered_snapshot: Some(serde_json::json!({
+        SchemaRegistration::with_registered_snapshot(
+            "runtime_profile",
+            serde_json::json!({
                 "value": {
                     "x-lix-key": "runtime_profile",
                     "x-lix-version": "1",
@@ -246,8 +246,8 @@ async fn register_schema_accepts_runtime_registered_snapshot_without_owning_sche
                         "name": { "type": "string" }
                     }
                 }
-            })),
-        },
+            }),
+        ),
     )
     .await
     .expect("runtime schema registration should succeed");
