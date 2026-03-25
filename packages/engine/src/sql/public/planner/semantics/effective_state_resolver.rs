@@ -1,14 +1,6 @@
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::raw::{
-    scan_rows_with_executor as scan_raw_rows_with_executor, RawRow, RawStorage,
-};
-use crate::live_state::tracked::{
-    load_exact_tombstone_with_executor, scan_tombstones_with_executor, ExactTrackedRowRequest,
-    TrackedScanRequest, TrackedTombstoneMarker,
-};
-use crate::live_state::{load_live_row_access_with_backend, normalized_live_column_values};
 use crate::sql::common::dependency_spec::DependencySpec;
-use crate::sql::execution::shared_path::PendingTransactionView;
+use crate::transaction::PendingTransactionView;
 use crate::sql::public::planner::ir::{
     CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
 };
@@ -16,9 +8,11 @@ use crate::sql::public::planner::semantics::surface_semantics::{
     canonical_filter_column_name, effective_state_pushdown_predicates, overlay_lanes,
     overlay_lanes_for_version, OverlayLane,
 };
-use crate::canonical::readers::{
-    load_exact_committed_state_row_from_live_state, CommitQueryExecutor, ExactCommittedStateRow,
-    ExactCommittedStateRowRequest,
+use crate::sql::public::services::state_reader::{
+    load_exact_committed_state_row, load_exact_tombstone, load_live_row_access,
+    normalized_values_from_snapshot, scan_live_rows_with_executor_ref, scan_tombstones,
+    CommitQueryExecutor, ExactCommittedStateRow, ExactCommittedStateRowRequest,
+    ExactTrackedRowRequest, RawRow, RawStorage, TrackedScanRequest, TrackedTombstoneMarker,
 };
 use crate::transaction::{PendingSemanticRow, PendingSemanticStorage};
 use crate::version::GLOBAL_VERSION_ID;
@@ -373,12 +367,12 @@ async fn tracked_exact_row_exists_including_tombstones(
         file_id: request.row_key.file_id.clone(),
     };
     if let Some(tombstone) =
-        load_exact_tombstone_with_executor(&mut executor, &exact_request).await?
+        load_exact_tombstone(&mut executor, &exact_request).await?
     {
         return Ok(tombstone_matches_row_key(&tombstone, &request.row_key));
     }
 
-    let tombstones = scan_tombstones_with_executor(
+    let tombstones = scan_tombstones(
         &mut executor,
         &TrackedScanRequest {
             schema_key: request.schema_key.clone(),
@@ -399,7 +393,7 @@ async fn load_exact_tracked_effective_row(
     internal_version_id: &str,
     overlay_lane: OverlayLane,
 ) -> Result<Option<ExactEffectiveStateRow>, LixError> {
-    let row = load_exact_committed_state_row_from_live_state(
+    let row = load_exact_committed_state_row(
         backend,
         &ExactCommittedStateRowRequest {
             entity_id: request.row_key.entity_id.clone(),
@@ -512,7 +506,7 @@ async fn load_exact_untracked_state_row(
     executor: &mut dyn CommitQueryExecutor,
     request: &ExactUntrackedStateRowRequest,
 ) -> Result<Option<ExactUntrackedStateRow>, LixError> {
-    let mut rows = scan_raw_rows_with_executor(
+    let mut rows = scan_live_rows_with_executor_ref(
         executor,
         RawStorage::Untracked,
         &request.schema_key,
@@ -721,9 +715,8 @@ async fn exact_effective_state_row_from_pending(
     } else {
         row.version_id.clone()
     };
-    let access = load_live_row_access_with_backend(backend, &row.schema_key).await?;
-    let mut values =
-        normalized_live_column_values(access.layout(), row.snapshot_content.as_deref())?;
+    let access = load_live_row_access(backend, &row.schema_key).await?;
+    let mut values = normalized_values_from_snapshot(&access, row.snapshot_content.as_deref())?;
     values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
     values.insert(
         "schema_key".to_string(),

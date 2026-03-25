@@ -15,9 +15,9 @@ use crate::functions::LixFunctionProvider;
 use crate::functions::SharedFunctionProvider;
 use crate::sql::common::ast::parse_sql_statements;
 use crate::sql::execution::contracts::planned_statement::PlannedStatementSet;
-use crate::state::internal::defaults::apply_vtable_insert_defaults;
-use crate::state::internal::inline_functions::inline_lix_functions_with_provider;
-use crate::state::internal::param_context::normalize_statement_placeholders_in_batch;
+use crate::sql::internal::defaults::apply_vtable_insert_defaults;
+use crate::sql::internal::inline_functions::inline_lix_functions_with_provider;
+use crate::sql::internal::param_context::normalize_statement_placeholders_in_batch;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use sqlparser::ast::{ObjectNamePart, Query, Statement, TableFactor, Visit, Visitor};
 use std::collections::{BTreeMap, BTreeSet};
@@ -128,7 +128,7 @@ pub(crate) fn parse_single_query(sql: &str) -> Result<sqlparser::ast::Query, Lix
 }
 
 pub(crate) fn quote_ident(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
+    crate::sql_support::text::quote_ident(value)
 }
 
 pub(crate) fn rewrite_internal_state_query_read(

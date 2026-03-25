@@ -1,7 +1,7 @@
 use super::*;
 use crate::schema::builtin::builtin_schema_definition;
 use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
-use crate::sql::execution::shared_path::PendingTransactionView;
+use crate::transaction::PendingTransactionView;
 use crate::sql::public::planner::ir::CanonicalStateAssignments;
 use crate::sql::public::planner::ir::CanonicalStateRowKey;
 use crate::sql::public::planner::semantics::effective_state_resolver::resolve_exact_effective_state_row_with_pending_transaction_view;

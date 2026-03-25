@@ -6,26 +6,23 @@ use crate::engine::TransactionBackendAdapter;
 use crate::functions::LixFunctionProvider;
 use crate::schema::live_layout::{normalized_live_column_values, tracked_live_table_name};
 use crate::schema::registry::load_live_table_layout_in_transaction;
-use crate::state::validation::{validate_commit_time_write, SchemaCache};
+use crate::sql::public::validation::{validate_commit_time_write, SchemaCache};
 use crate::canonical::append::{
-    append_tracked, CreateCommitArgs, CreateCommitDisposition, CreateCommitError,
-    CreateCommitErrorKind, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
-    CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
+    append_tracked_with_pending_public_session, BufferedTrackedAppendArgs,
+    CreateCommitDisposition, CreateCommitError, CreateCommitErrorKind,
+    CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitInvariantChecker,
+    CreateCommitPreconditions, CreateCommitWriteLane,
 };
-use crate::canonical::pending_session::create_commit_error_to_lix_error;
 use crate::canonical::ProposedDomainChange;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
 use super::{
-    apply_public_version_last_checkpoint_side_effects, binary_blob_writes_from_filesystem_state,
-    build_filesystem_payload_domain_changes_insert, build_pending_public_commit_session,
+    apply_public_version_last_checkpoint_side_effects, build_filesystem_payload_domain_changes_insert,
     empty_public_write_execution_outcome, escape_sql_string,
     execute_internal_execution_with_transaction,
-    merge_public_domain_change_batch_into_pending_commit,
-    mirror_public_registered_schema_bootstrap_rows, pending_session_matches_create_commit,
-    semantic_plan_effects_from_domain_changes, state_commit_stream_operation, DomainChangeBatch,
-    PendingPublicCommitSession, PlanEffects, PlannedInternalWriteUnit,
+    mirror_public_registered_schema_bootstrap_rows, semantic_plan_effects_from_domain_changes,
+    state_commit_stream_operation, DomainChangeBatch, PendingPublicCommitSession, PlanEffects, PlannedInternalWriteUnit,
     PlannedPublicUntrackedWriteUnit, PlannedStateRow, PlannedWriteDelta, PlannedWriteUnit,
     SqlExecutionOutcome, WriteLane,
 };
@@ -114,74 +111,17 @@ async fn materialize_tracked_append_phase(
 
     let mut create_commit_functions = unit.functions.clone();
     let canonical_preconditions = canonical_create_commit_preconditions_for_tracked_unit(unit)?;
-    if let Some(session_slot) = pending_commit_session.as_mut() {
-        let can_merge = !unit.has_compiler_only_filesystem_changes()
-            && session_slot.as_ref().is_some_and(|session| {
-                pending_session_matches_create_commit(session, &canonical_preconditions)
-            });
-        if can_merge {
-            let binary_blob_writes =
-                binary_blob_writes_from_filesystem_state(&unit.filesystem_state);
-            engine
-                .ensure_runtime_sequence_initialized_in_transaction(
-                    transaction,
-                    &create_commit_functions,
-                )
-                .await?;
-            let timestamp = create_commit_functions.timestamp();
-            let mut invariant_checker =
-                PublicCommitInvariantChecker::new(&unit.public_write.planned_write);
-            invariant_checker
-                .recheck_invariants(transaction)
-                .await
-                .map_err(create_commit_error_to_lix_error)?;
-            let session = session_slot
-                .as_mut()
-                .expect("session should exist when can_merge is true");
-            let merged_changes = public_domain_changes_to_proposed(
-                &unit.execution
-                    .domain_change_batch
-                    .as_ref()
-                    .expect("merged tracked writes should have a domain change batch")
-                    .changes,
-            )?;
-            merge_public_domain_change_batch_into_pending_commit(
+    if pending_commit_session
+        .as_ref()
+        .is_some_and(|slot| slot.as_ref().is_some())
+        && !unit.has_compiler_only_filesystem_changes()
+    {
+        engine
+            .ensure_runtime_sequence_initialized_in_transaction(
                 transaction,
-                session,
-                &merged_changes,
-                &binary_blob_writes,
-                &mut create_commit_functions,
-                &timestamp,
+                &create_commit_functions,
             )
             .await?;
-            if create_commit_functions
-                .deterministic_sequence_persist_highest_seen()
-                .is_some()
-            {
-                let mut settings = DeterministicSettings::disabled();
-                settings.enabled = create_commit_functions.deterministic_sequence_enabled();
-                engine
-                    .persist_runtime_sequence_in_transaction(
-                        transaction,
-                        settings,
-                        0,
-                        &create_commit_functions,
-                    )
-                    .await?;
-            }
-
-            return Ok(Some(SqlExecutionOutcome {
-                public_result: QueryResult {
-                    rows: Vec::new(),
-                    columns: Vec::new(),
-                },
-                postprocess_file_cache_targets: BTreeSet::new(),
-                plugin_changes_committed: true,
-                plan_effects_override: Some(unit.execution.semantic_effects.clone()),
-                state_commit_stream_changes: Vec::new(),
-                observe_tick_emitted: false,
-            }));
-        }
     }
 
     let mut invariant_checker = PublicCommitInvariantChecker::new(&unit.public_write.planned_write);
@@ -190,9 +130,9 @@ async fn materialize_tracked_append_phase(
     } else {
         Some(&mut invariant_checker as &mut dyn CreateCommitInvariantChecker)
     };
-    let create_result = append_tracked(
+    let append_outcome = append_tracked_with_pending_public_session(
         transaction,
-        CreateCommitArgs {
+        BufferedTrackedAppendArgs {
             timestamp: None,
             changes: unit
                 .execution
@@ -203,18 +143,34 @@ async fn materialize_tracked_append_phase(
                 .unwrap_or_default(),
             filesystem_state: unit.filesystem_state.clone(),
             preconditions: canonical_preconditions.clone(),
-            lane_parent_commit_ids_override: None,
-            allow_empty_commit: false,
-            should_emit_observe_tick: unit.should_emit_observe_tick(),
-            observe_tick_writer_key: unit.writer_key.clone(),
             writer_key: unit.writer_key.clone(),
+            should_emit_observe_tick: unit.should_emit_observe_tick(),
         },
         &mut create_commit_functions,
         invariant_checker,
+        pending_commit_session.as_deref_mut(),
+        !unit.has_compiler_only_filesystem_changes(),
     )
     .await?;
 
-    if let Some(applied_output) = create_result.applied_output.as_ref() {
+    if append_outcome.merged_into_pending_session
+        && create_commit_functions
+            .deterministic_sequence_persist_highest_seen()
+            .is_some()
+    {
+        let mut settings = DeterministicSettings::disabled();
+        settings.enabled = create_commit_functions.deterministic_sequence_enabled();
+        engine
+            .persist_runtime_sequence_in_transaction(
+                transaction,
+                settings,
+                0,
+                &create_commit_functions,
+            )
+            .await?;
+    }
+
+    if let Some(applied_output) = append_outcome.applied_output.as_ref() {
         mirror_public_registered_schema_bootstrap_rows(transaction, applied_output)
             .await
         .map_err(|error| LixError {
@@ -227,9 +183,9 @@ async fn materialize_tracked_append_phase(
     }
 
     let applied_domain_change_batch =
-        if matches!(create_result.disposition, CreateCommitDisposition::Applied) {
+        if matches!(append_outcome.disposition, CreateCommitDisposition::Applied) {
             Some(DomainChangeBatch {
-                changes: public_domain_changes_from_proposed(&create_result.applied_domain_changes),
+                changes: public_domain_changes_from_proposed(&append_outcome.applied_domain_changes),
                 write_lane: unit
                     .execution
                     .domain_change_batch
@@ -281,30 +237,12 @@ async fn materialize_tracked_append_phase(
     }
 
     let plugin_changes_committed =
-        matches!(create_result.disposition, CreateCommitDisposition::Applied);
-    if let Some(session_slot) = pending_commit_session.as_mut() {
-        **session_slot = if plugin_changes_committed {
-            if let Some(applied_output) = create_result.applied_output.as_ref() {
-                Some(
-                    build_pending_public_commit_session(
-                        transaction,
-                        canonical_preconditions.write_lane.clone(),
-                        applied_output,
-                    )
-                    .await?,
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-    }
+        matches!(append_outcome.disposition, CreateCommitDisposition::Applied);
 
     let plan_effects_override = if plugin_changes_committed {
         if unit.has_compiler_only_filesystem_changes() {
             semantic_plan_effects_from_domain_changes(
-                &create_result.applied_domain_changes,
+                &append_outcome.applied_domain_changes,
                 state_commit_stream_operation(
                     unit.public_write.planned_write.command.operation_kind,
                 ),

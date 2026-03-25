@@ -33,8 +33,8 @@ fn system_module_uses_raw_untracked_reads() {
 fn non_write_consumers_use_raw_or_system_instead_of_lane_modules() {
     for relative in [
         "sql/execution/shared_path.rs",
-        "state/commit/state_source.rs",
-        "state/validation.rs",
+        "canonical/state_source.rs",
+        "sql/public/validation.rs",
         "live_state/materialize/plan.rs",
         "version/switch_version.rs",
         "undo_redo/mod.rs",

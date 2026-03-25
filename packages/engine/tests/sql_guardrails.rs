@@ -181,6 +181,39 @@ fn guardrail_public_lowering_stays_isolated_from_legacy_rewrite_followup_and_cla
 }
 
 #[test]
+fn guardrail_sql_public_runtime_uses_service_seams_for_storage_and_pending_reads() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql/public");
+    let mut files = Vec::new();
+    collect_rust_sources(&root, &mut files);
+
+    for file in files {
+        let relative = file
+            .strip_prefix(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"))
+            .expect("public file should be under src");
+        let relative = relative.to_string_lossy();
+        if relative.starts_with("sql/public/services/") {
+            continue;
+        }
+
+        let source = fs::read_to_string(&file).expect("source file should be readable");
+        for forbidden in [
+            "crate::live_state::raw::",
+            "crate::live_state::tracked::",
+            "crate::live_state::system::",
+            "crate::canonical::readers::",
+            "shared_path::execute_prepared_public_read_with_pending_transaction_view",
+            "shared_path::bootstrap_public_surface_registry_with_pending_transaction_view",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "sql/public should depend on service seams instead of storage/pending-read helpers: {}",
+                file.display()
+            );
+        }
+    }
+}
+
+#[test]
 fn guardrail_legacy_surface_registry_directory_is_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
@@ -201,7 +234,7 @@ fn guardrail_filesystem_public_surfaces_do_not_enter_legacy_query_rewrite() {
 #[test]
 fn guardrail_vtable_read_stays_filesystem_blind() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let vtable_read_source = fs::read_to_string(root.join("src/state/internal/vtable_read.rs"))
+    let vtable_read_source = fs::read_to_string(root.join("src/sql/internal/vtable_read.rs"))
         .expect("vtable_read.rs should be readable");
 
     for forbidden in ["lix_file", "lix_directory", "filesystem::"] {
@@ -259,7 +292,7 @@ fn guardrail_dead_canonical_filesystem_write_wrapper_stays_removed() {
 fn guardrail_legacy_canonical_statement_rewrite_is_filesystem_blind() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let canonical_mod_source =
-        fs::read_to_string(root.join("src/state/internal/canonical_write.rs"))
+        fs::read_to_string(root.join("src/sql/internal/canonical_write.rs"))
             .expect("canonical_write.rs should be readable");
 
     for forbidden in [
@@ -275,6 +308,49 @@ fn guardrail_legacy_canonical_statement_rewrite_is_filesystem_blind() {
         assert!(
             !canonical_mod_source.contains(forbidden),
             "legacy canonical statement rewrite must not carry filesystem write branches: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn guardrail_state_module_no_longer_owns_sql_runtime_layers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let state_mod_source =
+        fs::read_to_string(root.join("src/state/mod.rs")).expect("state/mod.rs readable");
+    assert!(
+        !state_mod_source.contains("mod internal;"),
+        "state/mod.rs must not own sql/internal runtime logic"
+    );
+    assert!(
+        !state_mod_source.contains("mod validation;"),
+        "state/mod.rs must not own sql/public validation logic"
+    );
+
+    for removed in [
+        "src/state/validation.rs",
+        "src/state/internal/script.rs",
+        "src/state/internal/canonical_write.rs",
+        "src/state/internal/followup.rs",
+        "src/state/internal/vtable_read.rs",
+        "src/state/internal/vtable_write.rs",
+    ] {
+        assert!(
+            !root.join(removed).exists(),
+            "{removed} must stay removed once sql/internal and sql/public own runtime support"
+        );
+    }
+
+    for added in [
+        "src/sql/public/validation.rs",
+        "src/sql/internal/script.rs",
+        "src/sql/internal/canonical_write.rs",
+        "src/sql/internal/followup.rs",
+        "src/sql/internal/vtable_read.rs",
+        "src/sql/internal/vtable_write.rs",
+    ] {
+        assert!(
+            root.join(added).exists(),
+            "{added} should exist once sql owns runtime support"
         );
     }
 }

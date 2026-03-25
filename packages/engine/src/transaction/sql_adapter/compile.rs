@@ -6,8 +6,9 @@ use crate::sql::execution::execution_program::{
 };
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::shared_path::{
-    self, prepared_execution_mutates_public_surface_registry, PendingTransactionView,
+    self, prepared_execution_mutates_public_surface_registry,
 };
+use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, Value};
 use sqlparser::ast::Statement;
 

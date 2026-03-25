@@ -31,7 +31,7 @@ use crate::sql::execution::execute_prepared::execute_prepared_with_transaction;
 use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::sql_support::text::escape_sql_string;
 use crate::backend::program::WriteProgram;
-use crate::state::internal::{PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
+use crate::sql::internal::{PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "entity_id",
     "file_id",

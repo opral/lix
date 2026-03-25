@@ -12,13 +12,14 @@ pub(crate) use crate::sql::execution::contracts::planned_statement::MutationRow;
 pub(crate) use crate::sql::execution::contracts::result_contract::ResultContract;
 pub(crate) use crate::sql::execution::execution_program::ExecutionContext;
 pub(crate) use crate::filesystem::runtime::{
-    binary_blob_writes_from_filesystem_state, build_filesystem_payload_domain_changes_insert,
-    filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
-    FilesystemTransactionFileState, FilesystemTransactionState,
+    build_filesystem_payload_domain_changes_insert, filesystem_transaction_state_has_binary_payloads,
+    merge_filesystem_transaction_state, FilesystemTransactionFileState,
+    FilesystemTransactionState,
 };
+pub(crate) use crate::transaction::PendingTransactionView;
 pub(crate) use crate::sql::execution::shared_path::{
     apply_public_version_last_checkpoint_side_effects, empty_public_write_execution_outcome,
-    mirror_public_registered_schema_bootstrap_rows, PendingTransactionView,
+    mirror_public_registered_schema_bootstrap_rows,
 };
 pub(crate) use crate::sql::public::planner::ir::{
     OptionalTextPatch, PlannedStateRow, WriteLane, WriteMode,
@@ -31,8 +32,7 @@ pub(crate) use crate::sql::public::runtime::{
 };
 pub(crate) use crate::sql_support::text::escape_sql_string;
 pub(crate) use crate::canonical::pending_session::{
-    build_pending_public_commit_session, merge_public_domain_change_batch_into_pending_commit,
-    pending_session_matches_create_commit, PendingPublicCommitSession,
+    PendingPublicCommitSession,
 };
 
 pub(crate) use execute::{

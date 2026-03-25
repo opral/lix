@@ -2,14 +2,18 @@ use crate::engine::{DeferredTransactionSideEffects, Engine, TransactionBackendAd
 use crate::sql::execution::execution_program::ExecutionContext;
 use crate::filesystem::runtime::merge_filesystem_transaction_state;
 use crate::sql::execution::shared_path::{
-    self, prepared_execution_mutates_public_surface_registry, PendingTransactionView,
-    PreparedPublicReadTransactionMode,
+    self, prepared_execution_mutates_public_surface_registry,
+};
+use crate::sql::public::services::pending_reads::{
+    bootstrap_public_surface_registry_with_pending_transaction_view,
+    prepared_public_read_transaction_mode, PreparedPublicReadTransactionMode,
 };
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::sql::public::runtime::{
     apply_public_surface_registry_mutations, public_surface_registry_mutations,
     PublicWriteExecutionPartition,
 };
+use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError};
 
 use super::compile::SqlBufferedWriteCommand;
@@ -26,7 +30,7 @@ pub(super) fn command_metadata(
         CompiledExecutionRoute::Internal(_) => BufferedWriteExecutionRoute::Internal,
         CompiledExecutionRoute::PublicRead(public_read)
             if matches!(
-                shared_path::prepared_public_read_transaction_mode(public_read),
+                prepared_public_read_transaction_mode(public_read),
                 PreparedPublicReadTransactionMode::MaterializedState
             ) =>
         {
@@ -68,11 +72,8 @@ pub(super) async fn refresh_public_surface_registry_from_pending_transaction_vie
 ) -> Result<(), LixError> {
     let backend = TransactionBackendAdapter::new(transaction);
     context.public_surface_registry =
-        shared_path::bootstrap_public_surface_registry_with_pending_transaction_view(
-            &backend,
-            pending_transaction_view,
-        )
-        .await?;
+        bootstrap_public_surface_registry_with_pending_transaction_view(&backend, pending_transaction_view)
+            .await?;
     context.bump_public_surface_registry_generation();
     Ok(())
 }

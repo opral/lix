@@ -27,10 +27,10 @@ use crate::canonical::runtime::{
     generate_commit_result_from_domain_changes_with_executor,
 };
 use crate::canonical::DomainChangeInput;
-use crate::state::internal::param_context::{
+use crate::sql::internal::param_context::{
     expr_last_identifier_eq, extract_string_column_values_from_expr, match_bool_column_equality,
 };
-use crate::state::internal::{
+use crate::sql::internal::{
     object_name_matches, parse_single_query, quote_ident, resolve_expr_cell_with_state,
     MutationOperation, MutationRow, PlaceholderState, ResolvedCell, RowSourceResolver,
     SchemaLiveTableRequirement, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,

@@ -4,11 +4,12 @@ use crate::account::{
     active_account_storage_version_id,
 };
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::raw::{load_exact_row_with_backend, scan_rows_with_backend, RawStorage};
-use crate::live_state::system::load_version_ref_with_backend;
-use crate::sql::execution::shared_path::{
+use crate::sql::public::services::pending_reads::{
     bootstrap_public_surface_registry_with_pending_transaction_view,
-    execute_prepared_public_read_with_pending_transaction_view, PendingTransactionView,
+    execute_prepared_public_read_with_pending_transaction_view,
+};
+use crate::sql::public::services::state_reader::{
+    load_exact_live_row, load_version_ref, scan_live_rows, RawStorage,
 };
 use crate::sql::public::catalog::SurfaceFamily;
 use crate::sql::public::planner::ir::{
@@ -36,6 +37,7 @@ use crate::version::{
     version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
     version_ref_schema_version, version_ref_snapshot_content, GLOBAL_VERSION_ID,
 };
+use crate::transaction::PendingTransactionView;
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
@@ -537,7 +539,7 @@ async fn load_active_version_admin_rows(
         operator: ScanOperator::Eq(Value::Text(active_version_file_id().to_string())),
     }];
     let required_columns = vec!["version_id".to_string()];
-    let rows = scan_rows_with_backend(
+    let rows = scan_live_rows(
         backend,
         RawStorage::Untracked,
         active_version_schema_key(),
@@ -613,7 +615,7 @@ async fn load_active_account_admin_rows(
         operator: ScanOperator::Eq(Value::Text(active_account_file_id().to_string())),
     }];
     let required_columns = vec!["account_id".to_string()];
-    let rows = scan_rows_with_backend(
+    let rows = scan_live_rows(
         backend,
         RawStorage::Untracked,
         active_account_schema_key(),
@@ -907,7 +909,7 @@ async fn load_version_admin_row(
     backend: &dyn LixBackend,
     version_id: &str,
 ) -> Result<Option<VersionAdminRow>, crate::LixError> {
-    let Some(descriptor_row) = load_exact_row_with_backend(
+    let Some(descriptor_row) = load_exact_live_row(
         backend,
         RawStorage::Tracked,
         version_descriptor_schema_key(),
@@ -920,7 +922,7 @@ async fn load_version_admin_row(
     .and_then(|row| row.into_tracked()) else {
         return Ok(None);
     };
-    let pointer_row = load_version_ref_with_backend(backend, version_id).await?;
+    let pointer_row = load_version_ref(backend, version_id).await?;
     Ok(Some(VersionAdminRow {
         id: version_id.to_string(),
         name: descriptor_row.property_text("name").unwrap_or_default(),

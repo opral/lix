@@ -4,17 +4,12 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use jsonschema::JSONSchema;
-use serde_json::{Map as JsonMap, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
 use crate::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::raw::{scan_rows_with_backend, snapshot_json, RawRow, RawStorage};
-use crate::live_state::{
-    is_untracked_live_table, load_live_row_access_for_table_name,
-    load_live_row_access_with_backend, logical_snapshot_from_projected_row,
-};
 use crate::schema::live_layout::{tracked_live_table_name, untracked_live_table_name};
 use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
@@ -25,6 +20,10 @@ use crate::sql::execution::contracts::planned_statement::{
     MutationOperation, MutationRow, UpdateValidationKind, UpdateValidationPlan,
 };
 use crate::sql::public::catalog::SurfaceFamily;
+use crate::sql::public::services::state_reader::{
+    is_untracked_live_table_name, load_live_row_access, load_live_row_access_for_table,
+    projected_row_snapshot_json, scan_live_rows, snapshot_json_from_row, RawRow, RawStorage,
+};
 use crate::sql::public::planner::ir::{
     InsertOnConflictAction, PlannedStateRow, PlannedWrite, ResolvedWritePlan, WriteMode,
     WriteOperationKind,
@@ -187,7 +186,7 @@ pub async fn validate_updates(
     let mut deleted_rows = Vec::new();
 
     for plan in plans {
-        let live_access = load_live_row_access_for_table_name(backend, &plan.table).await?;
+        let live_access = load_live_row_access_for_table(backend, &plan.table).await?;
         let snapshot_projection = if live_access.is_some() {
             String::new()
         } else {
@@ -219,8 +218,7 @@ pub async fn validate_updates(
             let schema_key = value_to_string(&row[4], "schema_key")?;
             let schema_version = value_to_string(&row[5], "schema_version")?;
             let base_snapshot =
-                logical_snapshot_from_projected_row(live_access.as_ref(), &schema_key, &row, 6, 6)?
-                    .unwrap_or(JsonValue::Object(JsonMap::new()));
+                projected_row_snapshot_json(live_access.as_ref(), &schema_key, &row, 6, 6)?;
             let snapshot = resolve_update_snapshot(plan, &base_snapshot, &schema_key)?;
             let storage = storage_kind_for_table(&plan.table);
 
@@ -590,7 +588,7 @@ fn storage_kind_for_write_mode(mode: WriteMode) -> ConstraintStorageKind {
 }
 
 fn storage_kind_for_table(table: &str) -> ConstraintStorageKind {
-    if is_untracked_live_table(&table.to_ascii_lowercase()) {
+    if is_untracked_live_table_name(&table.to_ascii_lowercase()) {
         ConstraintStorageKind::Untracked
     } else {
         ConstraintStorageKind::Tracked
@@ -1656,7 +1654,7 @@ async fn query_committed_scope_rows(
     if !relation_exists(backend, &relation_name).await? {
         return Ok(Vec::new());
     }
-    let access = load_live_row_access_with_backend(backend, &scope.schema_key).await?;
+    let access = load_live_row_access(backend, &scope.schema_key).await?;
     let required_columns = access
         .columns()
         .iter()
@@ -1668,7 +1666,7 @@ async fn query_committed_scope_rows(
     }];
 
     match scope.storage {
-        ConstraintStorageKind::Tracked => scan_rows_with_backend(
+        ConstraintStorageKind::Tracked => scan_live_rows(
             backend,
             RawStorage::Tracked,
             &scope.schema_key,
@@ -1680,7 +1678,7 @@ async fn query_committed_scope_rows(
         .into_iter()
         .map(|row| committed_row_from_raw(&scope.schema_key, &scope.version_id, &access, row))
         .collect(),
-        ConstraintStorageKind::Untracked => scan_rows_with_backend(
+        ConstraintStorageKind::Untracked => scan_live_rows(
             backend,
             RawStorage::Untracked,
             &scope.schema_key,
@@ -1706,7 +1704,7 @@ async fn query_committed_schema_version_rows(
     if !relation_exists(backend, &relation_name).await? {
         return Ok(Vec::new());
     }
-    let access = load_live_row_access_with_backend(backend, &scope.schema_key).await?;
+    let access = load_live_row_access(backend, &scope.schema_key).await?;
     let required_columns = access
         .columns()
         .iter()
@@ -1714,7 +1712,7 @@ async fn query_committed_schema_version_rows(
         .collect::<Vec<_>>();
 
     match scope.storage {
-        ConstraintStorageKind::Tracked => scan_rows_with_backend(
+        ConstraintStorageKind::Tracked => scan_live_rows(
             backend,
             RawStorage::Tracked,
             &scope.schema_key,
@@ -1726,7 +1724,7 @@ async fn query_committed_schema_version_rows(
         .into_iter()
         .map(|row| committed_row_from_raw(&scope.schema_key, &scope.version_id, &access, row))
         .collect(),
-        ConstraintStorageKind::Untracked => scan_rows_with_backend(
+        ConstraintStorageKind::Untracked => scan_live_rows(
             backend,
             RawStorage::Untracked,
             &scope.schema_key,
@@ -1755,7 +1753,7 @@ fn committed_row_from_raw(
             version_id: version_id.to_string(),
         },
         schema_version: row.schema_version().to_string(),
-        snapshot: snapshot_json(access, &row)?,
+        snapshot: snapshot_json_from_row(access, &row)?,
     })
 }
 
