@@ -937,21 +937,21 @@ fn tracked_plan_is_coalescible_filesystem(plan: &TrackedTxnUnit) -> bool {
 }
 
 fn create_commit_expected_head_compatible(
-    left: &crate::state::commit::CreateCommitExpectedHead,
-    right: &crate::state::commit::CreateCommitExpectedHead,
+    left: &crate::sql::public::planner::ir::ExpectedHead,
+    right: &crate::sql::public::planner::ir::ExpectedHead,
 ) -> bool {
     match (left, right) {
         (
-            crate::state::commit::CreateCommitExpectedHead::CurrentHead,
-            crate::state::commit::CreateCommitExpectedHead::CurrentHead,
+            crate::sql::public::planner::ir::ExpectedHead::CurrentHead,
+            crate::sql::public::planner::ir::ExpectedHead::CurrentHead,
         ) => true,
         (
-            crate::state::commit::CreateCommitExpectedHead::CommitId(left),
-            crate::state::commit::CreateCommitExpectedHead::CommitId(right),
+            crate::sql::public::planner::ir::ExpectedHead::CommitId(left),
+            crate::sql::public::planner::ir::ExpectedHead::CommitId(right),
         ) => left == right,
         (
-            crate::state::commit::CreateCommitExpectedHead::CreateIfMissing,
-            crate::state::commit::CreateCommitExpectedHead::CreateIfMissing,
+            crate::sql::public::planner::ir::ExpectedHead::CreateIfMissing,
+            crate::sql::public::planner::ir::ExpectedHead::CreateIfMissing,
         ) => true,
         _ => false,
     }

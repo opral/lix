@@ -14,9 +14,8 @@ use crate::sql::execution::contracts::planned_statement::{
 };
 use crate::sql::execution::contracts::prepared_statement::PreparedStatement;
 use crate::sql::execution::contracts::result_contract::ResultContract;
-use crate::sql::execution::shared_path::{
-    self, PendingPublicCommitSession, PendingTransactionView,
-};
+use crate::canonical::pending_session::PendingPublicCommitSession;
+use crate::sql::execution::shared_path::{self, PendingTransactionView};
 use crate::sql::public::runtime::{PreparedPublicRead, PreparedPublicWrite};
 use crate::state::internal::followup::execute_internal_postprocess_with_transaction;
 use crate::state::internal::PostprocessPlan;

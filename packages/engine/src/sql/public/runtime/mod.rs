@@ -45,11 +45,8 @@ use crate::sql::public::planner::semantics::effective_state_resolver::{
 };
 use crate::sql::public::planner::semantics::write_analysis::analyze_write;
 use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan;
-use crate::state::commit::{
-    load_committed_version_head_commit_id_from_live_state, CreateCommitExpectedHead,
-    CreateCommitIdempotencyKey, CreateCommitPreconditions, CreateCommitWriteLane,
-    ProposedDomainChange,
-};
+use crate::canonical::readers::load_committed_version_head_commit_id_from_live_state;
+use crate::change_view::TrackedDomainChangeView;
 use crate::state::history::ensure_state_history_timeline_materialized_for_root;
 use crate::state::history::StateHistoryRequest;
 use crate::state::stream::{
@@ -505,7 +502,7 @@ pub(crate) enum PublicWriteExecutionPartition {
 pub(crate) struct TrackedWriteExecution {
     pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub(crate) domain_change_batch: Option<DomainChangeBatch>,
-    pub(crate) create_preconditions: CreateCommitPreconditions,
+    pub(crate) create_preconditions: CommitPreconditions,
     pub(crate) semantic_effects: PlanEffects,
 }
 
@@ -2062,11 +2059,7 @@ fn build_public_write_execution(
                     TrackedWriteExecution {
                         schema_live_table_requirements:
                             schema_live_table_requirements_from_partition(partition),
-                        create_preconditions: create_commit_preconditions_for_public_write(
-                            planned_write,
-                            Some(&domain_change_batch),
-                            commit_preconditions,
-                        )?,
+                        create_preconditions: commit_preconditions.clone(),
                         semantic_effects: semantic_plan_effects_from_domain_changes(
                             &domain_change_batch.changes,
                             state_commit_stream_operation(planned_write.command.operation_kind),
@@ -2283,66 +2276,6 @@ pub(crate) fn state_commit_stream_operation(
     }
 }
 
-fn create_commit_preconditions_for_public_write(
-    planned_write: &PlannedWrite,
-    batch: Option<&DomainChangeBatch>,
-    commit_preconditions: &CommitPreconditions,
-) -> Result<CreateCommitPreconditions, LixError> {
-    let write_lane = match &commit_preconditions.write_lane {
-        crate::sql::public::planner::ir::WriteLane::SingleVersion(version_id) => {
-            CreateCommitWriteLane::Version(version_id.clone())
-        }
-        crate::sql::public::planner::ir::WriteLane::ActiveVersion => {
-            let version_id = batch
-                .into_iter()
-                .flat_map(|batch| batch.changes.first())
-                .map(|change| change.version_id.to_string())
-                .next()
-                .or_else(|| {
-                    planned_write
-                        .command
-                        .execution_context
-                        .requested_version_id
-                        .clone()
-                })
-                .ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        "public commit execution requires a concrete active version id",
-                    )
-                })?;
-            CreateCommitWriteLane::Version(version_id)
-        }
-        crate::sql::public::planner::ir::WriteLane::GlobalAdmin => {
-            CreateCommitWriteLane::GlobalAdmin
-        }
-    };
-    let expected_head = match &commit_preconditions.expected_head {
-        crate::sql::public::planner::ir::ExpectedHead::CurrentHead => {
-            CreateCommitExpectedHead::CurrentHead
-        }
-        crate::sql::public::planner::ir::ExpectedHead::CommitId(commit_id) => {
-            CreateCommitExpectedHead::CommitId(commit_id.clone())
-        }
-        crate::sql::public::planner::ir::ExpectedHead::CreateIfMissing => {
-            CreateCommitExpectedHead::CreateIfMissing
-        }
-    };
-
-    Ok(CreateCommitPreconditions {
-        write_lane,
-        expected_head,
-        idempotency_key: match &commit_preconditions.expected_head {
-            crate::sql::public::planner::ir::ExpectedHead::CurrentHead => {
-                CreateCommitIdempotencyKey::CurrentHeadFingerprint(
-                    commit_preconditions.idempotency_key.0.clone(),
-                )
-            }
-            _ => CreateCommitIdempotencyKey::Exact(commit_preconditions.idempotency_key.0.clone()),
-        },
-    })
-}
-
 fn semantic_plan_effects_from_untracked_public_write(
     planned_write: &PlannedWrite,
     intended_post_state: &[crate::sql::public::planner::ir::PlannedStateRow],
@@ -2395,8 +2328,8 @@ fn semantic_plan_effects_from_untracked_public_write(
     Ok(effects)
 }
 
-pub(crate) fn semantic_plan_effects_from_domain_changes(
-    changes: &[ProposedDomainChange],
+pub(crate) fn semantic_plan_effects_from_domain_changes<Change: TrackedDomainChangeView>(
+    changes: &[Change],
     stream_operation: StateCommitStreamOperation,
 ) -> Result<PlanEffects, LixError> {
     Ok(PlanEffects {
@@ -2409,18 +2342,18 @@ pub(crate) fn semantic_plan_effects_from_domain_changes(
     })
 }
 
-fn next_active_version_id_from_domain_changes(
-    changes: &[ProposedDomainChange],
+fn next_active_version_id_from_domain_changes<Change: TrackedDomainChangeView>(
+    changes: &[Change],
 ) -> Result<Option<String>, LixError> {
     for change in changes.iter().rev() {
-        if change.schema_key != active_version_schema_key()
-            || change.file_id.as_deref() != Some(active_version_file_id())
-            || change.version_id != active_version_storage_version_id()
+        if change.schema_key() != active_version_schema_key()
+            || change.file_id() != Some(active_version_file_id())
+            || change.version_id() != active_version_storage_version_id()
         {
             continue;
         }
 
-        let Some(snapshot_content) = change.snapshot_content.as_deref() else {
+        let Some(snapshot_content) = change.snapshot_content() else {
             continue;
         };
         return parse_active_version_snapshot(snapshot_content).map(Some);
@@ -2429,19 +2362,18 @@ fn next_active_version_id_from_domain_changes(
     Ok(None)
 }
 
-fn file_cache_refresh_targets_from_domain_changes(
-    changes: &[ProposedDomainChange],
+fn file_cache_refresh_targets_from_domain_changes<Change: TrackedDomainChangeView>(
+    changes: &[Change],
 ) -> BTreeSet<(String, String)> {
     changes
         .iter()
-        .filter(|change| change.file_id.as_deref() != Some("lix"))
-        .filter(|change| change.schema_key != "lix_file_descriptor")
-        .filter(|change| change.schema_key != "lix_directory_descriptor")
+        .filter(|change| change.file_id() != Some("lix"))
+        .filter(|change| change.schema_key() != "lix_file_descriptor")
+        .filter(|change| change.schema_key() != "lix_directory_descriptor")
         .filter_map(|change| {
             change
-                .file_id
-                .as_ref()
-                .map(|file_id| (file_id.to_string(), change.version_id.to_string()))
+                .file_id()
+                .map(|file_id| (file_id.to_string(), change.version_id().to_string()))
         })
         .collect()
 }

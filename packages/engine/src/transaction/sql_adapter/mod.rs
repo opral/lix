@@ -17,11 +17,8 @@ pub(crate) use crate::sql::execution::runtime_effects::{
     FilesystemTransactionFileState, FilesystemTransactionState,
 };
 pub(crate) use crate::sql::execution::shared_path::{
-    apply_public_version_last_checkpoint_side_effects, build_pending_public_commit_session,
-    create_commit_error_to_lix_error, empty_public_write_execution_outcome,
-    merge_public_domain_change_batch_into_pending_commit,
-    mirror_public_registered_schema_bootstrap_rows, pending_session_matches_create_commit,
-    PendingPublicCommitSession, PendingTransactionView, PublicCommitInvariantChecker,
+    apply_public_version_last_checkpoint_side_effects, empty_public_write_execution_outcome,
+    mirror_public_registered_schema_bootstrap_rows, PendingTransactionView,
 };
 pub(crate) use crate::sql::public::planner::ir::{
     OptionalTextPatch, PlannedStateRow, WriteLane, WriteMode,
@@ -33,6 +30,10 @@ pub(crate) use crate::sql::public::runtime::{
     TrackedTxnUnit, UntrackedWriteExecution,
 };
 pub(crate) use crate::sql::storage::sql_text::escape_sql_string;
+pub(crate) use crate::canonical::pending_session::{
+    build_pending_public_commit_session, merge_public_domain_change_batch_into_pending_commit,
+    pending_session_matches_create_commit, PendingPublicCommitSession,
+};
 
 pub(crate) use execute::{
     execute_bound_statement_template_instance_in_borrowed_write_transaction,

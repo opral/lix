@@ -7,7 +7,8 @@ use crate::sql::execution::execution_program::{
     execute_execution_program_with_write_transaction, BoundStatementTemplateInstance,
     ExecutionContext, ExecutionProgram,
 };
-use crate::sql::execution::shared_path::{PendingPublicCommitSession, PendingTransactionView};
+use crate::canonical::pending_session::PendingPublicCommitSession;
+use crate::sql::execution::shared_path::PendingTransactionView;
 use crate::{ExecuteOptions, ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 
 use super::compile::{

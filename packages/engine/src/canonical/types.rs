@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::change_view::TrackedDomainChangeView;
 use crate::schema::live_layout::LiveTableLayout;
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
@@ -17,6 +18,40 @@ pub(crate) struct ProposedDomainChange {
     pub(crate) metadata: Option<String>,
     pub(crate) version_id: VersionId,
     pub(crate) writer_key: Option<String>,
+}
+
+impl TrackedDomainChangeView for ProposedDomainChange {
+    fn entity_id(&self) -> &str {
+        self.entity_id.as_str()
+    }
+
+    fn schema_key(&self) -> &str {
+        self.schema_key.as_str()
+    }
+
+    fn schema_version(&self) -> Option<&str> {
+        self.schema_version.as_ref().map(|value| value.as_str())
+    }
+
+    fn file_id(&self) -> Option<&str> {
+        self.file_id.as_ref().map(|value| value.as_str())
+    }
+
+    fn plugin_key(&self) -> Option<&str> {
+        self.plugin_key.as_ref().map(|value| value.as_str())
+    }
+
+    fn snapshot_content(&self) -> Option<&str> {
+        self.snapshot_content.as_deref()
+    }
+
+    fn version_id(&self) -> &str {
+        self.version_id.as_str()
+    }
+
+    fn writer_key(&self) -> Option<&str> {
+        self.writer_key.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

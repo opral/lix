@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::json;
 
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
-use crate::state::commit::types::{
+use crate::canonical::types::{
     CanonicalCommitOutput, ChangeRow, DerivedCommitApplyInput, DomainChangeInput,
     GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow,
 };
@@ -689,7 +689,7 @@ fn collapse_domain_changes_last_wins(changes: &[DomainChangeInput]) -> Vec<&Doma
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::commit::types::{VersionInfo, VersionSnapshot};
+    use crate::canonical::types::{VersionInfo, VersionSnapshot};
 
     fn domain_change(
         id: &str,

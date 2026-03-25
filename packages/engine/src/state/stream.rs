@@ -1,6 +1,6 @@
+use crate::change_view::TrackedDomainChangeView;
 use crate::schema::live_layout::{logical_live_snapshot_from_row_with_layout, LiveTableLayout};
 use crate::sql::execution::contracts::planned_statement::{MutationOperation, MutationRow};
-use crate::state::commit::ProposedDomainChange;
 use crate::{LixError, Value};
 use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
@@ -526,8 +526,8 @@ pub(crate) fn state_commit_stream_changes_from_postprocess_rows(
     Ok(changes)
 }
 
-pub(crate) fn state_commit_stream_changes_from_domain_changes(
-    changes: &[ProposedDomainChange],
+pub(crate) fn state_commit_stream_changes_from_domain_changes<Change: TrackedDomainChangeView>(
+    changes: &[Change],
     operation: StateCommitStreamOperation,
 ) -> Result<Vec<StateCommitStreamChange>, LixError> {
     if changes.is_empty() {
@@ -536,7 +536,7 @@ pub(crate) fn state_commit_stream_changes_from_domain_changes(
 
     let mut resolved = Vec::with_capacity(changes.len());
     for change in changes {
-        let snapshot_content = match &change.snapshot_content {
+        let snapshot_content = match change.snapshot_content() {
             Some(snapshot_content) => Some(
                 serde_json::from_str(snapshot_content).map_err(|error| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -549,11 +549,10 @@ pub(crate) fn state_commit_stream_changes_from_domain_changes(
         };
         resolved.push(StateCommitStreamChange {
             operation,
-            entity_id: change.entity_id.to_string(),
-            schema_key: change.schema_key.to_string(),
+            entity_id: change.entity_id().to_string(),
+            schema_key: change.schema_key().to_string(),
             schema_version: change
-                .schema_version
-                .clone()
+                .schema_version()
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: "domain change state commit stream requires schema_version"
@@ -561,17 +560,15 @@ pub(crate) fn state_commit_stream_changes_from_domain_changes(
                 })?
                 .to_string(),
             file_id: change
-                .file_id
-                .clone()
+                .file_id()
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: "domain change state commit stream requires file_id".to_string(),
                 })?
                 .to_string(),
-            version_id: change.version_id.to_string(),
+            version_id: change.version_id().to_string(),
             plugin_key: change
-                .plugin_key
-                .clone()
+                .plugin_key()
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: "domain change state commit stream requires plugin_key"
@@ -580,7 +577,7 @@ pub(crate) fn state_commit_stream_changes_from_domain_changes(
                 .to_string(),
             snapshot_content,
             untracked: false,
-            writer_key: change.writer_key.clone(),
+            writer_key: change.writer_key().map(str::to_string),
         });
     }
 
@@ -706,7 +703,7 @@ mod tests {
         state_commit_stream_changes_from_postprocess_rows, StateCommitStreamOperation,
     };
     use crate::sql::public::planner::ir::PlannedStateRow;
-    use crate::state::commit::ProposedDomainChange;
+    use crate::canonical::ProposedDomainChange;
     use crate::Value;
     use std::collections::BTreeMap;
 

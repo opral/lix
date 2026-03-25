@@ -16,7 +16,7 @@ use crate::sql::public::planner::semantics::surface_semantics::{
     canonical_filter_column_name, effective_state_pushdown_predicates, overlay_lanes,
     overlay_lanes_for_version, OverlayLane,
 };
-use crate::state::commit::{
+use crate::canonical::readers::{
     load_exact_committed_state_row_from_live_state, CommitQueryExecutor, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };

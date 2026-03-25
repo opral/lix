@@ -8,6 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
 };
+use crate::execution_support::{
+    bind_statement_ast, escape_sql_string, PreparedBatch, PreparedStatement,
+};
 use crate::functions::LixFunctionProvider;
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
 use crate::schema::live_layout::load_live_table_layout_with_executor;
@@ -17,19 +20,17 @@ use crate::schema::live_layout::{
     builtin_live_table_layout, normalized_live_column_values, tracked_live_table_name,
     untracked_live_table_name,
 };
-use crate::sql::ast::utils::bind_statement_ast;
-use crate::sql::execution::contracts::prepared_statement::{PreparedBatch, PreparedStatement};
-use crate::sql::storage::sql_text::escape_sql_string;
 use crate::{LixError, SqlDialect, Value as EngineValue};
 
+use super::generate_commit::generate_commit;
 use super::graph_index::{
     resolve_commit_graph_node_write_rows_with_executor, CommitGraphNodeWriteRow,
     COMMIT_GRAPH_NODE_TABLE,
 };
-use super::state_source::CommitQueryExecutor;
+use super::state_source::{load_version_info_for_versions, CommitQueryExecutor};
 use super::types::{
-    CanonicalCommitOutput, DerivedCommitApplyInput, DomainChangeInput, GenerateCommitResult,
-    MaterializedStateRow,
+    CanonicalCommitOutput, DerivedCommitApplyInput, DomainChangeInput, GenerateCommitArgs,
+    GenerateCommitResult, MaterializedStateRow,
 };
 
 const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
@@ -136,6 +137,50 @@ pub(crate) async fn build_prepared_batch_from_generate_commit_result_with_execut
         &commit_graph_rows,
         functions,
         executor.dialect(),
+    )
+}
+
+pub(crate) async fn build_prepared_batch_from_domain_changes_with_executor(
+    executor: &mut dyn CommitQueryExecutor,
+    timestamp: String,
+    domain_changes: Vec<DomainChangeInput>,
+    affected_versions: &BTreeSet<String>,
+    functions: &mut dyn LixFunctionProvider,
+) -> Result<PreparedBatch, LixError> {
+    if domain_changes.is_empty() {
+        return Ok(PreparedBatch { steps: Vec::new() });
+    }
+
+    let commit_result = generate_commit_result_from_domain_changes_with_executor(
+        executor,
+        timestamp,
+        domain_changes,
+        affected_versions,
+        functions,
+    )
+    .await?;
+    build_prepared_batch_from_generate_commit_result_with_executor(executor, commit_result, functions)
+        .await
+}
+
+pub(crate) async fn generate_commit_result_from_domain_changes_with_executor(
+    executor: &mut dyn CommitQueryExecutor,
+    timestamp: String,
+    domain_changes: Vec<DomainChangeInput>,
+    affected_versions: &BTreeSet<String>,
+    functions: &mut dyn LixFunctionProvider,
+) -> Result<GenerateCommitResult, LixError> {
+    let versions = load_version_info_for_versions(executor, affected_versions).await?;
+    let active_accounts = load_commit_active_accounts(executor, &domain_changes).await?;
+    generate_commit(
+        GenerateCommitArgs {
+            timestamp,
+            active_accounts,
+            changes: domain_changes,
+            versions,
+            force_commit_versions: BTreeSet::new(),
+        },
+        || functions.uuid_v7(),
     )
 }
 

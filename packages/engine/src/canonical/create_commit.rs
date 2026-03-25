@@ -5,6 +5,20 @@ use crate::account::{
 };
 use crate::canonical_json::CanonicalJson;
 use crate::deterministic_mode::build_persist_sequence_highest_sql;
+use crate::execution_support::{
+    build_binary_blob_fastcdc_write_program, compile_filesystem_transaction_state_from_state,
+    execute_write_program_with_transaction,
+    filesystem_transaction_state_needs_exact_descriptors, live_snapshot_select_expr_for_schema,
+    with_exact_filesystem_descriptors, BinaryBlobWrite, ExactFilesystemDescriptorState,
+    FilesystemDescriptorState, FilesystemSemanticChange, FilesystemTransactionState, MutationRow,
+    OptionalTextPatch,
+    FILESYSTEM_DESCRIPTOR_FILE_ID, FILESYSTEM_DESCRIPTOR_PLUGIN_KEY, FILESYSTEM_FILE_SCHEMA_KEY,
+    FILESYSTEM_FILE_SCHEMA_VERSION,
+};
+#[cfg(test)]
+use crate::execution_support::{
+    collapse_prepared_batch_for_dialect, FilesystemTransactionFileState, PreparedBatch,
+};
 use crate::functions::LixFunctionProvider;
 use crate::key_value::key_value_schema_key;
 use crate::live_state::require_ready_in_transaction;
@@ -14,16 +28,6 @@ use crate::schema::live_layout::{
     LiveTableLayout,
 };
 use crate::schema::registry::load_live_table_layout_in_transaction;
-use crate::sql::execution::contracts::planned_statement::MutationRow;
-use crate::sql::execution::runtime_effects::{
-    build_binary_blob_fastcdc_write_program, compile_filesystem_transaction_state_from_state,
-    filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
-    BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
-    FilesystemSemanticChange, FilesystemTransactionState, FILESYSTEM_DESCRIPTOR_FILE_ID,
-    FILESYSTEM_DESCRIPTOR_PLUGIN_KEY, FILESYSTEM_FILE_SCHEMA_KEY, FILESYSTEM_FILE_SCHEMA_VERSION,
-};
-use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
-use crate::sql::live_snapshot::live_snapshot_select_expr_for_schema;
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::SqlDialect;
@@ -133,6 +137,19 @@ pub(crate) struct CreateCommitAppliedOutput {
     pub(crate) canonical_output: CanonicalCommitOutput,
     pub(crate) derived_apply_input: DerivedCommitApplyInput,
     pub(crate) operational_apply_input: OperationalCommitApplyInput,
+    pub(crate) pending_public_commit_seed: Option<PendingPublicCommitSeed>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingPublicCommitSeed {
+    pub(crate) commit_id: String,
+    pub(crate) change_set_id: String,
+    pub(crate) commit_change_id: String,
+    pub(crate) commit_materialized_change_id: String,
+    pub(crate) commit_schema_version: String,
+    pub(crate) commit_file_id: String,
+    pub(crate) commit_plugin_key: String,
+    pub(crate) commit_snapshot_content: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,10 +428,13 @@ pub(crate) async fn create_commit(
             writer_key: args.observe_tick_writer_key.clone(),
         }),
     };
+    let pending_public_commit_seed =
+        build_pending_public_commit_seed(&canonical_output, &derived_apply_input)?;
     let applied_output = CreateCommitAppliedOutput {
         canonical_output,
         derived_apply_input,
         operational_apply_input,
+        pending_public_commit_seed,
     };
     let mut prepared_batch = build_prepared_batch_from_commit_apply_input(
         &applied_output.canonical_output,
@@ -464,9 +484,64 @@ pub(crate) async fn create_commit(
     })
 }
 
+fn build_pending_public_commit_seed(
+    canonical_output: &CanonicalCommitOutput,
+    derived_apply_input: &DerivedCommitApplyInput,
+) -> Result<Option<PendingPublicCommitSeed>, CreateCommitError> {
+    let Some(commit_row) = derived_apply_input
+        .live_state_rows
+        .iter()
+        .find(|row| row.schema_key == "lix_commit")
+    else {
+        return Ok(None);
+    };
+    let commit_snapshot_content =
+        commit_row
+            .snapshot_content
+            .as_deref()
+            .ok_or_else(|| CreateCommitError {
+                kind: CreateCommitErrorKind::Internal,
+                message: "public commit seed requires commit snapshot_content".to_string(),
+            })?;
+    let commit_snapshot: serde_json::Value =
+        serde_json::from_str(commit_snapshot_content).map_err(|error| CreateCommitError {
+            kind: CreateCommitErrorKind::Internal,
+            message: format!("public commit seed snapshot is invalid JSON: {error}"),
+        })?;
+    let change_set_id = commit_snapshot
+        .get("change_set_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CreateCommitError {
+            kind: CreateCommitErrorKind::Internal,
+            message: "public commit seed snapshot is missing change_set_id".to_string(),
+        })?
+        .to_string();
+    let commit_change_id = canonical_output
+        .changes
+        .iter()
+        .find(|row| row.schema_key == "lix_commit" && row.entity_id == commit_row.entity_id)
+        .map(|row| row.id.clone())
+        .ok_or_else(|| CreateCommitError {
+            kind: CreateCommitErrorKind::Internal,
+            message: "public commit seed requires a lix_commit change row".to_string(),
+        })?;
+
+    Ok(Some(PendingPublicCommitSeed {
+        commit_id: commit_row.entity_id.to_string(),
+        change_set_id,
+        commit_change_id,
+        commit_materialized_change_id: commit_row.id.clone(),
+        commit_schema_version: commit_row.schema_version.to_string(),
+        commit_file_id: commit_row.file_id.to_string(),
+        commit_plugin_key: commit_row.plugin_key.to_string(),
+        commit_snapshot_content: commit_snapshot_content.to_string(),
+    }))
+}
+
 async fn load_live_layouts_for_rows_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    rows: &[crate::state::commit::MaterializedStateRow],
+    rows: &[crate::canonical::MaterializedStateRow],
 ) -> Result<BTreeMap<String, LiveTableLayout>, LixError> {
     let mut layouts = BTreeMap::new();
     let schema_keys = rows
@@ -1109,7 +1184,7 @@ async fn load_create_commit_file_descriptors(
                 && file.descriptor.is_none()
                 && !matches!(
                     file.metadata_patch,
-                    crate::sql::public::planner::ir::OptionalTextPatch::Unchanged
+                    OptionalTextPatch::Unchanged
                 )
         })
         .map(|file| file.file_id.as_str())
@@ -1756,13 +1831,9 @@ mod tests {
 
         async fn execute_batch(
             &mut self,
-            batch: &crate::sql::execution::contracts::prepared_statement::PreparedBatch,
+            batch: &PreparedBatch,
         ) -> Result<QueryResult, LixError> {
-            let collapsed =
-                crate::sql::execution::contracts::prepared_statement::collapse_prepared_batch_for_dialect(
-                    batch,
-                    self.dialect(),
-                )?;
+            let collapsed = collapse_prepared_batch_for_dialect(batch, self.dialect())?;
             self.execute(&collapsed.sql, &collapsed.params).await
         }
 
@@ -1775,8 +1846,8 @@ mod tests {
         }
     }
 
-    fn sample_change() -> crate::state::commit::ProposedDomainChange {
-        crate::state::commit::ProposedDomainChange {
+    fn sample_change() -> crate::canonical::ProposedDomainChange {
+        crate::canonical::ProposedDomainChange {
             entity_id: "entity-1".try_into().unwrap(),
             schema_key: "lix_key_value".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
@@ -1789,8 +1860,8 @@ mod tests {
         }
     }
 
-    fn sample_global_change() -> crate::state::commit::ProposedDomainChange {
-        crate::state::commit::ProposedDomainChange {
+    fn sample_global_change() -> crate::canonical::ProposedDomainChange {
+        crate::canonical::ProposedDomainChange {
             entity_id: "version-a".try_into().unwrap(),
             schema_key: "lix_version_descriptor".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
@@ -2145,16 +2216,15 @@ mod tests {
             CreateCommitArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
                 changes: Vec::new(),
-                filesystem_state: crate::sql::execution::runtime_effects::FilesystemTransactionState {
+                filesystem_state: FilesystemTransactionState {
                     files: std::iter::once((
                         ("file-1".to_string(), "version-a".to_string()),
-                        crate::sql::execution::runtime_effects::FilesystemTransactionFileState {
+                        FilesystemTransactionFileState {
                             file_id: "file-1".to_string(),
                             version_id: "version-a".to_string(),
                             untracked: false,
                             descriptor: None,
-                            metadata_patch:
-                                crate::sql::public::planner::ir::OptionalTextPatch::Unchanged,
+                            metadata_patch: OptionalTextPatch::Unchanged,
                             data: Some(vec![1, 2, 3]),
                             deleted: false,
                         },

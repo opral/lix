@@ -3,7 +3,7 @@ use crate::schema::live_layout::{
     untracked_live_table_name,
 };
 use crate::sql::storage::sql_text::escape_sql_string;
-use crate::state::commit::build_reachable_commits_from_requested_cte_sql;
+use crate::canonical::graph::build_reachable_commits_from_requested_cte_sql;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id, GLOBAL_VERSION_ID,

@@ -6,13 +6,16 @@ use crate::live_state::{
     apply_live_state_scope_in_transaction, live_state_rebuild_plan_with_executor,
     LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
 };
-use crate::sql::execution::shared_path::create_commit_error_to_lix_error;
-use crate::state::commit::{
-    create_commit, load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,
-    CreateCommitArgs, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
-    CreateCommitPreconditions, CreateCommitWriteLane, ExactCommittedStateRow,
+use crate::canonical::readers::{
+    load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,
+    load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
+use crate::canonical::append::{
+    append_tracked, CreateCommitArgs, CreateCommitExpectedHead,
+    CreateCommitIdempotencyKey, CreateCommitPreconditions, CreateCommitWriteLane,
+};
+use crate::canonical::ProposedDomainChange;
 use crate::state::stream::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::{ExecuteOptions, LixError, Value};
 
@@ -296,7 +299,7 @@ async fn merge_version_in_transaction(
         .ensure_runtime_sequence_initialized_in_transaction(transaction, &functions)
         .await?;
     let mut functions = functions;
-    let merge_result = create_commit(
+    let merge_result = append_tracked(
         transaction,
         CreateCommitArgs {
             timestamp: Some(functions.timestamp()),
@@ -319,8 +322,7 @@ async fn merge_version_in_transaction(
         &mut functions,
         None,
     )
-    .await
-    .map_err(create_commit_error_to_lix_error)?;
+    .await?;
 
     tx.record_state_commit_stream_changes(stream_changes)?;
 
@@ -502,7 +504,7 @@ async fn load_visible_entity_state_at_commit(
     let Some(head_commit_id) = head_commit_id else {
         return Ok(None);
     };
-    let Some(row) = crate::state::commit::load_exact_committed_state_row_from_commit_with_executor(
+    let Some(row) = load_exact_committed_state_row_from_commit_with_executor(
         executor,
         head_commit_id,
         &ExactCommittedStateRowRequest {
@@ -571,8 +573,8 @@ fn classify_merge_decision(
 fn proposed_change_from_exact_row(
     version_id: &str,
     row: &ExactCommittedStateRow,
-) -> Result<crate::state::commit::ProposedDomainChange, LixError> {
-    Ok(crate::state::commit::ProposedDomainChange {
+) -> Result<ProposedDomainChange, LixError> {
+    Ok(ProposedDomainChange {
         entity_id: parse_identity(row.entity_id.clone(), "merge entity_id")?,
         schema_key: parse_identity(row.schema_key.clone(), "merge schema_key")?,
         schema_version: Some(parse_identity(
@@ -598,8 +600,8 @@ fn tombstone_change_from_state(
     version_id: &str,
     entity: &EntityKey,
     previous: &VisibleEntityState,
-) -> Result<crate::state::commit::ProposedDomainChange, LixError> {
-    Ok(crate::state::commit::ProposedDomainChange {
+) -> Result<ProposedDomainChange, LixError> {
+    Ok(ProposedDomainChange {
         entity_id: parse_identity(entity.entity_id.clone(), "merge tombstone entity_id")?,
         schema_key: parse_identity(entity.schema_key.clone(), "merge tombstone schema_key")?,
         schema_version: Some(parse_identity(
