@@ -10,7 +10,9 @@ use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
 use crate::plugin::types::PluginManifest;
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
-use crate::{LixBackendTransaction, LixError, Value};
+use crate::sql::execution::execution_program::ExecutionContext;
+use crate::transaction::{execute_with_options_in_write_transaction, WriteTransaction};
+use crate::{LixError, Value};
 
 const INSTALL_REGISTERED_SCHEMA_SQL: &str =
     "INSERT INTO lix_registered_schema (value) VALUES (lix_json(?))";
@@ -30,12 +32,13 @@ impl Engine {
         let parsed = parse_plugin_archive(archive_bytes)?;
         ensure_valid_wasm_binary(&parsed.wasm_bytes)?;
 
-        let mut transaction = self.begin_write_unit().await?;
+        let transaction = self.begin_write_unit().await?;
+        let mut write_transaction = WriteTransaction::new_buffered_write(transaction);
         let mut context = self.new_execution_context(ExecuteOptions::default())?;
 
         let install_result = install_plugin_in_transaction(
             self,
-            transaction.as_mut(),
+            &mut write_transaction,
             &parsed,
             archive_bytes,
             &mut context,
@@ -44,79 +47,77 @@ impl Engine {
 
         match install_result {
             Ok(()) => {
-                self.prepare_execution_context_for_commit(transaction.as_mut(), &mut context)
+                context.public_surface_registry_dirty = true;
+                context.installed_plugins_cache_invalidation_pending = true;
+                write_transaction
+                    .commit_buffered_write(self, context)
                     .await?;
-                transaction.commit().await?
             }
             Err(error) => {
-                let _ = transaction.rollback().await;
+                let _ = write_transaction.rollback_buffered_write().await;
                 return Err(error);
             }
         }
-
-        context.public_surface_registry_dirty = true;
-        context.installed_plugins_cache_invalidation_pending = true;
-        self.finalize_committed_execution_context(context).await?;
         Ok(())
     }
 }
 
 async fn install_plugin_in_transaction(
     engine: &Engine,
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: &mut WriteTransaction<'_>,
     parsed: &ParsedPluginArchive,
     archive_bytes: &[u8],
-    context: &mut crate::sql::execution::execution_program::ExecutionContext,
+    context: &mut ExecutionContext,
 ) -> Result<(), LixError> {
     for schema in &parsed.schemas {
-        engine
-            .execute_with_options_in_transaction(
-                transaction,
-                INSTALL_REGISTERED_SCHEMA_SQL,
-                &[Value::Text(schema.normalized_schema_json.clone())],
-                false,
-                context,
-                None,
-                false,
-            )
-            .await?;
+        execute_with_options_in_write_transaction(
+            engine,
+            transaction,
+            INSTALL_REGISTERED_SCHEMA_SQL,
+            &[Value::Text(schema.normalized_schema_json.clone())],
+            false,
+            context,
+            None,
+            false,
+        )
+        .await?;
     }
 
     let plugin_key = parsed.manifest.key.as_str();
     let archive_id = plugin_storage_archive_file_id(plugin_key);
     let archive_path = plugin_storage_archive_path(plugin_key)?;
 
-    engine
-        .execute_with_options_in_transaction(
-            transaction,
-            "DELETE FROM lix_file_by_version \
-             WHERE lixcol_version_id = 'global' \
-               AND id = $1",
-            &[Value::Text(archive_id.clone())],
-            false,
-            context,
-            None,
-            false,
-        )
-        .await?;
+    execute_with_options_in_write_transaction(
+        engine,
+        transaction,
+        "DELETE FROM lix_file_by_version \
+         WHERE lixcol_version_id = 'global' \
+           AND id = $1",
+        &[Value::Text(archive_id.clone())],
+        false,
+        context,
+        None,
+        false,
+    )
+    .await?;
 
-    engine
-        .execute_with_options_in_transaction(
-            transaction,
-            "INSERT INTO lix_file_by_version (\
-             id, path, data, lixcol_version_id\
-             ) VALUES ($1, $2, $3, 'global')",
-            &[
-                Value::Text(archive_id),
-                Value::Text(archive_path),
-                Value::Blob(archive_bytes.to_vec()),
-            ],
-            false,
-            context,
-            None,
-            false,
-        )
-        .await?;
+    execute_with_options_in_write_transaction(
+        engine,
+        transaction,
+        "INSERT INTO lix_file_by_version (\
+         id, path, data, lixcol_version_id\
+         ) VALUES ($1, $2, $3, 'global')",
+        &[
+            Value::Text(archive_id),
+            Value::Text(archive_path),
+            Value::Blob(archive_bytes.to_vec()),
+        ],
+        false,
+        context,
+        None,
+        false,
+    )
+    .await?;
 
     Ok(())
 }

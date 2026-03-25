@@ -51,11 +51,11 @@ use crate::sql::execution::runtime_effects::{
     build_binary_blob_fastcdc_write_program, BinaryBlobWrite, FilesystemTransactionFileState,
 };
 use crate::sql::execution::write_program_runner::execute_write_program_with_transaction;
-use crate::sql::execution::write_txn_plan::{
+use crate::state::internal::write_program::WriteProgram;
+use crate::transaction::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
     PendingSemanticRow, PendingSemanticStorage,
 };
-use crate::state::internal::write_program::WriteProgram;
 use crate::CanonicalJson;
 use serde_json::{json, Value as JsonValue};
 use sqlparser::ast::{

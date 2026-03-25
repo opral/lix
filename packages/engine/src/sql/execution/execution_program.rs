@@ -22,10 +22,6 @@ use crate::sql::execution::contracts::result_contract::ResultContract;
 use crate::sql::execution::shared_path::{
     self, PendingPublicCommitSession, PendingTransactionView,
 };
-use crate::sql::execution::write_txn_plan::{build_txn_delta, TxnDelta};
-use crate::sql::execution::write_txn_runner::{
-    run_txn_delta_with_transaction, stamp_watermark_before_commit,
-};
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::sql::public::runtime::{
     classify_public_execution_route_with_registry, PreparedPublicRead, PublicExecutionRoute,
@@ -34,6 +30,13 @@ use crate::state::internal::followup::execute_internal_postprocess_with_transact
 use crate::state::internal::script::coalesce_vtable_inserts_in_transactions;
 use crate::state::internal::PostprocessPlan;
 use crate::state::stream::StateCommitStreamChange;
+use crate::transaction::{
+    build_planned_write_delta,
+    execute_bound_statement_template_instance_in_borrowed_write_transaction,
+    execute_bound_statement_template_instance_in_write_transaction, execute_planned_write_delta,
+    execute_program_with_new_write_transaction, BorrowedWriteTransaction, PlannedWriteDelta,
+    WriteTransaction,
+};
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
 use sqlparser::ast::Statement;
 
@@ -52,8 +55,6 @@ pub(crate) struct ExecutionContext {
     pub(crate) public_surface_registry_dirty: bool,
     pub(crate) pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
     pub(crate) observe_tick_already_emitted: bool,
-    pub(crate) pending_public_commit_session: Option<PendingPublicCommitSession>,
-    pub(crate) mutation_journal: crate::sql::execution::write_txn_plan::MutationJournal,
     pub(crate) statement_template_cache: BTreeMap<StatementTemplateCacheKey, StatementTemplate>,
 }
 
@@ -73,8 +74,6 @@ impl ExecutionContext {
             public_surface_registry_dirty: false,
             pending_state_commit_stream_changes: Vec::new(),
             observe_tick_already_emitted: false,
-            pending_public_commit_session: None,
-            mutation_journal: Default::default(),
             statement_template_cache: BTreeMap::new(),
         }
     }
@@ -335,12 +334,12 @@ pub(crate) struct CompiledInternalExecution {
 
 pub(crate) struct CompiledExecutionStep {
     execution: CompiledExecution,
-    txn_delta: Option<TxnDelta>,
+    planned_write_delta: Option<PlannedWriteDelta>,
 }
 
 pub(crate) enum CompiledExecutionRoute<'a> {
     PublicRead(&'a PreparedPublicRead),
-    TxnDelta(&'a TxnDelta),
+    PlannedWriteDelta(&'a PlannedWriteDelta),
     PublicWriteNoop,
     Internal(&'a CompiledInternalExecution),
 }
@@ -355,10 +354,10 @@ impl CompiledExecutionStep {
         execution: CompiledExecution,
         writer_key: Option<&str>,
     ) -> Result<Self, LixError> {
-        let txn_delta = build_txn_delta(&execution, writer_key)?;
+        let planned_write_delta = build_planned_write_delta(&execution, writer_key)?;
         Ok(Self {
             execution,
-            txn_delta,
+            planned_write_delta,
         })
     }
 
@@ -366,18 +365,18 @@ impl CompiledExecutionStep {
         &self.execution
     }
 
-    pub(crate) fn txn_delta(&self) -> Option<&TxnDelta> {
-        self.txn_delta.as_ref()
+    pub(crate) fn planned_write_delta(&self) -> Option<&PlannedWriteDelta> {
+        self.planned_write_delta.as_ref()
     }
 
     pub(crate) fn has_materialization_plan(&self) -> bool {
-        self.txn_delta
+        self.planned_write_delta
             .as_ref()
             .is_some_and(|delta| !delta.materialization_plan().units.is_empty())
     }
 
     pub(crate) fn is_bufferable_write(&self, statement: &Statement) -> bool {
-        self.txn_delta.is_some()
+        self.planned_write_delta.is_some()
             && !matches!(self.execution.result_contract, ResultContract::DmlReturning)
             && !matches!(statement, Statement::Query(_) | Statement::Explain { .. })
     }
@@ -386,8 +385,8 @@ impl CompiledExecutionStep {
         if let Some(public_read) = self.execution.public_read() {
             return CompiledExecutionRoute::PublicRead(public_read);
         }
-        if let Some(delta) = self.txn_delta.as_ref() {
-            return CompiledExecutionRoute::TxnDelta(delta);
+        if let Some(delta) = self.planned_write_delta.as_ref() {
+            return CompiledExecutionRoute::PlannedWriteDelta(delta);
         }
         if self.execution.public_write().is_some() {
             return CompiledExecutionRoute::PublicWriteNoop;
@@ -407,37 +406,19 @@ pub(crate) async fn execute_execution_program_with_backend(
     active_version_id: String,
     allow_internal_tables: bool,
 ) -> Result<ExecuteResult, LixError> {
-    let mut transaction = engine.begin_write_unit().await?;
-    let mut context = engine.new_execution_context_with_active_version(options, active_version_id);
-    let result = execute_execution_program_with_transaction(
+    execute_program_with_new_write_transaction(
         engine,
-        transaction.as_mut(),
         program,
+        options,
+        active_version_id,
         allow_internal_tables,
-        &mut context,
     )
-    .await;
-
-    match result {
-        Ok(result) => {
-            engine
-                .prepare_execution_context_for_commit(transaction.as_mut(), &mut context)
-                .await?;
-            stamp_watermark_before_commit(transaction.as_mut()).await?;
-            transaction.commit().await?;
-            engine.finalize_committed_execution_context(context).await?;
-            Ok(result)
-        }
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            Err(error)
-        }
-    }
+    .await
 }
 
-pub(crate) async fn execute_execution_program_with_transaction(
+pub(crate) async fn execute_execution_program_with_write_transaction(
     engine: &Engine,
-    transaction: &mut dyn LixBackendTransaction,
+    write_transaction: &mut WriteTransaction<'_>,
     program: &ExecutionProgram,
     allow_internal_tables: bool,
     context: &mut ExecutionContext,
@@ -449,9 +430,53 @@ pub(crate) async fn execute_execution_program_with_transaction(
         match step {
             ExecutionProgramStep::TransactionControl => {}
             ExecutionProgramStep::Statement(step) => {
-                let result = engine
-                    .execute_bound_statement_template_instance_in_transaction(
-                        transaction,
+                let result = execute_bound_statement_template_instance_in_write_transaction(
+                    engine,
+                    write_transaction,
+                    &step.bound_template,
+                    allow_internal_tables,
+                    context,
+                    None,
+                    false,
+                )
+                .await?;
+                results.push(result);
+            }
+        }
+    }
+
+    if context.active_version_id != previous_active_version_id {
+        context.active_version_changed = true;
+    }
+    if crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements(
+        program.source_statements(),
+    ) {
+        context.installed_plugins_cache_invalidation_pending = true;
+    }
+
+    Ok(ExecuteResult {
+        statements: results,
+    })
+}
+
+pub(crate) async fn execute_execution_program_with_borrowed_write_transaction(
+    engine: &Engine,
+    write_transaction: &mut BorrowedWriteTransaction<'_>,
+    program: &ExecutionProgram,
+    allow_internal_tables: bool,
+    context: &mut ExecutionContext,
+) -> Result<ExecuteResult, LixError> {
+    let previous_active_version_id = context.active_version_id.clone();
+    let mut results = Vec::with_capacity(program.steps.len());
+
+    for step in &program.steps {
+        match step {
+            ExecutionProgramStep::TransactionControl => {}
+            ExecutionProgramStep::Statement(step) => {
+                let result =
+                    execute_bound_statement_template_instance_in_borrowed_write_transaction(
+                        engine,
+                        write_transaction,
                         &step.bound_template,
                         allow_internal_tables,
                         context,
@@ -515,8 +540,8 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
                 };
             Ok(CompiledExecutionStepResult::Immediate(public_result))
         }
-        CompiledExecutionRoute::TxnDelta(delta) => {
-            let execution = run_txn_delta_with_transaction(
+        CompiledExecutionRoute::PlannedWriteDelta(delta) => {
+            let execution = execute_planned_write_delta(
                 engine,
                 transaction,
                 delta,

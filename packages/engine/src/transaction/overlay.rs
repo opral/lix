@@ -11,14 +11,14 @@ use crate::LixError;
 use super::contracts::TransactionDelta;
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PendingTxnParticipants {
+pub(crate) struct PendingWriteOverlay {
     tracked_rows: BTreeMap<RowIdentity, TrackedRow>,
     tracked_tombstones: BTreeMap<RowIdentity, TrackedTombstoneMarker>,
     untracked_rows: BTreeMap<RowIdentity, UntrackedRow>,
     untracked_deletes: BTreeSet<RowIdentity>,
 }
 
-impl PendingTxnParticipants {
+impl PendingWriteOverlay {
     pub(crate) fn from_delta(delta: &TransactionDelta) -> Result<Self, LixError> {
         let mut participants = Self::default();
         for row in &delta.tracked_writes {
@@ -30,7 +30,7 @@ impl PendingTxnParticipants {
         Ok(participants)
     }
 
-    pub(crate) fn merge(&mut self, incoming: PendingTxnParticipants) {
+    pub(crate) fn merge(&mut self, incoming: PendingWriteOverlay) {
         for (identity, row) in incoming.tracked_rows {
             self.tracked_tombstones.remove(&identity);
             self.tracked_rows.insert(identity, row);

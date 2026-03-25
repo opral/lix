@@ -20,7 +20,6 @@ mod schema;
 pub(crate) mod sql;
 pub(crate) mod state;
 pub mod transaction;
-mod transaction_legacy;
 mod types;
 mod undo_redo;
 mod version;

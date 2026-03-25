@@ -2,18 +2,24 @@ use crate::cel::CelEvaluator;
 use crate::deterministic_mode::{deterministic_mode_key, DeterministicSettings};
 use crate::key_value::key_value_schema_key;
 use crate::plugin::types::InstalledPlugin;
+use crate::schema::schema_from_registered_snapshot;
 use crate::sql::execution::execution_program::ExecutionContext;
+use crate::sql::execution::parse::parse_sql;
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
 use crate::state::validation::SchemaCache;
+use crate::transaction::{execute_parsed_statements_in_write_transaction, WriteTransaction};
 use crate::WasmRuntime;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
+use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -30,6 +36,9 @@ const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 pub(crate) const INIT_STATE_NOT_STARTED: u8 = 0;
 pub(crate) const INIT_STATE_IN_PROGRESS: u8 = 1;
 pub(crate) const INIT_STATE_COMPLETED: u8 = 2;
+const REGISTER_SCHEMA_HELPER_SQL: &str =
+    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))";
+
 #[derive(Debug, Clone, Default)]
 pub struct ExecuteOptions {
     pub writer_key: Option<String>,
@@ -63,11 +72,57 @@ pub struct Engine {
 #[must_use = "EngineTransaction must be committed or rolled back"]
 pub struct EngineTransaction<'a> {
     pub(crate) engine: &'a Engine,
-    pub(crate) transaction: Option<Box<dyn LixBackendTransaction + 'a>>,
+    pub(crate) write_transaction: Option<WriteTransaction<'a>>,
     pub(crate) context: ExecutionContext,
 }
 
 impl Engine {
+    pub async fn register_schema(&self, schema: &JsonValue) -> Result<(), LixError> {
+        let mut transaction = self
+            .begin_transaction_with_options(ExecuteOptions::default())
+            .await?;
+        transaction.register_schema(schema).await?;
+        transaction.commit().await
+    }
+
+    pub async fn begin_transaction_with_options(
+        &self,
+        options: ExecuteOptions,
+    ) -> Result<EngineTransaction<'_>, LixError> {
+        let transaction = self.begin_write_unit().await?;
+        Ok(EngineTransaction {
+            engine: self,
+            write_transaction: Some(WriteTransaction::new_buffered_write(transaction)),
+            context: self.new_execution_context(options)?,
+        })
+    }
+
+    pub async fn transaction<T, F>(&self, options: ExecuteOptions, f: F) -> Result<T, LixError>
+    where
+        F: for<'tx> FnOnce(
+            &'tx mut EngineTransaction<'_>,
+        ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
+    {
+        let mut transaction = self.begin_transaction_with_options(options).await?;
+        match std::panic::AssertUnwindSafe(f(&mut transaction))
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(value)) => {
+                transaction.commit().await?;
+                Ok(value)
+            }
+            Ok(Err(error)) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+            Err(payload) => {
+                let _ = transaction.rollback().await;
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+
     pub(crate) fn new_execution_context(
         &self,
         options: ExecuteOptions,
@@ -204,29 +259,6 @@ impl Engine {
             .store(INIT_STATE_NOT_STARTED, Ordering::SeqCst);
     }
 
-    pub(crate) async fn prepare_execution_context_for_commit(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        context: &mut ExecutionContext,
-    ) -> Result<(), LixError> {
-        let active_version_before_flush = context.active_version_id.clone();
-        self.flush_mutation_journal_in_transaction(transaction, context)
-            .await?;
-        if context.active_version_id != active_version_before_flush {
-            context.active_version_changed = true;
-        }
-        if !context.observe_tick_already_emitted
-            && !context.pending_state_commit_stream_changes.is_empty()
-        {
-            self.append_observe_tick_in_transaction(
-                transaction,
-                context.options.writer_key.as_deref(),
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
     pub(crate) async fn finalize_committed_execution_context(
         &self,
         mut context: ExecutionContext,
@@ -295,6 +327,118 @@ impl Engine {
         })?;
         component_guard.clear();
         Ok(())
+    }
+}
+
+impl<'a> EngineTransaction<'a> {
+    pub async fn register_schema(&mut self, schema: &JsonValue) -> Result<(), LixError> {
+        let snapshot = serde_json::json!({ "value": schema });
+        let (schema_key, _) = schema_from_registered_snapshot(&snapshot)?;
+        self.write_transaction
+            .as_mut()
+            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?
+            .register_schema(
+                crate::live_state::SchemaRegistration::with_registered_snapshot(
+                    schema_key.schema_key.clone(),
+                    snapshot,
+                ),
+            )?;
+        let schema_json = serde_json::to_string(schema).map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("failed to serialize schema definition: {error}"),
+        })?;
+        self.execute(REGISTER_SCHEMA_HELPER_SQL, &[Value::Text(schema_json)])
+            .await?;
+        Ok(())
+    }
+
+    pub async fn execute(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<crate::ExecuteResult, LixError> {
+        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
+        if !self.engine.access_to_internal() {
+            reject_public_create_table(&parsed_statements)?;
+            reject_internal_table_writes(&parsed_statements)?;
+        }
+        self.execute_parsed_with_access(parsed_statements, params, self.engine.access_to_internal())
+            .await
+    }
+
+    pub(crate) async fn execute_internal(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<crate::ExecuteResult, LixError> {
+        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
+        self.execute_parsed_with_access(parsed_statements, params, true)
+            .await
+    }
+
+    async fn execute_parsed_with_access(
+        &mut self,
+        parsed_statements: Vec<Statement>,
+        params: &[Value],
+        allow_internal_tables: bool,
+    ) -> Result<crate::ExecuteResult, LixError> {
+        let write_transaction = self.write_transaction.as_mut().ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "transaction is no longer active".to_string(),
+        })?;
+        execute_parsed_statements_in_write_transaction(
+            self.engine,
+            write_transaction,
+            parsed_statements,
+            params,
+            allow_internal_tables,
+            &mut self.context,
+        )
+        .await
+    }
+
+    pub async fn commit(mut self) -> Result<(), LixError> {
+        let write_transaction = self.write_transaction.take().ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "transaction is no longer active".to_string(),
+        })?;
+        let context = std::mem::replace(
+            &mut self.context,
+            self.engine
+                .new_execution_context(ExecuteOptions::default())?,
+        );
+        write_transaction
+            .commit_buffered_write(self.engine, context)
+            .await
+    }
+
+    pub async fn rollback(mut self) -> Result<(), LixError> {
+        let write_transaction = self.write_transaction.take().ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "transaction is no longer active".to_string(),
+        })?;
+        write_transaction.rollback_buffered_write().await
+    }
+
+    pub(crate) fn backend_transaction_mut(
+        &mut self,
+    ) -> Result<&mut dyn crate::LixBackendTransaction, LixError> {
+        self.write_transaction_mut()?.backend_transaction_mut()
+    }
+
+    pub(crate) fn write_transaction_mut(&mut self) -> Result<&mut WriteTransaction<'a>, LixError> {
+        Ok(self
+            .write_transaction
+            .as_mut()
+            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?)
+    }
+}
+
+impl Drop for EngineTransaction<'_> {
+    fn drop(&mut self) {
+        if self.write_transaction.is_some() && !std::thread::panicking() {
+            panic!("EngineTransaction dropped without commit() or rollback()");
+        }
     }
 }
 

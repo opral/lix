@@ -23,6 +23,9 @@ use crate::state::checkpoint::{
     CHECKPOINT_LABEL_NAME,
 };
 use crate::state::commit::{build_commit_generation_seed_sql, COMMIT_GRAPH_NODE_TABLE};
+use crate::transaction::{
+    execute_parsed_statements_in_borrowed_write_transaction, BorrowedWriteTransaction,
+};
 use crate::version::DEFAULT_ACTIVE_VERSION_NAME;
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
@@ -44,7 +47,7 @@ const LIX_ID_KEY: &str = "lix_id";
 
 pub(crate) struct InitExecutor<'engine, 'tx> {
     engine: &'engine Engine,
-    transaction: &'tx mut dyn LixBackendTransaction,
+    write_transaction: BorrowedWriteTransaction<'tx>,
     context: ExecutionContext,
 }
 
@@ -55,7 +58,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     ) -> Result<Self, LixError> {
         Ok(Self {
             engine,
-            transaction,
+            write_transaction: BorrowedWriteTransaction::new(transaction),
             context: engine.new_execution_context_with_active_version(
                 ExecuteOptions::default(),
                 GLOBAL_VERSION_ID.to_string(),
@@ -77,18 +80,17 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         params: &[Value],
     ) -> Result<crate::ExecuteResult, LixError> {
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
-        let result = self
-            .engine
-            .execute_parsed_statements_in_transaction_core(
-                self.transaction,
-                parsed_statements,
-                params,
-                true,
-                &mut self.context,
-            )
-            .await?;
-        self.engine
-            .flush_mutation_journal_in_transaction(self.transaction, &mut self.context)
+        let result = execute_parsed_statements_in_borrowed_write_transaction(
+            self.engine,
+            &mut self.write_transaction,
+            parsed_statements,
+            params,
+            true,
+            &mut self.context,
+        )
+        .await?;
+        self.write_transaction
+            .flush_buffered_write_journal(self.engine, &mut self.context)
             .await?;
         Ok(result)
     }
@@ -98,12 +100,16 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         sql: &str,
         params: &[Value],
     ) -> Result<QueryResult, LixError> {
-        self.transaction.execute(sql, params).await
+        self.write_transaction
+            .backend_transaction_mut()
+            .execute(sql, params)
+            .await
     }
 
     async fn generate_runtime_uuid(&mut self) -> Result<String, LixError> {
         let (settings, sequence_start, functions) = {
-            let backend = TransactionBackendAdapter::new(self.transaction);
+            let backend =
+                TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
             self.engine
                 .prepare_runtime_functions_with_backend(&backend, false)
                 .await?
@@ -111,7 +117,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let uuid = functions.call_uuid_v7();
         self.engine
             .persist_runtime_sequence_in_transaction(
-                self.transaction,
+                self.write_transaction.backend_transaction_mut(),
                 settings,
                 sequence_start,
                 &functions,
@@ -122,7 +128,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
 
     async fn generate_runtime_timestamp(&mut self) -> Result<String, LixError> {
         let (settings, sequence_start, functions) = {
-            let backend = TransactionBackendAdapter::new(self.transaction);
+            let backend =
+                TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
             self.engine
                 .prepare_runtime_functions_with_backend(&backend, false)
                 .await?
@@ -130,7 +137,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let timestamp = functions.call_timestamp();
         self.engine
             .persist_runtime_sequence_in_transaction(
-                self.transaction,
+                self.write_transaction.backend_transaction_mut(),
                 settings,
                 sequence_start,
                 &functions,
@@ -140,7 +147,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     }
 
     async fn load_latest_commit_id(&mut self) -> Result<Option<String>, LixError> {
-        let mut backend = TransactionBackendAdapter::new(self.transaction);
+        let mut backend =
+            TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
         if let Some(commit_id) =
             crate::state::commit::load_committed_version_head_commit_id_from_live_state(
                 &mut backend,

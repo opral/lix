@@ -9,7 +9,6 @@ use crate::live_state::tracked::{
 use crate::live_state::{load_live_row_access_with_backend, normalized_live_column_values};
 use crate::sql::common::dependency_spec::DependencySpec;
 use crate::sql::execution::shared_path::PendingTransactionView;
-use crate::sql::execution::write_txn_plan::{PendingSemanticRow, PendingSemanticStorage};
 use crate::sql::public::planner::ir::{
     CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
 };
@@ -21,6 +20,7 @@ use crate::state::commit::{
     load_exact_committed_state_row_from_live_state, CommitQueryExecutor, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
+use crate::transaction::{PendingSemanticRow, PendingSemanticStorage};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::{Expr, OrderBy, OrderByKind, SelectItem, Visit, Visitor};
