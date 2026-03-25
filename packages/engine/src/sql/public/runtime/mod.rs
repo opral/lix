@@ -18,7 +18,7 @@ use crate::filesystem::runtime::{
     binary_blob_writes_from_filesystem_state, delete_targets_from_filesystem_state,
     FilesystemTransactionState,
 };
-use crate::sql::execution::shared_path::PendingTransactionView;
+use crate::transaction::PendingTransactionView;
 use crate::sql::public::backend::PushdownDecision;
 use crate::sql::public::catalog::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
@@ -45,7 +45,7 @@ use crate::sql::public::planner::semantics::effective_state_resolver::{
 };
 use crate::sql::public::planner::semantics::write_analysis::analyze_write;
 use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan;
-use crate::canonical::readers::load_committed_version_head_commit_id_from_live_state;
+use crate::sql::public::services::state_reader::load_committed_version_head_commit_id;
 use crate::change_view::TrackedDomainChangeView;
 use crate::state::history::ensure_state_history_timeline_materialized_for_root;
 use crate::state::history::StateHistoryRequest;
@@ -1554,11 +1554,9 @@ async fn maybe_bind_active_history_root(
         return Some(structured_read);
     }
 
-    let mut executor = backend;
-    let root_commit_id =
-        load_committed_version_head_commit_id_from_live_state(&mut executor, active_version_id)
-            .await
-            .ok()??;
+    let root_commit_id = load_committed_version_head_commit_id(backend, active_version_id)
+        .await
+        .ok()??;
     let root_predicate = Expr::BinaryOp {
         left: Box::new(Expr::Identifier(Ident::new("lixcol_root_commit_id"))),
         op: BinaryOperator::Eq,

@@ -7,7 +7,7 @@ use sqlparser::ast::{
 use crate::schema::live_layout::{
     builtin_live_table_layout, live_table_layout_from_schema, normalized_live_column_values,
 };
-use crate::state::internal::{
+use crate::sql::internal::{
     object_name_matches, MutationOperation, MutationRow, ResolvedCell, RowSourceResolver,
     SchemaLiveTableRequirement,
 };

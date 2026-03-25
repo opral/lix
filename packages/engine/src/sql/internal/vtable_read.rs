@@ -13,11 +13,11 @@ use crate::schema::live_layout::{
     tracked_live_table_name, untracked_live_table_name, LiveRowAccess, TRACKED_LIVE_TABLE_PREFIX,
 };
 use crate::live_state::shared::snapshot_sql::{live_snapshot_select_expr, live_snapshot_select_expr_for_schema};
-use crate::state::internal::param_context::{
+use crate::sql::internal::param_context::{
     expr_last_identifier_eq, extract_string_column_values_from_expr, normalize_query_placeholders,
     PlaceholderOrdinalState,
 };
-use crate::state::internal::{object_name_matches, quote_ident};
+use crate::sql::internal::{object_name_matches, quote_ident};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{errors, LixBackend, LixError, SqlDialect, Value as LixValue};
 

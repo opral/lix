@@ -6,7 +6,7 @@ use crate::sql::public::runtime::{
     statement_references_public_surface_with_backend,
     statement_references_public_surface_with_builtin_registry,
 };
-use crate::state::internal::{
+use crate::sql::internal::{
     prepare_statements_sync_to_plan, prepare_statements_with_backend_to_plan,
 };
 use crate::{LixBackend, LixError, SqlDialect, Value};

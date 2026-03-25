@@ -8,7 +8,7 @@ use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderSta
 use crate::filesystem::runtime::{
     FilesystemDescriptorState, FilesystemTransactionFileState, FilesystemTransactionState,
 };
-use crate::sql::execution::shared_path::PendingTransactionView;
+use crate::transaction::PendingTransactionView;
 use crate::sql::public::planner::semantics::filesystem_assignments::{
     parse_directory_insert_assignments, parse_directory_update_assignments,
     parse_file_insert_assignments, parse_file_update_assignments, DirectoryUpdateAssignments,

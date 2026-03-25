@@ -207,6 +207,27 @@ fn execution_program_is_a_thin_client_for_adapter_runtime() {
 }
 
 #[test]
+fn pending_transaction_view_is_transaction_owned() {
+    let shared_path_source = read_engine_source("sql/execution/shared_path.rs");
+    assert!(
+        !shared_path_source.contains("struct PendingTransactionView"),
+        "shared_path.rs should not define PendingTransactionView once transaction owns pending visibility"
+    );
+
+    let transaction_mod_source = read_engine_source("transaction/mod.rs");
+    assert!(
+        transaction_mod_source.contains("mod pending_view;"),
+        "transaction/mod.rs should compile a transaction-owned pending_view module"
+    );
+
+    let pending_view_source = read_engine_source("transaction/pending_view.rs");
+    assert!(
+        pending_view_source.contains("struct PendingTransactionView"),
+        "transaction/pending_view.rs should own PendingTransactionView"
+    );
+}
+
+#[test]
 fn schema_registration_and_commit_effects_are_transaction_owned() {
     let coordinator_source = read_engine_source("transaction/coordinator.rs");
     assert!(

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::Value as JsonValue;
 
 use crate::schema::live_layout::LiveTableLayout;
-use crate::state::internal::InternalStatePlan;
+use crate::sql::internal::InternalStatePlan;
 use crate::{LixError, Value};
 use sqlparser::ast::Expr;
 

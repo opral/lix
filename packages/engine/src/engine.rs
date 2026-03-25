@@ -9,7 +9,7 @@ use crate::sql::public::catalog::SurfaceRegistry;
 use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
-use crate::state::validation::SchemaCache;
+use crate::sql::public::validation::SchemaCache;
 use crate::transaction::{
     execute_parsed_statements_in_write_transaction, TransactionCommitOutcome, WriteTransaction,
 };
@@ -822,7 +822,7 @@ mod tests {
         PlaceholderState,
     };
     use crate::sql::execution::contracts::planned_statement::UpdateValidationPlan;
-    use crate::state::internal::script::extract_explicit_transaction_script_from_statements;
+    use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
     use crate::version::active_version_schema_key;
     use crate::{LixError, NoopWasmRuntime, QueryResult, Value};
     use async_trait::async_trait;

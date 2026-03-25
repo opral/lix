@@ -12,9 +12,8 @@ use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::functions::LixFunctionProvider;
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
 use crate::schema::live_layout::load_live_table_layout_with_executor;
-use crate::state::internal::quote_ident;
 use crate::sql_support::binding::bind_statement_ast;
-use crate::sql_support::text::escape_sql_string;
+use crate::sql_support::text::{escape_sql_string, quote_ident};
 
 use crate::schema::live_layout::{
     builtin_live_table_layout, normalized_live_column_values, tracked_live_table_name,

@@ -4,8 +4,8 @@ use sqlparser::ast::{Delete, Statement, Update};
 
 use crate::functions::LixFunctionProvider;
 use crate::schema::live_layout::LiveTableLayout;
-use crate::state::internal::{registered_schema, vtable_write};
-use crate::state::internal::{PostprocessPlan, RewriteOutput};
+use crate::sql::internal::{registered_schema, vtable_write};
+use crate::sql::internal::{PostprocessPlan, RewriteOutput};
 use crate::{LixBackend, LixError, Value};
 
 const MAX_REWRITE_PASSES: usize = 32;
@@ -16,11 +16,11 @@ struct StatementContext<'a> {
     backend: Option<&'a dyn LixBackend>,
     known_live_layouts: Option<&'a BTreeMap<String, LiveTableLayout>>,
     side_effects: Vec<Statement>,
-    live_table_requirements: Vec<crate::state::internal::SchemaLiveTableRequirement>,
+    live_table_requirements: Vec<crate::sql::internal::SchemaLiveTableRequirement>,
     generated_params: Vec<Value>,
-    mutations: Vec<crate::state::internal::MutationRow>,
-    update_validations: Vec<crate::state::internal::UpdateValidationPlan>,
-    postprocess: Option<crate::state::internal::PostprocessPlan>,
+    mutations: Vec<crate::sql::internal::MutationRow>,
+    update_validations: Vec<crate::sql::internal::UpdateValidationPlan>,
+    postprocess: Option<crate::sql::internal::PostprocessPlan>,
 }
 
 impl<'a> StatementContext<'a> {
@@ -75,7 +75,7 @@ impl<'a> StatementContext<'a> {
     fn take_output_with_prepared(
         &mut self,
         statements: Vec<Statement>,
-        prepared_statements: Vec<crate::state::internal::PreparedStatement>,
+        prepared_statements: Vec<crate::sql::internal::PreparedStatement>,
     ) -> RewriteOutput {
         RewriteOutput {
             statements,
@@ -503,7 +503,7 @@ where
                             context.params,
                             backend.dialect(),
                         )?;
-                        prepared_statements.push(crate::state::internal::PreparedStatement {
+                        prepared_statements.push(crate::sql::internal::PreparedStatement {
                             sql: bound.sql,
                             params: bound.params,
                         });

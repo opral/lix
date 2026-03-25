@@ -15,11 +15,13 @@ use crate::sql::execution::contracts::planned_statement::{
 use crate::backend::prepared::PreparedStatement;
 use crate::sql::execution::contracts::result_contract::ResultContract;
 use crate::canonical::pending_session::PendingPublicCommitSession;
-use crate::sql::execution::shared_path::{self, PendingTransactionView};
+use crate::sql::execution::shared_path;
+use crate::sql::public::services::pending_reads::execute_prepared_public_read_with_pending_transaction_view;
 use crate::sql::public::runtime::{PreparedPublicRead, PreparedPublicWrite};
-use crate::state::internal::followup::execute_internal_postprocess_with_transaction;
-use crate::state::internal::PostprocessPlan;
+use crate::sql::internal::followup::execute_internal_postprocess_with_transaction;
+use crate::sql::internal::PostprocessPlan;
 use crate::state::stream::StateCommitStreamChange;
+use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, QueryResult};
 use sqlparser::ast::Statement;
 
@@ -164,25 +166,24 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
     match step.route() {
         CompiledExecutionRoute::PublicRead(public_read) => {
             let backend = TransactionBackendAdapter::new(transaction);
-            let public_result =
-                match shared_path::execute_prepared_public_read_with_pending_transaction_view(
-                    &backend,
-                    pending_transaction_view,
-                    public_read,
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let normalized = normalize_sql_execution_error_with_backend(
-                            &backend,
-                            error,
-                            parsed_statements,
-                        )
-                        .await;
-                        return Err(normalized);
-                    }
-                };
+            let public_result = match execute_prepared_public_read_with_pending_transaction_view(
+                &backend,
+                pending_transaction_view,
+                public_read,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    let normalized = normalize_sql_execution_error_with_backend(
+                        &backend,
+                        error,
+                        parsed_statements,
+                    )
+                    .await;
+                    return Err(normalized);
+                }
+            };
             Ok(CompiledExecutionStepResult::Immediate(public_result))
         }
         CompiledExecutionRoute::PlannedWriteDelta(delta) => {

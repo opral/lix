@@ -5,3 +5,5 @@ pub(crate) mod catalog;
 pub(crate) mod core;
 pub(crate) mod planner;
 pub(crate) mod runtime;
+pub(crate) mod services;
+pub(crate) mod validation;

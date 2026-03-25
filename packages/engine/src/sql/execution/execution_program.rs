@@ -10,7 +10,7 @@ use crate::sql::public::catalog::SurfaceRegistry;
 use crate::sql::public::runtime::{
     classify_public_execution_route_with_registry, PublicExecutionRoute,
 };
-use crate::state::internal::script::coalesce_vtable_inserts_in_transactions;
+use crate::sql::internal::script::coalesce_vtable_inserts_in_transactions;
 use crate::transaction::{
     execute_bound_statement_template_instance_in_borrowed_write_transaction,
     execute_bound_statement_template_instance_in_write_transaction,

@@ -58,8 +58,9 @@ fn tracked_append_callers_use_canonical_append_entrypoint() {
     ] {
         let source = read_engine_source(relative);
         assert!(
-            source.contains("append_tracked("),
-            "{relative} should use the canonical append_tracked entrypoint"
+            source.contains("append_tracked(")
+                || source.contains("append_tracked_with_pending_public_session("),
+            "{relative} should use a canonical append entrypoint"
         );
         assert!(
             !source.contains("= create_commit("),
@@ -70,24 +71,24 @@ fn tracked_append_callers_use_canonical_append_entrypoint() {
 
 #[test]
 fn internal_tracked_generation_delegates_into_canonical_helpers() {
-    let followup_source = read_engine_source("state/internal/followup.rs");
+    let followup_source = read_engine_source("sql/internal/followup.rs");
     assert!(
         followup_source.contains("build_prepared_batch_from_domain_changes_with_executor("),
-        "state/internal/followup.rs should delegate tracked generation through canonical helpers"
+        "sql/internal/followup.rs should delegate tracked generation through canonical helpers"
     );
     assert!(
         !followup_source.contains("generate_commit("),
-        "state/internal/followup.rs should not generate canonical commits directly"
+        "sql/internal/followup.rs should not generate canonical commits directly"
     );
 
-    let vtable_source = read_engine_source("state/internal/vtable_write.rs");
+    let vtable_source = read_engine_source("sql/internal/vtable_write.rs");
     assert!(
         vtable_source.contains("generate_commit_result_from_domain_changes_with_executor("),
-        "state/internal/vtable_write.rs should delegate tracked generation through canonical helpers"
+        "sql/internal/vtable_write.rs should delegate tracked generation through canonical helpers"
     );
     assert!(
         !vtable_source.contains("generate_commit("),
-        "state/internal/vtable_write.rs should not generate canonical commits directly"
+        "sql/internal/vtable_write.rs should not generate canonical commits directly"
     );
 }
 
@@ -118,14 +119,14 @@ fn canonical_readers_and_graph_surfaces_exist_and_are_used() {
     let effective_state_source =
         read_engine_source("sql/public/planner/semantics/effective_state_resolver.rs");
     assert!(
-        effective_state_source.contains("crate::canonical::readers::"),
-        "effective_state_resolver should read committed state through canonical::readers"
+        effective_state_source.contains("crate::sql::public::services::state_reader::"),
+        "effective_state_resolver should read committed state through the sql/public state_reader seam"
     );
 
     let runtime_source = read_engine_source("sql/public/runtime/mod.rs");
     assert!(
-        runtime_source.contains("crate::canonical::readers::"),
-        "sql/public/runtime should use canonical::readers for committed-state lookups"
+        runtime_source.contains("crate::sql::public::services::state_reader::"),
+        "sql/public/runtime should use the sql/public state_reader seam for committed-state lookups"
     );
 
     let history_query_source = read_engine_source("state/history/query.rs");
@@ -206,8 +207,8 @@ fn transaction_adapter_uses_applied_output_not_synthetic_generate_commit_result(
         "planned_write_runner should mirror bootstrap rows from the canonical applied_output"
     );
     assert!(
-        runner_source.contains("build_pending_public_commit_session("),
-        "planned_write_runner should build pending sessions through the canonical helper"
+        runner_source.contains("append_tracked_with_pending_public_session("),
+        "planned_write_runner should delegate pending-session append protocol through canonical::append"
     );
 }
 
