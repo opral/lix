@@ -4,14 +4,14 @@ use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::backend::program::{
     PreparedParam, PreparedProgram, ProgramSlot, ProgramSlotId, SlotShape, WriteProgram, WriteStep,
 };
-use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, TransactionMode, Value};
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn execute_write_program_with_backend(
     backend: &dyn LixBackend,
     program: WriteProgram,
 ) -> Result<QueryResult, LixError> {
-    let mut transaction = backend.begin_transaction().await?;
+    let mut transaction = backend.begin_transaction(TransactionMode::Write).await?;
     let result = execute_write_program_steps_with_transaction(transaction.as_mut(), program).await;
     match result {
         Ok(result) => {
@@ -312,7 +312,10 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+        async fn begin_transaction(
+            &self,
+            _mode: crate::TransactionMode,
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             self.log.lock().unwrap().push("begin".to_string());
             Ok(Box::new(FakeTransaction {
                 log: std::sync::Arc::clone(&self.log),
@@ -324,7 +327,7 @@ mod tests {
             &self,
             _name: &str,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            self.begin_transaction().await
+            self.begin_transaction(crate::TransactionMode::Write).await
         }
     }
 
@@ -332,6 +335,10 @@ mod tests {
     impl LixBackendTransaction for FakeTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
+        }
+
+        fn mode(&self) -> crate::TransactionMode {
+            crate::TransactionMode::Write
         }
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {

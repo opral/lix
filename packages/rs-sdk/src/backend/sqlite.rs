@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use lix_engine::{
     ImageChunkReader, ImageChunkWriter, LixBackend, LixBackendTransaction, LixError, PreparedBatch,
-    QueryResult, SqlDialect, Value,
+    QueryResult, SqlDialect, TransactionMode, Value,
 };
 use rusqlite::{
     backup::{Backup, StepResult},
@@ -21,6 +21,7 @@ struct SqliteTransaction<'a> {
     conn: MutexGuard<'a, Option<Connection>>,
     finalized: bool,
     savepoint_name: Option<String>,
+    mode: TransactionMode,
 }
 
 #[derive(Clone, Debug)]
@@ -80,12 +81,18 @@ impl LixBackend for SqliteBackend {
         execute_sql(conn, sql, params)
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_transaction(
+        &self,
+        mode: TransactionMode,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let mut conn = self.lock_conn()?;
         let inner = conn.as_mut().ok_or_else(sqlite_backend_destroyed_error)?;
         if inner.is_autocommit() {
             inner
-                .execute_batch("BEGIN IMMEDIATE TRANSACTION")
+                .execute_batch(match mode {
+                    TransactionMode::Read | TransactionMode::Deferred => "BEGIN TRANSACTION",
+                    TransactionMode::Write => "BEGIN IMMEDIATE TRANSACTION",
+                })
                 .map_err(|err| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: err.to_string(),
@@ -94,25 +101,37 @@ impl LixBackend for SqliteBackend {
                 conn,
                 finalized: false,
                 savepoint_name: None,
+                mode,
             }))
         } else {
-            // A transaction is already active (e.g. during init). Use a
-            // savepoint so callers deep in the call stack still get an
-            // atomic unit of work without failing on nested BEGIN.
-            static FALLBACK_SP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let id = FALLBACK_SP.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let name = format!("sp_auto_{id}");
-            inner
-                .execute_batch(&format!("SAVEPOINT {name}"))
-                .map_err(|err| LixError {
+            match mode {
+                TransactionMode::Write => {
+                    // Nested sqlite write units use savepoints, but the
+                    // mode remains explicitly write-scoped.
+                    static FALLBACK_SP: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let id = FALLBACK_SP.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let name = format!("sp_auto_{id}");
+                    inner
+                        .execute_batch(&format!("SAVEPOINT {name}"))
+                        .map_err(|err| LixError {
+                            code: "LIX_ERROR_UNKNOWN".to_string(),
+                            description: err.to_string(),
+                        })?;
+                    Ok(Box::new(SqliteTransaction {
+                        conn,
+                        finalized: false,
+                        savepoint_name: Some(name),
+                        mode: TransactionMode::Write,
+                    }))
+                }
+                TransactionMode::Read | TransactionMode::Deferred => Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: err.to_string(),
-                })?;
-            Ok(Box::new(SqliteTransaction {
-                conn,
-                finalized: false,
-                savepoint_name: Some(name),
-            }))
+                    description:
+                        "sqlite backend cannot open a nested read/deferred transaction inside an active transaction; open the read on a separate connection or keep nested scopes write-savepoint based"
+                            .to_string(),
+                }),
+            }
         }
     }
 
@@ -132,6 +151,7 @@ impl LixBackend for SqliteBackend {
             conn,
             finalized: false,
             savepoint_name: Some(name.to_string()),
+            mode: TransactionMode::Write,
         }))
     }
 
@@ -228,6 +248,10 @@ impl LixBackend for SqliteBackend {
 impl LixBackendTransaction for SqliteTransaction<'_> {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
+    }
+
+    fn mode(&self) -> TransactionMode {
+        self.mode
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {

@@ -1,4 +1,4 @@
-use lix_engine::{ImageChunkReader, ImageChunkWriter, LixError};
+use lix_engine::{ImageChunkReader, ImageChunkWriter, LixError, TransactionMode};
 use lix_rs_sdk::{LixBackend, SqliteBackend, Value};
 
 struct VecImageWriter {
@@ -37,7 +37,7 @@ async fn sqlite_backend_transaction_commit_persists_changes() {
         .expect("schema setup should succeed");
 
     let mut tx = backend
-        .begin_transaction()
+        .begin_transaction(TransactionMode::Write)
         .await
         .expect("begin_transaction should succeed");
     tx.execute(
@@ -75,7 +75,7 @@ async fn sqlite_backend_transaction_rollback_discards_changes() {
         .expect("schema setup should succeed");
 
     let mut tx = backend
-        .begin_transaction()
+        .begin_transaction(TransactionMode::Write)
         .await
         .expect("begin_transaction should succeed");
     tx.execute(
@@ -148,4 +148,58 @@ async fn sqlite_backend_export_and_restore_image_roundtrip() {
         .expect("verification query should succeed");
     assert_eq!(rows.rows.len(), 1);
     assert_eq!(rows.rows[0][0], Value::Integer(1));
+}
+
+#[tokio::test]
+async fn sqlite_backend_rejects_nested_read_transaction_mode() {
+    let backend = SqliteBackend::in_memory().expect("in-memory backend should initialize");
+
+    backend
+        .execute("BEGIN IMMEDIATE TRANSACTION", &[])
+        .await
+        .expect("outer write transaction should succeed");
+
+    let error = match backend.begin_transaction(TransactionMode::Read).await {
+        Ok(_) => panic!("nested read transaction should be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .description
+            .contains("cannot open a nested read/deferred transaction"),
+        "unexpected nested read error: {}",
+        error.description
+    );
+
+    backend
+        .execute("ROLLBACK", &[])
+        .await
+        .expect("outer rollback should succeed");
+}
+
+#[tokio::test]
+async fn sqlite_backend_rejects_nested_deferred_transaction_mode() {
+    let backend = SqliteBackend::in_memory().expect("in-memory backend should initialize");
+
+    backend
+        .execute("BEGIN IMMEDIATE TRANSACTION", &[])
+        .await
+        .expect("outer write transaction should succeed");
+
+    let error = match backend.begin_transaction(TransactionMode::Deferred).await {
+        Ok(_) => panic!("nested deferred transaction should be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .description
+            .contains("cannot open a nested read/deferred transaction"),
+        "unexpected nested deferred error: {}",
+        error.description
+    );
+
+    backend
+        .execute("ROLLBACK", &[])
+        .await
+        .expect("outer rollback should succeed");
 }

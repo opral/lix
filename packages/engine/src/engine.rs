@@ -8,7 +8,7 @@ use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
 use crate::WasmRuntime;
-use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, TransactionMode, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
 use std::collections::{BTreeMap, BTreeSet};
@@ -181,8 +181,15 @@ impl Engine {
             let id = self.savepoint_counter.fetch_add(1, Ordering::SeqCst);
             self.backend.begin_savepoint(&format!("sp_{id}")).await
         } else {
-            self.backend.begin_transaction().await
+            self.backend.begin_transaction(TransactionMode::Write).await
         }
+    }
+
+    pub(crate) async fn begin_read_unit(
+        &self,
+        mode: TransactionMode,
+    ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, crate::LixError> {
+        self.backend.begin_transaction(mode).await
     }
 
     pub(crate) fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
@@ -389,7 +396,10 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
         unsafe { (&mut **guard).execute(sql, params).await }
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_transaction(
+        &self,
+        _mode: TransactionMode,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "nested transactions are not supported via TransactionBackendAdapter"
@@ -524,7 +534,7 @@ mod tests {
     use super::{
         boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
-    use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect};
+    use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect, TransactionMode};
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
     use crate::sql::analysis::state_resolution::optimize::should_refresh_file_cache_for_statements;
     use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
@@ -545,6 +555,7 @@ mod tests {
     struct TestTransaction {
         commit_called: Arc<AtomicBool>,
         rollback_called: Arc<AtomicBool>,
+        mode: TransactionMode,
     }
 
     #[async_trait(?Send)]
@@ -566,10 +577,14 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+        async fn begin_transaction(
+            &self,
+            mode: TransactionMode,
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             Ok(Box::new(TestTransaction {
                 commit_called: Arc::clone(&self.commit_called),
                 rollback_called: Arc::clone(&self.rollback_called),
+                mode,
             }))
         }
 
@@ -577,7 +592,7 @@ mod tests {
             &self,
             _name: &str,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            self.begin_transaction().await
+            self.begin_transaction(TransactionMode::Write).await
         }
     }
 
@@ -585,6 +600,10 @@ mod tests {
     impl LixBackendTransaction for TestTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
+        }
+
+        fn mode(&self) -> TransactionMode {
+            self.mode
         }
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {

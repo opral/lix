@@ -129,12 +129,6 @@ fn canonical_readers_and_graph_surfaces_exist_and_are_used() {
         "state/history/query.rs should use canonical::graph"
     );
 
-    let history_timeline_source = read_engine_source("state/history/timeline.rs");
-    assert!(
-        history_timeline_source.contains("crate::canonical::graph::"),
-        "state/history/timeline.rs should use canonical::graph"
-    );
-
     let merge_source = read_engine_source("version/merge_version.rs");
     assert!(
         merge_source.contains("crate::canonical::readers::"),

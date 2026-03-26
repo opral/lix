@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::raw::{scan_rows_with_backend, snapshot_text, RawRow, RawStorage};
 use crate::live_state::{load_live_row_access_with_backend, normalized_live_column_values};
+use crate::read::contracts::CommittedReadMode;
 use crate::sql::public::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::sql::public::runtime::{
     decode_public_read_result, execute_prepared_public_read, PreparedPublicRead,
@@ -21,13 +22,6 @@ use sqlparser::ast::{
 
 const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const GLOBAL_VERSION_ID: &str = "global";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PreparedPublicReadTransactionMode {
-    PendingView,
-    CommittedOnly,
-    MaterializedState,
-}
 
 struct TransactionReadModel<'a> {
     base: &'a dyn LixBackend,
@@ -88,7 +82,7 @@ impl<'a> TransactionReadModel<'a> {
         }
 
         match prepared_public_read_transaction_mode(public_read) {
-            PreparedPublicReadTransactionMode::PendingView => {
+            CommittedReadMode::PendingView => {
                 let query = live_table_query_from_prepared_public_read(public_read)
                     .expect("pending-view public reads must lower to a typed live-table query");
                 let result = self.execute_live_table_query(&query).await?;
@@ -97,8 +91,7 @@ impl<'a> TransactionReadModel<'a> {
                 }
                 Ok(result)
             }
-            PreparedPublicReadTransactionMode::CommittedOnly
-            | PreparedPublicReadTransactionMode::MaterializedState => {
+            CommittedReadMode::CommittedOnly | CommittedReadMode::MaterializedState => {
                 execute_prepared_public_read(self.base, public_read).await
             }
         }
@@ -343,16 +336,16 @@ pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view(
 
 pub(crate) fn prepared_public_read_transaction_mode(
     public_read: &PreparedPublicRead,
-) -> PreparedPublicReadTransactionMode {
+) -> CommittedReadMode {
     if public_read.direct_plan().is_some() {
-        return PreparedPublicReadTransactionMode::CommittedOnly;
+        return CommittedReadMode::CommittedOnly;
     }
 
     if live_table_query_from_prepared_public_read(public_read).is_some() {
-        return PreparedPublicReadTransactionMode::PendingView;
+        return CommittedReadMode::PendingView;
     }
 
-    PreparedPublicReadTransactionMode::MaterializedState
+    CommittedReadMode::MaterializedState
 }
 
 #[derive(Clone)]

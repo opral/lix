@@ -137,6 +137,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
+            _mode: crate::TransactionMode,
         ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -148,7 +149,7 @@ mod tests {
             &self,
             _name: &str,
         ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
-            self.begin_transaction().await
+            self.begin_transaction(crate::TransactionMode::Write).await
         }
     }
 
@@ -156,6 +157,10 @@ mod tests {
     impl crate::LixBackendTransaction for NoopTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
+        }
+
+        fn mode(&self) -> crate::TransactionMode {
+            crate::TransactionMode::Write
         }
 
         async fn execute(

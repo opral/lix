@@ -2490,6 +2490,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
+            _mode: crate::TransactionMode,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, crate::LixError> {
             Ok(Box::new(UnusedTransaction))
         }
@@ -2498,7 +2499,7 @@ mod tests {
             &self,
             _name: &str,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, crate::LixError> {
-            self.begin_transaction().await
+            self.begin_transaction(crate::TransactionMode::Write).await
         }
     }
 
@@ -2506,6 +2507,10 @@ mod tests {
     impl LixBackendTransaction for UnusedTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
+        }
+
+        fn mode(&self) -> crate::TransactionMode {
+            crate::TransactionMode::Write
         }
 
         async fn execute(

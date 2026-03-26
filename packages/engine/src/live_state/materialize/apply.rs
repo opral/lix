@@ -10,13 +10,13 @@ use crate::live_state::storage::{
     quoted_live_table_name,
 };
 use crate::live_state::{finalize_commit_in_transaction, register_schema_in_transaction};
-use crate::{LixBackend, LixBackendTransaction, LixError, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, TransactionMode, Value};
 
 pub(crate) async fn apply_live_state_rebuild_plan_internal(
     backend: &dyn LixBackend,
     plan: &LiveStateRebuildPlan,
 ) -> Result<LiveStateApplyReport, LixError> {
-    let mut transaction = backend.begin_transaction().await?;
+    let mut transaction = backend.begin_transaction(TransactionMode::Write).await?;
     transaction
         .execute(
             &build_set_live_state_mode_sql(LiveStateMode::Rebuilding),

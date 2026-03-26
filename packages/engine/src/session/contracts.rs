@@ -9,6 +9,12 @@ pub enum SessionDependency {
     PublicSurfaceRegistryGeneration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionExecutionMode {
+    CommittedRead,
+    WriteTransaction,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct SessionStateSnapshot {
     pub active_version_id: String,
