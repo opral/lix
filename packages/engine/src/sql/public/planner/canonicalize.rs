@@ -1,3 +1,4 @@
+use crate::Value;
 use crate::sql::public::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
 use crate::sql::public::core::contracts::{BoundStatement, StatementKind};
 use crate::sql::public::planner::ir::{
@@ -7,11 +8,10 @@ use crate::sql::public::planner::ir::{
     SortKey, StructuredPublicRead, WriteCommand, WriteModeRequest, WriteOperationKind,
     WriteSelector,
 };
-use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
-use crate::Value;
+use crate::sql_support::placeholders::{PlaceholderState, resolve_placeholder_index};
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, ConflictTarget, Delete, Expr, FromTable, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, LimitClause, ObjectNamePart,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, Insert, LimitClause, ObjectNamePart,
     OnConflictAction, OnInsert, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr,
     Statement, TableFactor, TableWithJoins, Update, Value as SqlValue,
 };
@@ -214,7 +214,7 @@ fn canonicalize_insert_write(
     validate_semantic_write_surface(&surface_binding, insert_write_surface_supported)?;
     if !insert.assignments.is_empty() || insert.returning.is_some() {
         return Err(CanonicalizeError::unsupported(
-            "public day-1 write canonicalizer only supports VALUES inserts without assignment targets or RETURNING",
+            "public day-1 write canonicalizer only supports INSERT statements without assignment targets or RETURNING",
         ));
     }
 
@@ -226,9 +226,11 @@ fn canonicalize_insert_write(
             &bound_statement.bound_parameters,
             payload,
         )?,
-        _ if insert.on.is_some() => return Err(CanonicalizeError::unsupported(
-            "public day-1 insert canonicalizer does not yet support ON CONFLICT on multi-row inserts",
-        )),
+        _ if insert.on.is_some() => {
+            return Err(CanonicalizeError::unsupported(
+                "public day-1 insert canonicalizer does not yet support ON CONFLICT on multi-row inserts",
+            ));
+        }
         _ => None,
     };
     let requested_mode = write_mode_request_for_insert_payloads(&surface_binding, &payloads)?;
@@ -288,7 +290,7 @@ fn canonicalize_update_write(
         None => {
             return Err(CanonicalizeError::unsupported(
                 "public day-1 update canonicalizer requires an explicit WHERE predicate",
-            ))
+            ));
         }
     };
     let requested_mode =
@@ -343,7 +345,7 @@ fn canonicalize_delete_write(
         None => {
             return Err(CanonicalizeError::unsupported(
                 "public day-1 delete canonicalizer requires an explicit WHERE predicate",
-            ))
+            ));
         }
     };
 
@@ -388,13 +390,15 @@ fn insert_on_conflict(
             .iter()
             .map(|ident| canonical_write_column_key(surface_binding, &ident.value))
             .collect::<Result<Vec<_>, _>>()?,
-        Some(_) => return Err(CanonicalizeError::unsupported(
-            "public day-1 insert canonicalizer only supports explicit ON CONFLICT column targets",
-        )),
+        Some(_) => {
+            return Err(CanonicalizeError::unsupported(
+                "public day-1 insert canonicalizer only supports explicit ON CONFLICT column targets",
+            ));
+        }
         None => {
             return Err(CanonicalizeError::unsupported(
                 "public day-1 insert canonicalizer requires explicit ON CONFLICT columns",
-            ))
+            ));
         }
     };
 
@@ -672,43 +676,189 @@ fn insert_payloads(
             return Ok(vec![BTreeMap::new()]);
         }
         return Err(CanonicalizeError::unsupported(
-            "public day-1 write canonicalizer requires VALUES inserts",
+            "public day-1 write canonicalizer requires an INSERT source when columns are specified",
         ));
     };
-    let SetExpr::Values(values) = source.body.as_ref() else {
-        return Err(CanonicalizeError::unsupported(
-            "public day-1 write canonicalizer requires VALUES inserts",
-        ));
-    };
-    if values.rows.is_empty() {
-        return Err(CanonicalizeError::unsupported(
-            "public day-1 write canonicalizer requires at least one insert row",
-        ));
-    }
 
     let mut placeholder_state = PlaceholderState::new();
-    let mut payloads = Vec::with_capacity(values.rows.len());
-    for row in &values.rows {
-        if row.len() != insert.columns.len() {
+    insert_source_payloads(
+        surface_binding,
+        insert.columns.as_slice(),
+        source,
+        params,
+        &mut placeholder_state,
+    )
+}
+
+fn insert_source_payloads(
+    surface_binding: &SurfaceBinding,
+    insert_columns: &[Ident],
+    source: &Query,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+) -> Result<Vec<BTreeMap<String, Value>>, CanonicalizeError> {
+    reject_unsupported_insert_source_query_clauses(source)?;
+
+    match source.body.as_ref() {
+        SetExpr::Values(values) => {
+            if values.rows.is_empty() {
+                return Err(CanonicalizeError::unsupported(
+                    "public day-1 write canonicalizer requires at least one insert row",
+                ));
+            }
+
+            let mut payloads = Vec::with_capacity(values.rows.len());
+            for row in &values.rows {
+                payloads.push(insert_payload_from_row_exprs(
+                    surface_binding,
+                    insert_columns,
+                    row.iter(),
+                    params,
+                    placeholder_state,
+                )?);
+            }
+            Ok(payloads)
+        }
+        SetExpr::Select(select) => Ok(vec![insert_payload_from_select(
+            surface_binding,
+            insert_columns,
+            select,
+            params,
+            placeholder_state,
+        )?]),
+        SetExpr::Query(query) => insert_source_payloads(
+            surface_binding,
+            insert_columns,
+            query,
+            params,
+            placeholder_state,
+        ),
+        SetExpr::SetOperation { .. } => Err(CanonicalizeError::unsupported(
+            "public day-1 insert canonicalizer does not yet support set-operation INSERT sources",
+        )),
+        _ => Err(CanonicalizeError::unsupported(
+            "public day-1 insert canonicalizer only supports VALUES and single-row SELECT insert sources",
+        )),
+    }
+}
+
+fn reject_unsupported_insert_source_query_clauses(source: &Query) -> Result<(), CanonicalizeError> {
+    if source.with.is_some()
+        || source.fetch.is_some()
+        || !source.locks.is_empty()
+        || source.for_clause.is_some()
+        || source.settings.is_some()
+        || source.format_clause.is_some()
+    {
+        return Err(CanonicalizeError::unsupported(
+            "public day-1 insert canonicalizer does not support WITH/FETCH/LOCK/FOR/SETTINGS/FORMAT clauses in INSERT sources",
+        ));
+    }
+
+    if source.order_by.is_some()
+        || source.limit_clause.is_some()
+        || !source.pipe_operators.is_empty()
+    {
+        return Err(CanonicalizeError::unsupported(
+            "public day-1 insert canonicalizer does not support ORDER BY/LIMIT/pipe operators in INSERT sources",
+        ));
+    }
+
+    Ok(())
+}
+
+fn insert_payload_from_select(
+    surface_binding: &SurfaceBinding,
+    insert_columns: &[Ident],
+    select: &Select,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+) -> Result<BTreeMap<String, Value>, CanonicalizeError> {
+    if !select.from.is_empty() {
+        return Err(CanonicalizeError::unsupported(
+            "public day-1 insert canonicalizer does not support table-backed INSERT ... SELECT sources",
+        ));
+    }
+
+    if select.distinct.is_some()
+        || select.top.is_some()
+        || select.exclude.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || select.selection.is_some()
+        || select.having.is_some()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.value_table_mode.is_some()
+        || select.connect_by.is_some()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+    {
+        return Err(CanonicalizeError::unsupported(
+            "public day-1 insert canonicalizer only supports single-row projection SELECT sources",
+        ));
+    }
+
+    match &select.group_by {
+        GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty() => {}
+        GroupByExpr::Expressions(_, _) | GroupByExpr::All(_) => {
             return Err(CanonicalizeError::unsupported(
-                "public day-1 write canonicalizer requires one value per inserted column",
+                "public day-1 insert canonicalizer does not support GROUP BY in INSERT ... SELECT sources",
             ));
         }
-
-        let mut payload = BTreeMap::new();
-        for (column, expr) in insert.columns.iter().zip(row.iter()) {
-            reject_forbidden_default_state_write_column(surface_binding, &column.value, "insert")?;
-            let key = canonical_write_column_key(surface_binding, &column.value)?;
-            let value = match expr_to_value(expr, params, &mut placeholder_state) {
-                Ok(value) => value,
-                Err(error) if key == "data" => return Err(filesystem_file_data_error(error)),
-                Err(error) => return Err(error),
-            };
-            payload.insert(key, value);
-        }
-        payloads.push(payload);
     }
-    Ok(payloads)
+
+    let projection_exprs = select
+        .projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => Ok(expr),
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                Err(CanonicalizeError::unsupported(
+                    "public day-1 insert canonicalizer only supports expression projection items in INSERT ... SELECT sources",
+                ))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    insert_payload_from_row_exprs(
+        surface_binding,
+        insert_columns,
+        projection_exprs,
+        params,
+        placeholder_state,
+    )
+}
+
+fn insert_payload_from_row_exprs<'a>(
+    surface_binding: &SurfaceBinding,
+    insert_columns: &[Ident],
+    exprs: impl IntoIterator<Item = &'a Expr>,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+) -> Result<BTreeMap<String, Value>, CanonicalizeError> {
+    let exprs = exprs.into_iter().collect::<Vec<_>>();
+    if exprs.len() != insert_columns.len() {
+        return Err(CanonicalizeError::unsupported(
+            "public day-1 write canonicalizer requires one value per inserted column",
+        ));
+    }
+
+    let mut payload = BTreeMap::new();
+    for (column, expr) in insert_columns.iter().zip(exprs) {
+        reject_forbidden_default_state_write_column(surface_binding, &column.value, "insert")?;
+        let key = canonical_write_column_key(surface_binding, &column.value)?;
+        let value = match expr_to_value(expr, params, placeholder_state) {
+            Ok(value) => value,
+            Err(error) if key == "data" => return Err(filesystem_file_data_error(error)),
+            Err(error) => return Err(error),
+        };
+        payload.insert(key, value);
+    }
+
+    Ok(payload)
 }
 
 fn write_mode_request_for_insert_payloads(
@@ -1223,7 +1373,7 @@ fn expr_to_value(
             }
         }
         _ => Err(CanonicalizeError::unsupported(
-            "public day-1 write canonicalizer only supports literal and placeholder VALUES",
+            "public day-1 write canonicalizer only supports literal and placeholder insert row expressions",
         )),
     }
 }
@@ -1271,12 +1421,12 @@ fn single_function_arg_expr<'a>(
         FunctionArguments::None => {
             return Err(CanonicalizeError::unsupported(format!(
                 "public day-1 write canonicalizer requires one argument for {function_name}",
-            )))
+            )));
         }
         _ => {
             return Err(CanonicalizeError::unsupported(format!(
-            "public day-1 write canonicalizer does not support complex arguments for {function_name}",
-        )))
+                "public day-1 write canonicalizer does not support complex arguments for {function_name}",
+            )));
         }
     };
     if args.len() != 1 {
@@ -1328,17 +1478,17 @@ fn sql_value_to_engine_value(
         | SqlValue::TripleDoubleQuotedByteStringLiteral(value) => {
             Ok(Value::Blob(value.clone().into_bytes()))
         }
-        SqlValue::HexStringLiteral(value) => {
-            Ok(Value::Blob(parse_hex_literal(value).map_err(
-                CanonicalizeError::unsupported,
-            )?))
-        }
+        SqlValue::HexStringLiteral(value) => Ok(Value::Blob(
+            parse_hex_literal(value).map_err(CanonicalizeError::unsupported)?,
+        )),
         SqlValue::Placeholder(token) => {
             let index = resolve_placeholder_index(token, params.len(), placeholder_state).map_err(
-                |err| CanonicalizeError::unsupported(format!(
-                    "public day-1 write canonicalizer could not bind placeholder: {}",
-                    err.description
-                )),
+                |err| {
+                    CanonicalizeError::unsupported(format!(
+                        "public day-1 write canonicalizer could not bind placeholder: {}",
+                        err.description
+                    ))
+                },
             )?;
             params.get(index).cloned().ok_or_else(|| {
                 CanonicalizeError::unsupported(format!(
@@ -1348,7 +1498,7 @@ fn sql_value_to_engine_value(
             })
         }
         _ => Err(CanonicalizeError::unsupported(
-            "public day-1 write canonicalizer only supports string, numeric, boolean, null, blob, and placeholder VALUES",
+            "public day-1 write canonicalizer only supports string, numeric, boolean, null, blob, and placeholder insert row values",
         )),
     }
 }
@@ -1620,13 +1770,13 @@ fn expr_to_u64(expr: &Expr) -> Result<u64, CanonicalizeError> {
 #[cfg(test)]
 mod tests {
     use super::{canonicalize_read, canonicalize_write};
+    use crate::Value;
     use crate::sql::public::catalog::{DynamicEntitySurfaceSpec, SurfaceRegistry};
     use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql::public::core::parser::parse_sql_script;
     use crate::sql::public::planner::ir::{
         MutationPayload, ReadContract, ReadPlan, VersionScope, WriteModeRequest, WriteOperationKind,
     };
-    use crate::Value;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -1634,6 +1784,12 @@ mod tests {
         let mut statements = parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
         BoundStatement::from_statement(statement, Vec::new(), ExecutionContext::default())
+    }
+
+    fn bound_statement_with_params(sql: &str, params: Vec<Value>) -> BoundStatement {
+        let mut statements = parse_sql_script(sql).expect("SQL should parse");
+        let statement = statements.pop().expect("single statement");
+        BoundStatement::from_statement(statement, params, ExecutionContext::default())
     }
 
     #[test]
@@ -1839,6 +1995,56 @@ mod tests {
     }
 
     #[test]
+    fn canonicalizes_parameterized_state_insert_select_into_write_command() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let canonicalized = canonicalize_write(
+            bound_statement_with_params(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) SELECT $1, $2, $3, $4, $5, $6, $7",
+                vec![
+                    Value::Text("entity-1".to_string()),
+                    Value::Text("lix_key_value".to_string()),
+                    Value::Text("lix".to_string()),
+                    Value::Text("version-a".to_string()),
+                    Value::Text("lix".to_string()),
+                    Value::Text("{\"key\":\"hello\"}".to_string()),
+                    Value::Text("1".to_string()),
+                ],
+            ),
+            &registry,
+        )
+        .expect("state insert select should canonicalize");
+
+        assert_eq!(
+            canonicalized.surface_binding.descriptor.public_name,
+            "lix_state_by_version"
+        );
+        assert_eq!(
+            canonicalized.write_command.operation_kind,
+            WriteOperationKind::Insert
+        );
+        assert_eq!(
+            canonicalized.write_command.requested_mode,
+            WriteModeRequest::Auto
+        );
+        let MutationPayload::InsertRows(rows) = &canonicalized.write_command.payload else {
+            panic!("expected insert rows payload");
+        };
+        let [payload] = rows.as_slice() else {
+            panic!("expected exactly one insert row");
+        };
+        assert_eq!(
+            payload.get("entity_id"),
+            Some(&Value::Text("entity-1".to_string()))
+        );
+        assert_eq!(
+            payload.get("snapshot_content"),
+            Some(&Value::Text("{\"key\":\"hello\"}".to_string()))
+        );
+    }
+
+    #[test]
     fn canonicalizes_multi_row_filesystem_insert_into_insert_rows() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
         let canonicalized = canonicalize_write(
@@ -1859,6 +2065,79 @@ mod tests {
         assert_eq!(
             rows[1].get("path"),
             Some(&Value::Text("/b.txt".to_string()))
+        );
+    }
+
+    #[test]
+    fn canonicalizes_insert_select_write_mode_from_payload() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let canonicalized = canonicalize_write(
+            bound_statement(
+                "INSERT INTO lix_file (id, path, data, untracked) \
+                 SELECT 'file-1', '/a.txt', X'01', true",
+            ),
+            &registry,
+        )
+        .expect("filesystem insert select should canonicalize");
+
+        assert_eq!(
+            canonicalized.write_command.requested_mode,
+            WriteModeRequest::ForceUntracked
+        );
+        let MutationPayload::InsertRows(rows) = &canonicalized.write_command.payload else {
+            panic!("expected insert rows payload");
+        };
+        let [payload] = rows.as_slice() else {
+            panic!("expected exactly one insert row");
+        };
+        assert_eq!(payload.get("id"), Some(&Value::Text("file-1".to_string())));
+    }
+
+    #[test]
+    fn rejects_table_backed_insert_select_sources_with_precise_error() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let error = canonicalize_write(
+            bound_statement(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) SELECT \
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version \
+                 FROM lix_state_by_version",
+            ),
+            &registry,
+        )
+        .expect_err("table-backed insert select should be rejected");
+
+        assert!(
+            error
+                .message
+                .contains("does not support table-backed INSERT ... SELECT sources"),
+            "unexpected error: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn rejects_set_operation_insert_sources_with_precise_error() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let error = canonicalize_write(
+            bound_statement(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) SELECT 'entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1' \
+                 UNION ALL \
+                 SELECT 'entity-2', 'lix_key_value', 'lix', 'version-b', 'lix', '{\"key\":\"world\"}', '1'",
+            ),
+            &registry,
+        )
+        .expect_err("set-operation insert sources should be rejected");
+
+        assert!(
+            error
+                .message
+                .contains("does not yet support set-operation INSERT sources"),
+            "unexpected error: {}",
+            error.message
         );
     }
 
