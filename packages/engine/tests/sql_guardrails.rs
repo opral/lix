@@ -312,7 +312,6 @@ fn guardrail_state_module_no_longer_owns_sql_runtime_layers() {
     for added in [
         "src/sql/public/validation.rs",
         "src/sql/internal/script.rs",
-        "src/sql/compat/internal_state_vtable.rs",
     ] {
         assert!(
             root.join(added).exists(),

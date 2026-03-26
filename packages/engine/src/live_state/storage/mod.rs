@@ -14,7 +14,7 @@ pub(crate) use layout::{
     LiveTableLayout,
 };
 #[allow(unused_imports)]
-pub(in crate::live_state) use registry::{
+pub(crate) use registry::{
     compile_registered_live_layout, ensure_schema_live_table_with_requirement,
     ensure_schema_live_table_with_requirement_in_transaction,
     load_live_table_layout_in_transaction, load_live_table_layout_with_backend, register_schema,
@@ -25,5 +25,6 @@ pub(crate) use sql::{
     build_partitioned_scan_sql, ensure_schema_live_table_sql_statements, is_untracked_live_table,
     live_schema_key_for_table_name, normalized_insert_columns_sql, normalized_insert_values_sql,
     normalized_update_assignments_sql, quote_ident, quoted_live_table_name, required_bool_cell,
-    required_text_cell, selected_columns, selected_projection_sql, text_from_value, ScanSqlRequest,
+    required_text_cell, selected_columns, selected_projection_sql, text_from_value,
+    tracked_live_table_name, untracked_live_table_name, ScanSqlRequest,
 };

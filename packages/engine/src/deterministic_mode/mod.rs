@@ -6,7 +6,7 @@ use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
 };
-use crate::schema::live_layout::{
+use crate::live_state::{
     builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
     untracked_live_table_name,
 };

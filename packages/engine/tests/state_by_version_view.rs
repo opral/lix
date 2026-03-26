@@ -436,7 +436,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_state_by_version_insert_routes_to_vtable,
+    lix_state_by_version_insert_routes_through_state_surface,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
@@ -1090,7 +1090,7 @@ simulation_test!(
 );
 
 // TODO(parity): Legacy SDK supports broader placeholder forms in UPDATE assignments.
-// Rust vtable UPDATE currently requires snapshot_content as a direct literal/parameter expression.
+// Rust state-surface UPDATE currently requires snapshot_content as a direct literal/parameter expression.
 
 simulation_test!(
     lix_state_by_version_update_supports_multi_version_selectors,

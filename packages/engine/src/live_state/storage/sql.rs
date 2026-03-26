@@ -219,6 +219,14 @@ pub(crate) fn quoted_live_table_name(schema_key: &str) -> String {
     quote_ident(&live_table_name(schema_key))
 }
 
+pub(crate) fn tracked_live_table_name(schema_key: &str) -> String {
+    live_table_name(schema_key)
+}
+
+pub(crate) fn untracked_live_table_name(schema_key: &str) -> String {
+    live_table_name(schema_key)
+}
+
 pub(crate) fn is_untracked_live_table(_name: &str) -> bool {
     false
 }

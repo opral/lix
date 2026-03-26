@@ -304,7 +304,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    active_version_can_be_switched_via_vtable_update,
+    active_version_can_be_switched_via_state_surface_update,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
@@ -337,7 +337,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    active_version_can_be_updated_multiple_times_via_vtable_update,
+    active_version_can_be_updated_multiple_times_via_state_surface_update,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)

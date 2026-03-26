@@ -78,7 +78,7 @@ pub(crate) async fn rewrite_statement_with_backend<P>(
     statement: Statement,
     _params: &[Value],
     _writer_key: Option<&str>,
-    _known_live_layouts: &BTreeMap<String, crate::schema::live_layout::LiveTableLayout>,
+    _known_live_layouts: &BTreeMap<String, crate::live_state::LiveTableLayout>,
     _provider: &mut P,
 ) -> Result<RewriteOutput, LixError>
 where
@@ -166,8 +166,7 @@ where
 {
     let mut rewritten = Vec::with_capacity(statements.len());
     let mut live_table_requirements: Vec<SchemaLiveTableRequirement> = Vec::new();
-    let mut known_live_layouts =
-        BTreeMap::<String, crate::schema::live_layout::LiveTableLayout>::new();
+    let mut known_live_layouts = BTreeMap::<String, crate::live_state::LiveTableLayout>::new();
     let mut mutations: Vec<MutationRow> = Vec::new();
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
 

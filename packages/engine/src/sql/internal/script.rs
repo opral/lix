@@ -38,7 +38,7 @@ pub(crate) fn extract_explicit_transaction_script_from_statements(
     Ok(Some(middle.to_vec()))
 }
 
-pub(crate) fn coalesce_vtable_inserts_in_transactions(
+pub(crate) fn coalesce_state_surface_inserts_in_transactions(
     statements: Vec<Statement>,
 ) -> Result<Vec<Statement>, LixError> {
     let mut result = Vec::with_capacity(statements.len());

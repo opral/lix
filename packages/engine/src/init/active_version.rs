@@ -1,5 +1,5 @@
 use crate::engine::Engine;
-use crate::schema::live_layout::{
+use crate::live_state::{
     builtin_live_table_layout, live_column_name_for_property, untracked_live_table_name,
 };
 use crate::version::{

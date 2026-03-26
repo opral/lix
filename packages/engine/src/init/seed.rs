@@ -10,11 +10,11 @@ use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
 };
-use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
-use crate::schema::live_layout::{
+use crate::live_state::{
     builtin_live_table_layout, live_column_name_for_property, normalized_live_column_values,
     tracked_live_table_name, untracked_live_table_name,
 };
+use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
 use crate::sql::execution::execution_program::ExecutionContext;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql_support::text::escape_sql_string;

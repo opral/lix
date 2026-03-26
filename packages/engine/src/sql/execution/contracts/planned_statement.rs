@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
 
-use crate::schema::live_layout::LiveTableLayout;
+use crate::live_state::LiveTableLayout;
 use crate::{LixError, Value};
 use sqlparser::ast::Expr;
 

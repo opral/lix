@@ -10,7 +10,7 @@ use crate::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::schema::live_layout::{tracked_live_table_name, untracked_live_table_name};
+use crate::live_state::{tracked_live_table_name, untracked_live_table_name};
 use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
     SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,

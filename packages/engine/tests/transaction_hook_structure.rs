@@ -310,10 +310,10 @@ fn internal_vtable_runtime_no_longer_uses_legacy_parallel_contracts() {
         );
     }
 
-    let compat_source = read_engine_source("sql/compat/internal_state_vtable.rs");
+    let compat_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql/compat");
     assert!(
-        compat_source.contains("lix_internal_state_vtable"),
-        "compat module should keep the legacy internal-state vtable syntax as a normalization-only front door"
+        !compat_dir.exists(),
+        "legacy sql/compat state-vtable normalization layer should stay removed"
     );
 }
 

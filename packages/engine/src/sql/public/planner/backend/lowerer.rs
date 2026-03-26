@@ -6,7 +6,7 @@ use crate::filesystem::live_projection::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
     FilesystemProjectionScope,
 };
-use crate::schema::live_layout::{
+use crate::live_state::{
     builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
     untracked_live_table_name, LiveRowAccess, LiveTableLayout,
 };
@@ -1687,7 +1687,7 @@ fn render_live_payload_column_expr(
     };
     let qualified = format!("{}.{}", quote_ident(table_alias), quote_ident(column_name));
     match column_spec.kind {
-        crate::schema::live_layout::LiveColumnKind::JsonText => match dialect {
+        crate::live_state::LiveColumnKind::JsonText => match dialect {
             SqlDialect::Sqlite => format!(
                 "CASE WHEN {qualified} IS NULL THEN NULL ELSE json_extract({qualified}, '$') || '' END"
             ),
@@ -2472,7 +2472,7 @@ mod tests {
         lower_read_for_execution_with_layouts, rewrite_supported_public_read_surfaces_in_statement,
         LoweredReadProgram,
     };
-    use crate::schema::live_layout::{LiveColumnKind, LiveColumnSpec, LiveTableLayout};
+    use crate::live_state::{LiveColumnKind, LiveColumnSpec, LiveTableLayout};
     use crate::sql::public::catalog::SurfaceRegistry;
     use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql::public::planner::canonicalize::canonicalize_read;

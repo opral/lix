@@ -16,14 +16,12 @@ use crate::filesystem::runtime::{
 };
 use crate::functions::LixFunctionProvider;
 use crate::key_value::key_value_schema_key;
-use crate::live_state::require_ready_in_transaction;
+use crate::live_state::{
+    builtin_live_table_layout, live_column_name_for_property, load_live_table_layout_in_transaction,
+    require_ready_in_transaction, untracked_live_table_name, LiveTableLayout,
+};
 use crate::live_state::shared::snapshot_sql::live_snapshot_select_expr_for_schema;
 use crate::schema::builtin::types::LixVersionRef;
-use crate::schema::live_layout::{
-    builtin_live_table_layout, live_column_name_for_property, untracked_live_table_name,
-    LiveTableLayout,
-};
-use crate::schema::registry::load_live_table_layout_in_transaction;
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::SqlDialect;
@@ -1556,7 +1554,7 @@ mod tests {
         FilesystemTransactionFileState, FilesystemTransactionState, OptionalTextPatch,
     };
     use crate::functions::LixFunctionProvider;
-    use crate::schema::live_layout::{builtin_live_table_layout, normalized_live_column_values};
+    use crate::live_state::{builtin_live_table_layout, normalized_live_column_values};
     use crate::version::GLOBAL_VERSION_ID;
     use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;

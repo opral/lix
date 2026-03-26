@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 
 use crate::engine::Engine;
 use crate::functions::SharedFunctionProvider;
-use crate::sql::compat::internal_state_vtable::normalize_legacy_internal_state_vtable_statements;
 use crate::sql::public::runtime::{
     finalize_public_write_execution, prepare_public_execution_with_internal_access_and_functions,
     prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions,
@@ -103,7 +102,6 @@ async fn compile_execution_with_backend(
 
     let mut statements = parsed_statements.to_vec();
     crate::filesystem::ensure_generated_filesystem_insert_ids(&mut statements, &functions)?;
-    normalize_legacy_internal_state_vtable_statements(&mut statements);
 
     let requirements = static_artifacts
         .plan_requirements
