@@ -93,23 +93,37 @@ fn core_transaction_files_do_not_import_sql_modules_directly() {
 }
 
 #[test]
-fn engine_transaction_api_targets_transaction_module_not_legacy_wrapper() {
-    let source = read_engine_source("engine.rs");
+fn session_runtime_api_targets_transaction_module_for_write_lifecycle() {
+    let source = read_engine_source("session/mod.rs");
     assert!(
         source.contains("WriteTransaction"),
-        "engine.rs should target the transaction module for the engine write boundary"
+        "session/mod.rs should target the transaction module for the runtime write boundary"
+    );
+    assert!(
+        source.contains("begin_write_unit().await?"),
+        "session/mod.rs should acquire backend write units through the shared engine owner"
     );
     assert!(
         source.contains("WriteTransaction::new_buffered_write("),
-        "engine.rs should construct buffered-write transactions through the transaction module"
+        "session/mod.rs should construct buffered-write transactions through the transaction module"
     );
     assert!(
         source.contains(".commit_buffered_write("),
-        "engine.rs should commit through the transaction-owned buffered-write lifecycle"
+        "session/mod.rs should commit through the transaction-owned buffered-write lifecycle"
     );
     assert!(
         source.contains(".rollback_buffered_write()"),
-        "engine.rs should roll back through the transaction-owned buffered-write lifecycle"
+        "session/mod.rs should roll back through the transaction-owned buffered-write lifecycle"
+    );
+
+    let engine_source = read_engine_source("engine.rs");
+    assert!(
+        !engine_source.contains(".commit_buffered_write("),
+        "engine.rs should not own runtime buffered-write commit choreography anymore"
+    );
+    assert!(
+        !engine_source.contains(".rollback_buffered_write()"),
+        "engine.rs should not own runtime buffered-write rollback choreography anymore"
     );
     assert!(
         !PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -133,15 +147,64 @@ fn engine_module_no_longer_owns_write_transaction_commit_choreography() {
 }
 
 #[test]
-fn sql_execution_backend_entrypoint_delegates_to_transaction_module() {
+fn session_owns_runtime_context_state_and_construction() {
+    let engine_source = read_engine_source("engine.rs");
+    let engine_runtime_region = engine_source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("engine.rs should contain a pre-test runtime region");
+    for forbidden in [
+        "active_version_id: RwLock<String>",
+        "active_account_ids: RwLock<Vec<String>>",
+        "new_execution_context(",
+        "begin_transaction_with_options(",
+        "apply_transaction_commit_outcome(",
+    ] {
+        assert!(
+            !engine_runtime_region.contains(forbidden),
+            "engine.rs should not own session runtime item `{forbidden}`"
+        );
+    }
+
+    let session_source = read_engine_source("session/mod.rs");
+    for required in [
+        "active_version_id: RwLock<String>",
+        "active_account_ids: RwLock<Vec<String>>",
+        "pub(crate) fn new_execution_context(",
+        "pub async fn begin_transaction_with_options(",
+        "pub(crate) async fn apply_transaction_commit_outcome(",
+    ] {
+        assert!(
+            session_source.contains(required),
+            "session/mod.rs should own runtime item `{required}`"
+        );
+    }
+}
+
+#[test]
+fn sql_execution_program_requires_caller_owned_write_transaction() {
     let source = read_engine_source("sql/execution/execution_program.rs");
     assert!(
-        source.contains("execute_program_with_new_write_transaction"),
-        "execution_program.rs should delegate backend execution lifecycle to the transaction module"
+        source.contains("execute_execution_program_with_write_transaction"),
+        "execution_program.rs should expose a caller-owned write-transaction entrypoint"
+    );
+    assert!(
+        source.contains("execute_bound_statement_template_instance_in_write_transaction"),
+        "execution_program.rs should delegate bound statement execution to the transaction module"
+    );
+    assert!(
+        !source.contains("execute_program_with_new_write_transaction"),
+        "execution_program.rs should not reconstruct a runtime-owned write lifecycle internally"
     );
     assert!(
         !source.contains("begin_write_unit().await?"),
-        "execution_program.rs should not begin backend transactions directly for the active engine write path"
+        "execution_program.rs should not begin backend transactions directly for the session-owned runtime path"
+    );
+
+    let session_source = read_engine_source("session/mod.rs");
+    assert!(
+        session_source.contains("execute_execution_program_with_write_transaction"),
+        "session/mod.rs should own the runtime execution choreography above sql/execution"
     );
 }
 
@@ -246,14 +309,20 @@ fn schema_registration_and_commit_effects_are_transaction_owned() {
         );
     }
 
-    let engine_source = read_engine_source("engine.rs");
+    let session_source = read_engine_source("session/mod.rs");
     assert!(
-        engine_source.contains("apply_transaction_commit_outcome"),
-        "engine.rs should apply a transaction-owned commit outcome"
+        session_source.contains("apply_transaction_commit_outcome"),
+        "session/mod.rs should apply a transaction-owned commit outcome"
     );
     assert!(
-        !engine_source.contains("finalize_committed_execution_context"),
-        "engine.rs should not finalize commits from ExecutionContext state"
+        !session_source.contains("finalize_committed_execution_context"),
+        "session/mod.rs should not finalize commits from ExecutionContext state"
+    );
+
+    let engine_source = read_engine_source("engine.rs");
+    assert!(
+        !engine_source.contains("apply_transaction_commit_outcome"),
+        "engine.rs should not apply runtime transaction commit outcomes anymore"
     );
 }
 

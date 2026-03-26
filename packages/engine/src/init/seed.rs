@@ -60,9 +60,11 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         Ok(Self {
             engine,
             write_transaction: BorrowedWriteTransaction::new(transaction),
-            context: engine.new_execution_context_with_active_version(
+            context: ExecutionContext::new(
                 ExecuteOptions::default(),
+                engine.public_surface_registry(),
                 GLOBAL_VERSION_ID.to_string(),
+                Vec::new(),
             ),
         })
     }
@@ -871,17 +873,22 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let Some(account) = self.boot_active_account().cloned() else {
             return Ok(());
         };
+        let bootstrap_commit_id = self.load_global_version_commit_id().await?;
+        let account_table = tracked_live_table_name(account_schema_key());
 
         let exists = self
-            .execute_internal(
-                "SELECT 1 \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = $1 \
-                   AND entity_id = $2 \
-                   AND file_id = $3 \
-                   AND version_id = $4 \
-                   AND snapshot_content IS NOT NULL \
-                 LIMIT 1",
+            .execute_backend(
+                &format!(
+                    "SELECT 1 \
+                     FROM {account_table} \
+                     WHERE schema_key = $1 \
+                       AND entity_id = $2 \
+                       AND file_id = $3 \
+                       AND version_id = $4 \
+                       AND is_tombstone = 0 \
+                     LIMIT 1",
+                    account_table = quote_ident(&account_table),
+                ),
                 &[
                     Value::Text(account_schema_key().to_string()),
                     Value::Text(account.id.clone()),
@@ -890,28 +897,17 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 ],
             )
             .await?;
-        let [statement] = exists.statements.as_slice() else {
-            return Err(errors::unexpected_statement_count_error(
-                "seed_boot_account existence query",
-                1,
-                exists.statements.len(),
-            ));
-        };
-        if statement.rows.is_empty() {
-            self.execute_internal(
-                "INSERT INTO lix_state_by_version (\
-                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                &[
-                    Value::Text(account.id.clone()),
-                    Value::Text(account_schema_key().to_string()),
-                    Value::Text(account_file_id().to_string()),
-                    Value::Text(account_storage_version_id().to_string()),
-                    Value::Text(account_plugin_key().to_string()),
-                    Value::Text(account_snapshot_content(&account.id, &account.name)),
-                    Value::Text(account_schema_version().to_string()),
-                ]
-                )
+        if exists.rows.is_empty() {
+            self.insert_bootstrap_tracked_row(
+                Some(&bootstrap_commit_id),
+                &account.id,
+                account_schema_key(),
+                account_schema_version(),
+                account_file_id(),
+                account_storage_version_id(),
+                account_plugin_key(),
+                &account_snapshot_content(&account.id, &account.name),
+            )
             .await?;
         }
 

@@ -18,5 +18,6 @@ pub(crate) fn checkpoint_commit_label_snapshot(commit_id: &str) -> String {
     .to_string()
 }
 
-pub use create_checkpoint::{create_checkpoint, CreateCheckpointResult};
+pub use create_checkpoint::CreateCheckpointResult;
+pub(crate) use create_checkpoint::create_checkpoint_in_session;
 pub(crate) use last_checkpoint::apply_public_version_last_checkpoint_side_effects;

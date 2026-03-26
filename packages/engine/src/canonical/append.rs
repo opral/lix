@@ -23,6 +23,7 @@ pub(crate) struct BufferedTrackedAppendArgs {
     pub(crate) changes: Vec<ProposedDomainChange>,
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) preconditions: CreateCommitPreconditions,
+    pub(crate) active_account_ids: Option<Vec<String>>,
     pub(crate) writer_key: Option<String>,
     pub(crate) should_emit_observe_tick: bool,
 }
@@ -79,6 +80,7 @@ pub(crate) async fn append_tracked_with_pending_public_session(
                 session,
                 &args.changes,
                 &binary_blob_writes,
+                args.active_account_ids.as_deref(),
                 functions,
                 &timestamp,
             )
@@ -100,6 +102,7 @@ pub(crate) async fn append_tracked_with_pending_public_session(
             changes: args.changes,
             filesystem_state: args.filesystem_state,
             preconditions: args.preconditions,
+            active_account_ids: args.active_account_ids,
             lane_parent_commit_ids_override: None,
             allow_empty_commit: false,
             should_emit_observe_tick: args.should_emit_observe_tick,

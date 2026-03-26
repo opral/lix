@@ -33,6 +33,7 @@ export { Value } from "./engine-wasm/index.js";
 export type CreateVersionOptions = {
 	id?: string;
 	name?: string;
+	sourceVersionId?: string;
 	hidden?: boolean;
 };
 
@@ -81,6 +82,11 @@ export type ExecuteOptions = {
 	writerKey?: string | null;
 };
 
+export type OpenSessionOptions = {
+	activeVersionId?: string;
+	activeAccountIds?: string[];
+};
+
 export type ObserveEvent = {
 	sequence: number;
 	rows: LixRuntimeQueryResult;
@@ -114,6 +120,7 @@ export type Lix = {
 	undo(args?: UndoOptions): Promise<UndoResult>;
 	redo(args?: RedoOptions): Promise<RedoResult>;
 	switchVersion(versionId: string): Promise<void>;
+	openSession(options?: OpenSessionOptions): Promise<Lix>;
 	installPlugin(
 		args: InstallPluginOptions | Uint8Array | ArrayBuffer,
 	): Promise<void>;
@@ -171,6 +178,19 @@ export async function openLix(
 		wasmBackend as any,
 		await getDefaultWasmRuntime(),
 	);
+	return createLixHandle({
+		backend,
+		wasmLix,
+		closeBackendOnClose: !args.backend,
+	});
+}
+
+function createLixHandle(args: {
+	backend: LixBackend;
+	wasmLix: unknown;
+	closeBackendOnClose: boolean;
+}): Lix {
+	const { backend, wasmLix, closeBackendOnClose } = args;
 	let closed = false;
 	let closing = false;
 	const openObserveHandles = new Set<{
@@ -305,6 +325,44 @@ export async function openLix(
 			throw new Error("switchVersion is not available in this wasm build");
 		}
 		await runQueued(() => (wasmLix as any).switchVersion(versionId));
+	};
+
+	const openSession = async (
+		options: OpenSessionOptions = {},
+	): Promise<Lix> => {
+		ensureOpen("openSession");
+		if (typeof (wasmLix as any).openSession !== "function") {
+			throw new Error("openSession is not available in this wasm build");
+		}
+		if (
+			options.activeVersionId !== undefined &&
+			(typeof options.activeVersionId !== "string" ||
+				options.activeVersionId.length === 0)
+		) {
+			throw new Error(
+				"openSession requires activeVersionId to be a non-empty string",
+			);
+		}
+		if (
+			options.activeAccountIds !== undefined &&
+			(!Array.isArray(options.activeAccountIds) ||
+				options.activeAccountIds.some(
+					(accountId) =>
+						typeof accountId !== "string" || accountId.length === 0,
+				))
+		) {
+			throw new Error(
+				"openSession requires activeAccountIds to be an array of non-empty strings",
+			);
+		}
+		const sessionWasmLix = await runQueued(() =>
+			(wasmLix as any).openSession(options),
+		);
+		return createLixHandle({
+			backend,
+			wasmLix: sessionWasmLix,
+			closeBackendOnClose: false,
+		});
 	};
 
 	const installPlugin = async (
@@ -467,7 +525,7 @@ export async function openLix(
 			}
 
 			try {
-				if (typeof backend.close === "function") {
+				if (closeBackendOnClose && typeof backend.close === "function") {
 					await backend.close();
 				}
 			} catch (error) {
@@ -495,6 +553,7 @@ export async function openLix(
 		undo,
 		redo,
 		switchVersion,
+		openSession,
 		installPlugin,
 		export_image,
 		close,

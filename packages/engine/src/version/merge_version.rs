@@ -10,14 +10,14 @@ use crate::canonical::readers::{
     ExactCommittedStateRowRequest,
 };
 use crate::canonical::ProposedDomainChange;
-use crate::engine::{Engine, EngineTransaction, TransactionBackendAdapter};
+use crate::engine::TransactionBackendAdapter;
 use crate::functions::LixFunctionProvider;
 use crate::live_state::{
     apply_live_state_scope_in_transaction, live_state_rebuild_plan_with_executor,
     LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
 };
 use crate::state::stream::{StateCommitStreamChange, StateCommitStreamOperation};
-use crate::{ExecuteOptions, LixError, Value};
+use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MergeVersionOptions {
@@ -77,11 +77,11 @@ enum MergeDecision {
     Conflict,
 }
 
-pub async fn merge_version(
-    engine: &Engine,
+pub(crate) async fn merge_version_in_session(
+    session: &Session,
     options: MergeVersionOptions,
 ) -> Result<MergeVersionResult, LixError> {
-    engine
+    session
         .transaction(ExecuteOptions::default(), move |tx| {
             let options = options.clone();
             Box::pin(async move { merge_version_in_transaction(tx, options).await })
@@ -90,7 +90,7 @@ pub async fn merge_version(
 }
 
 async fn merge_version_in_transaction(
-    tx: &mut EngineTransaction<'_>,
+    tx: &mut SessionTransaction<'_>,
     options: MergeVersionOptions,
 ) -> Result<MergeVersionResult, LixError> {
     let source_version_id =
@@ -290,6 +290,7 @@ async fn merge_version_in_transaction(
     }
 
     let engine = tx.engine;
+    let active_account_ids = tx.context.active_account_ids.clone();
     let transaction = tx.backend_transaction_mut()?;
     let backend = TransactionBackendAdapter::new(transaction);
     let (_settings, _sequence_start, functions) = engine
@@ -313,6 +314,7 @@ async fn merge_version_in_transaction(
                     source_version_id, target_version_id, source_head, target_head
                 )),
             },
+            active_account_ids: Some(active_account_ids),
             lane_parent_commit_ids_override: Some(vec![target_head.clone(), source_head.clone()]),
             allow_empty_commit: true,
             should_emit_observe_tick: false,
@@ -341,7 +343,7 @@ async fn merge_version_in_transaction(
 }
 
 async fn load_version_head_commit_id(
-    tx: &mut EngineTransaction<'_>,
+    tx: &mut SessionTransaction<'_>,
     version_id: &str,
 ) -> Result<String, LixError> {
     let result = tx

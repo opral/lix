@@ -19,15 +19,13 @@ use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_storage_version_id,
 };
-use crate::{EngineTransaction, LixBackendTransaction, LixError};
+use crate::{LixBackendTransaction, LixError, SessionTransaction};
 
 pub use types::{RedoOptions, RedoResult, UndoOptions, UndoResult};
 pub(crate) use types::{SemanticUndoRedoStacks, UndoRedoOperationKind, UndoRedoOperationRecord};
 
-#[allow(unused_imports)]
-pub(crate) use redo::{redo, redo_with_options};
-#[allow(unused_imports)]
-pub(crate) use undo::{undo, undo_with_options};
+pub(crate) use redo::redo_with_options_in_session;
+pub(crate) use undo::undo_with_options_in_session;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TargetCommitChangeEffect {
@@ -36,23 +34,30 @@ pub(crate) struct TargetCommitChangeEffect {
     pub(crate) forward_operation: StateCommitStreamOperation,
 }
 
-pub(crate) async fn resolve_target_version_id(
-    tx: &mut EngineTransaction<'_>,
+pub(crate) async fn resolve_target_version_id_in_session(
+    tx: &mut SessionTransaction<'_>,
     requested_version_id: Option<&str>,
 ) -> Result<String, LixError> {
     if let Some(version_id) = requested_version_id {
-        ensure_version_exists(tx, version_id).await?;
+        ensure_version_exists_in_session(tx, version_id).await?;
         return Ok(version_id.to_string());
     }
 
     Ok(tx.context.active_version_id.clone())
 }
 
-async fn ensure_version_exists(
-    tx: &mut EngineTransaction<'_>,
+async fn ensure_version_exists_in_session(
+    tx: &mut SessionTransaction<'_>,
     version_id: &str,
 ) -> Result<(), LixError> {
-    let mut executor = tx.backend_transaction_mut()?;
+    ensure_version_exists_with_transaction(tx.backend_transaction_mut()?, version_id).await
+}
+
+async fn ensure_version_exists_with_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    version_id: &str,
+) -> Result<(), LixError> {
+    let mut executor = crate::engine::TransactionBackendAdapter::new(transaction);
     let row = load_exact_row_with_executor(
         &mut executor,
         RawStorage::Tracked,

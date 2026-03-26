@@ -1,4 +1,3 @@
-pub(crate) mod active_version;
 mod run;
 mod seed;
 pub(crate) mod tables;

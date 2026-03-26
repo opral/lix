@@ -249,7 +249,7 @@ simulation_test!(
         );
         assert_eq!(
             changes.statements[0].rows[0][1],
-            Value::Text(deterministic_uuid(10))
+            Value::Text(deterministic_uuid(9))
         );
         assert_eq!(
             changes.statements[0].rows[0][2],
@@ -281,7 +281,7 @@ simulation_test!(
             Value::Text("1970-01-01T00:00:00.000Z".to_string())
         );
 
-        assert_eq!(read_sequence_value(&engine).await, 9);
+        assert_eq!(read_sequence_value(&engine).await, 8);
     }
 );
 
@@ -382,7 +382,7 @@ simulation_test!(
 
         // The entity-surface path now shares the normal tracked write contract, so the
         // end-to-end sequence shape matches the regular public write path.
-        assert_eq!(read_sequence_value(&engine).await, 11);
+        assert_eq!(read_sequence_value(&engine).await, 10);
     }
 );
 

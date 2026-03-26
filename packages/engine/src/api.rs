@@ -1,22 +1,13 @@
 use crate::backend::program::WriteProgram;
 use crate::backend::program_runner::execute_write_program_with_transaction;
-use crate::engine::{
-    reject_internal_table_writes, reject_public_create_table, Engine, ExecuteOptions,
-};
+use crate::engine::Engine;
 use crate::errors;
 use crate::live_state::{
     mark_mode_with_backend, require_ready, LiveStateApplyReport, LiveStateMode,
     LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
 };
-use crate::sql::execution::execution_program::{
-    execute_execution_program_with_backend, ExecutionProgram,
-};
-use crate::sql::execution::parse::parse_sql;
-use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
 use crate::sql_support::text::escape_sql_string;
-use crate::version::GLOBAL_VERSION_ID;
-use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
-use sqlparser::ast::Statement;
+use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
 impl Engine {
     pub(crate) fn build_observe_tick_insert_sql(&self, writer_key: Option<&str>) -> String {
@@ -38,7 +29,6 @@ impl Engine {
             return Err(errors::not_initialized_error());
         }
         require_ready(self.backend.as_ref()).await?;
-        self.load_and_cache_active_version().await?;
         self.refresh_public_surface_registry().await?;
         Ok(())
     }
@@ -62,105 +52,6 @@ impl Engine {
         Ok(())
     }
 
-    pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
-        self.execute_with_options(sql, params, ExecuteOptions::default())
-            .await
-    }
-
-    pub async fn execute_with_options(
-        &self,
-        sql: &str,
-        params: &[Value],
-        options: ExecuteOptions,
-    ) -> Result<ExecuteResult, LixError> {
-        self.execute_impl_sql(sql, params, options, false).await
-    }
-
-    pub(crate) async fn execute_impl_sql(
-        &self,
-        sql: &str,
-        params: &[Value],
-        options: ExecuteOptions,
-        allow_internal_tables: bool,
-    ) -> Result<ExecuteResult, LixError> {
-        let allow_internal_sql = allow_internal_tables || self.access_to_internal();
-
-        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
-        if !allow_internal_sql {
-            reject_public_create_table(&parsed_statements)?;
-            reject_internal_table_writes(&parsed_statements)?;
-        }
-        let explicit_transaction_script =
-            extract_explicit_transaction_script_from_statements(&parsed_statements, params)?
-                .is_some();
-        if !allow_internal_sql
-            && contains_transaction_control_statement(&parsed_statements)
-            && !explicit_transaction_script
-        {
-            return Err(errors::transaction_control_statement_denied_error());
-        }
-
-        let active_version_id = if allow_internal_tables {
-            self.require_active_version_id()
-                .unwrap_or_else(|_| GLOBAL_VERSION_ID.to_string())
-        } else {
-            self.require_active_version_id()?
-        };
-        let program = ExecutionProgram::compile(parsed_statements, params, self.backend.dialect())?;
-        execute_execution_program_with_backend(
-            self,
-            &program,
-            options,
-            active_version_id,
-            allow_internal_sql,
-        )
-        .await
-    }
-
-    pub async fn create_checkpoint(&self) -> Result<crate::CreateCheckpointResult, LixError> {
-        crate::state::checkpoint::create_checkpoint(self).await
-    }
-
-    pub async fn undo(&self) -> Result<crate::UndoResult, LixError> {
-        crate::undo_redo::undo(self).await
-    }
-
-    pub async fn undo_with_options(
-        &self,
-        options: crate::UndoOptions,
-    ) -> Result<crate::UndoResult, LixError> {
-        crate::undo_redo::undo_with_options(self, options).await
-    }
-
-    pub async fn redo(&self) -> Result<crate::RedoResult, LixError> {
-        crate::undo_redo::redo(self).await
-    }
-
-    pub async fn redo_with_options(
-        &self,
-        options: crate::RedoOptions,
-    ) -> Result<crate::RedoResult, LixError> {
-        crate::undo_redo::redo_with_options(self, options).await
-    }
-
-    pub async fn create_version(
-        &self,
-        options: crate::CreateVersionOptions,
-    ) -> Result<crate::CreateVersionResult, LixError> {
-        crate::version::create_version(self, options).await
-    }
-
-    pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
-        crate::version::switch_version(self, version_id).await
-    }
-
-    pub async fn merge_version(
-        &self,
-        options: crate::MergeVersionOptions,
-    ) -> Result<crate::MergeVersionResult, LixError> {
-        crate::version::merge_version(self, options).await
-    }
-
     /// Exports a portable image as SQLite3 file bytes written via chunk stream.
     pub async fn export_image(
         &self,
@@ -175,7 +66,6 @@ impl Engine {
     ) -> Result<(), LixError> {
         self.backend.restore_from_image(reader).await?;
         require_ready(self.backend.as_ref()).await?;
-        self.load_and_cache_active_version().await?;
         self.refresh_public_surface_registry().await?;
         self.invalidate_installed_plugins_cache()?;
         Ok(())
@@ -216,15 +106,4 @@ impl Engine {
 
         Ok(LiveStateRebuildReport { plan, apply })
     }
-}
-
-fn contains_transaction_control_statement(statements: &[Statement]) -> bool {
-    statements.iter().any(|statement| {
-        matches!(
-            statement,
-            Statement::StartTransaction { .. }
-                | Statement::Commit { .. }
-                | Statement::Rollback { .. }
-        )
-    })
 }

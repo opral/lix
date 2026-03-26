@@ -79,7 +79,7 @@ async fn global_version_commit_id(engine: &support::simulation_test::SimulationE
     )
 }
 
-fn boot_sqlite_engine_at_path(path: &Path) -> lix_engine::Engine {
+fn boot_sqlite_engine_at_path(path: &Path) -> Arc<lix_engine::Engine> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("sqlite test parent directory should be creatable");
     }
@@ -94,7 +94,7 @@ fn boot_sqlite_engine_at_path(path: &Path) -> lix_engine::Engine {
         Arc::new(NoopWasmRuntime),
     );
     args.access_to_internal = true;
-    boot(args)
+    Arc::new(boot(args))
 }
 
 fn temp_sqlite_init_path(label: &str) -> PathBuf {
@@ -220,14 +220,19 @@ fn init_reopen_preserves_working_changes_sqlite() {
                     let engine_a = boot_sqlite_engine_at_path(&path_for_thread);
                     engine_a.initialize().await.expect("first init should succeed");
 
-                    engine_a
+                    let session_a = engine_a
+                        .open_workspace_session()
+                        .await
+                        .expect("workspace session should open after init");
+
+                    session_a
                         .execute(
                             "INSERT INTO lix_file (path, data, metadata) \
                              VALUES ('/wc-reopen.md', lix_text_encode('hello'), NULL)", &[])
                         .await
                         .expect("file insert should succeed");
 
-                    let file_result = engine_a
+                    let file_result = session_a
                         .execute(
                             "SELECT id \
                              FROM lix_file \
@@ -244,7 +249,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
                     assert_eq!(file_result.rows.len(), 1);
                     let file_id = text_value(&file_result.rows[0][0], "file_id");
 
-                    let before = engine_a
+                    let before = session_a
                         .execute(
                             "SELECT COUNT(*) \
                              FROM lix_working_changes \
@@ -277,8 +282,12 @@ fn init_reopen_preserves_working_changes_sqlite() {
                         .open_existing()
                         .await
                         .expect("reopen open should load active version state");
+                    let session_b = engine_b
+                        .open_workspace_session()
+                        .await
+                        .expect("workspace session should open after reopen");
 
-                    let after = engine_b
+                    let after = session_b
                         .execute(
                             "SELECT COUNT(*) \
                              FROM lix_working_changes \
@@ -295,7 +304,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
                     };
                     let after_count = i64_value(&after.rows[0][0], "working_changes_after");
 
-                    let tip_result = engine_b
+                    let tip_result = session_b
                         .execute(
                             "SELECT v.commit_id \
                              FROM lix_active_version av \
@@ -313,7 +322,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
                     assert_eq!(tip_result.rows.len(), 1);
                     let head_commit_id = text_value(&tip_result.rows[0][0], "commit_id");
 
-                    let after_rows = engine_b
+                    let after_rows = session_b
                         .execute(
                             "SELECT status, before_change_id, after_change_id \
                              FROM lix_working_changes \
@@ -392,7 +401,12 @@ fn reopen_after_bare_multi_statement_write_succeeds_sqlite() {
                     // Two INSERT statements separated by ; WITHOUT BEGIN/COMMIT.
                     // This is exactly what the CLI does when a user runs:
                     //   lix sql execute "INSERT ...; INSERT ...;"
-                    engine_a
+                    let session_a = engine_a
+                        .open_workspace_session()
+                        .await
+                        .expect("workspace session should open after init");
+
+                    session_a
                         .execute(
                             "INSERT INTO lix_key_value (key, value) VALUES ('a', '\"1\"'); \
                              INSERT INTO lix_key_value (key, value) VALUES ('b', '\"2\"');",
@@ -409,9 +423,13 @@ fn reopen_after_bare_multi_statement_write_succeeds_sqlite() {
                         "reopen after bare multi-statement write must not fail \
                              with LIX_ERROR_LIVE_STATE_NOT_READY",
                     );
+                    let session_b = engine_b
+                        .open_workspace_session()
+                        .await
+                        .expect("workspace session should open after reopen");
 
                     // Verify both rows are actually readable.
-                    let result = engine_b
+                    let result = session_b
                         .execute(
                             "SELECT key, value FROM lix_key_value \
                              WHERE key IN ('a', 'b') ORDER BY key",

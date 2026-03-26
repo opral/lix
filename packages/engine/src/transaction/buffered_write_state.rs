@@ -131,9 +131,13 @@ fn apply_buffered_write_execution_outcome(
     if let Some(version_id) = &active_effects.next_active_version_id {
         context.active_version_id = version_id.clone();
     }
+    if let Some(active_account_ids) = &active_effects.next_active_account_ids {
+        context.active_account_ids = active_account_ids.clone();
+    }
     let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
     state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());
     state.commit_outcome.merge(TransactionCommitOutcome {
+        next_active_account_ids: active_effects.next_active_account_ids.clone(),
         invalidate_deterministic_settings_cache: engine
             .should_invalidate_deterministic_settings_cache(&[], &state_commit_stream_changes),
         invalidate_installed_plugins_cache: execution.plugin_changes_committed,

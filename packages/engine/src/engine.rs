@@ -2,26 +2,17 @@ use crate::cel::CelEvaluator;
 use crate::deterministic_mode::{deterministic_mode_key, DeterministicSettings};
 use crate::key_value::key_value_schema_key;
 use crate::plugin::types::InstalledPlugin;
-use crate::schema::schema_from_registered_snapshot;
-use crate::sql::execution::execution_program::ExecutionContext;
-use crate::sql::execution::parse::parse_sql;
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::sql::public::validation::SchemaCache;
 use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
-use crate::transaction::{
-    execute_parsed_statements_in_write_transaction, TransactionCommitOutcome, WriteTransaction,
-};
 use crate::WasmRuntime;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
-use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::marker::PhantomData;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -38,8 +29,6 @@ const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 pub(crate) const INIT_STATE_NOT_STARTED: u8 = 0;
 pub(crate) const INIT_STATE_IN_PROGRESS: u8 = 1;
 pub(crate) const INIT_STATE_COMPLETED: u8 = 2;
-const REGISTER_SCHEMA_HELPER_SQL: &str =
-    "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))";
 
 #[derive(Debug, Clone, Default)]
 pub struct ExecuteOptions {
@@ -61,84 +50,28 @@ pub struct Engine {
     /// the init path. `begin_write_unit()` uses savepoints instead of BEGIN.
     in_init_transaction: AtomicBool,
     savepoint_counter: AtomicU64,
-    active_version_id: RwLock<Option<String>>,
+    // Shared repo/process-scoped caches and buses. Session-local snapshots and
+    // observe handles live under `session/*`.
     public_surface_registry: RwLock<SurfaceRegistry>,
     access_to_internal: bool,
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
     plugin_component_cache: Mutex<BTreeMap<String, crate::plugin::runtime::CachedPluginComponent>>,
     state_commit_stream_bus: Arc<StateCommitStreamBus>,
-    pub(crate) observe_shared_sources:
-        Mutex<BTreeMap<String, Arc<Mutex<crate::observe::SharedObserveSource>>>>,
-}
-
-#[must_use = "EngineTransaction must be committed or rolled back"]
-pub struct EngineTransaction<'a> {
-    pub(crate) engine: &'a Engine,
-    pub(crate) write_transaction: Option<WriteTransaction<'a>>,
-    pub(crate) context: ExecutionContext,
 }
 
 impl Engine {
-    pub async fn register_schema(&self, schema: &JsonValue) -> Result<(), LixError> {
-        let mut transaction = self
-            .begin_transaction_with_options(ExecuteOptions::default())
-            .await?;
-        transaction.register_schema(schema).await?;
-        transaction.commit().await
+    pub async fn open_workspace_session(
+        self: &Arc<Self>,
+    ) -> Result<crate::Session, LixError> {
+        crate::Session::open_workspace(Arc::clone(self)).await
     }
 
-    pub async fn begin_transaction_with_options(
-        &self,
-        options: ExecuteOptions,
-    ) -> Result<EngineTransaction<'_>, LixError> {
-        let transaction = self.begin_write_unit().await?;
-        Ok(EngineTransaction {
-            engine: self,
-            write_transaction: Some(WriteTransaction::new_buffered_write(transaction)),
-            context: self.new_execution_context(options)?,
-        })
-    }
-
-    pub async fn transaction<T, F>(&self, options: ExecuteOptions, f: F) -> Result<T, LixError>
-    where
-        F: for<'tx> FnOnce(
-            &'tx mut EngineTransaction<'_>,
-        ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
-    {
-        let mut transaction = self.begin_transaction_with_options(options).await?;
-        match std::panic::AssertUnwindSafe(f(&mut transaction))
-            .catch_unwind()
-            .await
-        {
-            Ok(Ok(value)) => {
-                transaction.commit().await?;
-                Ok(value)
-            }
-            Ok(Err(error)) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-            Err(payload) => {
-                let _ = transaction.rollback().await;
-                std::panic::resume_unwind(payload);
-            }
-        }
-    }
-
-    pub(crate) fn new_execution_context(
-        &self,
-        options: ExecuteOptions,
-    ) -> Result<ExecutionContext, LixError> {
-        let active_version_id = self.require_active_version_id()?;
-        Ok(self.new_execution_context_with_active_version(options, active_version_id))
-    }
-
-    pub(crate) fn new_execution_context_with_active_version(
-        &self,
-        options: ExecuteOptions,
-        active_version_id: String,
-    ) -> ExecutionContext {
-        ExecutionContext::new(options, self.public_surface_registry(), active_version_id)
+    pub async fn open_session(
+        self: &Arc<Self>,
+        options: crate::OpenSessionOptions,
+    ) -> Result<crate::Session, LixError> {
+        let workspace = self.open_workspace_session().await?;
+        workspace.open_session(options).await
     }
 
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
@@ -185,29 +118,6 @@ impl Engine {
 
     pub(crate) fn boot_active_account(&self) -> Option<&BootAccount> {
         self.boot_active_account.as_ref()
-    }
-
-    pub(crate) fn require_active_version_id(&self) -> Result<String, LixError> {
-        let guard = self.active_version_id.read().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "active version cache lock poisoned".to_string(),
-        })?;
-        guard
-            .clone()
-            .ok_or_else(crate::errors::not_initialized_error)
-    }
-
-    pub(crate) fn clear_active_version_id(&self) {
-        let mut guard = self.active_version_id.write().unwrap();
-        *guard = None;
-    }
-
-    pub(crate) fn set_active_version_id(&self, version_id: String) {
-        let mut guard = self.active_version_id.write().unwrap();
-        if guard.as_ref() == Some(&version_id) {
-            return;
-        }
-        *guard = Some(version_id);
     }
 
     pub(crate) fn public_surface_registry(&self) -> SurfaceRegistry {
@@ -261,28 +171,6 @@ impl Engine {
             .store(INIT_STATE_NOT_STARTED, Ordering::SeqCst);
     }
 
-    pub(crate) async fn apply_transaction_commit_outcome(
-        &self,
-        mut outcome: TransactionCommitOutcome,
-    ) -> Result<(), LixError> {
-        if let Some(version_id) = outcome.next_active_version_id.take() {
-            self.set_active_version_id(version_id);
-        }
-        if outcome.invalidate_deterministic_settings_cache {
-            self.invalidate_deterministic_settings_cache();
-        }
-        if outcome.invalidate_installed_plugins_cache {
-            self.invalidate_installed_plugins_cache()?;
-        }
-        if outcome.refresh_public_surface_registry {
-            self.refresh_public_surface_registry().await?;
-        }
-        self.emit_state_commit_stream_changes(std::mem::take(
-            &mut outcome.state_commit_stream_changes,
-        ));
-        Ok(())
-    }
-
     /// Begin an isolated unit of work on the backend.
     ///
     /// During normal operation, this starts a real transaction (`BEGIN IMMEDIATE`).
@@ -328,141 +216,6 @@ impl Engine {
         })?;
         component_guard.clear();
         Ok(())
-    }
-}
-
-impl<'a> EngineTransaction<'a> {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn mark_installed_plugins_cache_invalidation_pending(
-        &mut self,
-    ) -> Result<(), LixError> {
-        self.write_transaction
-            .as_mut()
-            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?
-            .mark_installed_plugins_cache_invalidation_pending();
-        Ok(())
-    }
-
-    pub(crate) fn record_state_commit_stream_changes(
-        &mut self,
-        changes: Vec<StateCommitStreamChange>,
-    ) -> Result<(), LixError> {
-        self.write_transaction
-            .as_mut()
-            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?
-            .record_state_commit_stream_changes(changes);
-        Ok(())
-    }
-
-    pub async fn register_schema(&mut self, schema: &JsonValue) -> Result<(), LixError> {
-        let snapshot = serde_json::json!({ "value": schema });
-        let (schema_key, _) = schema_from_registered_snapshot(&snapshot)?;
-        self.write_transaction
-            .as_mut()
-            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?
-            .register_schema(
-                crate::live_state::SchemaRegistration::with_registered_snapshot(
-                    schema_key.schema_key.clone(),
-                    snapshot,
-                ),
-            )?;
-        let schema_json = serde_json::to_string(schema).map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("failed to serialize schema definition: {error}"),
-        })?;
-        self.execute(REGISTER_SCHEMA_HELPER_SQL, &[Value::Text(schema_json)])
-            .await?;
-        Ok(())
-    }
-
-    pub async fn execute(
-        &mut self,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<crate::ExecuteResult, LixError> {
-        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
-        if !self.engine.access_to_internal() {
-            reject_public_create_table(&parsed_statements)?;
-            reject_internal_table_writes(&parsed_statements)?;
-        }
-        self.execute_parsed_with_access(parsed_statements, params, self.engine.access_to_internal())
-            .await
-    }
-
-    pub(crate) async fn execute_internal(
-        &mut self,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<crate::ExecuteResult, LixError> {
-        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
-        self.execute_parsed_with_access(parsed_statements, params, true)
-            .await
-    }
-
-    async fn execute_parsed_with_access(
-        &mut self,
-        parsed_statements: Vec<Statement>,
-        params: &[Value],
-        allow_internal_tables: bool,
-    ) -> Result<crate::ExecuteResult, LixError> {
-        let write_transaction = self.write_transaction.as_mut().ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction is no longer active".to_string(),
-        })?;
-        execute_parsed_statements_in_write_transaction(
-            self.engine,
-            write_transaction,
-            parsed_statements,
-            params,
-            allow_internal_tables,
-            &mut self.context,
-        )
-        .await
-    }
-
-    pub async fn commit(mut self) -> Result<(), LixError> {
-        let write_transaction = self.write_transaction.take().ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction is no longer active".to_string(),
-        })?;
-        let context = std::mem::replace(
-            &mut self.context,
-            self.engine
-                .new_execution_context(ExecuteOptions::default())?,
-        );
-        let outcome = write_transaction
-            .commit_buffered_write(self.engine, context)
-            .await?;
-        self.engine.apply_transaction_commit_outcome(outcome).await
-    }
-
-    pub async fn rollback(mut self) -> Result<(), LixError> {
-        let write_transaction = self.write_transaction.take().ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction is no longer active".to_string(),
-        })?;
-        write_transaction.rollback_buffered_write().await
-    }
-
-    pub(crate) fn backend_transaction_mut(
-        &mut self,
-    ) -> Result<&mut dyn crate::LixBackendTransaction, LixError> {
-        self.write_transaction_mut()?.backend_transaction_mut()
-    }
-
-    pub(crate) fn write_transaction_mut(&mut self) -> Result<&mut WriteTransaction<'a>, LixError> {
-        Ok(self
-            .write_transaction
-            .as_mut()
-            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?)
-    }
-}
-
-impl Drop for EngineTransaction<'_> {
-    fn drop(&mut self) {
-        if self.write_transaction.is_some() && !std::thread::panicking() {
-            panic!("EngineTransaction dropped without commit() or rollback()");
-        }
     }
 }
 
@@ -676,13 +429,11 @@ impl Engine {
             init_state: AtomicU8::new(INIT_STATE_NOT_STARTED),
             in_init_transaction: AtomicBool::new(false),
             savepoint_counter: AtomicU64::new(0),
-            active_version_id: RwLock::new(None),
             public_surface_registry: RwLock::new(SurfaceRegistry::with_builtin_surfaces()),
             access_to_internal: args.access_to_internal,
             installed_plugins_cache: RwLock::new(None),
             plugin_component_cache: Mutex::new(BTreeMap::new()),
             state_commit_stream_bus: Arc::new(StateCommitStreamBus::default()),
-            observe_shared_sources: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -787,7 +538,7 @@ mod tests {
         PlaceholderState,
     };
     use crate::version::active_version_schema_key;
-    use crate::{LixError, NoopWasmRuntime, QueryResult, Value};
+    use crate::{LixError, NoopWasmRuntime, QueryResult, Session, Value};
     use async_trait::async_trait;
     use serde_json::json;
     use sqlparser::ast::{Expr, Statement};
@@ -962,16 +713,20 @@ mod tests {
                 runtime.block_on(async {
                     let commit_called = Arc::new(AtomicBool::new(false));
                     let rollback_called = Arc::new(AtomicBool::new(false));
-                    let engine = boot(BootArgs::new(
+                    let engine = Arc::new(boot(BootArgs::new(
                         Box::new(TestBackend {
                             commit_called,
                             rollback_called,
                         }),
                         Arc::new(NoopWasmRuntime),
-                    ));
-                    engine.set_active_version_id("version-test".to_string());
+                    )));
+                    let session = Session::new_for_test(
+                        Arc::clone(&engine),
+                        "version-test".to_string(),
+                        Vec::new(),
+                    );
 
-                    let error = engine
+                    let error = session
                         .execute("SELECT * FROM unknown_table", &[])
                         .await
                         .expect_err("unknown relation query should fail");
@@ -1004,13 +759,18 @@ mod tests {
     async fn transaction_plugin_cache_invalidation_happens_after_commit() {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
-        let engine = boot(BootArgs::new(
+        let engine = Arc::new(boot(BootArgs::new(
             Box::new(TestBackend {
                 commit_called: Arc::clone(&commit_called),
                 rollback_called: Arc::clone(&rollback_called),
             }),
             Arc::new(NoopWasmRuntime),
-        ));
+        )));
+        let session = Session::new_for_test(
+            Arc::clone(&engine),
+            "version-test".to_string(),
+            Vec::new(),
+        );
 
         {
             let mut cache = engine
@@ -1019,9 +779,8 @@ mod tests {
                 .expect("installed plugins cache lock");
             *cache = Some(Vec::new());
         }
-        engine.set_active_version_id("version-test".to_string());
 
-        let mut tx = engine
+        let mut tx = session
             .begin_transaction_with_options(ExecuteOptions::default())
             .await
             .expect("begin transaction");
@@ -1054,13 +813,18 @@ mod tests {
     async fn transaction_plugin_cache_invalidation_skips_rollback() {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
-        let engine = boot(BootArgs::new(
+        let engine = Arc::new(boot(BootArgs::new(
             Box::new(TestBackend {
                 commit_called: Arc::clone(&commit_called),
                 rollback_called: Arc::clone(&rollback_called),
             }),
             Arc::new(NoopWasmRuntime),
-        ));
+        )));
+        let session = Session::new_for_test(
+            Arc::clone(&engine),
+            "version-test".to_string(),
+            Vec::new(),
+        );
 
         {
             let mut cache = engine
@@ -1069,9 +833,8 @@ mod tests {
                 .expect("installed plugins cache lock");
             *cache = Some(Vec::new());
         }
-        engine.set_active_version_id("version-test".to_string());
 
-        let mut tx = engine
+        let mut tx = session
             .begin_transaction_with_options(ExecuteOptions::default())
             .await
             .expect("begin transaction");

@@ -8,14 +8,14 @@ use async_trait::async_trait;
 use lix_engine::{
     boot, collapse_prepared_batch_for_dialect, BootArgs, CreateVersionOptions, Engine,
     ImageChunkReader, ImageChunkWriter, LixBackend, LixBackendTransaction, LixError,
-    NoopWasmRuntime, PreparedBatch, QueryResult, SqlDialect, Value, WasmRuntime,
+    NoopWasmRuntime, PreparedBatch, QueryResult, Session, SqlDialect, Value, WasmRuntime,
 };
 use rusqlite::{
     backup::{Backup, StepResult},
     params_from_iter, Connection, Row,
 };
 
-fn boot_sqlite_engine_at_path(path: &Path, wasm_runtime: Arc<dyn WasmRuntime>) -> Engine {
+fn boot_sqlite_engine_at_path(path: &Path, wasm_runtime: Arc<dyn WasmRuntime>) -> Arc<Engine> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("sqlite test parent directory should be creatable");
     }
@@ -32,7 +32,7 @@ fn boot_sqlite_engine_at_path(path: &Path, wasm_runtime: Arc<dyn WasmRuntime>) -
         wasm_runtime,
     );
     args.access_to_internal = true;
-    boot(args)
+    Arc::new(boot(args))
 }
 
 fn temp_sqlite_path(label: &str) -> PathBuf {
@@ -418,8 +418,8 @@ fn text_value(value: &Value, field: &str) -> String {
     }
 }
 
-async fn key_value_version_id(engine: &Engine, key: &str) -> String {
-    let result = engine
+async fn key_value_version_id(session: &Session, key: &str) -> String {
+    let result = session
         .execute(
             "SELECT lixcol_version_id \
              FROM lix_key_value_by_version \
@@ -445,7 +445,11 @@ async fn run_restore_from_image_refreshes_active_version_cache_sqlite() {
         .initialize()
         .await
         .expect("source init should succeed");
-    let source_version = source_engine
+    let source_session = source_engine
+        .open_workspace_session()
+        .await
+        .expect("source workspace session should open");
+    let source_version = source_session
         .create_version(CreateVersionOptions {
             id: Some("after".to_string()),
             name: Some("after".to_string()),
@@ -454,7 +458,7 @@ async fn run_restore_from_image_refreshes_active_version_cache_sqlite() {
         })
         .await
         .expect("source create_version should succeed");
-    source_engine
+    source_session
         .switch_version(source_version.id.clone())
         .await
         .expect("source switch_version should succeed");
@@ -466,7 +470,11 @@ async fn run_restore_from_image_refreshes_active_version_cache_sqlite() {
         .initialize()
         .await
         .expect("destination init should succeed");
-    let destination_version = destination_engine
+    let destination_session = destination_engine
+        .open_workspace_session()
+        .await
+        .expect("destination workspace session should open");
+    let destination_version = destination_session
         .create_version(CreateVersionOptions {
             id: Some("before".to_string()),
             name: Some("before".to_string()),
@@ -475,7 +483,7 @@ async fn run_restore_from_image_refreshes_active_version_cache_sqlite() {
         })
         .await
         .expect("destination create_version should succeed");
-    destination_engine
+    destination_session
         .switch_version(destination_version.id.clone())
         .await
         .expect("destination switch_version should succeed");
@@ -485,8 +493,12 @@ async fn run_restore_from_image_refreshes_active_version_cache_sqlite() {
         .restore_from_image(&mut reader)
         .await
         .expect("restore_from_image should succeed");
+    let restored_session = destination_engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should reopen after restore");
 
-    destination_engine
+    restored_session
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('restore-cache-check', '1')",
             &[],
@@ -494,7 +506,7 @@ async fn run_restore_from_image_refreshes_active_version_cache_sqlite() {
         .await
         .expect("tracked write after restore should succeed");
     assert_eq!(
-        key_value_version_id(&destination_engine, "restore-cache-check").await,
+        key_value_version_id(&restored_session, "restore-cache-check").await,
         "after",
         "restore should refresh the active-version cache before subsequent tracked writes"
     );

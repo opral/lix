@@ -38,6 +38,7 @@ pub(super) async fn compile_sql_buffered_write_command(
         pending_transaction_view,
         bound_statement_template,
         context.active_version_id.as_str(),
+        &context.active_account_ids,
         writer_key.as_deref(),
         allow_internal_tables,
         Some(&context.public_surface_registry),

@@ -1,4 +1,4 @@
-use crate::{errors, Engine, EngineTransaction, ExecuteOptions, LixError, Value};
+use crate::{errors, ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct CreateVersionOptions {
@@ -17,11 +17,11 @@ pub struct CreateVersionResult {
     pub parent_commit_id: String,
 }
 
-pub async fn create_version(
-    engine: &Engine,
+pub(crate) async fn create_version_in_session(
+    session: &Session,
     options: CreateVersionOptions,
 ) -> Result<CreateVersionResult, LixError> {
-    engine
+    session
         .transaction(ExecuteOptions::default(), |tx| {
             Box::pin(async move { create_version_in_transaction(tx, options).await })
         })
@@ -29,7 +29,7 @@ pub async fn create_version(
 }
 
 async fn create_version_in_transaction(
-    tx: &mut EngineTransaction<'_>,
+    tx: &mut SessionTransaction<'_>,
     options: CreateVersionOptions,
 ) -> Result<CreateVersionResult, LixError> {
     let SourceVersion {
@@ -76,7 +76,7 @@ struct SourceVersion {
 }
 
 async fn load_create_version_source(
-    tx: &mut EngineTransaction<'_>,
+    tx: &mut SessionTransaction<'_>,
     source_version_id: Option<&str>,
 ) -> Result<SourceVersion, LixError> {
     match source_version_id {
@@ -86,39 +86,36 @@ async fn load_create_version_source(
 }
 
 async fn load_active_source_version(
-    tx: &mut EngineTransaction<'_>,
+    tx: &mut SessionTransaction<'_>,
 ) -> Result<SourceVersion, LixError> {
-    let active_version = tx
+    let version_id = tx.context.active_version_id.clone();
+    let source = tx
         .execute(
-            "SELECT av.version_id, v.commit_id \
-             FROM lix_active_version av \
-             JOIN lix_version v ON v.id = av.version_id \
-             ORDER BY av.id \
-             LIMIT 1",
-            &[],
+            "SELECT id, commit_id FROM lix_version WHERE id = $1 LIMIT 1",
+            &[Value::Text(version_id.clone())],
         )
         .await?;
-    let [statement] = active_version.statements.as_slice() else {
+    let [statement] = source.statements.as_slice() else {
         return Err(errors::unexpected_statement_count_error(
-            "active version query",
+            "create version source query",
             1,
-            active_version.statements.len(),
+            source.statements.len(),
         ));
     };
-    let [row] = statement.rows.as_slice() else {
+    let Some(row) = statement.rows.first() else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "missing active version row".to_string(),
+            description: format!("source version '{version_id}' does not exist"),
         });
     };
     Ok(SourceVersion {
-        version_id: text_at(row, 0, "active_version.version_id")?,
+        version_id: text_at(row, 0, "lix_version.id")?,
         commit_id: text_at(row, 1, "lix_version.commit_id")?,
     })
 }
 
 async fn load_explicit_source_version(
-    tx: &mut EngineTransaction<'_>,
+    tx: &mut SessionTransaction<'_>,
     source_version_id: &str,
 ) -> Result<SourceVersion, LixError> {
     let source_version_id = normalize_optional_non_empty_text(
@@ -151,7 +148,7 @@ async fn load_explicit_source_version(
     })
 }
 
-async fn generate_uuid(tx: &mut EngineTransaction<'_>) -> Result<String, LixError> {
+async fn generate_uuid(tx: &mut SessionTransaction<'_>) -> Result<String, LixError> {
     let generated = tx.execute("SELECT lix_uuid_v7()", &[]).await?;
     let [statement] = generated.statements.as_slice() else {
         return Err(errors::unexpected_statement_count_error(
@@ -212,6 +209,15 @@ mod tests {
             serde_json::from_str(r#"{"id":"test-version"}"#).expect("deserialization should work");
         assert_eq!(options.id.as_deref(), Some("test-version"));
         assert_eq!(options.source_version_id, None);
+        assert!(!options.hidden);
+    }
+
+    #[test]
+    fn create_version_options_deserialize_source_version_id() {
+        let options: CreateVersionOptions =
+            serde_json::from_str(r#"{"source_version_id":"base-version"}"#)
+                .expect("deserialization should work");
+        assert_eq!(options.source_version_id.as_deref(), Some("base-version"));
         assert!(!options.hidden);
     }
 }

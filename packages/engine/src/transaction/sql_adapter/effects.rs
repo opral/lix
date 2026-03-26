@@ -187,6 +187,9 @@ pub(super) async fn complete_sql_command_execution(
     if let Some(version_id) = &active_effects.next_active_version_id {
         context.active_version_id = version_id.clone();
     }
+    if let Some(active_account_ids) = &active_effects.next_active_account_ids {
+        context.active_account_ids = active_account_ids.clone();
+    }
 
     let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
     state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());

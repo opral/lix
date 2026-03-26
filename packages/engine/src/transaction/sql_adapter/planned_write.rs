@@ -966,6 +966,9 @@ fn merge_plan_effects(current: &mut PlanEffects, next: &PlanEffects) {
     if next.next_active_version_id.is_some() {
         current.next_active_version_id = next.next_active_version_id.clone();
     }
+    if next.next_active_account_ids.is_some() {
+        current.next_active_account_ids = next.next_active_account_ids.clone();
+    }
     current
         .file_cache_refresh_targets
         .extend(next.file_cache_refresh_targets.clone());

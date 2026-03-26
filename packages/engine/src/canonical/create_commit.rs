@@ -83,6 +83,7 @@ pub(crate) struct CreateCommitArgs {
     pub(crate) changes: Vec<ProposedDomainChange>,
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) preconditions: CreateCommitPreconditions,
+    pub(crate) active_account_ids: Option<Vec<String>>,
     pub(crate) lane_parent_commit_ids_override: Option<Vec<String>>,
     pub(crate) allow_empty_commit: bool,
     pub(crate) should_emit_observe_tick: bool,
@@ -205,6 +206,7 @@ pub(crate) async fn create_commit(
             &args.preconditions,
             &args.filesystem_state,
             needs_deterministic_sequence,
+            args.active_account_ids.as_deref(),
             needs_active_accounts,
         )
         .await?
@@ -901,6 +903,7 @@ async fn load_create_commit_preflight_state_with_active_accounts(
     preconditions: &CreateCommitPreconditions,
     filesystem_state: &FilesystemTransactionState,
     include_deterministic_sequence: bool,
+    provided_active_accounts: Option<&[String]>,
     include_active_accounts: bool,
 ) -> Result<CreateCommitPreflightState, CreateCommitError> {
     let lane_entity_id = match concrete_lane {
@@ -926,7 +929,9 @@ async fn load_create_commit_preflight_state_with_active_accounts(
     } else {
         None
     };
-    let active_accounts = if include_active_accounts {
+    let active_accounts = if let Some(active_accounts) = provided_active_accounts {
+        active_accounts.to_vec()
+    } else if include_active_accounts {
         load_create_commit_active_accounts(executor).await?
     } else {
         Vec::new()
@@ -1882,6 +1887,7 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                active_account_ids: None,
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -1908,8 +1914,15 @@ mod tests {
             "generated commit work should execute as one SQL batch"
         );
         assert!(
-            generated_commit_batches[0].contains("; INSERT INTO lix_internal_live_v1_"),
-            "generated commit batch should include live-state writes in the same execute call"
+            !generated_commit_batches[0].contains("lix_internal_live_v1_"),
+            "canonical commit batch should not inline live-state writes after apply isolation"
+        );
+        assert!(
+            transaction
+                .executed_sql
+                .iter()
+                .any(|sql| sql.contains("lix_internal_live_v1_")),
+            "create_commit should still apply derived live-state rows as a separate step"
         );
         assert!(
             transaction
@@ -1956,6 +1969,7 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                active_account_ids: None,
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2004,6 +2018,7 @@ mod tests {
                         "fp-1".to_string(),
                     ),
                 },
+                active_account_ids: None,
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2041,6 +2056,7 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                active_account_ids: None,
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2073,6 +2089,7 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                active_account_ids: None,
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2104,6 +2121,7 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CreateIfMissing,
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-create".to_string()),
                 },
+                active_account_ids: None,
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2141,6 +2159,7 @@ mod tests {
                     ),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-global".to_string()),
                 },
+                active_account_ids: None,
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2192,6 +2211,7 @@ mod tests {
                         "idem-file-data".to_string(),
                     ),
                 },
+                active_account_ids: None,
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2233,6 +2253,7 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                active_account_ids: None,
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2279,6 +2300,7 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
+                active_account_ids: None,
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
