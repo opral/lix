@@ -22,11 +22,10 @@ simulation_test!(
 
         let result = engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+                "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"same_request_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
              );\
-             INSERT INTO lix_internal_state_vtable (\
+             INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'same_request_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Ada\"}', '1'\
@@ -37,7 +36,7 @@ simulation_test!(
 
         let stored = engine
             .execute(
-                "SELECT snapshot_content FROM lix_internal_state_vtable \
+                "SELECT snapshot_content FROM lix_state_by_version \
              WHERE schema_key = 'same_request_schema' AND entity_id = 'entity-1'",
                 &[],
             )
@@ -61,12 +60,10 @@ simulation_test!(
 
         let result = engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+                "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"same_request_parent\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
              );\
-             INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+             INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"same_request_child\",\"x-lix-version\":\"1\",\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"same_request_parent\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"parent_id\":{\"type\":\"string\"}},\"required\":[\"parent_id\"],\"additionalProperties\":false}}'\
              )", &[])
             .await;
@@ -75,7 +72,7 @@ simulation_test!(
 
         let count = engine
             .execute(
-                "SELECT COUNT(*) FROM lix_internal_state_vtable \
+                "SELECT COUNT(*) FROM lix_state_by_version \
              WHERE schema_key = 'lix_registered_schema' \
                AND entity_id IN ('same_request_parent~1', 'same_request_child~1')",
                 &[],
@@ -99,11 +96,10 @@ simulation_test!(
 
         let result = engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+            "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"same_request_default_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"slug\":{\"type\":\"string\",\"x-lix-default\":\"name + ''-slug''\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
              );\
-             INSERT INTO lix_internal_state_vtable (\
+             INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'same_request_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1'\
@@ -114,7 +110,7 @@ simulation_test!(
 
         let row = engine
             .execute(
-                "SELECT snapshot_content FROM lix_internal_state_vtable \
+                "SELECT snapshot_content FROM lix_state_by_version \
              WHERE schema_key = 'same_request_default_schema' AND entity_id = 'entity-1'",
                 &[],
             )

@@ -263,7 +263,11 @@ pub(crate) fn snapshot_json_from_values(
         };
         let json_value =
             json_value_from_live_row_cell(value, column.kind, schema_key, &column.column_name)?;
-        if !json_value.is_null() {
+        if json_value.is_null() {
+            if column.preserve_null_in_logical_snapshot() {
+                object.insert(column.property_name.clone(), JsonValue::Null);
+            }
+        } else {
             object.insert(column.property_name.clone(), json_value);
         }
     }
@@ -288,6 +292,8 @@ mod tests {
                 property_name: "name".to_string(),
                 column_name: "name".to_string(),
                 kind: LiveColumnKind::String,
+                required: true,
+                nullable: false,
             }],
         })
     }

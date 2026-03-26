@@ -8,17 +8,16 @@ simulation_test!(
     registered_schema_registers_materialized_table,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_engine_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_engine_deterministic should succeed");
 
         engine.initialize().await.unwrap();
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
-             '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
+                "INSERT INTO lix_registered_schema (value) VALUES (\
+             lix_json('{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}')\
              )", &[])
             .await
             .unwrap();
@@ -26,9 +25,12 @@ simulation_test!(
         let stored = engine
         .execute(
             "SELECT entity_id, schema_key, schema_version, version_id, file_id, change_id, snapshot_content, untracked \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'lix_registered_schema' \
-               AND entity_id = 'test_schema~1'", &[])
+               AND entity_id = 'test_schema~1' \
+               AND version_id = 'global'",
+            &[],
+        )
         .await
         .unwrap();
 
@@ -40,7 +42,7 @@ simulation_test!(
         assert_eq!(row[2], Value::Text("1".to_string()));
         assert_eq!(row[3], Value::Text("global".to_string()));
         assert_eq!(row[4], Value::Text("lix".to_string()));
-        assert_eq!(row[5], Value::Text("schema".to_string()));
+        assert!(matches!(&row[5], Value::Text(change_id) if !change_id.is_empty()));
         assert_boolean_like(&row[7], false);
         let expected_snapshot = serde_json::to_string(
             &serde_json::from_str::<serde_json::Value>(
@@ -53,7 +55,7 @@ simulation_test!(
 
         let table_exists = engine
             .execute(
-                "SELECT COUNT(*) FROM lix_internal_state_vtable \
+                "SELECT COUNT(*) FROM lix_state_by_version \
                  WHERE schema_key = 'test_schema'",
                 &[],
             )
@@ -76,10 +78,9 @@ simulation_test!(
 
         engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ($1, $2)", &[
-                Value::Text("lix_registered_schema".to_string()),
+            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))", &[
                 Value::Text(
-                    "{\"value\":{\"x-lix-key\":\"param_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}"
+                    "{\"x-lix-key\":\"param_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}"
                         .to_string(),
                 ),
             ])
@@ -89,9 +90,10 @@ simulation_test!(
         let stored = engine
             .execute(
                 "SELECT entity_id, schema_key, schema_version \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'lix_registered_schema' \
-               AND entity_id = 'param_schema~1'",
+               AND entity_id = 'param_schema~1' \
+               AND version_id = 'global'",
                 &[],
             )
             .await
@@ -327,18 +329,16 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
-             '{\"value\":{\"x-lix-key\":\"parent_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-unique\":[[\"/slug\"]],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"slug\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"slug\",\"name\"],\"additionalProperties\":false}}'\
+                "INSERT INTO lix_registered_schema (value) VALUES (\
+             lix_json('{\"x-lix-key\":\"parent_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-unique\":[[\"/slug\"]],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"slug\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"slug\",\"name\"],\"additionalProperties\":false}')\
              )", &[])
             .await
             .unwrap();
 
         let valid = engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
-             '{\"value\":{\"x-lix-key\":\"child_schema\",\"x-lix-version\":\"1\",\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"parent_schema\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"parent_id\":{\"type\":\"string\"}},\"required\":[\"parent_id\"],\"additionalProperties\":false}}'\
+                "INSERT INTO lix_registered_schema (value) VALUES (\
+             lix_json('{\"x-lix-key\":\"child_schema\",\"x-lix-version\":\"1\",\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"parent_schema\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"parent_id\":{\"type\":\"string\"}},\"required\":[\"parent_id\"],\"additionalProperties\":false}')\
              )", &[])
             .await;
 
@@ -346,9 +346,8 @@ simulation_test!(
 
         let invalid = engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
-             '{\"value\":{\"x-lix-key\":\"bad_child\",\"x-lix-version\":\"1\",\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_name\"],\"references\":{\"schemaKey\":\"parent_schema\",\"properties\":[\"/name\"]}}],\"type\":\"object\",\"properties\":{\"parent_name\":{\"type\":\"string\"}},\"required\":[\"parent_name\"],\"additionalProperties\":false}}'\
+                "INSERT INTO lix_registered_schema (value) VALUES (\
+             lix_json('{\"x-lix-key\":\"bad_child\",\"x-lix-version\":\"1\",\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_name\"],\"references\":{\"schemaKey\":\"parent_schema\",\"properties\":[\"/name\"]}}],\"type\":\"object\",\"properties\":{\"parent_name\":{\"type\":\"string\"}},\"required\":[\"parent_name\"],\"additionalProperties\":false}')\
              )", &[])
             .await;
 
@@ -372,16 +371,15 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
-             '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
+                "INSERT INTO lix_registered_schema (value) VALUES (\
+             lix_json('{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}')\
              )", &[])
             .await
             .unwrap();
 
         let result = engine
             .execute(
-                "UPDATE lix_internal_state_vtable SET snapshot_content = '{\"value\":{\"x-lix-version\":\"1\"}}' \
+                "UPDATE lix_state_by_version SET snapshot_content = '{\"value\":{\"x-lix-version\":\"1\"}}' \
              WHERE schema_key = 'lix_registered_schema' AND entity_id = 'test_schema~1' AND file_id = 'lix' AND version_id = 'global'", &[])
             .await;
 

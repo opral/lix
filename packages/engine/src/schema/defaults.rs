@@ -1,21 +1,25 @@
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::cel::CelEvaluator;
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::LixError;
 
-pub(crate) fn apply_schema_defaults_with_system_functions(
+pub(crate) fn apply_schema_defaults_with_functions<P>(
     snapshot: &mut JsonMap<String, JsonValue>,
     schema: &JsonValue,
+    functions: SharedFunctionProvider<P>,
     schema_key: &str,
     schema_version: &str,
-) -> Result<bool, LixError> {
+) -> Result<bool, LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     apply_defaults_to_snapshot(
         snapshot,
         schema,
         &snapshot.clone(),
         &CelEvaluator::new(),
-        SharedFunctionProvider::new(SystemFunctionProvider),
+        functions,
         schema_key,
         schema_version,
     )

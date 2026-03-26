@@ -244,6 +244,8 @@ fn storage_layout_from_legacy(
             .map(|column| storage::LiveColumnSpec {
                 property_name: column.property_name.clone(),
                 column_name: column.column_name.clone(),
+                required: column.required,
+                nullable: column.nullable,
                 kind: match column.kind {
                     crate::schema::live_layout::LiveColumnKind::String => {
                         storage::LiveColumnKind::String

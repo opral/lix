@@ -60,7 +60,7 @@ async fn seed_key_value_row(
     version_id: &str,
 ) {
     let sql = format!(
-        "INSERT INTO lix_internal_state_vtable (\
+        "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
          '{entity_id}', 'lix_key_value', 'lix', '{version_id}', 'lix', '{snapshot}', '1'\
@@ -101,8 +101,7 @@ async fn install_global_override_schema(
         }
     });
     let sql = format!(
-        "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-         'lix_registered_schema', '{snapshot}'\
+        "INSERT INTO lix_registered_schema (value) VALUES ('{snapshot}'\
          )",
         snapshot = snapshot.to_string().replace('\'', "''"),
     );
@@ -122,8 +121,7 @@ async fn install_global_override_child_schema(engine: &support::simulation_test:
 async fn install_select_override_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema', \
+            "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"lix_select_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"inlang\\\"\",\"lixcol_plugin_key\":\"\\\"inlang_sdk\\\"\",\"lixcol_global\":\"true\",\"lixcol_untracked\":\"true\",\"lixcol_metadata\":\"null\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -133,8 +131,7 @@ async fn install_select_override_schema(engine: &support::simulation_test::Simul
 async fn install_inherited_override_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema', \
+            "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"lix_inherited_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -144,8 +141,7 @@ async fn install_inherited_override_schema(engine: &support::simulation_test::Si
 async fn install_default_values_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema', \
+            "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"lix_default_values_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"\\\"default-id-value\\\"\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -155,8 +151,7 @@ async fn install_default_values_schema(engine: &support::simulation_test::Simula
 async fn install_delete_subquery_schemas(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema', \
+            "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"lix_delete_message_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"bundle_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"bundle_id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -164,8 +159,7 @@ async fn install_delete_subquery_schemas(engine: &support::simulation_test::Simu
 
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema', \
+            "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"lix_delete_variant_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"message_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"message_id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -308,7 +302,7 @@ simulation_test!(
         let updated = engine
             .execute(
                 "SELECT snapshot_content, plugin_key, metadata \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_key_value' \
                    AND entity_id = 'key-state-update' \
                    AND snapshot_content IS NOT NULL",
@@ -437,7 +431,7 @@ simulation_test!(
         let stored = engine
             .execute(
                 "SELECT entity_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_default_values_schema' \
                    AND version_id = 'global' \
                    AND snapshot_content IS NOT NULL",
@@ -564,8 +558,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-                 'lix_registered_schema', \
+                "INSERT INTO lix_registered_schema (value) VALUES (\
                  '{\"value\":{\"x-lix-key\":\"lix_patch_validation\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}}'\
                  )", &[])
             .await
@@ -644,7 +637,7 @@ simulation_test!(
         let stored = engine
             .execute(
                 "SELECT version_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_version_override_schema' \
                    AND entity_id = 'ovr-1' \
                    AND version_id = 'global' \
@@ -688,7 +681,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'ovr-2', 'lix_version_override_schema', 'lix', 'global', 'lix', '{\"id\":\"ovr-2\",\"name\":\"Global\"}', '1'\
@@ -697,7 +690,7 @@ simulation_test!(
             .unwrap();
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'ovr-2', 'lix_version_override_schema', 'lix', 'main', 'lix', '{\"id\":\"ovr-2\",\"name\":\"Main\"}', '1'\
@@ -718,7 +711,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT version_id, global, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_version_override_schema' \
                    AND entity_id = 'ovr-2' \
                    AND snapshot_content IS NOT NULL \
@@ -784,7 +777,7 @@ simulation_test!(
         install_global_override_child_schema(&engine).await;
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'ovr-inherit-1', 'lix_version_override_child_schema', 'lix', 'global', 'lix', '{\"id\":\"ovr-inherit-1\",\"name\":\"Global\"}', '1'\
@@ -822,7 +815,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, untracked\
                  ) VALUES \
                  ('match-global', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"match-global\"}', NULL, '1', true), \
@@ -919,7 +912,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                  ) VALUES \
                  ('inherited-match', 'lix_inherited_override_schema', 'lix', 'global', 'lix', '{\"id\":\"inherited-match\"}', '1', false), \

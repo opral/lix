@@ -14,10 +14,6 @@ use crate::filesystem::runtime::{
     FILESYSTEM_DESCRIPTOR_FILE_ID, FILESYSTEM_DESCRIPTOR_PLUGIN_KEY, FILESYSTEM_FILE_SCHEMA_KEY,
     FILESYSTEM_FILE_SCHEMA_VERSION,
 };
-#[cfg(test)]
-use crate::backend::prepared::{collapse_prepared_batch_for_dialect, PreparedBatch};
-#[cfg(test)]
-use crate::filesystem::runtime::FilesystemTransactionFileState;
 use crate::functions::LixFunctionProvider;
 use crate::key_value::key_value_schema_key;
 use crate::live_state::require_ready_in_transaction;
@@ -634,7 +630,11 @@ fn resolve_proposed_domain_changes(
         let compiled_change = compiled_change?;
         let identity = proposed_domain_change_identity(&compiled_change);
         if let Some(index) = index_by_identity.get(&identity).copied() {
-            resolved[index] = compiled_change;
+            let mut merged = compiled_change;
+            if merged.writer_key.is_none() {
+                merged.writer_key = resolved[index].writer_key.clone();
+            }
+            resolved[index] = merged;
         } else {
             index_by_identity.insert(identity, resolved.len());
             resolved.push(compiled_change);
@@ -736,6 +736,7 @@ async fn proposed_domain_change_is_noop(
                 .get("snapshot_content")
                 .and_then(value_as_text);
             let current_metadata = current.values.get("metadata").and_then(value_as_text);
+            let current_writer_key = current.writer_key.as_deref();
             Ok(canonicalize_change_payload(
                 change.snapshot_content.as_deref(),
                 &change.schema_key,
@@ -752,7 +753,7 @@ async fn proposed_domain_change_is_noop(
                 current_metadata.as_deref(),
                 &change.schema_key,
                 "metadata",
-            )?)
+            )? && change.writer_key.as_deref() == current_writer_key)
         }
     }
 }
@@ -1549,6 +1550,10 @@ mod tests {
         create_commit, CreateCommitArgs, CreateCommitDisposition, CreateCommitError,
         CreateCommitErrorKind, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
         CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
+    };
+    use crate::backend::prepared::{collapse_prepared_batch_for_dialect, PreparedBatch};
+    use crate::filesystem::runtime::{
+        FilesystemTransactionFileState, FilesystemTransactionState, OptionalTextPatch,
     };
     use crate::functions::LixFunctionProvider;
     use crate::schema::live_layout::{builtin_live_table_layout, normalized_live_column_values};

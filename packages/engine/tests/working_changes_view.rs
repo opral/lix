@@ -1,6 +1,6 @@
 mod support;
 
-use lix_engine::Value;
+use lix_engine::{ExecuteOptions, LixError, Value};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -289,28 +289,31 @@ simulation_test!(
             .expect("boot_simulated_engine_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
         let key = unique_key("wc-view-collapse");
-        let key_sql = key.replace('\'', "''");
-        let active_version_id = active_version_id(&engine).await;
-        let active_version_id_sql = active_version_id.replace('\'', "''");
 
         engine
             .create_checkpoint()
             .await
             .expect("checkpoint should succeed");
 
+        let tx_key = key.clone();
         engine
-            .execute(
-                &format!(
-                    "INSERT INTO lix_internal_state_vtable (\
-                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                     ) VALUES (\
-                     '{key_sql}', 'lix_key_value', 'lix', '{active_version_id_sql}', 'lix', '{{\"key\":\"{key_sql}\",\"value\":\"v2\"}}', '1'\
-                     ), (\
-                     '{key_sql}', 'lix_key_value', 'lix', '{active_version_id_sql}', 'lix', '{{\"key\":\"{key_sql}\",\"value\":\"v3\"}}', '1'\
-                     )"
-                ), &[])
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO lix_key_value (key, value) VALUES ($1, 'v2')",
+                        &[Value::Text(tx_key.clone())],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE lix_key_value SET value = 'v3' WHERE key = $1",
+                        &[Value::Text(tx_key.clone())],
+                    )
+                    .await?;
+                    Ok::<(), LixError>(())
+                })
+            })
             .await
-            .expect("duplicate internal writes should succeed");
+            .expect("sequential same-entity writes in one transaction should succeed");
 
         let tip_change_set = engine
             .execute(
@@ -341,8 +344,8 @@ simulation_test!(
             .expect("tip entry count query should succeed");
         assert_eq!(
             as_i64(&tip_entry_count.statements[0].rows[0][0]),
-            1,
-            "tip change set should collapse duplicate entries for one entity"
+            2,
+            "tip change set should retain both tracked entries for one entity"
         );
 
         let result = engine

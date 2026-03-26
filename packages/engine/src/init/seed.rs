@@ -196,7 +196,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
 
             let existing = self
                 .execute_internal(
-                    "SELECT 1 FROM lix_internal_state_vtable \
+                    "SELECT 1 FROM lix_state_by_version \
                      WHERE schema_key = 'lix_registered_schema' \
                        AND entity_id = $1 \
                        AND version_id = 'global' \
@@ -221,14 +221,14 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             })
             .to_string();
             self.execute_internal(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, created_at, updated_at, untracked\
                  ) VALUES ($1, 'lix_registered_schema', 'lix', 'global', 'lix', $2, '1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z', true)",
                 &[
                     Value::Text(entity_id),
                     Value::Text(snapshot_content),
-                ]
-                )
+                ],
+            )
             .await?;
         }
 
@@ -250,7 +250,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             .to_string();
 
             self.execute_internal(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[
@@ -422,7 +422,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let existing = self
             .execute_internal(
                 "SELECT snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_label' \
                    AND entity_id = $1 \
                    AND file_id = 'lix' \
@@ -494,7 +494,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let rows = self
             .execute_internal(
                 "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_version_ref' \
                    AND entity_id = 'global' \
                    AND file_id = 'lix' \
@@ -531,7 +531,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let existing = self
             .execute_internal(
                 "SELECT 1 \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE entity_id = $1 \
                    AND schema_key = 'lix_entity_label' \
                    AND file_id = 'lix' \
@@ -875,7 +875,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let exists = self
             .execute_internal(
                 "SELECT 1 \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = $1 \
                    AND entity_id = $2 \
                    AND file_id = $3 \
@@ -899,7 +899,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         };
         if statement.rows.is_empty() {
             self.execute_internal(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 &[
@@ -1361,7 +1361,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                          lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
                          lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
                          lix_json_extract(snapshot_content, 'label_id') AS label_id \
-                       FROM lix_internal_state_vtable \
+                       FROM lix_state_by_version \
                        WHERE schema_key = 'lix_entity_label' \
                          AND file_id = 'lix' \
                          AND version_id = 'global' \
@@ -1372,7 +1372,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                       AND el.label_id = '{checkpoint_label_id}' \
                      LEFT JOIN ( \
                        SELECT entity_id AS id, created_at \
-                       FROM lix_internal_state_vtable \
+                       FROM lix_state_by_version \
                        WHERE schema_key = 'lix_commit' \
                          AND file_id = 'lix' \
                          AND version_id = 'global' \
@@ -1411,7 +1411,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let existing = self
             .execute_internal(
                 "SELECT 1 \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_commit' \
                    AND entity_id = $1 \
                    AND file_id = 'lix' \
@@ -1460,7 +1460,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let existing = self
             .execute_internal(
                 "SELECT 1 \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_change_set' \
                    AND entity_id = $1 \
                    AND file_id = 'lix' \
@@ -1506,7 +1506,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let commit_row = self
             .execute_internal(
                 "SELECT lix_json_extract(snapshot_content, 'change_set_id') \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_commit' \
                    AND entity_id = $1 \
                    AND file_id = 'lix' \
@@ -1552,7 +1552,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let existing = self
             .execute_internal(
                 "SELECT 1 \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_change_set' \
                    AND entity_id = $1 \
                    AND file_id = 'lix' \

@@ -4,23 +4,10 @@ use crate::sql::common::ast::parse_sql_statements;
 use crate::sql::execution::contracts::planned_statement::PlannedStatementSet;
 use crate::sql::public::runtime::{
     statement_references_public_surface_with_backend,
-    statement_references_public_surface_with_builtin_registry,
 };
-use crate::sql::internal::{
-    prepare_statements_sync_to_plan, prepare_statements_with_backend_to_plan,
-};
-use crate::{LixBackend, LixError, SqlDialect, Value};
+use crate::sql::internal::prepare_statements_with_backend_to_plan;
+use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::Statement;
-
-pub(crate) fn preprocess_statements_with_provider_to_plan<P: LixFunctionProvider>(
-    statements: Vec<Statement>,
-    params: &[Value],
-    provider: &mut P,
-    dialect: SqlDialect,
-) -> Result<PlannedStatementSet, LixError> {
-    reject_public_surface_statements(&statements)?;
-    Ok(prepare_statements_sync_to_plan(statements, params, provider, dialect, None)?.into())
-}
 
 pub(crate) async fn preprocess_sql_to_plan(
     backend: &dyn LixBackend,
@@ -87,19 +74,6 @@ where
     )
     .await?
     .into())
-}
-
-fn reject_public_surface_statements(statements: &[Statement]) -> Result<(), LixError> {
-    if statements
-        .iter()
-        .any(statement_references_public_surface_with_builtin_registry)
-    {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "public surface statements must route through public lowering",
-        ));
-    }
-    Ok(())
 }
 
 async fn reject_public_surface_statements_with_backend(

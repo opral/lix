@@ -3,6 +3,7 @@ use crate::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
 };
 use crate::filesystem::history::{DirectoryHistoryRequest, FileHistoryRequest};
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::schema::builtin::builtin_schema_definition;
 use crate::schema::live_layout::{
     builtin_live_table_layout, live_column_name_for_property, live_table_layout_from_schema,
@@ -44,7 +45,9 @@ use crate::sql::public::planner::semantics::effective_state_resolver::{
     build_effective_state, EffectiveStatePlan, EffectiveStateRequest,
 };
 use crate::sql::public::planner::semantics::write_analysis::analyze_write;
-use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan;
+use crate::sql::public::planner::semantics::write_resolver::{
+    resolve_write_plan_with_functions,
+};
 use crate::sql::public::services::state_reader::load_committed_version_head_commit_id;
 use crate::change_view::TrackedDomainChangeView;
 use crate::state::history::ensure_state_history_timeline_materialized_for_root;
@@ -589,6 +592,34 @@ pub(crate) async fn prepare_public_execution_with_registry_and_internal_access_a
     allow_internal_tables: bool,
     pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
+    prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions(
+        backend,
+        registry,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+        allow_internal_tables,
+        pending_transaction_view,
+        SharedFunctionProvider::new(SystemFunctionProvider),
+    )
+    .await
+}
+
+pub(crate) async fn prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions<P>(
+    backend: &dyn LixBackend,
+    registry: &SurfaceRegistry,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+    allow_internal_tables: bool,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    functions: SharedFunctionProvider<P>,
+) -> Result<Option<PreparedPublicExecution>, LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let Some(route) = classify_public_execution_route_with_registry(registry, parsed_statements)
     else {
         return Ok(None);
@@ -598,7 +629,7 @@ pub(crate) async fn prepare_public_execution_with_registry_and_internal_access_a
         PublicExecutionRoute::Write => {
             let target_name = public_write_target_name(registry, parsed_statements)
                 .expect("public write route must expose a target name");
-            let prepared = try_prepare_public_write_with_registry(
+            let prepared = try_prepare_public_write_with_registry_and_functions(
                 backend,
                 registry,
                 parsed_statements,
@@ -606,6 +637,7 @@ pub(crate) async fn prepare_public_execution_with_registry_and_internal_access_a
                 active_version_id,
                 writer_key,
                 pending_transaction_view,
+                functions,
             )
             .await?;
             prepared
@@ -658,10 +690,34 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
     writer_key: Option<&str>,
     allow_internal_tables: bool,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
+    prepare_public_execution_with_internal_access_and_functions(
+        backend,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+        allow_internal_tables,
+        SharedFunctionProvider::new(SystemFunctionProvider),
+    )
+    .await
+}
+
+pub(crate) async fn prepare_public_execution_with_internal_access_and_functions<P>(
+    backend: &dyn LixBackend,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+    allow_internal_tables: bool,
+    functions: SharedFunctionProvider<P>,
+) -> Result<Option<PreparedPublicExecution>, LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let builtin_registry = SurfaceRegistry::with_builtin_surfaces();
     if classify_public_execution_route_with_registry(&builtin_registry, parsed_statements).is_some()
     {
-        return prepare_public_execution_with_registry_and_internal_access(
+        return prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions(
             backend,
             &builtin_registry,
             parsed_statements,
@@ -669,6 +725,8 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
             active_version_id,
             writer_key,
             allow_internal_tables,
+            None,
+            functions,
         )
         .await;
     }
@@ -676,7 +734,7 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
-    prepare_public_execution_with_registry_and_internal_access(
+    prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions(
         backend,
         &registry,
         parsed_statements,
@@ -684,6 +742,8 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
         active_version_id,
         writer_key,
         allow_internal_tables,
+        None,
+        functions,
     )
     .await
 }
@@ -1856,6 +1916,28 @@ pub(crate) async fn try_prepare_public_write(
     active_version_id: &str,
     writer_key: Option<&str>,
 ) -> Result<Option<PreparedPublicWrite>, LixError> {
+    try_prepare_public_write_with_functions(
+        backend,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+        SharedFunctionProvider::new(SystemFunctionProvider),
+    )
+    .await
+}
+
+pub(crate) async fn try_prepare_public_write_with_functions<P>(
+    backend: &dyn LixBackend,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+    functions: SharedFunctionProvider<P>,
+) -> Result<Option<PreparedPublicWrite>, LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     if parsed_statements.len() != 1 {
         return Ok(None);
     }
@@ -1863,7 +1945,7 @@ pub(crate) async fn try_prepare_public_write(
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
-    try_prepare_public_write_with_registry(
+    try_prepare_public_write_with_registry_and_functions(
         backend,
         &registry,
         parsed_statements,
@@ -1871,6 +1953,7 @@ pub(crate) async fn try_prepare_public_write(
         active_version_id,
         writer_key,
         None,
+        functions,
     )
     .await
 }
@@ -1884,6 +1967,32 @@ pub(crate) async fn try_prepare_public_write_with_registry(
     writer_key: Option<&str>,
     pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<Option<PreparedPublicWrite>, LixError> {
+    try_prepare_public_write_with_registry_and_functions(
+        backend,
+        registry,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+        pending_transaction_view,
+        SharedFunctionProvider::new(SystemFunctionProvider),
+    )
+    .await
+}
+
+pub(crate) async fn try_prepare_public_write_with_registry_and_functions<P>(
+    backend: &dyn LixBackend,
+    registry: &SurfaceRegistry,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    functions: SharedFunctionProvider<P>,
+) -> Result<Option<PreparedPublicWrite>, LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     if parsed_statements.len() != 1 {
         return Ok(None);
     }
@@ -1935,8 +2044,14 @@ pub(crate) async fn try_prepare_public_write_with_registry(
             return Ok(None);
         }
     };
-    let resolved_write_plan =
-        match resolve_write_plan(backend, &planned_write, pending_transaction_view).await {
+    let resolved_write_plan = match resolve_write_plan_with_functions(
+        backend,
+        &planned_write,
+        pending_transaction_view,
+        functions.clone(),
+    )
+    .await
+    {
             Ok(resolved_write_plan) => resolved_write_plan,
             Err(error) => match public_authoritative_write_error(&canonicalized, error.message) {
                 Some(error) => return Err(error),

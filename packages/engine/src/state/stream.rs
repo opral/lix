@@ -1,5 +1,4 @@
 use crate::change_view::TrackedDomainChangeView;
-use crate::schema::live_layout::{logical_live_snapshot_from_row_with_layout, LiveTableLayout};
 use crate::sql::execution::contracts::planned_statement::{MutationOperation, MutationRow};
 use crate::{LixError, Value};
 use futures_util::future::poll_fn;
@@ -486,46 +485,6 @@ pub(crate) fn state_commit_stream_changes_from_mutations(
         .collect()
 }
 
-pub(crate) fn state_commit_stream_changes_from_postprocess_rows(
-    rows: &[Vec<Value>],
-    schema_key: &str,
-    layout: Option<&LiveTableLayout>,
-    operation: StateCommitStreamOperation,
-    writer_key: Option<&str>,
-) -> Result<Vec<StateCommitStreamChange>, LixError> {
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let writer_key = writer_key.map(str::to_string);
-    let mut changes = Vec::with_capacity(rows.len());
-
-    for row in rows {
-        let entity_id = row_text(row, 0, "entity_id")?;
-        let file_id = row_text(row, 1, "file_id")?;
-        let version_id = row_text(row, 2, "version_id")?;
-        let plugin_key = row_text(row, 3, "plugin_key")?;
-        let schema_version = row_text(row, 4, "schema_version")?;
-        let snapshot_content =
-            logical_live_snapshot_from_row_with_layout(layout, schema_key, row, 5, 9)?;
-
-        changes.push(StateCommitStreamChange {
-            operation,
-            entity_id,
-            schema_key: schema_key.to_string(),
-            schema_version,
-            file_id,
-            version_id,
-            plugin_key,
-            snapshot_content,
-            untracked: false,
-            writer_key: writer_key.clone(),
-        });
-    }
-
-    Ok(changes)
-}
-
 pub(crate) fn state_commit_stream_changes_from_domain_changes<Change: TrackedDomainChangeView>(
     changes: &[Change],
     operation: StateCommitStreamOperation,
@@ -626,24 +585,6 @@ pub(crate) fn state_commit_stream_changes_from_planned_rows(
     Ok(resolved)
 }
 
-fn row_text(row: &[Value], index: usize, column: &str) -> Result<String, LixError> {
-    let value = row.get(index).ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "postprocess state commit stream rows expected {column} column at index {index}"
-        ),
-    })?;
-    match value {
-        Value::Text(text) => Ok(text.clone()),
-        other => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "postprocess state commit stream expected text {column}, got {other:?}"
-            ),
-        }),
-    }
-}
-
 fn planned_row_required_text(
     row: &crate::sql::public::planner::ir::PlannedStateRow,
     key: &str,
@@ -698,74 +639,13 @@ fn map_mutation_operation(operation: &MutationOperation) -> StateCommitStreamOpe
 #[cfg(test)]
 mod tests {
     use super::{
-        state_commit_stream_changes_from_domain_changes,
-        state_commit_stream_changes_from_planned_rows,
-        state_commit_stream_changes_from_postprocess_rows, StateCommitStreamOperation,
+        state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
+        StateCommitStreamOperation,
     };
-    use crate::sql::public::planner::ir::PlannedStateRow;
     use crate::canonical::ProposedDomainChange;
+    use crate::sql::public::planner::ir::PlannedStateRow;
     use crate::Value;
     use std::collections::BTreeMap;
-
-    #[test]
-    fn postprocess_rows_map_to_update_changes() {
-        let rows = vec![vec![
-            Value::Text("entity-1".to_string()),
-            Value::Text("file-1".to_string()),
-            Value::Text("version-1".to_string()),
-            Value::Text("plugin-1".to_string()),
-            Value::Text("1".to_string()),
-            Value::Text("{\"name\":\"Ada\"}".to_string()),
-            Value::Text("{}".to_string()),
-            Value::Null,
-            Value::Text("2026-02-24T00:00:00Z".to_string()),
-        ]];
-
-        let changes = state_commit_stream_changes_from_postprocess_rows(
-            &rows,
-            "lix_entity",
-            None,
-            StateCommitStreamOperation::Update,
-            Some("writer-a"),
-        )
-        .expect("postprocess rows should map");
-
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].operation, StateCommitStreamOperation::Update);
-        assert_eq!(changes[0].entity_id, "entity-1");
-        assert_eq!(changes[0].schema_key, "lix_entity");
-        assert_eq!(changes[0].writer_key.as_deref(), Some("writer-a"));
-    }
-
-    #[test]
-    fn postprocess_rows_map_null_snapshot_for_delete_changes() {
-        let rows = vec![vec![
-            Value::Text("entity-2".to_string()),
-            Value::Text("file-2".to_string()),
-            Value::Text("version-2".to_string()),
-            Value::Text("plugin-2".to_string()),
-            Value::Text("1".to_string()),
-            Value::Null,
-            Value::Text("{}".to_string()),
-            Value::Null,
-            Value::Text("2026-02-24T00:00:00Z".to_string()),
-        ]];
-
-        let changes = state_commit_stream_changes_from_postprocess_rows(
-            &rows,
-            "lix_entity",
-            None,
-            StateCommitStreamOperation::Delete,
-            None,
-        )
-        .expect("postprocess rows should map");
-
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].operation, StateCommitStreamOperation::Delete);
-        assert_eq!(changes[0].entity_id, "entity-2");
-        assert_eq!(changes[0].snapshot_content, None);
-        assert_eq!(changes[0].writer_key, None);
-    }
 
     #[test]
     fn domain_changes_map_to_update_changes() {

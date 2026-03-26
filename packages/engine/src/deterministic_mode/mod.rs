@@ -10,15 +10,12 @@ use crate::schema::live_layout::{
     builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
     untracked_live_table_name,
 };
-use crate::sql_support::binding::parse_sql_statements;
-use crate::backend::prepared::{PreparedBatch, PreparedStatement};
-use crate::sql::execution::preprocess::preprocess_statements_with_provider_to_plan as preprocess_statements_with_provider;
+use crate::backend::prepared::PreparedBatch;
 use crate::sql_support::text::escape_sql_string;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 const SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
-const EPOCH_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 const DETERMINISTIC_UUID_COUNTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 #[derive(Debug, Clone, Copy)]
@@ -203,37 +200,11 @@ pub(crate) async fn load_runtime_sequence_start(backend: &dyn LixBackend) -> Res
 
 pub(crate) fn build_persist_sequence_highest_batch(
     highest_seen: i64,
-    dialect: SqlDialect,
+    _dialect: SqlDialect,
 ) -> Result<PreparedBatch, LixError> {
-    let snapshot_content = serde_json::json!({
-        "key": SEQUENCE_KEY,
-        "value": highest_seen
-    })
-    .to_string();
-
-    let sql = format!(
-        "INSERT INTO lix_internal_state_vtable \
-         (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked) \
-         VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', '{plugin_key}', '{snapshot_content}', '{schema_version}', true)",
-        entity_id = escape_sql_string(SEQUENCE_KEY),
-        schema_key = escape_sql_string(key_value_schema_key()),
-        file_id = escape_sql_string(key_value_file_id()),
-        version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
-        plugin_key = escape_sql_string(key_value_plugin_key()),
-        schema_version = escape_sql_string(key_value_schema_version()),
-        snapshot_content = escape_sql_string(&snapshot_content),
-    );
-
-    let mut provider = FixedTimestampFunctionProvider;
-    let statements = parse_sql_statements(&sql)?;
-    let rewritten = preprocess_statements_with_provider(statements, &[], &mut provider, dialect)?;
-    let params = rewritten.single_statement_params()?.to_vec();
-    Ok(PreparedBatch {
-        steps: vec![PreparedStatement {
-            sql: rewritten.sql,
-            params,
-        }],
-    })
+    let mut batch = PreparedBatch { steps: Vec::new() };
+    batch.append_sql(build_persist_sequence_highest_sql(highest_seen));
+    Ok(batch)
 }
 
 pub(crate) fn build_persist_sequence_highest_sql(highest_seen: i64) -> String {
@@ -356,18 +327,6 @@ fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("expected text value for {name}"),
         }),
-    }
-}
-
-struct FixedTimestampFunctionProvider;
-
-impl LixFunctionProvider for FixedTimestampFunctionProvider {
-    fn uuid_v7(&mut self) -> String {
-        uuid_v7()
-    }
-
-    fn timestamp(&mut self) -> String {
-        EPOCH_TIMESTAMP.to_string()
     }
 }
 

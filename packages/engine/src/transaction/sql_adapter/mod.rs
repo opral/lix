@@ -19,7 +19,6 @@ pub(crate) use crate::filesystem::runtime::{
 pub(crate) use crate::transaction::PendingTransactionView;
 pub(crate) use crate::sql::execution::shared_path::{
     apply_public_version_last_checkpoint_side_effects, empty_public_write_execution_outcome,
-    mirror_public_registered_schema_bootstrap_rows,
 };
 pub(crate) use crate::sql::public::planner::ir::{
     OptionalTextPatch, PlannedStateRow, WriteLane, WriteMode,
@@ -49,6 +48,7 @@ pub(crate) use planned_write::{
     PlannedWriteUnit,
 };
 pub(crate) use planned_write_runner::execute_planned_write_delta;
+pub(crate) use effects::mirror_public_registered_schema_bootstrap_rows;
 pub(crate) use runtime::{
     execute_compiled_execution_step_with_transaction, execute_internal_execution_with_transaction,
     CompiledExecution, CompiledExecutionBody, CompiledExecutionRoute, CompiledExecutionStep,

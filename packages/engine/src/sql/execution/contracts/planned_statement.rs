@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use serde_json::Value as JsonValue;
 
 use crate::schema::live_layout::LiveTableLayout;
-use crate::sql::internal::InternalStatePlan;
 use crate::{LixError, Value};
 use sqlparser::ast::Expr;
 
@@ -18,12 +17,6 @@ pub(crate) struct SchemaLiveTableRequirement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MutationOperation {
     Insert,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UpdateValidationKind {
-    Update,
-    Delete,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,7 +34,7 @@ pub(crate) struct MutationRow {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UpdateValidationPlan {
-    pub(crate) kind: UpdateValidationKind,
+    pub(crate) delete: bool,
     pub(crate) table: String,
     pub(crate) where_clause: Option<Expr>,
     pub(crate) snapshot_content: Option<JsonValue>,
@@ -53,7 +46,6 @@ pub(crate) struct PlannedStatementSet {
     pub(crate) sql: String,
     pub(crate) prepared_statements: Vec<PreparedStatement>,
     pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
-    pub(crate) internal_state: Option<InternalStatePlan>,
     pub(crate) mutations: Vec<MutationRow>,
     pub(crate) update_validations: Vec<UpdateValidationPlan>,
 }

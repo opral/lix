@@ -149,7 +149,7 @@ simulation_test!(
 
         assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
         assert!(error.description.contains(
-            "Direct writes or DDL against `lix_internal_*` tables can lead to data corruption."
+            "Direct writes against `lix_internal_*` tables can lead to data corruption."
         ));
     }
 );
@@ -194,7 +194,7 @@ simulation_test!(
         engine.initialize().await.expect("init should succeed");
 
         let error = engine
-            .execute("DROP TABLE lix_internal_state_vtable", &[])
+            .execute("DROP TABLE lix_state_by_version", &[])
             .await
             .expect_err("internal table drop should be rejected");
 
@@ -216,7 +216,7 @@ simulation_test!(
 
         let error = engine
             .execute(
-                "ALTER TABLE lix_internal_state_vtable ADD COLUMN blocked INTEGER",
+                "ALTER TABLE lix_state_by_version ADD COLUMN blocked INTEGER",
                 &[],
             )
             .await
@@ -240,7 +240,7 @@ simulation_test!(
 
         let error = engine
             .execute(
-                "CREATE TRIGGER lix_blocked_trigger AFTER INSERT ON lix_internal_state_vtable BEGIN SELECT 1; END",
+                "CREATE TRIGGER lix_blocked_trigger AFTER INSERT ON lix_state_by_version BEGIN SELECT 1; END",
                 &[],
             )
             .await

@@ -1,4 +1,5 @@
 use super::*;
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::builtin::builtin_schema_definition;
 use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
 use crate::transaction::PendingTransactionView;
@@ -7,8 +8,8 @@ use crate::sql::public::planner::ir::CanonicalStateRowKey;
 use crate::sql::public::planner::semantics::effective_state_resolver::resolve_exact_effective_state_row_with_pending_transaction_view;
 use crate::sql::public::planner::semantics::state_assignments::{
     apply_entity_state_assignments, apply_state_assignments, assignments_from_payload,
-    build_entity_insert_rows as build_entity_insert_rows_from_assignments, build_state_insert_row,
-    ensure_identity_columns_preserved, EntityAssignmentsSemantics, EntityInsertSemantics,
+    build_entity_insert_rows_with_functions, build_state_insert_row, ensure_identity_columns_preserved,
+    EntityAssignmentsSemantics, EntityInsertSemantics,
 };
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -229,25 +230,34 @@ fn authoritative_pre_state_row_for_effective_row(
     }
 }
 
-pub(super) async fn resolve_state_write(
+pub(super) async fn resolve_state_write<P>(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&PendingTransactionView>,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+    functions: SharedFunctionProvider<P>,
+) -> Result<ResolvedWritePlan, WriteResolveError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     resolve_state_backed_write(
         backend,
         planned_write,
         pending_transaction_view,
         StateBackedSurface::State,
+        functions,
     )
     .await
 }
 
-pub(super) async fn resolve_entity_write(
+pub(super) async fn resolve_entity_write<P>(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&PendingTransactionView>,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+    functions: SharedFunctionProvider<P>,
+) -> Result<ResolvedWritePlan, WriteResolveError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let mut provider = SqlRegisteredSchemaProvider::new(backend);
     let entity_schema = load_entity_schema(&mut provider, planned_write)
         .await
@@ -258,6 +268,7 @@ pub(super) async fn resolve_entity_write(
         planned_write,
         pending_transaction_view,
         StateBackedSurface::Entity(&entity_schema),
+        functions,
     )
     .await
 }
@@ -286,13 +297,17 @@ impl StateBackedSurface<'_> {
         }
     }
 
-    fn build_insert_rows(
+    fn build_insert_rows<P>(
         self,
         planned_write: &PlannedWrite,
-    ) -> Result<Vec<PlannedStateRow>, WriteResolveError> {
+        functions: SharedFunctionProvider<P>,
+    ) -> Result<Vec<PlannedStateRow>, WriteResolveError>
+    where
+        P: LixFunctionProvider + Send + 'static,
+    {
         match self {
             Self::State => build_state_insert_rows(planned_write),
-            Self::Entity(entity_schema) => build_entity_insert_rows_from_assignments(
+            Self::Entity(entity_schema) => build_entity_insert_rows_with_functions(
                 payload_maps(planned_write)?,
                 resolved_version_id(planned_write)?,
                 EntityInsertSemantics {
@@ -303,6 +318,7 @@ impl StateBackedSurface<'_> {
                     primary_key_paths: &entity_schema.primary_key_paths,
                     state_defaults: &entity_schema.state_defaults,
                 },
+                functions,
             )
             .map_err(write_resolve_state_assignments_error),
         }
@@ -418,12 +434,16 @@ impl StateBackedSurface<'_> {
     }
 }
 
-async fn resolve_state_backed_write(
+async fn resolve_state_backed_write<P>(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&PendingTransactionView>,
     surface: StateBackedSurface<'_>,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+    functions: SharedFunctionProvider<P>,
+) -> Result<ResolvedWritePlan, WriteResolveError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     match planned_write.command.operation_kind {
         WriteOperationKind::Insert => {
             resolve_state_backed_insert_write(
@@ -431,6 +451,7 @@ async fn resolve_state_backed_write(
                 planned_write,
                 pending_transaction_view,
                 surface,
+                functions,
             )
             .await
         }
@@ -446,13 +467,17 @@ async fn resolve_state_backed_write(
     }
 }
 
-async fn resolve_state_backed_insert_write(
+async fn resolve_state_backed_insert_write<P>(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&PendingTransactionView>,
     surface: StateBackedSurface<'_>,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let rows = surface.build_insert_rows(planned_write)?;
+    functions: SharedFunctionProvider<P>,
+) -> Result<ResolvedWritePlan, WriteResolveError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
+    let rows = surface.build_insert_rows(planned_write, functions)?;
     let mut partitions = ResolvedWritePlanBuilder::default();
     let default_execution_mode =
         default_execution_mode_for_request(planned_write.command.requested_mode);

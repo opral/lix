@@ -70,25 +70,15 @@ fn tracked_append_callers_use_canonical_append_entrypoint() {
 }
 
 #[test]
-fn internal_tracked_generation_delegates_into_canonical_helpers() {
-    let followup_source = read_engine_source("sql/internal/followup.rs");
+fn legacy_internal_tracked_generation_helpers_are_removed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql/internal");
     assert!(
-        followup_source.contains("build_prepared_batch_from_domain_changes_with_executor("),
-        "sql/internal/followup.rs should delegate tracked generation through canonical helpers"
+        !root.join("mutation_runtime.rs").exists(),
+        "sql/internal/mutation_runtime.rs should be removed once internal syntax no longer owns tracked generation followups"
     );
     assert!(
-        !followup_source.contains("generate_commit("),
-        "sql/internal/followup.rs should not generate canonical commits directly"
-    );
-
-    let vtable_source = read_engine_source("sql/internal/vtable_write.rs");
-    assert!(
-        vtable_source.contains("generate_commit_result_from_domain_changes_with_executor("),
-        "sql/internal/vtable_write.rs should delegate tracked generation through canonical helpers"
-    );
-    assert!(
-        !vtable_source.contains("generate_commit("),
-        "sql/internal/vtable_write.rs should not generate canonical commits directly"
+        !root.join("vtable_write.rs").exists(),
+        "sql/internal/vtable_write.rs should be removed once internal compatibility syntax stops owning tracked generation"
     );
 }
 
@@ -203,7 +193,9 @@ fn transaction_adapter_uses_applied_output_not_synthetic_generate_commit_result(
         "planned_write_runner should not rebuild synthetic GenerateCommitResult values"
     );
     assert!(
-        runner_source.contains("mirror_public_registered_schema_bootstrap_rows(transaction, applied_output)"),
+        runner_source.contains(
+            "mirror_public_registered_schema_bootstrap_rows(transaction, applied_output)"
+        ),
         "planned_write_runner should mirror bootstrap rows from the canonical applied_output"
     );
     assert!(

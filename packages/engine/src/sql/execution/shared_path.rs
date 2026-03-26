@@ -1,17 +1,20 @@
 use std::collections::BTreeSet;
 
 use crate::engine::Engine;
+use crate::functions::SharedFunctionProvider;
+use crate::sql::compat::internal_state_vtable::normalize_legacy_internal_state_vtable_statements;
 use crate::sql::public::runtime::{
-    finalize_public_write_execution,
-    prepare_public_execution_with_internal_access,
-    prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view,
+    finalize_public_write_execution, prepare_public_execution_with_internal_access_and_functions,
+    prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions,
     prepared_public_write_mutates_public_surface_registry,
-    try_prepare_public_read_with_registry_and_internal_access, try_prepare_public_write,
-    try_prepare_public_write_with_registry, PreparedPublicExecution, PreparedPublicWrite,
-    PublicWriteExecutionPartition,
+    try_prepare_public_read_with_registry_and_internal_access,
+    try_prepare_public_write_with_functions, try_prepare_public_write_with_registry_and_functions,
+    PreparedPublicExecution, PreparedPublicWrite, PublicWriteExecutionPartition,
+};
+use crate::sql::public::validation::{
+    validate_batch_local_write, validate_inserts, validate_updates,
 };
 use crate::sql_support::text::escape_sql_string;
-use crate::sql::public::validation::{validate_batch_local_write, validate_inserts, validate_updates};
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
 use crate::sql::execution::contracts::effects::PlanEffects;
@@ -27,15 +30,14 @@ use crate::sql::execution::intent::{
     collect_execution_intent_with_backend, ExecutionIntent, IntentCollectionPolicy,
 };
 use crate::sql::execution::preprocess::preprocess_with_surfaces_to_plan;
-use crate::transaction::PendingTransactionView;
 use crate::transaction::sql_adapter::{
     CompiledExecution, CompiledExecutionBody, CompiledExecutionStep, CompiledInternalExecution,
     SqlExecutionOutcome,
 };
+use crate::transaction::PendingTransactionView;
 use sqlparser::ast::Statement;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
-const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const GLOBAL_VERSION_ID: &str = "global";
 
 pub(crate) struct PreparationPolicy {
@@ -72,17 +74,7 @@ pub(crate) fn prepared_execution_mutates_public_surface_registry(
         return Ok(true);
     }
 
-    let dirty = match internal.postprocess.as_ref() {
-        Some(crate::sql::internal::PostprocessPlan::VtableUpdate(plan)) => {
-            plan.schema_key == REGISTERED_SCHEMA_KEY
-        }
-        Some(crate::sql::internal::PostprocessPlan::VtableDelete(plan)) => {
-            plan.schema_key == REGISTERED_SCHEMA_KEY
-        }
-        None => false,
-    };
-
-    Ok(dirty)
+    Ok(false)
 }
 
 async fn compile_execution_with_backend(
@@ -111,6 +103,7 @@ async fn compile_execution_with_backend(
 
     let mut statements = parsed_statements.to_vec();
     crate::filesystem::ensure_generated_filesystem_insert_ids(&mut statements, &functions)?;
+    normalize_legacy_internal_state_vtable_statements(&mut statements);
 
     let requirements = static_artifacts
         .plan_requirements
@@ -127,6 +120,7 @@ async fn compile_execution_with_backend(
         allow_internal_tables,
         public_surface_registry_override,
         static_artifacts.ownership_hint,
+        functions.clone(),
     )
     .await?;
     let (public_read, mut public_write) = match public_execution {
@@ -251,7 +245,6 @@ async fn compile_execution_with_backend(
         let internal_execution = CompiledInternalExecution {
             prepared_statements: preprocess.prepared_statements,
             live_table_requirements: preprocess.live_table_requirements,
-            postprocess: preprocess.internal_state.and_then(|plan| plan.postprocess),
             mutations: preprocess.mutations,
             update_validations: preprocess.update_validations,
             should_refresh_file_cache: requirements.should_refresh_file_cache,
@@ -312,6 +305,7 @@ async fn prepare_public_execution_for_compile(
     allow_internal_tables: bool,
     public_surface_registry_override: Option<&crate::sql::public::catalog::SurfaceRegistry>,
     ownership_hint: Option<StatementTemplateOwnership>,
+    functions: SharedFunctionProvider<crate::deterministic_mode::RuntimeFunctionProvider>,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
     let prepared = match ownership_hint {
         Some(StatementTemplateOwnership::PublicRead) => match public_surface_registry_override {
@@ -326,18 +320,19 @@ async fn prepare_public_execution_for_compile(
             )
             .await?
             .map(PreparedPublicExecution::Read),
-            None => prepare_public_execution_with_internal_access(
+            None => prepare_public_execution_with_internal_access_and_functions(
                 backend,
                 statements,
                 params,
                 active_version_id,
                 writer_key,
                 allow_internal_tables,
+                functions.clone(),
             )
             .await?,
         },
         Some(StatementTemplateOwnership::PublicWrite) => match public_surface_registry_override {
-            Some(registry) => try_prepare_public_write_with_registry(
+            Some(registry) => try_prepare_public_write_with_registry_and_functions(
                 backend,
                 registry,
                 statements,
@@ -345,15 +340,17 @@ async fn prepare_public_execution_for_compile(
                 active_version_id,
                 writer_key,
                 pending_transaction_view,
+                functions.clone(),
             )
             .await?
             .map(PreparedPublicExecution::Write),
-            None => try_prepare_public_write(
+            None => try_prepare_public_write_with_functions(
                 backend,
                 statements,
                 params,
                 active_version_id,
                 writer_key,
+                functions.clone(),
             )
             .await?
             .map(PreparedPublicExecution::Write),
@@ -361,7 +358,7 @@ async fn prepare_public_execution_for_compile(
         Some(StatementTemplateOwnership::Internal) => None,
         None => match public_surface_registry_override {
             Some(registry) => {
-                prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view(
+                prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions(
                     backend,
                     registry,
                     statements,
@@ -370,17 +367,19 @@ async fn prepare_public_execution_for_compile(
                     writer_key,
                     allow_internal_tables,
                     pending_transaction_view,
+                    functions.clone(),
                 )
                 .await?
             }
             None => {
-                prepare_public_execution_with_internal_access(
+                prepare_public_execution_with_internal_access_and_functions(
                     backend,
                     statements,
                     params,
                     active_version_id,
                     writer_key,
                     allow_internal_tables,
+                    functions.clone(),
                 )
                 .await?
             }
@@ -453,58 +452,14 @@ fn validate_compiled_internal_execution(
     preprocess: &PlannedStatementSet,
     result_contract: ResultContract,
 ) -> Result<(), LixError> {
-    let postprocess = preprocess
-        .internal_state
-        .as_ref()
-        .and_then(|plan| plan.postprocess.as_ref());
-
     if preprocess.prepared_statements.is_empty()
         && !matches!(result_contract, ResultContract::DmlNoReturning)
-        && postprocess.is_none()
         && preprocess.mutations.is_empty()
         && preprocess.update_validations.is_empty()
     {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "sql compiler produced an internal execution without statements",
-        ));
-    }
-    if crate::sql::internal::requires_single_statement_postprocess(postprocess)
-        && preprocess.prepared_statements.len() != 1
-    {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "sql compiler produced invalid postprocess execution with multiple statements",
-        ));
-    }
-    if postprocess.is_some() && !preprocess.mutations.is_empty() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "sql compiler produced postprocess execution with unexpected mutation rows",
-        ));
-    }
-    if let Some(postprocess) = postprocess {
-        crate::sql::internal::validate_internal_state_plan(Some(
-            &crate::sql::internal::InternalStatePlan {
-                postprocess: Some(postprocess.clone()),
-            },
-        ))?;
-    }
-    if postprocess.is_some()
-        && matches!(
-            result_contract,
-            ResultContract::Select | ResultContract::Other
-        )
-    {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "sql compiler produced postprocess execution for non-DML contract",
-        ));
-    }
-    if postprocess.is_some() && result_contract.expects_postprocess_output() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "sql compiler cannot expose postprocess internal rows as public DML RETURNING output",
         ));
     }
     Ok(())
@@ -608,7 +563,7 @@ pub(crate) fn empty_public_write_execution_outcome() -> SqlExecutionOutcome {
             rows: Vec::new(),
             columns: Vec::new(),
         },
-        postprocess_file_cache_targets: BTreeSet::new(),
+        internal_write_file_cache_targets: BTreeSet::new(),
         plugin_changes_committed: false,
         plan_effects_override: Some(PlanEffects::default()),
         state_commit_stream_changes: Vec::new(),
@@ -637,70 +592,6 @@ pub(crate) fn public_write_filesystem_payload_changes_already_committed(
             .iter()
             .any(|partition| matches!(partition, PublicWriteExecutionPartition::Tracked(_)))
     })
-}
-
-pub(crate) async fn mirror_public_registered_schema_bootstrap_rows(
-    transaction: &mut dyn LixBackendTransaction,
-    applied_output: &crate::canonical::append::CreateCommitAppliedOutput,
-) -> Result<(), LixError> {
-    for row in &applied_output.derived_apply_input.live_state_rows {
-        if row.schema_key != REGISTERED_SCHEMA_KEY || row.lixcol_version_id != GLOBAL_VERSION_ID {
-            continue;
-        }
-
-        let snapshot_sql = row
-            .snapshot_content
-            .as_ref()
-            .map(|value| format!("'{}'", escape_sql_string(value)))
-            .unwrap_or_else(|| "NULL".to_string());
-        let metadata_sql = row
-            .metadata
-            .as_ref()
-            .map(|value| format!("'{}'", escape_sql_string(value)))
-            .unwrap_or_else(|| "NULL".to_string());
-        let writer_key_sql = row
-            .writer_key
-            .as_ref()
-            .map(|value| format!("'{}'", escape_sql_string(value)))
-            .unwrap_or_else(|| "NULL".to_string());
-        let is_tombstone = if row.snapshot_content.is_some() { 0 } else { 1 };
-
-        let sql = format!(
-            "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
-             ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', {snapshot_content}, '{change_id}', {metadata}, {writer_key}, {is_tombstone}, '{created_at}', '{updated_at}'\
-             ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
-             schema_key = excluded.schema_key, \
-             schema_version = excluded.schema_version, \
-             global = excluded.global, \
-             plugin_key = excluded.plugin_key, \
-             snapshot_content = excluded.snapshot_content, \
-             change_id = excluded.change_id, \
-             metadata = excluded.metadata, \
-             writer_key = excluded.writer_key, \
-             is_tombstone = excluded.is_tombstone, \
-             updated_at = excluded.updated_at",
-            table = REGISTERED_SCHEMA_BOOTSTRAP_TABLE,
-            entity_id = escape_sql_string(&row.entity_id),
-            schema_key = escape_sql_string(&row.schema_key),
-            schema_version = escape_sql_string(&row.schema_version),
-            file_id = escape_sql_string(&row.file_id),
-            version_id = escape_sql_string(&row.lixcol_version_id),
-            plugin_key = escape_sql_string(&row.plugin_key),
-            snapshot_content = snapshot_sql,
-            change_id = escape_sql_string(&row.id),
-            metadata = metadata_sql,
-            writer_key = writer_key_sql,
-            is_tombstone = is_tombstone,
-            created_at = escape_sql_string(&row.created_at),
-            updated_at = escape_sql_string(&row.created_at),
-        );
-
-        transaction.execute(&sql, &[]).await?;
-    }
-
-    Ok(())
 }
 
 pub(crate) async fn apply_public_version_last_checkpoint_side_effects(

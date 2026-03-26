@@ -9,7 +9,7 @@ pub(crate) fn insert_filesystem_payload_domain_changes_sql(
             "INSERT INTO {} (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
              ) VALUES {row_values}",
-            tables::state::INTERNAL_STATE_VTABLE,
+            tables::state::STATE_BY_VERSION,
         );
     }
 

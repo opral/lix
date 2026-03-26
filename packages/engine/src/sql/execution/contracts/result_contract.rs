@@ -5,9 +5,3 @@ pub(crate) enum ResultContract {
     DmlReturning,
     Other,
 }
-
-impl ResultContract {
-    pub(crate) fn expects_postprocess_output(self) -> bool {
-        matches!(self, Self::DmlReturning)
-    }
-}

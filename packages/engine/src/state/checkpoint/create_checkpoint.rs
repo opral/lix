@@ -158,7 +158,7 @@ async fn ensure_checkpoint_label_on_commit(
     let exists = tx
         .execute_internal(
             "SELECT 1 \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE entity_id = $1 \
                AND schema_key = 'lix_entity_label' \
                AND file_id = 'lix' \
@@ -183,7 +183,7 @@ async fn ensure_checkpoint_label_on_commit(
     }
 
     tx.execute_internal(
-        "INSERT INTO lix_internal_state_vtable (\
+        "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
          ) VALUES ($1, 'lix_entity_label', 'lix', $2, 'lix', $3, '1', true)",
         &[

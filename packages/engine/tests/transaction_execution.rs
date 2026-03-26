@@ -10,7 +10,7 @@ fn deterministic_uuid(counter: i64) -> String {
 
 fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     format!(
-        "INSERT INTO lix_internal_state_vtable (\
+        "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
          '{key}', 'lix_key_value', 'lix', 'global', 'lix', '{{\"key\":\"{key}\",\"value\":{value_json}}}', '1'\
@@ -29,7 +29,7 @@ fn insert_many_key_values_sql(row_count: usize) -> String {
         ));
     }
     format!(
-        "INSERT INTO lix_internal_state_vtable (\
+        "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES {rows}"
     )
@@ -63,7 +63,7 @@ async fn read_sequence_value(engine: &support::simulation_test::SimulationEngine
     let sequence = engine
         .execute(
             "SELECT snapshot_content \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' \
                AND entity_id = 'lix_deterministic_sequence_number' \
                AND version_id = 'global' \
@@ -102,9 +102,8 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
 async fn register_state_history_test_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
-             '{\"value\":{\"x-lix-key\":\"tx_state_history_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
+            "INSERT INTO lix_registered_schema (value) VALUES (\
+             lix_json('{\"x-lix-key\":\"tx_state_history_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}')\
              )",
             &[],
         )
@@ -274,16 +273,15 @@ simulation_test!(
             .transaction(ExecuteOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
-                        "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-                         'lix_registered_schema',\
-                         '{\"value\":{\"x-lix-key\":\"tx_validation_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
+                        "INSERT INTO lix_registered_schema (value) VALUES (\
+                         lix_json('{\"x-lix-key\":\"tx_validation_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}')\
                          )",
                         &[],
                     )
                     .await?;
 
                     tx.execute(
-                        "INSERT INTO lix_internal_state_vtable (\
+                        "INSERT INTO lix_state_by_version (\
                          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                          ) VALUES (\
                          'entity-1', 'tx_validation_schema', 'file-1', 'version-1', 'lix', '{\"missing\":\"field\"}', '1'\

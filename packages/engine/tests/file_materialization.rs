@@ -369,8 +369,7 @@ fn plugin_txt_noop_wasm_bytes() -> Vec<u8> {
 async fn register_plugin_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+            "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"json_pointer\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"value\":{}},\"required\":[\"path\",\"value\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -1629,7 +1628,7 @@ mod legacy_plugin_and_cache_tests {
                 .execute(
                     &format!(
                         "SELECT COUNT(*) \
-                     FROM lix_internal_state_vtable \
+                     FROM lix_state_by_version \
                      WHERE schema_key = 'lix_commit_edge' \
                        AND entity_id = '{}' \
                        AND snapshot_content IS NOT NULL",
@@ -2152,7 +2151,7 @@ mod legacy_plugin_and_cache_tests {
                 .execute(
                     &format!(
                         "SELECT COUNT(*) \
-                     FROM lix_internal_state_vtable \
+                     FROM lix_state_by_version \
                      WHERE file_id = 'file-json-path-only-switch' \
                        AND version_id = '{}' \
                        AND schema_key = 'json_pointer' \
@@ -3197,7 +3196,7 @@ mod legacy_plugin_and_cache_tests {
             engine
             .execute(
                 &format!(
-                    "INSERT INTO lix_internal_state_vtable (\
+                    "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) \
                      SELECT \
@@ -3278,7 +3277,7 @@ mod legacy_plugin_and_cache_tests {
             engine
             .execute(
                 &format!(
-                    "INSERT INTO lix_internal_state_vtable (\
+                    "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) \
                      SELECT \

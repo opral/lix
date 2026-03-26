@@ -1,6 +1,7 @@
 mod support;
 
 use lix_engine::{ExecuteOptions, LixError, Value};
+use serde_json::json;
 
 fn assert_text(value: &Value, expected: &str) {
     match value {
@@ -40,13 +41,16 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
 
 async fn register_writer_key_test_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
-        .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
-             '{\"value\":{\"x-lix-key\":\"wk_writer_key_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+        .register_schema(&json!({
+            "x-lix-key": "wk_writer_key_schema",
+            "x-lix-version": "1",
+            "type": "object",
+            "properties": {
+                "key": { "type": "string" }
+            },
+            "required": ["key"],
+            "additionalProperties": false
+        }))
         .await
         .unwrap();
 }
@@ -67,7 +71,7 @@ simulation_test!(
         engine
             .execute_with_options(
                 &format!(
-                    "INSERT INTO lix_internal_state_vtable (\
+                    "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) VALUES (\
                      'wk-tracked', 'wk_writer_key_schema', 'file-1', '{version_id}', 'lix', '{{\"key\":\"tracked\"}}', '1'\
@@ -84,7 +88,7 @@ simulation_test!(
         engine
             .execute_with_options(
                 &format!(
-                    "INSERT INTO lix_internal_state_vtable (\
+                    "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                      ) VALUES (\
                      'wk-untracked', 'wk_writer_key_schema', 'file-1', '{version_id}', 'lix', '{{\"key\":\"untracked\"}}', '1', true\
@@ -291,7 +295,7 @@ simulation_test!(
 
         engine
             .execute(
-                "UPDATE lix_internal_state_vtable \
+                "UPDATE lix_state_by_version \
                  SET metadata = '{\"source\":\"update\"}' \
                  WHERE schema_key = 'lix_file_descriptor' \
                    AND entity_id = 'wk-clear-update'",
@@ -480,7 +484,7 @@ simulation_test!(
 
         engine
             .execute(
-                "UPDATE lix_internal_state_vtable \
+                "UPDATE lix_state_by_version \
                  SET writer_key = 'editor:explicit-update' \
                  WHERE schema_key = 'lix_file_descriptor' \
                    AND entity_id = 'wk-update-writer'",
@@ -526,7 +530,7 @@ simulation_test!(
         engine
             .execute_with_options(
                 &format!(
-                    "INSERT INTO lix_internal_state_vtable (\
+                    "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) VALUES (\
                      'wk-public-update', 'wk_writer_key_schema', 'file-1', '{version_id}', 'lix', '{{\"key\":\"before\"}}', '1'\

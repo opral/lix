@@ -30,8 +30,7 @@ fn scrub_timestamp_fields(value: &mut serde_json::Value) {
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+            "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"materialization_test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -192,7 +191,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT snapshot_content, change_id \
-                         FROM lix_internal_state_vtable \
+                         FROM lix_state_by_version \
                          WHERE schema_key = 'materialization_test_schema' \
                            AND entity_id = 'entity-2' \
                            AND version_id = '{}' \
@@ -300,7 +299,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT entity_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'materialization_test_schema' \
                  ORDER BY entity_id",
                 &[],

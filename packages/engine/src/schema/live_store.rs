@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::backend::QueryExecutor;
 use crate::errors::classification::is_missing_relation_error;
+use crate::live_state::storage::json_value_from_live_row_cell;
 use crate::schema::live_layout::{
-    json_value_from_live_row_cell, load_live_row_access_with_executor, tracked_live_table_name,
-    LiveColumnKind, LiveRowAccess,
+    load_live_row_access_with_executor, tracked_live_table_name, LiveColumnKind, LiveRowAccess,
 };
 use crate::{LixError, Value};
 
@@ -174,7 +174,11 @@ pub(crate) fn logical_snapshot_text(
             &row.schema_key,
             &column.column_name,
         )?;
-        if !json_value.is_null() {
+        if json_value.is_null() {
+            if column.preserve_null_in_logical_snapshot() {
+                object.insert(column.property_name.clone(), serde_json::Value::Null);
+            }
+        } else {
             object.insert(column.property_name.clone(), json_value);
         }
     }

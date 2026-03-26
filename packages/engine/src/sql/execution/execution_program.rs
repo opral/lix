@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::engine::{Engine, ExecuteOptions};
+use crate::sql::compat::internal_state_vtable::normalize_legacy_internal_state_vtable_statements;
 use crate::sql_support::binding::{
     bind_statement_binding_template, compile_statement_binding_template_with_state,
     PlaceholderState, StatementBindingTemplate,
@@ -222,7 +223,9 @@ impl ExecutionProgram {
         params: &[Value],
         dialect: SqlDialect,
     ) -> Result<Self, LixError> {
-        let source_statements = coalesce_vtable_inserts_in_transactions(original_statements)?;
+        let mut source_statements = original_statements;
+        normalize_legacy_internal_state_vtable_statements(&mut source_statements);
+        let source_statements = coalesce_vtable_inserts_in_transactions(source_statements)?;
         let mut steps = Vec::with_capacity(source_statements.len());
         let mut placeholder_state = PlaceholderState::new();
         for statement in source_statements.iter().cloned() {

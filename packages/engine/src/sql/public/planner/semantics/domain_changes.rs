@@ -150,7 +150,10 @@ fn build_domain_change_batch_for_partition(
             .version_id
             .clone()
             .unwrap_or_else(|| "active".to_string());
-        let writer_key = command_writer_key(planned_write);
+        let writer_key = resolved_row_writer_key(
+            row,
+            planned_write.command.execution_context.writer_key.as_deref(),
+        );
         let operation_key = if row.tombstone {
             "state.delete"
         } else {
@@ -378,34 +381,15 @@ where
     })
 }
 
-fn command_writer_key(planned_write: &PlannedWrite) -> Option<String> {
-    match &planned_write.command.payload {
-        crate::sql::public::planner::ir::MutationPayload::UpdatePatch(payload) => {
-            if !payload.contains_key("writer_key") {
-                return planned_write.command.execution_context.writer_key.clone();
-            }
-
-            match payload.get("writer_key") {
-                Some(crate::Value::Text(value)) => Some(value.clone()),
-                Some(crate::Value::Null) | None => None,
-                _ => None,
-            }
-        }
-        crate::sql::public::planner::ir::MutationPayload::InsertRows(payloads) => {
-            payloads.first().and_then(|payload| {
-                if !payload.contains_key("writer_key") {
-                    return planned_write.command.execution_context.writer_key.clone();
-                }
-                match payload.get("writer_key") {
-                    Some(crate::Value::Text(value)) => Some(value.clone()),
-                    Some(crate::Value::Null) | None => None,
-                    _ => None,
-                }
-            })
-        }
-        crate::sql::public::planner::ir::MutationPayload::Tombstone => {
-            planned_write.command.execution_context.writer_key.clone()
-        }
+fn resolved_row_writer_key(
+    row: &PlannedStateRow,
+    execution_writer_key: Option<&str>,
+) -> Option<String> {
+    match row.values.get("writer_key") {
+        Some(crate::Value::Text(value)) => Some(value.clone()),
+        Some(crate::Value::Null) => None,
+        Some(_) => None,
+        None => execution_writer_key.map(str::to_string),
     }
 }
 
@@ -623,4 +607,5 @@ mod tests {
             "idempotency key should stay tip-independent for large payloads"
         );
     }
+
 }

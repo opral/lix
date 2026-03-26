@@ -232,20 +232,6 @@ fn guardrail_filesystem_public_surfaces_do_not_enter_legacy_query_rewrite() {
 }
 
 #[test]
-fn guardrail_vtable_read_stays_filesystem_blind() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let vtable_read_source = fs::read_to_string(root.join("src/sql/internal/vtable_read.rs"))
-        .expect("vtable_read.rs should be readable");
-
-    for forbidden in ["lix_file", "lix_directory", "filesystem::"] {
-        assert!(
-            !vtable_read_source.contains(forbidden),
-            "vtable_read must not reintroduce public filesystem bridge logic: {forbidden}"
-        );
-    }
-}
-
-#[test]
 fn guardrail_legacy_filesystem_select_rewrite_is_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
@@ -289,30 +275,6 @@ fn guardrail_dead_canonical_filesystem_write_wrapper_stays_removed() {
 }
 
 #[test]
-fn guardrail_legacy_canonical_statement_rewrite_is_filesystem_blind() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let canonical_mod_source =
-        fs::read_to_string(root.join("src/sql/internal/canonical_write.rs"))
-            .expect("canonical_write.rs should be readable");
-
-    for forbidden in [
-        "mutation_rewrite::rewrite_insert(",
-        "mutation_rewrite::rewrite_update(",
-        "mutation_rewrite::rewrite_delete(",
-        "mutation_rewrite::insert_side_effect_statements_with_backend(",
-        "filesystem backend insert side-effect discovery failed",
-        "filesystem backend insert rewrite failed",
-        "filesystem/backend insert vtable lowering failed",
-        "FilesystemUpdateRewrite",
-    ] {
-        assert!(
-            !canonical_mod_source.contains(forbidden),
-            "legacy canonical statement rewrite must not carry filesystem write branches: {forbidden}"
-        );
-    }
-}
-
-#[test]
 fn guardrail_state_module_no_longer_owns_sql_runtime_layers() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let state_mod_source =
@@ -333,6 +295,13 @@ fn guardrail_state_module_no_longer_owns_sql_runtime_layers() {
         "src/state/internal/followup.rs",
         "src/state/internal/vtable_read.rs",
         "src/state/internal/vtable_write.rs",
+        "src/sql/internal/canonical_write.rs",
+        "src/sql/internal/followup.rs",
+        "src/sql/internal/mutation_plan.rs",
+        "src/sql/internal/mutation_runtime.rs",
+        "src/sql/internal/postprocess.rs",
+        "src/sql/internal/vtable_read.rs",
+        "src/sql/internal/vtable_write.rs",
     ] {
         assert!(
             !root.join(removed).exists(),
@@ -343,10 +312,7 @@ fn guardrail_state_module_no_longer_owns_sql_runtime_layers() {
     for added in [
         "src/sql/public/validation.rs",
         "src/sql/internal/script.rs",
-        "src/sql/internal/canonical_write.rs",
-        "src/sql/internal/followup.rs",
-        "src/sql/internal/vtable_read.rs",
-        "src/sql/internal/vtable_write.rs",
+        "src/sql/compat/internal_state_vtable.rs",
     ] {
         assert!(
             root.join(added).exists(),
@@ -575,7 +541,7 @@ fn guardrail_state_assignment_semantics_stay_out_of_write_resolver() {
         "apply_state_assignments(",
         "apply_entity_state_assignments(",
         "build_state_insert_row(",
-        "build_entity_insert_rows_from_assignments(",
+        "build_entity_insert_rows_with_functions(",
         "ensure_identity_columns_preserved(",
     ] {
         assert!(

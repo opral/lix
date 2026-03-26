@@ -31,7 +31,7 @@ async fn seed_key_value_row(
     version_id: &str,
 ) {
     let sql = format!(
-        "INSERT INTO lix_internal_state_vtable (\
+        "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
          '{entity_id}', 'lix_key_value', 'lix', '{version_id}', 'lix', '{snapshot}', '1'\

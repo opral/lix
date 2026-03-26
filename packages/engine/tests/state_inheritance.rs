@@ -38,8 +38,7 @@ fn normalize_bool_like_rows(rows: &[Vec<Value>], columns: &[usize]) -> Vec<Vec<V
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+            "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -64,7 +63,7 @@ async fn insert_state_row(
     snapshot_content: &str,
 ) {
     let sql = format!(
-        "INSERT INTO lix_internal_state_vtable (\
+        "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
          '{entity_id}', 'test_state_schema', 'test-file', '{version_id}', 'lix', '{snapshot_content}', '1'\

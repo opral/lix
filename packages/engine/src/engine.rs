@@ -6,10 +6,10 @@ use crate::schema::schema_from_registered_snapshot;
 use crate::sql::execution::execution_program::ExecutionContext;
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::public::catalog::SurfaceRegistry;
+use crate::sql::public::validation::SchemaCache;
 use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
-use crate::sql::public::validation::SchemaCache;
 use crate::transaction::{
     execute_parsed_statements_in_write_transaction, TransactionCommitOutcome, WriteTransaction,
 };
@@ -479,7 +479,7 @@ pub(crate) struct DeferredTransactionSideEffects {
 
 pub(crate) fn reject_internal_table_writes(statements: &[Statement]) -> Result<(), LixError> {
     for statement in statements {
-        if statement_mutates_lix_internal_table(statement) {
+        if statement_mutates_protected_lix_relation(statement) {
             return Err(crate::errors::internal_table_access_denied_error());
         }
     }
@@ -496,14 +496,14 @@ pub(crate) fn reject_public_create_table(statements: &[Statement]) -> Result<(),
     Ok(())
 }
 
-fn statement_mutates_lix_internal_table(statement: &Statement) -> bool {
+fn statement_mutates_protected_lix_relation(statement: &Statement) -> bool {
     match statement {
         Statement::Insert(insert) => match &insert.table {
-            TableObject::TableName(name) => object_name_is_lix_internal(name),
+            TableObject::TableName(name) => object_name_is_internal_storage_relation(name),
             _ => false,
         },
         Statement::Update(update) => match &update.table.relation {
-            TableFactor::Table { name, .. } => object_name_is_lix_internal(name),
+            TableFactor::Table { name, .. } => object_name_is_internal_storage_relation(name),
             _ => false,
         },
         Statement::Delete(delete) => {
@@ -512,53 +512,64 @@ fn statement_mutates_lix_internal_table(statement: &Statement) -> bool {
                 | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
             };
             tables.iter().any(|table| match &table.relation {
-                TableFactor::Table { name, .. } => object_name_is_lix_internal(name),
+                TableFactor::Table { name, .. } => object_name_is_internal_storage_relation(name),
                 _ => false,
             })
         }
-        Statement::AlterTable(alter) => object_name_is_lix_internal(&alter.name),
+        Statement::AlterTable(alter) => object_name_is_protected_lix_ddl_target(&alter.name),
         Statement::CreateIndex(create_index) => {
-            object_name_is_lix_internal(&create_index.table_name)
+            object_name_is_protected_lix_ddl_target(&create_index.table_name)
         }
         Statement::CreateTrigger(create_trigger) => {
-            object_name_is_lix_internal(&create_trigger.table_name)
+            object_name_is_protected_lix_ddl_target(&create_trigger.table_name)
                 || create_trigger
                     .referenced_table_name
                     .as_ref()
-                    .map(object_name_is_lix_internal)
+                    .map(object_name_is_protected_lix_ddl_target)
                     .unwrap_or(false)
         }
         Statement::DropTrigger(drop_trigger) => drop_trigger
             .table_name
             .as_ref()
-            .map(object_name_is_lix_internal)
+            .map(object_name_is_protected_lix_ddl_target)
             .unwrap_or(false),
         Statement::Drop { names, table, .. } => {
-            names.iter().any(object_name_is_lix_internal)
+            names.iter().any(object_name_is_protected_lix_ddl_target)
                 || table
                     .as_ref()
-                    .map(object_name_is_lix_internal)
+                    .map(object_name_is_protected_lix_ddl_target)
                     .unwrap_or(false)
         }
         Statement::Truncate(truncate) => truncate
             .table_names
             .iter()
-            .any(|target| object_name_is_lix_internal(&target.name)),
+            .any(|target| object_name_is_protected_lix_ddl_target(&target.name)),
         _ => false,
     }
 }
 
-fn object_name_is_lix_internal(name: &sqlparser::ast::ObjectName) -> bool {
+fn object_name_to_relation(name: &sqlparser::ast::ObjectName) -> Option<String> {
     name.0
         .last()
         .and_then(ObjectNamePart::as_ident)
-        .map(|ident| {
-            ident
-                .value
-                .to_ascii_lowercase()
-                .starts_with("lix_internal_")
-        })
+        .map(|ident| ident.value.to_ascii_lowercase())
+}
+
+fn object_name_is_internal_storage_relation(name: &sqlparser::ast::ObjectName) -> bool {
+    object_name_to_relation(name)
+        .map(|relation| relation.starts_with("lix_internal_"))
         .unwrap_or(false)
+}
+
+fn object_name_is_protected_lix_ddl_target(name: &sqlparser::ast::ObjectName) -> bool {
+    let Some(relation) = object_name_to_relation(name) else {
+        return false;
+    };
+
+    relation.starts_with("lix_internal_")
+        || crate::sql::public::catalog::builtin_public_surface_names()
+            .iter()
+            .any(|surface| surface.eq_ignore_ascii_case(&relation))
 }
 
 pub(crate) async fn normalize_sql_execution_error_with_backend(
@@ -701,54 +712,6 @@ pub(crate) fn should_run_binary_cas_gc(
             .any(|change| change.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
 }
 
-pub(crate) fn collect_postprocess_file_cache_targets(
-    rows: &[Vec<Value>],
-    schema_key: &str,
-) -> Result<BTreeSet<(String, String)>, LixError> {
-    if schema_key == FILE_DESCRIPTOR_SCHEMA_KEY || schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
-        return Ok(BTreeSet::new());
-    }
-
-    let mut targets = BTreeSet::new();
-    for row in rows {
-        let Some(file_id) = row.get(1) else {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "postprocess file cache refresh expected file_id column".to_string(),
-            });
-        };
-        let Some(version_id) = row.get(2) else {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "postprocess file cache refresh expected version_id column"
-                    .to_string(),
-            });
-        };
-        let Value::Text(file_id) = file_id else {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "postprocess file cache refresh expected text file_id, got {file_id:?}"
-                ),
-            });
-        };
-        let Value::Text(version_id) = version_id else {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "postprocess file cache refresh expected text version_id, got {version_id:?}"
-                ),
-            });
-        };
-        if file_id == "lix" {
-            continue;
-        }
-        targets.insert((file_id.clone(), version_id.clone()));
-    }
-
-    Ok(targets)
-}
-
 trait DedupableFilesystemPayloadChange {
     fn dedupe_key(&self) -> (&str, &str, &str, &str, bool);
 }
@@ -817,12 +780,12 @@ mod tests {
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
     use crate::sql::analysis::state_resolution::effects::active_version_from_update_validations;
     use crate::sql::analysis::state_resolution::optimize::should_refresh_file_cache_for_statements;
+    use crate::sql::execution::contracts::planned_statement::UpdateValidationPlan;
+    use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
     use crate::sql_support::binding::{
         advance_placeholder_state_for_statement_ast, bind_sql_with_state, parse_sql_statements,
         PlaceholderState,
     };
-    use crate::sql::execution::contracts::planned_statement::UpdateValidationPlan;
-    use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
     use crate::version::active_version_schema_key;
     use crate::{LixError, NoopWasmRuntime, QueryResult, Value};
     use async_trait::async_trait;
@@ -964,7 +927,7 @@ mod tests {
             "UPDATE lix_state_history SET snapshot_content = '{}' WHERE file_id = 'f'"
         ));
         assert!(!should_refresh_file_cache_for_sql(
-            "UPDATE lix_internal_state_vtable SET snapshot_content = '{}' WHERE file_id = 'f'"
+            "UPDATE lix_state_by_version SET snapshot_content = '{}' WHERE file_id = 'f'"
         ));
     }
 
@@ -1200,7 +1163,7 @@ mod tests {
 
     fn update_validation_plan(where_clause: Expr, version_id: &str) -> UpdateValidationPlan {
         UpdateValidationPlan {
-            kind: crate::sql::execution::contracts::planned_statement::UpdateValidationKind::Update,
+            delete: false,
             table: untracked_live_table_name("lix_active_version"),
             where_clause: Some(where_clause),
             snapshot_content: Some(json!({

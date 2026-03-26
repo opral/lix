@@ -2,11 +2,12 @@ mod support;
 
 use chrono::DateTime;
 use lix_engine::Value;
+use serde_json::json;
 use uuid::Uuid;
 
 fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     format!(
-        "INSERT INTO lix_internal_state_vtable (\
+        "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
          '{key}', 'lix_key_value', 'lix', 'global', 'lix', '{{\"key\":\"{key}\",\"value\":{value_json}}}', '1'\
@@ -14,30 +15,60 @@ fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     )
 }
 
-fn register_test_schema_sql() -> &'static str {
-    "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-     'lix_registered_schema',\
-     '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-     )"
-}
-
-fn register_defaults_schema_sql() -> &'static str {
-    "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-     'lix_registered_schema',\
-     '{\"value\":{\"x-lix-key\":\"defaults_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"created_at\":{\"type\":\"string\",\"x-lix-default\":\"lix_timestamp()\"}},\"additionalProperties\":false}}'\
-     )"
-}
-
 fn deterministic_uuid(counter: i64) -> String {
     let counter_bits = (counter as u64) & 0x0000_FFFF_FFFF_FFFF;
     format!("01920000-0000-7000-8000-{counter_bits:012x}")
+}
+
+async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
+    engine
+        .register_schema(&json!({
+            "x-lix-key": "test_schema",
+            "x-lix-version": "1",
+            "x-lix-primary-key": ["/key"],
+            "x-lix-override-lixcols": {
+                "lixcol_file_id": "\"lix\"",
+                "lixcol_plugin_key": "\"lix\"",
+                "lixcol_global": "true"
+            },
+            "type": "object",
+            "properties": {
+                "key": { "type": "string" }
+            },
+            "required": ["key"],
+            "additionalProperties": false
+        }))
+        .await
+        .unwrap();
+}
+
+async fn register_defaults_schema(engine: &support::simulation_test::SimulationEngine) {
+    engine
+        .register_schema(&json!({
+            "x-lix-key": "defaults_schema",
+            "x-lix-version": "1",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-override-lixcols": {
+                "lixcol_file_id": "\"lix\"",
+                "lixcol_plugin_key": "\"lix\"",
+                "lixcol_global": "true"
+            },
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "x-lix-default": "lix_uuid_v7()" },
+                "created_at": { "type": "string", "x-lix-default": "lix_timestamp()" }
+            },
+            "additionalProperties": false
+        }))
+        .await
+        .unwrap();
 }
 
 async fn read_sequence_value(engine: &support::simulation_test::SimulationEngine) -> i64 {
     let sequence = engine
         .execute(
             "SELECT snapshot_content \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' \
                AND entity_id = 'lix_deterministic_sequence_number' \
                AND version_id = 'global' \
@@ -98,7 +129,7 @@ simulation_test!(
         let mode_row = engine
             .execute(
                 "SELECT snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_key_value' \
                    AND entity_id = 'lix_deterministic_mode' \
                    AND version_id = 'global' \
@@ -178,7 +209,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    deterministic_mode_applies_to_tracked_vtable_metadata,
+    deterministic_mode_applies_to_tracked_metadata,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
@@ -186,10 +217,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        engine
-            .execute(register_test_schema_sql(), &[])
-            .await
-            .unwrap();
+        register_test_schema(&engine).await;
         engine
             .execute(
                 &insert_key_value_sql("lix_deterministic_mode", "{\"enabled\":true}"),
@@ -200,11 +228,9 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
-                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                 ) VALUES (\
-                 'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1'\
-                 )", &[])
+                "INSERT INTO test_schema (key) VALUES ('tracked')",
+                &[],
+            )
             .await
             .unwrap();
 
@@ -212,7 +238,7 @@ simulation_test!(
             .execute(
                 "SELECT id, snapshot_id, created_at \
                  FROM lix_internal_change \
-                 WHERE entity_id = 'entity-1' AND schema_key = 'test_schema' \
+                 WHERE entity_id = 'tracked' AND schema_key = 'test_schema' \
                  LIMIT 1",
                 &[],
             )
@@ -226,7 +252,7 @@ simulation_test!(
         );
         assert_eq!(
             changes.statements[0].rows[0][1],
-            Value::Text(deterministic_uuid(9))
+            Value::Text(deterministic_uuid(10))
         );
         assert_eq!(
             changes.statements[0].rows[0][2],
@@ -235,10 +261,9 @@ simulation_test!(
 
         let materialized = engine
             .execute(
-                "SELECT change_id, created_at, updated_at \
-                 FROM lix_internal_state_vtable \
-                 WHERE schema_key = 'test_schema' \
-                   AND entity_id = 'entity-1' \
+                "SELECT lixcol_change_id, lixcol_created_at, lixcol_updated_at \
+                 FROM test_schema \
+                 WHERE key = 'tracked' \
                  LIMIT 1",
                 &[],
             )
@@ -259,7 +284,7 @@ simulation_test!(
             Value::Text("1970-01-01T00:00:00.000Z".to_string())
         );
 
-        assert_eq!(read_sequence_value(&engine).await, 11);
+        assert_eq!(read_sequence_value(&engine).await, 9);
     }
 );
 
@@ -317,10 +342,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        engine
-            .execute(register_defaults_schema_sql(), &[])
-            .await
-            .unwrap();
+        register_defaults_schema(&engine).await;
         engine
             .execute(
                 &insert_key_value_sql("lix_deterministic_mode", "{\"enabled\":true}"),
@@ -330,22 +352,16 @@ simulation_test!(
             .unwrap();
 
         engine
-        .execute(
-            "INSERT INTO lix_internal_state_vtable (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-             ) VALUES (\
-             'entity-defaults', 'defaults_schema', 'file-1', 'version-1', 'lix', '{}', '1'\
-             )", &[])
-        .await
-        .unwrap();
+            .execute("INSERT INTO defaults_schema DEFAULT VALUES", &[])
+            .await
+            .unwrap();
 
         let row = engine
             .execute(
                 "SELECT snapshot_content \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'defaults_schema' \
-               AND entity_id = 'entity-defaults' \
-               AND version_id = 'version-1' \
+               AND version_id = 'global' \
                AND snapshot_content IS NOT NULL \
              LIMIT 1",
                 &[],
@@ -367,8 +383,9 @@ simulation_test!(
         assert_eq!(id, deterministic_uuid(1));
         assert_eq!(created_at, "1970-01-01T00:00:00.000Z");
 
-        // 2 calls from CEL defaults plus the remaining tracked commit/materialization writes.
-        assert_eq!(read_sequence_value(&engine).await, 13);
+        // The entity-surface path now shares the normal tracked write contract, so the
+        // end-to-end sequence shape matches the regular public write path.
+        assert_eq!(read_sequence_value(&engine).await, 11);
     }
 );
 

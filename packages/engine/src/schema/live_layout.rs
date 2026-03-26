@@ -5,10 +5,8 @@ pub(crate) const TRACKED_LIVE_TABLE_PREFIX: &str = "lix_internal_live_v1_";
 
 use crate::backend::QueryExecutor;
 use crate::schema::builtin::builtin_schema_definition;
-use crate::schema::registry::{
-    compile_registered_live_layout, load_live_table_layout_with_backend,
-};
-use crate::{LixBackend, LixError, Value};
+use crate::schema::registry::compile_registered_live_layout;
+use crate::{LixError, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveColumnKind {
@@ -24,6 +22,8 @@ pub(crate) struct LiveColumnSpec {
     pub(crate) property_name: String,
     pub(crate) column_name: String,
     pub(crate) kind: LiveColumnKind,
+    pub(crate) required: bool,
+    pub(crate) nullable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +75,10 @@ impl LiveColumnSpec {
             }
         }
     }
+
+    pub(crate) fn preserve_null_in_logical_snapshot(&self) -> bool {
+        self.required && self.nullable
+    }
 }
 
 pub(crate) fn builtin_live_table_layout(
@@ -101,6 +105,17 @@ pub(crate) fn live_table_layout_from_schema(
 
     let mut columns = Vec::new();
     let mut seen_columns = BTreeSet::new();
+    let required_properties = schema
+        .get("required")
+        .and_then(JsonValue::as_array)
+        .map(|required| {
+            required
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
     if let Some(properties) = schema.get("properties").and_then(JsonValue::as_object) {
         let mut ordered = properties.iter().collect::<Vec<_>>();
         ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -125,6 +140,8 @@ pub(crate) fn live_table_layout_from_schema(
                 property_name: property_name.clone(),
                 column_name,
                 kind,
+                required: required_properties.contains(property_name.as_str()),
+                nullable: schema_property_is_nullable(property_schema),
             });
         }
     }
@@ -157,7 +174,9 @@ where
             match columns_by_name.get(&column.column_name) {
                 Some(existing)
                     if existing.kind != column.kind
-                        || existing.property_name != column.property_name =>
+                        || existing.property_name != column.property_name
+                        || existing.required != column.required
+                        || existing.nullable != column.nullable =>
                 {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
@@ -200,11 +219,9 @@ impl LiveRowAccess {
         row: &[Value],
         normalized_start_index: usize,
     ) -> Result<Option<JsonValue>, LixError> {
-        logical_live_snapshot_from_row_with_layout(
-            Some(&self.layout),
-            &self.layout.schema_key,
+        logical_live_snapshot_from_legacy_layout(
+            &self.layout,
             row,
-            0,
             normalized_start_index,
         )
     }
@@ -241,15 +258,6 @@ pub(crate) async fn load_live_table_layout_with_executor(
         .execute(REGISTERED_SCHEMA_BOOTSTRAP_LAYOUT_SQL, &[])
         .await?;
     compile_registered_live_layout(schema_key, result.rows)
-}
-
-pub(crate) async fn load_live_row_access_with_backend(
-    backend: &dyn LixBackend,
-    schema_key: &str,
-) -> Result<LiveRowAccess, LixError> {
-    Ok(LiveRowAccess::new(
-        load_live_table_layout_with_backend(backend, schema_key).await?,
-    ))
 }
 
 fn live_envelope_column_names() -> BTreeSet<&'static str> {
@@ -313,52 +321,6 @@ pub(crate) fn normalized_live_column_values(
         );
     }
     Ok(values)
-}
-
-pub(crate) fn normalized_live_returning_columns(schema_key: &str) -> Result<Vec<String>, LixError> {
-    Ok(builtin_live_table_layout(schema_key)?
-        .map(|layout| normalized_live_returning_columns_for_layout(&layout))
-        .unwrap_or_default())
-}
-
-pub(crate) fn normalized_live_returning_columns_for_layout(
-    layout: &LiveTableLayout,
-) -> Vec<String> {
-    layout
-        .columns
-        .iter()
-        .map(|column| column.column_name.clone())
-        .collect()
-}
-
-pub(crate) fn logical_live_snapshot_from_row_with_layout(
-    layout: Option<&LiveTableLayout>,
-    schema_key: &str,
-    row: &[Value],
-    snapshot_index: usize,
-    normalized_start_index: usize,
-) -> Result<Option<JsonValue>, LixError> {
-    let Some(layout) = layout else {
-        return snapshot_value_from_row(row, snapshot_index, schema_key);
-    };
-    let mut object = serde_json::Map::new();
-    for (offset, column) in layout.columns.iter().enumerate() {
-        let value = row.get(normalized_start_index + offset).ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                &format!(
-                    "normalized live row for schema '{}' missing returning column '{}'",
-                    schema_key, column.column_name
-                ),
-            )
-        })?;
-        let json_value =
-            json_value_from_live_row_cell(value, column.kind, schema_key, &column.column_name)?;
-        if !json_value.is_null() {
-            object.insert(column.property_name.clone(), json_value);
-        }
-    }
-    Ok(Some(JsonValue::Object(object)))
 }
 
 pub(crate) fn render_normalized_live_projection_sql(
@@ -431,6 +393,40 @@ fn live_column_kind_from_schema(schema: &JsonValue) -> Option<LiveColumnKind> {
     None
 }
 
+fn schema_property_is_nullable(schema: &JsonValue) -> bool {
+    if schema.is_null() {
+        return true;
+    }
+    if schema
+        .get("nullable")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    match schema.get("type") {
+        Some(JsonValue::String(kind)) if kind == "null" => return true,
+        Some(JsonValue::Array(kinds)) => {
+            if kinds.iter().any(|kind| kind.as_str() == Some("null")) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    if schema
+        .get("const")
+        .map(JsonValue::is_null)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    ["anyOf", "oneOf"]
+        .into_iter()
+        .filter_map(|key| schema.get(key).and_then(JsonValue::as_array))
+        .flatten()
+        .any(schema_property_is_nullable)
+}
+
 fn live_column_name(property_name: &str, kind: LiveColumnKind) -> String {
     let base = match kind {
         LiveColumnKind::JsonText => format!("{property_name}_json"),
@@ -455,134 +451,118 @@ fn qualified_column_ref(table_alias: Option<&str>, column_name: &str) -> String 
     }
 }
 
-fn snapshot_value_from_row(
-    row: &[Value],
-    snapshot_index: usize,
-    schema_key: &str,
-) -> Result<Option<JsonValue>, LixError> {
-    let value = row.get(snapshot_index).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            &format!(
-                "live row for schema '{}' missing snapshot_content column at index {}",
-                schema_key, snapshot_index
-            ),
-        )
-    })?;
-    match value {
-        Value::Null => Ok(None),
-        Value::Json(value) => Ok(Some(value.clone())),
-        Value::Text(text) => serde_json::from_str(text).map(Some).map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                &format!(
-                    "live row for schema '{}' returned invalid snapshot_content JSON: {error}",
-                    schema_key
-                ),
-            )
-        }),
-        other => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            &format!(
-                "live row for schema '{}' expected null/text/json snapshot_content, got {other:?}",
-                schema_key
-            ),
-        )),
-    }
-}
-
-pub(crate) fn json_value_from_live_row_cell(
-    value: &Value,
-    kind: LiveColumnKind,
-    schema_key: &str,
-    column_name: &str,
-) -> Result<JsonValue, LixError> {
-    Ok(match kind {
-        LiveColumnKind::String => match value {
-            Value::Null => JsonValue::Null,
-            Value::Text(text) => JsonValue::String(text.clone()),
-            other => {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    &format!(
-                        "normalized live row for schema '{}' expected TEXT for column '{}', got {other:?}",
-                        schema_key, column_name
-                    ),
-                ))
-            }
-        },
-        LiveColumnKind::Integer => match value {
-            Value::Null => JsonValue::Null,
-            Value::Integer(number) => JsonValue::from(*number),
-            other => {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    &format!(
-                        "normalized live row for schema '{}' expected INTEGER for column '{}', got {other:?}",
-                        schema_key, column_name
-                    ),
-                ))
-            }
-        },
-        LiveColumnKind::Number => match value {
-            Value::Null => JsonValue::Null,
-            Value::Real(number) => JsonValue::from(*number),
-            Value::Integer(number) => JsonValue::from(*number),
-            other => {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    &format!(
-                        "normalized live row for schema '{}' expected REAL for column '{}', got {other:?}",
-                        schema_key, column_name
-                    ),
-                ))
-            }
-        },
-        LiveColumnKind::Boolean => match value {
-            Value::Null => JsonValue::Null,
-            Value::Boolean(boolean) => JsonValue::from(*boolean),
-            Value::Integer(number) if *number == 0 || *number == 1 => JsonValue::from(*number == 1),
-            other => {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    &format!(
-                        "normalized live row for schema '{}' expected BOOLEAN for column '{}', got {other:?}",
-                        schema_key, column_name
-                    ),
-                ))
-            }
-        },
-        LiveColumnKind::JsonText => match value {
-            Value::Null => JsonValue::Null,
-            Value::Text(text) => serde_json::from_str(text).map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    &format!(
-                        "normalized live row for schema '{}' returned invalid JSON text for column '{}': {error}",
-                        schema_key, column_name
-                    ),
-                )
-            })?,
-            Value::Json(value) => value.clone(),
-            other => {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    &format!(
-                        "normalized live row for schema '{}' expected JSON text for column '{}', got {other:?}",
-                        schema_key, column_name
-                    ),
-                ))
-            }
-        },
-    })
-}
-
 fn quote_ident_fragment(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-pub(crate) fn live_schema_key_for_table_name(table_name: &str) -> Option<&str> {
-    table_name.strip_prefix(TRACKED_LIVE_TABLE_PREFIX)
+#[cfg(test)]
+fn logical_live_snapshot_from_legacy_layout(
+    layout: &LiveTableLayout,
+    row: &[Value],
+    normalized_start_index: usize,
+) -> Result<Option<JsonValue>, LixError> {
+    let mut object = serde_json::Map::new();
+    for (offset, column) in layout.columns.iter().enumerate() {
+        let value = row.get(normalized_start_index + offset).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                &format!(
+                    "normalized live row for schema '{}' missing returning column '{}'",
+                    layout.schema_key, column.column_name
+                ),
+            )
+        })?;
+        let json_value = match column.kind {
+            LiveColumnKind::String => match value {
+                Value::Null => JsonValue::Null,
+                Value::Text(text) => JsonValue::String(text.clone()),
+                other => {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        &format!(
+                            "normalized live row for schema '{}' expected TEXT for column '{}', got {other:?}",
+                            layout.schema_key, column.column_name
+                        ),
+                    ))
+                }
+            },
+            LiveColumnKind::Integer => match value {
+                Value::Null => JsonValue::Null,
+                Value::Integer(number) => JsonValue::from(*number),
+                other => {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        &format!(
+                            "normalized live row for schema '{}' expected INTEGER for column '{}', got {other:?}",
+                            layout.schema_key, column.column_name
+                        ),
+                    ))
+                }
+            },
+            LiveColumnKind::Number => match value {
+                Value::Null => JsonValue::Null,
+                Value::Real(number) => JsonValue::from(*number),
+                Value::Integer(number) => JsonValue::from(*number),
+                other => {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        &format!(
+                            "normalized live row for schema '{}' expected REAL for column '{}', got {other:?}",
+                            layout.schema_key, column.column_name
+                        ),
+                    ))
+                }
+            },
+            LiveColumnKind::Boolean => match value {
+                Value::Null => JsonValue::Null,
+                Value::Boolean(boolean) => JsonValue::from(*boolean),
+                Value::Integer(number) if *number == 0 || *number == 1 => {
+                    JsonValue::from(*number == 1)
+                }
+                other => {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        &format!(
+                            "normalized live row for schema '{}' expected BOOLEAN for column '{}', got {other:?}",
+                            layout.schema_key, column.column_name
+                        ),
+                    ))
+                }
+            },
+            LiveColumnKind::JsonText => match value {
+                Value::Null => JsonValue::Null,
+                Value::Text(text) => serde_json::from_str(text).map_err(|error| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        &format!(
+                            "normalized live row for schema '{}' returned invalid JSON text for column '{}': {error}",
+                            layout.schema_key, column.column_name
+                        ),
+                    )
+                })?,
+                Value::Json(value) => value.clone(),
+                other => {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        &format!(
+                            "normalized live row for schema '{}' expected JSON text for column '{}', got {other:?}",
+                            layout.schema_key, column.column_name
+                        ),
+                    ))
+                }
+            },
+        };
+
+        if json_value.is_null() {
+            if column.preserve_null_in_logical_snapshot() {
+                object.insert(column.property_name.clone(), JsonValue::Null);
+            }
+        } else {
+            object.insert(column.property_name.clone(), json_value);
+        }
+    }
+
+    Ok(Some(JsonValue::Object(object)))
 }
 
 const REGISTERED_SCHEMA_BOOTSTRAP_LAYOUT_SQL: &str = "SELECT snapshot_content \
