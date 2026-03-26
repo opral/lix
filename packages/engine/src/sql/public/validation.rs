@@ -17,7 +17,7 @@ use crate::schema::{
 };
 use crate::sql_support::binding::bind_sql;
 use crate::sql::execution::contracts::planned_statement::{
-    MutationOperation, MutationRow, UpdateValidationKind, UpdateValidationPlan,
+    MutationOperation, MutationRow, UpdateValidationPlan,
 };
 use crate::sql::public::catalog::SurfaceFamily;
 use crate::sql::public::services::state_reader::{
@@ -235,7 +235,7 @@ pub async fn validate_updates(
                 continue;
             }
 
-            if plan.kind == UpdateValidationKind::Delete {
+            if plan.delete {
                 deleted_rows.push(ConstraintDeletedRow {
                     identity: ConstraintRowIdentity {
                         entity_id,

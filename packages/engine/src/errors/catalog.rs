@@ -13,7 +13,6 @@ pub(crate) enum ErrorCode {
     InternalTableAccessDenied,
     PublicCreateTableDenied,
     ReadOnlyViewWriteDenied,
-    VtableSchemaKeyRequired,
     TransactionControlStatementDenied,
     FileDataExpectsBytes,
     UnexpectedStatementCount,
@@ -32,7 +31,6 @@ impl ErrorCode {
             Self::InternalTableAccessDenied => "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED",
             Self::PublicCreateTableDenied => "LIX_ERROR_PUBLIC_CREATE_TABLE_DENIED",
             Self::ReadOnlyViewWriteDenied => "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED",
-            Self::VtableSchemaKeyRequired => "LIX_ERROR_VTABLE_SCHEMA_KEY_REQUIRED",
             Self::TransactionControlStatementDenied => {
                 "LIX_ERROR_TRANSACTION_CONTROL_STATEMENT_DENIED"
             }
@@ -54,7 +52,6 @@ impl ErrorCode {
             Self::InternalTableAccessDenied,
             Self::PublicCreateTableDenied,
             Self::ReadOnlyViewWriteDenied,
-            Self::VtableSchemaKeyRequired,
             Self::TransactionControlStatementDenied,
             Self::FileDataExpectsBytes,
             Self::UnexpectedStatementCount,
@@ -163,7 +160,7 @@ pub(crate) fn internal_table_access_denied_error() -> LixError {
     build_error(
         ErrorCode::InternalTableAccessDenied,
         &format!(
-            "Direct writes or DDL against `lix_internal_*` tables can lead to data corruption. Public SQL tables: {available_tables}."
+            "Direct writes against `lix_internal_*` tables can lead to data corruption. DDL against `lix_internal_*` tables and protected Lix system relations is also denied. Public SQL tables remain writable, including `lix_state` and `lix_state_by_version`. Public SQL tables: {available_tables}."
         ),
     )
 }
@@ -206,13 +203,6 @@ pub(crate) fn read_only_view_write_error(view_name: &str, operation: &str) -> Li
     )
 }
 
-pub(crate) fn vtable_schema_key_required_error() -> LixError {
-    build_error(
-        ErrorCode::VtableSchemaKeyRequired,
-        "This write targets a schema-scoped vtable. Add a WHERE predicate that resolves schema_key (for example: schema_key = 'markdown_v2_block' or schema_key = ?). This prevents accidental cross-schema updates/deletes.",
-    )
-}
-
 pub(crate) fn transaction_control_statement_denied_error() -> LixError {
     build_error(
         ErrorCode::TransactionControlStatementDenied,
@@ -248,7 +238,7 @@ mod tests {
         not_initialized_error, public_create_table_denied_error, read_only_view_write_error,
         schema_not_registered_error, sql_unknown_column_error, sql_unknown_table_error,
         table_not_found_read_error, transaction_control_statement_denied_error,
-        unexpected_statement_count_error, vtable_schema_key_required_error, ErrorCode,
+        unexpected_statement_count_error, ErrorCode,
     };
     use std::collections::HashSet;
 
@@ -313,12 +303,6 @@ mod tests {
         let read_only = read_only_view_write_error("lix_state_history", "INSERT");
         assert_eq!(read_only.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");
 
-        let schema_key_required = vtable_schema_key_required_error();
-        assert_eq!(
-            schema_key_required.code,
-            "LIX_ERROR_VTABLE_SCHEMA_KEY_REQUIRED"
-        );
-
         let transaction_control_denied = transaction_control_statement_denied_error();
         assert_eq!(
             transaction_control_denied.code,
@@ -353,9 +337,6 @@ mod tests {
 
         let change_write_src = include_str!("../sql/public/runtime/mod.rs");
         assert!(change_write_src.contains("read_only_view_write_error("));
-
-        let vtable_write_src = include_str!("../state/internal/vtable_write.rs");
-        assert!(vtable_write_src.contains("errors::vtable_schema_key_required_error"));
 
         let api_src = include_str!("../api.rs");
         assert!(api_src.contains("errors::transaction_control_statement_denied_error()"));

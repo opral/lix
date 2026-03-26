@@ -10,7 +10,7 @@ async fn insert_schema(engine: &support::simulation_test::SimulationEngine, sche
     engine
         .execute(
             &format!(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('lix_registered_schema', '{}')",
+                "INSERT INTO lix_registered_schema (value) VALUES ('{}')",
                 schema.replace('\'', "''")
             ), &[])
         .await
@@ -27,7 +27,7 @@ fn text_to_json(value: &Value) -> JsonValue {
 async fn enable_deterministic_mode(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (\
+            "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'lix_deterministic_mode', 'lix_key_value', 'lix', 'global', 'lix', '{\"key\":\"lix_deterministic_mode\",\"value\":{\"enabled\":true}}', '1'\
@@ -57,13 +57,13 @@ simulation_test!(insert_applies_cel_default, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'cel_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'cel_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')", &[])
         .await
         .unwrap();
 
     let row = engine
         .execute(
-            "SELECT snapshot_content FROM lix_internal_state_vtable WHERE schema_key = 'cel_default_schema' AND entity_id = 'entity-1'", &[])
+            "SELECT snapshot_content FROM lix_state_by_version WHERE schema_key = 'cel_default_schema' AND entity_id = 'entity-1'", &[])
         .await
         .unwrap();
 
@@ -93,7 +93,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ($1, $2, $3, $4, $5, $6, $7)", &[
+                "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ($1, $2, $3, $4, $5, $6, $7)", &[
                     Value::Text("entity-1".to_string()),
                     Value::Text("cel_default_param_schema".to_string()),
                     Value::Text("file-1".to_string()),
@@ -107,7 +107,7 @@ simulation_test!(
 
         let row = engine
             .execute(
-                "SELECT snapshot_content FROM lix_internal_state_vtable WHERE schema_key = 'cel_default_param_schema' AND entity_id = 'entity-1'", &[])
+                "SELECT snapshot_content FROM lix_state_by_version WHERE schema_key = 'cel_default_param_schema' AND entity_id = 'entity-1'", &[])
             .await
             .unwrap();
 
@@ -138,7 +138,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) SELECT $1, $2, $3, $4, $5, $6, $7", &[
+                "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) SELECT $1, $2, $3, $4, $5, $6, $7", &[
                     Value::Text("entity-1".to_string()),
                     Value::Text("cel_default_select_schema".to_string()),
                     Value::Text("file-1".to_string()),
@@ -152,7 +152,7 @@ simulation_test!(
 
         let row = engine
             .execute(
-                "SELECT snapshot_content FROM lix_internal_state_vtable WHERE schema_key = 'cel_default_select_schema' AND entity_id = 'entity-1'", &[])
+                "SELECT snapshot_content FROM lix_state_by_version WHERE schema_key = 'cel_default_select_schema' AND entity_id = 'entity-1'", &[])
             .await
             .unwrap();
 
@@ -181,13 +181,13 @@ simulation_test!(insert_uses_json_default_fallback, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'json_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'json_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')", &[])
         .await
         .unwrap();
 
     let row = engine
         .execute(
-            "SELECT snapshot_content FROM lix_internal_state_vtable WHERE schema_key = 'json_default_schema' AND entity_id = 'entity-1'", &[])
+            "SELECT snapshot_content FROM lix_state_by_version WHERE schema_key = 'json_default_schema' AND entity_id = 'entity-1'", &[])
         .await
         .unwrap();
 
@@ -211,13 +211,13 @@ simulation_test!(insert_x_lix_default_overrides_default, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'override_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'override_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')", &[])
         .await
         .unwrap();
 
     let row = engine
         .execute(
-            "SELECT snapshot_content FROM lix_internal_state_vtable WHERE schema_key = 'override_default_schema' AND entity_id = 'entity-1'", &[])
+            "SELECT snapshot_content FROM lix_state_by_version WHERE schema_key = 'override_default_schema' AND entity_id = 'entity-1'", &[])
         .await
         .unwrap();
 
@@ -244,13 +244,13 @@ simulation_test!(insert_does_not_override_explicit_null, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'null_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\",\"status\":null}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'null_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\",\"status\":null}', '1')", &[])
         .await
         .unwrap();
 
     let row = engine
         .execute(
-            "SELECT snapshot_content FROM lix_internal_state_vtable WHERE schema_key = 'null_default_schema' AND entity_id = 'entity-1'", &[])
+            "SELECT snapshot_content FROM lix_state_by_version WHERE schema_key = 'null_default_schema' AND entity_id = 'entity-1'", &[])
         .await
         .unwrap();
 
@@ -274,19 +274,19 @@ simulation_test!(update_does_not_backfill_defaults, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'update_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'update_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')", &[])
         .await
         .unwrap();
 
     engine
         .execute(
-            "UPDATE lix_internal_state_vtable SET snapshot_content = '{\"name\":\"Renamed\"}' WHERE schema_key = 'update_default_schema' AND entity_id = 'entity-1' AND file_id = 'file-1' AND version_id = 'version-1'", &[])
+            "UPDATE lix_state_by_version SET snapshot_content = '{\"name\":\"Renamed\"}' WHERE schema_key = 'update_default_schema' AND entity_id = 'entity-1' AND file_id = 'file-1' AND version_id = 'version-1'", &[])
         .await
         .unwrap();
 
     let row = engine
         .execute(
-            "SELECT snapshot_content FROM lix_internal_state_vtable WHERE schema_key = 'update_default_schema' AND entity_id = 'entity-1'", &[])
+            "SELECT snapshot_content FROM lix_state_by_version WHERE schema_key = 'update_default_schema' AND entity_id = 'entity-1'", &[])
         .await
         .unwrap();
 
@@ -312,13 +312,13 @@ async fn run_insert_applies_uuid_function_default(sim: SimulationArgs) {
 
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'uuid_fn_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'uuid_fn_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')", &[])
         .await
         .unwrap();
 
     let row = engine
         .execute(
-            "SELECT snapshot_content FROM lix_internal_state_vtable WHERE schema_key = 'uuid_fn_default_schema' AND entity_id = 'entity-1'", &[])
+            "SELECT snapshot_content FROM lix_state_by_version WHERE schema_key = 'uuid_fn_default_schema' AND entity_id = 'entity-1'", &[])
         .await
         .unwrap();
 
@@ -354,13 +354,13 @@ async fn run_insert_applies_timestamp_function_default(sim: SimulationArgs) {
 
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'timestamp_fn_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'timestamp_fn_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')", &[])
         .await
         .unwrap();
 
     let row = engine
         .execute(
-            "SELECT snapshot_content FROM lix_internal_state_vtable WHERE schema_key = 'timestamp_fn_default_schema' AND entity_id = 'entity-1'", &[])
+            "SELECT snapshot_content FROM lix_state_by_version WHERE schema_key = 'timestamp_fn_default_schema' AND entity_id = 'entity-1'", &[])
         .await
         .unwrap();
 
@@ -403,7 +403,7 @@ simulation_test!(insert_fails_on_unknown_cel_variable, |sim| async move {
 
     let result = engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'unknown_var_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'unknown_var_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')", &[])
         .await;
 
     let err = result.expect_err("expected unknown CEL variable error");

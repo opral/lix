@@ -95,8 +95,7 @@ fn finalize_dependency_spec(mut spec: DependencySpec) -> DependencySpec {
             }
             "lix_state_by_version"
             | "lix_state_history"
-            | "lix_state_history_by_version"
-            | "lix_internal_state_vtable" => {
+            | "lix_state_history_by_version" => {
                 uses_dynamic_state_relations = true;
             }
             "lix_working_changes" => {

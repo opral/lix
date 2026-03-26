@@ -7,7 +7,7 @@ use serde_json::json;
 
 fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     format!(
-        "INSERT INTO lix_internal_state_vtable (\
+        "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
          '{key}', 'lix_key_value', 'lix', 'global', 'lix', '{{\"key\":\"{key}\",\"value\":{value_json}}}', '1'\
@@ -31,7 +31,7 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
     let after_insert = engine
         .execute(
             "SELECT snapshot_content, untracked \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' AND entity_id = 'key0'",
             &[],
         )
@@ -52,7 +52,7 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
 
     engine
         .execute(
-            "UPDATE lix_internal_state_vtable \
+            "UPDATE lix_state_by_version \
              SET snapshot_content = '{\"key\":\"key0\",\"value\":\"value1\"}' \
              WHERE schema_key = 'lix_key_value' AND entity_id = 'key0' AND version_id = 'global'",
             &[],
@@ -63,7 +63,7 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
     let after_update = engine
         .execute(
             "SELECT snapshot_content \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' AND entity_id = 'key0'",
             &[],
         )
@@ -79,7 +79,7 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
 
     engine
         .execute(
-            "DELETE FROM lix_internal_state_vtable \
+            "DELETE FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' AND entity_id = 'key0' AND version_id = 'global'",
             &[],
         )
@@ -89,7 +89,7 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
     let after_delete = engine
         .execute(
             "SELECT entity_id \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' \
                AND entity_id = 'key0' \
                AND snapshot_content IS NOT NULL",
@@ -136,7 +136,7 @@ simulation_test!(
         let result = engine
             .execute(
                 "SELECT COUNT(*) \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_key_value' \
                    AND entity_id = 'boot-default-active' \
                    AND version_id = $1 \
@@ -173,7 +173,7 @@ simulation_test!(
         let result = engine
             .execute(
                 "SELECT COUNT(*) \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_key_value' \
                    AND entity_id = 'boot-global' \
                    AND version_id = 'global' \
@@ -260,7 +260,7 @@ simulation_test!(key_value_allows_arbitrary_json_values, |sim| async move {
     let rows = engine
         .execute(
             "SELECT entity_id, snapshot_content \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' \
                AND entity_id IN ('key0', 'key1', 'key2', 'key3', 'key4', 'key5') \
              ORDER BY entity_id",
@@ -336,7 +336,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT entity_id, snapshot_content \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' \
                AND entity_id IN ('type_test_string', 'type_test_number') \
              ORDER BY entity_id",
@@ -383,7 +383,7 @@ simulation_test!(
         let result = engine
             .execute(
                 "SELECT lix_json_extract(snapshot_content, 'value', 1) \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_key_value' AND entity_id = 'array_extract' \
                  LIMIT 1",
                 &[],
@@ -421,7 +421,7 @@ simulation_test!(
         let result = engine
             .execute(
                 "SELECT lix_json_extract(snapshot_content, 'value', '1') \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_key_value' AND entity_id = 'numeric_key_extract' \
                  LIMIT 1",
                 &[],
@@ -458,7 +458,7 @@ simulation_test!(
         let result = engine
             .execute(
                 "SELECT lix_json_extract(snapshot_content, 'value', '') \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_key_value' AND entity_id = 'empty_key_extract' \
                  LIMIT 1",
                 &[],

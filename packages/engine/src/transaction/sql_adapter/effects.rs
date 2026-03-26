@@ -22,6 +22,10 @@ use crate::transaction::commands::{
     BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteExecutionRoute,
 };
 use crate::transaction::contracts::TransactionCommitOutcome;
+use crate::version::GLOBAL_VERSION_ID;
+
+const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
+const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 
 pub(super) fn command_metadata(
     command: &SqlBufferedWriteCommand,
@@ -75,6 +79,70 @@ pub(super) async fn refresh_public_surface_registry_from_pending_transaction_vie
         bootstrap_public_surface_registry_with_pending_transaction_view(&backend, pending_transaction_view)
             .await?;
     context.bump_public_surface_registry_generation();
+    Ok(())
+}
+
+pub(crate) async fn mirror_public_registered_schema_bootstrap_rows(
+    transaction: &mut dyn LixBackendTransaction,
+    applied_output: &crate::canonical::append::CreateCommitAppliedOutput,
+) -> Result<(), LixError> {
+    for row in &applied_output.derived_apply_input.live_state_rows {
+        if row.schema_key != REGISTERED_SCHEMA_KEY || row.lixcol_version_id != GLOBAL_VERSION_ID {
+            continue;
+        }
+
+        let snapshot_sql = row
+            .snapshot_content
+            .as_ref()
+            .map(|value| format!("'{}'", crate::sql_support::text::escape_sql_string(value)))
+            .unwrap_or_else(|| "NULL".to_string());
+        let metadata_sql = row
+            .metadata
+            .as_ref()
+            .map(|value| format!("'{}'", crate::sql_support::text::escape_sql_string(value)))
+            .unwrap_or_else(|| "NULL".to_string());
+        let writer_key_sql = row
+            .writer_key
+            .as_ref()
+            .map(|value| format!("'{}'", crate::sql_support::text::escape_sql_string(value)))
+            .unwrap_or_else(|| "NULL".to_string());
+        let is_tombstone = if row.snapshot_content.is_some() { 0 } else { 1 };
+
+        let sql = format!(
+            "INSERT INTO {table} (\
+             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
+             ) VALUES (\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', {snapshot_content}, '{change_id}', {metadata}, {writer_key}, {is_tombstone}, '{created_at}', '{updated_at}'\
+             ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
+             schema_key = excluded.schema_key, \
+             schema_version = excluded.schema_version, \
+             global = excluded.global, \
+             plugin_key = excluded.plugin_key, \
+             snapshot_content = excluded.snapshot_content, \
+             change_id = excluded.change_id, \
+             metadata = excluded.metadata, \
+             writer_key = excluded.writer_key, \
+             is_tombstone = excluded.is_tombstone, \
+             updated_at = excluded.updated_at",
+            table = REGISTERED_SCHEMA_BOOTSTRAP_TABLE,
+            entity_id = crate::sql_support::text::escape_sql_string(&row.entity_id),
+            schema_key = crate::sql_support::text::escape_sql_string(&row.schema_key),
+            schema_version = crate::sql_support::text::escape_sql_string(&row.schema_version),
+            file_id = crate::sql_support::text::escape_sql_string(&row.file_id),
+            version_id = crate::sql_support::text::escape_sql_string(&row.lixcol_version_id),
+            plugin_key = crate::sql_support::text::escape_sql_string(&row.plugin_key),
+            snapshot_content = snapshot_sql,
+            change_id = crate::sql_support::text::escape_sql_string(&row.id),
+            metadata = metadata_sql,
+            writer_key = writer_key_sql,
+            is_tombstone = is_tombstone,
+            created_at = crate::sql_support::text::escape_sql_string(&row.created_at),
+            updated_at = crate::sql_support::text::escape_sql_string(&row.created_at),
+        );
+
+        transaction.execute(&sql, &[]).await?;
+    }
+
     Ok(())
 }
 

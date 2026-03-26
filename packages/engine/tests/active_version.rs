@@ -24,7 +24,7 @@ async fn read_active_version_value(engine: &support::simulation_test::Simulation
     let row = engine
         .execute(
             "SELECT snapshot_content \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'lix_active_version' \
                AND file_id = 'lix' \
                AND version_id = 'global' \
@@ -85,7 +85,7 @@ async fn run_init_seeds_default_active_version_deterministic(sim: SimulationArgs
     let row = engine
         .execute(
             "SELECT entity_id, snapshot_content, untracked \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'lix_active_version' \
                AND file_id = 'lix' \
                AND version_id = 'global' \
@@ -146,7 +146,7 @@ simulation_test!(init_seeds_default_active_version, |sim| async move {
     let row = engine
         .execute(
             "SELECT entity_id, snapshot_content, untracked \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'lix_active_version' \
                AND file_id = 'lix' \
                AND version_id = 'global' \
@@ -315,7 +315,7 @@ simulation_test!(
         let (active_id, _) = read_active_version_view_row(&engine).await;
         engine
             .execute(
-                "UPDATE lix_internal_state_vtable \
+                "UPDATE lix_state_by_version \
                  SET snapshot_content = $1 \
                  WHERE untracked = true \
                    AND schema_key = 'lix_active_version' \
@@ -349,7 +349,7 @@ simulation_test!(
 
         engine
             .execute(
-                "UPDATE lix_internal_state_vtable \
+                "UPDATE lix_state_by_version \
                  SET snapshot_content = $1 \
                  WHERE untracked = true \
                    AND schema_key = 'lix_active_version' \

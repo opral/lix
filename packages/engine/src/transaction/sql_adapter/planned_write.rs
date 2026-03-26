@@ -10,9 +10,8 @@ use super::{
     build_tracked_txn_unit, filesystem_transaction_state_has_binary_payloads,
     merge_filesystem_transaction_state, DomainChangeBatch, FilesystemTransactionFileState,
     FilesystemTransactionState, MutationRow, OptionalTextPatch, PendingTransactionView,
-    PlanEffects, PreparedPublicWrite,
-    PublicWriteExecutionPartition, ResultContract, TrackedTxnUnit, UntrackedWriteExecution,
-    WriteMode,
+    PlanEffects, PreparedPublicWrite, PublicWriteExecutionPartition, ResultContract,
+    TrackedTxnUnit, UntrackedWriteExecution, WriteMode,
 };
 use super::{CompiledExecution, CompiledInternalExecution};
 use crate::transaction::contracts::SchemaRegistrationSet;
@@ -147,7 +146,8 @@ impl PlannedWriteDelta {
     pub(crate) fn extend(&mut self, incoming: PlannedWriteDelta) -> Result<(), LixError> {
         self.materialization_plan
             .extend(incoming.materialization_plan);
-        self.schema_registrations.extend(incoming.schema_registrations);
+        self.schema_registrations
+            .extend(incoming.schema_registrations);
         self.semantic_overlay = match (self.semantic_overlay.take(), incoming.semantic_overlay) {
             (Some(mut current), Some(incoming)) => {
                 merge_pending_semantic_overlay(&mut current, incoming);
@@ -422,16 +422,16 @@ fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> Schem
     for unit in &plan.units {
         match unit {
             PlannedWriteUnit::PublicTracked(tracked) => {
-                for requirement in
-                    coalesce_live_table_requirements(&tracked.execution.schema_live_table_requirements)
-                {
+                for requirement in coalesce_live_table_requirements(
+                    &tracked.execution.schema_live_table_requirements,
+                ) {
                     match requirement.layout.as_ref() {
-                        Some(layout) => registrations.insert(
-                            SchemaRegistration::with_legacy_layout(
+                        Some(layout) => {
+                            registrations.insert(SchemaRegistration::with_legacy_layout(
                                 requirement.schema_key.clone(),
                                 layout,
-                            ),
-                        ),
+                            ))
+                        }
                         None => registrations.insert(requirement.schema_key.clone()),
                     }
                 }
@@ -442,14 +442,16 @@ fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> Schem
                 }
             }
             PlannedWriteUnit::Internal(internal) => {
-                for requirement in coalesce_live_table_requirements(&internal.execution.live_table_requirements) {
+                for requirement in
+                    coalesce_live_table_requirements(&internal.execution.live_table_requirements)
+                {
                     match requirement.layout.as_ref() {
-                        Some(layout) => registrations.insert(
-                            SchemaRegistration::with_legacy_layout(
+                        Some(layout) => {
+                            registrations.insert(SchemaRegistration::with_legacy_layout(
                                 requirement.schema_key.clone(),
                                 layout,
-                            ),
-                        ),
+                            ))
+                        }
                         None => registrations.insert(requirement.schema_key.clone()),
                     }
                 }
@@ -559,7 +561,6 @@ fn collect_semantic_overlay_from_planned_write_plan(
             }
             PlannedWriteUnit::Internal(internal) => {
                 internal.filesystem_state.files.is_empty()
-                    && internal.execution.postprocess.is_none()
                     && collect_semantic_overlay_from_mutation_rows(
                         &internal.execution.mutations,
                         overlay,

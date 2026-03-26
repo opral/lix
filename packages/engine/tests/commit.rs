@@ -28,8 +28,7 @@ use support::simulation_test::SimulationEngine;
 async fn register_test_schema(engine: &SimulationEngine) {
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+            "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -62,7 +61,7 @@ async fn read_version_ref_commit_id(engine: &SimulationEngine, version_id: &str)
         .execute(
             &format!(
                 "SELECT snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_version_ref' \
                    AND entity_id = '{}' \
                  LIMIT 1",
@@ -159,7 +158,7 @@ simulation_test!(
         // First write establishes the initial global tip in current Rust flow.
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'para-0', 'test_schema', 'file-1', 'global', 'lix', '{\"key\":\"v0\"}', '1'\
@@ -171,7 +170,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'para-1', 'test_schema', 'file-1', 'global', 'lix', '{\"key\":\"v1\"}', '1'\
@@ -238,7 +237,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT snapshot_content \
-                     FROM lix_internal_state_vtable \
+                     FROM lix_state_by_version \
                      WHERE schema_key = 'lix_commit_edge' \
                        AND entity_id = '{}' \
                      LIMIT 1",
@@ -309,7 +308,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                  ) VALUES (\
                  'entity-untracked', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"local\"}', '1', true\
@@ -329,7 +328,7 @@ simulation_test!(
         let row = engine
             .execute(
                 "SELECT snapshot_content, untracked \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_schema' \
                    AND entity_id = 'entity-untracked'",
                 &[],
@@ -362,7 +361,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'entity-a', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"a\"}', '1'\
@@ -397,7 +396,7 @@ simulation_test!(
         let cse_rows = engine
             .execute(
                 "SELECT cse.snapshot_content \
-                 FROM lix_internal_state_vtable cse \
+                 FROM lix_state_by_version cse \
                  JOIN lix_internal_change ch ON ch.id = lix_json_extract(cse.snapshot_content, 'change_id') \
                  WHERE cse.schema_key = 'lix_change_set_element' \
                    AND ch.schema_key = 'test_schema'", &[])
@@ -443,12 +442,12 @@ simulation_test!(
         engine
             .execute(
                 "BEGIN; \
-                 INSERT INTO lix_internal_state_vtable (\
+                 INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'entity-c', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"c\"}', '1'\
                  ); \
-                 INSERT INTO lix_internal_state_vtable (\
+                 INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'entity-d', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"d\"}', '1'\
@@ -482,7 +481,7 @@ simulation_test!(
         let cse_rows = engine
             .execute(
                 "SELECT cse.snapshot_content \
-                 FROM lix_internal_state_vtable cse \
+                 FROM lix_state_by_version cse \
                  JOIN lix_internal_change ch ON ch.id = lix_json_extract(cse.snapshot_content, 'change_id') \
                  WHERE cse.schema_key = 'lix_change_set_element' \
                    AND ch.schema_key = 'test_schema'", &[])
@@ -527,7 +526,7 @@ simulation_test!(
         let before_commit_count = engine
             .execute(
                 "SELECT COUNT(*) \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_commit'",
                 &[],
             )
@@ -575,7 +574,7 @@ simulation_test!(
         let after_commit_count = engine
             .execute(
                 "SELECT COUNT(*) \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_commit'",
                 &[],
             )
@@ -620,7 +619,7 @@ simulation_test!(
         let before_commit_count = engine
             .execute(
                 "SELECT COUNT(*) \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_commit'",
                 &[],
             )
@@ -676,7 +675,7 @@ simulation_test!(
         let after_commit_count = engine
             .execute(
                 "SELECT COUNT(*) \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_commit'",
                 &[],
             )

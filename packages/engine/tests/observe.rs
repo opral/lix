@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     format!(
-        "INSERT INTO lix_internal_state_vtable (\
+        "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
          '{key}', 'lix_key_value', 'lix', 'global', 'lix', '{{\"key\":\"{key}\",\"value\":{value_json}}}', '1'\
@@ -18,7 +18,7 @@ fn insert_key_value_sql(key: &str, value_json: &str) -> String {
 
 fn update_key_value_sql(key: &str, value_json: &str) -> String {
     format!(
-        "UPDATE lix_internal_state_vtable \
+        "UPDATE lix_state_by_version \
          SET snapshot_content = '{{\"key\":\"{key}\",\"value\":{value_json}}}' \
          WHERE entity_id = '{key}' \
            AND schema_key = 'lix_key_value' \

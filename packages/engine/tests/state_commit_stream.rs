@@ -4,7 +4,7 @@ use lix_engine::{ExecuteOptions, LixError, StateCommitStreamFilter, StateCommitS
 
 fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     format!(
-        "INSERT INTO lix_internal_state_vtable (\
+        "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
          '{key}', 'lix_key_value', 'lix', 'global', 'lix', '{{\"key\":\"{key}\",\"value\":{value_json}}}', '1'\
@@ -14,7 +14,7 @@ fn insert_key_value_sql(key: &str, value_json: &str) -> String {
 
 fn update_key_value_sql(key: &str, value_json: &str) -> String {
     format!(
-        "UPDATE lix_internal_state_vtable \
+        "UPDATE lix_state_by_version \
          SET snapshot_content = '{{\"key\":\"{key}\",\"value\":{value_json}}}' \
          WHERE schema_key = 'lix_key_value' AND entity_id = '{key}' AND version_id = 'global'"
     )
@@ -22,7 +22,7 @@ fn update_key_value_sql(key: &str, value_json: &str) -> String {
 
 fn delete_key_value_sql(key: &str) -> String {
     format!(
-        "DELETE FROM lix_internal_state_vtable \
+        "DELETE FROM lix_state_by_version \
          WHERE schema_key = 'lix_key_value' AND entity_id = '{key}' AND version_id = 'global'"
     )
 }

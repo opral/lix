@@ -279,3 +279,79 @@ fn init_and_plugin_paths_use_transaction_owned_write_entrypoints() {
         "plugin/install.rs should execute statements through the transaction module"
     );
 }
+
+#[test]
+fn internal_vtable_runtime_no_longer_uses_legacy_parallel_contracts() {
+    let planned_statement_source =
+        read_engine_source("sql/execution/contracts/planned_statement.rs");
+    assert!(
+        !planned_statement_source.contains("InternalStatePlan"),
+        "planned_statement.rs should not carry InternalStatePlan"
+    );
+    assert!(
+        !planned_statement_source.contains("internal_state"),
+        "planned_statement.rs should not carry the legacy internal_state contract"
+    );
+    assert!(
+        !planned_statement_source.contains("internal_mutation"),
+        "planned_statement.rs should not carry the removed internal_mutation compatibility contract"
+    );
+
+    let internal_mod_source = read_engine_source("sql/internal/mod.rs");
+    for forbidden in [
+        "InternalStatePlan",
+        "PostprocessPlan",
+        "internal_state_plan_from_postprocess",
+        "InternalMutationPlan",
+    ] {
+        assert!(
+            !internal_mod_source.contains(forbidden),
+            "sql/internal/mod.rs should not define legacy internal-vtable runtime contract `{forbidden}`"
+        );
+    }
+
+    let compat_source = read_engine_source("sql/compat/internal_state_vtable.rs");
+    assert!(
+        compat_source.contains("lix_internal_state_vtable"),
+        "compat module should keep the legacy internal-state vtable syntax as a normalization-only front door"
+    );
+}
+
+#[test]
+fn transaction_runtime_uses_normal_internal_execution_not_postprocess_callbacks() {
+    let runtime_source = read_engine_source("transaction/sql_adapter/runtime.rs");
+    assert!(
+        !runtime_source.contains("execute_internal_postprocess_with_transaction"),
+        "transaction runtime should not call the removed postprocess callback path"
+    );
+    assert!(
+        !runtime_source.contains("postprocess:"),
+        "transaction runtime should not carry a postprocess field"
+    );
+    assert!(
+        !runtime_source.contains("execute_internal_mutation_with_transaction"),
+        "transaction runtime should not preserve a second internal_mutation execution path"
+    );
+    assert!(
+        runtime_source.contains("execute_prepared_with_transaction"),
+        "transaction runtime should execute internal compatibility statements through normal prepared execution"
+    );
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql/internal");
+    assert!(
+        !root.join("followup.rs").exists(),
+        "sql/internal/followup.rs should be removed"
+    );
+    assert!(
+        !root.join("postprocess.rs").exists(),
+        "sql/internal/postprocess.rs should be removed"
+    );
+    assert!(
+        !root.join("mutation_plan.rs").exists(),
+        "sql/internal/mutation_plan.rs should be removed once internal compatibility syntax is normalization-only"
+    );
+    assert!(
+        !root.join("mutation_runtime.rs").exists(),
+        "sql/internal/mutation_runtime.rs should be removed once internal compatibility syntax is normalization-only"
+    );
+}

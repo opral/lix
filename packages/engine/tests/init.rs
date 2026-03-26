@@ -60,7 +60,7 @@ async fn global_version_commit_id(engine: &support::simulation_test::SimulationE
     let result = engine
         .execute(
             "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'lix_version_ref' \
                AND entity_id = 'global' \
                AND file_id = 'lix' \
@@ -538,7 +538,7 @@ simulation_test!(
 
         let result = engine
             .execute(
-                "SELECT 1 FROM lix_internal_state_vtable \
+                "SELECT 1 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_key_value' \
                  LIMIT 1",
                 &[],
@@ -561,7 +561,7 @@ simulation_test!(init_seeds_key_value_schema_definition, |sim| async move {
     let result = engine
         .execute(
             "SELECT entity_id, snapshot_content \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE entity_id = 'lix_key_value~1' \
                AND schema_key = 'lix_registered_schema' \
                AND file_id = 'lix' \
@@ -599,7 +599,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
     let result = engine
         .execute(
             "SELECT entity_id, snapshot_content \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE entity_id IN (\
                'lix_registered_schema~1', \
                'lix_key_value~1', \
@@ -853,7 +853,7 @@ simulation_test!(
         let main_authoritative_tip = engine
             .execute(
                 "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_version_ref' \
                    AND entity_id = $1 \
                    AND untracked = true \
@@ -886,7 +886,7 @@ simulation_test!(
         let global_authoritative_tip = engine
             .execute(
                 "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'lix_version_ref' \
                    AND entity_id = 'global' \
                    AND untracked = true \
@@ -954,7 +954,7 @@ simulation_test!(
         let result = engine
             .execute(
                 "SELECT entity_id, snapshot_content \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'lix_label' \
                AND file_id = 'lix' \
                AND version_id = 'global' \

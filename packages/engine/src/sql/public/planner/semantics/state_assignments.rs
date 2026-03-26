@@ -1,5 +1,6 @@
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::identity::{derive_entity_id_from_json_paths, EntityIdDerivationError};
-use crate::schema::defaults::apply_schema_defaults_with_system_functions;
+use crate::schema::defaults::apply_schema_defaults_with_functions;
 use crate::sql::public::planner::ir::{
     CanonicalStateAssignments, MutationPayload, PlannedStateRow,
 };
@@ -74,9 +75,27 @@ pub(crate) fn build_entity_insert_rows(
     version_id: Option<String>,
     semantics: EntityInsertSemantics<'_>,
 ) -> Result<Vec<PlannedStateRow>, StateAssignmentsError> {
+    build_entity_insert_rows_with_functions(
+        payloads,
+        version_id,
+        semantics,
+        SharedFunctionProvider::new(crate::functions::SystemFunctionProvider),
+    )
+}
+
+pub(crate) fn build_entity_insert_rows_with_functions<P>(
+    payloads: Vec<BTreeMap<String, Value>>,
+    version_id: Option<String>,
+    semantics: EntityInsertSemantics<'_>,
+    functions: SharedFunctionProvider<P>,
+) -> Result<Vec<PlannedStateRow>, StateAssignmentsError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let mut rows = Vec::with_capacity(payloads.len());
     for payload in payloads {
-        let snapshot = snapshot_from_entity_payload(&payload, semantics)?;
+        let snapshot =
+            snapshot_from_entity_payload_with_functions(&payload, semantics, functions.clone())?;
         let entity_id = if let Some(entity_id) = payload.get("entity_id").and_then(text_from_value)
         {
             entity_id.to_string()
@@ -332,15 +351,31 @@ fn snapshot_from_entity_payload(
     payload: &BTreeMap<String, Value>,
     semantics: EntityInsertSemantics<'_>,
 ) -> Result<JsonMap<String, JsonValue>, StateAssignmentsError> {
+    snapshot_from_entity_payload_with_functions(
+        payload,
+        semantics,
+        SharedFunctionProvider::new(crate::functions::SystemFunctionProvider),
+    )
+}
+
+fn snapshot_from_entity_payload_with_functions<P>(
+    payload: &BTreeMap<String, Value>,
+    semantics: EntityInsertSemantics<'_>,
+    functions: SharedFunctionProvider<P>,
+) -> Result<JsonMap<String, JsonValue>, StateAssignmentsError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let mut snapshot = JsonMap::new();
     for key in semantics.property_columns {
         if let Some(value) = payload.get(key) {
             snapshot.insert(key.clone(), engine_value_to_json_value(value)?);
         }
     }
-    apply_schema_defaults_with_system_functions(
+    apply_schema_defaults_with_functions(
         &mut snapshot,
         semantics.schema,
+        functions,
         semantics.schema_key,
         semantics.schema_version,
     )

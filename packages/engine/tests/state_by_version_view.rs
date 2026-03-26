@@ -55,12 +55,15 @@ async fn register_registered_schema_snapshot(
     engine: &support::simulation_test::SimulationEngine,
     snapshot_content: &str,
 ) {
+    let value = serde_json::from_str::<serde_json::Value>(snapshot_content)
+        .expect("registered schema snapshot must be valid JSON")
+        .get("value")
+        .cloned()
+        .expect("registered schema snapshot must contain value");
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema', $1\
-             )",
-            &[Value::Text(snapshot_content.to_string())],
+            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            &[Value::Text(value.to_string())],
         )
         .await
         .unwrap();
@@ -101,7 +104,7 @@ async fn insert_state_row_for_schema(
     snapshot_content: &str,
 ) {
     let sql = format!(
-        "INSERT INTO lix_internal_state_vtable (\
+        "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
          '{entity_id}', '{schema_key}', 'test-file', '{version_id}', 'lix', '{snapshot_content}', '1'\
@@ -457,7 +460,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT version_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-ins' \
                    AND file_id = 'test-file'",
@@ -549,7 +552,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT version_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-ins-p' \
                    AND file_id = 'test-file'",
@@ -619,7 +622,7 @@ simulation_test!(
         let materialized = engine
             .execute(
                 "SELECT snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-upsert-bv' \
                    AND file_id = 'file-upsert-bv' \
@@ -750,7 +753,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT version_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-upd' \
                    AND file_id = 'test-file' \
@@ -846,7 +849,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT file_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-upd-file-scope' \
                    AND version_id = 'version-a'",
@@ -900,7 +903,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT entity_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND version_id = 'version-a' \
                  ORDER BY entity_id",
@@ -966,7 +969,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT file_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-upd-identity' \
                    AND version_id = 'version-a'",
@@ -1152,7 +1155,7 @@ simulation_test!(
 
         let idempotency_rows = engine
             .execute(
-                "SELECT write_lane \
+                "SELECT DISTINCT write_lane \
                  FROM lix_internal_commit_idempotency \
                  WHERE write_lane IN ('version:version-a', 'version:version-b') \
                  ORDER BY write_lane",
@@ -1244,7 +1247,7 @@ simulation_test!(
         let materialized = engine
             .execute(
                 "SELECT version_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-del' \
                    AND file_id = 'test-file' \
@@ -1255,11 +1258,9 @@ simulation_test!(
             .unwrap();
 
         sim.assert_deterministic(materialized.statements[0].rows.clone());
-        assert_eq!(materialized.statements[0].rows.len(), 2);
-        assert_text(&materialized.statements[0].rows[0][0], "version-a");
-        assert_eq!(materialized.statements[0].rows[0][1], Value::Null);
-        assert_text(&materialized.statements[0].rows[1][0], "version-b");
-        assert_text(&materialized.statements[0].rows[1][1], "{\"value\":\"B\"}");
+        assert_eq!(materialized.statements[0].rows.len(), 1);
+        assert_text(&materialized.statements[0].rows[0][0], "version-b");
+        assert_text(&materialized.statements[0].rows[0][1], "{\"value\":\"B\"}");
 
         let visible = engine
             .execute(
@@ -1315,7 +1316,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT file_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-del-file-scope' \
                    AND version_id = 'version-a'",
@@ -1534,7 +1535,7 @@ simulation_test!(
         let materialized_rows = engine
             .execute(
                 "SELECT version_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-del-multi' \
                    AND file_id = 'test-file' \
@@ -1545,10 +1546,6 @@ simulation_test!(
             .unwrap();
 
         sim.assert_deterministic(materialized_rows.statements[0].rows.clone());
-        assert_eq!(materialized_rows.statements[0].rows.len(), 2);
-        assert_text(&materialized_rows.statements[0].rows[0][0], "version-a");
-        assert_eq!(materialized_rows.statements[0].rows[0][1], Value::Null);
-        assert_text(&materialized_rows.statements[0].rows[1][0], "version-b");
-        assert_eq!(materialized_rows.statements[0].rows[1][1], Value::Null);
+        assert!(materialized_rows.statements[0].rows.is_empty());
     }
 );

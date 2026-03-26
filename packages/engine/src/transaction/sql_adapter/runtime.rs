@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use crate::backend::prepared::PreparedStatement;
+use crate::canonical::pending_session::PendingPublicCommitSession;
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::engine::{
     normalize_sql_execution_error_with_backend, Engine, TransactionBackendAdapter,
@@ -12,23 +14,20 @@ use crate::sql::execution::contracts::executor_error::ExecutorError;
 use crate::sql::execution::contracts::planned_statement::{
     MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
-use crate::backend::prepared::PreparedStatement;
 use crate::sql::execution::contracts::result_contract::ResultContract;
-use crate::canonical::pending_session::PendingPublicCommitSession;
+use crate::sql::execution::execute_prepared::execute_prepared_with_transaction;
 use crate::sql::execution::shared_path;
-use crate::sql::public::services::pending_reads::execute_prepared_public_read_with_pending_transaction_view;
 use crate::sql::public::runtime::{PreparedPublicRead, PreparedPublicWrite};
-use crate::sql::internal::followup::execute_internal_postprocess_with_transaction;
-use crate::sql::internal::PostprocessPlan;
+use crate::sql::public::services::pending_reads::execute_prepared_public_read_with_pending_transaction_view;
 use crate::state::stream::StateCommitStreamChange;
 use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, QueryResult};
 use sqlparser::ast::Statement;
 
-use crate::transaction::contracts::SchemaRegistrationSet;
-use crate::transaction::coordinator::apply_schema_registrations_in_transaction;
 use super::planned_write::{build_planned_write_delta, PlannedWriteDelta};
 use super::planned_write_runner::execute_planned_write_delta;
+use crate::transaction::contracts::SchemaRegistrationSet;
+use crate::transaction::coordinator::apply_schema_registrations_in_transaction;
 
 pub(crate) struct CompiledExecution {
     pub(crate) intent: crate::sql::execution::intent::ExecutionIntent,
@@ -74,7 +73,6 @@ impl CompiledExecution {
 pub(crate) struct CompiledInternalExecution {
     pub(crate) prepared_statements: Vec<PreparedStatement>,
     pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
-    pub(crate) postprocess: Option<PostprocessPlan>,
     pub(crate) mutations: Vec<MutationRow>,
     pub(crate) update_validations: Vec<UpdateValidationPlan>,
     pub(crate) should_refresh_file_cache: bool,
@@ -236,7 +234,7 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
 
 pub(crate) struct SqlExecutionOutcome {
     pub(crate) public_result: QueryResult,
-    pub(crate) postprocess_file_cache_targets: BTreeSet<(String, String)>,
+    pub(crate) internal_write_file_cache_targets: BTreeSet<(String, String)>,
     pub(crate) plugin_changes_committed: bool,
     pub(crate) plan_effects_override: Option<PlanEffects>,
     pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
@@ -250,33 +248,26 @@ pub(crate) async fn execute_internal_execution_with_transaction(
     functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
     writer_key: Option<&str>,
 ) -> Result<SqlExecutionOutcome, ExecutorError> {
-    let outcome = execute_internal_postprocess_with_transaction(
-        transaction,
-        &internal.prepared_statements,
-        internal.postprocess.as_ref(),
-        internal.should_refresh_file_cache,
-        functions,
-        writer_key,
-    )
-    .await
-    .map_err(ExecutorError::execute)?;
-    let postprocess_file_cache_targets = outcome.postprocess_file_cache_targets;
-    let state_commit_stream_changes = outcome.state_commit_stream_changes;
-    let plugin_changes_committed = internal.postprocess.is_some();
-    let internal_result = outcome.internal_result;
+    let _ = (functions, writer_key, internal.should_refresh_file_cache);
+    let internal_result = execute_prepared_with_transaction(transaction, &internal.prepared_statements)
+        .await
+        .map_err(ExecutorError::execute)?;
     let public_result = public_result_from_contract(result_contract, &internal_result);
 
     Ok(SqlExecutionOutcome {
         public_result,
-        postprocess_file_cache_targets,
-        plugin_changes_committed,
+        internal_write_file_cache_targets: BTreeSet::new(),
+        plugin_changes_committed: false,
         plan_effects_override: None,
-        state_commit_stream_changes,
+        state_commit_stream_changes: Vec::new(),
         observe_tick_emitted: false,
     })
 }
 
-fn public_result_from_contract(contract: ResultContract, internal_result: &QueryResult) -> QueryResult {
+fn public_result_from_contract(
+    contract: ResultContract,
+    internal_result: &QueryResult,
+) -> QueryResult {
     match contract {
         ResultContract::DmlNoReturning => QueryResult {
             rows: Vec::new(),

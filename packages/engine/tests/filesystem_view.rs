@@ -268,7 +268,7 @@ simulation_test!(
 
         let before = engine
             .execute(
-                "SELECT COUNT(*) FROM lix_internal_state_vtable \
+                "SELECT COUNT(*) FROM lix_state_by_version \
              WHERE schema_key = 'lix_file_descriptor' \
                AND entity_id = 'file-2' \
                AND snapshot_content IS NOT NULL",
@@ -291,7 +291,7 @@ simulation_test!(
 
         let after = engine
             .execute(
-                "SELECT COUNT(*) FROM lix_internal_state_vtable \
+                "SELECT COUNT(*) FROM lix_state_by_version \
              WHERE schema_key = 'lix_file_descriptor' \
                AND entity_id = 'file-2' \
                AND snapshot_content IS NOT NULL",
@@ -3358,7 +3358,7 @@ simulation_test!(
         engine
             .execute(
                 &format!(
-                    "INSERT INTO lix_internal_state_vtable (\
+                    "INSERT INTO lix_state_by_version (\
                         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                      ) VALUES (\
                         'file-path-untracked', 'lix_file_descriptor', 'lix', '{version_id}', 'lix', '{snapshot_content}', '1', true\
@@ -3761,7 +3761,7 @@ simulation_test!(
         engine
             .execute(
                 &format!(
-                    "INSERT INTO lix_internal_state_vtable (\
+                    "INSERT INTO lix_state_by_version (\
                         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                      ) VALUES (\
                         'file-tombstone-fast-path', 'lix_file_descriptor', 'lix', '{version_id}', 'lix', NULL, '1', true\

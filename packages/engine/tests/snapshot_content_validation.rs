@@ -12,8 +12,7 @@ simulation_test!(allows_valid_snapshot, |sim| async move {
 
     engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+                "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
              )", &[])
             .await
@@ -21,7 +20,7 @@ simulation_test!(allows_valid_snapshot, |sim| async move {
 
     let result = engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Ada\"}', '1'\
@@ -32,7 +31,7 @@ simulation_test!(allows_valid_snapshot, |sim| async move {
 
     let stored = engine
             .execute(
-                "SELECT snapshot_content FROM lix_internal_state_vtable \
+                "SELECT snapshot_content FROM lix_state_by_version \
              WHERE schema_key = 'test_schema' AND entity_id = 'entity-1' AND file_id = 'file-1' AND version_id = 'version-1'", &[])
             .await
             .unwrap();
@@ -53,8 +52,7 @@ simulation_test!(rejects_invalid_snapshot, |sim| async move {
 
     engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+                "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
              )", &[])
             .await
@@ -62,7 +60,7 @@ simulation_test!(rejects_invalid_snapshot, |sim| async move {
 
     let result = engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"missing\":\"field\"}', '1'\
@@ -87,7 +85,7 @@ simulation_test!(requires_registered_schema, |sim| async move {
 
     let result = engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'missing_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Ada\"}', '1'\
@@ -112,8 +110,7 @@ simulation_test!(rejects_invalid_update, |sim| async move {
 
     engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+                "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
              )", &[])
             .await
@@ -121,7 +118,7 @@ simulation_test!(rejects_invalid_update, |sim| async move {
 
     engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Ada\"}', '1'\
@@ -131,7 +128,7 @@ simulation_test!(rejects_invalid_update, |sim| async move {
 
     let result = engine
             .execute(
-                "UPDATE lix_internal_state_vtable SET snapshot_content = '{\"missing\":\"field\"}' \
+                "UPDATE lix_state_by_version SET snapshot_content = '{\"missing\":\"field\"}' \
              WHERE entity_id = 'entity-1' AND schema_key = 'test_schema' AND file_id = 'file-1' AND version_id = 'version-1'", &[])
             .await;
 
@@ -153,8 +150,7 @@ simulation_test!(rejects_update_on_immutable_schema, |sim| async move {
 
     engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+                "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"immutable_schema\",\"x-lix-version\":\"1\",\"x-lix-immutable\":true,\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
              )", &[])
             .await
@@ -162,7 +158,7 @@ simulation_test!(rejects_update_on_immutable_schema, |sim| async move {
 
     engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'immutable_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Ada\"}', '1'\
@@ -172,7 +168,7 @@ simulation_test!(rejects_update_on_immutable_schema, |sim| async move {
 
     let result = engine
             .execute(
-                "UPDATE lix_internal_state_vtable SET snapshot_content = '{\"name\":\"Grace\"}' \
+                "UPDATE lix_state_by_version SET snapshot_content = '{\"name\":\"Grace\"}' \
              WHERE entity_id = 'entity-1' AND schema_key = 'immutable_schema' AND file_id = 'file-1' AND version_id = 'version-1'", &[])
             .await;
 
@@ -194,8 +190,7 @@ simulation_test!(allows_delete_on_immutable_schema, |sim| async move {
 
     engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+                "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"immutable_schema\",\"x-lix-version\":\"1\",\"x-lix-immutable\":true,\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
              )", &[])
             .await
@@ -203,7 +198,7 @@ simulation_test!(allows_delete_on_immutable_schema, |sim| async move {
 
     engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'immutable_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Ada\"}', '1'\
@@ -213,7 +208,7 @@ simulation_test!(allows_delete_on_immutable_schema, |sim| async move {
 
     let result = engine
             .execute(
-                "DELETE FROM lix_internal_state_vtable \
+                "DELETE FROM lix_state_by_version \
              WHERE entity_id = 'entity-1' AND schema_key = 'immutable_schema' AND file_id = 'file-1' AND version_id = 'version-1'", &[])
             .await;
 
@@ -222,7 +217,7 @@ simulation_test!(allows_delete_on_immutable_schema, |sim| async move {
     let stored = engine
         .execute(
             "SELECT snapshot_content \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'immutable_schema' \
                AND entity_id = 'entity-1' \
                AND file_id = 'file-1' \

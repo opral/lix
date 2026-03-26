@@ -3,6 +3,7 @@ use crate::account::{
     active_account_schema_version, active_account_snapshot_content,
     active_account_storage_version_id,
 };
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::sql::public::services::pending_reads::{
     bootstrap_public_surface_registry_with_pending_transaction_view,
@@ -203,12 +204,42 @@ pub(crate) async fn resolve_write_plan(
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
+    resolve_write_plan_with_functions(
+        backend,
+        planned_write,
+        pending_transaction_view,
+        SharedFunctionProvider::new(SystemFunctionProvider),
+    )
+    .await
+}
+
+pub(crate) async fn resolve_write_plan_with_functions<P>(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    functions: SharedFunctionProvider<P>,
+) -> Result<ResolvedWritePlan, WriteResolveError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let resolved = match planned_write.command.target.descriptor.surface_family {
         SurfaceFamily::State => {
-            resolve_state_write(backend, planned_write, pending_transaction_view).await
+            resolve_state_write(
+                backend,
+                planned_write,
+                pending_transaction_view,
+                functions.clone(),
+            )
+            .await
         }
         SurfaceFamily::Entity => {
-            resolve_entity_write(backend, planned_write, pending_transaction_view).await
+            resolve_entity_write(
+                backend,
+                planned_write,
+                pending_transaction_view,
+                functions.clone(),
+            )
+            .await
         }
         SurfaceFamily::Admin => resolve_admin_write(backend, planned_write).await,
         SurfaceFamily::Filesystem => {

@@ -47,8 +47,7 @@ fn assert_non_text_bool(value: &Value, expected: bool) {
 async fn register_test_state_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+            "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -186,7 +185,7 @@ simulation_test!(
         let vtable_rows = engine
             .execute(
                 "SELECT DISTINCT schema_key \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE entity_id = 'version-a' \
                AND schema_key IN ('lix_version_descriptor', 'lix_version_ref') \
                AND snapshot_content IS NOT NULL \
@@ -565,7 +564,7 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
     let deleted_descriptor_rows = engine
         .execute(
             "SELECT DISTINCT schema_key \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE entity_id = 'version-c' \
                AND schema_key = 'lix_version_descriptor' \
                AND snapshot_content IS NULL \
@@ -584,7 +583,7 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
     let version_ref_rows = engine
         .execute(
             "SELECT schema_key \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE entity_id = 'version-c' \
                AND schema_key = 'lix_version_ref'",
             &[],
@@ -767,7 +766,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
+                "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'state-entity-1', 'test_schema', 'file-state', 'version-state', 'lix', '{\"key\":\"value\"}', '1'\

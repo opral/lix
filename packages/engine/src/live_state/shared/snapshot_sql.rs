@@ -40,10 +40,17 @@ pub(crate) fn live_snapshot_select_expr(
                 }
                 (SqlDialect::Postgres, _) => format!("to_json({column_ref})::text"),
             };
-            format!(
-                "CASE WHEN {column_ref} IS NULL THEN NULL ELSE '\"{property_name}\":' || {value_expr} END",
-                property_name = column.property_name,
-            )
+            if column.preserve_null_in_logical_snapshot() {
+                format!(
+                    "CASE WHEN {column_ref} IS NULL THEN '\"{property_name}\":null' ELSE '\"{property_name}\":' || {value_expr} END",
+                    property_name = column.property_name,
+                )
+            } else {
+                format!(
+                    "CASE WHEN {column_ref} IS NULL THEN NULL ELSE '\"{property_name}\":' || {value_expr} END",
+                    property_name = column.property_name,
+                )
+            }
         })
         .collect::<Vec<_>>();
 

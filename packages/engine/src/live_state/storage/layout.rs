@@ -24,6 +24,8 @@ pub(crate) struct LiveColumnSpec {
     pub(crate) property_name: String,
     pub(crate) column_name: String,
     pub(crate) kind: LiveColumnKind,
+    pub(crate) required: bool,
+    pub(crate) nullable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +89,10 @@ impl LiveColumnSpec {
             }
         }
     }
+
+    pub(crate) fn preserve_null_in_logical_snapshot(&self) -> bool {
+        self.required && self.nullable
+    }
 }
 
 pub(crate) fn builtin_live_table_layout(
@@ -113,6 +119,17 @@ pub(crate) fn live_table_layout_from_schema(
 
     let mut columns = Vec::new();
     let mut seen_columns = BTreeSet::new();
+    let required_properties = schema
+        .get("required")
+        .and_then(JsonValue::as_array)
+        .map(|required| {
+            required
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
     if let Some(properties) = schema.get("properties").and_then(JsonValue::as_object) {
         let mut ordered = properties.iter().collect::<Vec<_>>();
         ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -137,6 +154,8 @@ pub(crate) fn live_table_layout_from_schema(
                 property_name: property_name.clone(),
                 column_name,
                 kind,
+                required: required_properties.contains(property_name.as_str()),
+                nullable: schema_property_is_nullable(property_schema),
             });
         }
     }
@@ -169,7 +188,9 @@ where
             match columns_by_name.get(&column.column_name) {
                 Some(existing)
                     if existing.kind != column.kind
-                        || existing.property_name != column.property_name =>
+                        || existing.property_name != column.property_name
+                        || existing.required != column.required
+                        || existing.nullable != column.nullable =>
                 {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
@@ -414,7 +435,11 @@ pub(crate) fn logical_live_snapshot_from_row_with_layout(
         })?;
         let json_value =
             json_value_from_live_row_cell(value, column.kind, schema_key, &column.column_name)?;
-        if !json_value.is_null() {
+        if json_value.is_null() {
+            if column.preserve_null_in_logical_snapshot() {
+                object.insert(column.property_name.clone(), JsonValue::Null);
+            }
+        } else {
             object.insert(column.property_name.clone(), json_value);
         }
     }
@@ -477,6 +502,40 @@ fn live_column_kind_from_schema(schema: &JsonValue) -> Option<LiveColumnKind> {
         return Some(LiveColumnKind::JsonText);
     }
     None
+}
+
+fn schema_property_is_nullable(schema: &JsonValue) -> bool {
+    if schema.is_null() {
+        return true;
+    }
+    if schema
+        .get("nullable")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    match schema.get("type") {
+        Some(JsonValue::String(kind)) if kind == "null" => return true,
+        Some(JsonValue::Array(kinds)) => {
+            if kinds.iter().any(|kind| kind.as_str() == Some("null")) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    if schema
+        .get("const")
+        .map(JsonValue::is_null)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    ["anyOf", "oneOf"]
+        .into_iter()
+        .filter_map(|key| schema.get(key).and_then(JsonValue::as_array))
+        .flatten()
+        .any(schema_property_is_nullable)
 }
 
 fn live_column_name(property_name: &str, kind: LiveColumnKind) -> String {
@@ -638,7 +697,9 @@ const REGISTERED_SCHEMA_BOOTSTRAP_LAYOUT_SQL: &str = "SELECT snapshot_content \
 
 #[cfg(test)]
 mod tests {
-    use super::builtin_live_table_layout;
+    use super::{builtin_live_table_layout, logical_live_snapshot_from_row_with_layout, live_table_layout_from_schema};
+    use crate::Value;
+    use serde_json::json;
 
     #[test]
     fn registered_schema_layout_includes_value_json() {
@@ -656,6 +717,37 @@ mod tests {
                 .iter()
                 .map(|column| column.column_name.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn required_nullable_columns_reconstruct_as_json_null() {
+        let layout = live_table_layout_from_schema(&json!({
+            "x-lix-key": "profile",
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "nickname": { "type": ["string", "null"] }
+            },
+            "required": ["id", "nickname"]
+        }))
+        .expect("layout should compile");
+        let row = vec![Value::Text("row-1".to_string()), Value::Null];
+        let snapshot = logical_live_snapshot_from_row_with_layout(
+            Some(&layout),
+            "profile",
+            &row,
+            0,
+            0,
+        )
+        .expect("snapshot should build")
+        .expect("snapshot should exist");
+        assert_eq!(
+            snapshot,
+            json!({
+                "id": "row-1",
+                "nickname": null
+            })
         );
     }
 }

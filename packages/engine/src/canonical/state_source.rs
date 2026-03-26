@@ -19,6 +19,7 @@ pub(crate) struct ExactCommittedStateRow {
     pub(crate) file_id: String,
     pub(crate) version_id: String,
     pub(crate) values: BTreeMap<String, Value>,
+    pub(crate) writer_key: Option<String>,
     pub(crate) source_change_id: Option<String>,
 }
 
@@ -236,6 +237,7 @@ pub(crate) async fn load_exact_committed_state_row_from_live_state_with_executor
         file_id: row.file_id,
         version_id: row.version_id,
         values,
+        writer_key: row.writer_key,
         source_change_id: row.change_id,
     }))
 }
@@ -368,6 +370,7 @@ pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
         file_id,
         version_id,
         values,
+        writer_key: None,
         source_change_id,
     }))
 }

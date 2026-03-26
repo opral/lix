@@ -1,5 +1,11 @@
 use std::collections::BTreeSet;
 
+use crate::canonical::append::{
+    append_tracked_with_pending_public_session, BufferedTrackedAppendArgs, CreateCommitDisposition,
+    CreateCommitError, CreateCommitErrorKind, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
+    CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
+};
+use crate::canonical::ProposedDomainChange;
 use crate::deterministic_mode::DeterministicSettings;
 use crate::engine::Engine;
 use crate::engine::TransactionBackendAdapter;
@@ -7,24 +13,17 @@ use crate::functions::LixFunctionProvider;
 use crate::schema::live_layout::{normalized_live_column_values, tracked_live_table_name};
 use crate::schema::registry::load_live_table_layout_in_transaction;
 use crate::sql::public::validation::{validate_commit_time_write, SchemaCache};
-use crate::canonical::append::{
-    append_tracked_with_pending_public_session, BufferedTrackedAppendArgs,
-    CreateCommitDisposition, CreateCommitError, CreateCommitErrorKind,
-    CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitInvariantChecker,
-    CreateCommitPreconditions, CreateCommitWriteLane,
-};
-use crate::canonical::ProposedDomainChange;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
 use super::{
-    apply_public_version_last_checkpoint_side_effects, build_filesystem_payload_domain_changes_insert,
-    empty_public_write_execution_outcome, escape_sql_string,
-    execute_internal_execution_with_transaction,
+    apply_public_version_last_checkpoint_side_effects,
+    build_filesystem_payload_domain_changes_insert, empty_public_write_execution_outcome,
+    escape_sql_string, execute_internal_execution_with_transaction,
     mirror_public_registered_schema_bootstrap_rows, semantic_plan_effects_from_domain_changes,
-    state_commit_stream_operation, DomainChangeBatch, PendingPublicCommitSession, PlanEffects, PlannedInternalWriteUnit,
-    PlannedPublicUntrackedWriteUnit, PlannedStateRow, PlannedWriteDelta, PlannedWriteUnit,
-    SqlExecutionOutcome, WriteLane,
+    state_commit_stream_operation, DomainChangeBatch, PendingPublicCommitSession, PlanEffects,
+    PlannedInternalWriteUnit, PlannedPublicUntrackedWriteUnit, PlannedStateRow, PlannedWriteDelta,
+    PlannedWriteUnit, SqlExecutionOutcome, WriteLane,
 };
 
 struct PublicCommitInvariantChecker<'a> {
@@ -173,19 +172,21 @@ async fn materialize_tracked_append_phase(
     if let Some(applied_output) = append_outcome.applied_output.as_ref() {
         mirror_public_registered_schema_bootstrap_rows(transaction, applied_output)
             .await
-        .map_err(|error| LixError {
-            code: error.code,
-            description: format!(
-                "public tracked write registered-schema bootstrap mirroring failed: {}",
-                error.description
-            ),
-        })?;
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "public tracked write registered-schema bootstrap mirroring failed: {}",
+                    error.description
+                ),
+            })?;
     }
 
     let applied_domain_change_batch =
         if matches!(append_outcome.disposition, CreateCommitDisposition::Applied) {
             Some(DomainChangeBatch {
-                changes: public_domain_changes_from_proposed(&append_outcome.applied_domain_changes),
+                changes: public_domain_changes_from_proposed(
+                    &append_outcome.applied_domain_changes,
+                ),
                 write_lane: unit
                     .execution
                     .domain_change_batch
@@ -259,7 +260,7 @@ async fn materialize_tracked_append_phase(
             rows: Vec::new(),
             columns: Vec::new(),
         },
-        postprocess_file_cache_targets: BTreeSet::new(),
+        internal_write_file_cache_targets: BTreeSet::new(),
         plugin_changes_committed,
         plan_effects_override: Some(plan_effects_override),
         state_commit_stream_changes: Vec::new(),
@@ -280,8 +281,13 @@ async fn run_public_untracked_write_txn_with_transaction(
         // descriptor-domain visibility in the untracked live tables owned here.
     }
 
-    apply_public_untracked_rows(transaction, &plan.execution.intended_post_state, &timestamp)
-        .await?;
+    apply_public_untracked_rows(
+        transaction,
+        &plan.execution.intended_post_state,
+        &timestamp,
+        plan.writer_key.as_deref(),
+    )
+    .await?;
 
     let filesystem_finalization = engine
         .compile_filesystem_finalization_from_state_in_transaction(
@@ -335,7 +341,7 @@ async fn run_public_untracked_write_txn_with_transaction(
             rows: Vec::new(),
             columns: Vec::new(),
         },
-        postprocess_file_cache_targets: BTreeSet::new(),
+        internal_write_file_cache_targets: BTreeSet::new(),
         plugin_changes_committed: false,
         plan_effects_override: Some(plan.execution.semantic_effects.clone()),
         state_commit_stream_changes: Vec::new(),
@@ -424,8 +430,8 @@ fn merge_sql_execution_outcome(
     };
 
     existing
-        .postprocess_file_cache_targets
-        .extend(outcome.postprocess_file_cache_targets);
+        .internal_write_file_cache_targets
+        .extend(outcome.internal_write_file_cache_targets);
     existing.plugin_changes_committed |= outcome.plugin_changes_committed;
     existing
         .state_commit_stream_changes
@@ -461,12 +467,14 @@ async fn apply_public_untracked_rows(
     transaction: &mut dyn LixBackendTransaction,
     rows: &[PlannedStateRow],
     timestamp: &str,
+    execution_writer_key: Option<&str>,
 ) -> Result<(), LixError> {
     for row in rows {
         if row.tombstone {
             apply_public_untracked_delete(transaction, row).await?;
         } else {
-            apply_public_untracked_upsert(transaction, row, timestamp).await?;
+            apply_public_untracked_upsert(transaction, row, timestamp, execution_writer_key)
+                .await?;
         }
     }
     Ok(())
@@ -476,6 +484,7 @@ async fn apply_public_untracked_upsert(
     transaction: &mut dyn LixBackendTransaction,
     row: &PlannedStateRow,
     timestamp: &str,
+    execution_writer_key: Option<&str>,
 ) -> Result<(), LixError> {
     let file_id = planned_row_text_value(row, "file_id")?;
     let plugin_key = planned_row_text_value(row, "plugin_key")?;
@@ -485,6 +494,7 @@ async fn apply_public_untracked_upsert(
         .map(|value| format!("'{}'", escape_sql_string(value)))
         .unwrap_or_else(|| "NULL".to_string());
     let writer_key_sql = planned_row_optional_text_value(row, "writer_key")
+        .or(execution_writer_key)
         .map(|value| format!("'{}'", escape_sql_string(value)))
         .unwrap_or_else(|| "NULL".to_string());
     let global = row
@@ -803,16 +813,18 @@ fn public_domain_changes_from_proposed(
 ) -> Vec<crate::sql::public::planner::semantics::domain_changes::PublicDomainChange> {
     changes
         .iter()
-        .map(|change| crate::sql::public::planner::semantics::domain_changes::PublicDomainChange {
-            entity_id: change.entity_id.to_string(),
-            schema_key: change.schema_key.to_string(),
-            schema_version: change.schema_version.as_ref().map(ToString::to_string),
-            file_id: change.file_id.as_ref().map(ToString::to_string),
-            plugin_key: change.plugin_key.as_ref().map(ToString::to_string),
-            snapshot_content: change.snapshot_content.clone(),
-            metadata: change.metadata.clone(),
-            version_id: change.version_id.to_string(),
-            writer_key: change.writer_key.clone(),
-        })
+        .map(
+            |change| crate::sql::public::planner::semantics::domain_changes::PublicDomainChange {
+                entity_id: change.entity_id.to_string(),
+                schema_key: change.schema_key.to_string(),
+                schema_version: change.schema_version.as_ref().map(ToString::to_string),
+                file_id: change.file_id.as_ref().map(ToString::to_string),
+                plugin_key: change.plugin_key.as_ref().map(ToString::to_string),
+                snapshot_content: change.snapshot_content.clone(),
+                metadata: change.metadata.clone(),
+                version_id: change.version_id.to_string(),
+                writer_key: change.writer_key.clone(),
+            },
+        )
         .collect()
 }

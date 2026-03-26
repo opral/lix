@@ -13,8 +13,7 @@ fn assert_text(value: &Value, expected: &str) {
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_registered_schema',\
+            "INSERT INTO lix_registered_schema (value) VALUES (\
              '{\"value\":{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
@@ -40,7 +39,7 @@ async fn insert_state_row(
     untracked: bool,
 ) {
     let sql = format!(
-        "INSERT INTO lix_internal_state_vtable (\
+        "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
          ) VALUES (\
          '{entity_id}', 'test_state_schema', 'test-file', '{version_id}', 'lix', '{snapshot_content}', '1', {untracked}\
@@ -460,7 +459,7 @@ simulation_test!(
 
         engine
             .execute(
-                "UPDATE lix_internal_state_vtable \
+                "UPDATE lix_state_by_version \
                  SET snapshot_content = '{\"value\":\"updated\"}' \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'untracked-entity' \
@@ -525,7 +524,7 @@ simulation_test!(
         let first = engine
             .execute(
                 "SELECT version_id, snapshot_content \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'test_state_schema' \
                AND entity_id = 'entity-0' \
                AND file_id = 'file-0' \
@@ -562,7 +561,7 @@ simulation_test!(
         let second = engine
             .execute(
                 "SELECT version_id, snapshot_content \
-             FROM lix_internal_state_vtable \
+             FROM lix_state_by_version \
              WHERE schema_key = 'test_state_schema' \
                AND entity_id = 'entity-0' \
                AND file_id = 'file-0' \
@@ -619,7 +618,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT version_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-p' \
                    AND file_id = 'file-p'",
@@ -695,7 +694,7 @@ simulation_test!(
         let materialized = engine
             .execute(
                 "SELECT snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-upsert' \
                    AND file_id = 'file-upsert' \
@@ -861,7 +860,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT version_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-u' \
                    AND file_id = 'test-file' \
@@ -1363,7 +1362,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT version_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-d' \
                    AND file_id = 'test-file' \
@@ -1434,7 +1433,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT version_id, snapshot_content, untracked \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'untracked-entity-d' \
                    AND file_id = 'test-file' \
@@ -1498,7 +1497,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT version_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-s' \
                    AND file_id = 'test-file' \

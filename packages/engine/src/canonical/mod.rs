@@ -10,6 +10,4 @@ pub(crate) mod runtime;
 mod state_source;
 mod types;
 pub(crate) use types::ProposedDomainChange;
-pub(crate) use types::{
-    DomainChangeInput, MaterializedStateRow,
-};
+pub(crate) use types::MaterializedStateRow;
