@@ -1,3 +1,6 @@
+use crate::account::{
+    active_account_file_id, active_account_schema_key, active_account_storage_version_id,
+};
 use crate::change_view::TrackedDomainChangeView;
 use crate::errors::schema_not_registered_error;
 use crate::errors::{
@@ -545,6 +548,7 @@ pub(crate) async fn prepare_public_execution(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_account_ids: &[String],
     writer_key: Option<&str>,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
     prepare_public_execution_with_internal_access(
@@ -552,6 +556,7 @@ pub(crate) async fn prepare_public_execution(
         parsed_statements,
         params,
         active_version_id,
+        active_account_ids,
         writer_key,
         false,
     )
@@ -564,6 +569,7 @@ pub(crate) async fn prepare_public_execution_with_registry_and_internal_access(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
@@ -573,6 +579,7 @@ pub(crate) async fn prepare_public_execution_with_registry_and_internal_access(
         parsed_statements,
         params,
         active_version_id,
+        active_account_ids,
         writer_key,
         allow_internal_tables,
         None,
@@ -586,6 +593,7 @@ pub(crate) async fn prepare_public_execution_with_registry_and_internal_access_a
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
     pending_transaction_view: Option<&PendingTransactionView>,
@@ -596,6 +604,7 @@ pub(crate) async fn prepare_public_execution_with_registry_and_internal_access_a
         parsed_statements,
         params,
         active_version_id,
+        active_account_ids,
         writer_key,
         allow_internal_tables,
         pending_transaction_view,
@@ -612,6 +621,7 @@ pub(crate) async fn prepare_public_execution_with_registry_and_internal_access_a
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
     pending_transaction_view: Option<&PendingTransactionView>,
@@ -635,6 +645,7 @@ where
                 parsed_statements,
                 params,
                 active_version_id,
+                active_account_ids,
                 writer_key,
                 pending_transaction_view,
                 functions,
@@ -687,6 +698,7 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
@@ -695,6 +707,7 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
         parsed_statements,
         params,
         active_version_id,
+        active_account_ids,
         writer_key,
         allow_internal_tables,
         SharedFunctionProvider::new(SystemFunctionProvider),
@@ -707,6 +720,7 @@ pub(crate) async fn prepare_public_execution_with_internal_access_and_functions<
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
     functions: SharedFunctionProvider<P>,
@@ -723,6 +737,7 @@ where
             parsed_statements,
             params,
             active_version_id,
+            active_account_ids,
             writer_key,
             allow_internal_tables,
             None,
@@ -740,6 +755,7 @@ where
         parsed_statements,
         params,
         active_version_id,
+        active_account_ids,
         writer_key,
         allow_internal_tables,
         None,
@@ -1917,6 +1933,7 @@ pub(crate) async fn try_prepare_public_write(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_account_ids: &[String],
     writer_key: Option<&str>,
 ) -> Result<Option<PreparedPublicWrite>, LixError> {
     try_prepare_public_write_with_functions(
@@ -1924,6 +1941,7 @@ pub(crate) async fn try_prepare_public_write(
         parsed_statements,
         params,
         active_version_id,
+        active_account_ids,
         writer_key,
         SharedFunctionProvider::new(SystemFunctionProvider),
     )
@@ -1935,6 +1953,7 @@ pub(crate) async fn try_prepare_public_write_with_functions<P>(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_account_ids: &[String],
     writer_key: Option<&str>,
     functions: SharedFunctionProvider<P>,
 ) -> Result<Option<PreparedPublicWrite>, LixError>
@@ -1954,6 +1973,7 @@ where
         parsed_statements,
         params,
         active_version_id,
+        active_account_ids,
         writer_key,
         None,
         functions,
@@ -1967,6 +1987,7 @@ pub(crate) async fn try_prepare_public_write_with_registry(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_account_ids: &[String],
     writer_key: Option<&str>,
     pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<Option<PreparedPublicWrite>, LixError> {
@@ -1976,6 +1997,7 @@ pub(crate) async fn try_prepare_public_write_with_registry(
         parsed_statements,
         params,
         active_version_id,
+        active_account_ids,
         writer_key,
         pending_transaction_view,
         SharedFunctionProvider::new(SystemFunctionProvider),
@@ -1989,6 +2011,7 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions<P>(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_account_ids: &[String],
     writer_key: Option<&str>,
     pending_transaction_view: Option<&PendingTransactionView>,
     functions: SharedFunctionProvider<P>,
@@ -2008,6 +2031,7 @@ where
             dialect: Some(backend.dialect()),
             writer_key: writer_key.map(ToString::to_string),
             requested_version_id: Some(active_version_id.to_string()),
+            active_account_ids: active_account_ids.to_vec(),
         },
     );
     let filesystem_target_name =
@@ -2126,6 +2150,7 @@ pub(crate) async fn prepare_public_write(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_account_ids: &[String],
     writer_key: Option<&str>,
 ) -> Option<PreparedPublicWrite> {
     try_prepare_public_write(
@@ -2133,6 +2158,7 @@ pub(crate) async fn prepare_public_write(
         parsed_statements,
         params,
         active_version_id,
+        active_account_ids,
         writer_key,
     )
     .await
@@ -2422,24 +2448,32 @@ fn semantic_plan_effects_from_untracked_public_write(
             .file_cache_refresh_targets
             .extend(pending_file_delete_targets);
     }
-    if planned_write.command.target.descriptor.public_name != "lix_active_version" {
-        return Ok(effects);
-    }
-    for row in intended_post_state.iter().rev() {
-        if row.schema_key != active_version_schema_key()
-            || planned_row_optional_text_value(row, "file_id") != Some(active_version_file_id())
-            || row.version_id.as_deref() != Some(active_version_storage_version_id())
-            || row.tombstone
-        {
-            continue;
+    match planned_write.command.target.descriptor.public_name.as_str() {
+        "lix_active_version" => {
+            for row in intended_post_state.iter().rev() {
+                if row.schema_key != active_version_schema_key()
+                    || planned_row_optional_text_value(row, "file_id")
+                        != Some(active_version_file_id())
+                    || row.version_id.as_deref() != Some(active_version_storage_version_id())
+                    || row.tombstone
+                {
+                    continue;
+                }
+                let Some(snapshot_content) =
+                    planned_row_optional_json_text_value(row, "snapshot_content")
+                else {
+                    continue;
+                };
+                effects.next_active_version_id =
+                    Some(parse_active_version_snapshot(snapshot_content.as_ref())?);
+                break;
+            }
         }
-        let Some(snapshot_content) = planned_row_optional_json_text_value(row, "snapshot_content")
-        else {
-            continue;
-        };
-        effects.next_active_version_id =
-            Some(parse_active_version_snapshot(snapshot_content.as_ref())?);
-        break;
+        "lix_active_account" => {
+            effects.next_active_account_ids =
+                Some(next_active_account_ids_from_planned_rows(intended_post_state));
+        }
+        _ => {}
     }
     Ok(effects)
 }
@@ -2454,6 +2488,7 @@ pub(crate) fn semantic_plan_effects_from_domain_changes<Change: TrackedDomainCha
             stream_operation,
         )?,
         next_active_version_id: next_active_version_id_from_domain_changes(changes)?,
+        next_active_account_ids: None,
         file_cache_refresh_targets: file_cache_refresh_targets_from_domain_changes(changes),
     })
 }
@@ -2476,6 +2511,28 @@ fn next_active_version_id_from_domain_changes<Change: TrackedDomainChangeView>(
     }
 
     Ok(None)
+}
+
+fn next_active_account_ids_from_planned_rows(
+    intended_post_state: &[crate::sql::public::planner::ir::PlannedStateRow],
+) -> Vec<String> {
+    let mut deduped = BTreeSet::new();
+    for row in intended_post_state {
+        if row.schema_key != active_account_schema_key()
+            || planned_row_optional_text_value(row, "file_id") != Some(active_account_file_id())
+            || row.version_id.as_deref() != Some(active_account_storage_version_id())
+            || row.tombstone
+        {
+            continue;
+        }
+        let Some(account_id) = planned_row_optional_text_value(row, "account_id") else {
+            continue;
+        };
+        if !account_id.is_empty() {
+            deduped.insert(account_id.to_string());
+        }
+    }
+    deduped.into_iter().collect()
 }
 
 fn file_cache_refresh_targets_from_domain_changes<Change: TrackedDomainChangeView>(
@@ -4081,6 +4138,7 @@ mod tests {
                         ),
                         &[],
                         "main",
+                        &[],
                         None,
                     )
                     .await
@@ -4111,6 +4169,7 @@ mod tests {
                         ),
                         &[],
                         "main",
+                        &[],
                         None,
                     )
                     .await
@@ -4138,6 +4197,7 @@ mod tests {
                         ),
                         &[],
                         "main",
+                        &[],
                         None,
                     )
                     .await
@@ -4163,7 +4223,14 @@ mod tests {
                         "INSERT INTO lix_change_set (id) VALUES ('cs1')",
                     ] {
                         let error =
-                            prepare_public_execution(&backend, &parse_one(sql), &[], "main", None)
+                            prepare_public_execution(
+                                &backend,
+                                &parse_one(sql),
+                                &[],
+                                "main",
+                                &[],
+                                None,
+                            )
                                 .await
                                 .expect_err(
                                     "read-only public write should be rejected by public lowering",
@@ -4285,6 +4352,7 @@ mod tests {
                         ),
                         &[],
                         "main",
+                        &[],
                         None,
                     )
                     .await
@@ -4416,6 +4484,7 @@ mod tests {
             ),
             &[],
             "main",
+            &[],
             None,
             true,
         )

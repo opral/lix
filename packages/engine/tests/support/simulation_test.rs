@@ -11,9 +11,12 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use lix_engine::{
-    boot, BootAccount, BootArgs, BootKeyValue, Engine, ExecuteOptions, ExecuteResult,
-    LiveStateApplyReport, LiveStateRebuildDebugMode, LiveStateRebuildPlan, LiveStateRebuildReport,
-    LiveStateRebuildRequest, LiveStateRebuildScope, LixBackend, LixError, Value, WasmRuntime,
+    boot, BootAccount, BootArgs, BootKeyValue, CreateCheckpointResult, CreateVersionOptions,
+    CreateVersionResult, Engine, ExecuteOptions, ExecuteResult, LiveStateApplyReport,
+    LiveStateRebuildDebugMode, LiveStateRebuildPlan, LiveStateRebuildReport,
+    LiveStateRebuildRequest, LiveStateRebuildScope, LixBackend, LixError, MergeVersionOptions,
+    MergeVersionResult, ObserveEvents, ObserveQuery, RedoOptions, RedoResult, Session,
+    SessionTransaction, UndoOptions, UndoResult, Value, WasmRuntime,
 };
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex as TokioMutex;
@@ -57,7 +60,8 @@ impl Default for SimulationBootArgs {
 }
 
 pub struct SimulationEngine {
-    engine: Engine,
+    engine: Arc<Engine>,
+    session: OnceLock<Arc<Session>>,
     behavior: SimulationBehavior,
     rematerialization_pending: AtomicBool,
     initialized: AtomicBool,
@@ -72,6 +76,8 @@ impl SimulationEngine {
 
     pub async fn initialize(&self) -> Result<(), LixError> {
         self.engine.initialize().await?;
+        let session = Arc::new(self.engine.open_workspace_session().await?);
+        let _ = self.session.set(session);
         self.initialized.store(true, Ordering::SeqCst);
         if self.behavior == SimulationBehavior::Rematerialization {
             // Re-materialize on first read after init, mirroring "cache cleared then repopulated"
@@ -92,28 +98,87 @@ impl SimulationEngine {
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
+        let session = self.opened_session().await?;
         match classify_statement(sql) {
             StatementKind::Read => {
                 self.rematerialize_before_read_if_needed().await?;
-                self.engine.execute_with_options(sql, params, options).await
+                session.execute_with_options(sql, params, options).await
             }
             StatementKind::Write => {
-                let result = self.engine.execute_with_options(sql, params, options).await;
+                let result = session.execute_with_options(sql, params, options).await;
                 if self.behavior == SimulationBehavior::Rematerialization && result.is_ok() {
                     self.rematerialization_pending.store(true, Ordering::SeqCst);
                 }
                 result
             }
-            StatementKind::Other => self.engine.execute_with_options(sql, params, options).await,
+            StatementKind::Other => session.execute_with_options(sql, params, options).await,
         }
     }
 
     pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
-        self.engine.install_plugin(archive_bytes).await
+        self.opened_session().await?.install_plugin(archive_bytes).await
     }
 
     pub async fn register_schema(&self, schema: &JsonValue) -> Result<(), LixError> {
-        self.engine.register_schema(schema).await
+        self.opened_session().await?.register_schema(schema).await
+    }
+
+    pub async fn create_version(
+        &self,
+        options: CreateVersionOptions,
+    ) -> Result<CreateVersionResult, LixError> {
+        self.opened_session().await?.create_version(options).await
+    }
+
+    pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
+        self.opened_session().await?.switch_version(version_id).await
+    }
+
+    pub async fn merge_version(
+        &self,
+        options: MergeVersionOptions,
+    ) -> Result<MergeVersionResult, LixError> {
+        self.opened_session().await?.merge_version(options).await
+    }
+
+    pub async fn create_checkpoint(&self) -> Result<CreateCheckpointResult, LixError> {
+        self.opened_session().await?.create_checkpoint().await
+    }
+
+    pub async fn undo(&self) -> Result<UndoResult, LixError> {
+        self.opened_session().await?.undo().await
+    }
+
+    pub async fn undo_with_options(&self, options: UndoOptions) -> Result<UndoResult, LixError> {
+        self.opened_session().await?.undo_with_options(options).await
+    }
+
+    pub async fn redo(&self) -> Result<RedoResult, LixError> {
+        self.opened_session().await?.redo().await
+    }
+
+    pub async fn redo_with_options(&self, options: RedoOptions) -> Result<RedoResult, LixError> {
+        self.opened_session().await?.redo_with_options(options).await
+    }
+
+    pub fn observe(&self, query: ObserveQuery) -> Result<ObserveEvents<'_>, LixError> {
+        self.session()?.observe(query)
+    }
+
+    pub async fn begin_transaction_with_options(
+        &self,
+        options: ExecuteOptions,
+    ) -> Result<SessionTransaction<'_>, LixError> {
+        self.session()?.begin_transaction_with_options(options).await
+    }
+
+    pub async fn transaction<T, F>(&self, options: ExecuteOptions, f: F) -> Result<T, LixError>
+    where
+        F: for<'tx> FnOnce(
+            &'tx mut SessionTransaction<'_>,
+        ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
+    {
+        self.session()?.transaction(options, f).await
     }
 
     pub async fn live_state_rebuild_plan(
@@ -162,6 +227,26 @@ impl SimulationEngine {
         self.rematerialization_pending
             .store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn session(&self) -> Result<&Session, LixError> {
+        self.session
+            .get()
+            .map(Arc::as_ref)
+            .ok_or_else(|| LixError::unknown("simulation session is not initialized"))
+    }
+
+    async fn opened_session(&self) -> Result<Arc<Session>, LixError> {
+        if let Some(session) = self.session.get() {
+            return Ok(Arc::clone(session));
+        }
+        let session = Arc::new(self.engine.open_workspace_session().await?);
+        let _ = self.session.set(Arc::clone(&session));
+        Ok(self
+            .session
+            .get()
+            .map(Arc::clone)
+            .unwrap_or(session))
     }
 }
 
@@ -284,7 +369,7 @@ impl Deref for SimulationEngine {
     type Target = Engine;
 
     fn deref(&self) -> &Self::Target {
-        &self.engine
+        self.engine.as_ref()
     }
 }
 
@@ -301,13 +386,14 @@ impl SimulationArgs {
             enable_timestamp_shuffle_mode(&mut args.key_values);
         }
         Ok(SimulationEngine {
-            engine: boot(BootArgs {
+            engine: Arc::new(boot(BootArgs {
                 backend: (self.backend_factory)(),
                 wasm_runtime: args.wasm_runtime,
                 key_values: args.key_values,
                 active_account: args.active_account,
                 access_to_internal: args.access_to_internal,
-            }),
+            })),
+            session: OnceLock::new(),
             behavior: self.behavior,
             rematerialization_pending: AtomicBool::new(false),
             initialized: AtomicBool::new(false),

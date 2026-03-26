@@ -3,27 +3,22 @@ use crate::canonical::append::{
     CreateCommitPreconditions, CreateCommitWriteLane,
 };
 use crate::canonical::readers::load_committed_version_head_commit_id_from_live_state;
-use crate::engine::Engine;
 use crate::functions::LixFunctionProvider;
-use crate::{EngineTransaction, LixError};
+use crate::{LixError, Session, SessionTransaction};
 
 use super::store::insert_undo_redo_operation_in_transaction;
 use super::{
     build_restore_proposed_change, build_tombstone_proposed_change,
     load_target_commit_change_effects, rebuild_semantic_undo_redo_stacks,
-    resolve_target_version_id, UndoOptions, UndoRedoOperationKind, UndoRedoOperationRecord,
-    UndoResult,
+    resolve_target_version_id_in_session, UndoOptions, UndoRedoOperationKind,
+    UndoRedoOperationRecord, UndoResult,
 };
 
-pub(crate) async fn undo(engine: &Engine) -> Result<UndoResult, LixError> {
-    undo_with_options(engine, UndoOptions::default()).await
-}
-
-pub(crate) async fn undo_with_options(
-    engine: &Engine,
+pub(crate) async fn undo_with_options_in_session(
+    session: &Session,
     options: UndoOptions,
 ) -> Result<UndoResult, LixError> {
-    engine
+    session
         .transaction(crate::ExecuteOptions::default(), move |tx| {
             let options = options.clone();
             Box::pin(async move { undo_in_transaction(tx, options).await })
@@ -32,11 +27,12 @@ pub(crate) async fn undo_with_options(
 }
 
 async fn undo_in_transaction(
-    tx: &mut EngineTransaction<'_>,
+    tx: &mut SessionTransaction<'_>,
     options: UndoOptions,
 ) -> Result<UndoResult, LixError> {
     let engine = tx.engine;
-    let version_id = resolve_target_version_id(tx, options.version_id.as_deref()).await?;
+    let active_account_ids = tx.context.active_account_ids.clone();
+    let version_id = resolve_target_version_id_in_session(tx, options.version_id.as_deref()).await?;
     let (result, state_commit_stream_changes) = {
         let transaction = tx.backend_transaction_mut()?;
         let stacks = rebuild_semantic_undo_redo_stacks(transaction, &version_id).await?;
@@ -205,6 +201,7 @@ async fn undo_in_transaction(
                         version_id, target_commit_id, current_head_commit_id
                     )),
                 },
+                active_account_ids: Some(active_account_ids.clone()),
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,

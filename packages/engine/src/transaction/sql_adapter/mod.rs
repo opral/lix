@@ -37,8 +37,7 @@ pub(crate) use execute::{
     execute_bound_statement_template_instance_in_borrowed_write_transaction,
     execute_bound_statement_template_instance_in_write_transaction,
     execute_parsed_statements_in_borrowed_write_transaction,
-    execute_parsed_statements_in_write_transaction, execute_program_with_new_write_transaction,
-    execute_with_options_in_write_transaction,
+    execute_parsed_statements_in_write_transaction, execute_with_options_in_write_transaction,
 };
 pub(crate) use planned_write::{
     BufferedWriteJournal, PendingFilesystemOverlay, PendingRegisteredSchemaOverlay,

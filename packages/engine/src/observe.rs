@@ -1,5 +1,6 @@
 use crate::engine::Engine;
 use crate::errors;
+use crate::session::Session;
 use crate::sql::execution::dependency_spec::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
 };
@@ -39,12 +40,12 @@ pub struct ObserveEvent {
 }
 
 pub struct ObserveEvents<'a> {
-    engine: &'a Engine,
+    session: &'a Session,
     state: ObserveState,
 }
 
 pub struct ObserveEventsOwned {
-    engine: Arc<Engine>,
+    session: Arc<Session>,
     state: ObserveState,
 }
 
@@ -269,11 +270,11 @@ impl SharedObserveSource {
 
 impl ObserveEvents<'_> {
     pub async fn next(&mut self) -> Result<Option<ObserveEvent>, LixError> {
-        self.state.next_with_engine(self.engine).await
+        self.state.next_with_session(self.session).await
     }
 
     pub fn close(&mut self) {
-        self.state.close_with_engine(self.engine);
+        self.state.close_with_session(self.session);
     }
 }
 
@@ -285,11 +286,11 @@ impl Drop for ObserveEvents<'_> {
 
 impl ObserveEventsOwned {
     pub async fn next(&mut self) -> Result<Option<ObserveEvent>, LixError> {
-        self.state.next_with_engine(self.engine.as_ref()).await
+        self.state.next_with_session(self.session.as_ref()).await
     }
 
     pub fn close(&mut self) {
-        self.state.close_with_engine(self.engine.as_ref());
+        self.state.close_with_session(self.session.as_ref());
     }
 }
 
@@ -300,9 +301,9 @@ impl Drop for ObserveEventsOwned {
 }
 
 impl ObserveState {
-    async fn next_with_engine(
+    async fn next_with_session(
         &mut self,
-        engine: &Engine,
+        session: &Session,
     ) -> Result<Option<ObserveEvent>, LixError> {
         if self.closed {
             return Ok(None);
@@ -332,7 +333,7 @@ impl ObserveState {
 
             if role {
                 let mut polling_guard = PollingGuard::new(Arc::clone(&self.source));
-                let poll_result = self.poll_shared_source_once(engine).await;
+                let poll_result = self.poll_shared_source_once(session).await;
                 if let Ok(mut source) = lock_shared_source(&self.source) {
                     source.polling = false;
                 }
@@ -352,7 +353,7 @@ impl ObserveState {
         Ok(source.take_next_event_for_subscriber(self.subscriber_id))
     }
 
-    async fn poll_shared_source_once(&mut self, engine: &Engine) -> Result<(), LixError> {
+    async fn poll_shared_source_once(&mut self, session: &Session) -> Result<(), LixError> {
         let work = {
             let source = lock_shared_source(&self.source)?;
             if source.closed {
@@ -379,8 +380,8 @@ impl ObserveState {
 
         let outcome = match work {
             PollWork::Initial { query } => {
-                let latest_tick_seq = latest_observe_tick_seq(engine).await?;
-                let rows = execute_observe_query(engine, &query).await?;
+                let latest_tick_seq = latest_observe_tick_seq(session.engine().as_ref()).await?;
+                let rows = execute_observe_query(session, &query).await?;
                 PollOutcome {
                     maybe_rows: Some((rows, None)),
                     update_last_seen_tick_seq: Some(latest_tick_seq),
@@ -391,7 +392,7 @@ impl ObserveState {
                 query,
                 state_commit_sequence,
             } => {
-                let rows = execute_observe_query(engine, &query).await?;
+                let rows = execute_observe_query(session, &query).await?;
                 PollOutcome {
                     maybe_rows: Some((rows, Some(state_commit_sequence))),
                     update_last_seen_tick_seq: None,
@@ -404,7 +405,8 @@ impl ObserveState {
                 writer_key_filter,
             } => {
                 observe_poll_sleep(OBSERVE_TICK_POLL_INTERVAL).await;
-                let observed_ticks = observe_ticks_since(engine, last_seen_tick_seq).await?;
+                let observed_ticks =
+                    observe_ticks_since(session.engine().as_ref(), last_seen_tick_seq).await?;
                 if observed_ticks.is_empty() {
                     PollOutcome {
                         maybe_rows: None,
@@ -428,7 +430,7 @@ impl ObserveState {
                             mark_initialized: true,
                         }
                     } else {
-                        let rows = execute_observe_query(engine, &query).await?;
+                        let rows = execute_observe_query(session, &query).await?;
                         PollOutcome {
                             maybe_rows: Some((rows, None)),
                             update_last_seen_tick_seq: Some(next_last_seen_tick_seq),
@@ -479,17 +481,12 @@ impl ObserveState {
         }
     }
 
-    fn close_with_engine(&mut self, engine: &Engine) {
+    fn close_with_session(&mut self, session: &Session) {
         if self.closed {
             return;
         }
         self.closed = true;
-        let _ = unregister_observe_subscriber(
-            engine,
-            &self.source_key,
-            &self.source,
-            self.subscriber_id,
-        );
+        let _ = unregister_observe_subscriber(session, &self.source_key, &self.source, self.subscriber_id);
     }
 }
 
@@ -539,10 +536,14 @@ impl ObserveWriterKeyFilter {
 }
 
 async fn execute_observe_query(
-    engine: &Engine,
+    session: &Session,
     query: &ObserveQuery,
 ) -> Result<QueryResult, LixError> {
-    let result = Box::pin(engine.execute(&query.sql, &query.params)).await?;
+    let result = Box::pin(session.execute(&query.sql, &query.params)).await?;
+    extract_single_observe_query_result(result)
+}
+
+fn extract_single_observe_query_result(result: crate::ExecuteResult) -> Result<QueryResult, LixError> {
     let [statement] = result.statements.as_slice() else {
         return Err(errors::unexpected_statement_count_error(
             "observe query",
@@ -553,27 +554,27 @@ async fn execute_observe_query(
     Ok(statement.clone())
 }
 
-impl Engine {
+impl Session {
     pub fn observe(&self, query: ObserveQuery) -> Result<ObserveEvents<'_>, LixError> {
         let state = build_observe_state(self, query)?;
         Ok(ObserveEvents {
-            engine: self,
+            session: self,
             state,
         })
     }
 }
 
-pub(crate) fn observe_owned(
-    engine: Arc<Engine>,
+pub(crate) fn observe_owned_session(
+    session: Arc<Session>,
     query: ObserveQuery,
 ) -> Result<ObserveEventsOwned, LixError> {
-    let state = build_observe_state(engine.as_ref(), query)?;
-    Ok(ObserveEventsOwned { engine, state })
+    let state = build_observe_state(session.as_ref(), query)?;
+    Ok(ObserveEventsOwned { session, state })
 }
 
-fn build_observe_state(engine: &Engine, query: ObserveQuery) -> Result<ObserveState, LixError> {
-    let source_key = observe_source_key(&query)?;
-    let source = acquire_or_create_shared_source(engine, &source_key, query)?;
+fn build_observe_state(session: &Session, query: ObserveQuery) -> Result<ObserveState, LixError> {
+    let source_key = observe_source_key_for_session(session, &query)?;
+    let source = acquire_or_create_shared_source(session, &source_key, query)?;
     let subscriber_id = {
         let mut shared = lock_shared_source(&source)?;
         if shared.closed {
@@ -594,6 +595,14 @@ fn build_observe_state(engine: &Engine, query: ObserveQuery) -> Result<ObserveSt
     })
 }
 
+fn observe_source_key_for_session(session: &Session, query: &ObserveQuery) -> Result<String, LixError> {
+    Ok(format!(
+        "{}\n--runtime:{}",
+        observe_source_key(query)?,
+        session_runtime_namespace(session),
+    ))
+}
+
 fn observe_source_key(query: &ObserveQuery) -> Result<String, LixError> {
     let wire_params = query
         .params
@@ -608,15 +617,15 @@ fn observe_source_key(query: &ObserveQuery) -> Result<String, LixError> {
 }
 
 fn acquire_or_create_shared_source(
-    engine: &Engine,
+    session: &Session,
     source_key: &str,
     query: ObserveQuery,
 ) -> Result<Arc<Mutex<SharedObserveSource>>, LixError> {
     loop {
-        if let Some(existing_source) = lock_observe_registry(engine)?.get(source_key).cloned() {
+        if let Some(existing_source) = lock_observe_registry(session)?.get(source_key).cloned() {
             let is_closed = lock_shared_source(&existing_source)?.closed;
             if is_closed {
-                let mut registry = lock_observe_registry(engine)?;
+                let mut registry = lock_observe_registry(session)?;
                 if registry
                     .get(source_key)
                     .is_some_and(|current| Arc::ptr_eq(current, &existing_source))
@@ -629,10 +638,10 @@ fn acquire_or_create_shared_source(
         }
 
         let new_source = Arc::new(Mutex::new(build_shared_observe_source(
-            engine,
+            session,
             query.clone(),
         )?));
-        let mut registry = lock_observe_registry(engine)?;
+        let mut registry = lock_observe_registry(session)?;
         if let std::collections::btree_map::Entry::Vacant(entry) =
             registry.entry(source_key.to_string())
         {
@@ -643,7 +652,7 @@ fn acquire_or_create_shared_source(
 }
 
 fn build_shared_observe_source(
-    engine: &Engine,
+    session: &Session,
     query: ObserveQuery,
 ) -> Result<SharedObserveSource, LixError> {
     let statements = parse_sql_statements(&query.sql)?;
@@ -664,7 +673,7 @@ fn build_shared_observe_source(
         include: filter.writer_keys.iter().cloned().collect(),
         exclude: filter.exclude_writer_keys.iter().cloned().collect(),
     };
-    let state_commits = engine.state_commit_stream(filter);
+    let state_commits = session.engine().state_commit_stream(filter);
 
     Ok(SharedObserveSource::new(
         query,
@@ -674,7 +683,7 @@ fn build_shared_observe_source(
 }
 
 fn unregister_observe_subscriber(
-    engine: &Engine,
+    session: &Session,
     source_key: &str,
     source: &Arc<Mutex<SharedObserveSource>>,
     subscriber_id: u64,
@@ -696,7 +705,7 @@ fn unregister_observe_subscriber(
     };
 
     if should_remove_registry_entry {
-        let mut registry = lock_observe_registry(engine)?;
+        let mut registry = lock_observe_registry(session)?;
         if registry
             .get(source_key)
             .is_some_and(|current| Arc::ptr_eq(current, source))
@@ -709,12 +718,16 @@ fn unregister_observe_subscriber(
 }
 
 fn lock_observe_registry<'a>(
-    engine: &'a Engine,
+    session: &'a Session,
 ) -> Result<MutexGuard<'a, BTreeMap<String, Arc<Mutex<SharedObserveSource>>>>, LixError> {
-    engine.observe_shared_sources.lock().map_err(|_| LixError {
+    session.observe_shared_sources().lock().map_err(|_| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "observe shared source registry lock poisoned".to_string(),
     })
+}
+
+fn session_runtime_namespace(session: &Session) -> String {
+    format!("session:{session:p}")
 }
 
 fn lock_shared_source<'a>(
@@ -836,7 +849,7 @@ mod tests {
         observe_source_key, ObserveEvent, ObserveEvents, ObserveQuery, OBSERVE_TICK_POLL_INTERVAL,
     };
     use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect};
-    use crate::{boot, BootArgs, LixError, NoopWasmRuntime, QueryResult, Value};
+    use crate::{boot, BootArgs, LixError, NoopWasmRuntime, QueryResult, Session, Value};
     use async_trait::async_trait;
     use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -958,19 +971,23 @@ mod tests {
     fn observe_dedups_initial_query_execution_across_identical_subscribers() {
         run_observe_test_with_large_stack(|| async move {
             let observe_query_hits = Arc::new(AtomicUsize::new(0));
-            let engine = boot(BootArgs::new(
+            let engine = Arc::new(boot(BootArgs::new(
                 Box::new(CountingObserveBackend {
                     observe_query_hits: Arc::clone(&observe_query_hits),
                 }),
                 Arc::new(NoopWasmRuntime),
-            ));
-            engine.set_active_version_id("version-test".to_string());
+            )));
+            let session = Session::new_for_test(
+                Arc::clone(&engine),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
-            let mut observed_a = engine
+            let mut observed_a = session
                 .observe(query.clone())
                 .expect("observe should succeed");
-            let mut observed_b = engine.observe(query).expect("observe should succeed");
+            let mut observed_b = session.observe(query).expect("observe should succeed");
 
             let event_a = next_observe_event(&mut observed_a, "observe_a").await;
             let event_b = next_observe_event(&mut observed_b, "observe_b").await;
@@ -995,22 +1012,26 @@ mod tests {
     fn observe_late_subscriber_reuses_cached_initial_snapshot() {
         run_observe_test_with_large_stack(|| async move {
             let observe_query_hits = Arc::new(AtomicUsize::new(0));
-            let engine = boot(BootArgs::new(
+            let engine = Arc::new(boot(BootArgs::new(
                 Box::new(CountingObserveBackend {
                     observe_query_hits: Arc::clone(&observe_query_hits),
                 }),
                 Arc::new(NoopWasmRuntime),
-            ));
-            engine.set_active_version_id("version-test".to_string());
+            )));
+            let session = Session::new_for_test(
+                Arc::clone(&engine),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
-            let mut observed_a = engine
+            let mut observed_a = session
                 .observe(query.clone())
                 .expect("observe should succeed");
 
             let _initial_a = next_observe_event(&mut observed_a, "observe_a").await;
 
-            let mut observed_b = engine.observe(query).expect("observe should succeed");
+            let mut observed_b = session.observe(query).expect("observe should succeed");
             let event_b = next_observe_event(&mut observed_b, "observe_b").await;
 
             assert_eq!(
@@ -1027,7 +1048,7 @@ mod tests {
             observed_b.close();
             tokio::time::sleep(OBSERVE_TICK_POLL_INTERVAL).await;
 
-            let mut observed_c = engine
+            let mut observed_c = session
                 .observe(ObserveQuery::new(
                     "SELECT 'observe-shared-sentinel' AS marker",
                     vec![],
@@ -1041,7 +1062,7 @@ mod tests {
                 "new observer after all subscribers close should execute a fresh initial query"
             );
 
-            let _ = engine
+            let _ = session
                 .execute("SELECT 1", &[])
                 .await
                 .expect("sanity execute should succeed");

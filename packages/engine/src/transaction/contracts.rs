@@ -135,6 +135,8 @@ impl SchemaRegistrationSet {
 pub struct TransactionCommitOutcome {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_active_version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_active_account_ids: Option<Vec<String>>,
     #[serde(default)]
     pub invalidate_deterministic_settings_cache: bool,
     #[serde(default)]
@@ -149,6 +151,9 @@ impl TransactionCommitOutcome {
     pub(crate) fn merge(&mut self, other: TransactionCommitOutcome) {
         if other.next_active_version_id.is_some() {
             self.next_active_version_id = other.next_active_version_id;
+        }
+        if other.next_active_account_ids.is_some() {
+            self.next_active_account_ids = other.next_active_account_ids;
         }
         self.invalidate_deterministic_settings_cache |=
             other.invalidate_deterministic_settings_cache;

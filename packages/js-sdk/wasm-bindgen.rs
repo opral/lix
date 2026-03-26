@@ -7,8 +7,8 @@ mod wasm {
     use lix_engine::{
         BootKeyValue, CreateCheckpointResult, CreateVersionOptions, CreateVersionResult,
         ExecuteOptions, ExecuteResult as EngineExecuteResult, ImageChunkWriter,
-        InitResult as EngineInitResult, Lix as CoreLix, LixBackend, LixConfig, LixError,
-        LixBackendTransaction, ObserveEvent as EngineObserveEvent,
+        InitResult as EngineInitResult, Lix as CoreLix, LixBackend, LixBackendTransaction,
+        LixConfig, LixError, ObserveEvent as EngineObserveEvent,
         ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
         QueryResult as EngineQueryResult, RedoOptions, RedoResult, SqlDialect, UndoOptions,
         UndoResult, Value as EngineValue, WasmComponentInstance, WasmLimits, WasmRuntime,
@@ -97,6 +97,7 @@ export type InitLixResult = {
 export type CreateVersionOptions = {
   id?: string;
   name?: string;
+  sourceVersionId?: string;
   hidden?: boolean;
 };
 
@@ -134,6 +135,11 @@ export type ObserveQuery = {
 
 export type ExecuteOptions = {
   writerKey?: string | null;
+};
+
+export type OpenSessionOptions = {
+  activeVersionId?: string;
+  activeAccountIds?: string[];
 };
 
 export type ObserveEvent = {
@@ -235,6 +241,15 @@ export type LixObserveEvents = {
         #[wasm_bindgen(js_name = switchVersion)]
         pub async fn switch_version(&self, version_id: String) -> Result<(), JsValue> {
             self.lix.switch_version(version_id).await.map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = openSession)]
+        pub async fn open_session(&self, args: Option<JsValue>) -> Result<Lix, JsValue> {
+            let options = parse_open_session_options(args).map_err(js_error)?;
+            let session = self.lix.open_session(options).await.map_err(js_error)?;
+            Ok(Lix {
+                lix: Arc::new(session),
+            })
         }
 
         #[wasm_bindgen(js_name = export_image)]
@@ -421,6 +436,71 @@ export type LixObserveEvents = {
         config
     }
 
+    fn parse_open_session_options(
+        input: Option<JsValue>,
+    ) -> Result<lix_engine::OpenSessionOptions, LixError> {
+        let Some(input) = input else {
+            return Ok(lix_engine::OpenSessionOptions::default());
+        };
+        if input.is_null() || input.is_undefined() {
+            return Ok(lix_engine::OpenSessionOptions::default());
+        }
+        let object = Object::from(input);
+        let active_version_id = match Reflect::get(&object, &JsValue::from_str("activeVersionId"))
+            .map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_JS_SDK",
+                "openSession activeVersionId lookup failed",
+            )
+        })? {
+            value if value.is_null() || value.is_undefined() => None,
+            _value => Some(read_required_string_property(
+                &object,
+                "activeVersionId",
+                "openSession options",
+            )?),
+        };
+        let active_account_ids =
+            match Reflect::get(&object, &JsValue::from_str("activeAccountIds")).map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_JS_SDK",
+                    "openSession activeAccountIds lookup failed",
+                )
+            })? {
+                value if value.is_null() || value.is_undefined() => None,
+                value => {
+                    if !Array::is_array(&value) {
+                        return Err(LixError::new(
+                            "LIX_ERROR_JS_SDK",
+                            "openSession activeAccountIds must be an array",
+                        ));
+                    }
+                    let values = Array::from(&value);
+                    let mut parsed = Vec::with_capacity(values.length() as usize);
+                    for entry in values.iter() {
+                        let account_id = entry.as_string().ok_or_else(|| {
+                            LixError::new(
+                                "LIX_ERROR_JS_SDK",
+                                "openSession activeAccountIds entries must be strings",
+                            )
+                        })?;
+                        if account_id.is_empty() {
+                            return Err(LixError::new(
+                                "LIX_ERROR_JS_SDK",
+                                "openSession activeAccountIds entries must be non-empty strings",
+                            ));
+                        }
+                        parsed.push(account_id);
+                    }
+                    Some(parsed)
+                }
+            };
+        Ok(lix_engine::OpenSessionOptions {
+            active_version_id,
+            active_account_ids,
+        })
+    }
+
     fn parse_boot_key_values(input: JsValue) -> Result<Vec<BootKeyValue>, LixError> {
         if input.is_null() || input.is_undefined() {
             return Ok(Vec::new());
@@ -525,11 +605,21 @@ export type LixObserveEvents = {
 
         let id = read_optional_string_property_with_context(&input, "id", "createVersion")?;
         let name = read_optional_string_property_with_context(&input, "name", "createVersion")?;
+        let source_version_id = read_optional_string_property_with_context(
+            &input,
+            "sourceVersionId",
+            "createVersion",
+        )?;
 
         let hidden = read_optional_bool_property_with_context(&input, "hidden", "createVersion")?
             .unwrap_or(false);
 
-        Ok(CreateVersionOptions { id, name, hidden })
+        Ok(CreateVersionOptions {
+            id,
+            name,
+            source_version_id,
+            hidden,
+        })
     }
 
     fn parse_undo_options(input: Option<JsValue>) -> Result<UndoOptions, LixError> {
@@ -999,6 +1089,7 @@ export type LixObserveEvents = {
 
     enum JsTransactionKind {
         Js { transaction: JsValue },
+        Savepoint { name: String },
     }
 
     struct JsTransaction<'a> {
@@ -1050,6 +1141,21 @@ export type LixObserveEvents = {
             }))
         }
 
+        async fn begin_savepoint(
+            &self,
+            name: &str,
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+            self.execute_raw(&format!("SAVEPOINT {}", sql_identifier(name)), &[])
+                .await?;
+            Ok(Box::new(JsTransaction {
+                backend: self,
+                kind: JsTransactionKind::Savepoint {
+                    name: name.to_string(),
+                },
+                closed: false,
+            }))
+        }
+
         async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
             let export_image = Self::get_optional_method(&self.backend, "export_image")?
                 .ok_or_else(|| LixError {
@@ -1071,6 +1177,7 @@ export type LixObserveEvents = {
                 JsTransactionKind::Js { transaction } => {
                     JsBackend::dialect_from_object(transaction).unwrap_or(self.backend.dialect())
                 }
+                JsTransactionKind::Savepoint { .. } => self.backend.dialect(),
             }
         }
 
@@ -1089,6 +1196,7 @@ export type LixObserveEvents = {
                 JsTransactionKind::Js { transaction } => {
                     self.backend.execute_raw_on(transaction, sql, params).await
                 }
+                JsTransactionKind::Savepoint { .. } => self.backend.execute_raw(sql, params).await,
             }
         }
 
@@ -1105,6 +1213,11 @@ export type LixObserveEvents = {
                         })?;
                     let result = commit.call0(transaction).map_err(js_to_lix_error)?;
                     JsBackend::await_if_promise(result).await?;
+                }
+                JsTransactionKind::Savepoint { name } => {
+                    self.backend
+                        .execute_raw(&format!("RELEASE SAVEPOINT {}", sql_identifier(name)), &[])
+                        .await?;
                 }
             }
             self.closed = true;
@@ -1125,10 +1238,23 @@ export type LixObserveEvents = {
                     let result = rollback.call0(transaction).map_err(js_to_lix_error)?;
                     JsBackend::await_if_promise(result).await?;
                 }
+                JsTransactionKind::Savepoint { name } => {
+                    let savepoint = sql_identifier(name);
+                    self.backend
+                        .execute_raw(&format!("ROLLBACK TO SAVEPOINT {savepoint}"), &[])
+                        .await?;
+                    self.backend
+                        .execute_raw(&format!("RELEASE SAVEPOINT {savepoint}"), &[])
+                        .await?;
+                }
             }
             self.closed = true;
             Ok(())
         }
+    }
+
+    fn sql_identifier(name: &str) -> String {
+        format!("\"{}\"", name.replace('"', "\"\""))
     }
 
     fn js_to_lix_error(value: JsValue) -> LixError {

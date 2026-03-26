@@ -13,8 +13,8 @@ use crate::sql_support::binding::{
 };
 use crate::transaction::{
     execute_bound_statement_template_instance_in_borrowed_write_transaction,
-    execute_bound_statement_template_instance_in_write_transaction,
-    execute_program_with_new_write_transaction, BorrowedWriteTransaction, WriteTransaction,
+    execute_bound_statement_template_instance_in_write_transaction, BorrowedWriteTransaction,
+    WriteTransaction,
 };
 use crate::{ExecuteResult, LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
@@ -29,6 +29,7 @@ pub(crate) struct ExecutionContext {
     pub(crate) public_surface_registry: SurfaceRegistry,
     pub(crate) public_surface_registry_generation: u64,
     pub(crate) active_version_id: String,
+    pub(crate) active_account_ids: Vec<String>,
     pub(crate) statement_template_cache: BTreeMap<StatementTemplateCacheKey, StatementTemplate>,
 }
 
@@ -37,12 +38,14 @@ impl ExecutionContext {
         options: ExecuteOptions,
         public_surface_registry: SurfaceRegistry,
         active_version_id: String,
+        active_account_ids: Vec<String>,
     ) -> Self {
         Self {
             options,
             public_surface_registry,
             public_surface_registry_generation: 0,
             active_version_id,
+            active_account_ids,
             statement_template_cache: BTreeMap::new(),
         }
     }
@@ -250,23 +253,6 @@ impl ExecutionProgram {
     pub(crate) fn source_statements(&self) -> &[Statement] {
         &self.source_statements
     }
-}
-
-pub(crate) async fn execute_execution_program_with_backend(
-    engine: &Engine,
-    program: &ExecutionProgram,
-    options: ExecuteOptions,
-    active_version_id: String,
-    allow_internal_tables: bool,
-) -> Result<ExecuteResult, LixError> {
-    execute_program_with_new_write_transaction(
-        engine,
-        program,
-        options,
-        active_version_id,
-        allow_internal_tables,
-    )
-    .await
 }
 
 pub(crate) async fn execute_execution_program_with_write_transaction(

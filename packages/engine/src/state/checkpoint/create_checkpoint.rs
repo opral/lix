@@ -1,5 +1,5 @@
 use super::{checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot};
-use crate::{errors, Engine, EngineTransaction, ExecuteOptions, LixError, Value};
+use crate::{errors, ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CreateCheckpointResult {
@@ -7,8 +7,10 @@ pub struct CreateCheckpointResult {
     pub change_set_id: String,
 }
 
-pub async fn create_checkpoint(engine: &Engine) -> Result<CreateCheckpointResult, LixError> {
-    engine
+pub(crate) async fn create_checkpoint_in_session(
+    session: &Session,
+) -> Result<CreateCheckpointResult, LixError> {
+    session
         .transaction(ExecuteOptions::default(), |tx| {
             Box::pin(async move { create_checkpoint_in_transaction(tx).await })
         })
@@ -16,33 +18,10 @@ pub async fn create_checkpoint(engine: &Engine) -> Result<CreateCheckpointResult
 }
 
 async fn create_checkpoint_in_transaction(
-    tx: &mut EngineTransaction<'_>,
+    tx: &mut SessionTransaction<'_>,
 ) -> Result<CreateCheckpointResult, LixError> {
-    let version_row = tx
-        .execute(
-            "SELECT av.version_id, v.commit_id \
-             FROM lix_active_version av \
-             JOIN lix_version v ON v.id = av.version_id \
-             ORDER BY av.id \
-             LIMIT 1",
-            &[],
-        )
-        .await?;
-    let [statement] = version_row.statements.as_slice() else {
-        return Err(errors::unexpected_statement_count_error(
-            "active version query",
-            1,
-            version_row.statements.len(),
-        ));
-    };
-    let [row] = statement.rows.as_slice() else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "missing active version row".to_string(),
-        });
-    };
-    let version_id = text_at(row, 0, "version_id")?;
-    let local_commit_id = text_at(row, 1, "commit_id")?;
+    let version_id = tx.context.active_version_id.clone();
+    let local_commit_id = load_version_commit_id(tx, &version_id).await?;
     let global_commit_id = load_global_version_commit_id(tx).await?;
 
     let commit = load_commit(tx, &local_commit_id)
@@ -97,7 +76,7 @@ struct CommitRow {
 }
 
 async fn load_commit(
-    tx: &mut EngineTransaction<'_>,
+    tx: &mut SessionTransaction<'_>,
     commit_id: &str,
 ) -> Result<Option<CommitRow>, LixError> {
     let result = tx
@@ -124,7 +103,7 @@ async fn load_commit(
     }))
 }
 
-async fn load_global_version_commit_id(tx: &mut EngineTransaction<'_>) -> Result<String, LixError> {
+async fn load_global_version_commit_id(tx: &mut SessionTransaction<'_>) -> Result<String, LixError> {
     let result = tx
         .execute(
             "SELECT commit_id \
@@ -150,8 +129,37 @@ async fn load_global_version_commit_id(tx: &mut EngineTransaction<'_>) -> Result
     text_at(row, 0, "lix_version.commit_id")
 }
 
+async fn load_version_commit_id(
+    tx: &mut SessionTransaction<'_>,
+    version_id: &str,
+) -> Result<String, LixError> {
+    let result = tx
+        .execute(
+            "SELECT commit_id \
+             FROM lix_version \
+             WHERE id = $1 \
+             LIMIT 1",
+            &[Value::Text(version_id.to_string())],
+        )
+        .await?;
+    let [statement] = result.statements.as_slice() else {
+        return Err(errors::unexpected_statement_count_error(
+            "active version query",
+            1,
+            result.statements.len(),
+        ));
+    };
+    let Some(row) = statement.rows.first() else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("version '{version_id}' is missing"),
+        });
+    };
+    text_at(row, 0, "lix_version.commit_id")
+}
+
 async fn ensure_checkpoint_label_on_commit(
-    tx: &mut EngineTransaction<'_>,
+    tx: &mut SessionTransaction<'_>,
     commit_id: &str,
 ) -> Result<(), LixError> {
     let state_entity_id = checkpoint_commit_label_entity_id(commit_id);

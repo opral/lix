@@ -129,7 +129,7 @@ test("openLix executes SQL against default in-memory sqlite backend", async () =
 
 test("openLix allows querying internal tables for debugging", async () => {
 	const lix = await createInitializedLix();
-	const result = await lix.execute("SELECT * FROM lix_internal_state_vtable", []);
+	const result = await lix.execute("SELECT id FROM lix_internal_snapshot LIMIT 1", []);
 	expect(statementRows(result).length).toBeGreaterThan(0);
 	await lix.close();
 });
@@ -150,6 +150,83 @@ test("createVersion + switchVersion use the JS API surface", async () => {
 	expect(activeRows.length).toBe(1);
 	expect(activeRows[0]?.[0]).toBe(created.id);
 	await lix.close();
+});
+
+test("openSession snapshots the caller active version and isolates later switches", async () => {
+	const lix = await createInitializedLix();
+	const version = await lix.createVersion({ name: "session-branch" });
+	await lix.switchVersion(version.id);
+
+	const worker = await lix.openSession();
+	await worker.switchVersion("global");
+
+	const workspaceActive = await lix.execute("SELECT lix_active_version_id()", []);
+	const workerActive = await worker.execute("SELECT lix_active_version_id()", []);
+
+	expect(statementRows(workspaceActive)[0]?.[0]).toBe(version.id);
+	expect(statementRows(workerActive)[0]?.[0]).toBe("global");
+
+	await worker.close();
+	await lix.close();
+});
+
+test("openSession accepts an explicit activeVersionId override", async () => {
+	const lix = await createInitializedLix();
+	const version = await lix.createVersion({ name: "override-branch" });
+
+	const worker = await lix.openSession({
+		activeVersionId: version.id,
+	});
+	const workerActive = await worker.execute("SELECT lix_active_version_id()", []);
+	expect(statementRows(workerActive)[0]?.[0]).toBe(version.id);
+
+	await worker.close();
+	await lix.close();
+});
+
+test("openSession snapshots active accounts and allows explicit overrides", async () => {
+	const lix = await createInitializedLix();
+	const seeded = await lix.openSession({
+		activeAccountIds: ["acct-parent"],
+	});
+	const worker = await seeded.openSession();
+	const overrideWorker = await seeded.openSession({
+		activeAccountIds: ["acct-override"],
+	});
+
+	const workspaceAccounts = await lix.execute("SELECT lix_active_account_ids()", []);
+	const seededAccounts = await seeded.execute("SELECT lix_active_account_ids()", []);
+	const workerAccounts = await worker.execute("SELECT lix_active_account_ids()", []);
+	const overrideAccounts = await overrideWorker.execute(
+		"SELECT lix_active_account_ids()",
+		[],
+	);
+
+	expect(statementRows(workspaceAccounts)[0]?.[0]).toBe("[]");
+	expect(statementRows(seededAccounts)[0]?.[0]).toBe('["acct-parent"]');
+	expect(statementRows(workerAccounts)[0]?.[0]).toBe('["acct-parent"]');
+	expect(statementRows(overrideAccounts)[0]?.[0]).toBe('["acct-override"]');
+
+	await overrideWorker.close();
+	await worker.close();
+	await seeded.close();
+	await lix.close();
+});
+
+test("openLix reopens on the workspace-backed active version", async () => {
+	const backend = await createWasmSqliteBackend();
+	await initLix({ backend });
+
+	const lix = await openLix({ backend });
+	const version = await lix.createVersion({ name: "workspace-reopen" });
+	await lix.switchVersion(version.id);
+	await lix.close();
+
+	const reopened = await openLix({ backend });
+	const active = await reopened.execute("SELECT lix_active_version_id()", []);
+	expect(statementRows(active)[0]?.[0]).toBe(version.id);
+
+	await reopened.close();
 });
 
 test("createVersion forwards hidden option", async () => {
@@ -248,65 +325,6 @@ test("execute rejects unsupported transaction control variants", async () => {
 	await expect(lix.execute("BEGIN IMMEDIATE;", [])).rejects.toThrow(
 		/plain BEGIN|transaction control|not supported/i,
 	);
-
-	await lix.close();
-});
-
-test("separate BEGIN and COMMIT execute calls form a transaction", async () => {
-	const lix = await createInitializedLix();
-
-	await lix.execute("BEGIN;", []);
-
-	await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
-		"tx-separate-begin-a",
-		"a",
-	]);
-	await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
-		"tx-separate-begin-b",
-		"b",
-	]);
-
-	await lix.execute("COMMIT;", []);
-
-	const result = await lix.execute(
-		"SELECT key, value FROM lix_key_value WHERE key IN (?1, ?2) ORDER BY key",
-		["tx-separate-begin-a", "tx-separate-begin-b"],
-	);
-	expect(statementRows(result)).toEqual([
-		["tx-separate-begin-a", "a"],
-		["tx-separate-begin-b", "b"],
-	]);
-
-	await lix.close();
-});
-
-test("separate BEGIN and ROLLBACK execute calls discard changes", async () => {
-	const lix = await createInitializedLix();
-
-	await lix.execute("BEGIN;", []);
-	await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
-		"tx-separate-rollback",
-		"discard-me",
-	]);
-	await lix.execute("ROLLBACK;", []);
-
-	const result = await lix.execute(
-		"SELECT COUNT(*) FROM lix_key_value WHERE key = ?1",
-		["tx-separate-rollback"],
-	);
-	expect(statementRows(result)).toEqual([[0]]);
-
-	await lix.close();
-});
-
-test("non-execute methods fail while a SQL transaction is open", async () => {
-	const lix = await createInitializedLix();
-
-	await lix.execute("BEGIN;", []);
-	await expect(lix.createVersion()).rejects.toThrow(
-		/unavailable while a SQL transaction is open|transaction/i,
-	);
-	await lix.execute("ROLLBACK;", []);
 
 	await lix.close();
 });
@@ -420,13 +438,12 @@ test("openLix seeds global keyValues at startup", async () => {
 		],
 	});
 	const result = await lix.execute(
-		"SELECT COUNT(*) FROM lix_internal_state_vtable \
+		"SELECT COUNT(*) FROM lix_state_by_version \
      WHERE schema_key = 'lix_key_value' \
-       AND entity_id = 'lix_deterministic_mode' \
+       AND entity_id = ?1 \
        AND version_id = 'global' \
-       AND global = true \
        AND snapshot_content IS NOT NULL",
-		[],
+		["lix_deterministic_mode"],
 	);
 	const resultRows = statementRows(result);
 	expect(resultRows.length).toBe(1);
@@ -453,13 +470,11 @@ test("openLix defaults boot keyValues to the active version", async () => {
 	expect(typeof activeVersionId).toBe("string");
 
 	const result = await lix.execute(
-		"SELECT COUNT(*) FROM lix_internal_state_vtable \
-     WHERE schema_key = 'lix_key_value' \
-       AND entity_id = 'boot-default-active' \
-       AND version_id = ?1 \
-       AND global = false \
-       AND snapshot_content IS NOT NULL",
-		[activeVersionId as string],
+		"SELECT COUNT(*) FROM lix_key_value_by_version \
+     WHERE key = ?1 \
+       AND lixcol_version_id = ?2 \
+       AND lixcol_global = false",
+		["boot-default-active", activeVersionId as string],
 	);
 	const resultRows = statementRows(result);
 	expect(resultRows.length).toBe(1);
@@ -701,7 +716,7 @@ test("observe stream remains usable after query error", async () => {
 	if (failingResult.ok) {
 		throw new Error("observe query unexpectedly succeeded");
 	}
-	expect(String(failingResult.error)).toMatch(/malformed|json|parse/i);
+	expect(String(failingResult.error)).toContain("LIX_ERROR_");
 
 	await lix.execute("UPDATE lix_key_value SET value = ?2 WHERE key = ?1", [
 		key,

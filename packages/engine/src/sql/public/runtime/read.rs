@@ -1092,6 +1092,7 @@ async fn lower_public_read_query_with_details(
                 dialect: Some(backend.dialect()),
                 writer_key: None,
                 requested_version_id: Some(active_version_id),
+                active_account_ids: Vec::new(),
             },
         );
         let structured_read = canonicalize_read(bound_statement, &registry)
@@ -5712,6 +5713,7 @@ async fn try_prepare_public_read_with_internal_access(
             dialect: Some(backend.dialect()),
             writer_key: writer_key.map(ToString::to_string),
             requested_version_id: Some(active_version_id.to_string()),
+            active_account_ids: Vec::new(),
         },
     );
     let mut attempted_broad_lowering = false;

@@ -4,11 +4,11 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use crate::{
-    boot::EngineConfig, observe::observe_owned, BootKeyValue, CreateCheckpointResult,
+    boot::EngineConfig, observe::observe_owned_session, BootKeyValue, CreateCheckpointResult,
     CreateVersionOptions, CreateVersionResult, Engine, ExecuteOptions, ExecuteResult,
     ImageChunkWriter, LixBackend, LixError, MergeVersionOptions, MergeVersionResult,
-    ObserveEventsOwned, ObserveQuery, RedoOptions, RedoResult, UndoOptions, UndoResult, Value,
-    WasmRuntime,
+    ObserveEventsOwned, ObserveQuery, OpenSessionOptions, RedoOptions, RedoResult, Session,
+    UndoOptions, UndoResult, Value, WasmRuntime,
 };
 
 pub struct LixConfig {
@@ -47,17 +47,15 @@ pub struct InitResult {
 
 #[derive(Clone)]
 pub struct Lix {
-    engine: Arc<Engine>,
+    session: Arc<Session>,
 }
 
 impl Lix {
-    // `Lix` is intentionally just a thin SDK-facing wrapper over `Engine`.
-    // New behavior, APIs, and engine-level tests should be added to `Engine` first,
-    // with `Lix` only forwarding or adapting ownership for SDK consumers.
     pub async fn open(config: LixConfig) -> Result<Self, LixError> {
-        let engine = Engine::open(config.into_engine_config()).await?;
+        let engine = Arc::new(Engine::open(config.into_engine_config()).await?);
+        let session = engine.open_workspace_session().await?;
         Ok(Self {
-            engine: Arc::new(engine),
+            session: Arc::new(session),
         })
     }
 
@@ -67,7 +65,7 @@ impl Lix {
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
-        self.engine.execute(sql, params).await
+        self.session.execute(sql, params).await
     }
 
     pub async fn execute_with_options(
@@ -76,62 +74,71 @@ impl Lix {
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
-        self.engine.execute_with_options(sql, params, options).await
+        self.session
+            .execute_with_options(sql, params, options)
+            .await
     }
 
     pub fn observe(&self, query: ObserveQuery) -> Result<ObserveEventsOwned, LixError> {
-        observe_owned(Arc::clone(&self.engine), query)
+        observe_owned_session(Arc::clone(&self.session), query)
+    }
+
+    pub async fn open_session(&self, options: OpenSessionOptions) -> Result<Self, LixError> {
+        let session = self.session.open_session(options).await?;
+        Ok(Self {
+            session: Arc::new(session),
+        })
     }
 
     pub async fn create_version(
         &self,
         options: CreateVersionOptions,
     ) -> Result<CreateVersionResult, LixError> {
-        self.engine.create_version(options).await
+        self.session.create_version(options).await
     }
 
     pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
-        self.engine.switch_version(version_id).await
+        self.session.switch_version(version_id).await
     }
 
     pub async fn merge_version(
         &self,
         options: MergeVersionOptions,
     ) -> Result<MergeVersionResult, LixError> {
-        self.engine.merge_version(options).await
+        self.session.merge_version(options).await
     }
 
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointResult, LixError> {
-        self.engine.create_checkpoint().await
+        self.session.create_checkpoint().await
     }
 
     pub async fn undo(&self) -> Result<UndoResult, LixError> {
-        self.engine.undo().await
+        self.session.undo().await
     }
 
     pub async fn undo_with_options(&self, options: UndoOptions) -> Result<UndoResult, LixError> {
-        self.engine.undo_with_options(options).await
+        self.session.undo_with_options(options).await
     }
 
     pub async fn redo(&self) -> Result<RedoResult, LixError> {
-        self.engine.redo().await
+        self.session.redo().await
     }
 
     pub async fn redo_with_options(&self, options: RedoOptions) -> Result<RedoResult, LixError> {
-        self.engine.redo_with_options(options).await
+        self.session.redo_with_options(options).await
     }
 
     pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
-        self.engine.install_plugin(archive_bytes).await
+        self.session.install_plugin(archive_bytes).await
     }
 
     pub async fn register_schema(&self, schema: &JsonValue) -> Result<(), LixError> {
-        self.engine.register_schema(schema).await
+        self.session.register_schema(schema).await
     }
 
     pub async fn export_image(&self) -> Result<Vec<u8>, LixError> {
         let mut writer = VecImageWriter::default();
-        self.engine.export_image(&mut writer).await?;
+        self.session.export_image(&mut writer).await?;
         Ok(writer.bytes)
     }
 }

@@ -727,8 +727,16 @@ fn observe_sqlite_detects_external_insert_without_local_commit_stream_event() {
                 .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
+            let session_a = engine_a
+                .open_workspace_session()
+                .await
+                .expect("session_a should open");
+            let session_b = engine_b
+                .open_workspace_session()
+                .await
+                .expect("session_b should open");
 
-            let mut observed = engine_a
+            let mut observed = session_a
                 .observe(ObserveQuery::new(
                     "SELECT path FROM lix_file WHERE path = '/observe-external.md'",
                     vec![],
@@ -742,7 +750,7 @@ fn observe_sqlite_detects_external_insert_without_local_commit_stream_event() {
                 .expect("initial observe event should exist");
             assert!(initial.rows.rows.is_empty());
 
-            engine_b
+            session_b
                 .execute(
                     "INSERT INTO lix_file (path, data) VALUES ('/observe-external.md', lix_text_encode('hello'))", &[])
                 .await
@@ -761,6 +769,8 @@ fn observe_sqlite_detects_external_insert_without_local_commit_stream_event() {
 
             observed.close();
             drop(observed);
+            drop(session_b);
+            drop(session_a);
             drop(engine_b);
             drop(engine_a);
             cleanup_sqlite_path(&path);
@@ -786,8 +796,16 @@ fn observe_sqlite_detects_external_untracked_state_insert() {
                 .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
+            let session_a = engine_a
+                .open_workspace_session()
+                .await
+                .expect("session_a should open");
+            let session_b = engine_b
+                .open_workspace_session()
+                .await
+                .expect("session_b should open");
 
-            let mut observed = engine_a
+            let mut observed = session_a
                 .observe(ObserveQuery::new(
                     "SELECT entity_id \
                  FROM lix_state \
@@ -805,7 +823,7 @@ fn observe_sqlite_detects_external_untracked_state_insert() {
                 .expect("initial observe event should exist");
             assert!(initial.rows.rows.is_empty());
 
-            engine_b
+            session_b
                 .execute(
                     "INSERT INTO lix_state (\
                  entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
@@ -829,6 +847,8 @@ fn observe_sqlite_detects_external_untracked_state_insert() {
 
             observed.close();
             drop(observed);
+            drop(session_b);
+            drop(session_a);
             drop(engine_b);
             drop(engine_a);
             cleanup_sqlite_path(&path);
@@ -856,8 +876,16 @@ fn observe_postgres_detects_external_insert_without_local_commit_stream_event() 
                 .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
+            let session_a = engine_a
+                .open_workspace_session()
+                .await
+                .expect("session_a should open");
+            let session_b = engine_b
+                .open_workspace_session()
+                .await
+                .expect("session_b should open");
 
-            let mut observed = engine_a
+            let mut observed = session_a
                 .observe(ObserveQuery::new(
                     "SELECT path FROM lix_file WHERE path = '/observe-external.md'",
                     vec![],
@@ -871,7 +899,7 @@ fn observe_postgres_detects_external_insert_without_local_commit_stream_event() 
                 .expect("initial observe event should exist");
             assert!(initial.rows.rows.is_empty());
 
-            engine_b
+            session_b
                 .execute(
                     "INSERT INTO lix_file (path, data) VALUES ('/observe-external.md', lix_text_encode('hello'))", &[])
                 .await
@@ -913,8 +941,16 @@ fn observe_postgres_detects_external_untracked_state_insert() {
                 .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
+            let session_a = engine_a
+                .open_workspace_session()
+                .await
+                .expect("session_a should open");
+            let session_b = engine_b
+                .open_workspace_session()
+                .await
+                .expect("session_b should open");
 
-            let mut observed = engine_a
+            let mut observed = session_a
                 .observe(ObserveQuery::new(
                     "SELECT entity_id \
                  FROM lix_state \
@@ -932,7 +968,7 @@ fn observe_postgres_detects_external_untracked_state_insert() {
                 .expect("initial observe event should exist");
             assert!(initial.rows.rows.is_empty());
 
-            engine_b
+            session_b
                 .execute(
                     "INSERT INTO lix_state (\
                  entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
@@ -977,8 +1013,16 @@ fn observe_external_same_writer_key_is_suppressed() {
             .initialize_if_needed()
             .await
             .expect("engine_b init should succeed");
+        let session_a = engine_a
+            .open_workspace_session()
+            .await
+            .expect("session_a should open");
+        let session_b = engine_b
+            .open_workspace_session()
+            .await
+            .expect("session_b should open");
 
-        let mut observed = engine_a
+        let mut observed = session_a
             .observe(ObserveQuery::new(
                 "SELECT path \
                  FROM lix_file \
@@ -994,7 +1038,7 @@ fn observe_external_same_writer_key_is_suppressed() {
             .expect("initial observe event should exist");
         assert!(initial.rows.rows.is_empty());
 
-        engine_b
+        session_b
             .execute_with_options(
                 "INSERT INTO lix_file (path, data) VALUES ('/observe-writer.md', lix_text_encode('same-writer'))",
                 &[],
@@ -1031,8 +1075,16 @@ fn observe_external_different_writer_key_emits() {
             .initialize_if_needed()
             .await
             .expect("engine_b init should succeed");
+        let session_a = engine_a
+            .open_workspace_session()
+            .await
+            .expect("session_a should open");
+        let session_b = engine_b
+            .open_workspace_session()
+            .await
+            .expect("session_b should open");
 
-        let mut observed = engine_a
+        let mut observed = session_a
             .observe(ObserveQuery::new(
                 "SELECT path \
                  FROM lix_file \
@@ -1048,7 +1100,7 @@ fn observe_external_different_writer_key_emits() {
             .expect("initial observe event should exist");
         assert!(initial.rows.rows.is_empty());
 
-        engine_b
+        session_b
             .execute_with_options(
                 "INSERT INTO lix_file (path, data) VALUES ('/observe-writer-different.md', lix_text_encode('different-writer'))",
                 &[],
@@ -1087,8 +1139,16 @@ fn observe_external_null_writer_key_emits() {
             .initialize_if_needed()
             .await
             .expect("engine_b init should succeed");
+        let session_a = engine_a
+            .open_workspace_session()
+            .await
+            .expect("session_a should open");
+        let session_b = engine_b
+            .open_workspace_session()
+            .await
+            .expect("session_b should open");
 
-        let mut observed = engine_a
+        let mut observed = session_a
             .observe(ObserveQuery::new(
                 "SELECT path \
                  FROM lix_file \
@@ -1104,7 +1164,7 @@ fn observe_external_null_writer_key_emits() {
             .expect("initial observe event should exist");
         assert!(initial.rows.rows.is_empty());
 
-        engine_b
+        session_b
             .execute(
                 "INSERT INTO lix_file (path, data) VALUES ('/observe-writer-null.md', lix_text_encode('null-writer'))", &[])
             .await
@@ -1140,8 +1200,16 @@ fn observe_external_read_only_transaction_does_not_emit() {
                 .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
+            let session_a = engine_a
+                .open_workspace_session()
+                .await
+                .expect("session_a should open");
+            let session_b = engine_b
+                .open_workspace_session()
+                .await
+                .expect("session_b should open");
 
-            let mut observed = engine_a
+            let mut observed = session_a
                 .observe(ObserveQuery::new(
                     "SELECT path FROM lix_file WHERE path = '/observe-read-only-tx.md'",
                     vec![],
@@ -1154,7 +1222,7 @@ fn observe_external_read_only_transaction_does_not_emit() {
                 .expect("initial observe event should exist");
             assert!(initial.rows.rows.is_empty());
 
-            let mut tx = engine_b
+            let mut tx = session_b
                 .begin_transaction_with_options(ExecuteOptions::default())
                 .await
                 .expect("begin transaction should succeed");
@@ -1189,8 +1257,16 @@ fn observe_external_mutating_transaction_emits_once_for_result_delta() {
                 .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
+            let session_a = engine_a
+                .open_workspace_session()
+                .await
+                .expect("session_a should open");
+            let session_b = engine_b
+                .open_workspace_session()
+                .await
+                .expect("session_b should open");
 
-            let mut observed = engine_a
+            let mut observed = session_a
                 .observe(ObserveQuery::new(
                     "SELECT lix_text_decode(data) \
                      FROM lix_file \
@@ -1205,7 +1281,7 @@ fn observe_external_mutating_transaction_emits_once_for_result_delta() {
                 .expect("initial observe event should exist");
             assert!(initial.rows.rows.is_empty());
 
-            let mut tx = engine_b
+            let mut tx = session_b
                 .begin_transaction_with_options(ExecuteOptions::default())
                 .await
                 .expect("begin transaction should succeed");
@@ -1261,8 +1337,16 @@ fn observe_external_unrelated_mutation_does_not_emit() {
                 .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
+            let session_a = engine_a
+                .open_workspace_session()
+                .await
+                .expect("session_a should open");
+            let session_b = engine_b
+                .open_workspace_session()
+                .await
+                .expect("session_b should open");
 
-            let mut observed = engine_a
+            let mut observed = session_a
                 .observe(ObserveQuery::new(
                     "SELECT path FROM lix_file WHERE path = '/observe-unrelated-target.md'",
                     vec![],
@@ -1275,7 +1359,7 @@ fn observe_external_unrelated_mutation_does_not_emit() {
                 .expect("initial observe event should exist");
             assert!(initial.rows.rows.is_empty());
 
-            engine_b
+            session_b
             .execute(
                 "INSERT INTO lix_file (path, data) VALUES ('/observe-unrelated-other.md', lix_text_encode('other'))", &[])
             .await
@@ -1290,25 +1374,25 @@ fn observe_external_unrelated_mutation_does_not_emit() {
     );
 }
 
-fn boot_sqlite_engine_at_path(path: PathBuf) -> Engine {
+fn boot_sqlite_engine_at_path(path: PathBuf) -> Arc<Engine> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("sqlite test parent directory should be creatable");
     }
     let _ = std::fs::File::create(&path).expect("sqlite test file should be creatable");
-    boot(BootArgs::new(
+    Arc::new(boot(BootArgs::new(
         support::simulations::sqlite_backend_with_filename(format!(
             "sqlite://{}",
             path.to_string_lossy()
         )),
         Arc::new(NoopWasmRuntime),
-    ))
+    )))
 }
 
-fn boot_postgres_engine_at_url(connection_string: String) -> Engine {
-    boot(BootArgs::new(
+fn boot_postgres_engine_at_url(connection_string: String) -> Arc<Engine> {
+    Arc::new(boot(BootArgs::new(
         support::simulations::postgres_backend_with_connection_string(connection_string),
         Arc::new(NoopWasmRuntime),
-    ))
+    )))
 }
 
 fn temp_sqlite_observe_path(label: &str) -> PathBuf {

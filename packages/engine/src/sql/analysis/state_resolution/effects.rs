@@ -31,6 +31,7 @@ pub(crate) fn derive_effects_from_state_resolution(
     Ok(PlanEffects {
         state_commit_stream_changes,
         next_active_version_id,
+        next_active_account_ids: None,
         file_cache_refresh_targets,
     })
 }

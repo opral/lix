@@ -19,6 +19,7 @@ mod lix;
 mod observe;
 mod plugin;
 mod schema;
+pub mod session;
 pub(crate) mod sql;
 mod sql_support;
 pub(crate) mod state;
@@ -45,7 +46,7 @@ pub use backend::SqlDialect;
 pub use canonical_json::CanonicalJson;
 #[doc(hidden)]
 pub use engine::{boot, BootArgs};
-pub use engine::{BootAccount, BootKeyValue, Engine, EngineTransaction, ExecuteOptions};
+pub use engine::{BootAccount, BootKeyValue, Engine, ExecuteOptions};
 pub use errors::LixError;
 pub use identity::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
@@ -60,6 +61,7 @@ pub use live_state::{
 };
 pub use lix::{InitResult, Lix, LixConfig};
 pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
+pub use session::{OpenSessionOptions, Session, SessionTransaction};
 pub use state::checkpoint::CreateCheckpointResult;
 pub use state::image::{ImageChunkReader, ImageChunkWriter};
 pub use state::stream::{

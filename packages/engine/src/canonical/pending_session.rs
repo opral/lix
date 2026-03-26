@@ -154,6 +154,7 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
     session: &mut PendingPublicCommitSession,
     changes: &[ProposedDomainChange],
     binary_blob_writes: &[BinaryBlobWrite],
+    active_account_ids: Option<&[String]>,
     functions: &mut dyn LixFunctionProvider,
     timestamp: &str,
 ) -> Result<(), LixError> {
@@ -228,7 +229,9 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let active_accounts = {
+    let active_accounts = if let Some(active_account_ids) = active_account_ids {
+        active_account_ids.to_vec()
+    } else {
         let mut executor = TransactionCommitExecutor { transaction };
         load_commit_active_accounts(&mut executor, &domain_changes).await?
     };

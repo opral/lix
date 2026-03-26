@@ -9,7 +9,7 @@ use crate::sql::execution::execution_program::{
     ExecutionContext, ExecutionProgram,
 };
 use crate::transaction::PendingTransactionView;
-use crate::{ExecuteOptions, ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
+use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 
 use super::compile::{
     bind_single_statement_template, compile_sql_buffered_write_command, SqlBufferedWriteCommand,
@@ -135,40 +135,6 @@ pub(crate) async fn execute_bound_statement_template_instance_in_borrowed_write_
         skip_side_effect_collection,
     )
     .await
-}
-
-pub(crate) async fn execute_program_with_new_write_transaction(
-    engine: &Engine,
-    program: &ExecutionProgram,
-    options: ExecuteOptions,
-    active_version_id: String,
-    allow_internal_tables: bool,
-) -> Result<ExecuteResult, LixError> {
-    let transaction = engine.begin_write_unit().await?;
-    let mut write_transaction = WriteTransaction::new_buffered_write(transaction);
-    let mut context = engine.new_execution_context_with_active_version(options, active_version_id);
-    let result = execute_execution_program_with_write_transaction(
-        engine,
-        &mut write_transaction,
-        program,
-        allow_internal_tables,
-        &mut context,
-    )
-    .await;
-
-    match result {
-        Ok(result) => {
-            let outcome = write_transaction
-                .commit_buffered_write(engine, context)
-                .await?;
-            engine.apply_transaction_commit_outcome(outcome).await?;
-            Ok(result)
-        }
-        Err(error) => {
-            let _ = write_transaction.rollback_buffered_write().await;
-            Err(error)
-        }
-    }
 }
 
 async fn execute_bound_statement_template_instance_in_buffered_write_scope(

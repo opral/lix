@@ -103,6 +103,7 @@ impl<'a> WriteTransaction<'a> {
         mut context: ExecutionContext,
     ) -> Result<TransactionCommitOutcome, LixError> {
         let initial_active_version_id = context.active_version_id.clone();
+        let initial_active_account_ids = context.active_account_ids.clone();
         self.prepare_buffered_write_commit(engine, &mut context)
             .await?;
         let mut outcome = self
@@ -111,6 +112,9 @@ impl<'a> WriteTransaction<'a> {
             .unwrap_or_default();
         if context.active_version_id != initial_active_version_id {
             outcome.next_active_version_id = Some(context.active_version_id.clone());
+        }
+        if context.active_account_ids != initial_active_account_ids {
+            outcome.next_active_account_ids = Some(context.active_account_ids.clone());
         }
         self.finalize_live_state_for_commit().await?;
         self.coordinator.commit().await?;
