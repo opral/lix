@@ -11,12 +11,12 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use lix_engine::{
-    boot, BootAccount, BootArgs, BootKeyValue, CreateCheckpointResult, CreateVersionOptions,
+    BootAccount, BootArgs, BootKeyValue, CreateCheckpointResult, CreateVersionOptions,
     CreateVersionResult, Engine, ExecuteOptions, ExecuteResult, LiveStateApplyReport,
     LiveStateRebuildDebugMode, LiveStateRebuildPlan, LiveStateRebuildReport,
     LiveStateRebuildRequest, LiveStateRebuildScope, LixBackend, LixError, MergeVersionOptions,
     MergeVersionResult, ObserveEvents, ObserveQuery, RedoOptions, RedoResult, Session,
-    SessionTransaction, UndoOptions, UndoResult, Value, WasmRuntime,
+    SessionTransaction, UndoOptions, UndoResult, Value, WasmRuntime, boot,
 };
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex as TokioMutex;
@@ -560,11 +560,9 @@ impl LocalExpectDeterministic {
 
         if &actual != expected {
             panic!(
-				"SIMULATION DETERMINISM VIOLATION\n\nCall #{}: values differ across simulations\nactual: {:?}\nexpected: {:?}",
-				idx,
-				actual,
-				expected
-			);
+                "SIMULATION DETERMINISM VIOLATION\n\nCall #{}: values differ across simulations\nactual: {:?}\nexpected: {:?}",
+                idx, actual, expected
+            );
         }
     }
 
@@ -654,19 +652,14 @@ impl SharedDeterministicRun {
                     panic!(
                         "SIMULATION DETERMINISM VIOLATION\n\nCase `{}` baseline backend `{}` failed; cannot compare call #{} for backend `{}`",
                         self.case_id,
-                        state
-                            .baseline_backend
-                            .as_deref()
-                            .unwrap_or("<unknown>"),
+                        state.baseline_backend.as_deref().unwrap_or("<unknown>"),
                         idx,
                         self.backend_name
                     );
                 }
                 panic!(
                     "SIMULATION DETERMINISM VIOLATION\n\nCase `{}` backend `{}` called assert_deterministic one extra time at call #{}",
-                    self.case_id,
-                    self.backend_name,
-                    idx
+                    self.case_id, self.backend_name, idx
                 );
             }
 
@@ -674,9 +667,7 @@ impl SharedDeterministicRun {
             if now >= deadline {
                 panic!(
                     "SIMULATION DETERMINISM VIOLATION\n\nTimed out waiting for baseline values in case `{}` (backend `{}`, call #{})",
-                    self.case_id,
-                    self.backend_name,
-                    idx
+                    self.case_id, self.backend_name, idx
                 );
             }
             let remaining = deadline.saturating_duration_since(now);
@@ -698,11 +689,7 @@ impl SharedDeterministicRun {
         if &actual != expected {
             panic!(
                 "SIMULATION DETERMINISM VIOLATION\n\nCase `{}` call #{} differs for backend `{}`\nactual: {:?}\nexpected: {:?}",
-                self.case_id,
-                idx,
-                self.backend_name,
-                actual,
-                expected
+                self.case_id, idx, self.backend_name, actual, expected
             );
         }
     }
@@ -756,10 +743,7 @@ impl SharedDeterministicRun {
             return Err(format!(
                 "SIMULATION DETERMINISM VIOLATION\n\nCase `{}` baseline backend `{}` failed; cannot validate backend `{}`",
                 self.case_id,
-                state
-                    .baseline_backend
-                    .as_deref()
-                    .unwrap_or("<unknown>"),
+                state.baseline_backend.as_deref().unwrap_or("<unknown>"),
                 self.backend_name
             ));
         }

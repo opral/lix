@@ -8,8 +8,8 @@ use sqlx::{Column, Executor, PgPool, Row, ValueRef};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
 use lix_engine::{
-    collapse_prepared_batch_for_dialect, LixBackend, LixBackendTransaction, LixError,
-    PreparedBatch, QueryResult, SqlDialect, Value,
+    LixBackend, LixBackendTransaction, LixError, PreparedBatch, QueryResult, SqlDialect, Value,
+    collapse_prepared_batch_for_dialect,
 };
 
 use crate::support::simulation_test::{Simulation, SimulationBehavior};

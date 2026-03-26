@@ -111,7 +111,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(insert_select_is_deferred_to_plan27, |sim| async move {
+simulation_test!(insert_select_applies_cel_default, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)
         .await
@@ -129,22 +129,35 @@ simulation_test!(insert_select_is_deferred_to_plan27, |sim| async move {
             .await
             .unwrap();
 
-    let error = engine
-            .execute(
-                "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) SELECT $1, $2, $3, lix_active_version_id(), $4, $5, $6", &[
-                    Value::Text("entity-1".to_string()),
-                    Value::Text("cel_default_select_schema".to_string()),
-                    Value::Text("file-1".to_string()),
-                    Value::Text("lix".to_string()),
-                    Value::Text("{\"name\":\"Sample\"}".to_string()),
-                    Value::Text("1".to_string()),
-                ])
-            .await
-            .expect_err("INSERT ... SELECT remains deferred to Plan 27");
+    engine
+        .execute(
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) SELECT $1, $2, $3, lix_active_version_id(), $4, $5, $6",
+            &[
+                Value::Text("entity-1".to_string()),
+                Value::Text("cel_default_select_schema".to_string()),
+                Value::Text("file-1".to_string()),
+                Value::Text("lix".to_string()),
+                Value::Text("{\"name\":\"Sample\"}".to_string()),
+                Value::Text("1".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
 
-    assert!(error
-        .to_string()
-        .contains("public day-1 write canonicalizer requires VALUES inserts"));
+    let row = engine
+        .execute(
+            "SELECT snapshot_content FROM lix_state_by_version WHERE schema_key = 'cel_default_select_schema' AND entity_id = 'entity-1'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let snapshot = text_to_json(&row.statements[0].rows[0][0]);
+    assert_eq!(snapshot["name"], JsonValue::String("Sample".to_string()));
+    assert_eq!(
+        snapshot["slug"],
+        JsonValue::String("Sample-slug".to_string())
+    );
 });
 
 simulation_test!(insert_uses_json_default_fallback, |sim| async move {
