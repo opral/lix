@@ -17,7 +17,7 @@
 
 ---
 
-Lix is an semantic version control system for AI agents. 
+Lix is a semantic version control system for AI agents. 
 
 Lix is not a git replacement, nor is it explicitly designed for software engineering. The goal is to bring version control to industries other than software engineering like health, finance, policy making, design, etc.
 
