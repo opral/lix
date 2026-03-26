@@ -36,7 +36,7 @@ fn non_write_consumers_use_raw_or_system_instead_of_lane_modules() {
         "canonical/state_source.rs",
         "sql/public/validation.rs",
         "live_state/materialize/plan.rs",
-        "version/switch_version.rs",
+        "session/mod.rs",
         "undo_redo/mod.rs",
         "sql/public/planner/semantics/write_resolver.rs",
     ] {

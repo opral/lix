@@ -18,10 +18,9 @@ async fn tracked_commit_state(
         .expect("commit count query should succeed");
     let head = engine
         .execute(
-            "SELECT v.commit_id \
-             FROM lix_version v \
-             JOIN lix_active_version av ON av.version_id = v.id \
-             ORDER BY av.id \
+            "SELECT commit_id \
+             FROM lix_version \
+             WHERE id = lix_active_version_id() \
              LIMIT 1",
             &[],
         )

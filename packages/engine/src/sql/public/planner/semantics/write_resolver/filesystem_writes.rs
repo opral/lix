@@ -9,8 +9,8 @@ use crate::filesystem::runtime::{
 };
 use crate::sql::public::planner::semantics::filesystem_assignments::{
     parse_directory_insert_assignments, parse_directory_update_assignments,
-    parse_file_insert_assignments, parse_file_update_assignments, DirectoryUpdateAssignments,
-    FileUpdateAssignments,
+    parse_file_insert_assignments, parse_file_update_assignments, DirectoryInsertAssignments,
+    DirectoryUpdateAssignments, FileInsertAssignments, FileUpdateAssignments,
 };
 use crate::sql::public::planner::semantics::filesystem_planning::{
     plan_directory_insert_batch, plan_file_insert_batch,
@@ -100,45 +100,70 @@ async fn resolve_directory_insert_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let version_id = resolved_filesystem_version_id(planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
-    let mut assignments_batch = Vec::new();
-    for payload in payload_maps(planned_write)? {
-        assignments_batch.push(
-            parse_directory_insert_assignments(&payload)
-                .map_err(write_resolve_filesystem_assignments_error)?,
-        );
-    }
-    let planned_batch =
-        plan_directory_insert_batch(backend, &assignments_batch, &version_id, lookup_scope)
-            .await
-            .map_err(write_resolve_filesystem_planning_error)?;
-    let mut intended_post_state = Vec::new();
-    let mut lineage = Vec::new();
-    for directory in planned_batch.directories {
-        intended_post_state.push(directory_descriptor_row(
-            &directory.id,
-            directory.parent_id.as_deref(),
-            &directory.name,
-            directory.hidden,
-            &version_id,
-            directory.metadata.as_deref(),
-        ));
-        lineage.push(RowLineage {
-            entity_id: directory.id,
-            source_change_id: None,
-            source_commit_id: None,
+    let payloads = payload_maps(planned_write)?;
+    let row_version_ids = resolved_insert_version_ids(backend, planned_write).await?;
+    if payloads.len() != row_version_ids.len() {
+        return Err(WriteResolveError {
+            message:
+                "public filesystem directory insert requires one version target per payload row"
+                    .to_string(),
         });
     }
 
-    Ok(single_partition_write_plan(
-        default_execution_mode_for_request(planned_write.command.requested_mode),
-        Vec::new(),
-        Vec::new(),
-        intended_post_state,
-        Vec::new(),
-        lineage,
-    ))
+    let mut grouped_batches = Vec::<(WriteMode, String, Vec<DirectoryInsertAssignments>)>::new();
+    for (payload, version_id) in payloads.into_iter().zip(row_version_ids.into_iter()) {
+        let version_id = version_id.ok_or_else(|| WriteResolveError {
+            message: "public filesystem write requires a concrete version_id".to_string(),
+        })?;
+        let execution_mode = default_execution_mode_for_request(
+            write_mode_request_for_insert_payload(planned_write, &payload),
+        );
+        let assignments = parse_directory_insert_assignments(&payload)
+            .map_err(write_resolve_filesystem_assignments_error)?;
+        if let Some((_, _, batch)) =
+            grouped_batches
+                .iter_mut()
+                .find(|(group_mode, group_version_id, _)| {
+                    *group_mode == execution_mode && *group_version_id == version_id
+                })
+        {
+            batch.push(assignments);
+        } else {
+            grouped_batches.push((execution_mode, version_id, vec![assignments]));
+        }
+    }
+
+    let mut partitions = ResolvedWritePlanBuilder::default();
+    for (execution_mode, version_id, assignments_batch) in grouped_batches {
+        let planned_batch =
+            plan_directory_insert_batch(backend, &assignments_batch, &version_id, lookup_scope)
+                .await
+                .map_err(write_resolve_filesystem_planning_error)?;
+        let target_write_lane = target_write_lane_for_version(
+            planned_write,
+            execution_mode,
+            Some(version_id.as_str()),
+        )?;
+        let partition = partitions.partition_mut(execution_mode, target_write_lane);
+        for directory in planned_batch.directories {
+            partition.intended_post_state.push(directory_descriptor_row(
+                &directory.id,
+                directory.parent_id.as_deref(),
+                &directory.name,
+                directory.hidden,
+                &version_id,
+                directory.metadata.as_deref(),
+            ));
+            partition.lineage.push(RowLineage {
+                entity_id: directory.id,
+                source_change_id: None,
+                source_commit_id: None,
+            });
+        }
+    }
+
+    Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
 }
 
 async fn resolve_existing_directory_write(
@@ -370,89 +395,113 @@ async fn resolve_file_insert_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let version_id = resolved_filesystem_version_id(planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
-    let mut assignments_batch = Vec::new();
-    for payload in payload_maps(planned_write)? {
-        assignments_batch.push(
-            parse_file_insert_assignments(&payload)
-                .map_err(write_resolve_filesystem_assignments_error)?,
-        );
-    }
-    let planned_batch =
-        plan_file_insert_batch(backend, &assignments_batch, &version_id, lookup_scope)
-            .await
-            .map_err(write_resolve_filesystem_planning_error)?;
-    let mut intended_post_state = Vec::new();
-    let mut lineage = Vec::new();
-    let execution_mode = default_execution_mode_for_request(planned_write.command.requested_mode);
-    let mut filesystem_state = FilesystemTransactionState::default();
-    for directory in planned_batch.directories {
-        intended_post_state.push(directory_descriptor_row(
-            &directory.id,
-            directory.parent_id.as_deref(),
-            &directory.name,
-            directory.hidden,
-            &version_id,
-            directory.metadata.as_deref(),
-        ));
-        lineage.push(RowLineage {
-            entity_id: directory.id,
-            source_change_id: None,
-            source_commit_id: None,
-        });
-    }
-    for file in planned_batch.files {
-        intended_post_state.push(file_descriptor_row(
-            &file.id,
-            file.directory_id.as_deref(),
-            &file.name,
-            file.extension.as_deref(),
-            file.hidden,
-            &version_id,
-            file.metadata.as_deref(),
-        ));
-        let descriptor = filesystem_descriptor_state_from_file_row(
-            file.directory_id.as_deref(),
-            &file.name,
-            file.extension.as_deref(),
-            file.hidden,
-            file.metadata.as_deref(),
-        );
-        set_filesystem_descriptor_state(
-            &mut filesystem_state,
-            &file.id,
-            &version_id,
-            execution_mode == WriteMode::Untracked,
-            descriptor,
-        );
-        if let Some(bytes) = file.data.as_deref() {
-            intended_post_state.push(binary_blob_ref_row(&file.id, &version_id, bytes)?);
-            set_filesystem_data_state(
-                &mut filesystem_state,
-                &file.id,
-                &version_id,
-                execution_mode == WriteMode::Untracked,
-                bytes.to_vec(),
-            );
-        }
-        lineage.push(RowLineage {
-            entity_id: file.id,
-            source_change_id: None,
-            source_commit_id: None,
+    let payloads = payload_maps(planned_write)?;
+    let row_version_ids = resolved_insert_version_ids(backend, planned_write).await?;
+    if payloads.len() != row_version_ids.len() {
+        return Err(WriteResolveError {
+            message: "public filesystem file insert requires one version target per payload row"
+                .to_string(),
         });
     }
 
-    Ok(ResolvedWritePlan::from_partition(ResolvedWritePartition {
-        execution_mode,
-        authoritative_pre_state: Vec::new(),
-        authoritative_pre_state_rows: Vec::new(),
-        intended_post_state,
-        tombstones: Vec::new(),
-        lineage,
-        target_write_lane: None,
-        filesystem_state,
-    }))
+    let mut grouped_batches = Vec::<(WriteMode, String, Vec<FileInsertAssignments>)>::new();
+    for (payload, version_id) in payloads.into_iter().zip(row_version_ids.into_iter()) {
+        let version_id = version_id.ok_or_else(|| WriteResolveError {
+            message: "public filesystem write requires a concrete version_id".to_string(),
+        })?;
+        let execution_mode = default_execution_mode_for_request(
+            write_mode_request_for_insert_payload(planned_write, &payload),
+        );
+        let assignments = parse_file_insert_assignments(&payload)
+            .map_err(write_resolve_filesystem_assignments_error)?;
+        if let Some((_, _, batch)) =
+            grouped_batches
+                .iter_mut()
+                .find(|(group_mode, group_version_id, _)| {
+                    *group_mode == execution_mode && *group_version_id == version_id
+                })
+        {
+            batch.push(assignments);
+        } else {
+            grouped_batches.push((execution_mode, version_id, vec![assignments]));
+        }
+    }
+
+    let mut partitions = ResolvedWritePlanBuilder::default();
+    for (execution_mode, version_id, assignments_batch) in grouped_batches {
+        let planned_batch =
+            plan_file_insert_batch(backend, &assignments_batch, &version_id, lookup_scope)
+                .await
+                .map_err(write_resolve_filesystem_planning_error)?;
+        let target_write_lane = target_write_lane_for_version(
+            planned_write,
+            execution_mode,
+            Some(version_id.as_str()),
+        )?;
+        let partition = partitions.partition_mut(execution_mode, target_write_lane);
+        for directory in planned_batch.directories {
+            partition.intended_post_state.push(directory_descriptor_row(
+                &directory.id,
+                directory.parent_id.as_deref(),
+                &directory.name,
+                directory.hidden,
+                &version_id,
+                directory.metadata.as_deref(),
+            ));
+            partition.lineage.push(RowLineage {
+                entity_id: directory.id,
+                source_change_id: None,
+                source_commit_id: None,
+            });
+        }
+        for file in planned_batch.files {
+            partition.intended_post_state.push(file_descriptor_row(
+                &file.id,
+                file.directory_id.as_deref(),
+                &file.name,
+                file.extension.as_deref(),
+                file.hidden,
+                &version_id,
+                file.metadata.as_deref(),
+            ));
+            let descriptor = filesystem_descriptor_state_from_file_row(
+                file.directory_id.as_deref(),
+                &file.name,
+                file.extension.as_deref(),
+                file.hidden,
+                file.metadata.as_deref(),
+            );
+            set_filesystem_descriptor_state(
+                &mut partition.filesystem_state,
+                &file.id,
+                &version_id,
+                execution_mode == WriteMode::Untracked,
+                descriptor,
+            );
+            if let Some(bytes) = file.data.as_deref() {
+                partition.intended_post_state.push(binary_blob_ref_row(
+                    &file.id,
+                    &version_id,
+                    bytes,
+                )?);
+                set_filesystem_data_state(
+                    &mut partition.filesystem_state,
+                    &file.id,
+                    &version_id,
+                    execution_mode == WriteMode::Untracked,
+                    bytes.to_vec(),
+                );
+            }
+            partition.lineage.push(RowLineage {
+                entity_id: file.id,
+                source_change_id: None,
+                source_commit_id: None,
+            });
+        }
+    }
+
+    Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
 }
 
 async fn resolve_existing_file_write(

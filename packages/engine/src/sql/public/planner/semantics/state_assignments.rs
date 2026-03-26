@@ -72,12 +72,12 @@ pub(crate) fn build_state_insert_row(
 
 pub(crate) fn build_entity_insert_rows(
     payloads: Vec<BTreeMap<String, Value>>,
-    version_id: Option<String>,
+    version_ids: Vec<Option<String>>,
     semantics: EntityInsertSemantics<'_>,
 ) -> Result<Vec<PlannedStateRow>, StateAssignmentsError> {
     build_entity_insert_rows_with_functions(
         payloads,
-        version_id,
+        version_ids,
         semantics,
         SharedFunctionProvider::new(crate::functions::SystemFunctionProvider),
     )
@@ -85,15 +85,22 @@ pub(crate) fn build_entity_insert_rows(
 
 pub(crate) fn build_entity_insert_rows_with_functions<P>(
     payloads: Vec<BTreeMap<String, Value>>,
-    version_id: Option<String>,
+    version_ids: Vec<Option<String>>,
     semantics: EntityInsertSemantics<'_>,
     functions: SharedFunctionProvider<P>,
 ) -> Result<Vec<PlannedStateRow>, StateAssignmentsError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
+    if payloads.len() != version_ids.len() {
+        return Err(StateAssignmentsError {
+            message: "public entity insert resolver requires one version target per payload row"
+                .to_string(),
+        });
+    }
+
     let mut rows = Vec::with_capacity(payloads.len());
-    for payload in payloads {
+    for (payload, version_id) in payloads.into_iter().zip(version_ids.into_iter()) {
         let snapshot =
             snapshot_from_entity_payload_with_functions(&payload, semantics, functions.clone())?;
         let entity_id = if let Some(entity_id) = payload.get("entity_id").and_then(text_from_value)
@@ -158,7 +165,7 @@ where
         rows.push(build_state_insert_row(
             entity_id,
             semantics.schema_key.to_string(),
-            version_id.clone(),
+            version_id,
             values,
         ));
     }

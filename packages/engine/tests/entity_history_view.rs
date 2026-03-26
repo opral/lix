@@ -9,21 +9,6 @@ fn assert_text(value: &Value, expected: &str) {
     }
 }
 
-async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
-    let rows = engine
-        .execute(
-            "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-            &[],
-        )
-        .await
-        .unwrap();
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    match &rows.statements[0].rows[0][0] {
-        Value::Text(value) => value.clone(),
-        other => panic!("expected text active version id, got {other:?}"),
-    }
-}
-
 async fn seed_key_value_row(
     engine: &support::simulation_test::SimulationEngine,
     key: &str,
@@ -56,7 +41,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
 
         seed_key_value_row(&engine, "key-history", "value-history", &version_id).await;
 

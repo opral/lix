@@ -170,20 +170,6 @@ async fn change_set_element_change_ids_for_change_set(
     change_ids
 }
 
-async fn active_version_id(engine: &SimulationEngine) -> String {
-    let result = engine
-        .execute(
-            "SELECT version_id \
-             FROM lix_active_version \
-             ORDER BY id \
-             LIMIT 1",
-            &[],
-        )
-        .await
-        .unwrap();
-    as_text(&result.statements[0].rows[0][0])
-}
-
 simulation_test!(
     commit_writes_business_rows_to_change_and_snapshot_tables,
     |sim| async move {
@@ -351,7 +337,7 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                  ) VALUES (\
-                 'entity-untracked', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"local\"}', '1', true\
+                 'entity-untracked', 'test_schema', 'file-1', lix_active_version_id(), 'lix', '{\"key\":\"local\"}', '1', true\
                  )", &[])
             .await
             .unwrap();
@@ -721,7 +707,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let before = read_version_ref_commit_id(&engine, &version_id).await;
 
         engine

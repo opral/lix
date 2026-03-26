@@ -237,6 +237,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         &mut self,
         default_active_version_id: &str,
     ) -> Result<(), LixError> {
+        let mut bootstrap_commit_id: Option<String> = None;
         for key_value in self.boot_key_values().to_vec() {
             let version_id = if key_value.lixcol_global.unwrap_or(false) {
                 KEY_VALUE_GLOBAL_VERSION.to_string()
@@ -250,22 +251,38 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             })
             .to_string();
 
-            self.execute_internal(
-                "INSERT INTO lix_state_by_version (\
-                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[
-                    Value::Text(key_value.key.clone()),
-                    Value::Text(key_value_schema_key().to_string()),
-                    Value::Text(key_value_file_id().to_string()),
-                    Value::Text(version_id),
-                    Value::Text(key_value_plugin_key().to_string()),
-                    Value::Text(snapshot_content),
-                    Value::Text(key_value_schema_version().to_string()),
-                    Value::Boolean(untracked),
-                ]
+            if untracked {
+                self.insert_bootstrap_untracked_row(
+                    &key_value.key,
+                    key_value_schema_key(),
+                    key_value_schema_version(),
+                    key_value_file_id(),
+                    &version_id,
+                    key_value_plugin_key(),
+                    &snapshot_content,
                 )
-            .await?;
+                .await?;
+            } else {
+                let commit_id = match &bootstrap_commit_id {
+                    Some(commit_id) => commit_id.clone(),
+                    None => {
+                        let commit_id = self.load_global_version_commit_id().await?;
+                        bootstrap_commit_id = Some(commit_id.clone());
+                        commit_id
+                    }
+                };
+                self.insert_bootstrap_tracked_row(
+                    Some(&commit_id),
+                    &key_value.key,
+                    key_value_schema_key(),
+                    key_value_schema_version(),
+                    key_value_file_id(),
+                    &version_id,
+                    key_value_plugin_key(),
+                    &snapshot_content,
+                )
+                .await?;
+            }
         }
 
         Ok(())
@@ -1001,6 +1018,44 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             self.add_change_id_to_commit(commit_id, &change_id).await?;
         }
 
+        Ok(())
+    }
+
+    async fn insert_bootstrap_untracked_row(
+        &mut self,
+        entity_id: &str,
+        schema_key: &str,
+        schema_version: &str,
+        file_id: &str,
+        version_id: &str,
+        plugin_key: &str,
+        snapshot_content: &str,
+    ) -> Result<(), LixError> {
+        let timestamp = self.generate_runtime_timestamp().await?;
+        let normalized_values = normalized_seed_values(schema_key, Some(snapshot_content))?;
+        let insert_sql = format!(
+            "INSERT INTO {table} (\
+             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, writer_key, untracked, created_at, updated_at{normalized_columns}\
+             ) VALUES (\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', NULL, NULL, true, '{timestamp}', '{timestamp}'{normalized_literals}\
+             )",
+            table = quote_ident(&untracked_live_table_name(schema_key)),
+            entity_id = escape_sql_string(entity_id),
+            schema_key = escape_sql_string(schema_key),
+            schema_version = escape_sql_string(schema_version),
+            file_id = escape_sql_string(file_id),
+            version_id = escape_sql_string(version_id),
+            global = if version_id == GLOBAL_VERSION_ID {
+                "true"
+            } else {
+                "false"
+            },
+            plugin_key = escape_sql_string(plugin_key),
+            timestamp = escape_sql_string(&timestamp),
+            normalized_columns = normalized_insert_columns_sql(&normalized_values),
+            normalized_literals = normalized_insert_literals_sql(&normalized_values),
+        );
+        self.execute_backend(&insert_sql, &[]).await?;
         Ok(())
     }
 

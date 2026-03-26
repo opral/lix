@@ -6,8 +6,8 @@ use sqlx::{Column, Executor, Row, SqlitePool, ValueRef};
 use tokio::sync::OnceCell;
 
 use lix_engine::{
-    LixBackend, LixBackendTransaction, LixError, PreparedBatch, QueryResult, SqlDialect, Value,
-    collapse_prepared_batch_for_dialect,
+    collapse_prepared_batch_for_dialect, LixBackend, LixBackendTransaction, LixError,
+    PreparedBatch, QueryResult, SqlDialect, Value,
 };
 
 use crate::support::simulation_test::{Simulation, SimulationBehavior};

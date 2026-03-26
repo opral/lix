@@ -1,6 +1,5 @@
-use crate::Value;
 use crate::sql::public::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
-use crate::sql::public::core::contracts::{BoundStatement, StatementKind};
+use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext, StatementKind};
 use crate::sql::public::planner::ir::{
     CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan,
     CanonicalWorkingChangesScan, InsertOnConflict, InsertOnConflictAction, MutationPayload,
@@ -8,7 +7,8 @@ use crate::sql::public::planner::ir::{
     SortKey, StructuredPublicRead, WriteCommand, WriteModeRequest, WriteOperationKind,
     WriteSelector,
 };
-use crate::sql_support::placeholders::{PlaceholderState, resolve_placeholder_index};
+use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::Value;
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, ConflictTarget, Delete, Expr, FromTable, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, Insert, LimitClause, ObjectNamePart,
@@ -218,12 +218,18 @@ fn canonicalize_insert_write(
         ));
     }
 
-    let payloads = insert_payloads(&surface_binding, insert, &bound_statement.bound_parameters)?;
+    let payloads = insert_payloads(
+        &surface_binding,
+        insert,
+        &bound_statement.bound_parameters,
+        &bound_statement.execution_context,
+    )?;
     let on_conflict = match payloads.as_slice() {
         [payload] => insert_on_conflict(
             &surface_binding,
             insert,
             &bound_statement.bound_parameters,
+            &bound_statement.execution_context,
             payload,
         )?,
         _ if insert.on.is_some() => {
@@ -274,6 +280,7 @@ fn canonicalize_update_write(
         &surface_binding,
         &update.assignments,
         &bound_statement.bound_parameters,
+        &bound_statement.execution_context,
         &mut placeholder_state,
     )?;
     let selector = match update.selection.as_ref() {
@@ -281,6 +288,7 @@ fn canonicalize_update_write(
             &surface_binding,
             selection,
             &bound_statement.bound_parameters,
+            &bound_statement.execution_context,
             &mut placeholder_state,
         )?,
         None if supports_implicit_admin_selector(&surface_binding) => WriteSelector {
@@ -336,6 +344,7 @@ fn canonicalize_delete_write(
             &surface_binding,
             selection,
             &bound_statement.bound_parameters,
+            &bound_statement.execution_context,
             &mut placeholder_state,
         )?,
         None if supports_implicit_admin_selector(&surface_binding) => WriteSelector {
@@ -373,6 +382,7 @@ fn insert_on_conflict(
     surface_binding: &SurfaceBinding,
     insert: &Insert,
     params: &[Value],
+    execution_context: &ExecutionContext,
     insert_payload: &BTreeMap<String, Value>,
 ) -> Result<Option<InsertOnConflict>, CanonicalizeError> {
     let Some(on_insert) = &insert.on else {
@@ -418,6 +428,7 @@ fn insert_on_conflict(
                 surface_binding,
                 &update.assignments,
                 params,
+                execution_context,
                 &mut placeholder_state,
             )?;
             for (key, value) in update_payload {
@@ -670,6 +681,7 @@ fn insert_payloads(
     surface_binding: &SurfaceBinding,
     insert: &Insert,
     params: &[Value],
+    execution_context: &ExecutionContext,
 ) -> Result<Vec<BTreeMap<String, Value>>, CanonicalizeError> {
     let Some(source) = &insert.source else {
         if insert.columns.is_empty() {
@@ -686,6 +698,7 @@ fn insert_payloads(
         insert.columns.as_slice(),
         source,
         params,
+        execution_context,
         &mut placeholder_state,
     )
 }
@@ -695,6 +708,7 @@ fn insert_source_payloads(
     insert_columns: &[Ident],
     source: &Query,
     params: &[Value],
+    execution_context: &ExecutionContext,
     placeholder_state: &mut PlaceholderState,
 ) -> Result<Vec<BTreeMap<String, Value>>, CanonicalizeError> {
     reject_unsupported_insert_source_query_clauses(source)?;
@@ -714,6 +728,7 @@ fn insert_source_payloads(
                     insert_columns,
                     row.iter(),
                     params,
+                    execution_context,
                     placeholder_state,
                 )?);
             }
@@ -724,6 +739,7 @@ fn insert_source_payloads(
             insert_columns,
             select,
             params,
+            execution_context,
             placeholder_state,
         )?]),
         SetExpr::Query(query) => insert_source_payloads(
@@ -731,6 +747,7 @@ fn insert_source_payloads(
             insert_columns,
             query,
             params,
+            execution_context,
             placeholder_state,
         ),
         SetExpr::SetOperation { .. } => Err(CanonicalizeError::unsupported(
@@ -772,6 +789,7 @@ fn insert_payload_from_select(
     insert_columns: &[Ident],
     select: &Select,
     params: &[Value],
+    execution_context: &ExecutionContext,
     placeholder_state: &mut PlaceholderState,
 ) -> Result<BTreeMap<String, Value>, CanonicalizeError> {
     if !select.from.is_empty() {
@@ -828,6 +846,7 @@ fn insert_payload_from_select(
         insert_columns,
         projection_exprs,
         params,
+        execution_context,
         placeholder_state,
     )
 }
@@ -837,6 +856,7 @@ fn insert_payload_from_row_exprs<'a>(
     insert_columns: &[Ident],
     exprs: impl IntoIterator<Item = &'a Expr>,
     params: &[Value],
+    execution_context: &ExecutionContext,
     placeholder_state: &mut PlaceholderState,
 ) -> Result<BTreeMap<String, Value>, CanonicalizeError> {
     let exprs = exprs.into_iter().collect::<Vec<_>>();
@@ -850,7 +870,7 @@ fn insert_payload_from_row_exprs<'a>(
     for (column, expr) in insert_columns.iter().zip(exprs) {
         reject_forbidden_default_state_write_column(surface_binding, &column.value, "insert")?;
         let key = canonical_write_column_key(surface_binding, &column.value)?;
-        let value = match expr_to_value(expr, params, placeholder_state) {
+        let value = match expr_to_value(expr, params, execution_context, placeholder_state) {
             Ok(value) => value,
             Err(error) if key == "data" => return Err(filesystem_file_data_error(error)),
             Err(error) => return Err(error),
@@ -874,9 +894,7 @@ fn write_mode_request_for_insert_payloads(
     for payload in &payloads[1..] {
         let row_mode = write_mode_request_for_surface_and_selector(surface_binding, payload, None);
         if row_mode != mode {
-            return Err(CanonicalizeError::unsupported(
-                "public day-1 insert canonicalizer does not support mixing tracked and untracked rows in one INSERT",
-            ));
+            return Ok(WriteModeRequest::Auto);
         }
     }
     Ok(mode)
@@ -886,6 +904,7 @@ fn assignment_payload(
     surface_binding: &SurfaceBinding,
     assignments: &[sqlparser::ast::Assignment],
     params: &[Value],
+    execution_context: &ExecutionContext,
     placeholder_state: &mut PlaceholderState,
 ) -> Result<BTreeMap<String, Value>, CanonicalizeError> {
     if assignments.is_empty() {
@@ -913,7 +932,12 @@ fn assignment_payload(
             })?;
         reject_forbidden_default_state_write_column(surface_binding, &raw_key, "update")?;
         let key = canonical_write_column_key(surface_binding, &raw_key)?;
-        let value = match expr_to_value(&assignment.value, params, placeholder_state) {
+        let value = match expr_to_value(
+            &assignment.value,
+            params,
+            execution_context,
+            placeholder_state,
+        ) {
             Ok(value) => value,
             Err(error) if key == "data" => return Err(filesystem_file_data_error(error)),
             Err(error) => return Err(error),
@@ -927,6 +951,7 @@ fn write_selector(
     surface_binding: &SurfaceBinding,
     expr: &Expr,
     params: &[Value],
+    execution_context: &ExecutionContext,
     placeholder_state: &mut PlaceholderState,
 ) -> Result<WriteSelector, CanonicalizeError> {
     reject_forbidden_default_state_selector(surface_binding, expr)?;
@@ -936,6 +961,7 @@ fn write_selector(
         surface_binding,
         expr,
         params,
+        execution_context,
         placeholder_state,
         &mut exact_filters,
     );
@@ -951,6 +977,7 @@ fn collect_exact_selector_filters(
     surface_binding: &SurfaceBinding,
     expr: &Expr,
     params: &[Value],
+    execution_context: &ExecutionContext,
     placeholder_state: &mut PlaceholderState,
     exact_filters: &mut BTreeMap<String, Value>,
 ) -> bool {
@@ -964,12 +991,14 @@ fn collect_exact_selector_filters(
                 surface_binding,
                 left,
                 params,
+                execution_context,
                 placeholder_state,
                 exact_filters,
             ) && collect_exact_selector_filters(
                 surface_binding,
                 right,
                 params,
+                execution_context,
                 placeholder_state,
                 exact_filters,
             )
@@ -995,7 +1024,8 @@ fn collect_exact_selector_filters(
             } else {
                 left
             };
-            let Ok(value) = expr_to_value(value_expr, params, placeholder_state) else {
+            let Ok(value) = expr_to_value(value_expr, params, execution_context, placeholder_state)
+            else {
                 return false;
             };
             match exact_filters.get(&column) {
@@ -1024,7 +1054,8 @@ fn collect_exact_selector_filters(
             if !selector_column_is_supported(surface_binding, &column) {
                 return false;
             }
-            let Ok(value) = expr_to_value(&list[0], params, placeholder_state) else {
+            let Ok(value) = expr_to_value(&list[0], params, execution_context, placeholder_state)
+            else {
                 return false;
             };
             match exact_filters.get(&column) {
@@ -1040,6 +1071,7 @@ fn collect_exact_selector_filters(
             surface_binding,
             inner,
             params,
+            execution_context,
             placeholder_state,
             exact_filters,
         ),
@@ -1333,9 +1365,19 @@ fn filesystem_file_data_error(_error: CanonicalizeError) -> CanonicalizeError {
     CanonicalizeError::unsupported(crate::errors::FILE_DATA_EXPECTS_BYTES_MESSAGE)
 }
 
+pub(crate) fn evaluate_public_write_expr_to_value(
+    expr: &Expr,
+    params: &[Value],
+    execution_context: &ExecutionContext,
+) -> Result<Value, CanonicalizeError> {
+    let mut placeholder_state = PlaceholderState::new();
+    expr_to_value(expr, params, execution_context, &mut placeholder_state)
+}
+
 fn expr_to_value(
     expr: &Expr,
     params: &[Value],
+    execution_context: &ExecutionContext,
     placeholder_state: &mut PlaceholderState,
 ) -> Result<Value, CanonicalizeError> {
     match expr {
@@ -1345,7 +1387,7 @@ fn expr_to_value(
                 .is_some_and(|name| name.eq_ignore_ascii_case("lix_text_encode")) =>
         {
             let encoded = single_function_arg_expr(function, "lix_text_encode")?;
-            match expr_to_value(encoded, params, placeholder_state)? {
+            match expr_to_value(encoded, params, execution_context, placeholder_state)? {
                 Value::Text(text) => Ok(Value::Blob(text.into_bytes())),
                 Value::Blob(bytes) => Ok(Value::Blob(bytes)),
                 Value::Null => Ok(Value::Null),
@@ -1359,12 +1401,41 @@ fn expr_to_value(
                 .is_some_and(|name| name.eq_ignore_ascii_case("lix_json")) =>
         {
             let json_expr = single_function_arg_expr(function, "lix_json")?;
-            let value = expr_to_value(json_expr, params, placeholder_state)?;
+            let value = expr_to_value(json_expr, params, execution_context, placeholder_state)?;
             value_to_json_value(value)
         }
-        Expr::Nested(inner) => expr_to_value(inner, params, placeholder_state),
+        Expr::Function(function)
+            if function_name(function)
+                .is_some_and(|name| name.eq_ignore_ascii_case("lix_active_version_id")) =>
+        {
+            ensure_no_function_args(function, "lix_active_version_id")?;
+            execution_context
+                .requested_version_id
+                .clone()
+                .map(Value::Text)
+                .ok_or_else(|| {
+                    CanonicalizeError::unsupported(
+                        "lix_active_version_id() requires a requested session version",
+                    )
+                })
+        }
+        Expr::Function(function)
+            if function_name(function)
+                .is_some_and(|name| name.eq_ignore_ascii_case("lix_active_account_ids")) =>
+        {
+            ensure_no_function_args(function, "lix_active_account_ids")?;
+            Ok(Value::Json(serde_json::Value::Array(
+                execution_context
+                    .active_account_ids
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            )))
+        }
+        Expr::Nested(inner) => expr_to_value(inner, params, execution_context, placeholder_state),
         Expr::UnaryOp { op, expr } if op.to_string() == "-" => {
-            match expr_to_value(expr, params, placeholder_state)? {
+            match expr_to_value(expr, params, execution_context, placeholder_state)? {
                 Value::Integer(value) => Ok(Value::Integer(-value)),
                 Value::Real(value) => Ok(Value::Real(-value)),
                 _ => Err(CanonicalizeError::unsupported(
@@ -1446,6 +1517,19 @@ fn single_function_arg_expr<'a>(
         } => Ok(expr),
         _ => Err(CanonicalizeError::unsupported(format!(
             "public day-1 write canonicalizer only supports expression arguments for {function_name}",
+        ))),
+    }
+}
+
+fn ensure_no_function_args(
+    function: &sqlparser::ast::Function,
+    function_name: &str,
+) -> Result<(), CanonicalizeError> {
+    match &function.args {
+        FunctionArguments::None => Ok(()),
+        FunctionArguments::List(list) if list.clauses.is_empty() && list.args.is_empty() => Ok(()),
+        _ => Err(CanonicalizeError::unsupported(format!(
+            "public day-1 write canonicalizer requires zero arguments for {function_name}",
         ))),
     }
 }
@@ -1770,13 +1854,13 @@ fn expr_to_u64(expr: &Expr) -> Result<u64, CanonicalizeError> {
 #[cfg(test)]
 mod tests {
     use super::{canonicalize_read, canonicalize_write};
-    use crate::Value;
     use crate::sql::public::catalog::{DynamicEntitySurfaceSpec, SurfaceRegistry};
     use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql::public::core::parser::parse_sql_script;
     use crate::sql::public::planner::ir::{
         MutationPayload, ReadContract, ReadPlan, VersionScope, WriteModeRequest, WriteOperationKind,
     };
+    use crate::Value;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -1790,6 +1874,15 @@ mod tests {
         let mut statements = parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
         BoundStatement::from_statement(statement, params, ExecutionContext::default())
+    }
+
+    fn bound_statement_with_context(
+        sql: &str,
+        execution_context: ExecutionContext,
+    ) -> BoundStatement {
+        let mut statements = parse_sql_script(sql).expect("SQL should parse");
+        let statement = statements.pop().expect("single statement");
+        BoundStatement::from_statement(statement, Vec::new(), execution_context)
     }
 
     #[test]
@@ -1995,6 +2088,37 @@ mod tests {
     }
 
     #[test]
+    fn canonicalizes_state_insert_with_lix_active_version_id() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let canonicalized = canonicalize_write(
+            bound_statement_with_context(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'entity-1', 'lix_key_value', 'lix', lix_active_version_id(), 'lix', '{\"key\":\"hello\"}', '1'\
+                 )",
+                ExecutionContext {
+                    requested_version_id: Some("version-active".to_string()),
+                    ..ExecutionContext::default()
+                },
+            ),
+            &registry,
+        )
+        .expect("state insert with active version function should canonicalize");
+
+        let MutationPayload::InsertRows(rows) = &canonicalized.write_command.payload else {
+            panic!("expected insert rows payload");
+        };
+        let [payload] = rows.as_slice() else {
+            panic!("expected exactly one insert row");
+        };
+        assert_eq!(
+            payload.get("version_id"),
+            Some(&Value::Text("version-active".to_string()))
+        );
+    }
+
+    #[test]
     fn canonicalizes_parameterized_state_insert_select_into_write_command() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
         let canonicalized = canonicalize_write(
@@ -2066,6 +2190,33 @@ mod tests {
             rows[1].get("path"),
             Some(&Value::Text("/b.txt".to_string()))
         );
+    }
+
+    #[test]
+    fn canonicalizes_multi_row_insert_with_mixed_trackedness_as_auto_mode() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let canonicalized = canonicalize_write(
+            bound_statement(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+                 ) VALUES \
+                 ('entity-tracked', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"tracked\"}', '1', false), \
+                 ('entity-untracked', 'lix_key_value', 'lix', 'version-b', 'lix', '{\"key\":\"untracked\"}', '1', true)",
+            ),
+            &registry,
+        )
+        .expect("mixed trackedness insert should canonicalize");
+
+        assert_eq!(
+            canonicalized.write_command.requested_mode,
+            WriteModeRequest::Auto
+        );
+        let MutationPayload::InsertRows(rows) = &canonicalized.write_command.payload else {
+            panic!("expected insert rows payload");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("untracked"), Some(&Value::Boolean(false)));
+        assert_eq!(rows[1].get("untracked"), Some(&Value::Boolean(true)));
     }
 
     #[test]

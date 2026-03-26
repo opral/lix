@@ -19,14 +19,17 @@ fn as_i64(value: &Value) -> i64 {
 async fn active_version_ref(
     engine: &support::simulation_test::SimulationEngine,
 ) -> (String, String) {
+    let version_id = engine
+        .active_version_id()
+        .await
+        .expect("active version query should succeed");
     let result = engine
         .execute(
-            "SELECT av.version_id, v.commit_id \
-             FROM lix_active_version av \
-             JOIN lix_version v ON v.id = av.version_id \
-             ORDER BY av.id \
+            "SELECT id, commit_id \
+             FROM lix_version \
+             WHERE id = $1 \
              LIMIT 1",
-            &[],
+            &[Value::Text(version_id)],
         )
         .await
         .expect("active version query should succeed");

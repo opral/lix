@@ -124,17 +124,7 @@ simulation_test!(
 
         engine.initialize().await.unwrap();
 
-        let active_version = engine
-            .execute(
-                "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-                &[],
-            )
-            .await
-            .unwrap();
-        let active_version_id = match &active_version.statements[0].rows[0][0] {
-            Value::Text(value) => value.clone(),
-            other => panic!("expected text active version id, got {other:?}"),
-        };
+        let active_version_id = engine.active_version_id().await.unwrap();
 
         let result = engine
             .execute(

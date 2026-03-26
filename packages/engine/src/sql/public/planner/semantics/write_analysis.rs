@@ -1,11 +1,15 @@
 use crate::sql::public::catalog::SurfaceOverrideValue;
-use crate::sql::public::planner::canonicalize::CanonicalizedWrite;
+use crate::sql::public::planner::canonicalize::{
+    evaluate_public_write_expr_to_value, CanonicalizedWrite,
+};
 use crate::sql::public::planner::ir::{
     MutationPayload, PlannedWrite, SchemaProof, ScopeProof, StateSourceKind, TargetSetProof,
     WriteModeRequest,
 };
+use crate::sql::public::planner::semantics::surface_semantics::canonical_filter_column_name;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::Value;
+use sqlparser::ast::{BinaryOperator, Expr};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +61,10 @@ pub(crate) fn analyze_write(
 fn analyze_write_scope(
     canonicalized: &CanonicalizedWrite,
 ) -> Result<ScopeProof, WriteAnalysisError> {
+    if let Some(scope_proof) = insert_scope_proof(canonicalized) {
+        return Ok(scope_proof);
+    }
+
     if let Some(version_id) = forced_write_version_id(canonicalized) {
         return Ok(ScopeProof::SingleVersion(version_id));
     }
@@ -87,10 +95,309 @@ fn analyze_write_scope(
     }
 }
 
+fn insert_scope_proof(canonicalized: &CanonicalizedWrite) -> Option<ScopeProof> {
+    let MutationPayload::InsertRows(rows) = &canonicalized.write_command.payload else {
+        return None;
+    };
+
+    Some(match canonicalized.surface_binding.default_scope {
+        crate::sql::public::catalog::DefaultScopeSemantics::ActiveVersion => {
+            insert_scope_for_active_version_surface(canonicalized, rows)
+        }
+        crate::sql::public::catalog::DefaultScopeSemantics::ExplicitVersion => {
+            insert_scope_for_explicit_version_surface(rows)
+        }
+        crate::sql::public::catalog::DefaultScopeSemantics::History => ScopeProof::Unbounded,
+        crate::sql::public::catalog::DefaultScopeSemantics::GlobalAdmin => ScopeProof::GlobalAdmin,
+        crate::sql::public::catalog::DefaultScopeSemantics::WorkingChanges => ScopeProof::Unknown,
+    })
+}
+
+fn insert_scope_for_active_version_surface(
+    canonicalized: &CanonicalizedWrite,
+    rows: &[std::collections::BTreeMap<String, Value>],
+) -> ScopeProof {
+    if surface_forces_global_scope(canonicalized) {
+        return ScopeProof::SingleVersion(GLOBAL_VERSION_ID.to_string());
+    }
+
+    let Some(active_version_id) = canonicalized
+        .write_command
+        .execution_context
+        .requested_version_id
+        .as_ref()
+    else {
+        return ScopeProof::Unknown;
+    };
+
+    let mut version_ids = BTreeSet::new();
+    let mut uses_local_active_version = false;
+
+    for payload in rows {
+        if bool_value_from_payload(payload, "global") == Some(true) {
+            version_ids.insert(GLOBAL_VERSION_ID.to_string());
+        } else {
+            version_ids.insert(active_version_id.clone());
+            uses_local_active_version = true;
+        }
+    }
+
+    match version_ids.len() {
+        0 => ScopeProof::Unknown,
+        1 if uses_local_active_version && !version_ids.contains(GLOBAL_VERSION_ID) => {
+            ScopeProof::ActiveVersion
+        }
+        1 => ScopeProof::SingleVersion(
+            version_ids
+                .into_iter()
+                .next()
+                .expect("singleton version scope"),
+        ),
+        _ => ScopeProof::FiniteVersionSet(version_ids),
+    }
+}
+
+fn insert_scope_for_explicit_version_surface(
+    rows: &[std::collections::BTreeMap<String, Value>],
+) -> ScopeProof {
+    let mut version_ids = BTreeSet::new();
+    for payload in rows {
+        if bool_value_from_payload(payload, "global") == Some(true) {
+            version_ids.insert(GLOBAL_VERSION_ID.to_string());
+            continue;
+        }
+
+        let Some(version_id) = payload.get("version_id").and_then(|value| match value {
+            Value::Text(version_id) => Some(version_id.clone()),
+            _ => None,
+        }) else {
+            return ScopeProof::FiniteVersionSet(BTreeSet::new());
+        };
+        version_ids.insert(version_id);
+    }
+
+    match version_ids.len() {
+        0 => ScopeProof::FiniteVersionSet(version_ids),
+        1 => ScopeProof::SingleVersion(
+            version_ids
+                .into_iter()
+                .next()
+                .expect("singleton version scope"),
+        ),
+        _ => ScopeProof::FiniteVersionSet(version_ids),
+    }
+}
+
 fn write_scope_for_explicit_version_surface(canonicalized: &CanonicalizedWrite) -> ScopeProof {
     write_text_value(canonicalized, "version_id")
         .map(ScopeProof::SingleVersion)
+        .or_else(|| {
+            finite_selector_version_ids(canonicalized).map(|version_ids| match version_ids.len() {
+                1 => ScopeProof::SingleVersion(
+                    version_ids
+                        .into_iter()
+                        .next()
+                        .expect("singleton version scope"),
+                ),
+                _ => ScopeProof::FiniteVersionSet(version_ids),
+            })
+        })
         .unwrap_or_else(|| ScopeProof::FiniteVersionSet(BTreeSet::new()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VersionSelectorConstraint {
+    Unconstrained,
+    Finite(BTreeSet<String>),
+    Unknown,
+}
+
+fn finite_selector_version_ids(canonicalized: &CanonicalizedWrite) -> Option<BTreeSet<String>> {
+    let constraint = canonicalized
+        .write_command
+        .selector
+        .residual_predicates
+        .iter()
+        .fold(
+            VersionSelectorConstraint::Unconstrained,
+            |acc, predicate| {
+                combine_version_constraints_with_and(
+                    acc,
+                    analyze_version_selector_constraint(predicate, canonicalized),
+                )
+            },
+        );
+
+    match constraint {
+        VersionSelectorConstraint::Finite(version_ids) => Some(version_ids),
+        VersionSelectorConstraint::Unconstrained | VersionSelectorConstraint::Unknown => None,
+    }
+}
+
+fn analyze_version_selector_constraint(
+    expr: &Expr,
+    canonicalized: &CanonicalizedWrite,
+) -> VersionSelectorConstraint {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => combine_version_constraints_with_and(
+            analyze_version_selector_constraint(left, canonicalized),
+            analyze_version_selector_constraint(right, canonicalized),
+        ),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => combine_version_constraints_with_or(
+            analyze_version_selector_constraint(left, canonicalized),
+            analyze_version_selector_constraint(right, canonicalized),
+        ),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => version_constraint_for_binary_equality(left, right, canonicalized)
+            .or_else(|| version_constraint_for_binary_equality(right, left, canonicalized))
+            .unwrap_or_else(|| version_constraint_for_non_version_expr(expr)),
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            if canonical_filter_column_name(expr) != Some("version_id") {
+                return version_constraint_for_non_version_expr(expr);
+            }
+
+            let mut version_ids = BTreeSet::new();
+            for value_expr in list {
+                let Some(version_id) = selector_expr_text_value(value_expr, canonicalized) else {
+                    return VersionSelectorConstraint::Unknown;
+                };
+                version_ids.insert(version_id);
+            }
+
+            VersionSelectorConstraint::Finite(version_ids)
+        }
+        Expr::Nested(inner) => analyze_version_selector_constraint(inner, canonicalized),
+        _ => version_constraint_for_non_version_expr(expr),
+    }
+}
+
+fn version_constraint_for_binary_equality(
+    column_expr: &Expr,
+    value_expr: &Expr,
+    canonicalized: &CanonicalizedWrite,
+) -> Option<VersionSelectorConstraint> {
+    if canonical_filter_column_name(column_expr) != Some("version_id") {
+        return None;
+    }
+
+    Some(
+        selector_expr_text_value(value_expr, canonicalized)
+            .map(|version_id| VersionSelectorConstraint::Finite(BTreeSet::from([version_id])))
+            .unwrap_or(VersionSelectorConstraint::Unknown),
+    )
+}
+
+fn selector_expr_text_value(expr: &Expr, canonicalized: &CanonicalizedWrite) -> Option<String> {
+    match evaluate_public_write_expr_to_value(
+        expr,
+        &canonicalized.write_command.bound_parameters,
+        &canonicalized.write_command.execution_context,
+    )
+    .ok()?
+    {
+        Value::Text(value) => Some(value),
+        Value::Integer(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn version_constraint_for_non_version_expr(expr: &Expr) -> VersionSelectorConstraint {
+    if expr_references_version_id(expr) {
+        VersionSelectorConstraint::Unknown
+    } else {
+        VersionSelectorConstraint::Unconstrained
+    }
+}
+
+fn expr_references_version_id(expr: &Expr) -> bool {
+    if canonical_filter_column_name(expr) == Some("version_id") {
+        return true;
+    }
+
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            expr_references_version_id(left) || expr_references_version_id(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => expr_references_version_id(expr),
+        Expr::InList { expr, list, .. } => {
+            expr_references_version_id(expr) || list.iter().any(expr_references_version_id)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_references_version_id(expr)
+                || expr_references_version_id(low)
+                || expr_references_version_id(high)
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            expr_references_version_id(expr) || expr_references_version_id(pattern)
+        }
+        _ => false,
+    }
+}
+
+fn combine_version_constraints_with_and(
+    left: VersionSelectorConstraint,
+    right: VersionSelectorConstraint,
+) -> VersionSelectorConstraint {
+    match (left, right) {
+        (VersionSelectorConstraint::Unknown, _) | (_, VersionSelectorConstraint::Unknown) => {
+            VersionSelectorConstraint::Unknown
+        }
+        (VersionSelectorConstraint::Unconstrained, other)
+        | (other, VersionSelectorConstraint::Unconstrained) => other,
+        (
+            VersionSelectorConstraint::Finite(left_ids),
+            VersionSelectorConstraint::Finite(right_ids),
+        ) => VersionSelectorConstraint::Finite(
+            left_ids
+                .intersection(&right_ids)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        ),
+    }
+}
+
+fn combine_version_constraints_with_or(
+    left: VersionSelectorConstraint,
+    right: VersionSelectorConstraint,
+) -> VersionSelectorConstraint {
+    match (left, right) {
+        (VersionSelectorConstraint::Unknown, _) | (_, VersionSelectorConstraint::Unknown) => {
+            VersionSelectorConstraint::Unknown
+        }
+        (VersionSelectorConstraint::Unconstrained, VersionSelectorConstraint::Unconstrained) => {
+            VersionSelectorConstraint::Unconstrained
+        }
+        (VersionSelectorConstraint::Unconstrained, _)
+        | (_, VersionSelectorConstraint::Unconstrained) => VersionSelectorConstraint::Unknown,
+        (
+            VersionSelectorConstraint::Finite(mut left_ids),
+            VersionSelectorConstraint::Finite(right_ids),
+        ) => {
+            left_ids.extend(right_ids);
+            VersionSelectorConstraint::Finite(left_ids)
+        }
+    }
 }
 
 fn forced_write_version_id(canonicalized: &CanonicalizedWrite) -> Option<String> {
@@ -315,6 +622,46 @@ mod tests {
     }
 
     #[test]
+    fn analyzes_finite_scope_for_multi_version_insert_rows() {
+        let planned = analyze_write(&canonicalized_write(
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked) \
+             VALUES \
+             ('entity-tracked', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"tracked\"}', '1', false), \
+             ('entity-untracked', 'lix_key_value', 'lix', 'version-b', 'lix', '{\"key\":\"untracked\"}', '1', true)",
+            "main",
+        ))
+        .expect("write analysis should succeed");
+
+        assert_eq!(
+            planned.scope_proof,
+            ScopeProof::FiniteVersionSet(BTreeSet::from([
+                "version-a".to_string(),
+                "version-b".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn analyzes_finite_scope_for_mixed_active_and_global_insert_rows() {
+        let planned = analyze_write(&canonicalized_write(
+            "INSERT INTO lix_state (entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version, global) \
+             VALUES \
+             ('entity-local', 'lix_key_value', 'lix', 'lix', '{\"key\":\"local\"}', '1', false), \
+             ('entity-global', 'lix_key_value', 'lix', 'lix', '{\"key\":\"global\"}', '1', true)",
+            "version-active",
+        ))
+        .expect("write analysis should succeed");
+
+        assert_eq!(
+            planned.scope_proof,
+            ScopeProof::FiniteVersionSet(BTreeSet::from([
+                "global".to_string(),
+                "version-active".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
     fn analyzes_scope_and_target_from_lix_state_by_version_update_predicate() {
         let planned = analyze_write(&canonicalized_write(
             "UPDATE lix_state_by_version \
@@ -356,7 +703,30 @@ mod tests {
 
         assert_eq!(
             planned.scope_proof,
-            ScopeProof::FiniteVersionSet(BTreeSet::new())
+            ScopeProof::FiniteVersionSet(BTreeSet::from([
+                "version-a".to_string(),
+                "version-b".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn explicit_version_surfaces_union_or_version_predicates() {
+        let planned = analyze_write(&canonicalized_write(
+            "DELETE FROM lix_state_by_version \
+             WHERE schema_key = 'lix_key_value' \
+               AND ((version_id = 'version-a' AND entity_id = 'entity-a') \
+                 OR (version_id = 'version-b' AND entity_id = 'entity-b'))",
+            "main",
+        ))
+        .expect("write analysis should succeed");
+
+        assert_eq!(
+            planned.scope_proof,
+            ScopeProof::FiniteVersionSet(BTreeSet::from([
+                "version-a".to_string(),
+                "version-b".to_string(),
+            ]))
         );
     }
 }

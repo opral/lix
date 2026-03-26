@@ -11,12 +11,12 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use lix_engine::{
-    BootAccount, BootArgs, BootKeyValue, CreateCheckpointResult, CreateVersionOptions,
+    boot, BootAccount, BootArgs, BootKeyValue, CreateCheckpointResult, CreateVersionOptions,
     CreateVersionResult, Engine, ExecuteOptions, ExecuteResult, LiveStateApplyReport,
     LiveStateRebuildDebugMode, LiveStateRebuildPlan, LiveStateRebuildReport,
     LiveStateRebuildRequest, LiveStateRebuildScope, LixBackend, LixError, MergeVersionOptions,
     MergeVersionResult, ObserveEvents, ObserveQuery, RedoOptions, RedoResult, Session,
-    SessionTransaction, UndoOptions, UndoResult, Value, WasmRuntime, boot,
+    SessionTransaction, UndoOptions, UndoResult, Value, WasmRuntime,
 };
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex as TokioMutex;
@@ -90,6 +90,14 @@ impl SimulationEngine {
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.execute_with_options(sql, params, ExecuteOptions::default())
             .await
+    }
+
+    pub async fn active_version_id(&self) -> Result<String, LixError> {
+        Ok(self.opened_session().await?.active_version_id())
+    }
+
+    pub async fn active_account_ids(&self) -> Result<Vec<String>, LixError> {
+        Ok(self.opened_session().await?.active_account_ids())
     }
 
     pub async fn execute_with_options(

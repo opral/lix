@@ -84,21 +84,6 @@ async fn read_sequence_value(engine: &support::simulation_test::SimulationEngine
         .expect("sequence value must be integer")
 }
 
-async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
-    let rows = engine
-        .execute(
-            "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-            &[],
-        )
-        .await
-        .unwrap();
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    match &rows.statements[0].rows[0][0] {
-        Value::Text(value) => value.clone(),
-        other => panic!("expected active version id text, got {other:?}"),
-    }
-}
-
 async fn register_state_history_test_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
@@ -112,13 +97,14 @@ async fn register_state_history_test_schema(engine: &support::simulation_test::S
 }
 
 async fn active_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
+    let version_id = engine.active_version_id().await.unwrap();
     let result = engine
         .execute(
-            "SELECT v.commit_id \
-             FROM lix_active_version av \
-             JOIN lix_version v ON v.id = av.version_id \
+            "SELECT commit_id \
+             FROM lix_version \
+             WHERE id = $1 \
              LIMIT 1",
-            &[],
+            &[Value::Text(version_id)],
         )
         .await
         .unwrap();
@@ -209,7 +195,8 @@ fn update_key_value_state_row_sql(entity_id: &str, value_json: &str) -> String {
          SET snapshot_content = '{{\"key\":\"{entity_id}\",\"value\":{value_json}}}' \
          WHERE entity_id = '{entity_id}' \
            AND schema_key = 'lix_key_value' \
-           AND file_id = 'lix'"
+           AND file_id = 'lix' \
+           AND version_id = lix_active_version_id()"
     )
 }
 
@@ -218,7 +205,8 @@ fn delete_key_value_state_row_sql(entity_id: &str) -> String {
         "DELETE FROM lix_state_by_version \
          WHERE entity_id = '{entity_id}' \
            AND schema_key = 'lix_key_value' \
-           AND file_id = 'lix'"
+           AND file_id = 'lix' \
+           AND version_id = lix_active_version_id()"
     )
 }
 
@@ -284,7 +272,7 @@ simulation_test!(
                         "INSERT INTO lix_state_by_version (\
                          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                          ) VALUES (\
-                         'entity-1', 'tx_validation_schema', 'file-1', 'version-1', 'lix', '{\"missing\":\"field\"}', '1'\
+                         'entity-1', 'tx_validation_schema', 'file-1', lix_active_version_id(), 'lix', '{\"missing\":\"field\"}', '1'\
                          )",
                         &[],
                     )
@@ -435,7 +423,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let active_version_id = active_version_id(&engine).await;
+        let active_version_id = engine.active_version_id().await.unwrap();
         let active_version_id_for_tx = active_version_id.clone();
         engine
             .transaction(ExecuteOptions::default(), |tx| {
@@ -484,7 +472,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let active_version_id = active_version_id(&engine).await;
+        let active_version_id = engine.active_version_id().await.unwrap();
         engine
             .execute(&insert_tx_dynamic_schema_sql(), &[])
             .await
@@ -516,7 +504,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let active_version_id = active_version_id(&engine).await;
+        let active_version_id = engine.active_version_id().await.unwrap();
         engine
             .execute(&insert_tx_dynamic_schema_sql(), &[])
             .await
@@ -554,7 +542,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let active_version_id = active_version_id(&engine).await;
+        let active_version_id = engine.active_version_id().await.unwrap();
         engine
             .execute(&insert_tx_dynamic_schema_sql(), &[])
             .await
@@ -759,10 +747,9 @@ simulation_test!(
                 Box::pin(async move {
                     let before = tx
                         .execute(
-                            "SELECT v.commit_id \
-                             FROM lix_active_version av \
-                             JOIN lix_version v ON v.id = av.version_id \
-                             ORDER BY av.id \
+                            "SELECT commit_id \
+                             FROM lix_version \
+                             WHERE id = lix_active_version_id() \
                              LIMIT 1",
                             &[],
                         )
@@ -778,10 +765,9 @@ simulation_test!(
                         .execute(
                             "UPDATE lix_file SET data = lix_text_encode('after') \
                              WHERE id = 'tx-commit-barrier'; \
-                             SELECT v.commit_id \
-                             FROM lix_active_version av \
-                             JOIN lix_version v ON v.id = av.version_id \
-                             ORDER BY av.id \
+                             SELECT commit_id \
+                             FROM lix_version \
+                             WHERE id = lix_active_version_id() \
                              LIMIT 1",
                             &[],
                         )
@@ -856,7 +842,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let before_commit_count = public_commit_count(&engine).await;
 
         engine
@@ -934,7 +920,7 @@ simulation_test!(
             .unwrap();
 
         let root_commit_id = active_commit_id(&engine).await;
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let before_commit_count = public_commit_count(&engine).await;
 
         engine
@@ -1016,7 +1002,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         engine
             .execute(
                 &insert_key_value_state_row_sql("tx-update-a", &version_id, "\"before-a\""),
@@ -1085,7 +1071,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         engine
             .execute(
                 &insert_key_value_state_row_sql("tx-ud-a", &version_id, "\"before-a\""),

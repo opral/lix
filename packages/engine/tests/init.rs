@@ -38,24 +38,6 @@ fn assert_uuid_v7_like(value: &str, field: &str) {
     );
 }
 
-async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
-    let result = engine
-        .execute(
-            "SELECT version_id \
-             FROM lix_active_version \
-             ORDER BY id \
-             LIMIT 1",
-            &[],
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.statements[0].rows.len(), 1);
-    text_value(
-        &result.statements[0].rows[0][0],
-        "lix_active_version.version_id",
-    )
-}
-
 async fn global_version_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let result = engine
         .execute(
@@ -306,11 +288,12 @@ fn init_reopen_preserves_working_changes_sqlite() {
 
                     let tip_result = session_b
                         .execute(
-                            "SELECT v.commit_id \
-                             FROM lix_active_version av \
-                             JOIN lix_version v ON v.id = av.version_id \
-                             ORDER BY av.id \
-                             LIMIT 1", &[])
+                            "SELECT commit_id \
+                             FROM lix_version \
+                             WHERE id = lix_active_version_id() \
+                             LIMIT 1",
+                            &[],
+                        )
                         .await
                         .expect("tip query should succeed");
                     let [tip_result] = tip_result.statements.as_slice() else {
@@ -841,7 +824,7 @@ simulation_test!(
 
         engine.initialize().await.unwrap();
 
-        let main_version_id = active_version_id(&engine).await;
+        let main_version_id = engine.active_version_id().await.unwrap();
         assert_ne!(main_version_id, "global");
 
         let main_version = engine
