@@ -6,8 +6,10 @@ use crate::filesystem::history::{
     DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
     FileHistoryRootScope, FileHistoryRow, FileHistoryVersionScope,
 };
-use crate::live_state::{builtin_live_table_layout, load_live_table_layout_with_backend, register_schema, LiveTableLayout};
-use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::live_state::{
+    builtin_live_table_layout, load_live_table_layout_with_backend, register_schema,
+    LiveTableLayout,
+};
 use crate::sql::public::catalog::SurfaceBinding;
 use crate::sql::public::planner::backend::lowerer::{
     lower_read_for_execution_with_layouts,
@@ -15,6 +17,7 @@ use crate::sql::public::planner::backend::lowerer::{
     LoweredReadProgram, LoweredResultColumn, LoweredResultColumns,
 };
 use crate::sql::public::planner::canonicalize::canonicalize_read;
+use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::state::history::{
     load_state_history_rows, StateHistoryContentMode, StateHistoryLineageScope,
     StateHistoryRequest, StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
@@ -1161,7 +1164,9 @@ fn required_schema_keys_from_dependency_spec(
         .map(|spec| {
             spec.schema_keys
                 .iter()
-                .filter(|schema_key| schema_key.as_str() != "lix_active_version")
+                .filter(|schema_key| {
+                    !(schema_key.as_str() == "lix_active_version" && spec.depends_on_active_version)
+                })
                 .cloned()
                 .collect()
         })
@@ -1225,9 +1230,7 @@ async fn load_known_live_layouts_for_public_read(
             .as_ref()
         {
             if !layouts.contains_key(schema_key) {
-                if let Some(layout) =
-                    builtin_live_table_layout(schema_key)?
-                {
+                if let Some(layout) = builtin_live_table_layout(schema_key)? {
                     layouts.insert(schema_key.clone(), layout);
                 } else {
                     let layout = load_live_table_layout_with_backend(backend, schema_key).await?;
@@ -1239,8 +1242,7 @@ async fn load_known_live_layouts_for_public_read(
             if layouts.contains_key(schema_key) {
                 continue;
             }
-            if let Some(layout) = builtin_live_table_layout(schema_key)?
-            {
+            if let Some(layout) = builtin_live_table_layout(schema_key)? {
                 layouts.insert(schema_key.clone(), layout);
                 continue;
             }

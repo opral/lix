@@ -721,7 +721,7 @@ fn live_value_from_expr(
                 params.get(index).cloned()
             }
             _ => sql_value_as_engine_value(value),
-        }
+        },
         _ => None,
     }
 }
@@ -733,9 +733,9 @@ fn sql_value_as_engine_value(value: &sqlparser::ast::ValueWithSpan) -> Option<Va
         SqlValue::SingleQuotedString(text)
         | SqlValue::TripleSingleQuotedString(text)
         | SqlValue::EscapedStringLiteral(text)
-        | SqlValue::DollarQuotedString(sqlparser::ast::DollarQuotedString { value: text, .. }) => {
-            Some(Value::Text(text.clone()))
-        }
+        | SqlValue::DollarQuotedString(sqlparser::ast::DollarQuotedString {
+            value: text, ..
+        }) => Some(Value::Text(text.clone())),
         SqlValue::Number(value, _) => value
             .parse::<i64>()
             .map(Value::Integer)
@@ -902,12 +902,7 @@ fn live_row_value(row: &OverlayVisibleLiveRow, column: &str) -> Option<Value> {
         "file_id" => Some(Value::Text(row.file_id.clone())),
         "version_id" => Some(Value::Text(row.version_id.clone())),
         "plugin_key" => Some(Value::Text(row.plugin_key.clone())),
-        "metadata" => Some(
-            row.metadata
-                .clone()
-                .map(Value::Text)
-                .unwrap_or(Value::Null),
-        ),
+        "metadata" => Some(row.metadata.clone().map(Value::Text).unwrap_or(Value::Null)),
         "change_id" => Some(
             row.change_id
                 .clone()

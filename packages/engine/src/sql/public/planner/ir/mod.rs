@@ -1,6 +1,4 @@
-use crate::filesystem::runtime::{
-    merge_filesystem_transaction_state, FilesystemTransactionState,
-};
+use crate::filesystem::runtime::{merge_filesystem_transaction_state, FilesystemTransactionState};
 use crate::sql::public::catalog::{
     DefaultScopeSemantics, SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceVariant,
 };

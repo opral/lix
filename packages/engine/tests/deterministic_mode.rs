@@ -227,10 +227,7 @@ simulation_test!(
             .unwrap();
 
         engine
-            .execute(
-                "INSERT INTO test_schema (key) VALUES ('tracked')",
-                &[],
-            )
+            .execute("INSERT INTO test_schema (key) VALUES ('tracked')", &[])
             .await
             .unwrap();
 

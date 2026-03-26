@@ -524,11 +524,7 @@ fn schema_property_is_nullable(schema: &JsonValue) -> bool {
         }
         _ => {}
     }
-    if schema
-        .get("const")
-        .map(JsonValue::is_null)
-        .unwrap_or(false)
-    {
+    if schema.get("const").map(JsonValue::is_null).unwrap_or(false) {
         return true;
     }
     ["anyOf", "oneOf"]
@@ -697,7 +693,10 @@ const REGISTERED_SCHEMA_BOOTSTRAP_LAYOUT_SQL: &str = "SELECT snapshot_content \
 
 #[cfg(test)]
 mod tests {
-    use super::{builtin_live_table_layout, logical_live_snapshot_from_row_with_layout, live_table_layout_from_schema};
+    use super::{
+        builtin_live_table_layout, live_table_layout_from_schema,
+        logical_live_snapshot_from_row_with_layout,
+    };
     use crate::Value;
     use serde_json::json;
 
@@ -733,15 +732,10 @@ mod tests {
         }))
         .expect("layout should compile");
         let row = vec![Value::Text("row-1".to_string()), Value::Null];
-        let snapshot = logical_live_snapshot_from_row_with_layout(
-            Some(&layout),
-            "profile",
-            &row,
-            0,
-            0,
-        )
-        .expect("snapshot should build")
-        .expect("snapshot should exist");
+        let snapshot =
+            logical_live_snapshot_from_row_with_layout(Some(&layout), "profile", &row, 0, 0)
+                .expect("snapshot should build")
+                .expect("snapshot should exist");
         assert_eq!(
             snapshot,
             json!({

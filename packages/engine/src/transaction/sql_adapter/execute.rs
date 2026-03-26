@@ -1,13 +1,13 @@
 use async_trait::async_trait;
 use sqlparser::ast::Statement;
 
+use crate::canonical::pending_session::PendingPublicCommitSession;
 use crate::engine::{DeferredTransactionSideEffects, Engine};
 use crate::sql::execution::execution_program::{
     execute_execution_program_with_borrowed_write_transaction,
     execute_execution_program_with_write_transaction, BoundStatementTemplateInstance,
     ExecutionContext, ExecutionProgram,
 };
-use crate::canonical::pending_session::PendingPublicCommitSession;
 use crate::transaction::PendingTransactionView;
 use crate::{ExecuteOptions, ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -423,5 +423,4 @@ impl BufferedWriteAdapter for SqlBufferedWriteAdapter {
             }
         }
     }
-
 }

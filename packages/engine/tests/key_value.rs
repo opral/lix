@@ -15,92 +15,95 @@ fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     )
 }
 
-simulation_test!(key_value_crud_is_handled_through_state_surface, |sim| async move {
-    let engine = sim
-        .boot_simulated_engine(None)
-        .await
-        .expect("boot_simulated_engine should succeed");
+simulation_test!(
+    key_value_crud_is_handled_through_state_surface,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
 
-    engine.initialize().await.unwrap();
+        engine.initialize().await.unwrap();
 
-    engine
-        .execute(&insert_key_value_sql("key0", "\"value0\""), &[])
-        .await
-        .unwrap();
+        engine
+            .execute(&insert_key_value_sql("key0", "\"value0\""), &[])
+            .await
+            .unwrap();
 
-    let after_insert = engine
-        .execute(
-            "SELECT snapshot_content, untracked \
+        let after_insert = engine
+            .execute(
+                "SELECT snapshot_content, untracked \
              FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' AND entity_id = 'key0'",
-            &[],
-        )
-        .await
-        .unwrap();
+                &[],
+            )
+            .await
+            .unwrap();
 
-    sim.assert_deterministic(vec![vec![after_insert.statements[0].rows[0][0].clone()]]);
-    assert_eq!(after_insert.statements[0].rows.len(), 1);
-    assert_eq!(
-        after_insert.statements[0].rows[0][0],
-        Value::Text("{\"key\":\"key0\",\"value\":\"value0\"}".to_string())
-    );
-    match &after_insert.statements[0].rows[0][1] {
-        Value::Boolean(value) => assert!(!value),
-        Value::Integer(value) => assert_eq!(*value, 0),
-        other => panic!("expected false-like untracked marker, got {other:?}"),
-    }
+        sim.assert_deterministic(vec![vec![after_insert.statements[0].rows[0][0].clone()]]);
+        assert_eq!(after_insert.statements[0].rows.len(), 1);
+        assert_eq!(
+            after_insert.statements[0].rows[0][0],
+            Value::Text("{\"key\":\"key0\",\"value\":\"value0\"}".to_string())
+        );
+        match &after_insert.statements[0].rows[0][1] {
+            Value::Boolean(value) => assert!(!value),
+            Value::Integer(value) => assert_eq!(*value, 0),
+            other => panic!("expected false-like untracked marker, got {other:?}"),
+        }
 
-    engine
-        .execute(
-            "UPDATE lix_state_by_version \
+        engine
+            .execute(
+                "UPDATE lix_state_by_version \
              SET snapshot_content = '{\"key\":\"key0\",\"value\":\"value1\"}' \
              WHERE schema_key = 'lix_key_value' AND entity_id = 'key0' AND version_id = 'global'",
-            &[],
-        )
-        .await
-        .unwrap();
+                &[],
+            )
+            .await
+            .unwrap();
 
-    let after_update = engine
-        .execute(
-            "SELECT snapshot_content \
+        let after_update = engine
+            .execute(
+                "SELECT snapshot_content \
              FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' AND entity_id = 'key0'",
-            &[],
-        )
-        .await
-        .unwrap();
+                &[],
+            )
+            .await
+            .unwrap();
 
-    sim.assert_deterministic(after_update.statements[0].rows.clone());
-    assert_eq!(after_update.statements[0].rows.len(), 1);
-    assert_eq!(
-        after_update.statements[0].rows[0][0],
-        Value::Text("{\"key\":\"key0\",\"value\":\"value1\"}".to_string())
-    );
+        sim.assert_deterministic(after_update.statements[0].rows.clone());
+        assert_eq!(after_update.statements[0].rows.len(), 1);
+        assert_eq!(
+            after_update.statements[0].rows[0][0],
+            Value::Text("{\"key\":\"key0\",\"value\":\"value1\"}".to_string())
+        );
 
-    engine
-        .execute(
-            "DELETE FROM lix_state_by_version \
+        engine
+            .execute(
+                "DELETE FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' AND entity_id = 'key0' AND version_id = 'global'",
-            &[],
-        )
-        .await
-        .unwrap();
+                &[],
+            )
+            .await
+            .unwrap();
 
-    let after_delete = engine
-        .execute(
-            "SELECT entity_id \
+        let after_delete = engine
+            .execute(
+                "SELECT entity_id \
              FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' \
                AND entity_id = 'key0' \
                AND snapshot_content IS NOT NULL",
-            &[],
-        )
-        .await
-        .unwrap();
+                &[],
+            )
+            .await
+            .unwrap();
 
-    sim.assert_deterministic(after_delete.statements[0].rows.clone());
-    assert_eq!(after_delete.statements[0].rows.len(), 0);
-});
+        sim.assert_deterministic(after_delete.statements[0].rows.clone());
+        assert_eq!(after_delete.statements[0].rows.len(), 0);
+    }
+);
 
 simulation_test!(
     boot_key_values_default_to_active_version_scope,

@@ -1,14 +1,12 @@
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{
-    Expr, Insert, SetExpr, Statement, Value as SqlValue, VisitMut, VisitorMut,
-};
+use sqlparser::ast::{Expr, Insert, SetExpr, Statement, Value as SqlValue, VisitMut, VisitorMut};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-pub(crate) use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql_support::placeholders::{parse_placeholder_ref, resolve_placeholder_ref};
+pub(crate) use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::{LixError, SqlDialect, Value};
 
 #[derive(Debug, Clone)]
@@ -22,7 +20,6 @@ pub(crate) struct BoundSql {
 pub(crate) struct BoundStatementAst {
     pub(crate) statement: Statement,
     pub(crate) params: Vec<Value>,
-    pub(crate) state: PlaceholderState,
 }
 
 #[derive(Debug, Clone)]
@@ -94,39 +91,6 @@ pub(crate) fn bind_sql_with_state_and_appended_params(
     })
 }
 
-pub(crate) fn bind_statement_ast(
-    statement: &Statement,
-    params: &[Value],
-    dialect: SqlDialect,
-) -> Result<BoundSql, LixError> {
-    bind_statement_ast_with_state(statement, params, dialect, PlaceholderState::new())
-}
-
-pub(crate) fn bind_statement_ast_with_state(
-    statement: &Statement,
-    params: &[Value],
-    dialect: SqlDialect,
-    state: PlaceholderState,
-) -> Result<BoundSql, LixError> {
-    let bound = bind_statement_ast_for_execution_with_state(statement, params, dialect, state)?;
-    Ok(BoundSql {
-        sql: bound.statement.to_string(),
-        params: bound.params,
-        state: bound.state,
-    })
-}
-
-pub(crate) fn bind_statement_ast_for_execution_with_state(
-    statement: &Statement,
-    params: &[Value],
-    dialect: SqlDialect,
-    state: PlaceholderState,
-) -> Result<BoundStatementAst, LixError> {
-    let template =
-        compile_statement_binding_template_with_state(statement, params.len(), dialect, state)?;
-    bind_statement_binding_template(&template, params)
-}
-
 pub(crate) fn compile_statement_binding_template_with_state(
     statement: &Statement,
     params_len: usize,
@@ -184,7 +148,6 @@ pub(crate) fn bind_statement_binding_template(
             .iter()
             .map(|source_index| params[*source_index].clone())
             .collect(),
-        state: template.state.clone(),
     })
 }
 

@@ -1,10 +1,10 @@
 use crate::sql::common::dependency_spec::{DependencyPrecision, DependencySpec};
-use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::public::catalog::{SurfaceBinding, SurfaceFamily};
 use crate::sql::public::planner::ir::{
     CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan,
     CanonicalWorkingChangesScan, FilesystemKind, ReadPlan, StructuredPublicRead, VersionScope,
 };
+use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
 use sqlparser::ast::{
     BinaryOperator, Expr, OrderByKind, SelectItem, UnaryOperator, Value as SqlValue, Visit, Visitor,

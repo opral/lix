@@ -51,7 +51,7 @@ fn shared_path_no_longer_owns_canonical_session_helpers() {
 #[test]
 fn tracked_append_callers_use_canonical_append_entrypoint() {
     for relative in [
-        "transaction/sql_adapter/planned_write_runner.rs",
+        "transaction/sql_adapter/tracked_apply.rs",
         "version/merge_version.rs",
         "undo_redo/undo.rs",
         "undo_redo/redo.rs",
@@ -94,8 +94,12 @@ fn canonical_readers_and_graph_surfaces_exist_and_are_used() {
         "canonical/mod.rs should expose canonical::pending_session"
     );
     assert!(
-        canonical_mod.contains("pub(crate) mod runtime;"),
-        "canonical/mod.rs should expose canonical::runtime"
+        canonical_mod.contains("pub(crate) mod apply;"),
+        "canonical/mod.rs should expose canonical::apply"
+    );
+    assert!(
+        canonical_mod.contains("mod change_log;"),
+        "canonical/mod.rs should compile canonical::change_log"
     );
     assert!(
         canonical_mod.contains("pub(crate) mod graph;"),
@@ -148,8 +152,9 @@ fn canonical_readers_and_graph_surfaces_exist_and_are_used() {
 fn canonical_core_no_longer_imports_sql_modules_directly() {
     for relative in [
         "canonical/create_commit.rs",
+        "canonical/change_log.rs",
+        "canonical/apply.rs",
         "canonical/pending_session.rs",
-        "canonical/runtime.rs",
         "canonical/graph_index.rs",
     ] {
         let source = read_engine_source(relative);
@@ -188,19 +193,20 @@ fn sql_public_runtime_stays_on_sql_owned_write_intent() {
 #[test]
 fn transaction_adapter_uses_applied_output_not_synthetic_generate_commit_result() {
     let runner_source = read_engine_source("transaction/sql_adapter/planned_write_runner.rs");
+    let tracked_source = read_engine_source("transaction/sql_adapter/tracked_apply.rs");
     assert!(
         !runner_source.contains("GenerateCommitResult {"),
         "planned_write_runner should not rebuild synthetic GenerateCommitResult values"
     );
     assert!(
-        runner_source.contains(
+        tracked_source.contains(
             "mirror_public_registered_schema_bootstrap_rows(transaction, applied_output)"
         ),
-        "planned_write_runner should mirror bootstrap rows from the canonical applied_output"
+        "tracked_apply.rs should mirror bootstrap rows from the canonical applied_output"
     );
     assert!(
-        runner_source.contains("append_tracked_with_pending_public_session("),
-        "planned_write_runner should delegate pending-session append protocol through canonical::append"
+        tracked_source.contains("append_tracked_with_pending_public_session("),
+        "tracked_apply.rs should delegate pending-session append protocol through canonical::append"
     );
 }
 

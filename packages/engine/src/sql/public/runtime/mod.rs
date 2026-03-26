@@ -1,8 +1,13 @@
+use crate::change_view::TrackedDomainChangeView;
 use crate::errors::schema_not_registered_error;
 use crate::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
 };
 use crate::filesystem::history::{DirectoryHistoryRequest, FileHistoryRequest};
+use crate::filesystem::runtime::{
+    binary_blob_writes_from_filesystem_state, delete_targets_from_filesystem_state,
+    FilesystemTransactionState,
+};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::live_state::{
     builtin_live_table_layout, live_column_name_for_property, live_table_layout_from_schema,
@@ -15,11 +20,6 @@ use crate::sql::common::dependency_spec::DependencySpec;
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::sql::execution::intent::authoritative_binary_blob_write_targets;
-use crate::filesystem::runtime::{
-    binary_blob_writes_from_filesystem_state, delete_targets_from_filesystem_state,
-    FilesystemTransactionState,
-};
-use crate::transaction::PendingTransactionView;
 use crate::sql::public::backend::PushdownDecision;
 use crate::sql::public::catalog::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
@@ -45,17 +45,15 @@ use crate::sql::public::planner::semantics::effective_state_resolver::{
     build_effective_state, EffectiveStatePlan, EffectiveStateRequest,
 };
 use crate::sql::public::planner::semantics::write_analysis::analyze_write;
-use crate::sql::public::planner::semantics::write_resolver::{
-    resolve_write_plan_with_functions,
-};
+use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan_with_functions;
 use crate::sql::public::services::state_reader::load_committed_version_head_commit_id;
-use crate::change_view::TrackedDomainChangeView;
 use crate::state::history::ensure_state_history_timeline_materialized_for_root;
 use crate::state::history::StateHistoryRequest;
 use crate::state::stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamOperation,
 };
+use crate::transaction::PendingTransactionView;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot, GLOBAL_VERSION_ID,
@@ -606,7 +604,9 @@ pub(crate) async fn prepare_public_execution_with_registry_and_internal_access_a
     .await
 }
 
-pub(crate) async fn prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions<P>(
+pub(crate) async fn prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions<
+    P,
+>(
     backend: &dyn LixBackend,
     registry: &SurfaceRegistry,
     parsed_statements: &[Statement],
@@ -1780,6 +1780,10 @@ fn dependency_spec_has_unknown_schema_keys(
         .any(|schema_key| !registered.contains(schema_key))
 }
 
+fn counts_as_explicit_state_schema_key(dependency_spec: &DependencySpec, schema_key: &str) -> bool {
+    !(schema_key == "lix_active_version" && dependency_spec.depends_on_active_version)
+}
+
 fn unknown_public_state_schema_error(
     registry: &SurfaceRegistry,
     dependency_spec: Option<&DependencySpec>,
@@ -1788,7 +1792,7 @@ fn unknown_public_state_schema_error(
         return None;
     }
     let dependency_spec = dependency_spec?;
-    let registered = registry.registered_state_backed_schema_keys();
+    let registered = registry.registered_state_surface_schema_keys();
     let available_refs = registered.iter().map(String::as_str).collect::<Vec<_>>();
     let unknown = dependency_spec.schema_keys.iter().find(|schema_key| {
         !registered
@@ -1806,15 +1810,14 @@ fn augment_dependency_spec_for_public_read(
     let dependency_spec = dependency_spec?;
     augment_dependency_spec_for_broad_public_read(registry, Some(dependency_spec)).map(
         |mut dependency_spec| {
-            let has_state_schema_keys = dependency_spec
-                .schema_keys
-                .iter()
-                .any(|schema_key| schema_key != "lix_active_version");
+            let has_state_schema_keys = dependency_spec.schema_keys.iter().any(|schema_key| {
+                counts_as_explicit_state_schema_key(&dependency_spec, schema_key)
+            });
             if structured_read.surface_binding.descriptor.surface_family == SurfaceFamily::State
                 && !has_state_schema_keys
             {
                 dependency_spec.schema_keys = registry
-                    .registered_state_backed_schema_keys()
+                    .registered_state_surface_schema_keys()
                     .into_iter()
                     .collect();
             }
@@ -1841,11 +1844,11 @@ fn augment_dependency_spec_for_broad_public_read(
     let has_state_schema_keys = dependency_spec
         .schema_keys
         .iter()
-        .any(|schema_key| schema_key != "lix_active_version");
+        .any(|schema_key| counts_as_explicit_state_schema_key(&dependency_spec, schema_key));
     if references_state_like_surface && !has_state_schema_keys {
         dependency_spec
             .schema_keys
-            .extend(registry.registered_state_backed_schema_keys());
+            .extend(registry.registered_state_surface_schema_keys());
     }
     Some(dependency_spec)
 }
@@ -2052,12 +2055,12 @@ where
     )
     .await
     {
-            Ok(resolved_write_plan) => resolved_write_plan,
-            Err(error) => match public_authoritative_write_error(&canonicalized, error.message) {
-                Some(error) => return Err(error),
-                None => return Ok(None),
-            },
-        };
+        Ok(resolved_write_plan) => resolved_write_plan,
+        Err(error) => match public_authoritative_write_error(&canonicalized, error.message) {
+            Some(error) => return Err(error),
+            None => return Ok(None),
+        },
+    };
     planned_write.resolved_write_plan = Some(resolved_write_plan.clone());
     let domain_change_batches = match build_domain_change_batch(&planned_write) {
         Ok(domain_change_batches) => domain_change_batches,

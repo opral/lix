@@ -248,9 +248,10 @@ pub(crate) async fn execute_internal_execution_with_transaction(
     writer_key: Option<&str>,
 ) -> Result<SqlExecutionOutcome, ExecutorError> {
     let _ = (functions, writer_key, internal.should_refresh_file_cache);
-    let internal_result = execute_prepared_with_transaction(transaction, &internal.prepared_statements)
-        .await
-        .map_err(ExecutorError::execute)?;
+    let internal_result =
+        execute_prepared_with_transaction(transaction, &internal.prepared_statements)
+            .await
+            .map_err(ExecutorError::execute)?;
     let public_result = public_result_from_contract(result_contract, &internal_result);
 
     Ok(SqlExecutionOutcome {

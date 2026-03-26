@@ -25,11 +25,15 @@ pub(crate) fn parse_placeholder_ref(token: &str) -> Result<PlaceholderRef, LixEr
     }
 
     if let Some(numeric) = trimmed.strip_prefix('?') {
-        return Ok(PlaceholderRef::Explicit(parse_1_based_index(trimmed, numeric)?));
+        return Ok(PlaceholderRef::Explicit(parse_1_based_index(
+            trimmed, numeric,
+        )?));
     }
 
     if let Some(numeric) = trimmed.strip_prefix('$') {
-        return Ok(PlaceholderRef::Explicit(parse_1_based_index(trimmed, numeric)?));
+        return Ok(PlaceholderRef::Explicit(parse_1_based_index(
+            trimmed, numeric,
+        )?));
     }
 
     Err(LixError {
@@ -103,8 +107,14 @@ mod tests {
     #[test]
     fn parses_placeholder_kinds() {
         assert_eq!(parse_placeholder_ref("?").unwrap(), PlaceholderRef::Next);
-        assert_eq!(parse_placeholder_ref(" ?3 ").unwrap(), PlaceholderRef::Explicit(3));
-        assert_eq!(parse_placeholder_ref("$2").unwrap(), PlaceholderRef::Explicit(2));
+        assert_eq!(
+            parse_placeholder_ref(" ?3 ").unwrap(),
+            PlaceholderRef::Explicit(3)
+        );
+        assert_eq!(
+            parse_placeholder_ref("$2").unwrap(),
+            PlaceholderRef::Explicit(2)
+        );
     }
 
     #[test]

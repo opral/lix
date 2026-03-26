@@ -8,8 +8,8 @@ use sqlparser::ast::{
 use sqlparser::ast::{Visit, Visitor};
 
 use crate::live_state::is_untracked_live_table;
-use crate::sql_support::binding::{bind_sql_with_state, parse_sql_statements, PlaceholderState};
 use crate::sql::execution::contracts::dependency_spec::{DependencyPrecision, DependencySpec};
+use crate::sql_support::binding::{bind_sql_with_state, parse_sql_statements, PlaceholderState};
 use crate::state::stream::StateCommitStreamFilter;
 use crate::{LixError, SqlDialect, Value};
 
@@ -93,9 +93,7 @@ fn finalize_dependency_spec(mut spec: DependencySpec) -> DependencySpec {
                 uses_dynamic_state_relations = true;
                 depends_on_active_version = true;
             }
-            "lix_state_by_version"
-            | "lix_state_history"
-            | "lix_state_history_by_version" => {
+            "lix_state_by_version" | "lix_state_history" | "lix_state_history_by_version" => {
                 uses_dynamic_state_relations = true;
             }
             "lix_working_changes" => {

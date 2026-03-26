@@ -1,17 +1,15 @@
 use crate::engine::{DeferredTransactionSideEffects, Engine, TransactionBackendAdapter};
-use crate::sql::execution::execution_program::ExecutionContext;
 use crate::filesystem::runtime::merge_filesystem_transaction_state;
-use crate::sql::execution::shared_path::{
-    self, prepared_execution_mutates_public_surface_registry,
-};
-use crate::sql::public::services::pending_reads::{
-    bootstrap_public_surface_registry_with_pending_transaction_view,
-    prepared_public_read_transaction_mode, PreparedPublicReadTransactionMode,
-};
+use crate::sql::execution::execution_program::ExecutionContext;
+use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::sql::public::runtime::{
     apply_public_surface_registry_mutations, public_surface_registry_mutations,
     PublicWriteExecutionPartition,
+};
+use crate::sql::public::services::pending_reads::{
+    bootstrap_public_surface_registry_with_pending_transaction_view,
+    prepared_public_read_transaction_mode, PreparedPublicReadTransactionMode,
 };
 use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError};
@@ -76,8 +74,11 @@ pub(super) async fn refresh_public_surface_registry_from_pending_transaction_vie
 ) -> Result<(), LixError> {
     let backend = TransactionBackendAdapter::new(transaction);
     context.public_surface_registry =
-        bootstrap_public_surface_registry_with_pending_transaction_view(&backend, pending_transaction_view)
-            .await?;
+        bootstrap_public_surface_registry_with_pending_transaction_view(
+            &backend,
+            pending_transaction_view,
+        )
+        .await?;
     context.bump_public_surface_registry_generation();
     Ok(())
 }
@@ -189,8 +190,8 @@ pub(super) async fn complete_sql_command_execution(
 
     let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
     state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());
-    commit_outcome.invalidate_deterministic_settings_cache =
-        engine.should_invalidate_deterministic_settings_cache(
+    commit_outcome.invalidate_deterministic_settings_cache = engine
+        .should_invalidate_deterministic_settings_cache(
             command
                 .compiled
                 .execution()
@@ -215,9 +216,7 @@ pub(super) async fn complete_sql_command_execution(
         );
     } else {
         let filesystem_payload_changes_already_committed =
-            shared_path::public_write_filesystem_payload_changes_already_committed(
-                command.compiled.execution(),
-            );
+            public_write_filesystem_payload_changes_already_committed(command.compiled.execution());
         let binary_blob_writes =
             crate::filesystem::runtime::binary_blob_writes_from_filesystem_state(
                 &command.compiled.execution().intent.filesystem_state,
@@ -314,6 +313,27 @@ pub(super) async fn complete_sql_command_execution(
         public_result: execution.public_result,
         clear_pending_public_commit_session,
         commit_outcome,
+    })
+}
+
+fn public_write_filesystem_payload_changes_already_committed(prepared: &CompiledExecution) -> bool {
+    let Some(public_write) = prepared.public_write() else {
+        return false;
+    };
+    matches!(
+        public_write
+            .planned_write
+            .command
+            .target
+            .descriptor
+            .public_name
+            .as_str(),
+        "lix_file" | "lix_file_by_version"
+    ) && public_write.materialization().is_some_and(|execution| {
+        execution
+            .partitions
+            .iter()
+            .any(|partition| matches!(partition, PublicWriteExecutionPartition::Tracked(_)))
     })
 }
 

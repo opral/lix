@@ -639,8 +639,8 @@ fn map_mutation_operation(operation: &MutationOperation) -> StateCommitStreamOpe
 #[cfg(test)]
 mod tests {
     use super::{
-        state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
-        StateCommitStreamOperation,
+        state_commit_stream_changes_from_domain_changes,
+        state_commit_stream_changes_from_planned_rows, StateCommitStreamOperation,
     };
     use crate::canonical::ProposedDomainChange;
     use crate::sql::public::planner::ir::PlannedStateRow;

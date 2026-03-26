@@ -20,9 +20,9 @@ pub mod system;
 pub mod tracked;
 pub mod untracked;
 
+use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 use serde_json::Value as JsonValue;
-use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
 
 pub use lifecycle::{CanonicalWatermark, LiveStateMode, LiveStateReadiness};
 pub use materialize::{
@@ -230,8 +230,8 @@ pub(crate) use materialize::{
 };
 #[allow(unused_imports)]
 pub(crate) use storage::{
-    builtin_live_table_layout, compile_registered_live_layout, is_untracked_live_table,
-    ensure_schema_live_table_with_requirement_in_transaction,
+    builtin_live_table_layout, compile_registered_live_layout,
+    ensure_schema_live_table_with_requirement_in_transaction, is_untracked_live_table,
     json_value_from_live_row_cell, live_column_name_for_property, live_schema_key_for_table_name,
     live_table_layout_from_schema, load_live_row_access_for_table_name,
     load_live_row_access_with_backend, load_live_row_access_with_executor,

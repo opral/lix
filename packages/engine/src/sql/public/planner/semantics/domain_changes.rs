@@ -1,8 +1,8 @@
+use crate::change_view::TrackedDomainChangeView;
 use crate::sql::public::planner::ir::{
     CommitPreconditions, ExpectedHead, IdempotencyKey, MutationPayload, PlannedStateRow,
     PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode,
 };
-use crate::change_view::TrackedDomainChangeView;
 use crate::{LixBackend, LixError};
 use serde_json::{json, Map, Value as JsonValue};
 
@@ -152,7 +152,11 @@ fn build_domain_change_batch_for_partition(
             .unwrap_or_else(|| "active".to_string());
         let writer_key = resolved_row_writer_key(
             row,
-            planned_write.command.execution_context.writer_key.as_deref(),
+            planned_write
+                .command
+                .execution_context
+                .writer_key
+                .as_deref(),
         );
         let operation_key = if row.tombstone {
             "state.delete"
@@ -180,7 +184,9 @@ fn build_domain_change_batch_for_partition(
                 .transpose()?
                 .map(|value| value.into_inner()),
             file_id: text_value(&row.values, "file_id")
-                .map(|value| require_identity::<crate::FileId>(value, "public domain-change file_id"))
+                .map(|value| {
+                    require_identity::<crate::FileId>(value, "public domain-change file_id")
+                })
                 .transpose()?
                 .map(|value| value.into_inner()),
             plugin_key: text_value(&row.values, "plugin_key")
@@ -607,5 +613,4 @@ mod tests {
             "idempotency key should stay tip-independent for large payloads"
         );
     }
-
 }

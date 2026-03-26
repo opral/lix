@@ -1,8 +1,8 @@
 use crate::backend::SqlDialect;
+use crate::canonical::graph::build_reachable_commits_for_root_cte_sql;
 use crate::live_state::{
     builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
 };
-use crate::canonical::graph::build_reachable_commits_for_root_cte_sql;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, QueryResult, Value};
 

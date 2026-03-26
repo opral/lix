@@ -67,7 +67,9 @@ impl BufferedWriteState {
         &mut self,
         changes: Vec<crate::state::stream::StateCommitStreamChange>,
     ) {
-        self.commit_outcome.state_commit_stream_changes.extend(changes);
+        self.commit_outcome
+            .state_commit_stream_changes
+            .extend(changes);
     }
 
     pub(crate) async fn flush(
@@ -79,7 +81,8 @@ impl BufferedWriteState {
         let Some(delta) = self.journal.take_staged_delta() else {
             return Ok(());
         };
-        apply_schema_registrations_in_transaction(transaction, delta.schema_registrations()).await?;
+        apply_schema_registrations_in_transaction(transaction, delta.schema_registrations())
+            .await?;
         let mut pending_public_commit_session = self.pending_public_commit_session.take();
         let execution = execute_planned_write_delta(
             engine,

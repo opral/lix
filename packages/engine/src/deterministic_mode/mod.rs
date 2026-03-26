@@ -1,5 +1,6 @@
 use serde_json::Value as JsonValue;
 
+use crate::backend::prepared::PreparedBatch;
 use crate::errors::classification::is_missing_relation_error;
 use crate::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
 use crate::key_value::{
@@ -10,7 +11,6 @@ use crate::live_state::{
     builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
     untracked_live_table_name,
 };
-use crate::backend::prepared::PreparedBatch;
 use crate::sql_support::text::escape_sql_string;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 

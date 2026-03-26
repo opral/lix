@@ -245,6 +245,24 @@ impl SurfaceRegistry {
         schema_keys
     }
 
+    pub(crate) fn registered_state_surface_schema_keys(&self) -> Vec<String> {
+        let mut schema_keys = self.registered_state_backed_schema_keys();
+        schema_keys.extend(
+            self.descriptors
+                .values()
+                .filter(|descriptor| {
+                    matches!(
+                        descriptor.public_name.as_str(),
+                        "lix_active_version" | "lix_active_account"
+                    )
+                })
+                .filter_map(|descriptor| descriptor.implicit_overrides.fixed_schema_key.clone()),
+        );
+        schema_keys.sort();
+        schema_keys.dedup();
+        schema_keys
+    }
+
     pub(crate) fn register_dynamic_entity_surfaces(
         &mut self,
         spec: DynamicEntitySurfaceSpec,

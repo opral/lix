@@ -2,10 +2,8 @@ use crate::cel::CelEvaluator;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::sql::common::ast::parse_sql_statements;
 use crate::sql::execution::contracts::planned_statement::PlannedStatementSet;
-use crate::sql::public::runtime::{
-    statement_references_public_surface_with_backend,
-};
 use crate::sql::internal::prepare_statements_with_backend_to_plan;
+use crate::sql::public::runtime::statement_references_public_surface_with_backend;
 use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::Statement;
 

@@ -16,21 +16,23 @@ use crate::filesystem::runtime::{
 };
 use crate::functions::LixFunctionProvider;
 use crate::key_value::key_value_schema_key;
-use crate::live_state::{
-    builtin_live_table_layout, live_column_name_for_property, load_live_table_layout_in_transaction,
-    require_ready_in_transaction, untracked_live_table_name, LiveTableLayout,
-};
 use crate::live_state::shared::snapshot_sql::live_snapshot_select_expr_for_schema;
-use crate::schema::builtin::types::LixVersionRef;
+use crate::live_state::{
+    builtin_live_table_layout, live_column_name_for_property, require_ready_in_transaction,
+    untracked_live_table_name,
+};
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::SqlDialect;
 use crate::{CanonicalSchemaKey, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
 
+use super::apply::apply_derived_live_state_rows_in_transaction;
+use super::change_log::build_prepared_batch_from_canonical_output;
 use super::generate_commit::generate_commit;
-use super::graph_index::resolve_commit_graph_node_write_rows_with_executor;
-use super::runtime::build_prepared_batch_from_commit_apply_input;
+use super::graph_index::{
+    build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
+};
 use super::state_source::{
     load_committed_version_head_commit_id_from_live_state,
     load_exact_committed_state_row_from_live_state_with_executor, load_version_info_for_versions,
@@ -42,7 +44,6 @@ use super::types::{
 };
 
 const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
-const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
@@ -372,7 +373,7 @@ pub(crate) async fn create_commit(
             });
         global_version.parent_commit_ids = current_head.clone().into_iter().collect();
     }
-    let mut generated_commit = generate_commit(
+    let generated_commit = generate_commit(
         GenerateCommitArgs {
             timestamp: timestamp.clone(),
             active_accounts: preflight.active_accounts,
@@ -389,12 +390,6 @@ pub(crate) async fn create_commit(
         },
         || functions.uuid_v7(),
     )
-    .map_err(backend_error)?;
-    generated_commit.derived_apply_input.live_layouts = load_live_layouts_for_rows_in_transaction(
-        transaction,
-        &generated_commit.derived_apply_input.live_state_rows,
-    )
-    .await
     .map_err(backend_error)?;
     let committed_head = extract_committed_head_id(&generated_commit, &concrete_lane)?;
     let canonical_output = generated_commit.canonical_output;
@@ -430,14 +425,16 @@ pub(crate) async fn create_commit(
         operational_apply_input,
         pending_public_commit_seed,
     };
-    let mut prepared_batch = build_prepared_batch_from_commit_apply_input(
+    let mut prepared_batch = build_prepared_batch_from_canonical_output(
         &applied_output.canonical_output,
-        &applied_output.derived_apply_input,
-        &commit_graph_rows,
         functions,
         transaction.dialect(),
     )
     .map_err(backend_error)?;
+    prepared_batch.extend(
+        build_commit_graph_node_prepared_batch(&commit_graph_rows, transaction.dialect())
+            .map_err(backend_error)?,
+    );
     prepared_batch.append_sql(insert_idempotency_row_sql(
         &applied_output.operational_apply_input.idempotency_write,
     ));
@@ -469,6 +466,9 @@ pub(crate) async fn create_commit(
     execute_write_program_with_transaction(transaction, write_program)
         .await
         .map_err(backend_error)?;
+    apply_derived_live_state_rows_in_transaction(transaction, &applied_output.derived_apply_input)
+        .await
+        .map_err(backend_error)?;
 
     Ok(CreateCommitResult {
         disposition: CreateCommitDisposition::Applied,
@@ -497,8 +497,8 @@ fn build_pending_public_commit_seed(
                 kind: CreateCommitErrorKind::Internal,
                 message: "public commit seed requires commit snapshot_content".to_string(),
             })?;
-    let commit_snapshot: serde_json::Value =
-        serde_json::from_str(commit_snapshot_content).map_err(|error| CreateCommitError {
+    let commit_snapshot: serde_json::Value = serde_json::from_str(commit_snapshot_content)
+        .map_err(|error| CreateCommitError {
             kind: CreateCommitErrorKind::Internal,
             message: format!("public commit seed snapshot is invalid JSON: {error}"),
         })?;
@@ -531,28 +531,6 @@ fn build_pending_public_commit_seed(
         commit_plugin_key: commit_row.plugin_key.to_string(),
         commit_snapshot_content: commit_snapshot_content.to_string(),
     }))
-}
-
-async fn load_live_layouts_for_rows_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    rows: &[crate::canonical::MaterializedStateRow],
-) -> Result<BTreeMap<String, LiveTableLayout>, LixError> {
-    let mut layouts = BTreeMap::new();
-    let schema_keys = rows
-        .iter()
-        .map(|row| row.schema_key.to_string())
-        .collect::<BTreeSet<_>>();
-    for schema_key in schema_keys {
-        if let Some(layout) = builtin_live_table_layout(&schema_key)? {
-            layouts.insert(schema_key, layout);
-            continue;
-        }
-        layouts.insert(
-            schema_key.clone(),
-            load_live_table_layout_in_transaction(transaction, &schema_key).await?,
-        );
-    }
-    Ok(layouts)
 }
 
 fn build_observe_tick_insert_sql(writer_key: Option<&str>) -> String {
@@ -1181,10 +1159,7 @@ async fn load_create_commit_file_descriptors(
         .filter(|file| {
             !file.deleted
                 && file.descriptor.is_none()
-                && !matches!(
-                    file.metadata_patch,
-                    OptionalTextPatch::Unchanged
-                )
+                && !matches!(file.metadata_patch, OptionalTextPatch::Unchanged)
         })
         .map(|file| file.file_id.as_str())
         .collect::<BTreeSet<_>>();
@@ -1438,13 +1413,11 @@ fn extract_committed_head_id(
         ConcreteWriteLane::Version { version_id } => version_id.as_str(),
         ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
     };
-    let pointer_change = commit_result
+    let update = commit_result
         .derived_apply_input
-        .live_state_rows
+        .version_ref_updates
         .iter()
-        .find(|change| {
-            change.schema_key == VERSION_REF_SCHEMA_KEY && change.entity_id == version_id
-        })
+        .find(|update| update.version_id.as_str() == version_id)
         .ok_or_else(|| CreateCommitError {
             kind: CreateCommitErrorKind::Internal,
             message: format!(
@@ -1452,26 +1425,7 @@ fn extract_committed_head_id(
                 version_id
             ),
         })?;
-    let snapshot_content =
-        pointer_change
-            .snapshot_content
-            .as_ref()
-            .ok_or_else(|| CreateCommitError {
-                kind: CreateCommitErrorKind::Internal,
-                message: format!(
-                    "generated version ref for '{}' is missing snapshot_content",
-                    version_id
-                ),
-            })?;
-    let pointer: LixVersionRef =
-        serde_json::from_str(snapshot_content).map_err(|error| CreateCommitError {
-            kind: CreateCommitErrorKind::Internal,
-            message: format!(
-                "generated version ref for '{}' could not be parsed: {error}",
-                version_id
-            ),
-        })?;
-    if pointer.commit_id.is_empty() {
+    if update.commit_id.is_empty() {
         return Err(CreateCommitError {
             kind: CreateCommitErrorKind::Internal,
             message: format!(
@@ -1480,7 +1434,7 @@ fn extract_committed_head_id(
             ),
         });
     }
-    Ok(pointer.commit_id)
+    Ok(update.commit_id.clone())
 }
 
 fn insert_idempotency_row_sql(idempotency: &CommitIdempotencyWrite) -> String {
@@ -1832,10 +1786,7 @@ mod tests {
             })
         }
 
-        async fn execute_batch(
-            &mut self,
-            batch: &PreparedBatch,
-        ) -> Result<QueryResult, LixError> {
+        async fn execute_batch(&mut self, batch: &PreparedBatch) -> Result<QueryResult, LixError> {
             let collapsed = collapse_prepared_batch_for_dialect(batch, self.dialect())?;
             self.execute(&collapsed.sql, &collapsed.params).await
         }

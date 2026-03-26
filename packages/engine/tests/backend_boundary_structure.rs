@@ -67,7 +67,10 @@ fn legacy_backend_substrate_paths_are_removed() {
 #[test]
 fn sql_module_tree_no_longer_owns_backend_substrate() {
     let execution_mod = read_engine_source("sql/execution/mod.rs");
-    for forbidden in ["pub(crate) mod runtime_effects;", "pub(crate) mod write_program_runner;"] {
+    for forbidden in [
+        "pub(crate) mod runtime_effects;",
+        "pub(crate) mod write_program_runner;",
+    ] {
         assert!(
             !execution_mod.contains(forbidden),
             "sql/execution/mod.rs should not compile legacy substrate `{forbidden}`"
@@ -114,8 +117,9 @@ fn backend_module_stays_sql_feature_blind() {
 fn canonical_no_longer_depends_on_execution_support() {
     for relative in [
         "canonical/create_commit.rs",
+        "canonical/change_log.rs",
+        "canonical/apply.rs",
         "canonical/pending_session.rs",
-        "canonical/runtime.rs",
         "canonical/graph_index.rs",
     ] {
         let source = read_engine_source(relative);
