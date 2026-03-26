@@ -146,14 +146,7 @@ fn schema_set_for_read(
         schema_set.insert(schema_key);
     }
     if let Some(spec) = dependency_spec {
-        schema_set.extend(
-            spec.schema_keys
-                .iter()
-                .filter(|schema_key| {
-                    !(schema_key.as_str() == "lix_active_version" && spec.depends_on_active_version)
-                })
-                .cloned(),
-        );
+        schema_set.extend(spec.schema_keys.iter().cloned());
     }
     schema_set
 }

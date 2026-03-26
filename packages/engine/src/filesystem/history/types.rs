@@ -29,6 +29,7 @@ pub(crate) enum FileHistoryVersionScope {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct FileHistoryRequest {
     pub(crate) lineage_scope: FileHistoryLineageScope,
+    pub(crate) active_version_id: Option<String>,
     pub(crate) root_scope: FileHistoryRootScope,
     pub(crate) version_scope: FileHistoryVersionScope,
     pub(crate) file_ids: Vec<String>,
@@ -59,6 +60,7 @@ pub(crate) struct FileHistoryRow {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct DirectoryHistoryRequest {
     pub(crate) lineage_scope: FileHistoryLineageScope,
+    pub(crate) active_version_id: Option<String>,
     pub(crate) root_scope: FileHistoryRootScope,
     pub(crate) version_scope: FileHistoryVersionScope,
     pub(crate) directory_ids: Vec<String>,

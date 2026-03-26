@@ -1,6 +1,6 @@
 mod support;
 
-use lix_engine::Value;
+use lix_engine::{LixError, Value};
 use support::simulation_test::assert_boolean_like;
 
 fn assert_text(value: &Value, expected: &str) {
@@ -10,12 +10,23 @@ fn assert_text(value: &Value, expected: &str) {
     }
 }
 
+fn assert_missing_version_id_error(error: &LixError, version_id: &str) {
+    let expected = format!("version with id '{version_id}' does not exist");
+    assert!(
+        error.description.contains(&expected),
+        "unexpected error message: {}",
+        error.description
+    );
+}
+
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
-        .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
-             )", &[])
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 }
@@ -61,13 +72,7 @@ simulation_test!(lix_state_select_exposes_commit_id, |sim| async move {
 
     register_test_schema(&engine).await;
     insert_version(&engine, "version-a").await;
-    engine
-        .execute(
-            "UPDATE lix_active_version SET version_id = 'version-a'",
-            &[],
-        )
-        .await
-        .unwrap();
+    engine.switch_version("version-a".to_string()).await.unwrap();
     insert_state_row(
         &engine,
         "entity-commit",
@@ -111,13 +116,7 @@ simulation_test!(
         insert_version(&engine, "version-a").await;
         insert_version(&engine, "version-b").await;
 
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         insert_state_row(&engine, "entity-a", "version-a", "{\"value\":\"A\"}", false).await;
         insert_state_row(&engine, "entity-b", "version-b", "{\"value\":\"B\"}", false).await;
@@ -155,13 +154,7 @@ simulation_test!(
         insert_state_row(&engine, "entity-a", "version-a", "{\"value\":\"A\"}", false).await;
         insert_state_row(&engine, "entity-b", "version-b", "{\"value\":\"B\"}", false).await;
 
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
         let first = engine
             .execute(
                 "SELECT entity_id \
@@ -175,13 +168,7 @@ simulation_test!(
         assert_eq!(first.statements[0].rows.len(), 1);
         assert_text(&first.statements[0].rows[0][0], "entity-a");
 
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-b'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-b".to_string()).await.unwrap();
         let second = engine
             .execute(
                 "SELECT entity_id \
@@ -208,13 +195,7 @@ simulation_test!(
 
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         insert_state_row(
             &engine,
@@ -262,13 +243,7 @@ simulation_test!(
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
         insert_version(&engine, "version-b").await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         insert_state_row(&engine, "entity-a", "version-a", "{\"value\":\"A\"}", false).await;
         insert_state_row(&engine, "entity-b", "version-b", "{\"value\":\"B\"}", false).await;
@@ -302,13 +277,7 @@ simulation_test!(
 
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
         insert_state_row(
             &engine,
             "entity-version-col",
@@ -348,13 +317,7 @@ simulation_test!(
 
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
         insert_state_row(
             &engine,
             "entity-version-col-2",
@@ -394,13 +357,7 @@ simulation_test!(
 
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
         insert_state_row(
             &engine,
             "entity-subquery",
@@ -440,13 +397,7 @@ simulation_test!(
 
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         insert_state_row(
             &engine,
@@ -501,13 +452,7 @@ simulation_test!(
         insert_version(&engine, "version-a").await;
         insert_version(&engine, "version-b").await;
 
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         engine
             .execute(
@@ -538,13 +483,7 @@ simulation_test!(
         assert_text(&first.statements[0].rows[0][0], "version-a");
         assert_text(&first.statements[0].rows[0][1], "{\"value\":\"A\"}");
 
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-b'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-b".to_string()).await.unwrap();
 
         engine
             .execute(
@@ -590,13 +529,7 @@ simulation_test!(
 
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         engine
             .execute(
@@ -635,6 +568,33 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_by_version_insert_rejects_missing_version_id,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        register_test_schema(&engine).await;
+
+        let error = engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'entity-missing-version', 'test_state_schema', 'test-file', 'version-missing', 'lix', '{\"value\":\"A\"}', '1'\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("insert with missing version_id should fail");
+
+        assert_missing_version_id_error(&error, "version-missing");
+    }
+);
+
+simulation_test!(
     lix_state_insert_on_conflict_do_update_is_supported,
     |sim| async move {
         let engine = sim
@@ -645,13 +605,7 @@ simulation_test!(
 
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         engine
             .execute(
@@ -721,13 +675,7 @@ simulation_test!(
 
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         engine
             .execute(
@@ -780,13 +728,7 @@ simulation_test!(
 
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         let error = engine
             .execute(
@@ -837,13 +779,7 @@ simulation_test!(
         )
         .await;
 
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         engine
             .execute(
@@ -880,6 +816,34 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_by_version_update_rejects_missing_version_id,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        register_test_schema(&engine).await;
+
+        let error = engine
+            .execute(
+                "UPDATE lix_state_by_version \
+                 SET snapshot_content = '{\"value\":\"A-updated\"}' \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-missing-version' \
+                   AND file_id = 'test-file' \
+                   AND version_id = 'version-missing'",
+                &[],
+            )
+            .await
+            .expect_err("update with missing version_id should fail");
+
+        assert_missing_version_id_error(&error, "version-missing");
+    }
+);
+
+simulation_test!(
     lix_state_update_supports_placeholder_schema_key_predicate,
     |sim| async move {
         let engine = sim
@@ -899,13 +863,7 @@ simulation_test!(
         )
         .await;
 
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         engine
             .execute(
@@ -953,13 +911,7 @@ simulation_test!(
 
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         insert_state_row(
             &engine,
@@ -1010,13 +962,7 @@ simulation_test!(
 
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         insert_state_row(
             &engine,
@@ -1098,13 +1044,7 @@ simulation_test!(
 
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         insert_state_row(
             &engine,
@@ -1190,13 +1130,7 @@ simulation_test!(
             false,
         )
         .await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         let error = engine
             .execute(
@@ -1237,13 +1171,7 @@ simulation_test!(
             false,
         )
         .await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         let error = engine
             .execute(
@@ -1284,13 +1212,7 @@ simulation_test!(
             false,
         )
         .await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         let error = engine
             .execute(
@@ -1340,13 +1262,7 @@ simulation_test!(
             false,
         )
         .await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         engine
             .execute(
@@ -1373,11 +1289,27 @@ simulation_test!(
             .unwrap();
 
         sim.assert_deterministic_normalized(rows.statements[0].rows.clone());
-        assert_eq!(rows.statements[0].rows.len(), 2);
-        assert_text(&rows.statements[0].rows[0][0], "version-a");
-        assert_eq!(rows.statements[0].rows[0][1], Value::Null);
-        assert_text(&rows.statements[0].rows[1][0], "version-b");
-        assert_text(&rows.statements[0].rows[1][1], "{\"value\":\"B-initial\"}");
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "version-b");
+        assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"B-initial\"}");
+
+        let history_rows = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_change \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-d' \
+                   AND file_id = 'test-file' \
+                   AND snapshot_content IS NULL \
+                 ORDER BY created_at DESC, id DESC",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(history_rows.statements[0].rows.clone());
+        assert_eq!(history_rows.statements[0].rows.len(), 1);
+        assert_eq!(history_rows.statements[0].rows[0][0], Value::Null);
     }
 );
 
@@ -1393,13 +1325,7 @@ simulation_test!(
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
         insert_version(&engine, "version-b").await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         insert_state_row(
             &engine,
@@ -1468,13 +1394,7 @@ simulation_test!(
         insert_version(&engine, "version-b").await;
         insert_state_row(&engine, "entity-s", "version-a", "{\"value\":\"A\"}", false).await;
         insert_state_row(&engine, "entity-s", "version-b", "{\"value\":\"B\"}", false).await;
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.switch_version("version-a".to_string()).await.unwrap();
 
         let error = engine
             .execute(

@@ -1,15 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::account::{
-    active_account_file_id, active_account_schema_key, active_account_storage_version_id,
-};
 use crate::backend::program::WriteProgram;
 use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::canonical_json::CanonicalJson;
 use crate::filesystem::runtime::{build_binary_blob_fastcdc_write_program, BinaryBlobWrite};
 use crate::functions::LixFunctionProvider;
-use crate::live_state::untracked_live_table_name;
-use crate::sql_support::text::{escape_sql_string, quote_ident};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
@@ -154,7 +149,7 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
     session: &mut PendingPublicCommitSession,
     changes: &[ProposedDomainChange],
     binary_blob_writes: &[BinaryBlobWrite],
-    active_account_ids: Option<&[String]>,
+    active_account_ids: &[String],
     functions: &mut dyn LixFunctionProvider,
     timestamp: &str,
 ) -> Result<(), LixError> {
@@ -229,12 +224,7 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let active_accounts = if let Some(active_account_ids) = active_account_ids {
-        active_account_ids.to_vec()
-    } else {
-        let mut executor = TransactionCommitExecutor { transaction };
-        load_commit_active_accounts(&mut executor, &domain_changes).await?
-    };
+    let active_accounts = active_account_ids.to_vec();
     let versions = load_version_info_for_domain_changes(transaction, &domain_changes).await?;
     let generated = generate_commit(
         GenerateCommitArgs {
@@ -523,55 +513,6 @@ async fn execute_generated_commit_result(
     execute_write_program_with_transaction(transaction, program).await?;
     apply_derived_live_state_rows_in_transaction(transaction, &result.derived_apply_input).await?;
     Ok(())
-}
-
-async fn load_commit_active_accounts(
-    executor: &mut dyn CommitQueryExecutor,
-    domain_changes: &[DomainChangeInput],
-) -> Result<Vec<String>, LixError> {
-    if domain_changes.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    if domain_changes
-        .iter()
-        .all(|change| change.schema_key == "lix_change_author")
-    {
-        return Ok(Vec::new());
-    }
-
-    let sql = format!(
-        "SELECT account_id \
-         FROM {table_name} \
-         WHERE file_id = '{file_id}' \
-           AND version_id = '{version_id}' \
-           AND untracked = true \
-           AND account_id IS NOT NULL",
-        table_name = quote_ident(&untracked_live_table_name(active_account_schema_key())),
-        file_id = escape_sql_string(active_account_file_id()),
-        version_id = escape_sql_string(active_account_storage_version_id()),
-    );
-    let result = executor.execute(&sql, &[]).await?;
-
-    let mut deduped = BTreeSet::new();
-    for row in result.rows {
-        let Some(value) = row.first() else {
-            continue;
-        };
-        let account_id = match value {
-            Value::Text(text) => text.clone(),
-            Value::Null => continue,
-            _ => {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "active account id must be text".to_string(),
-                });
-            }
-        };
-        deduped.insert(account_id);
-    }
-
-    Ok(deduped.into_iter().collect())
 }
 
 pub(crate) fn create_commit_error_to_lix_error(error: CreateCommitError) -> LixError {

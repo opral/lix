@@ -314,7 +314,7 @@ async fn merge_version_in_transaction(
                     source_version_id, target_version_id, source_head, target_head
                 )),
             },
-            active_account_ids: Some(active_account_ids),
+            active_account_ids,
             lane_parent_commit_ids_override: Some(vec![target_head.clone(), source_head.clone()]),
             allow_empty_commit: true,
             should_emit_observe_tick: false,

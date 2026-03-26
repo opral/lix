@@ -60,9 +60,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub async fn open_workspace_session(
-        self: &Arc<Self>,
-    ) -> Result<crate::Session, LixError> {
+    pub async fn open_workspace_session(self: &Arc<Self>) -> Result<crate::Session, LixError> {
         crate::Session::open_workspace(Arc::clone(self)).await
     }
 
@@ -527,21 +525,16 @@ mod tests {
         boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect};
-    use crate::live_state::untracked_live_table_name;
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
-    use crate::sql::analysis::state_resolution::effects::active_version_from_update_validations;
     use crate::sql::analysis::state_resolution::optimize::should_refresh_file_cache_for_statements;
-    use crate::sql::execution::contracts::planned_statement::UpdateValidationPlan;
     use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
     use crate::sql_support::binding::{
         advance_placeholder_state_for_statement_ast, bind_sql_with_state, parse_sql_statements,
         PlaceholderState,
     };
-    use crate::version::active_version_schema_key;
     use crate::{LixError, NoopWasmRuntime, QueryResult, Session, Value};
     use async_trait::async_trait;
-    use serde_json::json;
-    use sqlparser::ast::{Expr, Statement};
+    use sqlparser::ast::Statement;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     struct TestBackend {
@@ -619,50 +612,15 @@ mod tests {
     }
 
     #[test]
-    fn detects_active_version_update_with_single_quoted_schema_key() {
-        let table = untracked_live_table_name("lix_active_version");
-        let where_clause = parse_update_where_clause(&format!(
-            "UPDATE {table} SET writer_key = NULL WHERE schema_key = '{}' AND entity_id = 'main'",
-            active_version_schema_key()
-        ));
-        let plan = update_validation_plan(where_clause, "v-single");
-
-        let detected = active_version_from_update_validations(&[plan]).expect("detect version");
-        assert_eq!(detected.as_deref(), Some("v-single"));
-    }
-
-    #[test]
-    fn detects_active_version_update_with_double_quoted_schema_key() {
-        let table = untracked_live_table_name("lix_active_version");
-        let where_clause = parse_update_where_clause(&format!(
-            "UPDATE {table} SET writer_key = NULL WHERE schema_key = \"{}\" AND entity_id = 'main'",
-            active_version_schema_key()
-        ));
-        let plan = update_validation_plan(where_clause, "v-double");
-
-        let detected = active_version_from_update_validations(&[plan]).expect("detect version");
-        assert_eq!(detected.as_deref(), Some("v-double"));
-    }
-
-    #[test]
-    fn ignores_non_active_version_schema_key() {
-        let table = untracked_live_table_name("lix_active_version");
-        let where_clause = parse_update_where_clause(&format!(
-            "UPDATE {table} SET writer_key = NULL WHERE schema_key = 'other_schema' AND entity_id = 'main'",
-        ));
-        let plan = update_validation_plan(where_clause, "v-other");
-
-        let detected = active_version_from_update_validations(&[plan]).expect("detect version");
-        assert_eq!(detected, None);
-    }
-
-    #[test]
     fn refresh_cache_detection_matches_lix_state_writes() {
         assert!(should_refresh_file_cache_for_sql(
             "UPDATE lix_state SET snapshot_content = '{}' WHERE file_id = 'f'"
         ));
         assert!(should_refresh_file_cache_for_sql(
             "DELETE FROM lix_state_by_version WHERE file_id = 'f'"
+        ));
+        assert!(should_refresh_file_cache_for_sql(
+            "UPDATE lix_state_by_version SET snapshot_content = '{}' WHERE file_id = 'f'"
         ));
         assert!(should_refresh_file_cache_for_sql(
             "INSERT INTO lix_state (entity_id, schema_key, file_id, snapshot_content) VALUES ('/x', 'json_pointer', 'f', '{}')"
@@ -676,9 +634,6 @@ mod tests {
         ));
         assert!(!should_refresh_file_cache_for_sql(
             "UPDATE lix_state_history SET snapshot_content = '{}' WHERE file_id = 'f'"
-        ));
-        assert!(!should_refresh_file_cache_for_sql(
-            "UPDATE lix_state_by_version SET snapshot_content = '{}' WHERE file_id = 'f'"
         ));
     }
 
@@ -766,11 +721,8 @@ mod tests {
             }),
             Arc::new(NoopWasmRuntime),
         )));
-        let session = Session::new_for_test(
-            Arc::clone(&engine),
-            "version-test".to_string(),
-            Vec::new(),
-        );
+        let session =
+            Session::new_for_test(Arc::clone(&engine), "version-test".to_string(), Vec::new());
 
         {
             let mut cache = engine
@@ -820,11 +772,8 @@ mod tests {
             }),
             Arc::new(NoopWasmRuntime),
         )));
-        let session = Session::new_for_test(
-            Arc::clone(&engine),
-            "version-test".to_string(),
-            Vec::new(),
-        );
+        let session =
+            Session::new_for_test(Arc::clone(&engine), "version-test".to_string(), Vec::new());
 
         {
             let mut cache = engine
@@ -913,27 +862,5 @@ mod tests {
     ) -> Result<Option<Vec<Statement>>, LixError> {
         let statements = parse_sql_statements(sql)?;
         extract_explicit_transaction_script_from_statements(&statements, params)
-    }
-
-    fn parse_update_where_clause(sql: &str) -> Expr {
-        let mut statements = parse_sql_statements(sql).expect("parse sql");
-        let statement = statements.remove(0);
-        let Statement::Update(update) = statement else {
-            panic!("expected update statement");
-        };
-        update.selection.expect("where clause")
-    }
-
-    fn update_validation_plan(where_clause: Expr, version_id: &str) -> UpdateValidationPlan {
-        UpdateValidationPlan {
-            delete: false,
-            table: untracked_live_table_name("lix_active_version"),
-            where_clause: Some(where_clause),
-            snapshot_content: Some(json!({
-                "id": "main",
-                "version_id": version_id
-            })),
-            snapshot_patch: None,
-        }
     }
 }

@@ -368,10 +368,12 @@ fn plugin_txt_noop_wasm_bytes() -> Vec<u8> {
 #[cfg(any())]
 async fn register_plugin_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
-        .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"json_pointer\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"value\":{}},\"required\":[\"path\",\"value\"],\"additionalProperties\":false}}'\
-             )", &[])
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"json_pointer\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"value\":{}},\"required\":[\"path\",\"value\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
         .await
         .expect("register plugin schema should succeed");
 }
@@ -394,10 +396,9 @@ async fn main_version_id(engine: &support::simulation_test::SimulationEngine) ->
 async fn active_version_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let rows = engine
         .execute(
-            "SELECT v.commit_id \
-             FROM lix_version v \
-             JOIN lix_active_version av ON av.version_id = v.id \
-             ORDER BY av.id \
+            "SELECT commit_id \
+             FROM lix_version \
+             WHERE id = lix_active_version_id() \
              LIMIT 1",
             &[],
         )
@@ -410,13 +411,9 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
     }
 }
 
-#[cfg(any())]
 async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let rows = engine
-        .execute(
-            "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-            &[],
-        )
+        .execute("SELECT lix_active_version_id()", &[])
         .await
         .expect("active version query should succeed");
     assert_eq!(rows.statements[0].rows.len(), 1);
@@ -2672,14 +2669,17 @@ mod legacy_plugin_and_cache_tests {
             .expect("file_by_version insert should succeed");
 
             engine
-            .execute(
-                &format!(
-                    "UPDATE lix_active_version SET version_id = '{}'; \
-                     UPDATE lix_file SET data = lix_text_encode('{{\"hello\":\"after\"}}') WHERE id = 'file-active-switch'",
-                    version_b
-                ), &[])
+            .switch_version(version_b.to_string())
             .await
-            .expect("active-version switch + file update should succeed");
+            .expect("active-version switch should succeed");
+
+            engine
+                .execute(
+                    "UPDATE lix_file SET data = lix_text_encode('{\"hello\":\"after\"}') WHERE id = 'file-active-switch'",
+                    &[],
+                )
+                .await
+                .expect("file update after active-version switch should succeed");
 
             assert_eq!(active_version_id(&engine).await, version_b);
 

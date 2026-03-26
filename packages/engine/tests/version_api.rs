@@ -22,10 +22,9 @@ fn value_as_bool(value: &Value) -> bool {
 async fn active_version_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let active = engine
         .execute(
-            "SELECT v.commit_id \
-             FROM lix_active_version av \
-             JOIN lix_version v ON v.id = av.version_id \
-             ORDER BY av.id \
+            "SELECT commit_id \
+             FROM lix_version \
+             WHERE id = lix_active_version_id() \
              LIMIT 1",
             &[],
         )
@@ -95,10 +94,9 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
 
     let active_before = engine
         .execute(
-            "SELECT av.version_id, v.commit_id \
-             FROM lix_active_version av \
-             JOIN lix_version v ON v.id = av.version_id \
-             ORDER BY av.id \
+            "SELECT lix_active_version_id(), commit_id \
+             FROM lix_version \
+             WHERE id = lix_active_version_id() \
              LIMIT 1",
             &[],
         )
@@ -148,10 +146,7 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
     );
 
     let active_after = engine
-        .execute(
-            "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-            &[],
-        )
+        .execute("SELECT lix_active_version_id()", &[])
         .await
         .expect("active version query after create should succeed");
     assert_eq!(
@@ -171,10 +166,9 @@ simulation_test!(
 
         let active_before = engine
             .execute(
-                "SELECT av.version_id, v.commit_id \
-                 FROM lix_active_version av \
-                 JOIN lix_version v ON v.id = av.version_id \
-                 ORDER BY av.id \
+                "SELECT lix_active_version_id(), commit_id \
+                 FROM lix_version \
+                 WHERE id = lix_active_version_id() \
                  LIMIT 1",
                 &[],
             )
@@ -194,10 +188,9 @@ simulation_test!(
 
         let active_after = engine
             .execute(
-                "SELECT av.version_id, v.commit_id \
-                 FROM lix_active_version av \
-                 JOIN lix_version v ON v.id = av.version_id \
-                 ORDER BY av.id \
+                "SELECT lix_active_version_id(), commit_id \
+                 FROM lix_version \
+                 WHERE id = lix_active_version_id() \
                  LIMIT 1",
                 &[],
             )
@@ -291,10 +284,7 @@ simulation_test!(
             .await
             .expect("switch_version should succeed");
         let active = engine
-            .execute(
-                "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-                &[],
-            )
+            .execute("SELECT lix_active_version_id()", &[])
             .await
             .expect("active version query should succeed");
         assert_eq!(
@@ -333,10 +323,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.expect("init should succeed");
         let main_version_id = engine
-            .execute(
-                "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-                &[],
-            )
+            .execute("SELECT lix_active_version_id()", &[])
             .await
             .expect("active version query should succeed");
         let main_version_id = value_as_text(&main_version_id.statements[0].rows[0][0]);
@@ -369,10 +356,7 @@ simulation_test!(
             .await
             .expect("switch back to main should succeed");
         let active_before = engine
-            .execute(
-                "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-                &[],
-            )
+            .execute("SELECT lix_active_version_id()", &[])
             .await
             .expect("active version query should succeed");
         assert_eq!(
@@ -394,10 +378,7 @@ simulation_test!(
         assert_eq!(created.parent_commit_id, source_head);
 
         let active_after = engine
-            .execute(
-                "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-                &[],
-            )
+            .execute("SELECT lix_active_version_id()", &[])
             .await
             .expect("active version query should succeed");
         assert_eq!(

@@ -3,43 +3,44 @@ mod support;
 use lix_engine::{BootAccount, Value};
 use support::simulation_test::SimulationBootArgs;
 
-fn assert_text(value: &Value, expected: &str) {
-    match value {
-        Value::Text(actual) => assert_eq!(actual, expected),
-        other => panic!("expected text value '{expected}', got {other:?}"),
+fn first_text(result: &lix_engine::ExecuteResult) -> String {
+    match &result.statements[0].rows[0][0] {
+        Value::Text(value) => value.clone(),
+        other => panic!("expected first result cell to be text, got {other:?}"),
     }
 }
 
-async fn read_active_account_rows(
+fn first_string_vec(result: &lix_engine::ExecuteResult) -> Vec<String> {
+    serde_json::from_str(&first_text(result))
+        .unwrap_or_else(|error| panic!("expected JSON array text, got parse error: {error}"))
+}
+
+async fn workspace_metadata_value(
     engine: &support::simulation_test::SimulationEngine,
-) -> Vec<(String, String)> {
+    key: &str,
+) -> Option<String> {
     let result = engine
         .execute(
-            "SELECT id, account_id FROM lix_active_account ORDER BY account_id",
-            &[],
+            "SELECT value \
+             FROM lix_internal_workspace_metadata \
+             WHERE key = $1 \
+             LIMIT 1",
+            &[Value::Text(key.to_string())],
         )
         .await
-        .unwrap();
-
+        .expect("workspace metadata query should succeed");
     result.statements[0]
         .rows
-        .iter()
-        .map(|row| {
-            let id = match &row[0] {
-                Value::Text(value) => value.clone(),
-                other => panic!("expected text id, got {other:?}"),
-            };
-            let account_id = match &row[1] {
-                Value::Text(value) => value.clone(),
-                other => panic!("expected text account_id, got {other:?}"),
-            };
-            (id, account_id)
+        .first()
+        .and_then(|row| row.first())
+        .map(|value| match value {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected text metadata value, got {other:?}"),
         })
-        .collect()
 }
 
 simulation_test!(
-    active_account_view_select_reads_boot_account,
+    active_account_ids_function_reads_boot_account,
     simulations = [sqlite, materialization],
     |sim| async move {
         let engine = sim
@@ -52,206 +53,96 @@ simulation_test!(
             }))
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.initialize().await.unwrap();
+        engine.initialize().await.expect("init should succeed");
 
-        let rows = read_active_account_rows(&engine).await;
-        assert_eq!(
-            rows,
-            vec![("acct-boot".to_string(), "acct-boot".to_string())]
-        );
+        let result = engine
+            .execute("SELECT lix_active_account_ids()", &[])
+            .await
+            .expect("active account ids query should succeed");
+        assert_eq!(first_string_vec(&result), vec!["acct-boot".to_string()]);
     }
 );
 
 simulation_test!(
-    active_account_view_insert_creates_untracked_row,
+    set_active_account_ids_updates_runtime_function_and_workspace_metadata,
     simulations = [sqlite, materialization],
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.initialize().await.unwrap();
+        engine.initialize().await.expect("init should succeed");
 
         engine
-            .execute(
-                "INSERT INTO lix_active_account (account_id) VALUES ('acct-insert')",
-                &[],
-            )
+            .set_active_account_ids(vec!["acct-first".to_string(), "acct-second".to_string()])
             .await
-            .unwrap();
+            .expect("set_active_account_ids should succeed");
 
-        let rows = read_active_account_rows(&engine).await;
+        let result = engine
+            .execute("SELECT lix_active_account_ids()", &[])
+            .await
+            .expect("active account ids query should succeed");
         assert_eq!(
-            rows,
-            vec![("acct-insert".to_string(), "acct-insert".to_string())]
+            first_string_vec(&result),
+            vec!["acct-first".to_string(), "acct-second".to_string()]
         );
 
-        let stored = engine
-            .execute(
-                "SELECT entity_id, account_id \
-             FROM lix_internal_live_v1_lix_active_account \
-             WHERE file_id = 'lix' \
-               AND version_id = 'global' \
-               AND untracked = true",
-                &[],
-            )
+        let persisted = workspace_metadata_value(&engine, "active_account_ids")
             .await
-            .unwrap();
-        assert_eq!(stored.statements[0].rows.len(), 1);
-        assert_text(&stored.statements[0].rows[0][0], "acct-insert");
-        assert_text(&stored.statements[0].rows[0][1], "acct-insert");
+            .expect("workspace metadata should persist active account ids");
+        assert_eq!(persisted, r#"["acct-first","acct-second"]"#);
     }
 );
 
 simulation_test!(
-    active_account_view_insert_replaces_previous_selection,
-    simulations = [sqlite, materialization],
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.initialize().await.unwrap();
-
-        engine
-            .execute(
-                "INSERT INTO lix_active_account (account_id) VALUES ('acct-first')",
-                &[],
-            )
-            .await
-            .unwrap();
-        engine
-            .execute(
-                "INSERT INTO lix_active_account (account_id) VALUES ('acct-second')",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let rows = read_active_account_rows(&engine).await;
-        assert_eq!(
-            rows,
-            vec![("acct-second".to_string(), "acct-second".to_string())]
-        );
-
-        let stored = engine
-            .execute(
-                "SELECT entity_id \
-             FROM lix_internal_live_v1_lix_active_account \
-             WHERE file_id = 'lix' \
-               AND version_id = 'global' \
-               AND untracked = true",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(stored.statements[0].rows.len(), 1);
-        assert_text(&stored.statements[0].rows[0][0], "acct-second");
-    }
-);
-
-simulation_test!(
-    active_account_view_insert_same_account_is_noop,
-    simulations = [sqlite, materialization],
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.initialize().await.unwrap();
-
-        engine
-            .execute(
-                "INSERT INTO lix_active_account (account_id) VALUES ('acct-stable')",
-                &[],
-            )
-            .await
-            .unwrap();
-        engine
-            .execute(
-                "INSERT INTO lix_active_account (account_id) VALUES ('acct-stable')",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let rows = read_active_account_rows(&engine).await;
-        assert_eq!(
-            rows,
-            vec![("acct-stable".to_string(), "acct-stable".to_string())]
-        );
-
-        let stored = engine
-            .execute(
-                "SELECT entity_id \
-             FROM lix_internal_live_v1_lix_active_account \
-             WHERE file_id = 'lix' \
-               AND version_id = 'global' \
-               AND untracked = true",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(stored.statements[0].rows.len(), 1);
-        assert_text(&stored.statements[0].rows[0][0], "acct-stable");
-    }
-);
-
-simulation_test!(
-    active_account_view_delete_removes_matching_row,
+    set_active_account_ids_can_clear_selection,
     simulations = [sqlite, materialization],
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(Some(SimulationBootArgs {
                 active_account: Some(BootAccount {
-                    id: "acct-delete".to_string(),
-                    name: "Delete Me".to_string(),
+                    id: "acct-clear".to_string(),
+                    name: "Clear Me".to_string(),
                 }),
                 ..SimulationBootArgs::default()
             }))
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.initialize().await.unwrap();
+        engine.initialize().await.expect("init should succeed");
 
         engine
-            .execute(
-                "DELETE FROM lix_active_account WHERE account_id = 'acct-delete'",
-                &[],
-            )
+            .set_active_account_ids(Vec::new())
             .await
-            .unwrap();
+            .expect("clearing active account ids should succeed");
 
-        let rows = read_active_account_rows(&engine).await;
-        assert!(rows.is_empty());
+        let result = engine
+            .execute("SELECT lix_active_account_ids()", &[])
+            .await
+            .expect("active account ids query should succeed");
+        assert_eq!(first_string_vec(&result), Vec::<String>::new());
+
+        let persisted = workspace_metadata_value(&engine, "active_account_ids")
+            .await
+            .expect("workspace metadata should persist cleared active account ids");
+        assert_eq!(persisted, "[]");
     }
 );
 
 simulation_test!(
-    active_account_view_delete_supports_or_selector,
-    simulations = [sqlite],
+    active_account_surface_is_not_publicly_queryable,
+    simulations = [sqlite, materialization],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(Some(SimulationBootArgs {
-                active_account: Some(BootAccount {
-                    id: "acct-delete-or".to_string(),
-                    name: "Delete Me".to_string(),
-                }),
-                ..SimulationBootArgs::default()
-            }))
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.initialize().await.unwrap();
+        engine.initialize().await.expect("init should succeed");
 
-        engine
-            .execute(
-                "DELETE FROM lix_active_account \
-                 WHERE account_id = 'acct-delete-or' OR account_id = 'missing-account'",
-                &[],
-            )
+        let error = engine
+            .execute("SELECT account_id FROM lix_active_account", &[])
             .await
-            .unwrap();
-
-        let rows = read_active_account_rows(&engine).await;
-        assert!(rows.is_empty());
+            .expect_err("removed active account surface should not be queryable");
+        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
+        assert!(error.description.contains("lix_active_account"));
     }
 );

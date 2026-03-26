@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lix_engine::{
-    CreateVersionOptions, Lix, LixConfig, NoopWasmRuntime, ObserveEventsOwned, ObserveQuery,
-    OpenSessionOptions, Value,
+    boot, BootArgs, CreateVersionOptions, Engine, Lix, LixConfig, NoopWasmRuntime, ObserveEvents,
+    ObserveEventsOwned, ObserveQuery, OpenSessionOptions, Session, Value,
 };
 
 fn run_with_large_stack<F, Fut>(factory: F)
@@ -57,10 +57,24 @@ fn lix_config(path: &Path) -> LixConfig {
     )
 }
 
+fn boot_engine(path: &Path) -> Arc<Engine> {
+    Arc::new(boot(BootArgs::new(
+        support::simulations::sqlite_backend_with_filename(format!("sqlite://{}", path.display())),
+        Arc::new(NoopWasmRuntime),
+    )))
+}
+
 fn first_text(result: &lix_engine::ExecuteResult) -> String {
     match &result.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected first result cell to be text, got {other:?}"),
+    }
+}
+
+fn first_text_query_result(result: &lix_engine::QueryResult) -> String {
+    match &result.rows[0][0] {
+        Value::Text(value) => value.clone(),
+        other => panic!("expected first query result cell to be text, got {other:?}"),
     }
 }
 
@@ -93,6 +107,49 @@ async fn next_observe_count(observed: &mut ObserveEventsOwned, label: &str) -> i
             .unwrap_or_else(|error| panic!("expected integer-like text, got parse error: {error}")),
         other => panic!("expected observe count cell to be integer-like, got {other:?}"),
     }
+}
+
+async fn next_session_observe_text(observed: &mut ObserveEvents<'_>, label: &str) -> String {
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), observed.next())
+        .await
+        .unwrap_or_else(|_| panic!("{label} next should not time out"))
+        .unwrap_or_else(|error| panic!("{label} next should succeed: {error:?}"))
+        .unwrap_or_else(|| panic!("{label} should emit an event"));
+    first_text_query_result(&event.rows)
+}
+
+async fn next_session_observe_string_vec(
+    observed: &mut ObserveEvents<'_>,
+    label: &str,
+) -> Vec<String> {
+    serde_json::from_str(&next_session_observe_text(observed, label).await)
+        .unwrap_or_else(|error| panic!("{label} should return a JSON string array: {error}"))
+}
+
+async fn assert_no_session_observe_event(observed: &mut ObserveEvents<'_>, label: &str) {
+    let result = tokio::time::timeout(std::time::Duration::from_millis(400), observed.next()).await;
+    assert!(result.is_err(), "{label} should not emit another event");
+}
+
+async fn workspace_metadata_value(session: &Session, key: &str) -> Option<String> {
+    let result = session
+        .execute(
+            "SELECT value \
+             FROM lix_internal_workspace_metadata \
+             WHERE key = $1 \
+             LIMIT 1",
+            &[Value::Text(key.to_string())],
+        )
+        .await
+        .expect("workspace metadata query should succeed");
+    result.statements[0]
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .map(|value| match value {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected workspace metadata text value, got {other:?}"),
+        })
 }
 
 #[test]
@@ -389,7 +446,10 @@ fn create_checkpoint_uses_the_calling_sessions_active_version() {
             .await
             .expect("workspace checkpoint query should succeed");
 
-        assert_eq!(first_text(&workspace_checkpoint_after), workspace_checkpoint.id);
+        assert_eq!(
+            first_text(&workspace_checkpoint_after),
+            workspace_checkpoint.id
+        );
 
         drop(worker);
         drop(lix);
@@ -592,9 +652,14 @@ fn observe_initial_snapshot_is_session_scoped() {
         let mut worker_observed = worker
             .observe(query.clone())
             .expect("worker observe should succeed");
-        let mut workspace_observed = lix.observe(query).expect("workspace observe should succeed");
+        let mut workspace_observed = lix
+            .observe(query)
+            .expect("workspace observe should succeed");
 
-        assert_eq!(next_observe_count(&mut worker_observed, "worker_observed").await, 1);
+        assert_eq!(
+            next_observe_count(&mut worker_observed, "worker_observed").await,
+            1
+        );
         assert_eq!(
             next_observe_count(&mut workspace_observed, "workspace_observed").await,
             0
@@ -604,6 +669,197 @@ fn observe_initial_snapshot_is_session_scoped() {
         workspace_observed.close();
         drop(worker);
         drop(lix);
+        cleanup_sqlite_path(&path);
+    });
+}
+
+#[test]
+fn extra_session_switch_version_refreshes_only_its_own_observes() {
+    run_with_large_stack(|| async move {
+        let path = temp_sqlite_path("observe-worker-switch-version");
+        let _ = std::fs::File::create(&path).expect("sqlite test file should be creatable");
+
+        let engine = boot_engine(&path);
+        engine.initialize().await.expect("init should succeed");
+
+        let workspace = engine
+            .open_workspace_session()
+            .await
+            .expect("open_workspace_session should succeed");
+        let worker = workspace
+            .open_session(OpenSessionOptions::default())
+            .await
+            .expect("open_session should succeed");
+        let worker_version = worker
+            .create_version(CreateVersionOptions {
+                name: Some("worker-observe-switch".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("worker create_version should succeed");
+
+        let query = ObserveQuery::new("SELECT lix_active_version_id()", Vec::new());
+        let mut worker_observed = worker
+            .observe(query.clone())
+            .expect("worker observe should succeed");
+        let mut workspace_observed = workspace
+            .observe(query)
+            .expect("workspace observe should succeed");
+
+        let initial_version_id = workspace.active_version_id();
+        assert_eq!(
+            next_session_observe_text(&mut worker_observed, "worker_observed_initial").await,
+            initial_version_id
+        );
+        assert_eq!(
+            next_session_observe_text(&mut workspace_observed, "workspace_observed_initial").await,
+            initial_version_id
+        );
+
+        worker
+            .switch_version(worker_version.id.clone())
+            .await
+            .expect("worker switch_version should succeed");
+
+        assert_eq!(
+            next_session_observe_text(&mut worker_observed, "worker_observed_after_switch").await,
+            worker_version.id
+        );
+        assert_no_session_observe_event(
+            &mut workspace_observed,
+            "workspace_observed_after_worker_switch",
+        )
+        .await;
+
+        worker_observed.close();
+        workspace_observed.close();
+        drop(engine);
+        cleanup_sqlite_path(&path);
+    });
+}
+
+#[test]
+fn extra_session_active_account_changes_refresh_only_its_own_observes() {
+    run_with_large_stack(|| async move {
+        let path = temp_sqlite_path("observe-worker-active-accounts");
+        let _ = std::fs::File::create(&path).expect("sqlite test file should be creatable");
+
+        let engine = boot_engine(&path);
+        engine.initialize().await.expect("init should succeed");
+
+        let workspace = engine
+            .open_workspace_session()
+            .await
+            .expect("open_workspace_session should succeed");
+        let worker = workspace
+            .open_session(OpenSessionOptions::default())
+            .await
+            .expect("open_session should succeed");
+
+        let query = ObserveQuery::new("SELECT lix_active_account_ids()", Vec::new());
+        let mut worker_observed = worker
+            .observe(query.clone())
+            .expect("worker observe should succeed");
+        let mut workspace_observed = workspace
+            .observe(query)
+            .expect("workspace observe should succeed");
+
+        assert_eq!(
+            next_session_observe_string_vec(&mut worker_observed, "worker_accounts_initial").await,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            next_session_observe_string_vec(&mut workspace_observed, "workspace_accounts_initial",)
+                .await,
+            Vec::<String>::new()
+        );
+
+        worker
+            .set_active_account_ids(vec!["acct-worker".to_string(), "acct-shadow".to_string()])
+            .await
+            .expect("worker set_active_account_ids should succeed");
+
+        assert_eq!(
+            next_session_observe_string_vec(&mut worker_observed, "worker_accounts_after_set")
+                .await,
+            vec!["acct-worker".to_string(), "acct-shadow".to_string()]
+        );
+        assert_no_session_observe_event(
+            &mut workspace_observed,
+            "workspace_accounts_after_worker_set",
+        )
+        .await;
+
+        worker_observed.close();
+        workspace_observed.close();
+        drop(engine);
+        cleanup_sqlite_path(&path);
+    });
+}
+
+#[test]
+fn workspace_reopen_restores_runtime_state_from_workspace_metadata() {
+    run_with_large_stack(|| async move {
+        let path = temp_sqlite_path("workspace-metadata-reopen");
+        let _ = std::fs::File::create(&path).expect("sqlite test file should be creatable");
+
+        let version_id = {
+            let engine = boot_engine(&path);
+            engine.initialize().await.expect("init should succeed");
+            let workspace = engine
+                .open_workspace_session()
+                .await
+                .expect("open_workspace_session should succeed");
+            let version = workspace
+                .create_version(CreateVersionOptions {
+                    name: Some("workspace-metadata-reopen".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .expect("create_version should succeed");
+            workspace
+                .switch_version(version.id.clone())
+                .await
+                .expect("switch_version should succeed");
+            workspace
+                .set_active_account_ids(vec!["acct-persisted".to_string()])
+                .await
+                .expect("set_active_account_ids should succeed");
+
+            assert_eq!(
+                workspace_metadata_value(&workspace, "active_version_id").await,
+                Some(version.id.clone())
+            );
+            assert_eq!(
+                workspace_metadata_value(&workspace, "active_account_ids").await,
+                Some(r#"["acct-persisted"]"#.to_string())
+            );
+
+            version.id
+        };
+
+        let reopened_engine = boot_engine(&path);
+        let reopened = reopened_engine
+            .open_workspace_session()
+            .await
+            .expect("reopen open_workspace_session should succeed");
+
+        assert_eq!(reopened.active_version_id(), version_id);
+        assert_eq!(
+            reopened.active_account_ids(),
+            vec!["acct-persisted".to_string()]
+        );
+        assert_eq!(
+            workspace_metadata_value(&reopened, "active_version_id").await,
+            Some(reopened.active_version_id())
+        );
+        assert_eq!(
+            workspace_metadata_value(&reopened, "active_account_ids").await,
+            Some(r#"["acct-persisted"]"#.to_string())
+        );
+
+        drop(reopened);
+        drop(reopened_engine);
         cleanup_sqlite_path(&path);
     });
 }
@@ -638,7 +894,10 @@ fn tracked_writes_use_the_calling_sessions_active_accounts() {
             .expect("tracked write should succeed");
 
         let authors = lix
-            .execute("SELECT account_id FROM lix_change_author ORDER BY account_id", &[])
+            .execute(
+                "SELECT account_id FROM lix_change_author ORDER BY account_id",
+                &[],
+            )
             .await
             .expect("change author query should succeed");
         let author_ids = authors.statements[0]

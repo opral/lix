@@ -60,9 +60,6 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
         init.seed_commit_graph_nodes()
             .await
             .map_err(|error| init_step_error("seed_commit_graph_nodes", error))?;
-        init.seed_default_active_version(&default_active_version_id)
-            .await
-            .map_err(|error| init_step_error("seed_default_active_version", error))?;
         init.seed_lix_id()
             .await
             .map_err(|error| init_step_error("seed_lix_id", error))?;
@@ -72,7 +69,7 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
         init.rebuild_internal_last_checkpoint()
             .await
             .map_err(|error| init_step_error("rebuild_internal_last_checkpoint", error))?;
-        init.seed_boot_key_values()
+        init.seed_boot_key_values(&default_active_version_id)
             .await
             .map_err(|error| init_step_error("seed_boot_key_values", error))?;
         init.seed_boot_account()

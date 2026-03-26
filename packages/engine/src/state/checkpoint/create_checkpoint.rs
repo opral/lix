@@ -103,7 +103,9 @@ async fn load_commit(
     }))
 }
 
-async fn load_global_version_commit_id(tx: &mut SessionTransaction<'_>) -> Result<String, LixError> {
+async fn load_global_version_commit_id(
+    tx: &mut SessionTransaction<'_>,
+) -> Result<String, LixError> {
     let result = tx
         .execute(
             "SELECT commit_id \

@@ -37,10 +37,12 @@ fn normalize_bool_like_rows(rows: &[Vec<Value>], columns: &[usize]) -> Vec<Vec<V
 
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
-        .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
-             )", &[])
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 }
@@ -90,10 +92,7 @@ simulation_test!(
         register_test_schema(&engine).await;
         insert_version(&engine, "version-child").await;
         engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-child'",
-                &[],
-            )
+            .switch_version("version-child".to_string())
             .await
             .unwrap();
 
@@ -136,10 +135,7 @@ simulation_test!(
         register_test_schema(&engine).await;
         insert_version(&engine, "version-child").await;
         engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-child'",
-                &[],
-            )
+            .switch_version("version-child".to_string())
             .await
             .unwrap();
 
@@ -188,10 +184,7 @@ simulation_test!(
         register_test_schema(&engine).await;
         insert_version(&engine, "version-child").await;
         engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-child'",
-                &[],
-            )
+            .switch_version("version-child".to_string())
             .await
             .unwrap();
 
@@ -244,10 +237,7 @@ simulation_test!(
         register_test_schema(&engine).await;
         insert_version(&engine, "version-child").await;
         engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-child'",
-                &[],
-            )
+            .switch_version("version-child".to_string())
             .await
             .unwrap();
 

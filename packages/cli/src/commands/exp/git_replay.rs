@@ -3,7 +3,7 @@ use crate::db;
 use crate::error::CliError;
 use async_trait::async_trait;
 use lix_rs_sdk::{
-    BootKeyValue, Lix, LixBackend, LixConfig, LixError, LixBackendTransaction,
+    BootKeyValue, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,
     PreparedBatch as EnginePreparedBatch, QueryResult, SqlDialect, SqliteBackend, Value,
     WasmtimeRuntime,
 };
@@ -283,7 +283,10 @@ impl LixBackend for TracingSqliteBackend {
         self.inner.execute(sql, params).await
     }
 
-    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_savepoint(
+        &self,
+        name: &str,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         self.inner.begin_savepoint(name).await
     }
 

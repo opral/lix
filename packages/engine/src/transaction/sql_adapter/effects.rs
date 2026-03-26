@@ -59,12 +59,7 @@ pub(super) fn apply_buffered_write_planning_effects(
     command: &SqlBufferedWriteCommand,
     context: &mut ExecutionContext,
 ) -> Result<(), LixError> {
-    apply_execution_planning_effects(
-        command.compiled.execution(),
-        &mut context.public_surface_registry,
-        &mut context.public_surface_registry_generation,
-        &mut context.active_version_id,
-    )
+    apply_execution_planning_effects(command.compiled.execution(), context)
 }
 
 pub(super) async fn refresh_public_surface_registry_from_pending_transaction_view(
@@ -184,10 +179,10 @@ pub(super) async fn complete_sql_command_execution(
         .as_ref()
         .unwrap_or(&command.compiled.execution().effects);
 
-    if let Some(version_id) = &active_effects.next_active_version_id {
+    if let Some(version_id) = &active_effects.session_delta.next_active_version_id {
         context.active_version_id = version_id.clone();
     }
-    if let Some(active_account_ids) = &active_effects.next_active_account_ids {
+    if let Some(active_account_ids) = &active_effects.session_delta.next_active_account_ids {
         context.active_account_ids = active_account_ids.clone();
     }
 
@@ -342,22 +337,23 @@ fn public_write_filesystem_payload_changes_already_committed(prepared: &Compiled
 
 fn apply_execution_planning_effects(
     execution: &CompiledExecution,
-    public_surface_registry: &mut SurfaceRegistry,
-    public_surface_registry_generation: &mut u64,
-    active_version_id: &mut String,
+    context: &mut ExecutionContext,
 ) -> Result<(), LixError> {
     if let Some(public_write) = execution.public_write() {
         let mut mutations = public_surface_registry_mutations(public_write)?;
-        if apply_public_surface_registry_mutations(public_surface_registry, &mut mutations)? {
-            *public_surface_registry_generation += 1;
+        if apply_public_surface_registry_mutations(
+            &mut context.public_surface_registry,
+            &mut mutations,
+        )? {
+            context.bump_public_surface_registry_generation();
         }
         if let Some(next_active_version_id) =
             public_write_execution_next_active_version_id(public_write)
         {
-            *active_version_id = next_active_version_id;
+            context.active_version_id = next_active_version_id;
         }
-    } else if let Some(version_id) = &execution.effects.next_active_version_id {
-        *active_version_id = version_id.clone();
+    } else if let Some(version_id) = &execution.effects.session_delta.next_active_version_id {
+        context.active_version_id = version_id.clone();
     }
     Ok(())
 }
@@ -371,12 +367,16 @@ fn public_write_execution_next_active_version_id(
             .iter()
             .rev()
             .find_map(|partition| match partition {
-                PublicWriteExecutionPartition::Tracked(tracked) => {
-                    tracked.semantic_effects.next_active_version_id.clone()
-                }
-                PublicWriteExecutionPartition::Untracked(untracked) => {
-                    untracked.semantic_effects.next_active_version_id.clone()
-                }
+                PublicWriteExecutionPartition::Tracked(tracked) => tracked
+                    .semantic_effects
+                    .session_delta
+                    .next_active_version_id
+                    .clone(),
+                PublicWriteExecutionPartition::Untracked(untracked) => untracked
+                    .semantic_effects
+                    .session_delta
+                    .next_active_version_id
+                    .clone(),
             })
     })
 }

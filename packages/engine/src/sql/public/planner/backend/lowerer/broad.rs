@@ -10,10 +10,25 @@ pub(crate) fn rewrite_supported_public_read_surfaces_in_statement(
     statement: &mut Statement,
     dialect: SqlDialect,
 ) -> Result<(), LixError> {
-    rewrite_supported_public_read_surfaces_in_statement_with_registry(
+    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id(
         statement,
         &SurfaceRegistry::with_builtin_surfaces(),
         dialect,
+        None,
+    )
+}
+
+pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id(
+    statement: &mut Statement,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+) -> Result<(), LixError> {
+    rewrite_supported_public_read_surfaces_in_statement_with_registry(
+        statement,
+        registry,
+        dialect,
+        active_version_id,
     )
 }
 
@@ -21,11 +36,13 @@ pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry(
     statement: &mut Statement,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<(), LixError> {
     let Some(bound_statement) = bind_broad_public_read_statement(statement, registry)? else {
         return Ok(());
     };
-    *statement = lower_broad_public_read_statement(&bound_statement, registry, dialect)?;
+    *statement =
+        lower_broad_public_read_statement(&bound_statement, registry, dialect, active_version_id)?;
     Ok(())
 }
 
@@ -228,10 +245,11 @@ fn lower_broad_public_read_statement(
     statement: &BroadPublicReadStatement,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<Statement, LixError> {
     match statement {
         BroadPublicReadStatement::Query(query) => Ok(Statement::Query(Box::new(
-            lower_broad_public_read_query(query, registry, dialect)?,
+            lower_broad_public_read_query(query, registry, dialect, active_version_id)?,
         ))),
         BroadPublicReadStatement::Explain {
             original,
@@ -243,8 +261,12 @@ fn lower_broad_public_read_statement(
                 ..
             } = &mut lowered
             {
-                **lowered_statement =
-                    lower_broad_public_read_statement(bound_statement.as_ref(), registry, dialect)?;
+                **lowered_statement = lower_broad_public_read_statement(
+                    bound_statement.as_ref(),
+                    registry,
+                    dialect,
+                    active_version_id,
+                )?;
             }
             Ok(lowered)
         }
@@ -255,19 +277,26 @@ fn lower_broad_public_read_query(
     query: &BroadPublicReadQuery,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<Query, LixError> {
     let mut lowered = query.original.clone();
     lowered.with = query
         .with
         .as_ref()
-        .map(|with| lower_broad_public_read_with(with, registry, dialect))
+        .map(|with| lower_broad_public_read_with(with, registry, dialect, active_version_id))
         .transpose()?;
     lowered.body = Box::new(lower_broad_public_read_set_expr(
         &query.body,
         registry,
         dialect,
+        active_version_id,
     )?);
-    lower_nested_public_surfaces_in_query_expressions(&mut lowered, registry, dialect)?;
+    lower_nested_public_surfaces_in_query_expressions(
+        &mut lowered,
+        registry,
+        dialect,
+        active_version_id,
+    )?;
     Ok(lowered)
 }
 
@@ -275,6 +304,7 @@ fn lower_broad_public_read_with(
     with: &BroadPublicReadWith,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<With, LixError> {
     let mut lowered = with.original.clone();
     for (cte, bound_query) in lowered.cte_tables.iter_mut().zip(&with.cte_tables) {
@@ -282,6 +312,7 @@ fn lower_broad_public_read_with(
             bound_query,
             registry,
             dialect,
+            active_version_id,
         )?);
     }
     Ok(lowered)
@@ -291,13 +322,14 @@ fn lower_broad_public_read_set_expr(
     expr: &BroadPublicReadSetExpr,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<SetExpr, LixError> {
     match expr {
         BroadPublicReadSetExpr::Select(select) => Ok(SetExpr::Select(Box::new(
-            lower_broad_public_read_select(select, registry, dialect)?,
+            lower_broad_public_read_select(select, registry, dialect, active_version_id)?,
         ))),
         BroadPublicReadSetExpr::Query(query) => Ok(SetExpr::Query(Box::new(
-            lower_broad_public_read_query(query, registry, dialect)?,
+            lower_broad_public_read_query(query, registry, dialect, active_version_id)?,
         ))),
         BroadPublicReadSetExpr::SetOperation {
             original,
@@ -315,21 +347,34 @@ fn lower_broad_public_read_set_expr(
                     left.as_ref(),
                     registry,
                     dialect,
+                    active_version_id,
                 )?);
                 *lowered_right = Box::new(lower_broad_public_read_set_expr(
                     right.as_ref(),
                     registry,
                     dialect,
+                    active_version_id,
                 )?);
             }
             Ok(lowered)
         }
         BroadPublicReadSetExpr::Table { original, relation } => {
-            lower_broad_public_read_table_relation(relation, original, registry, dialect)
+            lower_broad_public_read_table_relation(
+                relation,
+                original,
+                registry,
+                dialect,
+                active_version_id,
+            )
         }
         BroadPublicReadSetExpr::Other(expr) => {
             let mut lowered = expr.clone();
-            lower_nested_public_surfaces_in_set_expr_expressions(&mut lowered, registry, dialect)?;
+            lower_nested_public_surfaces_in_set_expr_expressions(
+                &mut lowered,
+                registry,
+                dialect,
+                active_version_id,
+            )?;
             Ok(lowered)
         }
     }
@@ -339,14 +384,22 @@ fn lower_broad_public_read_select(
     select: &BroadPublicReadSelect,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<Select, LixError> {
     let mut lowered = select.original.clone();
     lowered.from = select
         .from
         .iter()
-        .map(|table| lower_broad_public_read_table_with_joins(table, registry, dialect))
+        .map(|table| {
+            lower_broad_public_read_table_with_joins(table, registry, dialect, active_version_id)
+        })
         .collect::<Result<_, _>>()?;
-    lower_nested_public_surfaces_in_select_expressions(&mut lowered, registry, dialect)?;
+    lower_nested_public_surfaces_in_select_expressions(
+        &mut lowered,
+        registry,
+        dialect,
+        active_version_id,
+    )?;
     Ok(lowered)
 }
 
@@ -354,13 +407,19 @@ fn lower_broad_public_read_table_with_joins(
     table: &BroadPublicReadTableWithJoins,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<TableWithJoins, LixError> {
     let mut lowered = table.original.clone();
-    lowered.relation = lower_broad_public_read_table_factor(&table.relation, registry, dialect)?;
+    lowered.relation = lower_broad_public_read_table_factor(
+        &table.relation,
+        registry,
+        dialect,
+        active_version_id,
+    )?;
     lowered.joins = table
         .joins
         .iter()
-        .map(|join| lower_broad_public_read_join(join, registry, dialect))
+        .map(|join| lower_broad_public_read_join(join, registry, dialect, active_version_id))
         .collect::<Result<_, _>>()?;
     Ok(lowered)
 }
@@ -369,10 +428,21 @@ fn lower_broad_public_read_join(
     join: &BroadPublicReadJoin,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<sqlparser::ast::Join, LixError> {
     let mut lowered = join.original.clone();
-    lowered.relation = lower_broad_public_read_table_factor(&join.relation, registry, dialect)?;
-    lower_nested_public_surfaces_in_join_operator(&mut lowered.join_operator, registry, dialect)?;
+    lowered.relation = lower_broad_public_read_table_factor(
+        &join.relation,
+        registry,
+        dialect,
+        active_version_id,
+    )?;
+    lower_nested_public_surfaces_in_join_operator(
+        &mut lowered.join_operator,
+        registry,
+        dialect,
+        active_version_id,
+    )?;
     Ok(lowered)
 }
 
@@ -380,10 +450,17 @@ fn lower_broad_public_read_table_factor(
     relation: &BroadPublicReadTableFactor,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<TableFactor, LixError> {
     match relation {
         BroadPublicReadTableFactor::Table { original, relation } => {
-            lower_broad_public_read_relation(relation, original, registry, dialect)
+            lower_broad_public_read_relation(
+                relation,
+                original,
+                registry,
+                dialect,
+                active_version_id,
+            )
         }
         BroadPublicReadTableFactor::Derived { original, subquery } => {
             let mut lowered = original.clone();
@@ -396,6 +473,7 @@ fn lower_broad_public_read_table_factor(
                     subquery.as_ref(),
                     registry,
                     dialect,
+                    active_version_id,
                 )?);
             }
             Ok(lowered)
@@ -414,6 +492,7 @@ fn lower_broad_public_read_table_factor(
                     table_with_joins.as_ref(),
                     registry,
                     dialect,
+                    active_version_id,
                 )?);
             }
             Ok(lowered)
@@ -427,6 +506,7 @@ fn lower_broad_public_read_relation(
     original: &TableFactor,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<TableFactor, LixError> {
     match relation {
         BroadPublicReadRelation::Public(binding) => {
@@ -435,6 +515,7 @@ fn lower_broad_public_read_relation(
                 registry,
                 false,
                 dialect,
+                active_version_id,
             )?
             else {
                 return Ok(original.clone());
@@ -466,6 +547,7 @@ fn lower_broad_public_read_table_relation(
     original: &SetExpr,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<SetExpr, LixError> {
     match relation {
         BroadPublicReadRelation::Public(binding) => {
@@ -474,6 +556,7 @@ fn lower_broad_public_read_table_relation(
                 registry,
                 true,
                 dialect,
+                active_version_id,
             )?
             else {
                 return Ok(original.clone());
@@ -490,19 +573,25 @@ fn lower_nested_public_surfaces_in_query_expressions(
     query: &mut Query,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<(), LixError> {
     if let Some(order_by) = &mut query.order_by {
-        lower_nested_public_surfaces_in_order_by(order_by, registry, dialect)?;
+        lower_nested_public_surfaces_in_order_by(order_by, registry, dialect, active_version_id)?;
     }
     if let Some(limit_clause) = &mut query.limit_clause {
-        lower_nested_public_surfaces_in_limit_clause(limit_clause, registry, dialect)?;
+        lower_nested_public_surfaces_in_limit_clause(
+            limit_clause,
+            registry,
+            dialect,
+            active_version_id,
+        )?;
     }
     if let Some(quantity) = query
         .fetch
         .as_mut()
         .and_then(|fetch| fetch.quantity.as_mut())
     {
-        lower_nested_public_surfaces_in_expr(quantity, registry, dialect)?;
+        lower_nested_public_surfaces_in_expr(quantity, registry, dialect, active_version_id)?;
     }
     Ok(())
 }
@@ -511,27 +600,49 @@ fn lower_nested_public_surfaces_in_set_expr_expressions(
     expr: &mut SetExpr,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<(), LixError> {
     match expr {
         SetExpr::Select(select) => {
-            lower_nested_public_surfaces_in_select_expressions(select, registry, dialect)
+            lower_nested_public_surfaces_in_select_expressions(
+                select,
+                registry,
+                dialect,
+                active_version_id,
+            )
         }
         SetExpr::Query(query) => {
             *query = Box::new(lower_query_via_broad_binding(
                 query.as_ref(),
                 registry,
                 dialect,
+                active_version_id,
             )?);
             Ok(())
         }
         SetExpr::SetOperation { left, right, .. } => {
-            lower_nested_public_surfaces_in_set_expr_expressions(left, registry, dialect)?;
-            lower_nested_public_surfaces_in_set_expr_expressions(right, registry, dialect)
+            lower_nested_public_surfaces_in_set_expr_expressions(
+                left,
+                registry,
+                dialect,
+                active_version_id,
+            )?;
+            lower_nested_public_surfaces_in_set_expr_expressions(
+                right,
+                registry,
+                dialect,
+                active_version_id,
+            )
         }
         SetExpr::Values(values) => {
             for row in &mut values.rows {
                 for expr in row {
-                    lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
+                    lower_nested_public_surfaces_in_expr(
+                        expr,
+                        registry,
+                        dialect,
+                        active_version_id,
+                    )?;
                 }
             }
             Ok(())
@@ -544,22 +655,23 @@ fn lower_nested_public_surfaces_in_select_expressions(
     select: &mut Select,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<(), LixError> {
     if let Some(prewhere) = &mut select.prewhere {
-        lower_nested_public_surfaces_in_expr(prewhere, registry, dialect)?;
+        lower_nested_public_surfaces_in_expr(prewhere, registry, dialect, active_version_id)?;
     }
     if let Some(selection) = &mut select.selection {
-        lower_nested_public_surfaces_in_expr(selection, registry, dialect)?;
+        lower_nested_public_surfaces_in_expr(selection, registry, dialect, active_version_id)?;
     }
     for item in &mut select.projection {
         match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
+                lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)?;
             }
             SelectItem::QualifiedWildcard(
                 sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr),
                 _,
-            ) => lower_nested_public_surfaces_in_expr(expr, registry, dialect)?,
+            ) => lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)?,
             _ => {}
         }
     }
@@ -567,29 +679,34 @@ fn lower_nested_public_surfaces_in_select_expressions(
         GroupByExpr::All(_) => {}
         GroupByExpr::Expressions(expressions, _) => {
             for expr in expressions {
-                lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
+                lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)?;
             }
         }
     }
     for expr in &mut select.cluster_by {
-        lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
+        lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)?;
     }
     for expr in &mut select.distribute_by {
-        lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
+        lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)?;
     }
     for expr in &mut select.sort_by {
-        lower_nested_public_surfaces_in_order_by_expr(expr, registry, dialect)?;
+        lower_nested_public_surfaces_in_order_by_expr(expr, registry, dialect, active_version_id)?;
     }
     if let Some(having) = &mut select.having {
-        lower_nested_public_surfaces_in_expr(having, registry, dialect)?;
+        lower_nested_public_surfaces_in_expr(having, registry, dialect, active_version_id)?;
     }
     if let Some(qualify) = &mut select.qualify {
-        lower_nested_public_surfaces_in_expr(qualify, registry, dialect)?;
+        lower_nested_public_surfaces_in_expr(qualify, registry, dialect, active_version_id)?;
     }
     if let Some(connect_by) = &mut select.connect_by {
-        lower_nested_public_surfaces_in_expr(&mut connect_by.condition, registry, dialect)?;
+        lower_nested_public_surfaces_in_expr(
+            &mut connect_by.condition,
+            registry,
+            dialect,
+            active_version_id,
+        )?;
         for expr in &mut connect_by.relationships {
-            lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
+            lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)?;
         }
     }
     Ok(())
@@ -599,12 +716,18 @@ fn lower_nested_public_surfaces_in_order_by(
     order_by: &mut OrderBy,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<(), LixError> {
     match &mut order_by.kind {
         sqlparser::ast::OrderByKind::All(_) => Ok(()),
         sqlparser::ast::OrderByKind::Expressions(expressions) => {
             for expr in expressions {
-                lower_nested_public_surfaces_in_order_by_expr(expr, registry, dialect)?;
+                lower_nested_public_surfaces_in_order_by_expr(
+                    expr,
+                    registry,
+                    dialect,
+                    active_version_id,
+                )?;
             }
             Ok(())
         }
@@ -615,17 +738,23 @@ fn lower_nested_public_surfaces_in_order_by_expr(
     order_by_expr: &mut OrderByExpr,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<(), LixError> {
-    lower_nested_public_surfaces_in_expr(&mut order_by_expr.expr, registry, dialect)?;
+    lower_nested_public_surfaces_in_expr(
+        &mut order_by_expr.expr,
+        registry,
+        dialect,
+        active_version_id,
+    )?;
     if let Some(with_fill) = &mut order_by_expr.with_fill {
         if let Some(from) = &mut with_fill.from {
-            lower_nested_public_surfaces_in_expr(from, registry, dialect)?;
+            lower_nested_public_surfaces_in_expr(from, registry, dialect, active_version_id)?;
         }
         if let Some(to) = &mut with_fill.to {
-            lower_nested_public_surfaces_in_expr(to, registry, dialect)?;
+            lower_nested_public_surfaces_in_expr(to, registry, dialect, active_version_id)?;
         }
         if let Some(step) = &mut with_fill.step {
-            lower_nested_public_surfaces_in_expr(step, registry, dialect)?;
+            lower_nested_public_surfaces_in_expr(step, registry, dialect, active_version_id)?;
         }
     }
     Ok(())
@@ -635,6 +764,7 @@ fn lower_nested_public_surfaces_in_limit_clause(
     limit_clause: &mut LimitClause,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<(), LixError> {
     match limit_clause {
         LimitClause::LimitOffset {
@@ -643,19 +773,24 @@ fn lower_nested_public_surfaces_in_limit_clause(
             limit_by,
         } => {
             if let Some(limit) = limit {
-                lower_nested_public_surfaces_in_expr(limit, registry, dialect)?;
+                lower_nested_public_surfaces_in_expr(limit, registry, dialect, active_version_id)?;
             }
             if let Some(offset) = offset {
-                lower_nested_public_surfaces_in_expr(&mut offset.value, registry, dialect)?;
+                lower_nested_public_surfaces_in_expr(
+                    &mut offset.value,
+                    registry,
+                    dialect,
+                    active_version_id,
+                )?;
             }
             for expr in limit_by {
-                lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
+                lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)?;
             }
             Ok(())
         }
         LimitClause::OffsetCommaLimit { offset, limit } => {
-            lower_nested_public_surfaces_in_expr(offset, registry, dialect)?;
-            lower_nested_public_surfaces_in_expr(limit, registry, dialect)
+            lower_nested_public_surfaces_in_expr(offset, registry, dialect, active_version_id)?;
+            lower_nested_public_surfaces_in_expr(limit, registry, dialect, active_version_id)
         }
     }
 }
@@ -664,6 +799,7 @@ fn lower_nested_public_surfaces_in_join_operator(
     join_operator: &mut JoinOperator,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<(), LixError> {
     let (match_condition, constraint) = match join_operator {
         JoinOperator::AsOf {
@@ -688,10 +824,15 @@ fn lower_nested_public_surfaces_in_join_operator(
         JoinOperator::CrossApply | JoinOperator::OuterApply => (None, None),
     };
     if let Some(expr) = match_condition {
-        lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
+        lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)?;
     }
     if let Some(constraint) = constraint {
-        lower_nested_public_surfaces_in_join_constraint(constraint, registry, dialect)?;
+        lower_nested_public_surfaces_in_join_constraint(
+            constraint,
+            registry,
+            dialect,
+            active_version_id,
+        )?;
     }
     Ok(())
 }
@@ -700,9 +841,12 @@ fn lower_nested_public_surfaces_in_join_constraint(
     constraint: &mut JoinConstraint,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<(), LixError> {
     match constraint {
-        JoinConstraint::On(expr) => lower_nested_public_surfaces_in_expr(expr, registry, dialect),
+        JoinConstraint::On(expr) => {
+            lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)
+        }
         _ => Ok(()),
     }
 }
@@ -711,40 +855,44 @@ fn lower_nested_public_surfaces_in_expr(
     expr: &mut Expr,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<(), LixError> {
     match expr {
         Expr::BinaryOp { left, right, .. } => {
-            lower_nested_public_surfaces_in_expr(left, registry, dialect)?;
-            lower_nested_public_surfaces_in_expr(right, registry, dialect)
+            lower_nested_public_surfaces_in_expr(left, registry, dialect, active_version_id)?;
+            lower_nested_public_surfaces_in_expr(right, registry, dialect, active_version_id)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
-        | Expr::Cast { expr, .. } => lower_nested_public_surfaces_in_expr(expr, registry, dialect),
+        | Expr::Cast { expr, .. } => {
+            lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)
+        }
         Expr::InList { expr, list, .. } => {
-            lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
+            lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)?;
             for item in list {
-                lower_nested_public_surfaces_in_expr(item, registry, dialect)?;
+                lower_nested_public_surfaces_in_expr(item, registry, dialect, active_version_id)?;
             }
             Ok(())
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
-            lower_nested_public_surfaces_in_expr(low, registry, dialect)?;
-            lower_nested_public_surfaces_in_expr(high, registry, dialect)
+            lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)?;
+            lower_nested_public_surfaces_in_expr(low, registry, dialect, active_version_id)?;
+            lower_nested_public_surfaces_in_expr(high, registry, dialect, active_version_id)
         }
         Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
-            lower_nested_public_surfaces_in_expr(pattern, registry, dialect)
+            lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)?;
+            lower_nested_public_surfaces_in_expr(pattern, registry, dialect, active_version_id)
         }
         Expr::Subquery(query) => {
             *query = Box::new(lower_query_via_broad_binding(
                 query.as_ref(),
                 registry,
                 dialect,
+                active_version_id,
             )?);
             Ok(())
         }
@@ -753,30 +901,37 @@ fn lower_nested_public_surfaces_in_expr(
                 subquery.as_ref(),
                 registry,
                 dialect,
+                active_version_id,
             )?);
             Ok(())
         }
         Expr::InSubquery { expr, subquery, .. } => {
-            lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
+            lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)?;
             *subquery = Box::new(lower_query_via_broad_binding(
                 subquery.as_ref(),
                 registry,
                 dialect,
+                active_version_id,
             )?);
             Ok(())
         }
         Expr::InUnnest {
             expr, array_expr, ..
         } => {
-            lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
-            lower_nested_public_surfaces_in_expr(array_expr, registry, dialect)
+            lower_nested_public_surfaces_in_expr(expr, registry, dialect, active_version_id)?;
+            lower_nested_public_surfaces_in_expr(array_expr, registry, dialect, active_version_id)
         }
         Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
-            lower_nested_public_surfaces_in_expr(left, registry, dialect)?;
-            lower_nested_public_surfaces_in_expr(right, registry, dialect)
+            lower_nested_public_surfaces_in_expr(left, registry, dialect, active_version_id)?;
+            lower_nested_public_surfaces_in_expr(right, registry, dialect, active_version_id)
         }
         Expr::Function(function) => {
-            lower_nested_public_surfaces_in_function_args(&mut function.args, registry, dialect)
+            lower_nested_public_surfaces_in_function_args(
+                &mut function.args,
+                registry,
+                dialect,
+                active_version_id,
+            )
         }
         Expr::Case {
             operand,
@@ -785,20 +940,35 @@ fn lower_nested_public_surfaces_in_expr(
             ..
         } => {
             if let Some(operand) = operand {
-                lower_nested_public_surfaces_in_expr(operand, registry, dialect)?;
+                lower_nested_public_surfaces_in_expr(operand, registry, dialect, active_version_id)?;
             }
             for condition in conditions {
-                lower_nested_public_surfaces_in_expr(&mut condition.condition, registry, dialect)?;
-                lower_nested_public_surfaces_in_expr(&mut condition.result, registry, dialect)?;
+                lower_nested_public_surfaces_in_expr(
+                    &mut condition.condition,
+                    registry,
+                    dialect,
+                    active_version_id,
+                )?;
+                lower_nested_public_surfaces_in_expr(
+                    &mut condition.result,
+                    registry,
+                    dialect,
+                    active_version_id,
+                )?;
             }
             if let Some(else_result) = else_result {
-                lower_nested_public_surfaces_in_expr(else_result, registry, dialect)?;
+                lower_nested_public_surfaces_in_expr(
+                    else_result,
+                    registry,
+                    dialect,
+                    active_version_id,
+                )?;
             }
             Ok(())
         }
         Expr::Tuple(items) => {
             for item in items {
-                lower_nested_public_surfaces_in_expr(item, registry, dialect)?;
+                lower_nested_public_surfaces_in_expr(item, registry, dialect, active_version_id)?;
             }
             Ok(())
         }
@@ -810,17 +980,28 @@ fn lower_nested_public_surfaces_in_function_args(
     args: &mut FunctionArguments,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<(), LixError> {
     match args {
         FunctionArguments::List(list) => {
             for arg in &mut list.args {
                 match arg {
                     FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
-                        lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
+                        lower_nested_public_surfaces_in_expr(
+                            expr,
+                            registry,
+                            dialect,
+                            active_version_id,
+                        )?;
                     }
                     FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
                         if let FunctionArgExpr::Expr(expr) = arg {
-                            lower_nested_public_surfaces_in_expr(expr, registry, dialect)?;
+                            lower_nested_public_surfaces_in_expr(
+                                expr,
+                                registry,
+                                dialect,
+                                active_version_id,
+                            )?;
                         }
                     }
                     _ => {}
@@ -836,9 +1017,10 @@ fn lower_query_via_broad_binding(
     query: &Query,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<Query, LixError> {
     let bound = bind_broad_public_read_query_scoped(query, registry, &BTreeSet::new())?;
-    lower_broad_public_read_query(&bound, registry, dialect)
+    lower_broad_public_read_query(&bound, registry, dialect, active_version_id)
 }
 
 fn collect_broad_public_read_statement_summary(
@@ -1221,6 +1403,7 @@ fn build_supported_public_read_surface_query(
     registry: &SurfaceRegistry,
     _top_level: bool,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<Option<Query>, LixError> {
     let Some(surface_binding) = registry.bind_relation_name(surface_name) else {
         return Ok(None);
@@ -1228,14 +1411,20 @@ fn build_supported_public_read_surface_query(
 
     match surface_binding.descriptor.surface_family {
         SurfaceFamily::State => {
-            build_public_state_surface_query(&surface_binding, registry, dialect)
+            build_public_state_surface_query(&surface_binding, registry, dialect, active_version_id)
         }
-        SurfaceFamily::Entity => build_builtin_entity_surface_query(&surface_binding),
+        SurfaceFamily::Entity => {
+            build_builtin_entity_surface_query(&surface_binding, active_version_id)
+        }
         SurfaceFamily::Filesystem => {
-            build_nested_filesystem_surface_query(dialect, &surface_binding.descriptor.public_name)
+            build_nested_filesystem_surface_query(
+                dialect,
+                active_version_id,
+                &surface_binding.descriptor.public_name,
+            )
         }
         SurfaceFamily::Admin => build_public_admin_surface_query(&surface_binding),
-        SurfaceFamily::Change => build_public_change_surface_query(&surface_binding),
+        SurfaceFamily::Change => build_public_change_surface_query(&surface_binding, active_version_id),
     }
 }
 
@@ -1243,6 +1432,7 @@ fn build_public_state_surface_query(
     surface_binding: &SurfaceBinding,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    active_version_id: Option<&str>,
 ) -> Result<Option<Query>, LixError> {
     let Some(state_scan) = CanonicalStateScan::from_surface_binding(surface_binding.clone()) else {
         return Ok(None);
@@ -1268,7 +1458,17 @@ fn build_public_state_surface_query(
         predicate_classes: Vec::new(),
         required_columns: surface_binding.exposed_columns.clone(),
     };
-    build_state_source_query(dialect, surface_binding, &request, &[], &BTreeMap::new())
+    if state_scan.version_scope == VersionScope::ActiveVersion && active_version_id.is_none() {
+        return Ok(None);
+    }
+    build_state_source_query(
+        dialect,
+        active_version_id,
+        surface_binding,
+        &request,
+        &[],
+        &BTreeMap::new(),
+    )
 }
 
 fn build_public_admin_surface_query(
@@ -1282,9 +1482,13 @@ fn build_public_admin_surface_query(
 
 fn build_public_change_surface_query(
     surface_binding: &SurfaceBinding,
+    active_version_id: Option<&str>,
 ) -> Result<Option<Query>, LixError> {
     if CanonicalWorkingChangesScan::from_surface_binding(surface_binding.clone()).is_some() {
-        return build_working_changes_source_query().map(Some);
+        let Some(active_version_id) = active_version_id else {
+            return Ok(None);
+        };
+        return build_working_changes_source_query(active_version_id).map(Some);
     }
     if CanonicalChangeScan::from_surface_binding(surface_binding.clone()).is_some() {
         return build_change_source_query().map(Some);
@@ -1294,6 +1498,7 @@ fn build_public_change_surface_query(
 
 fn build_builtin_entity_surface_query(
     surface_binding: &SurfaceBinding,
+    active_version_id: Option<&str>,
 ) -> Result<Option<Query>, LixError> {
     let Some(schema_key) = surface_binding.implicit_overrides.fixed_schema_key.clone() else {
         return Err(LixError {
@@ -1325,8 +1530,12 @@ fn build_builtin_entity_surface_query(
         predicate_classes: Vec::new(),
         required_columns: surface_binding.exposed_columns.clone(),
     };
+    if state_scan.version_scope == VersionScope::ActiveVersion && active_version_id.is_none() {
+        return Ok(None);
+    }
     build_entity_source_query(
         SqlDialect::Sqlite,
+        active_version_id,
         surface_binding,
         &request,
         &[],

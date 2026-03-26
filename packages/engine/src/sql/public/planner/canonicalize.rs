@@ -639,7 +639,6 @@ fn insert_write_surface_supported(surface_binding: &SurfaceBinding) -> bool {
         "lix_state"
             | "lix_state_by_version"
             | "lix_version"
-            | "lix_active_account"
             | "lix_file"
             | "lix_file_by_version"
             | "lix_directory"
@@ -656,8 +655,6 @@ fn update_delete_surface_supported(surface_binding: &SurfaceBinding) -> bool {
         "lix_state"
             | "lix_state_by_version"
             | "lix_version"
-            | "lix_active_version"
-            | "lix_active_account"
             | "lix_file"
             | "lix_file_by_version"
             | "lix_directory"
@@ -1062,8 +1059,6 @@ fn selector_column_is_supported(surface_binding: &SurfaceBinding, column: &str) 
             }),
         SurfaceFamily::Admin => match surface_binding.descriptor.public_name.as_str() {
             "lix_version" => column == "id",
-            "lix_active_version" => matches!(column, "id" | "version_id"),
-            "lix_active_account" => matches!(column, "id" | "account_id"),
             _ => false,
         },
         SurfaceFamily::Filesystem => match surface_binding.descriptor.public_name.as_str() {
@@ -1108,20 +1103,6 @@ fn canonical_write_column_key(
         SurfaceFamily::Admin => match surface_binding.descriptor.public_name.as_str() {
             "lix_version" => match canonical.as_str() {
                 "id" | "name" | "hidden" | "commit_id" => Ok(canonical.clone()),
-                _ => Err(CanonicalizeError::unsupported(format!(
-                    "public write canonicalizer does not support column '{raw_column}' on '{}'",
-                    surface_binding.descriptor.public_name
-                ))),
-            },
-            "lix_active_version" => match canonical.as_str() {
-                "id" | "version_id" => Ok(canonical.clone()),
-                _ => Err(CanonicalizeError::unsupported(format!(
-                    "public write canonicalizer does not support column '{raw_column}' on '{}'",
-                    surface_binding.descriptor.public_name
-                ))),
-            },
-            "lix_active_account" => match canonical.as_str() {
-                "id" | "account_id" => Ok(canonical.clone()),
                 _ => Err(CanonicalizeError::unsupported(format!(
                     "public write canonicalizer does not support column '{raw_column}' on '{}'",
                     surface_binding.descriptor.public_name
@@ -1402,23 +1383,15 @@ fn hex_nibble(byte: u8) -> Result<u8, String> {
 }
 
 fn supports_implicit_admin_selector(surface_binding: &SurfaceBinding) -> bool {
-    matches!(
-        surface_binding.descriptor.public_name.as_str(),
-        "lix_active_version" | "lix_active_account"
-    )
+    let _ = surface_binding;
+    false
 }
 
 fn write_mode_request_for_surface(
     surface_binding: &SurfaceBinding,
     payload: &BTreeMap<String, Value>,
 ) -> WriteModeRequest {
-    if matches!(
-        surface_binding.descriptor.public_name.as_str(),
-        "lix_active_version" | "lix_active_account"
-    ) {
-        return WriteModeRequest::ForceUntracked;
-    }
-
+    let _ = surface_binding;
     write_mode_request_from_payload(payload)
 }
 
@@ -1654,6 +1627,7 @@ mod tests {
         MutationPayload, ReadContract, ReadPlan, VersionScope, WriteModeRequest, WriteOperationKind,
     };
     use crate::Value;
+    use serde_json::json;
     use std::collections::BTreeMap;
 
     fn bound_statement(sql: &str) -> BoundStatement {
@@ -1915,6 +1889,60 @@ mod tests {
             ),
             "expected insert rows payload, got: {:?}",
             canonicalized.write_command.payload
+        );
+    }
+
+    #[test]
+    fn canonicalizes_registered_schema_insert_via_lix_json() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let canonicalized = canonicalize_write(
+            bound_statement(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json('{\"x-lix-key\":\"test\",\"x-lix-version\":\"1\"}'))",
+            ),
+            &registry,
+        )
+        .expect("registered schema insert should canonicalize");
+
+        let MutationPayload::InsertRows(rows) = &canonicalized.write_command.payload else {
+            panic!("expected insert rows payload");
+        };
+        let [payload] = rows.as_slice() else {
+            panic!("expected exactly one insert row");
+        };
+        assert_eq!(
+            payload.get("value"),
+            Some(&Value::Json(json!({
+                "x-lix-key": "test",
+                "x-lix-version": "1"
+            })))
+        );
+    }
+
+    #[test]
+    fn canonicalizes_json_typed_entity_update_via_lix_json() {
+        let mut registry = SurfaceRegistry::with_builtin_surfaces();
+        registry.register_dynamic_entity_surfaces(DynamicEntitySurfaceSpec {
+            schema_key: "test_json_entity".to_string(),
+            visible_columns: vec!["key".to_string(), "payload".to_string()],
+            column_types: BTreeMap::new(),
+            predicate_overrides: Vec::new(),
+        });
+        let canonicalized = canonicalize_write(
+            bound_statement(
+                "UPDATE test_json_entity SET payload = lix_json('{\"enabled\":true}') WHERE key = 'a'",
+            ),
+            &registry,
+        )
+        .expect("json entity update should canonicalize");
+
+        let MutationPayload::UpdatePatch(payload) = &canonicalized.write_command.payload else {
+            panic!("expected update payload");
+        };
+        assert_eq!(
+            payload.get("payload"),
+            Some(&Value::Json(json!({
+                "enabled": true
+            })))
         );
     }
 

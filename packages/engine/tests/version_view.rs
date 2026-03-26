@@ -46,10 +46,12 @@ fn assert_non_text_bool(value: &Value, expected: bool) {
 
 async fn register_test_state_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
-        .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )", &[])
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 }

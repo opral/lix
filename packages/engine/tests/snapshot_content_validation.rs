@@ -11,12 +11,14 @@ simulation_test!(allows_valid_snapshot, |sim| async move {
     engine.initialize().await.unwrap();
 
     engine
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
-             )", &[])
-            .await
-            .unwrap();
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     let result = engine
             .execute(
@@ -51,12 +53,14 @@ simulation_test!(rejects_invalid_snapshot, |sim| async move {
     engine.initialize().await.unwrap();
 
     engine
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
-             )", &[])
-            .await
-            .unwrap();
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     let result = engine
             .execute(
@@ -109,12 +113,14 @@ simulation_test!(rejects_invalid_update, |sim| async move {
     engine.initialize().await.unwrap();
 
     engine
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
-             )", &[])
-            .await
-            .unwrap();
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     engine
             .execute(
@@ -149,12 +155,14 @@ simulation_test!(rejects_update_on_immutable_schema, |sim| async move {
     engine.initialize().await.unwrap();
 
     engine
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"immutable_schema\",\"x-lix-version\":\"1\",\"x-lix-immutable\":true,\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
-             )", &[])
-            .await
-            .unwrap();
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"immutable_schema\",\"x-lix-version\":\"1\",\"x-lix-immutable\":true,\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     engine
             .execute(
@@ -189,12 +197,14 @@ simulation_test!(allows_delete_on_immutable_schema, |sim| async move {
     engine.initialize().await.unwrap();
 
     engine
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"immutable_schema\",\"x-lix-version\":\"1\",\"x-lix-immutable\":true,\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}}'\
-             )", &[])
-            .await
-            .unwrap();
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"immutable_schema\",\"x-lix-version\":\"1\",\"x-lix-immutable\":true,\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     engine
             .execute(

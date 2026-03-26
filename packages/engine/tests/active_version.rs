@@ -1,77 +1,53 @@
 mod support;
 
-use lix_engine::Value;
+use lix_engine::{CreateVersionOptions, Value};
 use support::simulation_test::SimulationArgs;
 
-fn assert_true_like(value: &Value) {
-    match value {
-        Value::Boolean(value) => assert!(*value),
-        Value::Integer(value) => assert_eq!(*value, 1),
-        Value::Text(value) => assert!(matches!(value.as_str(), "true" | "TRUE" | "1")),
-        other => panic!("expected boolean-like true value, got {other:?}"),
+fn first_text(result: &lix_engine::ExecuteResult) -> String {
+    match &result.statements[0].rows[0][0] {
+        Value::Text(value) => value.clone(),
+        other => panic!("expected first result cell to be text, got {other:?}"),
     }
 }
 
-fn parse_snapshot(value: &Value) -> serde_json::Value {
-    let text = match value {
-        Value::Text(value) => value,
-        other => panic!("expected text snapshot_content, got {other:?}"),
-    };
-    serde_json::from_str(text).expect("snapshot_content should be valid JSON")
-}
-
-async fn read_active_version_value(engine: &support::simulation_test::SimulationEngine) -> String {
-    let row = engine
+async fn workspace_metadata_value(
+    engine: &support::simulation_test::SimulationEngine,
+    key: &str,
+) -> Option<String> {
+    let result = engine
         .execute(
-            "SELECT snapshot_content \
-             FROM lix_state_by_version \
-             WHERE schema_key = 'lix_active_version' \
-               AND file_id = 'lix' \
-               AND version_id = 'global' \
-               AND untracked = true \
-             ORDER BY updated_at DESC \
+            "SELECT value \
+             FROM lix_internal_workspace_metadata \
+             WHERE key = $1 \
              LIMIT 1",
-            &[],
+            &[Value::Text(key.to_string())],
         )
         .await
-        .unwrap();
-
-    assert_eq!(row.statements[0].rows.len(), 1);
-    let snapshot = parse_snapshot(&row.statements[0].rows[0][0]);
-    snapshot["version_id"]
-        .as_str()
-        .expect("active version value should be a string")
-        .to_string()
+        .expect("workspace metadata query should succeed");
+    result.statements[0]
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .map(first_text_value)
 }
 
-async fn read_active_version_view_row(
-    engine: &support::simulation_test::SimulationEngine,
-) -> (String, String) {
-    let result = engine
-        .execute("SELECT id, version_id FROM lix_active_version", &[])
-        .await
-        .unwrap();
-    assert_eq!(result.statements[0].rows.len(), 1);
-    let id = match &result.statements[0].rows[0][0] {
+fn first_text_value(value: &Value) -> String {
+    match value {
         Value::Text(value) => value.clone(),
-        other => panic!("expected text id, got {other:?}"),
-    };
-    let version_id = match &result.statements[0].rows[0][1] {
-        Value::Text(value) => value.clone(),
-        other => panic!("expected text version_id, got {other:?}"),
-    };
-    (id, version_id)
+        other => panic!("expected text value, got {other:?}"),
+    }
 }
 
 async fn insert_version(engine: &support::simulation_test::SimulationEngine, version_id: &str) {
-    let sql = format!(
-        "INSERT INTO lix_version (\
-         id, name, hidden, commit_id\
-         ) VALUES (\
-         '{version_id}', '{version_id}', false, 'commit-{version_id}'\
-         )",
-    );
-    engine.execute(&sql, &[]).await.unwrap();
+    engine
+        .create_version(CreateVersionOptions {
+            id: Some(version_id.to_string()),
+            name: Some(version_id.to_string()),
+            source_version_id: None,
+            hidden: false,
+        })
+        .await
+        .expect("create_version should succeed");
 }
 
 async fn run_init_seeds_default_active_version_deterministic(sim: SimulationArgs) {
@@ -80,51 +56,33 @@ async fn run_init_seeds_default_active_version_deterministic(sim: SimulationArgs
         .await
         .expect("boot_simulated_engine_deterministic should succeed");
 
-    engine.initialize().await.unwrap();
+    engine.initialize().await.expect("init should succeed");
 
-    let row = engine
-        .execute(
-            "SELECT entity_id, snapshot_content, untracked \
-             FROM lix_state_by_version \
-             WHERE schema_key = 'lix_active_version' \
-               AND file_id = 'lix' \
-               AND version_id = 'global' \
-               AND untracked = true \
-             ORDER BY updated_at DESC \
-             LIMIT 1",
-            &[],
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(row.statements[0].rows.len(), 1);
-    let entity_id = match &row.statements[0].rows[0][0] {
-        Value::Text(value) => value,
-        other => panic!("expected text entity_id, got {other:?}"),
-    };
-    let snapshot = parse_snapshot(&row.statements[0].rows[0][1]);
-    assert_eq!(snapshot["id"], entity_id.as_str());
-    let active_version_id = snapshot["version_id"]
-        .as_str()
-        .expect("active version snapshot should include string version_id");
-    assert!(!active_version_id.is_empty());
-    assert_true_like(&row.statements[0].rows[0][2]);
-
-    sim.assert_deterministic(entity_id.to_string());
-    sim.assert_deterministic(active_version_id.to_string());
-
-    let version = engine
-        .execute(
-            "SELECT name FROM lix_version WHERE id = $1",
-            &[Value::Text(active_version_id.to_string())],
-        )
-        .await
-        .unwrap();
-    assert_eq!(version.statements[0].rows.len(), 1);
-    assert_eq!(
-        version.statements[0].rows[0][0],
-        Value::Text("main".to_string())
+    let active_version_id = first_text(
+        &engine
+            .execute("SELECT lix_active_version_id()", &[])
+            .await
+            .expect("active version id query should succeed"),
     );
+    assert!(!active_version_id.is_empty());
+    sim.assert_deterministic(active_version_id.clone());
+
+    let version_name = first_text(
+        &engine
+            .execute(
+                "SELECT name FROM lix_version WHERE id = $1 LIMIT 1",
+                &[Value::Text(active_version_id.clone())],
+            )
+            .await
+            .expect("version name query should succeed"),
+    );
+    assert_eq!(version_name, "main");
+
+    let persisted = workspace_metadata_value(&engine, "active_version_id")
+        .await
+        .expect("workspace metadata should persist active version id");
+    assert_eq!(persisted, active_version_id);
+    sim.assert_deterministic(persisted);
 }
 
 simulation_test!(
@@ -135,237 +93,64 @@ simulation_test!(
     }
 );
 
-simulation_test!(init_seeds_default_active_version, |sim| async move {
+simulation_test!(
+    switch_version_updates_runtime_function_and_workspace_metadata,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.expect("init should succeed");
+        insert_version(&engine, "version-switch-target").await;
+
+        engine
+            .switch_version("version-switch-target".to_string())
+            .await
+            .expect("switch_version should succeed");
+
+        let active_version_id = first_text(
+            &engine
+                .execute("SELECT lix_active_version_id()", &[])
+                .await
+                .expect("active version id query should succeed"),
+        );
+        assert_eq!(active_version_id, "version-switch-target");
+
+        let persisted = workspace_metadata_value(&engine, "active_version_id")
+            .await
+            .expect("workspace metadata should persist active version id");
+        assert_eq!(persisted, "version-switch-target");
+    }
+);
+
+simulation_test!(switch_version_rejects_missing_version, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
+    engine.initialize().await.expect("init should succeed");
 
-    engine.initialize().await.unwrap();
-
-    let row = engine
-        .execute(
-            "SELECT entity_id, snapshot_content, untracked \
-             FROM lix_state_by_version \
-             WHERE schema_key = 'lix_active_version' \
-               AND file_id = 'lix' \
-               AND version_id = 'global' \
-               AND untracked = true \
-             ORDER BY updated_at DESC \
-             LIMIT 1",
-            &[],
-        )
+    let error = engine
+        .switch_version("version-nonexistent".to_string())
         .await
-        .unwrap();
-
-    assert_eq!(row.statements[0].rows.len(), 1);
-    let entity_id = match &row.statements[0].rows[0][0] {
-        Value::Text(value) => value,
-        other => panic!("expected text entity_id, got {other:?}"),
-    };
-    let snapshot = parse_snapshot(&row.statements[0].rows[0][1]);
-    assert_eq!(snapshot["id"], entity_id.as_str());
-    let active_version_id = snapshot["version_id"]
-        .as_str()
-        .expect("active version snapshot should include string version_id");
-    assert!(!active_version_id.is_empty());
-    assert_true_like(&row.statements[0].rows[0][2]);
-
-    let version = engine
-        .execute(
-            "SELECT name FROM lix_version WHERE id = $1",
-            &[Value::Text(active_version_id.to_string())],
-        )
-        .await
-        .unwrap();
-    assert_eq!(version.statements[0].rows.len(), 1);
-    assert_eq!(
-        version.statements[0].rows[0][0],
-        Value::Text("main".to_string())
-    );
+        .expect_err("missing version id should fail");
+    assert!(error.description.contains("does not exist"));
 });
 
 simulation_test!(
-    active_version_view_select_reads_seeded_row,
+    active_version_surface_is_not_publicly_queryable,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.initialize().await.unwrap();
-
-        let (id, version_id) = read_active_version_view_row(&engine).await;
-        assert!(!id.is_empty());
-        assert!(!version_id.is_empty());
-    }
-);
-
-simulation_test!(
-    active_version_view_update_switches_version,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.initialize().await.unwrap();
-        insert_version(&engine, "version-switch-target").await;
-
-        let (before_id, _) = read_active_version_view_row(&engine).await;
-
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = $1",
-                &[Value::Text("version-switch-target".to_string())],
-            )
-            .await
-            .unwrap();
-
-        let (after_id, after_version_id) = read_active_version_view_row(&engine).await;
-        assert_eq!(after_id, before_id);
-        assert_eq!(after_version_id, "version-switch-target");
-    }
-);
-
-simulation_test!(
-    active_version_view_update_rejects_missing_version_fk,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.initialize().await.unwrap();
+        engine.initialize().await.expect("init should succeed");
 
         let error = engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version_nonexistent'",
-                &[],
-            )
+            .execute("SELECT version_id FROM lix_active_version", &[])
             .await
-            .expect_err("missing version_id should violate active version FK");
-        assert!(
-            error
-                .description
-                .contains("Foreign key constraint violation"),
-            "unexpected error message: {}",
-            error.description
-        );
-    }
-);
-
-simulation_test!(
-    active_version_view_update_allows_existing_version_fk,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.initialize().await.unwrap();
-        insert_version(&engine, "version-existing-fk").await;
-
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-existing-fk'",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let (_, version_id) = read_active_version_view_row(&engine).await;
-        assert_eq!(version_id, "version-existing-fk");
-    }
-);
-
-simulation_test!(
-    active_version_view_update_supports_or_selector,
-    simulations = [sqlite],
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.initialize().await.unwrap();
-        insert_version(&engine, "version-or-target").await;
-
-        let (active_id, _) = read_active_version_view_row(&engine).await;
-
-        engine
-            .execute(
-                "UPDATE lix_active_version \
-                 SET version_id = 'version-or-target' \
-                 WHERE id = $1 OR version_id = 'missing-version'",
-                &[Value::Text(active_id)],
-            )
-            .await
-            .unwrap();
-
-        let (_, version_id) = read_active_version_view_row(&engine).await;
-        assert_eq!(version_id, "version-or-target");
-    }
-);
-
-simulation_test!(
-    active_version_can_be_switched_via_state_surface_update,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-
-        engine.initialize().await.unwrap();
-        let (active_id, _) = read_active_version_view_row(&engine).await;
-        engine
-            .execute(
-                "UPDATE lix_state_by_version \
-                 SET snapshot_content = $1 \
-                 WHERE untracked = true \
-                   AND schema_key = 'lix_active_version' \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global'",
-                &[Value::Text(
-                    serde_json::json!({
-                        "id": active_id,
-                        "version_id": "version-a"
-                    })
-                    .to_string(),
-                )],
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(read_active_version_value(&engine).await, "version-a");
-    }
-);
-
-simulation_test!(
-    active_version_can_be_updated_multiple_times_via_state_surface_update,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-
-        engine.initialize().await.unwrap();
-        let (active_id, _) = read_active_version_view_row(&engine).await;
-
-        engine
-            .execute(
-                "UPDATE lix_state_by_version \
-                 SET snapshot_content = $1 \
-                 WHERE untracked = true \
-                   AND schema_key = 'lix_active_version' \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global'",
-                &[Value::Text(
-                    serde_json::json!({
-                        "id": active_id,
-                        "version_id": "version-b"
-                    })
-                    .to_string(),
-                )],
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(read_active_version_value(&engine).await, "version-b");
+            .expect_err("removed active version surface should not be queryable");
+        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
+        assert!(error.description.contains("lix_active_version"));
     }
 );

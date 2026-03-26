@@ -40,10 +40,7 @@ fn normalize_bool_like_rows(rows: &[Vec<Value>], columns: &[usize]) -> Vec<Vec<V
 
 async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let rows = engine
-        .execute(
-            "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-            &[],
-        )
+        .execute("SELECT lix_active_version_id()", &[])
         .await
         .unwrap();
     assert_eq!(rows.statements[0].rows.len(), 1);
@@ -81,31 +78,26 @@ async fn install_global_override_schema(
     engine: &support::simulation_test::SimulationEngine,
     schema_key: &str,
 ) {
-    let snapshot = json!({
-        "value": {
-            "x-lix-key": schema_key,
-            "x-lix-version": "1",
-            "x-lix-primary-key": ["/id"],
-            "x-lix-override-lixcols": {
-                "lixcol_file_id": "\"lix\"",
-                "lixcol_plugin_key": "\"lix\"",
-                "lixcol_global": "true",
-            },
-            "type": "object",
-            "properties": {
-                "id": { "type": "string" },
-                "name": { "type": "string" },
-            },
-            "required": ["id"],
-            "additionalProperties": false,
-        }
-    });
-    let sql = format!(
-        "INSERT INTO lix_registered_schema (value) VALUES ('{snapshot}'\
-         )",
-        snapshot = snapshot.to_string().replace('\'', "''"),
-    );
-    engine.execute(&sql, &[]).await.unwrap();
+    engine
+        .register_schema(&json!({
+        "x-lix-key": schema_key,
+        "x-lix-version": "1",
+        "x-lix-primary-key": ["/id"],
+        "x-lix-override-lixcols": {
+            "lixcol_file_id": "\"lix\"",
+            "lixcol_plugin_key": "\"lix\"",
+            "lixcol_global": "true",
+        },
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "name": { "type": "string" },
+        },
+        "required": ["id"],
+        "additionalProperties": false,
+    }))
+        .await
+        .unwrap();
 }
 
 async fn install_global_override_schema_for_version_override_schema(
@@ -120,48 +112,58 @@ async fn install_global_override_child_schema(engine: &support::simulation_test:
 
 async fn install_select_override_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
-        .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"lix_select_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"inlang\\\"\",\"lixcol_plugin_key\":\"\\\"inlang_sdk\\\"\",\"lixcol_global\":\"true\",\"lixcol_untracked\":\"true\",\"lixcol_metadata\":\"null\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
-             )", &[])
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"lix_select_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"inlang\\\"\",\"lixcol_plugin_key\":\"\\\"inlang_sdk\\\"\",\"lixcol_global\":\"true\",\"lixcol_untracked\":\"true\",\"lixcol_metadata\":\"null\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 }
 
 async fn install_inherited_override_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
-        .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"lix_inherited_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
-             )", &[])
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"lix_inherited_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 }
 
 async fn install_default_values_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
-        .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"lix_default_values_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"\\\"default-id-value\\\"\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
-             )", &[])
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"lix_default_values_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"\\\"default-id-value\\\"\"}},\"required\":[\"id\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 }
 
 async fn install_delete_subquery_schemas(engine: &support::simulation_test::SimulationEngine) {
     engine
-        .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"lix_delete_message_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"bundle_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"bundle_id\"],\"additionalProperties\":false}}'\
-             )", &[])
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"lix_delete_message_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"bundle_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"bundle_id\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 
     engine
-        .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"lix_delete_variant_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"message_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"message_id\"],\"additionalProperties\":false}}'\
-             )", &[])
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"lix_delete_variant_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"message_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"message_id\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 }
@@ -557,10 +559,12 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         engine
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (\
-                 '{\"value\":{\"x-lix-key\":\"lix_patch_validation\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}}'\
-                 )", &[])
+            .register_schema(
+                &serde_json::from_str::<serde_json::Value>(
+                    "{\"x-lix-key\":\"lix_patch_validation\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}",
+                )
+                .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -615,10 +619,7 @@ simulation_test!(
             .await
             .unwrap();
         engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'active-test'",
-                &[],
-            )
+            .switch_version("active-test".to_string())
             .await
             .unwrap();
 
@@ -903,10 +904,7 @@ simulation_test!(
             .await
             .unwrap();
         engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'active-inherited'",
-                &[],
-            )
+            .switch_version("active-inherited".to_string())
             .await
             .unwrap();
 

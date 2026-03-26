@@ -460,41 +460,41 @@ export type LixObserveEvents = {
                 "openSession options",
             )?),
         };
-        let active_account_ids =
-            match Reflect::get(&object, &JsValue::from_str("activeAccountIds")).map_err(|_| {
+        let active_account_ids = match Reflect::get(&object, &JsValue::from_str("activeAccountIds"))
+            .map_err(|_| {
                 LixError::new(
                     "LIX_ERROR_JS_SDK",
                     "openSession activeAccountIds lookup failed",
                 )
             })? {
-                value if value.is_null() || value.is_undefined() => None,
-                value => {
-                    if !Array::is_array(&value) {
+            value if value.is_null() || value.is_undefined() => None,
+            value => {
+                if !Array::is_array(&value) {
+                    return Err(LixError::new(
+                        "LIX_ERROR_JS_SDK",
+                        "openSession activeAccountIds must be an array",
+                    ));
+                }
+                let values = Array::from(&value);
+                let mut parsed = Vec::with_capacity(values.length() as usize);
+                for entry in values.iter() {
+                    let account_id = entry.as_string().ok_or_else(|| {
+                        LixError::new(
+                            "LIX_ERROR_JS_SDK",
+                            "openSession activeAccountIds entries must be strings",
+                        )
+                    })?;
+                    if account_id.is_empty() {
                         return Err(LixError::new(
                             "LIX_ERROR_JS_SDK",
-                            "openSession activeAccountIds must be an array",
+                            "openSession activeAccountIds entries must be non-empty strings",
                         ));
                     }
-                    let values = Array::from(&value);
-                    let mut parsed = Vec::with_capacity(values.length() as usize);
-                    for entry in values.iter() {
-                        let account_id = entry.as_string().ok_or_else(|| {
-                            LixError::new(
-                                "LIX_ERROR_JS_SDK",
-                                "openSession activeAccountIds entries must be strings",
-                            )
-                        })?;
-                        if account_id.is_empty() {
-                            return Err(LixError::new(
-                                "LIX_ERROR_JS_SDK",
-                                "openSession activeAccountIds entries must be non-empty strings",
-                            ));
-                        }
-                        parsed.push(account_id);
-                    }
-                    Some(parsed)
+                    parsed.push(account_id);
                 }
-            };
+                Some(parsed)
+            }
+        };
         Ok(lix_engine::OpenSessionOptions {
             active_version_id,
             active_account_ids,
@@ -605,11 +605,8 @@ export type LixObserveEvents = {
 
         let id = read_optional_string_property_with_context(&input, "id", "createVersion")?;
         let name = read_optional_string_property_with_context(&input, "name", "createVersion")?;
-        let source_version_id = read_optional_string_property_with_context(
-            &input,
-            "sourceVersionId",
-            "createVersion",
-        )?;
+        let source_version_id =
+            read_optional_string_property_with_context(&input, "sourceVersionId", "createVersion")?;
 
         let hidden = read_optional_bool_property_with_context(&input, "hidden", "createVersion")?
             .unwrap_or(false);

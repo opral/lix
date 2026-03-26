@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crate::live_state::tracked::{TrackedWriteOperation, TrackedWriteRow};
 use crate::live_state::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
 use crate::live_state::SchemaRegistration;
+use crate::session::contracts::SessionStateDelta;
 use crate::state::stream::StateCommitStreamChange;
 use crate::LixError;
 
@@ -133,10 +134,8 @@ impl SchemaRegistrationSet {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct TransactionCommitOutcome {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_active_version_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_active_account_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "SessionStateDelta::is_empty")]
+    pub session_delta: SessionStateDelta,
     #[serde(default)]
     pub invalidate_deterministic_settings_cache: bool,
     #[serde(default)]
@@ -149,12 +148,7 @@ pub struct TransactionCommitOutcome {
 
 impl TransactionCommitOutcome {
     pub(crate) fn merge(&mut self, other: TransactionCommitOutcome) {
-        if other.next_active_version_id.is_some() {
-            self.next_active_version_id = other.next_active_version_id;
-        }
-        if other.next_active_account_ids.is_some() {
-            self.next_active_account_ids = other.next_active_account_ids;
-        }
+        self.session_delta.merge(other.session_delta);
         self.invalidate_deterministic_settings_cache |=
             other.invalidate_deterministic_settings_cache;
         self.invalidate_installed_plugins_cache |= other.invalidate_installed_plugins_cache;

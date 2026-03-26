@@ -13,7 +13,7 @@ use crate::live_state::{
 use crate::sql::public::catalog::SurfaceBinding;
 use crate::sql::public::planner::backend::lowerer::{
     lower_read_for_execution_with_layouts,
-    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_dialect,
+    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id,
     LoweredReadProgram, LoweredResultColumn, LoweredResultColumns,
 };
 use crate::sql::public::planner::canonicalize::canonicalize_read;
@@ -1162,15 +1162,7 @@ fn required_schema_keys_from_dependency_spec(
     dependency_spec: Option<&DependencySpec>,
 ) -> BTreeSet<String> {
     dependency_spec
-        .map(|spec| {
-            spec.schema_keys
-                .iter()
-                .filter(|schema_key| {
-                    !(schema_key.as_str() == "lix_active_version" && spec.depends_on_active_version)
-                })
-                .cloned()
-                .collect()
-        })
+        .map(|spec| spec.schema_keys.iter().cloned().collect())
         .unwrap_or_default()
 }
 
@@ -1268,6 +1260,7 @@ fn build_direct_state_history_plan(
 
     let mut request = StateHistoryRequest {
         lineage_scope: StateHistoryLineageScope::ActiveVersion,
+        active_version_id: Some(required_requested_version_id(structured_read)?.to_string()),
         content_mode: StateHistoryContentMode::MetadataOnly,
         ..StateHistoryRequest::default()
     };
@@ -1334,6 +1327,7 @@ fn build_direct_entity_history_plan(
 
     let mut request = StateHistoryRequest {
         lineage_scope: StateHistoryLineageScope::ActiveVersion,
+        active_version_id: Some(required_requested_version_id(structured_read)?.to_string()),
         content_mode: StateHistoryContentMode::IncludeSnapshotContent,
         schema_keys: vec![schema_key],
         ..StateHistoryRequest::default()
@@ -1415,6 +1409,25 @@ fn build_state_history_having(
         )
     })
     .map(Some)
+}
+
+fn required_requested_version_id(
+    structured_read: &StructuredPublicRead,
+) -> Result<&str, LixError> {
+    structured_read
+        .bound_statement
+        .execution_context
+        .requested_version_id
+        .as_deref()
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "public read '{}' requires a session-requested active version id",
+                    structured_read.surface_binding.descriptor.public_name
+                ),
+            )
+        })
 }
 
 fn build_entity_history_predicates_and_request(
@@ -1739,6 +1752,9 @@ fn build_direct_file_history_plan(
         } else {
             FileHistoryLineageScope::Standard
         },
+        active_version_id: (public_name == "lix_file_history")
+            .then(|| required_requested_version_id(structured_read).map(str::to_string))
+            .transpose()?,
         ..FileHistoryRequest::default()
     };
     let predicates = build_file_history_predicates_and_request(structured_read, &mut request)?;
@@ -1801,6 +1817,7 @@ fn build_direct_directory_history_plan(
 
     let mut request = DirectoryHistoryRequest {
         lineage_scope: FileHistoryLineageScope::ActiveVersion,
+        active_version_id: Some(required_requested_version_id(structured_read)?.to_string()),
         ..DirectoryHistoryRequest::default()
     };
     let predicates = build_directory_history_predicates_and_request(structured_read, &mut request)?;
@@ -5802,11 +5819,16 @@ async fn prepare_public_read_via_surface_lowering(
     }
 
     let mut rewritten_statement = bound_statement.statement.clone();
+    let active_version_id = bound_statement
+        .execution_context
+        .requested_version_id
+        .as_deref();
     if let Err(error) =
-        rewrite_supported_public_read_surfaces_in_statement_with_registry_and_dialect(
+        rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id(
             &mut rewritten_statement,
             registry,
             backend.dialect(),
+            active_version_id,
         )
     {
         if let Some(mapped) =

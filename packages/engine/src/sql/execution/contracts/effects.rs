@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use crate::session::contracts::SessionStateDelta;
 use crate::state::stream::StateCommitStreamChange;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,7 +20,6 @@ pub(crate) struct FilesystemPayloadDomainChange {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct PlanEffects {
     pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
-    pub(crate) next_active_version_id: Option<String>,
-    pub(crate) next_active_account_ids: Option<Vec<String>>,
+    pub(crate) session_delta: SessionStateDelta,
     pub(crate) file_cache_refresh_targets: BTreeSet<(String, String)>,
 }

@@ -8,6 +8,7 @@ use sqlparser::ast::{
 use sqlparser::ast::{Visit, Visitor};
 
 use crate::live_state::is_untracked_live_table;
+use crate::session::contracts::SessionDependency;
 use crate::sql::execution::contracts::dependency_spec::{DependencyPrecision, DependencySpec};
 use crate::sql_support::binding::{bind_sql_with_state, parse_sql_statements, PlaceholderState};
 use crate::state::stream::StateCommitStreamFilter;
@@ -45,6 +46,7 @@ pub(crate) fn derive_dependency_spec_from_statements(
         };
 
         collect_relation_names_from_query(&query, &mut spec.relations);
+        collect_session_dependencies_from_query(&query, &mut spec.session_dependencies);
         if allow_literal_filters {
             let representable = collect_literal_filters_from_query(
                 &query,
@@ -86,31 +88,37 @@ fn finalize_dependency_spec(mut spec: DependencySpec) -> DependencySpec {
     let mut compiled_schema_keys = BTreeSet::new();
     let mut uses_dynamic_state_relations = false;
     let mut depends_on_active_version = false;
+    let mut depends_on_public_surface_registry = false;
 
     for relation in &spec.relations {
         match relation.as_str() {
             "lix_state" => {
                 uses_dynamic_state_relations = true;
                 depends_on_active_version = true;
+                depends_on_public_surface_registry = true;
             }
             "lix_state_by_version" | "lix_state_history" | "lix_state_history_by_version" => {
                 uses_dynamic_state_relations = true;
+                depends_on_public_surface_registry = true;
             }
             "lix_working_changes" => {
                 uses_dynamic_state_relations = true;
                 depends_on_active_version = true;
+                depends_on_public_surface_registry = true;
             }
             "lix_file"
             | "lix_file_by_version"
             | "lix_file_history"
             | "lix_file_history_by_version" => {
                 compiled_schema_keys.insert("lix_file_descriptor".to_string());
+                depends_on_public_surface_registry = true;
                 if relation == "lix_file" {
                     depends_on_active_version = true;
                 }
             }
             "lix_directory" | "lix_directory_by_version" | "lix_directory_history" => {
                 compiled_schema_keys.insert("lix_directory_descriptor".to_string());
+                depends_on_public_surface_registry = true;
                 if relation == "lix_directory" {
                     depends_on_active_version = true;
                 }
@@ -118,15 +126,11 @@ fn finalize_dependency_spec(mut spec: DependencySpec) -> DependencySpec {
             "lix_version" | "lix_version_by_version" => {
                 compiled_schema_keys.insert("lix_version_descriptor".to_string());
                 compiled_schema_keys.insert("lix_version_ref".to_string());
-            }
-            "lix_active_version" => {
-                compiled_schema_keys.insert("lix_active_version".to_string());
-            }
-            "lix_active_account" => {
-                compiled_schema_keys.insert("lix_active_account".to_string());
+                depends_on_public_surface_registry = true;
             }
             "lix_change" => {
                 compiled_schema_keys.insert("lix_change".to_string());
+                depends_on_public_surface_registry = true;
             }
             _ => {
                 if is_untracked_live_table(relation) {
@@ -135,6 +139,7 @@ fn finalize_dependency_spec(mut spec: DependencySpec) -> DependencySpec {
                 }
                 if relation.starts_with("lix_") && !relation.starts_with("lix_internal_") {
                     compiled_schema_keys.insert(normalize_relation_schema_key(relation));
+                    depends_on_public_surface_registry = true;
                 }
             }
         }
@@ -144,14 +149,22 @@ fn finalize_dependency_spec(mut spec: DependencySpec) -> DependencySpec {
         compiled_schema_keys.extend(spec.schema_keys.iter().cloned());
     }
     if depends_on_active_version {
-        compiled_schema_keys.insert("lix_active_version".to_string());
+        spec.session_dependencies
+            .insert(SessionDependency::ActiveVersion);
         spec.entity_ids.clear();
         spec.file_ids.clear();
         spec.version_ids.clear();
     }
+    if depends_on_public_surface_registry {
+        spec.session_dependencies
+            .insert(SessionDependency::PublicSurfaceRegistryGeneration);
+    }
 
     spec.schema_keys = compiled_schema_keys;
-    spec.depends_on_active_version = depends_on_active_version;
+    spec.depends_on_active_version = depends_on_active_version
+        || spec
+            .session_dependencies
+            .contains(&SessionDependency::ActiveVersion);
     spec
 }
 
@@ -187,6 +200,52 @@ fn collect_relation_names_from_query(query: &Query, relation_names: &mut BTreeSe
     }
 
     let mut collector = Collector { relation_names };
+    let _ = query.visit(&mut collector);
+}
+
+fn collect_session_dependencies_from_query(
+    query: &Query,
+    session_dependencies: &mut BTreeSet<SessionDependency>,
+) {
+    struct Collector<'a> {
+        session_dependencies: &'a mut BTreeSet<SessionDependency>,
+    }
+
+    impl Visitor for Collector<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            let Expr::Function(function) = expr else {
+                return ControlFlow::Continue(());
+            };
+            let Some(function_name) = function
+                .name
+                .0
+                .last()
+                .and_then(ObjectNamePart::as_ident)
+                .map(|ident| ident.value.to_ascii_lowercase())
+            else {
+                return ControlFlow::Continue(());
+            };
+
+            match function_name.as_str() {
+                "lix_active_version_id" => {
+                    self.session_dependencies
+                        .insert(SessionDependency::ActiveVersion);
+                }
+                "lix_active_account_ids" => {
+                    self.session_dependencies
+                        .insert(SessionDependency::ActiveAccounts);
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut collector = Collector {
+        session_dependencies,
+    };
     let _ = query.visit(&mut collector);
 }
 
@@ -447,6 +506,7 @@ mod tests {
         dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
         parse_sql_statements,
     };
+    use crate::session::contracts::SessionDependency;
     use crate::sql::execution::contracts::dependency_spec::DependencyPrecision;
     use crate::Value;
 
@@ -460,12 +520,12 @@ mod tests {
 
         assert_eq!(spec.precision, DependencyPrecision::Precise);
         assert!(spec.depends_on_active_version);
+        assert!(spec
+            .session_dependencies
+            .contains(&SessionDependency::ActiveVersion));
         assert_eq!(
             spec.schema_keys.iter().cloned().collect::<Vec<_>>(),
-            vec![
-                "lix_active_version".to_string(),
-                "lix_key_value".to_string()
-            ]
+            vec!["lix_key_value".to_string()]
         );
         assert!(spec.entity_ids.is_empty());
     }
@@ -479,10 +539,10 @@ mod tests {
         let spec = derive_dependency_spec_from_statements(&statements, &[]).expect("derive spec");
 
         assert_eq!(spec.precision, DependencyPrecision::Conservative);
-        assert_eq!(
-            spec.schema_keys.iter().cloned().collect::<Vec<_>>(),
-            vec!["lix_active_version".to_string()]
-        );
+        assert!(spec
+            .session_dependencies
+            .contains(&SessionDependency::ActiveVersion));
+        assert!(spec.schema_keys.is_empty());
         assert!(spec.entity_ids.is_empty());
         assert!(spec.file_ids.is_empty());
         assert!(spec.version_ids.is_empty());
@@ -539,6 +599,9 @@ mod tests {
             vec!["lix_key_value".to_string()]
         );
         assert!(!spec.depends_on_active_version);
+        assert!(spec
+            .session_dependencies
+            .contains(&SessionDependency::PublicSurfaceRegistryGeneration));
     }
 
     #[test]
@@ -551,12 +614,12 @@ mod tests {
         assert_eq!(spec.precision, DependencyPrecision::Precise);
         assert_eq!(
             spec.schema_keys.iter().cloned().collect::<Vec<_>>(),
-            vec![
-                "lix_active_version".to_string(),
-                "lix_file_descriptor".to_string()
-            ]
+            vec!["lix_file_descriptor".to_string()]
         );
         assert!(spec.depends_on_active_version);
+        assert!(spec
+            .session_dependencies
+            .contains(&SessionDependency::ActiveVersion));
     }
 
     #[test]
@@ -585,12 +648,12 @@ mod tests {
         .expect("parse sql");
         let spec = derive_dependency_spec_from_statements(&statements, &[]).expect("derive spec");
 
+        assert!(spec
+            .session_dependencies
+            .contains(&SessionDependency::ActiveVersion));
         assert_eq!(
             spec.schema_keys.iter().cloned().collect::<Vec<_>>(),
-            vec![
-                "lix_active_version".to_string(),
-                "lix_key_value".to_string()
-            ]
+            vec!["lix_key_value".to_string()]
         );
         assert!(spec.entity_ids.is_empty());
     }
@@ -649,6 +712,9 @@ mod tests {
         assert_eq!(spec.precision, DependencyPrecision::Precise);
         assert!(spec.schema_keys.contains("lix_key_value"));
         assert!(spec.depends_on_active_version);
+        assert!(spec
+            .session_dependencies
+            .contains(&SessionDependency::ActiveVersion));
     }
 
     #[test]

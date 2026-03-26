@@ -6,19 +6,6 @@ use serde_json::Value as JsonValue;
 use support::simulation_test::SimulationArgs;
 use uuid::Uuid;
 
-async fn insert_schema(engine: &support::simulation_test::SimulationEngine, schema: &str) {
-    engine
-        .execute(
-            &format!(
-                "INSERT INTO lix_registered_schema (value) VALUES ('{}')",
-                schema.replace('\'', "''")
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
-}
-
 fn text_to_json(value: &Value) -> JsonValue {
     match value {
         Value::Text(text) => serde_json::from_str(text).expect("valid json"),
@@ -51,11 +38,15 @@ simulation_test!(insert_applies_cel_default, |sim| async move {
 
     engine.initialize().await.unwrap();
 
-    insert_schema(
-        &engine,
-        r#"{"value":{"x-lix-key":"cel_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"slug":{"type":"string","x-lix-default":"name + '-slug'"}},"required":["name"],"additionalProperties":false}}"#,
-    )
-    .await;
+    engine
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                r#"{"x-lix-key":"cel_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"slug":{"type":"string","x-lix-default":"name + '-slug'"}},"required":["name"],"additionalProperties":false}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     engine
         .execute(
@@ -87,11 +78,15 @@ simulation_test!(
 
         engine.initialize().await.unwrap();
 
-        insert_schema(
-            &engine,
-            r#"{"value":{"x-lix-key":"cel_default_param_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"slug":{"type":"string","x-lix-default":"name + '-slug'"}},"required":["name"],"additionalProperties":false}}"#,
-        )
-        .await;
+        engine
+            .register_schema(
+                &serde_json::from_str::<serde_json::Value>(
+                    r#"{"x-lix-key":"cel_default_param_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"slug":{"type":"string","x-lix-default":"name + '-slug'"}},"required":["name"],"additionalProperties":false}"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
 
         engine
             .execute(
@@ -132,11 +127,15 @@ simulation_test!(
 
         engine.initialize().await.unwrap();
 
-        insert_schema(
-            &engine,
-            r#"{"value":{"x-lix-key":"cel_default_select_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"slug":{"type":"string","x-lix-default":"name + '-slug'"}},"required":["name"],"additionalProperties":false}}"#,
-        )
-        .await;
+        engine
+            .register_schema(
+                &serde_json::from_str::<serde_json::Value>(
+                    r#"{"x-lix-key":"cel_default_select_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"slug":{"type":"string","x-lix-default":"name + '-slug'"}},"required":["name"],"additionalProperties":false}"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
 
         engine
             .execute(
@@ -175,11 +174,15 @@ simulation_test!(insert_uses_json_default_fallback, |sim| async move {
 
     engine.initialize().await.unwrap();
 
-    insert_schema(
-        &engine,
-        r#"{"value":{"x-lix-key":"json_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"status":{"type":"string","default":"pending"}},"required":["name"],"additionalProperties":false}}"#,
-    )
-    .await;
+    engine
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                r#"{"x-lix-key":"json_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"status":{"type":"string","default":"pending"}},"required":["name"],"additionalProperties":false}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     engine
         .execute(
@@ -205,11 +208,15 @@ simulation_test!(insert_x_lix_default_overrides_default, |sim| async move {
 
     engine.initialize().await.unwrap();
 
-    insert_schema(
-        &engine,
-        r#"{"value":{"x-lix-key":"override_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"status":{"type":"string","default":"pending","x-lix-default":"'computed'"}},"required":["name"],"additionalProperties":false}}"#,
-    )
-    .await;
+    engine
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                r#"{"x-lix-key":"override_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"status":{"type":"string","default":"pending","x-lix-default":"'computed'"}},"required":["name"],"additionalProperties":false}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     engine
         .execute(
@@ -238,11 +245,15 @@ simulation_test!(insert_does_not_override_explicit_null, |sim| async move {
 
     engine.initialize().await.unwrap();
 
-    insert_schema(
-        &engine,
-        r#"{"value":{"x-lix-key":"null_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"status":{"anyOf":[{"type":"string"},{"type":"null"}],"x-lix-default":"'computed'"}},"required":["name"],"additionalProperties":false}}"#,
-    )
-    .await;
+    engine
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                r#"{"x-lix-key":"null_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"status":{"anyOf":[{"type":"string"},{"type":"null"}],"x-lix-default":"'computed'"}},"required":["name"],"additionalProperties":false}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     engine
         .execute(
@@ -268,11 +279,15 @@ simulation_test!(update_does_not_backfill_defaults, |sim| async move {
 
     engine.initialize().await.unwrap();
 
-    insert_schema(
-        &engine,
-        r#"{"value":{"x-lix-key":"update_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"slug":{"type":"string","x-lix-default":"name + '-slug'"}},"required":["name"],"additionalProperties":false}}"#,
-    )
-    .await;
+    engine
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                r#"{"x-lix-key":"update_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"slug":{"type":"string","x-lix-default":"name + '-slug'"}},"required":["name"],"additionalProperties":false}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     engine
         .execute(
@@ -306,11 +321,15 @@ async fn run_insert_applies_uuid_function_default(sim: SimulationArgs) {
     engine.initialize().await.unwrap();
     enable_deterministic_mode(&engine).await;
 
-    insert_schema(
-        &engine,
-        r#"{"value":{"x-lix-key":"uuid_fn_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"token":{"type":"string","x-lix-default":"lix_uuid_v7()"}},"required":["name"],"additionalProperties":false}}"#,
-    )
-    .await;
+    engine
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                r#"{"x-lix-key":"uuid_fn_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"token":{"type":"string","x-lix-default":"lix_uuid_v7()"}},"required":["name"],"additionalProperties":false}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     engine
         .execute(
@@ -348,11 +367,15 @@ async fn run_insert_applies_timestamp_function_default(sim: SimulationArgs) {
     engine.initialize().await.unwrap();
     enable_deterministic_mode(&engine).await;
 
-    insert_schema(
-        &engine,
-        r#"{"value":{"x-lix-key":"timestamp_fn_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"created_at":{"type":"string","x-lix-default":"lix_timestamp()"}},"required":["name"],"additionalProperties":false}}"#,
-    )
-    .await;
+    engine
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                r#"{"x-lix-key":"timestamp_fn_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"created_at":{"type":"string","x-lix-default":"lix_timestamp()"}},"required":["name"],"additionalProperties":false}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     engine
         .execute(
@@ -397,11 +420,15 @@ simulation_test!(insert_fails_on_unknown_cel_variable, |sim| async move {
 
     engine.initialize().await.unwrap();
 
-    insert_schema(
-        &engine,
-        r#"{"value":{"x-lix-key":"unknown_var_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"slug":{"type":"string","x-lix-default":"missing_var + '-slug'"}},"required":["name"],"additionalProperties":false}}"#,
-    )
-    .await;
+    engine
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                r#"{"x-lix-key":"unknown_var_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"slug":{"type":"string","x-lix-default":"missing_var + '-slug'"}},"required":["name"],"additionalProperties":false}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     let result = engine
         .execute(
