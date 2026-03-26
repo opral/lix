@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::functions::SharedFunctionProvider;
-use crate::live_state::SchemaRegistration;
-use crate::schema::registry::coalesce_live_table_requirements;
+use crate::live_state::{coalesce_live_table_requirements, SchemaRegistration};
 use crate::LixError;
 
 use super::{
@@ -427,7 +426,7 @@ fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> Schem
                 ) {
                     match requirement.layout.as_ref() {
                         Some(layout) => {
-                            registrations.insert(SchemaRegistration::with_legacy_layout(
+                            registrations.insert(SchemaRegistration::with_layout(
                                 requirement.schema_key.clone(),
                                 layout,
                             ))
@@ -447,7 +446,7 @@ fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> Schem
                 {
                     match requirement.layout.as_ref() {
                         Some(layout) => {
-                            registrations.insert(SchemaRegistration::with_legacy_layout(
+                            registrations.insert(SchemaRegistration::with_layout(
                                 requirement.schema_key.clone(),
                                 layout,
                             ))

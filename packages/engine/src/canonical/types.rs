@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::change_view::TrackedDomainChangeView;
-use crate::schema::live_layout::LiveTableLayout;
+use crate::live_state::LiveTableLayout;
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
     FileId, VersionId,

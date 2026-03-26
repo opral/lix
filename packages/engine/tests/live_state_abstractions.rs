@@ -84,3 +84,43 @@ fn schema_registration_hides_legacy_bridge_fields() {
         "layout_override should stay behind internal accessors"
     );
 }
+
+#[test]
+fn live_state_storage_layout_is_the_only_live_layout_owner() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema_mod = read_engine_source("schema/mod.rs");
+    let live_state_layout = read_engine_source("live_state/storage/layout.rs");
+
+    assert!(
+        !schema_mod.contains("mod live_layout;"),
+        "schema/mod.rs must not wire a parallel live_layout module"
+    );
+    assert!(
+        !schema_mod.contains("mod registry;"),
+        "schema/mod.rs must not wire the old schema registry live-layout owner"
+    );
+    assert!(
+        live_state_layout.contains("struct LiveTableLayout"),
+        "live_state/storage/layout.rs should define the owned LiveTableLayout"
+    );
+    assert!(
+        live_state_layout.contains("logical_live_snapshot_from_row_with_layout"),
+        "snapshot reconstruction should live under live_state/storage/layout.rs"
+    );
+    assert!(
+        !manifest_dir.join("src/schema/live_layout.rs").exists(),
+        "schema/live_layout.rs should stay removed"
+    );
+    assert!(
+        !manifest_dir.join("src/schema/registry.rs").exists(),
+        "schema/registry.rs should stay removed"
+    );
+    assert!(
+        !manifest_dir.join("src/schema/live_store.rs").exists(),
+        "schema/live_store.rs should stay removed"
+    );
+    assert!(
+        !manifest_dir.join("src/state/materialization").exists(),
+        "dead state/materialization subtree should stay removed"
+    );
+}

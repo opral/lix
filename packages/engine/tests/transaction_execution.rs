@@ -1605,7 +1605,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    transaction_path_handles_large_vtable_insert_batch_without_sqlite_variable_overflow,
+    transaction_path_handles_large_state_surface_insert_batch_without_sqlite_variable_overflow,
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
@@ -1623,7 +1623,7 @@ simulation_test!(
                 })
             })
             .await
-            .expect("large vtable insert should not fail with SQL variable overflow");
+            .expect("large state-surface insert should not fail with SQL variable overflow");
     }
 );
 

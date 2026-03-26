@@ -1,5 +1,5 @@
 use crate::backend::SqlDialect;
-use crate::schema::live_layout::{builtin_live_table_layout, LiveColumnKind, LiveTableLayout};
+use crate::live_state::{builtin_live_table_layout, LiveColumnKind, LiveTableLayout};
 use crate::LixError;
 
 pub(crate) fn live_snapshot_select_expr_for_schema(

@@ -22,6 +22,7 @@ pub mod untracked;
 
 use crate::{LixBackend, LixBackendTransaction, LixError};
 use serde_json::Value as JsonValue;
+use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
 
 pub use lifecycle::{CanonicalWatermark, LiveStateMode, LiveStateReadiness};
 pub use materialize::{
@@ -45,7 +46,7 @@ pub struct SchemaRegistration {
 enum SchemaRegistrationSource {
     #[default]
     StoredLayout,
-    LegacyLayout(storage::LiveTableLayout),
+    Layout(storage::LiveTableLayout),
 }
 
 impl From<&str> for SchemaRegistration {
@@ -84,14 +85,14 @@ impl SchemaRegistration {
         }
     }
 
-    pub(crate) fn with_legacy_layout(
+    pub(crate) fn with_layout(
         schema_key: impl Into<String>,
-        layout: &crate::schema::live_layout::LiveTableLayout,
+        layout: &storage::LiveTableLayout,
     ) -> Self {
         Self {
             schema_key: schema_key.into(),
             registered_snapshot: None,
-            source: SchemaRegistrationSource::LegacyLayout(storage_layout_from_legacy(layout)),
+            source: SchemaRegistrationSource::Layout(layout.clone()),
         }
     }
 
@@ -102,7 +103,7 @@ impl SchemaRegistration {
     pub(crate) fn layout_override(&self) -> Option<&storage::LiveTableLayout> {
         match &self.source {
             SchemaRegistrationSource::StoredLayout => None,
-            SchemaRegistrationSource::LegacyLayout(layout) => Some(layout),
+            SchemaRegistrationSource::Layout(layout) => Some(layout),
         }
     }
 }
@@ -227,43 +228,34 @@ pub(crate) use lifecycle::LIVE_STATE_SCHEMA_EPOCH;
 pub(crate) use materialize::{
     apply_live_state_scope_in_transaction, live_state_rebuild_plan_with_executor,
 };
+#[allow(unused_imports)]
 pub(crate) use storage::{
-    is_untracked_live_table, load_live_row_access_for_table_name,
+    builtin_live_table_layout, compile_registered_live_layout, is_untracked_live_table,
+    ensure_schema_live_table_with_requirement_in_transaction,
+    json_value_from_live_row_cell, live_column_name_for_property, live_schema_key_for_table_name,
+    live_table_layout_from_schema, load_live_row_access_for_table_name,
     load_live_row_access_with_backend, load_live_row_access_with_executor,
-    logical_snapshot_from_projected_row, normalized_live_column_values, LiveRowAccess,
+    load_live_table_layout_in_transaction, load_live_table_layout_with_backend,
+    load_live_table_layout_with_executor, logical_live_snapshot_from_row_with_layout,
+    logical_snapshot_from_projected_row, merge_live_table_layouts, normalized_live_column_values,
+    normalized_live_returning_columns, normalized_live_returning_columns_for_layout,
+    render_normalized_live_projection_sql, tracked_live_table_name, untracked_live_table_name,
+    LiveColumnKind, LiveColumnSpec, LiveRowAccess, LiveTableLayout, LiveTableRequirement,
 };
 
-fn storage_layout_from_legacy(
-    layout: &crate::schema::live_layout::LiveTableLayout,
-) -> storage::LiveTableLayout {
-    storage::LiveTableLayout {
-        schema_key: layout.schema_key.clone(),
-        columns: layout
-            .columns
-            .iter()
-            .map(|column| storage::LiveColumnSpec {
-                property_name: column.property_name.clone(),
-                column_name: column.column_name.clone(),
-                required: column.required,
-                nullable: column.nullable,
-                kind: match column.kind {
-                    crate::schema::live_layout::LiveColumnKind::String => {
-                        storage::LiveColumnKind::String
-                    }
-                    crate::schema::live_layout::LiveColumnKind::Integer => {
-                        storage::LiveColumnKind::Integer
-                    }
-                    crate::schema::live_layout::LiveColumnKind::Number => {
-                        storage::LiveColumnKind::Number
-                    }
-                    crate::schema::live_layout::LiveColumnKind::Boolean => {
-                        storage::LiveColumnKind::Boolean
-                    }
-                    crate::schema::live_layout::LiveColumnKind::JsonText => {
-                        storage::LiveColumnKind::JsonText
-                    }
-                },
+pub(crate) fn coalesce_live_table_requirements(
+    requirements: &[SchemaLiveTableRequirement],
+) -> Vec<SchemaLiveTableRequirement> {
+    let mut by_schema = std::collections::BTreeMap::<String, SchemaLiveTableRequirement>::new();
+    for requirement in requirements {
+        by_schema
+            .entry(requirement.schema_key.clone())
+            .and_modify(|existing| {
+                if existing.layout.is_none() && requirement.layout.is_some() {
+                    existing.layout = requirement.layout.clone();
+                }
             })
-            .collect(),
+            .or_insert_with(|| requirement.clone());
     }
+    by_schema.into_values().collect()
 }

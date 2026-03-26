@@ -6,9 +6,7 @@ use crate::filesystem::history::{
     DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
     FileHistoryRootScope, FileHistoryRow, FileHistoryVersionScope,
 };
-use crate::live_state::register_schema;
-use crate::schema::live_layout::LiveTableLayout;
-use crate::schema::registry::load_live_table_layout_with_backend;
+use crate::live_state::{builtin_live_table_layout, load_live_table_layout_with_backend, register_schema, LiveTableLayout};
 use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::public::catalog::SurfaceBinding;
 use crate::sql::public::planner::backend::lowerer::{
@@ -1202,7 +1200,7 @@ async fn load_known_live_layouts_for_dependency_spec(
 ) -> Result<BTreeMap<String, LiveTableLayout>, LixError> {
     let mut layouts = BTreeMap::new();
     for schema_key in required_schema_keys_from_dependency_spec(dependency_spec) {
-        if let Some(layout) = crate::schema::live_layout::builtin_live_table_layout(&schema_key)? {
+        if let Some(layout) = builtin_live_table_layout(&schema_key)? {
             layouts.insert(schema_key, layout);
             continue;
         }
@@ -1228,7 +1226,7 @@ async fn load_known_live_layouts_for_public_read(
         {
             if !layouts.contains_key(schema_key) {
                 if let Some(layout) =
-                    crate::schema::live_layout::builtin_live_table_layout(schema_key)?
+                    builtin_live_table_layout(schema_key)?
                 {
                     layouts.insert(schema_key.clone(), layout);
                 } else {
@@ -1241,7 +1239,7 @@ async fn load_known_live_layouts_for_public_read(
             if layouts.contains_key(schema_key) {
                 continue;
             }
-            if let Some(layout) = crate::schema::live_layout::builtin_live_table_layout(schema_key)?
+            if let Some(layout) = builtin_live_table_layout(schema_key)?
             {
                 layouts.insert(schema_key.clone(), layout);
                 continue;

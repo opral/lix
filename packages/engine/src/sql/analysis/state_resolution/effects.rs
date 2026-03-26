@@ -1,5 +1,5 @@
 use crate::engine::direct_state_file_cache_refresh_targets;
-use crate::schema::live_layout::untracked_live_table_name;
+use crate::live_state::untracked_live_table_name;
 use crate::state::stream::state_commit_stream_changes_from_mutations;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,

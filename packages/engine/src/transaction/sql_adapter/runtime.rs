@@ -7,8 +7,7 @@ use crate::engine::{
     normalize_sql_execution_error_with_backend, Engine, TransactionBackendAdapter,
 };
 use crate::functions::SharedFunctionProvider;
-use crate::live_state::SchemaRegistration;
-use crate::schema::registry::coalesce_live_table_requirements;
+use crate::live_state::{coalesce_live_table_requirements, SchemaRegistration};
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::contracts::executor_error::ExecutorError;
 use crate::sql::execution::contracts::planned_statement::{
@@ -286,7 +285,7 @@ fn build_compiled_execution_schema_registrations(
     if let Some(internal) = execution.internal_execution() {
         for requirement in coalesce_live_table_requirements(&internal.live_table_requirements) {
             match requirement.layout.as_ref() {
-                Some(layout) => registrations.insert(SchemaRegistration::with_legacy_layout(
+                Some(layout) => registrations.insert(SchemaRegistration::with_layout(
                     requirement.schema_key.clone(),
                     layout,
                 )),

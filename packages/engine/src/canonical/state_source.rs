@@ -592,7 +592,7 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
 mod tests {
     use super::*;
     use crate::backend::LixBackendTransaction;
-    use crate::schema::live_layout::{builtin_live_table_layout, LiveRowAccess};
+    use crate::live_state::{builtin_live_table_layout, LiveRowAccess};
     use crate::QueryResult;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, Ordering};

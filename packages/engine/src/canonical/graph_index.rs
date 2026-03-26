@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
 
-use crate::schema::live_layout::{
+use crate::live_state::{
     builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
 };
 use crate::sql_support::binding::bind_sql;

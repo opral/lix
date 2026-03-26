@@ -10,8 +10,9 @@ use crate::deterministic_mode::DeterministicSettings;
 use crate::engine::Engine;
 use crate::engine::TransactionBackendAdapter;
 use crate::functions::LixFunctionProvider;
-use crate::schema::live_layout::{normalized_live_column_values, tracked_live_table_name};
-use crate::schema::registry::load_live_table_layout_in_transaction;
+use crate::live_state::{
+    load_live_table_layout_in_transaction, normalized_live_column_values, tracked_live_table_name,
+};
 use crate::sql::public::validation::{validate_commit_time_write, SchemaCache};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
@@ -601,7 +602,7 @@ fn value_as_bool(value: &Value) -> Option<bool> {
 }
 
 fn normalized_untracked_live_column_values_for_row(
-    layout: Option<&crate::schema::live_layout::LiveTableLayout>,
+    layout: Option<&crate::live_state::LiveTableLayout>,
     snapshot_content: Option<&str>,
 ) -> Result<Vec<(String, Value)>, LixError> {
     let Some(layout) = layout else {

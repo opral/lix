@@ -10,12 +10,12 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::live_state) struct LiveTableRequirement {
+pub(crate) struct LiveTableRequirement {
     pub(crate) schema_key: String,
     pub(crate) layout: Option<LiveTableLayout>,
 }
 
-pub(in crate::live_state) async fn register_schema(
+pub(crate) async fn register_schema(
     backend: &dyn LixBackend,
     registration: &SchemaRegistration,
 ) -> Result<(), LixError> {
@@ -26,7 +26,7 @@ pub(in crate::live_state) async fn register_schema(
     .await
 }
 
-pub(in crate::live_state) async fn register_schema_in_transaction(
+pub(crate) async fn register_schema_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     registration: &SchemaRegistration,
 ) -> Result<(), LixError> {
@@ -37,7 +37,7 @@ pub(in crate::live_state) async fn register_schema_in_transaction(
     .await
 }
 
-pub(in crate::live_state) async fn ensure_schema_live_table_with_requirement(
+pub(crate) async fn ensure_schema_live_table_with_requirement(
     backend: &dyn LixBackend,
     requirement: &LiveTableRequirement,
 ) -> Result<(), LixError> {
@@ -53,7 +53,7 @@ pub(in crate::live_state) async fn ensure_schema_live_table_with_requirement(
     Ok(())
 }
 
-pub(in crate::live_state) async fn ensure_schema_live_table_with_requirement_in_transaction(
+pub(crate) async fn ensure_schema_live_table_with_requirement_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     requirement: &LiveTableRequirement,
 ) -> Result<(), LixError> {
@@ -71,7 +71,7 @@ pub(in crate::live_state) async fn ensure_schema_live_table_with_requirement_in_
     Ok(())
 }
 
-pub(in crate::live_state) async fn load_live_table_layout_with_backend(
+pub(crate) async fn load_live_table_layout_with_backend(
     backend: &dyn LixBackend,
     schema_key: &str,
 ) -> Result<LiveTableLayout, LixError> {
@@ -79,7 +79,7 @@ pub(in crate::live_state) async fn load_live_table_layout_with_backend(
     load_live_table_layout_with_provider(&mut provider, schema_key).await
 }
 
-pub(in crate::live_state) async fn load_live_table_layout_in_transaction(
+pub(crate) async fn load_live_table_layout_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     schema_key: &str,
 ) -> Result<LiveTableLayout, LixError> {
@@ -177,7 +177,7 @@ fn layout_from_registered_snapshot(
     live_table_layout_from_schema(&schema)
 }
 
-pub(in crate::live_state) fn compile_registered_live_layout(
+pub(crate) fn compile_registered_live_layout(
     schema_key: &str,
     rows: Vec<Vec<Value>>,
 ) -> Result<LiveTableLayout, LixError> {

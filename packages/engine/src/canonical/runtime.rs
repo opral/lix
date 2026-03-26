@@ -10,15 +10,13 @@ use crate::account::{
 };
 use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::functions::LixFunctionProvider;
+use crate::live_state::{
+    builtin_live_table_layout, load_live_table_layout_with_executor, normalized_live_column_values,
+    tracked_live_table_name, untracked_live_table_name,
+};
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
-use crate::schema::live_layout::load_live_table_layout_with_executor;
 use crate::sql_support::binding::bind_statement_ast;
 use crate::sql_support::text::{escape_sql_string, quote_ident};
-
-use crate::schema::live_layout::{
-    builtin_live_table_layout, normalized_live_column_values, tracked_live_table_name,
-    untracked_live_table_name,
-};
 use crate::{LixError, SqlDialect, Value as EngineValue};
 
 use super::graph_index::{
@@ -313,7 +311,7 @@ fn max_bind_parameters_for_dialect(dialect: SqlDialect) -> usize {
 async fn load_live_layouts_for_rows_with_executor(
     executor: &mut dyn CommitQueryExecutor,
     rows: &[MaterializedStateRow],
-) -> Result<BTreeMap<String, crate::schema::live_layout::LiveTableLayout>, LixError> {
+) -> Result<BTreeMap<String, crate::live_state::LiveTableLayout>, LixError> {
     let mut layouts = BTreeMap::new();
     let schema_keys = rows
         .iter()
@@ -441,7 +439,7 @@ fn optional_text_param_expr(
 }
 
 fn normalized_live_column_values_for_row(
-    layout: Option<&crate::schema::live_layout::LiveTableLayout>,
+    layout: Option<&crate::live_state::LiveTableLayout>,
     snapshot_content: Option<&str>,
 ) -> Result<Vec<(String, EngineValue)>, LixError> {
     let Some(layout) = layout else {
@@ -454,7 +452,7 @@ fn normalized_live_column_values_for_row(
 }
 
 fn live_state_insert_columns(
-    layout: Option<&crate::schema::live_layout::LiveTableLayout>,
+    layout: Option<&crate::live_state::LiveTableLayout>,
     _untracked: bool,
 ) -> Vec<Ident> {
     let mut columns = vec![
@@ -486,7 +484,7 @@ fn live_state_insert_columns(
 
 fn live_state_row_values_parameterized(
     row: &MaterializedStateRow,
-    _layout: Option<&crate::schema::live_layout::LiveTableLayout>,
+    _layout: Option<&crate::live_state::LiveTableLayout>,
     untracked: bool,
     normalized_columns: &[(String, EngineValue)],
     next_placeholder: &mut usize,

@@ -15,7 +15,7 @@ fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     )
 }
 
-simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
+simulation_test!(key_value_crud_is_handled_through_state_surface, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)
         .await

@@ -4,11 +4,11 @@ use crate::errors::{
 };
 use crate::filesystem::history::{DirectoryHistoryRequest, FileHistoryRequest};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
-use crate::schema::builtin::builtin_schema_definition;
-use crate::schema::live_layout::{
+use crate::live_state::{
     builtin_live_table_layout, live_column_name_for_property, live_table_layout_from_schema,
     untracked_live_table_name,
 };
+use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::common::dependency_spec::DependencySpec;
@@ -2768,7 +2768,7 @@ mod tests {
         prepare_public_read_strict, DirectPublicReadPlan, PreparedPublicExecution,
         PreparedPublicReadExecution,
     };
-    use crate::schema::live_layout::{builtin_live_table_layout, normalized_live_column_values};
+    use crate::live_state::{builtin_live_table_layout, normalized_live_column_values};
     use crate::state::history::StateHistoryRootScope;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
