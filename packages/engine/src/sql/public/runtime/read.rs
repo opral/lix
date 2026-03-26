@@ -1411,9 +1411,7 @@ fn build_state_history_having(
     .map(Some)
 }
 
-fn required_requested_version_id(
-    structured_read: &StructuredPublicRead,
-) -> Result<&str, LixError> {
+fn required_requested_version_id(structured_read: &StructuredPublicRead) -> Result<&str, LixError> {
     structured_read
         .bound_statement
         .execution_context

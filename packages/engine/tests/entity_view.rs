@@ -80,22 +80,22 @@ async fn install_global_override_schema(
 ) {
     engine
         .register_schema(&json!({
-        "x-lix-key": schema_key,
-        "x-lix-version": "1",
-        "x-lix-primary-key": ["/id"],
-        "x-lix-override-lixcols": {
-            "lixcol_file_id": "\"lix\"",
-            "lixcol_plugin_key": "\"lix\"",
-            "lixcol_global": "true",
-        },
-        "type": "object",
-        "properties": {
-            "id": { "type": "string" },
-            "name": { "type": "string" },
-        },
-        "required": ["id"],
-        "additionalProperties": false,
-    }))
+            "x-lix-key": schema_key,
+            "x-lix-version": "1",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-override-lixcols": {
+                "lixcol_file_id": "\"lix\"",
+                "lixcol_plugin_key": "\"lix\"",
+                "lixcol_global": "true",
+            },
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "name": { "type": "string" },
+            },
+            "required": ["id"],
+            "additionalProperties": false,
+        }))
         .await
         .unwrap();
 }

@@ -820,10 +820,7 @@ fn rewrite_public_read_statement_to_lowered_sql_with_registry(
     registry: &SurfaceRegistry,
 ) -> Result<Statement, LixError> {
     rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id(
-        statement,
-        registry,
-        dialect,
-        None,
+        statement, registry, dialect, None,
     )?;
     lower_statement(statement.clone(), dialect)
 }
@@ -2744,12 +2741,11 @@ mod tests {
         prepare_public_read_strict, DirectPublicReadPlan, PreparedPublicExecution,
         PreparedPublicReadExecution,
     };
-    use crate::live_state::{builtin_live_table_layout, normalized_live_column_values};
     use crate::state::history::StateHistoryRootScope;
-    use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
+    use crate::{LixBackend, LixError, QueryResult, Session, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::json;
-    use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor};
+    use sqlparser::ast::Statement;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
     use std::collections::HashMap;
@@ -2757,8 +2753,6 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         registered_schema_rows: HashMap<String, String>,
-        version_descriptor_rows: HashMap<String, String>,
-        version_ref_rows: HashMap<String, String>,
         change_rows: Vec<Vec<Value>>,
         untracked_rows: Vec<Vec<Value>>,
     }
@@ -2833,145 +2827,6 @@ mod tests {
                     ],
                 });
             }
-            if sql.contains("FROM lix_internal_change c")
-                && sql.contains("c.schema_key = 'lix_version_descriptor'")
-            {
-                let rows = self
-                    .version_descriptor_rows
-                    .iter()
-                    .filter(|(version_id, _)| {
-                        sql.contains(&format!("c.entity_id = '{}'", version_id))
-                            || sql.contains(&format!("'{}'", version_id))
-                    })
-                    .map(|(_, snapshot)| {
-                        vec![
-                            Value::Text(snapshot.clone()),
-                            Value::Text("descriptor-change".to_string()),
-                        ]
-                    })
-                    .collect::<Vec<_>>();
-                return Ok(QueryResult {
-                    rows,
-                    columns: vec!["snapshot_content".to_string(), "change_id".to_string()],
-                });
-            }
-            if sql.contains("FROM lix_internal_live_v1_lix_version_descriptor") {
-                if sql.contains("SELECT entity_id") {
-                    let rows = self
-                        .version_descriptor_rows
-                        .iter()
-                        .filter(|(_, snapshot)| snapshot.contains("\"name\":\"main\""))
-                        .map(|(version_id, _)| vec![Value::Text(version_id.clone())])
-                        .collect::<Vec<_>>();
-                    return Ok(QueryResult {
-                        rows,
-                        columns: vec!["entity_id".to_string()],
-                    });
-                }
-                let rows = self
-                    .version_descriptor_rows
-                    .iter()
-                    .filter(|(version_id, _)| {
-                        sql.contains(&format!("entity_id = '{}'", version_id))
-                            || sql.contains(&format!("'{}'", version_id))
-                    })
-                    .map(|(_, snapshot)| {
-                        if sql.contains("change_id") {
-                            vec![
-                                Value::Text(snapshot.clone()),
-                                Value::Text("descriptor-change".to_string()),
-                            ]
-                        } else {
-                            vec![Value::Text(snapshot.clone())]
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                return Ok(QueryResult {
-                    rows,
-                    columns: if sql.contains("change_id") {
-                        vec!["snapshot_content".to_string(), "change_id".to_string()]
-                    } else {
-                        vec!["snapshot_content".to_string()]
-                    },
-                });
-            }
-            if sql.contains("FROM lix_internal_change c")
-                && sql.contains("c.schema_key = 'lix_version_ref'")
-            {
-                let rows = self
-                    .version_ref_rows
-                    .iter()
-                    .filter(|(version_id, _)| {
-                        sql.contains(&format!("c.entity_id = '{}'", version_id))
-                            || sql.contains(&format!("'{}'", version_id))
-                    })
-                    .map(|(version_id, snapshot)| {
-                        if sql.contains("SELECT c.entity_id, s.content AS snapshot_content") {
-                            vec![
-                                Value::Text(version_id.clone()),
-                                Value::Text(snapshot.clone()),
-                            ]
-                        } else {
-                            vec![Value::Text(snapshot.clone())]
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                return Ok(QueryResult {
-                    rows,
-                    columns: if sql.contains("SELECT c.entity_id, s.content AS snapshot_content") {
-                        vec!["entity_id".to_string(), "snapshot_content".to_string()]
-                    } else {
-                        vec!["snapshot_content".to_string()]
-                    },
-                });
-            }
-            if query_targets_table(sql, "lix_internal_live_v1_lix_version_ref") {
-                let rows = self
-                    .version_ref_rows
-                    .iter()
-                    .filter(|(version_id, _)| {
-                        query_has_text_equality(sql, "entity_id", version_id)
-                            || sql.contains(&format!("'{}'", version_id))
-                    })
-                    .map(|(version_id, snapshot)| build_version_ref_live_row(version_id, snapshot))
-                    .collect::<Vec<_>>();
-                return Ok(QueryResult {
-                    rows,
-                    columns: vec![
-                        "entity_id".to_string(),
-                        "schema_key".to_string(),
-                        "schema_version".to_string(),
-                        "file_id".to_string(),
-                        "version_id".to_string(),
-                        "global".to_string(),
-                        "plugin_key".to_string(),
-                        "metadata".to_string(),
-                        "writer_key".to_string(),
-                        "created_at".to_string(),
-                        "updated_at".to_string(),
-                        "commit_id".to_string(),
-                        "id".to_string(),
-                    ],
-                });
-            }
-            if sql.contains("FROM lix_internal_change c")
-                && sql.contains("c.schema_key = 'lix_version_ref'")
-                && sql.contains("c.entity_id = 'global'")
-            {
-                let rows = self
-                    .version_ref_rows
-                    .iter()
-                    .filter(|(version_id, _)| {
-                        sql.contains(&format!("c.entity_id = '{}'", version_id))
-                            || sql.contains(&format!("'{}'", version_id))
-                    })
-                    .map(|(_, snapshot)| vec![Value::Text(snapshot.clone())])
-                    .collect::<Vec<_>>();
-                return Ok(QueryResult {
-                    rows,
-                    columns: vec!["snapshot_content".to_string()],
-                });
-            }
             if sql.contains("SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at")
                 && sql.contains("FROM lix_internal_change c")
             {
@@ -3018,117 +2873,6 @@ mod tests {
 
     fn parse_one(sql: &str) -> Vec<Statement> {
         Parser::parse_sql(&GenericDialect {}, sql).expect("SQL should parse")
-    }
-
-    fn query_targets_table(sql: &str, table_name: &str) -> bool {
-        let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
-            return false;
-        };
-        statements
-            .iter()
-            .any(|statement| statement_targets_table(statement, table_name))
-    }
-
-    fn statement_targets_table(statement: &Statement, table_name: &str) -> bool {
-        match statement {
-            Statement::Query(query) => query_targets_table_name(query, table_name),
-            _ => false,
-        }
-    }
-
-    fn query_targets_table_name(query: &Query, table_name: &str) -> bool {
-        match query.body.as_ref() {
-            SetExpr::Select(select) => select.from.iter().any(|table_with_joins| {
-                table_factor_targets_table(&table_with_joins.relation, table_name)
-                    || table_with_joins
-                        .joins
-                        .iter()
-                        .any(|join| table_factor_targets_table(&join.relation, table_name))
-            }),
-            SetExpr::Query(query) => query_targets_table_name(query, table_name),
-            _ => false,
-        }
-    }
-
-    fn table_factor_targets_table(table_factor: &TableFactor, table_name: &str) -> bool {
-        match table_factor {
-            TableFactor::Table { name, .. } => name
-                .0
-                .last()
-                .and_then(|part| part.as_ident())
-                .map(|ident| ident.value.eq_ignore_ascii_case(table_name))
-                .unwrap_or(false),
-            TableFactor::Derived { subquery, .. } => query_targets_table_name(subquery, table_name),
-            _ => false,
-        }
-    }
-
-    fn query_has_text_equality(sql: &str, column_name: &str, expected: &str) -> bool {
-        let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
-            return false;
-        };
-        statements
-            .iter()
-            .any(|statement| statement_has_text_equality(statement, column_name, expected))
-    }
-
-    fn statement_has_text_equality(
-        statement: &Statement,
-        column_name: &str,
-        expected: &str,
-    ) -> bool {
-        match statement {
-            Statement::Query(query) => query_has_where_text_equality(query, column_name, expected),
-            _ => false,
-        }
-    }
-
-    fn query_has_where_text_equality(query: &Query, column_name: &str, expected: &str) -> bool {
-        match query.body.as_ref() {
-            SetExpr::Select(select) => select
-                .selection
-                .as_ref()
-                .is_some_and(|expr| expr_has_text_equality(expr, column_name, expected)),
-            SetExpr::Query(query) => query_has_where_text_equality(query, column_name, expected),
-            _ => false,
-        }
-    }
-
-    fn expr_has_text_equality(expr: &Expr, column_name: &str, expected: &str) -> bool {
-        match expr {
-            Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => {
-                expr_identifier_name(left)
-                    .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
-                    && expr_single_quoted_text(right).is_some_and(|value| value == expected)
-                    || expr_identifier_name(right)
-                        .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
-                        && expr_single_quoted_text(left).is_some_and(|value| value == expected)
-            }
-            Expr::BinaryOp { left, right, .. } => {
-                expr_has_text_equality(left, column_name, expected)
-                    || expr_has_text_equality(right, column_name, expected)
-            }
-            Expr::Nested(inner) => expr_has_text_equality(inner, column_name, expected),
-            _ => false,
-        }
-    }
-
-    fn expr_identifier_name(expr: &Expr) -> Option<&str> {
-        match expr {
-            Expr::Identifier(ident) => Some(ident.value.as_str()),
-            Expr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.as_str()),
-            _ => None,
-        }
-    }
-
-    fn expr_single_quoted_text(expr: &Expr) -> Option<&str> {
-        match expr {
-            Expr::Value(sqlparser::ast::ValueWithSpan {
-                value: sqlparser::ast::Value::SingleQuotedString(text),
-                ..
-            }) => Some(text.as_str()),
-            _ => None,
-        }
     }
 
     fn extract_sql_string_filter(sql: &str, column: &str) -> Option<String> {
@@ -3221,34 +2965,41 @@ mod tests {
         ]]
     }
 
-    fn build_version_ref_live_row(version_id: &str, snapshot: &str) -> Vec<Value> {
-        let layout = builtin_live_table_layout(crate::version::version_ref_schema_key())
-            .expect("builtin layout should load")
-            .expect("version ref layout should exist");
-        let normalized = normalized_live_column_values(&layout, Some(snapshot))
-            .expect("version ref test snapshot must normalize");
-        let mut row = vec![
-            Value::Text(version_id.to_string()),
-            Value::Text(crate::version::version_ref_schema_key().to_string()),
-            Value::Text(crate::version::version_ref_schema_version().to_string()),
-            Value::Text(crate::version::version_ref_file_id().to_string()),
-            Value::Text(crate::version::version_ref_storage_version_id().to_string()),
-            Value::Boolean(true),
-            Value::Text(crate::version::version_ref_plugin_key().to_string()),
-            Value::Null,
-            Value::Null,
-            Value::Text("2026-03-06T18:00:02Z".to_string()),
-            Value::Text("2026-03-06T18:00:02Z".to_string()),
-        ];
-        for column in &layout.columns {
-            row.push(
-                normalized
-                    .get(&column.column_name)
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            );
+    async fn boot_real_backend() -> (crate::test_support::InMemorySqliteBackend, Session) {
+        let (backend, _engine, session) = crate::test_support::boot_test_engine()
+            .await
+            .expect("test engine should boot");
+        (backend, session)
+    }
+
+    async fn active_version_fixture() -> (
+        crate::test_support::InMemorySqliteBackend,
+        Session,
+        String,
+        String,
+    ) {
+        let (backend, session) = boot_real_backend().await;
+        let version_id = session.active_version_id();
+        let commit_id = active_version_commit_id(&session, &version_id).await;
+        (backend, session, version_id, commit_id)
+    }
+
+    async fn active_version_commit_id(session: &Session, version_id: &str) -> String {
+        let result = session
+            .execute(
+                "SELECT commit_id FROM lix_version WHERE id = $1 LIMIT 1",
+                &[Value::Text(version_id.to_string())],
+            )
+            .await
+            .expect("active version query should succeed");
+        let row = result.statements[0]
+            .rows
+            .first()
+            .expect("active version should exist");
+        match &row[0] {
+            Value::Text(commit_id) => commit_id.clone(),
+            other => panic!("expected active version commit id text, got {other:?}"),
         }
-        row
     }
 
     fn run_with_large_stack<T, F>(run: F) -> T
@@ -3382,44 +3133,50 @@ mod tests {
         assert!(lowered_sql.contains("lix_internal_live_v1_message"));
     }
 
-    #[tokio::test]
-    async fn lowers_backend_registered_public_queries_with_public_surface_lowering() {
-        let mut backend = FakeBackend::default();
-        backend.version_descriptor_rows.insert(
-            "main".to_string(),
-            crate::version::version_descriptor_snapshot_content("main", "main", false),
-        );
-        backend.registered_schema_rows.insert(
-            "message".to_string(),
-            json!({
-                "value": {
-                    "x-lix-key": "message",
-                    "x-lix-version": "1",
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "body": { "type": "string" }
-                    }
-                }
-            })
-            .to_string(),
-        );
-        let mut statements = parse_one("SELECT body FROM message WHERE id = 'm1'");
-        let Statement::Query(query) = statements.remove(0) else {
-            panic!("expected SELECT query");
-        };
+    #[test]
+    fn lowers_backend_registered_public_queries_with_public_surface_lowering() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .execute(
+                            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                            &[Value::Json(json!({
+                                "x-lix-key": "message",
+                                "x-lix-version": "1",
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "body": { "type": "string" }
+                                },
+                                "required": ["id", "body"],
+                                "additionalProperties": false
+                            }))],
+                        )
+                        .await
+                        .expect("schema registration write should succeed");
+                    let mut statements = parse_one("SELECT body FROM message WHERE id = 'm1'");
+                    let Statement::Query(query) = statements.remove(0) else {
+                        panic!("expected SELECT query");
+                    };
 
-        let lowered = lower_public_read_query_with_backend(&backend, *query, &[])
-            .await
-            .expect("registered-schema derived public query should lower through backend registry");
-        let lowered_sql = lowered.query.to_string();
+                    let lowered = lower_public_read_query_with_backend(&backend, *query, &[])
+                        .await
+                        .expect("registered-schema derived public query should lower through backend registry");
+                    let lowered_sql = lowered.query.to_string();
 
-        assert_eq!(
-            lowered.required_schema_keys,
-            ["message".to_string()].into_iter().collect()
-        );
-        assert!(lowered_sql.contains("lix_internal_live_v1_message"));
-        assert!(!lowered_sql.contains("FROM message"));
+                    assert_eq!(
+                        lowered.required_schema_keys,
+                        ["message".to_string()].into_iter().collect()
+                    );
+                    assert!(lowered_sql.contains("lix_internal_live_v1_message"));
+                    assert!(!lowered_sql.contains("FROM message"));
+                })
+        });
     }
 
     #[tokio::test]
@@ -3464,51 +3221,60 @@ mod tests {
         assert!(lowered_sql.contains("version_id AS lixcol_version_id"));
     }
 
-    #[tokio::test]
-    async fn prepares_builtin_entity_history_reads() {
-        let mut backend = FakeBackend::default();
-        backend.version_ref_rows.insert(
-            "main".to_string(),
-            crate::version::version_ref_snapshot_content("main", "commit-active-root"),
-        );
-        let prepared = prepare_public_read(
-            &backend,
-            &parse_one(
-                "SELECT key, value, lixcol_commit_id, lixcol_depth \
-                 FROM lix_key_value_history \
-                 WHERE key = 'hello' \
-                 ORDER BY lixcol_depth ASC",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("builtin entity history read should canonicalize");
+    #[test]
+    fn prepares_builtin_entity_history_reads() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, _session, active_version_id, active_commit_id) =
+                        active_version_fixture().await;
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(
+                            "SELECT key, value, lixcol_commit_id, lixcol_depth \
+                             FROM lix_key_value_history \
+                             WHERE key = 'hello' \
+                             ORDER BY lixcol_depth ASC",
+                        ),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("builtin entity history read should canonicalize");
 
-        assert_eq!(
-            prepared.debug_trace.surface_bindings,
-            vec!["lix_key_value_history"]
-        );
-        assert_eq!(
-            prepared
-                .debug_trace
-                .pushdown_decision
-                .as_ref()
-                .expect("pushdown decision should be recorded")
-                .residual_predicates,
-            vec!["key = 'hello'".to_string()]
-        );
-        match &prepared.execution {
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(plan)) => {
-                assert_eq!(
-                    plan.request.root_scope,
-                    StateHistoryRootScope::RequestedRoots(vec!["commit-active-root".to_string()])
-                );
-                assert!(prepared.debug_trace.lowered_sql.is_empty());
-            }
-            _ => panic!("entity history read should use direct entity-history execution"),
-        }
+                    assert_eq!(
+                        prepared.debug_trace.surface_bindings,
+                        vec!["lix_key_value_history"]
+                    );
+                    assert_eq!(
+                        prepared
+                            .debug_trace
+                            .pushdown_decision
+                            .as_ref()
+                            .expect("pushdown decision should be recorded")
+                            .residual_predicates,
+                        vec!["key = 'hello'".to_string()]
+                    );
+                    match &prepared.execution {
+                        PreparedPublicReadExecution::Direct(
+                            DirectPublicReadPlan::EntityHistory(plan),
+                        ) => {
+                            assert_eq!(
+                                plan.request.root_scope,
+                                StateHistoryRootScope::RequestedRoots(vec![active_commit_id])
+                            );
+                            assert!(prepared.debug_trace.lowered_sql.is_empty());
+                        }
+                        _ => {
+                            panic!("entity history read should use direct entity-history execution")
+                        }
+                    }
+                })
+        });
     }
 
     #[tokio::test]
@@ -3891,86 +3657,108 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn binds_active_root_commit_for_filesystem_history_reads_without_explicit_root() {
-        let mut backend = FakeBackend::default();
-        backend.version_ref_rows.insert(
-            "main".to_string(),
-            crate::version::version_ref_snapshot_content("main", "commit-active-root"),
-        );
+    #[test]
+    fn binds_active_root_commit_for_filesystem_history_reads_without_explicit_root() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, _session, active_version_id, active_commit_id) =
+                        active_version_fixture().await;
 
-        let prepared = prepare_public_read(
-            &backend,
-            &parse_one(
-                "SELECT id, path, lixcol_commit_id, lixcol_depth \
-                 FROM lix_file_history \
-                 WHERE id = 'file-1' \
-                 ORDER BY lixcol_depth ASC",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("filesystem history read should canonicalize");
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(
+                            "SELECT id, path, lixcol_commit_id, lixcol_depth \
+                             FROM lix_file_history \
+                             WHERE id = 'file-1' \
+                             ORDER BY lixcol_depth ASC",
+                        ),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("filesystem history read should canonicalize");
 
-        match &prepared.execution {
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(plan)) => {
-                assert_eq!(
-                    plan.request.root_scope,
-                    crate::filesystem::history::FileHistoryRootScope::RequestedRoots(vec![
-                        "commit-active-root".to_string()
-                    ])
-                );
-            }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(_)) => {
-                panic!("filesystem history read should not use state-history direct plan")
-            }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(_)) => {
-                panic!("filesystem history read should not use entity-history direct plan")
-            }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::DirectoryHistory(_)) => {
-                panic!("filesystem history read should not use directory-history direct plan")
-            }
-            PreparedPublicReadExecution::LoweredSql(_) => {
-                panic!("filesystem history read should not use lowered SQL")
-            }
-        }
+                    match &prepared.execution {
+                        PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(
+                            plan,
+                        )) => {
+                            assert_eq!(
+                                plan.request.root_scope,
+                                crate::filesystem::history::FileHistoryRootScope::RequestedRoots(
+                                    vec![active_commit_id]
+                                )
+                            );
+                        }
+                        PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(
+                            _,
+                        )) => {
+                            panic!("filesystem history read should not use state-history direct plan")
+                        }
+                        PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(
+                            _,
+                        )) => {
+                            panic!("filesystem history read should not use entity-history direct plan")
+                        }
+                        PreparedPublicReadExecution::Direct(
+                            DirectPublicReadPlan::DirectoryHistory(_),
+                        ) => {
+                            panic!("filesystem history read should not use directory-history direct plan")
+                        }
+                        PreparedPublicReadExecution::LoweredSql(_) => {
+                            panic!("filesystem history read should not use lowered SQL")
+                        }
+                    }
+                })
+        });
     }
 
-    #[tokio::test]
-    async fn binds_active_root_commit_for_entity_history_reads_without_explicit_root() {
-        let mut backend = FakeBackend::default();
-        backend.version_ref_rows.insert(
-            "main".to_string(),
-            crate::version::version_ref_snapshot_content("main", "commit-active-root"),
-        );
+    #[test]
+    fn binds_active_root_commit_for_entity_history_reads_without_explicit_root() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, _session, active_version_id, active_commit_id) =
+                        active_version_fixture().await;
 
-        let prepared = prepare_public_read(
-            &backend,
-            &parse_one(
-                "SELECT key, value, lixcol_commit_id, lixcol_depth \
-                 FROM lix_key_value_history \
-                 WHERE key = 'hello' \
-                 ORDER BY lixcol_depth ASC",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("entity history read should canonicalize");
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(
+                            "SELECT key, value, lixcol_commit_id, lixcol_depth \
+                             FROM lix_key_value_history \
+                             WHERE key = 'hello' \
+                             ORDER BY lixcol_depth ASC",
+                        ),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("entity history read should canonicalize");
 
-        match &prepared.execution {
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(plan)) => {
-                assert_eq!(
-                    plan.request.root_scope,
-                    StateHistoryRootScope::RequestedRoots(vec!["commit-active-root".to_string()])
-                );
-                assert!(prepared.debug_trace.lowered_sql.is_empty());
-            }
-            _ => panic!("entity history read should use direct entity-history execution"),
-        }
+                    match &prepared.execution {
+                        PreparedPublicReadExecution::Direct(
+                            DirectPublicReadPlan::EntityHistory(plan),
+                        ) => {
+                            assert_eq!(
+                                plan.request.root_scope,
+                                StateHistoryRootScope::RequestedRoots(vec![active_commit_id])
+                            );
+                            assert!(prepared.debug_trace.lowered_sql.is_empty());
+                        }
+                        _ => {
+                            panic!("entity history read should use direct entity-history execution")
+                        }
+                    }
+                })
+        });
     }
 
     #[tokio::test]
@@ -4065,18 +3853,15 @@ mod tests {
                 .build()
                 .expect("test runtime should build")
                 .block_on(async move {
-                    let mut backend = FakeBackend::default();
-                    backend.version_ref_rows.insert(
-                        "main".to_string(),
-                        crate::version::version_ref_snapshot_content("main", "commit-active-root"),
-                    );
+                    let (backend, session) = boot_real_backend().await;
+                    let active_version_id = session.active_version_id();
                     let prepared = prepare_public_execution(
                         &backend,
                         &parse_one(
                             "INSERT INTO lix_key_value (key, value) VALUES ('phase1-boundary', 'ok')",
                         ),
                         &[],
-                        "main",
+                        &active_version_id,
                         &[],
                         None,
                     )
@@ -4461,29 +4246,38 @@ mod tests {
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_file_descriptor"));
     }
 
-    #[tokio::test]
-    async fn prepares_session_runtime_functions_without_active_surfaces() {
-        let backend = FakeBackend::default();
-        let prepared = prepare_public_read(
-            &backend,
-            &parse_one(
-                "SELECT lix_active_version_id() AS version_id \
-                 FROM lix_version v \
-                 WHERE v.id = lix_active_version_id() \
-                   AND v.commit_id IS NOT NULL",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("session runtime function read should prepare through public lowering");
+    #[test]
+    fn prepares_session_runtime_functions_without_active_surfaces() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    let active_version_id = session.active_version_id();
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(
+                            "SELECT lix_active_version_id() AS version_id \
+                             FROM lix_version v \
+                             WHERE v.id = lix_active_version_id() \
+                               AND v.commit_id IS NOT NULL",
+                        ),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("session runtime function read should prepare through public lowering");
 
-        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_version"]);
-        if let Some(lowered_sql) = prepared.debug_trace.lowered_sql.first() {
-            assert!(!lowered_sql.contains("FROM lix_version"));
-            assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
-            assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
-        }
+                    assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_version"]);
+                    if let Some(lowered_sql) = prepared.debug_trace.lowered_sql.first() {
+                        assert!(!lowered_sql.contains("FROM lix_version"));
+                        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
+                        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
+                    }
+                })
+        });
     }
 }
