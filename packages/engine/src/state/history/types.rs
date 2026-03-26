@@ -37,6 +37,7 @@ pub(crate) enum StateHistoryVersionScope {
 pub(crate) struct StateHistoryRequest {
     pub(crate) root_scope: StateHistoryRootScope,
     pub(crate) lineage_scope: StateHistoryLineageScope,
+    pub(crate) active_version_id: Option<String>,
     pub(crate) version_scope: StateHistoryVersionScope,
     pub(crate) entity_ids: Vec<String>,
     pub(crate) file_ids: Vec<String>,

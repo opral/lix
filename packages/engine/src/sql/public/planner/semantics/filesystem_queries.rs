@@ -529,8 +529,10 @@ pub(crate) async fn load_directory_rows_under_path(
          ORDER BY path ASC, id ASC",
         projection_sql = build_filesystem_directory_projection_sql(
             FilesystemProjectionScope::ExplicitVersion,
+            None,
             backend.dialect(),
-        ),
+        )
+        .map_err(filesystem_query_backend_error)?,
         version_id = escape_sql_string(version_id),
         prefix_length = prefix_length,
         root_path = escape_sql_string(root_path),
@@ -552,9 +554,11 @@ pub(crate) async fn load_file_rows_under_path(
          ORDER BY path ASC, id ASC",
         projection_sql = build_filesystem_file_projection_sql(
             FilesystemProjectionScope::ExplicitVersion,
+            None,
             false,
             backend.dialect(),
-        ),
+        )
+        .map_err(filesystem_query_backend_error)?,
         version_id = escape_sql_string(version_id),
         prefix_length = prefix_length,
         root_path = escape_sql_string(root_path),
@@ -578,7 +582,12 @@ pub(crate) async fn load_directory_rows_by_paths(
          WHERE lixcol_version_id = '{version_id}' \
            AND path IN ({path_list}) \
          ORDER BY path ASC, id ASC",
-        projection_sql = build_filesystem_directory_projection_sql(scope, backend.dialect()),
+        projection_sql = build_filesystem_directory_projection_sql(
+            scope,
+            matches!(scope, FilesystemProjectionScope::ActiveVersion).then_some(version_id),
+            backend.dialect(),
+        )
+        .map_err(filesystem_query_backend_error)?,
         version_id = escape_sql_string(version_id),
         path_list = path_list,
     );
@@ -601,7 +610,13 @@ pub(crate) async fn load_file_rows_by_paths(
          WHERE lixcol_version_id = '{version_id}' \
            AND path IN ({path_list}) \
          ORDER BY path ASC, id ASC",
-        projection_sql = build_filesystem_file_projection_sql(scope, false, backend.dialect()),
+        projection_sql = build_filesystem_file_projection_sql(
+            scope,
+            matches!(scope, FilesystemProjectionScope::ActiveVersion).then_some(version_id),
+            false,
+            backend.dialect(),
+        )
+        .map_err(filesystem_query_backend_error)?,
         version_id = escape_sql_string(version_id),
         path_list = path_list,
     );

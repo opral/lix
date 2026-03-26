@@ -282,27 +282,6 @@ async fn resolve_admin_write(
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     match planned_write.command.target.descriptor.public_name.as_str() {
-        "lix_active_version" => match planned_write.command.operation_kind {
-            WriteOperationKind::Update => {
-                resolve_active_version_update_write_plan(backend, planned_write).await
-            }
-            _ => Err(WriteResolveError {
-                message: "public write resolver only supports UPDATE for 'lix_active_version'"
-                    .to_string(),
-            }),
-        },
-        "lix_active_account" => match planned_write.command.operation_kind {
-            WriteOperationKind::Insert => {
-                resolve_active_account_insert_write_plan(backend, planned_write).await
-            }
-            WriteOperationKind::Delete => {
-                resolve_active_account_delete_write_plan(backend, planned_write).await
-            }
-            WriteOperationKind::Update => Err(WriteResolveError {
-                message: "public write resolver does not support UPDATE for 'lix_active_account'"
-                    .to_string(),
-            }),
-        },
         "lix_version" => match planned_write.command.operation_kind {
             WriteOperationKind::Insert => {
                 resolve_version_insert_write_plan(backend, planned_write).await
@@ -1371,6 +1350,59 @@ fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, W
             message: "public write resolver requires a bounded scope proof".to_string(),
         }),
     }
+}
+
+async fn resolved_existing_version_id(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+) -> Result<Option<String>, WriteResolveError> {
+    let version_id = resolved_version_id(planned_write)?;
+    let Some(version_id) = version_id.as_deref() else {
+        return Ok(None);
+    };
+    validate_public_write_version_target(backend, version_id).await?;
+    Ok(Some(version_id.to_string()))
+}
+
+async fn validate_public_write_version_target(
+    backend: &dyn LixBackend,
+    version_id: &str,
+) -> Result<(), WriteResolveError> {
+    if version_id == GLOBAL_VERSION_ID {
+        return Ok(());
+    }
+
+    let descriptor_exists = load_exact_live_row(
+        backend,
+        RawStorage::Tracked,
+        version_descriptor_schema_key(),
+        version_descriptor_storage_version_id(),
+        version_id,
+        Some(version_descriptor_file_id()),
+    )
+    .await
+    .map_err(write_resolve_backend_error)?
+    .filter(|row| row.plugin_key() == version_descriptor_plugin_key())
+    .and_then(|row| row.into_tracked())
+    .is_some();
+    if !descriptor_exists {
+        return Err(WriteResolveError {
+            message: format!("version with id '{version_id}' does not exist"),
+        });
+    }
+
+    let version_ref = load_version_ref(backend, version_id)
+        .await
+        .map_err(write_resolve_backend_error)?;
+    if version_ref.is_none() {
+        return Err(WriteResolveError {
+            message: format!(
+                "public write invariant violation: version with id '{version_id}' exists but its version ref is missing"
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 fn insert_on_conflict_action(planned_write: &PlannedWrite) -> Option<InsertOnConflictAction> {

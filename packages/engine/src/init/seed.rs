@@ -1,8 +1,6 @@
 use crate::account::{
     account_file_id, account_plugin_key, account_schema_key, account_schema_version,
-    account_snapshot_content, account_storage_version_id, active_account_file_id,
-    active_account_plugin_key, active_account_schema_key, active_account_schema_version,
-    active_account_snapshot_content, active_account_storage_version_id,
+    account_snapshot_content, account_storage_version_id,
 };
 use crate::canonical::graph::{build_commit_generation_seed_sql, COMMIT_GRAPH_NODE_TABLE};
 use crate::canonical::readers::load_committed_version_head_commit_id_from_live_state;
@@ -17,7 +15,7 @@ use crate::live_state::{
     tracked_live_table_name, untracked_live_table_name,
 };
 use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
-use crate::sql::execution::execution_program::ExecutionContext;
+use crate::sql::execution::execution_program::{ExecutionContext, SessionExecutionRuntime};
 use crate::sql::execution::parse::parse_sql;
 use crate::sql_support::text::escape_sql_string;
 use crate::state::checkpoint::{
@@ -29,14 +27,11 @@ use crate::transaction::{
 };
 use crate::version::DEFAULT_ACTIVE_VERSION_NAME;
 use crate::version::{
-    active_version_file_id, active_version_plugin_key, active_version_schema_key,
-    active_version_schema_version, active_version_snapshot_content,
-    active_version_storage_version_id, version_descriptor_file_id, version_descriptor_plugin_key,
-    version_descriptor_schema_key, version_descriptor_schema_version,
-    version_descriptor_snapshot_content, version_descriptor_storage_version_id,
-    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-    version_ref_schema_version, version_ref_snapshot_content, version_ref_storage_version_id,
-    GLOBAL_VERSION_ID,
+    version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
+    version_descriptor_schema_version, version_descriptor_snapshot_content,
+    version_descriptor_storage_version_id, version_ref_file_id, version_ref_plugin_key,
+    version_ref_schema_key, version_ref_schema_version, version_ref_snapshot_content,
+    version_ref_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
@@ -63,6 +58,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             context: ExecutionContext::new(
                 ExecuteOptions::default(),
                 engine.public_surface_registry(),
+                SessionExecutionRuntime::new(),
                 GLOBAL_VERSION_ID.to_string(),
                 Vec::new(),
             ),
@@ -237,12 +233,15 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         Ok(())
     }
 
-    pub(crate) async fn seed_boot_key_values(&mut self) -> Result<(), LixError> {
+    pub(crate) async fn seed_boot_key_values(
+        &mut self,
+        default_active_version_id: &str,
+    ) -> Result<(), LixError> {
         for key_value in self.boot_key_values().to_vec() {
             let version_id = if key_value.lixcol_global.unwrap_or(false) {
                 KEY_VALUE_GLOBAL_VERSION.to_string()
             } else {
-                self.load_boot_active_version_id().await?
+                default_active_version_id.to_string()
             };
             let untracked = key_value.lixcol_untracked.unwrap_or(true);
             let snapshot_content = serde_json::json!({
@@ -270,59 +269,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         }
 
         Ok(())
-    }
-
-    async fn load_boot_active_version_id(&mut self) -> Result<String, LixError> {
-        let layout = builtin_live_table_layout(active_version_schema_key())?.ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "builtin active version schema must compile to a live layout",
-            )
-        })?;
-        let payload_version_column = live_column_name_for_property(&layout, "version_id")
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "active version live layout is missing version_id",
-                )
-            })?;
-        let result = self
-            .execute_backend(
-                &format!(
-                    "SELECT {payload_version_column} \
-                     FROM {table_name} \
-                     WHERE file_id = $1 \
-                       AND version_id = $2 \
-                       AND untracked = true \
-                       AND {payload_version_column} IS NOT NULL \
-                     ORDER BY updated_at DESC \
-                     LIMIT 1",
-                    payload_version_column = quote_ident(payload_version_column),
-                    table_name =
-                        quote_ident(&untracked_live_table_name(active_version_schema_key())),
-                ),
-                &[
-                    Value::Text(active_version_file_id().to_string()),
-                    Value::Text(active_version_storage_version_id().to_string()),
-                ],
-            )
-            .await?;
-
-        let row = result.rows.first().ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "boot key-value seeding requires an active version".to_string(),
-        })?;
-        let version_id = row.first().ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "active version query row is missing version_id".to_string(),
-        })?;
-        match version_id {
-            Value::Text(value) => Ok(value.clone()),
-            other => Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("active version id must be text, got {other:?}"),
-            }),
-        }
     }
 
     pub(crate) async fn seed_global_system_directories(&mut self) -> Result<(), LixError> {
@@ -910,49 +856,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             )
             .await?;
         }
-
-        let table_name = untracked_live_table_name(active_account_schema_key());
-        let timestamp = self.generate_runtime_timestamp().await?;
-        let snapshot_content = active_account_snapshot_content(&account.id);
-        let normalized_values =
-            normalized_seed_values(active_account_schema_key(), Some(&snapshot_content))?;
-        self.execute_backend(
-            &format!(
-                "DELETE FROM {table_name} \
-                     WHERE schema_key = '{schema_key}' \
-                       AND file_id = '{file_id}' \
-                       AND version_id = '{version_id}' \
-                       AND untracked = true",
-                table_name = quote_ident(&table_name),
-                schema_key = escape_sql_string(active_account_schema_key()),
-                file_id = escape_sql_string(active_account_file_id()),
-                version_id = escape_sql_string(active_account_storage_version_id()),
-            ),
-            &[],
-        )
-        .await?;
-
-        self.execute_backend(
-                &format!(
-                    "INSERT INTO {table_name} (\
-                     entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, writer_key, untracked, created_at, updated_at{normalized_columns}\
-                     ) VALUES (\
-                     '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', NULL, NULL, true, '{timestamp}', '{timestamp}'{normalized_literals}\
-                     )",
-                    table_name = quote_ident(&table_name),
-                    entity_id = escape_sql_string(&account.id),
-                    schema_key = escape_sql_string(active_account_schema_key()),
-                    schema_version = escape_sql_string(active_account_schema_version()),
-                    file_id = escape_sql_string(active_account_file_id()),
-                    version_id = escape_sql_string(active_account_storage_version_id()),
-                    plugin_key = escape_sql_string(active_account_plugin_key()),
-                    timestamp = escape_sql_string(&timestamp),
-                    normalized_columns = normalized_insert_columns_sql(&normalized_values),
-                    normalized_literals = normalized_insert_literals_sql(&normalized_values),
-                ),
-                &[],
-            )
-            .await?;
 
         Ok(())
     }
@@ -1610,73 +1513,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             });
         }
 
-        Ok(())
-    }
-
-    pub(crate) async fn seed_default_active_version(
-        &mut self,
-        version_id: &str,
-    ) -> Result<(), LixError> {
-        let layout = builtin_live_table_layout(active_version_schema_key())?.ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "builtin active version schema must compile to a live layout",
-            )
-        })?;
-        let payload_version_column = live_column_name_for_property(&layout, "version_id")
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "active version live layout is missing version_id",
-                )
-            })?;
-        let check_sql = format!(
-            "SELECT 1 \
-             FROM {table_name} \
-             WHERE file_id = '{file_id}' \
-               AND file_id = '{file_id}' \
-               AND version_id = '{storage_version_id}' \
-               AND {payload_version_column} IS NOT NULL \
-             LIMIT 1",
-            table_name = quote_ident(&untracked_live_table_name(active_version_schema_key())),
-            file_id = escape_sql_string(active_version_file_id()),
-            storage_version_id = escape_sql_string(active_version_storage_version_id()),
-            payload_version_column = quote_ident(payload_version_column),
-        );
-        let existing = self.execute_backend(&check_sql, &[]).await?;
-        if !existing.rows.is_empty() {
-            return Ok(());
-        }
-
-        let entity_id = self.generate_runtime_uuid().await?;
-        let timestamp = self.generate_runtime_timestamp().await?;
-        let snapshot_content = active_version_snapshot_content(&entity_id, version_id);
-        builtin_live_table_layout(active_version_schema_key())?.ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "builtin active version schema must compile to a live layout",
-            )
-        })?;
-        let normalized_values =
-            normalized_seed_values(active_version_schema_key(), Some(&snapshot_content))?;
-        let insert_sql = format!(
-            "INSERT INTO {table_name} (\
-             entity_id, schema_key, file_id, version_id, global, plugin_key, schema_version, untracked, created_at, updated_at{normalized_columns}\
-             ) VALUES (\
-             '{entity_id}', '{schema_key}', '{file_id}', '{storage_version_id}', true, '{plugin_key}', '{schema_version}', true, '{timestamp}', '{timestamp}'{normalized_literals}\
-             )",
-            table_name = quote_ident(&untracked_live_table_name(active_version_schema_key())),
-            entity_id = escape_sql_string(&entity_id),
-            schema_key = escape_sql_string(active_version_schema_key()),
-            file_id = escape_sql_string(active_version_file_id()),
-            storage_version_id = escape_sql_string(active_version_storage_version_id()),
-            plugin_key = escape_sql_string(active_version_plugin_key()),
-            schema_version = escape_sql_string(active_version_schema_version()),
-            timestamp = escape_sql_string(&timestamp),
-            normalized_columns = normalized_insert_columns_sql(&normalized_values),
-            normalized_literals = normalized_insert_literals_sql(&normalized_values),
-        );
-        self.execute_backend(&insert_sql, &[]).await?;
         Ok(())
     }
 }

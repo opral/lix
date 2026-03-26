@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::engine::{Engine, ExecuteOptions};
 use crate::sql::execution::contracts::requirements::PlanRequirements;
@@ -9,7 +11,7 @@ use crate::sql::public::runtime::{
 };
 use crate::sql_support::binding::{
     bind_statement_binding_template, compile_statement_binding_template_with_state,
-    PlaceholderState, StatementBindingTemplate,
+    PlaceholderState, RuntimeBindingValues, StatementBindingTemplate,
 };
 use crate::transaction::{
     execute_bound_statement_template_instance_in_borrowed_write_transaction,
@@ -24,34 +26,119 @@ pub(crate) struct ExecutionProgram {
     steps: Vec<ExecutionProgramStep>,
 }
 
+pub(crate) type SessionExecutionRuntimeHandle = Arc<SessionExecutionRuntime>;
+
+pub(crate) struct SessionExecutionRuntime {
+    public_surface_registry_generation: AtomicU64,
+    statement_template_cache: Mutex<BTreeMap<StatementTemplateCacheKey, StatementTemplate>>,
+}
+
+impl SessionExecutionRuntime {
+    pub(crate) fn new() -> SessionExecutionRuntimeHandle {
+        Arc::new(Self {
+            public_surface_registry_generation: AtomicU64::new(0),
+            statement_template_cache: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    pub(crate) fn public_surface_registry_generation(&self) -> u64 {
+        self.public_surface_registry_generation
+            .load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn bump_public_surface_registry_generation(&self) {
+        self.public_surface_registry_generation
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn cached_statement_template(
+        &self,
+        key: &StatementTemplateCacheKey,
+    ) -> Option<StatementTemplate> {
+        self.statement_template_cache
+            .lock()
+            .expect("statement template cache lock poisoned")
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn cache_statement_template(
+        &self,
+        key: StatementTemplateCacheKey,
+        template: StatementTemplate,
+    ) {
+        self.statement_template_cache
+            .lock()
+            .expect("statement template cache lock poisoned")
+            .insert(key, template);
+    }
+}
+
 pub(crate) struct ExecutionContext {
     pub(crate) options: ExecuteOptions,
     pub(crate) public_surface_registry: SurfaceRegistry,
-    pub(crate) public_surface_registry_generation: u64,
+    session_runtime: SessionExecutionRuntimeHandle,
     pub(crate) active_version_id: String,
     pub(crate) active_account_ids: Vec<String>,
-    pub(crate) statement_template_cache: BTreeMap<StatementTemplateCacheKey, StatementTemplate>,
 }
 
 impl ExecutionContext {
     pub(crate) fn new(
         options: ExecuteOptions,
         public_surface_registry: SurfaceRegistry,
+        session_runtime: SessionExecutionRuntimeHandle,
         active_version_id: String,
         active_account_ids: Vec<String>,
     ) -> Self {
         Self {
             options,
             public_surface_registry,
-            public_surface_registry_generation: 0,
+            session_runtime,
             active_version_id,
             active_account_ids,
-            statement_template_cache: BTreeMap::new(),
         }
     }
 
     pub(crate) fn bump_public_surface_registry_generation(&mut self) {
-        self.public_surface_registry_generation += 1;
+        self.session_runtime
+            .bump_public_surface_registry_generation();
+    }
+
+    pub(crate) fn public_surface_registry_generation(&self) -> u64 {
+        self.session_runtime.public_surface_registry_generation()
+    }
+
+    pub(crate) fn cached_statement_template(
+        &self,
+        key: &StatementTemplateCacheKey,
+    ) -> Option<StatementTemplate> {
+        self.session_runtime.cached_statement_template(key)
+    }
+
+    pub(crate) fn cache_statement_template(
+        &self,
+        key: StatementTemplateCacheKey,
+        template: StatementTemplate,
+    ) {
+        self.session_runtime.cache_statement_template(key, template);
+    }
+
+    pub(crate) fn session_runtime(&self) -> SessionExecutionRuntimeHandle {
+        Arc::clone(&self.session_runtime)
+    }
+
+    pub(crate) fn runtime_binding_values(&self) -> Result<RuntimeBindingValues, LixError> {
+        Ok(RuntimeBindingValues {
+            active_version_id: self.active_version_id.clone(),
+            active_account_ids_json: serde_json::to_string(&self.active_account_ids).map_err(
+                |error| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!("active account ids serialization failed: {error}"),
+                    )
+                },
+            )?,
+        })
     }
 }
 
@@ -149,8 +236,10 @@ impl StatementTemplate {
     pub(crate) fn bind(
         &self,
         params: &[Value],
+        runtime_bindings: &RuntimeBindingValues,
     ) -> Result<BoundStatementTemplateInstance, LixError> {
-        let bound = bind_statement_binding_template(&self.binding_template, params)?;
+        let bound =
+            bind_statement_binding_template(&self.binding_template, params, runtime_bindings)?;
         Ok(BoundStatementTemplateInstance {
             statement: bound.statement,
             params: bound.params,
@@ -224,6 +313,7 @@ impl ExecutionProgram {
         original_statements: Vec<Statement>,
         params: &[Value],
         dialect: SqlDialect,
+        runtime_bindings: &RuntimeBindingValues,
     ) -> Result<Self, LixError> {
         let source_statements =
             coalesce_state_surface_inserts_in_transactions(original_statements)?;
@@ -237,7 +327,7 @@ impl ExecutionProgram {
 
             let (template, next_placeholder_state) =
                 StatementTemplate::compile(statement, dialect, params.len(), placeholder_state)?;
-            let bound_template = template.bind(params)?;
+            let bound_template = template.bind(params, runtime_bindings)?;
             placeholder_state = next_placeholder_state;
             steps.push(ExecutionProgramStep::Statement(ExecutionProgramStatement {
                 bound_template,

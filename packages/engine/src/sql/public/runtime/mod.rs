@@ -12,11 +12,9 @@ use crate::filesystem::runtime::{
     FilesystemTransactionState,
 };
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
-use crate::live_state::{
-    builtin_live_table_layout, live_column_name_for_property, live_table_layout_from_schema,
-    untracked_live_table_name,
-};
+use crate::live_state::live_table_layout_from_schema;
 use crate::schema::builtin::builtin_schema_definition;
+use crate::session::contracts::SessionStateDelta;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::common::dependency_spec::DependencySpec;
@@ -29,7 +27,7 @@ use crate::sql::public::catalog::{
 };
 use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
 use crate::sql::public::planner::backend::lowerer::{
-    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_dialect,
+    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id,
     summarize_bound_public_read_statement_with_registry, LoweredReadProgram, LoweredResultColumns,
 };
 use crate::sql::public::planner::canonicalize::{canonicalize_write, CanonicalizedWrite};
@@ -821,8 +819,11 @@ fn rewrite_public_read_statement_to_lowered_sql_with_registry(
     dialect: crate::SqlDialect,
     registry: &SurfaceRegistry,
 ) -> Result<Statement, LixError> {
-    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_dialect(
-        statement, registry, dialect,
+    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id(
+        statement,
+        registry,
+        dialect,
+        None,
     )?;
     lower_statement(statement.clone(), dialect)
 }
@@ -1559,55 +1560,7 @@ impl Visitor for PublicRelationCollectorVisitor<'_> {
 async fn load_active_version_id_for_public_read(
     backend: &dyn LixBackend,
 ) -> Result<String, LixError> {
-    let layout = builtin_live_table_layout(active_version_schema_key())?.ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "builtin active version schema must compile to a live layout",
-        )
-    })?;
-    let payload_version_column =
-        live_column_name_for_property(&layout, "version_id").ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "active version live layout is missing version_id",
-            )
-        })?;
-    let result = backend
-        .execute(
-            &format!(
-                "SELECT {payload_version_column} \
-                 FROM {} \
-                 WHERE file_id = $1 \
-                   AND version_id = $2 \
-                   AND untracked = true \
-                   AND {payload_version_column} IS NOT NULL \
-                 ORDER BY updated_at DESC \
-                 LIMIT 1",
-                untracked_live_table_name(crate::version::active_version_schema_key())
-            ),
-            &[
-                Value::Text(crate::version::active_version_file_id().to_string()),
-                Value::Text(crate::version::active_version_storage_version_id().to_string()),
-            ],
-        )
-        .await?;
-
-    let Some(row) = result.rows.first() else {
-        return Ok(crate::version::DEFAULT_ACTIVE_VERSION_NAME.to_string());
-    };
-    let version_id = row.first().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "active version query row is missing version_id",
-        )
-    })?;
-    match version_id {
-        Value::Text(value) => Ok(value.clone()),
-        other => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("active version id must be text, got {other:?}"),
-        )),
-    }
+    crate::session::workspace::require_workspace_active_version_id(backend).await
 }
 
 async fn maybe_bind_active_history_root(
@@ -1796,10 +1749,6 @@ fn dependency_spec_has_unknown_schema_keys(
         .any(|schema_key| !registered.contains(schema_key))
 }
 
-fn counts_as_explicit_state_schema_key(dependency_spec: &DependencySpec, schema_key: &str) -> bool {
-    !(schema_key == "lix_active_version" && dependency_spec.depends_on_active_version)
-}
-
 fn unknown_public_state_schema_error(
     registry: &SurfaceRegistry,
     dependency_spec: Option<&DependencySpec>,
@@ -1826,9 +1775,7 @@ fn augment_dependency_spec_for_public_read(
     let dependency_spec = dependency_spec?;
     augment_dependency_spec_for_broad_public_read(registry, Some(dependency_spec)).map(
         |mut dependency_spec| {
-            let has_state_schema_keys = dependency_spec.schema_keys.iter().any(|schema_key| {
-                counts_as_explicit_state_schema_key(&dependency_spec, schema_key)
-            });
+            let has_state_schema_keys = !dependency_spec.schema_keys.is_empty();
             if structured_read.surface_binding.descriptor.surface_family == SurfaceFamily::State
                 && !has_state_schema_keys
             {
@@ -1857,10 +1804,7 @@ fn augment_dependency_spec_for_broad_public_read(
                 )
             })
     });
-    let has_state_schema_keys = dependency_spec
-        .schema_keys
-        .iter()
-        .any(|schema_key| counts_as_explicit_state_schema_key(&dependency_spec, schema_key));
+    let has_state_schema_keys = !dependency_spec.schema_keys.is_empty();
     if references_state_like_surface && !has_state_schema_keys {
         dependency_spec
             .schema_keys
@@ -2388,10 +2332,7 @@ fn public_untracked_operation_supported(planned_write: &PlannedWrite) -> bool {
     matches!(
         planned_write.command.target.descriptor.surface_family,
         SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
-    ) || matches!(
-        planned_write.command.target.descriptor.public_name.as_str(),
-        "lix_active_version" | "lix_active_account" | "lix_version"
-    )
+    ) || planned_write.command.target.descriptor.public_name == "lix_version"
 }
 
 fn public_write_persists_filesystem_payloads(
@@ -2448,33 +2389,6 @@ fn semantic_plan_effects_from_untracked_public_write(
             .file_cache_refresh_targets
             .extend(pending_file_delete_targets);
     }
-    match planned_write.command.target.descriptor.public_name.as_str() {
-        "lix_active_version" => {
-            for row in intended_post_state.iter().rev() {
-                if row.schema_key != active_version_schema_key()
-                    || planned_row_optional_text_value(row, "file_id")
-                        != Some(active_version_file_id())
-                    || row.version_id.as_deref() != Some(active_version_storage_version_id())
-                    || row.tombstone
-                {
-                    continue;
-                }
-                let Some(snapshot_content) =
-                    planned_row_optional_json_text_value(row, "snapshot_content")
-                else {
-                    continue;
-                };
-                effects.next_active_version_id =
-                    Some(parse_active_version_snapshot(snapshot_content.as_ref())?);
-                break;
-            }
-        }
-        "lix_active_account" => {
-            effects.next_active_account_ids =
-                Some(next_active_account_ids_from_planned_rows(intended_post_state));
-        }
-        _ => {}
-    }
     Ok(effects)
 }
 
@@ -2487,8 +2401,11 @@ pub(crate) fn semantic_plan_effects_from_domain_changes<Change: TrackedDomainCha
             changes,
             stream_operation,
         )?,
-        next_active_version_id: next_active_version_id_from_domain_changes(changes)?,
-        next_active_account_ids: None,
+        session_delta: SessionStateDelta {
+            next_active_version_id: next_active_version_id_from_domain_changes(changes)?,
+            next_active_account_ids: None,
+            persist_workspace: false,
+        },
         file_cache_refresh_targets: file_cache_refresh_targets_from_domain_changes(changes),
     })
 }
@@ -2823,8 +2740,7 @@ fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWri
 mod tests {
     use super::read::try_prepare_public_read;
     use super::{
-        lower_public_read_query_with_backend, prepare_public_execution,
-        prepare_public_execution_with_internal_access, prepare_public_read,
+        lower_public_read_query_with_backend, prepare_public_execution, prepare_public_read,
         prepare_public_read_strict, DirectPublicReadPlan, PreparedPublicExecution,
         PreparedPublicReadExecution,
     };
@@ -2843,8 +2759,6 @@ mod tests {
         registered_schema_rows: HashMap<String, String>,
         version_descriptor_rows: HashMap<String, String>,
         version_ref_rows: HashMap<String, String>,
-        active_version_rows: Vec<(String, String)>,
-        active_account_rows: Vec<String>,
         change_rows: Vec<Vec<Value>>,
         untracked_rows: Vec<Vec<Value>>,
     }
@@ -2895,44 +2809,14 @@ mod tests {
                     },
                 });
             }
-            if query_targets_table(sql, "lix_internal_live_v1_lix_active_version") {
-                let rows = self
-                    .active_version_rows
-                    .iter()
-                    .map(|(entity_id, snapshot)| {
-                        vec![
-                            Value::Text(entity_id.clone()),
-                            Value::Text(snapshot.clone()),
-                        ]
-                    })
-                    .collect::<Vec<_>>();
+            if sql.contains("FROM lix_internal_workspace_metadata") {
                 return Ok(QueryResult {
-                    rows,
-                    columns: vec!["entity_id".to_string(), "snapshot_content".to_string()],
-                });
-            }
-            if query_targets_table(sql, "lix_internal_live_v1_lix_active_account") {
-                let rows = self
-                    .active_account_rows
-                    .iter()
-                    .map(|account_id| {
-                        vec![
-                            Value::Text(account_id.clone()),
-                            Value::Text(crate::account::active_account_snapshot_content(
-                                account_id,
-                            )),
-                        ]
-                    })
-                    .collect::<Vec<_>>();
-                return Ok(QueryResult {
-                    rows,
-                    columns: vec!["entity_id".to_string(), "snapshot_content".to_string()],
+                    rows: Vec::new(),
+                    columns: vec!["value".to_string()],
                 });
             }
             if sql.contains("FROM lix_internal_live_v1_")
                 && sql.contains("untracked = true")
-                && !sql.contains("lix_active_version")
-                && !sql.contains("lix_active_account")
                 && !sql.contains("lix_version_ref")
             {
                 return Ok(QueryResult {
@@ -2972,6 +2856,18 @@ mod tests {
                 });
             }
             if sql.contains("FROM lix_internal_live_v1_lix_version_descriptor") {
+                if sql.contains("SELECT entity_id") {
+                    let rows = self
+                        .version_descriptor_rows
+                        .iter()
+                        .filter(|(_, snapshot)| snapshot.contains("\"name\":\"main\""))
+                        .map(|(version_id, _)| vec![Value::Text(version_id.clone())])
+                        .collect::<Vec<_>>();
+                    return Ok(QueryResult {
+                        rows,
+                        columns: vec!["entity_id".to_string()],
+                    });
+                }
                 let rows = self
                     .version_descriptor_rows
                     .iter()
@@ -3391,11 +3287,14 @@ mod tests {
                 .iter()
                 .cloned()
                 .collect::<Vec<_>>(),
-            vec![
-                "lix_active_version".to_string(),
-                "lix_key_value".to_string()
-            ]
+            vec!["lix_key_value".to_string()]
         );
+        assert!(prepared
+            .dependency_spec
+            .as_ref()
+            .expect("dependency spec should be derived")
+            .session_dependencies
+            .contains(&crate::session::contracts::SessionDependency::ActiveVersion));
         assert_eq!(
             prepared
                 .effective_state_request()
@@ -3486,6 +3385,10 @@ mod tests {
     #[tokio::test]
     async fn lowers_backend_registered_public_queries_with_public_surface_lowering() {
         let mut backend = FakeBackend::default();
+        backend.version_descriptor_rows.insert(
+            "main".to_string(),
+            crate::version::version_descriptor_snapshot_content("main", "main", false),
+        );
         backend.registered_schema_rows.insert(
             "message".to_string(),
             json!({
@@ -3731,12 +3634,17 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>(),
             vec![
-                "lix_active_version".to_string(),
                 "lix_binary_blob_ref".to_string(),
                 "lix_directory_descriptor".to_string(),
                 "lix_file_descriptor".to_string(),
             ]
         );
+        assert!(prepared
+            .dependency_spec
+            .as_ref()
+            .expect("filesystem dependency spec should be recorded")
+            .session_dependencies
+            .contains(&crate::session::contracts::SessionDependency::ActiveVersion));
         assert_eq!(
             prepared
                 .debug_trace
@@ -4222,19 +4130,16 @@ mod tests {
                         "INSERT INTO lix_commit (id, change_set_id) VALUES ('c1', 'cs1')",
                         "INSERT INTO lix_change_set (id) VALUES ('cs1')",
                     ] {
-                        let error =
-                            prepare_public_execution(
-                                &backend,
-                                &parse_one(sql),
-                                &[],
-                                "main",
-                                &[],
-                                None,
-                            )
-                                .await
-                                .expect_err(
-                                    "read-only public write should be rejected by public lowering",
-                                );
+                        let error = prepare_public_execution(
+                            &backend,
+                            &parse_one(sql),
+                            &[],
+                            "main",
+                            &[],
+                            None,
+                        )
+                        .await
+                        .expect_err("read-only public write should be rejected by public lowering");
                         assert_eq!(error.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");
                     }
                 })
@@ -4361,149 +4266,6 @@ mod tests {
                     assert!(prepared.is_none());
                 })
         });
-    }
-
-    #[tokio::test]
-    async fn prepares_joined_admin_reads_via_surface_expansion() {
-        let backend = FakeBackend::default();
-        let prepared = prepare_public_read(
-            &backend,
-            &parse_one(
-                "SELECT av.version_id, v.commit_id \
-                 FROM lix_active_version av \
-                 JOIN lix_version v ON v.id = av.version_id",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("joined admin read should prepare through public lowering");
-
-        assert!(prepared.optimization.is_none());
-        assert!(prepared.dependency_spec.is_some());
-        assert_eq!(
-            prepared.debug_trace.surface_bindings,
-            vec!["lix_active_version", "lix_version"]
-        );
-        assert_eq!(
-            prepared
-                .debug_trace
-                .bound_public_leaves
-                .iter()
-                .map(|leaf| leaf.public_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["lix_active_version", "lix_version"]
-        );
-        assert_eq!(
-            prepared
-                .dependency_spec
-                .as_ref()
-                .expect("joined admin read should derive dependency spec")
-                .relations,
-            ["lix_active_version".to_string(), "lix_version".to_string()]
-                .into_iter()
-                .collect()
-        );
-        let lowered_sql = prepared
-            .debug_trace
-            .lowered_sql
-            .first()
-            .expect("joined admin read should lower");
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_active_version"));
-        assert!(lowered_sql.contains("untracked = true"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
-    }
-
-    #[tokio::test]
-    async fn prepares_public_reads_joined_with_backend_real_tables() {
-        let backend = FakeBackend::default();
-        let prepared = prepare_public_read_strict(
-            &backend,
-            &parse_one(
-                "SELECT av.version_id \
-                 FROM app_versions app \
-                 JOIN lix_active_version av \
-                   ON av.version_id = app.id",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("public/external mixed read should not error")
-        .expect("public/external mixed read should prepare through public lowering");
-
-        assert!(prepared.optimization.is_none());
-        assert_eq!(
-            prepared.debug_trace.surface_bindings,
-            vec!["lix_active_version"]
-        );
-        let lowered_sql = prepared
-            .debug_trace
-            .lowered_sql
-            .first()
-            .expect("mixed read should lower");
-        assert!(lowered_sql.contains("app_versions"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_active_version"));
-        assert!(lowered_sql.contains("untracked = true"));
-    }
-
-    #[tokio::test]
-    async fn rejects_public_reads_mixed_with_internal_engine_tables() {
-        let backend = FakeBackend::default();
-        let error = prepare_public_read_strict(
-            &backend,
-            &parse_one(
-                "SELECT av.version_id \
-                 FROM lix_active_version av \
-                 JOIN lix_internal_live_v1_lix_active_version u ON u.entity_id = av.id",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect_err("public/internal mixed read should be rejected");
-
-        assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
-        assert!(error
-            .description
-            .contains("lix_internal_live_v1_lix_active_version"));
-    }
-
-    #[tokio::test]
-    async fn allows_public_reads_mixed_with_internal_engine_tables_when_internal_access_enabled() {
-        let backend = FakeBackend::default();
-        let prepared = prepare_public_execution_with_internal_access(
-            &backend,
-            &parse_one(
-                "SELECT av.version_id \
-                 FROM lix_active_version av \
-                 JOIN lix_internal_live_v1_lix_active_version u ON u.entity_id = av.id",
-            ),
-            &[],
-            "main",
-            &[],
-            None,
-            true,
-        )
-        .await
-        .expect("public/internal mixed read should prepare when internal access is enabled")
-        .expect("public/internal mixed read should return a prepared public read");
-
-        let PreparedPublicExecution::Read(prepared) = prepared else {
-            panic!("expected prepared public read");
-        };
-
-        assert!(prepared.optimization.is_none());
-        let lowered_sql = prepared
-            .debug_trace
-            .lowered_sql
-            .first()
-            .expect("public/internal mixed read should lower");
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_active_version"));
-        assert!(lowered_sql.contains("untracked = true"));
     }
 
     #[tokio::test]
@@ -4700,41 +4462,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepares_nested_public_subqueries_via_surface_expansion_when_multiple_public_surfaces_are_bound(
-    ) {
+    async fn prepares_session_runtime_functions_without_active_surfaces() {
         let backend = FakeBackend::default();
         let prepared = prepare_public_read(
             &backend,
             &parse_one(
-                "SELECT av.version_id \
-                 FROM lix_active_version av \
-                 WHERE av.version_id IN ( \
-                   SELECT v.id \
-                   FROM lix_version v \
-                   WHERE v.commit_id IS NOT NULL \
-                 )",
+                "SELECT lix_active_version_id() AS version_id \
+                 FROM lix_version v \
+                 WHERE v.id = lix_active_version_id() \
+                   AND v.commit_id IS NOT NULL",
             ),
             &[],
             "main",
             None,
         )
         .await
-        .expect("nested public-subquery read should prepare through public lowering");
+        .expect("session runtime function read should prepare through public lowering");
 
-        assert!(prepared.optimization.is_none());
-        assert_eq!(
-            prepared.debug_trace.surface_bindings,
-            vec!["lix_active_version", "lix_version"]
-        );
-        let lowered_sql = prepared
-            .debug_trace
-            .lowered_sql
-            .first()
-            .expect("nested public-subquery read should lower");
-        assert!(!lowered_sql.contains("FROM lix_active_version"));
-        assert!(!lowered_sql.contains("FROM lix_version"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
-        assert!(lowered_sql.contains("untracked = true"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
+        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_version"]);
+        if let Some(lowered_sql) = prepared.debug_trace.lowered_sql.first() {
+            assert!(!lowered_sql.contains("FROM lix_version"));
+            assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
+            assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
+        }
     }
 }

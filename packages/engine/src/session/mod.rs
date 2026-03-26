@@ -1,22 +1,23 @@
+pub mod contracts;
 pub(crate) mod workspace;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::ops::ControlFlow;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use futures_util::FutureExt;
-use sqlparser::ast::{Expr, FunctionArguments, Statement, Value as SqlValue, VisitMut, VisitorMut};
+use sqlparser::ast::Statement;
 
 use crate::engine::{
     reject_internal_table_writes, reject_public_create_table, Engine, ExecuteOptions,
 };
 use crate::errors;
 use crate::live_state::raw::{load_exact_row_with_backend, RawStorage};
-use crate::sql::ast::walk::object_name_matches;
 use crate::sql::execution::execution_program::{
     execute_execution_program_with_write_transaction, ExecutionContext, ExecutionProgram,
+    SessionExecutionRuntime, SessionExecutionRuntimeHandle,
 };
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
@@ -28,14 +29,11 @@ use crate::version::{
 };
 use crate::{ExecuteResult, LixError, Value};
 
-use workspace::{persist_workspace_active_account_ids, persist_workspace_active_version_id};
-pub(crate) use workspace::{
-    load_compat_active_account_ids, load_effective_workspace_active_account_ids,
-    require_workspace_active_version_id,
+use contracts::{SessionDependency, SessionStateSnapshot};
+use workspace::{
+    load_workspace_active_account_ids, persist_workspace_active_account_ids,
+    persist_workspace_active_version_id, require_workspace_active_version_id,
 };
-
-const ACTIVE_VERSION_FUNCTION_NAME: &str = "lix_active_version_id";
-const ACTIVE_ACCOUNT_IDS_FUNCTION_NAME: &str = "lix_active_account_ids";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct OpenSessionOptions {
@@ -57,9 +55,13 @@ pub struct Session {
     active_version_id: RwLock<String>,
     active_account_ids: RwLock<Vec<String>>,
     public_surface_registry: RwLock<SurfaceRegistry>,
+    execution_runtime: SessionExecutionRuntimeHandle,
     #[allow(dead_code)]
     observe_shared_sources:
         Mutex<BTreeMap<String, Arc<Mutex<crate::observe::SharedObserveSource>>>>,
+    active_version_generation: AtomicU64,
+    active_account_generation: AtomicU64,
+    runtime_generation: AtomicU64,
     persistence: Persistence,
 }
 
@@ -75,16 +77,35 @@ impl Session {
         if !engine.is_initialized().await? {
             return Err(errors::not_initialized_error());
         }
-        let active_version_id = require_workspace_active_version_id(engine.backend.as_ref()).await?;
+        let active_version_id =
+            require_workspace_active_version_id(engine.backend.as_ref()).await?;
         let active_account_ids =
-            load_effective_workspace_active_account_ids(engine.backend.as_ref()).await?;
+            match load_workspace_active_account_ids(engine.backend.as_ref()).await? {
+                Some(active_account_ids) => active_account_ids,
+                None => match engine.boot_active_account() {
+                    Some(account) => {
+                        let active_account_ids = vec![account.id.clone()];
+                        persist_workspace_active_account_ids(
+                            engine.backend.as_ref(),
+                            &active_account_ids,
+                        )
+                        .await?;
+                        active_account_ids
+                    }
+                    None => Vec::new(),
+                },
+            };
         let registry = engine.public_surface_registry();
         Ok(Self {
             engine,
             active_version_id: RwLock::new(active_version_id),
             active_account_ids: RwLock::new(active_account_ids),
             public_surface_registry: RwLock::new(registry),
+            execution_runtime: SessionExecutionRuntime::new(),
             observe_shared_sources: Mutex::new(BTreeMap::new()),
+            active_version_generation: AtomicU64::new(0),
+            active_account_generation: AtomicU64::new(0),
+            runtime_generation: AtomicU64::new(0),
             persistence: Persistence::Workspace,
         })
     }
@@ -101,7 +122,11 @@ impl Session {
             active_version_id: RwLock::new(active_version_id),
             active_account_ids: RwLock::new(active_account_ids),
             public_surface_registry: RwLock::new(self.public_surface_registry()),
+            execution_runtime: SessionExecutionRuntime::new(),
             observe_shared_sources: Mutex::new(BTreeMap::new()),
+            active_version_generation: AtomicU64::new(0),
+            active_account_generation: AtomicU64::new(0),
+            runtime_generation: AtomicU64::new(0),
             persistence: Persistence::Ephemeral,
         })
     }
@@ -117,7 +142,11 @@ impl Session {
             engine,
             active_version_id: RwLock::new(active_version_id),
             active_account_ids: RwLock::new(active_account_ids),
+            execution_runtime: SessionExecutionRuntime::new(),
             observe_shared_sources: Mutex::new(BTreeMap::new()),
+            active_version_generation: AtomicU64::new(0),
+            active_account_generation: AtomicU64::new(0),
+            runtime_generation: AtomicU64::new(0),
             persistence: Persistence::Ephemeral,
         }
     }
@@ -140,6 +169,21 @@ impl Session {
             .clone()
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn public_surface_registry_generation(&self) -> u64 {
+        self.execution_runtime.public_surface_registry_generation()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn snapshot(&self) -> SessionStateSnapshot {
+        SessionStateSnapshot {
+            active_version_id: self.active_version_id(),
+            active_account_ids: self.active_account_ids(),
+            generation: self.runtime_generation(),
+            public_surface_registry_generation: self.public_surface_registry_generation(),
+        }
+    }
+
     pub(crate) fn public_surface_registry(&self) -> SurfaceRegistry {
         self.public_surface_registry
             .read()
@@ -152,6 +196,35 @@ impl Session {
         &self,
     ) -> &Mutex<BTreeMap<String, Arc<Mutex<crate::observe::SharedObserveSource>>>> {
         &self.observe_shared_sources
+    }
+
+    pub(crate) fn runtime_generation(&self) -> u64 {
+        self.runtime_generation.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn dependency_generation(&self, dependency: SessionDependency) -> u64 {
+        match dependency {
+            SessionDependency::ActiveVersion => {
+                self.active_version_generation.load(Ordering::SeqCst)
+            }
+            SessionDependency::ActiveAccounts => {
+                self.active_account_generation.load(Ordering::SeqCst)
+            }
+            SessionDependency::PublicSurfaceRegistryGeneration => {
+                self.public_surface_registry_generation()
+            }
+        }
+    }
+
+    pub(crate) fn dependency_generations(
+        &self,
+        dependencies: &BTreeSet<SessionDependency>,
+    ) -> BTreeMap<SessionDependency, u64> {
+        dependencies
+            .iter()
+            .copied()
+            .map(|dependency| (dependency, self.dependency_generation(dependency)))
+            .collect()
     }
 
     pub async fn create_version(
@@ -217,6 +290,7 @@ impl Session {
         ExecutionContext::new(
             options,
             self.public_surface_registry(),
+            Arc::clone(&self.execution_runtime),
             self.active_version_id(),
             self.active_account_ids(),
         )
@@ -245,9 +319,7 @@ impl Session {
     ) -> Result<ExecuteResult, LixError> {
         let allow_internal_sql = allow_internal_tables || self.engine.access_to_internal();
 
-        let mut parsed_statements = parse_sql(sql).map_err(LixError::from)?;
-        inline_session_runtime_state(&mut parsed_statements, self)?;
-        let mutates_active_accounts = statements_mutate_active_account_surface(&parsed_statements);
+        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         if !allow_internal_sql {
             reject_public_create_table(&parsed_statements)?;
             reject_internal_table_writes(&parsed_statements)?;
@@ -262,11 +334,16 @@ impl Session {
             return Err(errors::transaction_control_statement_denied_error());
         }
 
-        let program =
-            ExecutionProgram::compile(parsed_statements, params, self.engine.backend.dialect())?;
         let transaction = self.engine.begin_write_unit().await?;
         let mut write_transaction = WriteTransaction::new_buffered_write(transaction);
         let mut context = self.new_execution_context(options);
+        let runtime_bindings = context.runtime_binding_values()?;
+        let program = ExecutionProgram::compile(
+            parsed_statements,
+            params,
+            self.engine.backend.dialect(),
+            &runtime_bindings,
+        )?;
 
         let result = execute_execution_program_with_write_transaction(
             self.engine.as_ref(),
@@ -283,9 +360,6 @@ impl Session {
                     .commit_buffered_write(self.engine.as_ref(), context)
                     .await?;
                 self.apply_transaction_commit_outcome(outcome).await?;
-                if mutates_active_accounts {
-                    self.refresh_active_account_ids_from_backend().await?;
-                }
                 Ok(result)
             }
             Err(error) => {
@@ -342,37 +416,18 @@ impl Session {
             ));
         }
         ensure_version_exists(self, &version_id).await?;
-
+        self.replace_active_version_id(version_id.clone());
         if matches!(self.persistence, Persistence::Workspace) {
-            self.execute(
-                "UPDATE lix_active_version SET version_id = $1",
-                &[Value::Text(version_id)],
-            )
-            .await?;
-            return Ok(());
+            persist_workspace_active_version_id(self.engine.backend.as_ref(), &version_id).await?;
         }
-
-        self.set_active_version_id(version_id);
         Ok(())
     }
 
-    pub(crate) fn set_active_version_id(&self, version_id: String) {
-        *self
-            .active_version_id
-            .write()
-            .expect("session active version lock poisoned") = version_id;
-    }
-
-    pub(crate) fn set_active_account_ids(&self, active_account_ids: Vec<String>) {
-        *self
-            .active_account_ids
-            .write()
-            .expect("session active account ids lock poisoned") = active_account_ids;
-    }
-
-    async fn refresh_active_account_ids_from_backend(&self) -> Result<(), LixError> {
-        let active_account_ids = load_compat_active_account_ids(self.engine.backend.as_ref()).await?;
-        self.set_active_account_ids(active_account_ids.clone());
+    pub async fn set_active_account_ids(
+        &self,
+        active_account_ids: Vec<String>,
+    ) -> Result<(), LixError> {
+        self.replace_active_account_ids(active_account_ids.clone());
         if matches!(self.persistence, Persistence::Workspace) {
             persist_workspace_active_account_ids(self.engine.backend.as_ref(), &active_account_ids)
                 .await?;
@@ -380,33 +435,49 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn replace_active_version_id(&self, version_id: String) {
+        let mut guard = self
+            .active_version_id
+            .write()
+            .expect("session active version lock poisoned");
+        if *guard != version_id {
+            *guard = version_id;
+            self.active_version_generation
+                .fetch_add(1, Ordering::SeqCst);
+            self.bump_runtime_generation();
+        }
+    }
+
+    pub(crate) fn replace_active_account_ids(&self, active_account_ids: Vec<String>) {
+        let mut guard = self
+            .active_account_ids
+            .write()
+            .expect("session active account ids lock poisoned");
+        if *guard != active_account_ids {
+            *guard = active_account_ids;
+            self.active_account_generation
+                .fetch_add(1, Ordering::SeqCst);
+            self.bump_runtime_generation();
+        }
+    }
+
+    pub(crate) fn bump_runtime_generation(&self) {
+        self.runtime_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
     pub(crate) async fn apply_transaction_commit_outcome(
         &self,
         mut outcome: TransactionCommitOutcome,
     ) -> Result<(), LixError> {
-        let refresh_active_accounts_from_backend = outcome
-            .state_commit_stream_changes
-            .iter()
-            .any(|change| change.schema_key == crate::account::active_account_schema_key());
-        if let Some(version_id) = outcome.next_active_version_id.take() {
-            self.set_active_version_id(version_id.clone());
+        if let Some(version_id) = outcome.session_delta.next_active_version_id.take() {
+            self.replace_active_version_id(version_id.clone());
             if matches!(self.persistence, Persistence::Workspace) {
                 persist_workspace_active_version_id(self.engine.backend.as_ref(), &version_id)
                     .await?;
             }
         }
-        if let Some(active_account_ids) = outcome.next_active_account_ids.take() {
-            self.set_active_account_ids(active_account_ids.clone());
-            if matches!(self.persistence, Persistence::Workspace) {
-                persist_workspace_active_account_ids(
-                    self.engine.backend.as_ref(),
-                    &active_account_ids,
-                )
-                .await?;
-            }
-        } else if refresh_active_accounts_from_backend {
-            let active_account_ids = load_compat_active_account_ids(self.engine.backend.as_ref()).await?;
-            self.set_active_account_ids(active_account_ids.clone());
+        if let Some(active_account_ids) = outcome.session_delta.next_active_account_ids.take() {
+            self.replace_active_account_ids(active_account_ids.clone());
             if matches!(self.persistence, Persistence::Workspace) {
                 persist_workspace_active_account_ids(
                     self.engine.backend.as_ref(),
@@ -428,6 +499,7 @@ impl Session {
                 .public_surface_registry
                 .write()
                 .expect("session public surface registry lock poisoned") = registry.clone();
+            self.bump_runtime_generation();
             if matches!(self.persistence, Persistence::Workspace) {
                 self.engine.refresh_public_surface_registry().await?;
             }
@@ -493,8 +565,7 @@ impl<'a> SessionTransaction<'a> {
         sql: &str,
         params: &[Value],
     ) -> Result<crate::ExecuteResult, LixError> {
-        let mut parsed_statements = parse_sql(sql).map_err(LixError::from)?;
-        inline_session_runtime_state(&mut parsed_statements, self.session)?;
+        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         if !self.engine.access_to_internal() {
             reject_public_create_table(&parsed_statements)?;
             reject_internal_table_writes(&parsed_statements)?;
@@ -520,8 +591,7 @@ impl<'a> SessionTransaction<'a> {
         sql: &str,
         params: &[Value],
     ) -> Result<crate::ExecuteResult, LixError> {
-        let mut parsed_statements = parse_sql(sql).map_err(LixError::from)?;
-        inline_session_runtime_state(&mut parsed_statements, self.session)?;
+        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         let write_transaction = self.write_transaction.as_mut().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
@@ -545,6 +615,7 @@ impl<'a> SessionTransaction<'a> {
         let placeholder = ExecutionContext::new(
             ExecuteOptions::default(),
             self.context.public_surface_registry.clone(),
+            self.context.session_runtime(),
             self.context.active_version_id.clone(),
             self.context.active_account_ids.clone(),
         );
@@ -618,76 +689,4 @@ fn contains_transaction_control_statement(statements: &[Statement]) -> bool {
                 | Statement::Rollback { .. }
         )
     })
-}
-
-fn statements_mutate_active_account_surface(statements: &[Statement]) -> bool {
-    statements.iter().any(|statement| {
-        matches!(
-            statement,
-            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
-        ) && crate::sql::analysis::state_resolution::canonical::statement_targets_table_name(
-            statement,
-            "lix_active_account",
-        )
-    })
-}
-
-fn inline_session_runtime_state(
-    statements: &mut [Statement],
-    session: &Session,
-) -> Result<(), LixError> {
-    let mut inliner = SessionRuntimeFunctionInliner {
-        active_version_id: session.active_version_id(),
-        active_account_ids_json: serde_json::to_string(&session.active_account_ids()).map_err(
-            |error| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("active account ids serialization failed: {error}"),
-                )
-            },
-        )?,
-    };
-    for statement in statements {
-        let _ = statement.visit(&mut inliner);
-    }
-    Ok(())
-}
-
-struct SessionRuntimeFunctionInliner {
-    active_version_id: String,
-    active_account_ids_json: String,
-}
-
-impl VisitorMut for SessionRuntimeFunctionInliner {
-    type Break = ();
-
-    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
-        let Expr::Function(function) = expr else {
-            return ControlFlow::Continue(());
-        };
-        if !object_name_matches(&function.name, ACTIVE_VERSION_FUNCTION_NAME) {
-            if object_name_matches(&function.name, ACTIVE_ACCOUNT_IDS_FUNCTION_NAME) {
-                if !function_args_empty(&function.args) {
-                    return ControlFlow::Continue(());
-                }
-                *expr = Expr::Value(
-                    SqlValue::SingleQuotedString(self.active_account_ids_json.clone()).into(),
-                );
-            }
-            return ControlFlow::Continue(());
-        }
-        if !function_args_empty(&function.args) {
-            return ControlFlow::Continue(());
-        }
-        *expr = Expr::Value(SqlValue::SingleQuotedString(self.active_version_id.clone()).into());
-        ControlFlow::Continue(())
-    }
-}
-
-fn function_args_empty(args: &FunctionArguments) -> bool {
-    match args {
-        FunctionArguments::None => true,
-        FunctionArguments::List(list) => list.args.is_empty() && list.clauses.is_empty(),
-        FunctionArguments::Subquery(_) => false,
-    }
 }

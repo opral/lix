@@ -353,9 +353,10 @@ async fn load_file_paths_for_descriptors(
 
     let file_projection_sql = build_filesystem_file_projection_sql(
         FilesystemProjectionScope::ExplicitVersion,
+        None,
         false,
         backend.dialect(),
-    );
+    )?;
     let mut sql = String::from("WITH requested(file_id, version_id) AS (VALUES ");
     let mut params = Vec::with_capacity(targets.len() * 2);
     for (index, (version_id, file_id)) in targets.iter().enumerate() {

@@ -5,10 +5,7 @@ use crate::live_state::{
 };
 use crate::sql::public::planner::semantics::filesystem_queries::lookup_file_id_by_path;
 use crate::sql_support::text::escape_sql_string;
-use crate::version::{
-    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    version_descriptor_schema_key, GLOBAL_VERSION_ID,
-};
+use crate::version::{version_descriptor_schema_key, GLOBAL_VERSION_ID};
 use crate::{LixBackend, LixError, SqlDialect};
 
 pub(crate) const LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN: &str = "__lix_blob_hash";
@@ -43,9 +40,10 @@ pub(crate) async fn resolve_file_id_by_path_in_version(
 
 pub(crate) fn build_filesystem_file_projection_sql(
     scope: FilesystemProjectionScope,
+    active_version_id: Option<&str>,
     include_blob_hash: bool,
     dialect: SqlDialect,
-) -> String {
+) -> Result<String, LixError> {
     let commit_change_set_id_column =
         quote_ident(&live_payload_column_name("lix_commit", "change_set_id"));
     let cse_change_set_id_column = quote_ident(&live_payload_column_name(
@@ -57,7 +55,9 @@ pub(crate) fn build_filesystem_file_projection_sql(
         "change_id",
     ));
     let commit_id_projection = match scope {
-        FilesystemProjectionScope::ActiveVersion => active_version_commit_id_sql(),
+        FilesystemProjectionScope::ActiveVersion => {
+            active_version_commit_id_sql(required_active_version_id(scope, active_version_id)?)?
+        }
         FilesystemProjectionScope::ExplicitVersion => "f.lixcol_commit_id".to_string(),
     };
     let blob_hash_projection = if include_blob_hash {
@@ -68,7 +68,7 @@ pub(crate) fn build_filesystem_file_projection_sql(
     let live_commit_table = tracked_live_table_name("lix_commit");
     let live_cse_table = tracked_live_table_name("lix_change_set_element");
 
-    format!(
+    Ok(format!(
         "WITH RECURSIVE \
            {target_versions_cte}, \
            commit_by_version AS ( \
@@ -294,16 +294,17 @@ pub(crate) fn build_filesystem_file_projection_sql(
          LEFT JOIN binary_blob_ref_rows bfr \
            ON bfr.id = f.id \
           AND bfr.lixcol_version_id = f.lixcol_version_id \
-         LEFT JOIN lix_internal_binary_blob_store bbs \
+        LEFT JOIN lix_internal_binary_blob_store bbs \
            ON bbs.blob_hash = bfr.blob_hash",
         target_versions_cte = target_versions_cte_sql(
             scope,
+            active_version_id,
             &[
                 FILE_DESCRIPTOR_SCHEMA_KEY,
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
                 BINARY_BLOB_REF_SCHEMA_KEY
             ]
-        ),
+        )?,
         directory_candidates_sql = effective_directory_descriptor_candidates_sql(),
         file_candidates_sql = effective_file_descriptor_candidates_sql(dialect),
         blob_candidates_sql = effective_binary_blob_ref_candidates_sql(),
@@ -313,13 +314,14 @@ pub(crate) fn build_filesystem_file_projection_sql(
         commit_change_set_id_column = commit_change_set_id_column,
         cse_change_set_id_column = cse_change_set_id_column,
         cse_change_id_column = cse_change_id_column,
-    )
+    ))
 }
 
 pub(crate) fn build_filesystem_directory_projection_sql(
     scope: FilesystemProjectionScope,
+    active_version_id: Option<&str>,
     _dialect: SqlDialect,
-) -> String {
+) -> Result<String, LixError> {
     let commit_change_set_id_column =
         quote_ident(&live_payload_column_name("lix_commit", "change_set_id"));
     let cse_change_set_id_column = quote_ident(&live_payload_column_name(
@@ -331,12 +333,14 @@ pub(crate) fn build_filesystem_directory_projection_sql(
         "change_id",
     ));
     let commit_id_projection = match scope {
-        FilesystemProjectionScope::ActiveVersion => active_version_commit_id_sql(),
+        FilesystemProjectionScope::ActiveVersion => {
+            active_version_commit_id_sql(required_active_version_id(scope, active_version_id)?)?
+        }
         FilesystemProjectionScope::ExplicitVersion => "d.lixcol_commit_id".to_string(),
     };
     let live_commit_table = tracked_live_table_name("lix_commit");
     let live_cse_table = tracked_live_table_name("lix_change_set_element");
-    format!(
+    Ok(format!(
         "WITH RECURSIVE \
            {target_versions_cte}, \
            commit_by_version AS ( \
@@ -459,38 +463,30 @@ pub(crate) fn build_filesystem_directory_projection_sql(
          LEFT JOIN directory_paths dp \
            ON dp.id = d.id \
           AND dp.lixcol_version_id = d.lixcol_version_id",
-        target_versions_cte = target_versions_cte_sql(scope, &[DIRECTORY_DESCRIPTOR_SCHEMA_KEY]),
+        target_versions_cte =
+            target_versions_cte_sql(scope, active_version_id, &[DIRECTORY_DESCRIPTOR_SCHEMA_KEY])?,
         directory_candidates_sql = effective_directory_descriptor_candidates_sql(),
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
         commit_id_projection = commit_id_projection,
         commit_change_set_id_column = commit_change_set_id_column,
         cse_change_set_id_column = cse_change_set_id_column,
         cse_change_id_column = cse_change_id_column,
-    )
+    ))
 }
 
-fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str]) -> String {
-    let active_version_layout = builtin_live_table_layout(active_version_schema_key())
-        .expect("active version layout lookup should succeed")
-        .expect("builtin active version schema should exist");
-    let active_version_column = live_column_name_for_property(&active_version_layout, "version_id")
-        .expect("active version live layout must include version_id");
+fn target_versions_cte_sql(
+    scope: FilesystemProjectionScope,
+    active_version_id: Option<&str>,
+    schema_keys: &[&str],
+) -> Result<String, LixError> {
     match scope {
-        FilesystemProjectionScope::ActiveVersion => format!(
+        FilesystemProjectionScope::ActiveVersion => Ok(format!(
             "target_versions AS ( \
-               SELECT DISTINCT \
-                 {active_version_column} AS version_id \
-               FROM {table_name} \
-               WHERE file_id = '{file_id}' \
-                 AND version_id = '{storage_version_id}' \
-                 AND untracked = true \
-                 AND {active_version_column} IS NOT NULL \
+               SELECT '{active_version_id}' AS version_id \
              )",
-            active_version_column = quote_ident(active_version_column),
-            table_name = quote_ident(&untracked_live_table_name(active_version_schema_key())),
-            file_id = escape_sql_string(active_version_file_id()),
-            storage_version_id = escape_sql_string(active_version_storage_version_id()),
-        ),
+            active_version_id =
+                escape_sql_string(required_active_version_id(scope, active_version_id)?),
+        )),
         FilesystemProjectionScope::ExplicitVersion => {
             let union_rows = schema_keys
                 .iter()
@@ -522,7 +518,7 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
                 format!(" UNION {}", union_rows.join(" UNION "))
             };
             let live_version_descriptor_table = tracked_live_table_name("lix_version_descriptor");
-            format!(
+            Ok(format!(
                 "all_target_versions AS ( \
                    SELECT '{global_version}' AS version_id \
                    UNION \
@@ -540,7 +536,7 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
                 version_descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
                 global_version = escape_sql_string(GLOBAL_VERSION_ID),
                 union_sql = union_sql,
-            )
+            ))
         }
     }
 }
@@ -777,16 +773,11 @@ fn quote_ident(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
-fn active_version_commit_id_sql() -> String {
-    let active_version_layout = builtin_live_table_layout(active_version_schema_key())
-        .expect("active version layout lookup should succeed")
-        .expect("builtin active version schema should exist");
-    let active_version_column = live_column_name_for_property(&active_version_layout, "version_id")
-        .expect("active version live layout must include version_id");
+fn active_version_commit_id_sql(active_version_id: &str) -> Result<String, LixError> {
     let version_ref_commit_id_column =
         quote_ident(&live_payload_column_name("lix_version_ref", "commit_id"));
     let live_version_ref_table = untracked_live_table_name("lix_version_ref");
-    format!(
+    Ok(format!(
         "(\
          SELECT {version_ref_commit_id_column} \
          FROM {live_version_ref_table} vp \
@@ -794,24 +785,30 @@ fn active_version_commit_id_sql() -> String {
            AND vp.version_id = '{global_version}' \
            AND vp.untracked = true \
            AND {version_ref_commit_id_column} IS NOT NULL \
-           AND vp.entity_id = (\
-               SELECT {active_version_column} \
-               FROM {active_version_table} \
-               WHERE file_id = '{file_id}' \
-                 AND version_id = '{storage_version_id}' \
-                 AND untracked = true \
-                 AND {active_version_column} IS NOT NULL \
-               LIMIT 1\
-           ) \
+           AND vp.entity_id = '{active_version_id}' \
          LIMIT 1\
         )",
-        active_version_column = quote_ident(active_version_column),
         version_ref_commit_id_column = version_ref_commit_id_column,
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
-        active_version_table = quote_ident(&untracked_live_table_name(active_version_schema_key())),
-        file_id = escape_sql_string(active_version_file_id()),
-        storage_version_id = escape_sql_string(active_version_storage_version_id()),
-    )
+        active_version_id = escape_sql_string(active_version_id),
+    ))
+}
+
+fn required_active_version_id(
+    scope: FilesystemProjectionScope,
+    active_version_id: Option<&str>,
+) -> Result<&str, LixError> {
+    match (scope, active_version_id) {
+        (FilesystemProjectionScope::ActiveVersion, Some(active_version_id)) => Ok(active_version_id),
+        (FilesystemProjectionScope::ActiveVersion, None) => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "filesystem active-version projection requires a session-requested version id",
+        )),
+        (FilesystemProjectionScope::ExplicitVersion, _) => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "explicit filesystem projections must not request an active version id",
+        )),
+    }
 }
 
 fn live_payload_column_name(schema_key: &str, property_name: &str) -> String {

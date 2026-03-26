@@ -1,3 +1,4 @@
+use crate::session::contracts::SessionDependency;
 use crate::sql::common::dependency_spec::{DependencyPrecision, DependencySpec};
 use crate::sql::public::catalog::{SurfaceBinding, SurfaceFamily};
 use crate::sql::public::planner::ir::{
@@ -16,19 +17,27 @@ pub(crate) fn derive_dependency_spec_from_structured_public_read(
     structured_read: &StructuredPublicRead,
 ) -> Option<DependencySpec> {
     if let Some(change_scan) = canonical_change_scan(&structured_read.read_command.root) {
-        return Some(dependency_spec_for_change_scan(&change_scan.binding));
+        return Some(with_public_surface_registry_dependency(
+            dependency_spec_for_change_scan(&change_scan.binding),
+        ));
     }
     if canonical_working_changes_scan(&structured_read.read_command.root).is_some() {
-        return Some(dependency_spec_for_working_changes_scan());
+        return Some(with_public_surface_registry_dependency(
+            dependency_spec_for_working_changes_scan(),
+        ));
     }
     if let Some(filesystem_scan) = canonical_filesystem_scan(&structured_read.read_command.root) {
-        return Some(dependency_spec_for_filesystem_scan(
-            filesystem_scan.kind,
-            &structured_read.surface_binding,
+        return Some(with_public_surface_registry_dependency(
+            dependency_spec_for_filesystem_scan(
+                filesystem_scan.kind,
+                &structured_read.surface_binding,
+            ),
         ));
     }
     if let Some(admin_scan) = canonical_admin_scan(&structured_read.read_command.root) {
-        return Some(dependency_spec_for_admin_scan(admin_scan.kind));
+        return Some(with_public_surface_registry_dependency(
+            dependency_spec_for_admin_scan(admin_scan.kind),
+        ));
     }
     let Some(scan) = canonical_state_scan(&structured_read.read_command.root) else {
         return None;
@@ -77,13 +86,14 @@ pub(crate) fn derive_dependency_spec_from_structured_public_read(
 
     if state_like_surface_depends_on_active_version(&scan.binding, scan.version_scope) {
         spec.depends_on_active_version = true;
-        spec.schema_keys.insert("lix_active_version".to_string());
+        spec.session_dependencies
+            .insert(SessionDependency::ActiveVersion);
         spec.entity_ids.clear();
         spec.file_ids.clear();
         spec.version_ids.clear();
     }
 
-    Some(spec)
+    Some(with_public_surface_registry_dependency(spec))
 }
 
 fn query_contains_expression_subqueries(
@@ -159,20 +169,18 @@ pub(crate) fn derive_dependency_spec_from_bound_public_surface_bindings(
     merged.entity_ids.clear();
     merged.file_ids.clear();
     merged.version_ids.clear();
-    Some(merged)
+    Some(with_public_surface_registry_dependency(merged))
+}
+
+fn with_public_surface_registry_dependency(mut spec: DependencySpec) -> DependencySpec {
+    spec.session_dependencies
+        .insert(SessionDependency::PublicSurfaceRegistryGeneration);
+    spec
 }
 
 fn dependency_spec_for_admin_scan(kind: CanonicalAdminKind) -> DependencySpec {
     let mut spec = DependencySpec::default();
     match kind {
-        CanonicalAdminKind::ActiveVersion => {
-            spec.relations.insert("lix_active_version".to_string());
-            spec.schema_keys.insert("lix_active_version".to_string());
-        }
-        CanonicalAdminKind::ActiveAccount => {
-            spec.relations.insert("lix_active_account".to_string());
-            spec.schema_keys.insert("lix_active_account".to_string());
-        }
         CanonicalAdminKind::Version => {
             spec.relations.insert("lix_version".to_string());
             spec.schema_keys
@@ -237,7 +245,8 @@ fn dependency_spec_for_filesystem_scan(
         "lix_file" | "lix_directory" | "lix_file_history" | "lix_directory_history"
     ) {
         spec.depends_on_active_version = true;
-        spec.schema_keys.insert("lix_active_version".to_string());
+        spec.session_dependencies
+            .insert(SessionDependency::ActiveVersion);
     }
 
     spec.precision = DependencyPrecision::Conservative;
@@ -285,7 +294,8 @@ fn dependency_spec_for_state_like_surface(binding: &SurfaceBinding) -> Dependenc
             .is_some_and(|scope| state_like_surface_depends_on_active_version(binding, scope))
         {
             spec.depends_on_active_version = true;
-            spec.schema_keys.insert("lix_active_version".to_string());
+            spec.session_dependencies
+                .insert(SessionDependency::ActiveVersion);
         }
         spec.precision = DependencyPrecision::Conservative;
     }
@@ -310,6 +320,7 @@ fn merge_dependency_specs(mut left: DependencySpec, right: DependencySpec) -> De
     left.entity_ids.extend(right.entity_ids);
     left.file_ids.extend(right.file_ids);
     left.version_ids.extend(right.version_ids);
+    left.session_dependencies.extend(right.session_dependencies);
     left.writer_filter
         .include
         .extend(right.writer_filter.include);
@@ -572,6 +583,7 @@ fn add_filter_literal(column: FilterColumn, value: String, spec: &mut Dependency
 #[cfg(test)]
 mod tests {
     use super::derive_dependency_spec_from_structured_public_read;
+    use crate::session::contracts::SessionDependency;
     use crate::sql::common::dependency_spec::DependencyPrecision;
     use crate::sql::public::catalog::SurfaceRegistry;
     use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
@@ -611,12 +623,15 @@ mod tests {
 
         assert_eq!(spec.precision, DependencyPrecision::Precise);
         assert!(spec.depends_on_active_version);
+        assert!(spec
+            .session_dependencies
+            .contains(&SessionDependency::ActiveVersion));
+        assert!(spec
+            .session_dependencies
+            .contains(&SessionDependency::PublicSurfaceRegistryGeneration));
         assert_eq!(
             spec.schema_keys.into_iter().collect::<Vec<_>>(),
-            vec![
-                "lix_active_version".to_string(),
-                "lix_key_value".to_string()
-            ]
+            vec!["lix_key_value".to_string()]
         );
     }
 
@@ -660,10 +675,10 @@ mod tests {
             .expect("state read should derive dependency spec");
 
         assert_eq!(spec.precision, DependencyPrecision::Conservative);
-        assert_eq!(
-            spec.schema_keys.into_iter().collect::<Vec<_>>(),
-            vec!["lix_active_version".to_string()]
-        );
+        assert!(spec
+            .session_dependencies
+            .contains(&SessionDependency::ActiveVersion));
+        assert!(spec.schema_keys.is_empty());
         assert!(spec.entity_ids.is_empty());
     }
 }

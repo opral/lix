@@ -81,12 +81,7 @@ fn merge_plan_effects_override(existing: &mut Option<PlanEffects>, next: Option<
             current
                 .file_cache_refresh_targets
                 .extend(next.file_cache_refresh_targets);
-            if next.next_active_version_id.is_some() {
-                current.next_active_version_id = next.next_active_version_id;
-            }
-            if next.next_active_account_ids.is_some() {
-                current.next_active_account_ids = next.next_active_account_ids;
-            }
+            current.session_delta.merge(next.session_delta);
         }
     }
 }

@@ -5,7 +5,6 @@ use crate::live_state::{
 };
 use crate::sql_support::text::escape_sql_string;
 use crate::version::{
-    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
@@ -32,13 +31,16 @@ pub(crate) async fn load_state_history_rows(
         }
     }
 
-    let sql = build_state_history_query_sql(backend.dialect(), request);
+    let sql = build_state_history_query_sql(backend.dialect(), request)?;
     let result = backend.execute(&sql, &[]).await?;
     parse_state_history_rows(result)
 }
 
-fn build_state_history_query_sql(dialect: SqlDialect, request: &StateHistoryRequest) -> String {
-    let source_sql = build_state_history_source_sql(dialect, request);
+fn build_state_history_query_sql(
+    dialect: SqlDialect,
+    request: &StateHistoryRequest,
+) -> Result<String, LixError> {
+    let source_sql = build_state_history_source_sql(dialect, request)?;
     let mut predicates = Vec::new();
     if !request.entity_ids.is_empty() {
         predicates.push(render_text_in_predicate(
@@ -78,7 +80,7 @@ fn build_state_history_query_sql(dialect: SqlDialect, request: &StateHistoryRequ
         }
     };
 
-    format!(
+    Ok(format!(
         "SELECT \
            history.entity_id, \
            history.schema_key, \
@@ -99,10 +101,13 @@ fn build_state_history_query_sql(dialect: SqlDialect, request: &StateHistoryRequ
         source_sql = source_sql,
         where_sql = where_sql,
         order_sql = order_sql,
-    )
+    ))
 }
 
-fn build_state_history_source_sql(dialect: SqlDialect, request: &StateHistoryRequest) -> String {
+fn build_state_history_source_sql(
+    dialect: SqlDialect,
+    request: &StateHistoryRequest,
+) -> Result<String, LixError> {
     let version_ref_table = untracked_live_table_name("lix_version_ref");
     let commit_table = tracked_live_table_name("lix_commit");
     let version_ref_commit_id_column = quote_ident(&live_payload_column_name(
@@ -138,49 +143,27 @@ fn build_state_history_source_sql(dialect: SqlDialect, request: &StateHistoryReq
     }
     let requested_where_sql = render_where_clause_sql(&requested_predicates, "WHERE ");
 
-    let active_version_rows_sql =
-        if request.lineage_scope == StateHistoryLineageScope::ActiveVersion {
-            let active_version_column = active_version_payload_column_name();
-            format!(
-                "active_version_rows AS ( \
-               SELECT DISTINCT \
-                 {active_version_column} AS version_id \
-               FROM {active_version_table} \
-               WHERE file_id = '{file_id}' \
-                 AND version_id = '{storage_version_id}' \
-                 AND untracked = true \
-                 AND {active_version_column} IS NOT NULL \
-             ), ",
-                active_version_column = quote_ident(&active_version_column),
-                active_version_table =
-                    quote_ident(&untracked_live_table_name(active_version_schema_key())),
-                file_id = escape_sql_string(active_version_file_id()),
-                storage_version_id = escape_sql_string(active_version_storage_version_id()),
-            )
-        } else {
-            String::new()
-        };
-
     let default_root_commits_sql =
         if request.lineage_scope == StateHistoryLineageScope::ActiveVersion {
+            let active_version_id = required_active_version_id(request)?;
             format!(
                 "default_root_commits AS ( \
                SELECT DISTINCT \
                  vp.{version_ref_commit_id_column} AS root_commit_id, \
                  vp.entity_id AS root_version_id \
                FROM {version_ref_table} vp \
-               JOIN active_version_rows av \
-                 ON av.version_id = vp.entity_id \
                WHERE vp.schema_key = '{schema_key}' \
                  AND vp.file_id = '{file_id}' \
                  AND vp.version_id = '{storage_version_id}' \
                  AND vp.untracked = true \
+                 AND vp.entity_id = '{active_version_id}' \
              ), ",
                 version_ref_commit_id_column = version_ref_commit_id_column,
                 version_ref_table = version_ref_table,
                 schema_key = escape_sql_string(version_ref_schema_key()),
                 file_id = escape_sql_string(version_ref_file_id()),
                 storage_version_id = escape_sql_string(version_ref_storage_version_id()),
+                active_version_id = escape_sql_string(active_version_id),
             )
         } else {
             format!(
@@ -217,9 +200,8 @@ fn build_state_history_source_sql(dialect: SqlDialect, request: &StateHistoryReq
             .to_string(),
     };
 
-    format!(
+    Ok(format!(
         "WITH RECURSIVE \
-           {active_version_rows_sql}\
            {default_root_commits_sql}\
            commit_by_version AS ( \
              SELECT \
@@ -306,7 +288,6 @@ fn build_state_history_source_sql(dialect: SqlDialect, request: &StateHistoryReq
          FROM history_rows h \
          {snapshot_join}\
          WHERE h.snapshot_id != 'no-content'",
-        active_version_rows_sql = active_version_rows_sql,
         default_root_commits_sql = default_root_commits_sql,
         commit_change_set_id_column = commit_change_set_id_column,
         commit_table = commit_table,
@@ -315,7 +296,7 @@ fn build_state_history_source_sql(dialect: SqlDialect, request: &StateHistoryReq
         reachable_commits_cte_sql = reachable_commits_cte_sql,
         snapshot_projection = snapshot_projection,
         snapshot_join = snapshot_join,
-    )
+    ))
 }
 
 fn parse_state_history_rows(result: QueryResult) -> Result<Vec<StateHistoryRow>, LixError> {
@@ -367,8 +348,16 @@ fn quote_ident(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-fn active_version_payload_column_name() -> String {
-    live_payload_column_name(active_version_schema_key(), "version_id")
+fn required_active_version_id(request: &StateHistoryRequest) -> Result<&str, LixError> {
+    request
+        .active_version_id
+        .as_deref()
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "state history active-version reads require a session-requested version id",
+            )
+        })
 }
 
 fn live_payload_column_name(schema_key: &str, property_name: &str) -> String {

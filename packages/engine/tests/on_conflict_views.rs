@@ -11,10 +11,7 @@ fn assert_text(value: &Value, expected: &str) {
 
 async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let rows = engine
-        .execute(
-            "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-            &[],
-        )
+        .execute("SELECT lix_active_version_id()", &[])
         .await
         .unwrap();
     assert_eq!(rows.statements[0].rows.len(), 1);
@@ -26,10 +23,12 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
 
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
-        .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
-             )", &[])
+        .register_schema(
+            &serde_json::from_str::<serde_json::Value>(
+                "{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}",
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 }
@@ -141,10 +140,7 @@ simulation_test!(
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
         engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-a'",
-                &[],
-            )
+            .switch_version("version-a".to_string())
             .await
             .unwrap();
 

@@ -1,6 +1,6 @@
 use crate::engine::Engine;
 use crate::errors;
-use crate::session::Session;
+use crate::session::{contracts::SessionDependency, Session};
 use crate::sql::execution::dependency_spec::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
 };
@@ -91,7 +91,9 @@ pub(crate) struct SharedObserveSource {
     query: ObserveQuery,
     state_commits: StateCommitStream,
     writer_key_filter: ObserveWriterKeyFilter,
+    session_dependencies: BTreeSet<SessionDependency>,
     last_seen_tick_seq: Option<i64>,
+    last_seen_session_dependency_generations: BTreeMap<SessionDependency, u64>,
     last_result: Option<QueryResult>,
     latest_event: Option<SharedObserveEvent>,
     events: VecDeque<SharedObserveEvent>,
@@ -106,21 +108,29 @@ pub(crate) struct SharedObserveSource {
 enum PollWork {
     Initial {
         query: ObserveQuery,
+        session_dependency_generations: BTreeMap<SessionDependency, u64>,
+    },
+    SessionRuntime {
+        query: ObserveQuery,
+        session_dependency_generations: BTreeMap<SessionDependency, u64>,
     },
     StateCommit {
         query: ObserveQuery,
         state_commit_sequence: u64,
+        session_dependency_generations: BTreeMap<SessionDependency, u64>,
     },
     External {
         query: ObserveQuery,
         last_seen_tick_seq: Option<i64>,
         writer_key_filter: ObserveWriterKeyFilter,
+        session_dependency_generations: BTreeMap<SessionDependency, u64>,
     },
 }
 
 struct PollOutcome {
     maybe_rows: Option<(QueryResult, Option<u64>)>,
     update_last_seen_tick_seq: Option<Option<i64>>,
+    update_last_seen_session_dependency_generations: Option<BTreeMap<SessionDependency, u64>>,
     mark_initialized: bool,
 }
 
@@ -129,12 +139,15 @@ impl SharedObserveSource {
         query: ObserveQuery,
         state_commits: StateCommitStream,
         writer_key_filter: ObserveWriterKeyFilter,
+        session_dependencies: BTreeSet<SessionDependency>,
     ) -> Self {
         Self {
             query,
             state_commits,
             writer_key_filter,
+            session_dependencies,
             last_seen_tick_seq: None,
+            last_seen_session_dependency_generations: BTreeMap::new(),
             last_result: None,
             latest_event: None,
             events: VecDeque::new(),
@@ -145,6 +158,22 @@ impl SharedObserveSource {
             next_subscriber_id: 1,
             subscribers: BTreeMap::new(),
         }
+    }
+
+    fn session_dependency_generations_changed(
+        &self,
+        session_dependency_generations: &BTreeMap<SessionDependency, u64>,
+    ) -> bool {
+        self.session_dependencies.iter().any(|dependency| {
+            self.last_seen_session_dependency_generations
+                .get(dependency)
+                .copied()
+                .unwrap_or_default()
+                != session_dependency_generations
+                    .get(dependency)
+                    .copied()
+                    .unwrap_or_default()
+        })
     }
 
     fn register_subscriber(&mut self) -> u64 {
@@ -356,6 +385,8 @@ impl ObserveState {
     async fn poll_shared_source_once(&mut self, session: &Session) -> Result<(), LixError> {
         let work = {
             let source = lock_shared_source(&self.source)?;
+            let session_dependency_generations =
+                session.dependency_generations(&source.session_dependencies);
             if source.closed {
                 return Ok(());
             }
@@ -363,39 +394,72 @@ impl ObserveState {
             if !source.initialized {
                 PollWork::Initial {
                     query: source.query.clone(),
+                    session_dependency_generations,
+                }
+            } else if source.session_dependency_generations_changed(&session_dependency_generations)
+            {
+                PollWork::SessionRuntime {
+                    query: source.query.clone(),
+                    session_dependency_generations,
                 }
             } else if let Some(batch) = source.state_commits.try_next() {
                 PollWork::StateCommit {
                     query: source.query.clone(),
                     state_commit_sequence: batch.sequence,
+                    session_dependency_generations,
                 }
             } else {
                 PollWork::External {
                     query: source.query.clone(),
                     last_seen_tick_seq: source.last_seen_tick_seq,
                     writer_key_filter: source.writer_key_filter.clone(),
+                    session_dependency_generations,
                 }
             }
         };
 
         let outcome = match work {
-            PollWork::Initial { query } => {
+            PollWork::Initial {
+                query,
+                session_dependency_generations,
+            } => {
                 let latest_tick_seq = latest_observe_tick_seq(session.engine().as_ref()).await?;
                 let rows = execute_observe_query(session, &query).await?;
                 PollOutcome {
                     maybe_rows: Some((rows, None)),
                     update_last_seen_tick_seq: Some(latest_tick_seq),
+                    update_last_seen_session_dependency_generations: Some(
+                        session_dependency_generations,
+                    ),
+                    mark_initialized: true,
+                }
+            }
+            PollWork::SessionRuntime {
+                query,
+                session_dependency_generations,
+            } => {
+                let rows = execute_observe_query(session, &query).await?;
+                PollOutcome {
+                    maybe_rows: Some((rows, None)),
+                    update_last_seen_tick_seq: None,
+                    update_last_seen_session_dependency_generations: Some(
+                        session_dependency_generations,
+                    ),
                     mark_initialized: true,
                 }
             }
             PollWork::StateCommit {
                 query,
                 state_commit_sequence,
+                session_dependency_generations,
             } => {
                 let rows = execute_observe_query(session, &query).await?;
                 PollOutcome {
                     maybe_rows: Some((rows, Some(state_commit_sequence))),
                     update_last_seen_tick_seq: None,
+                    update_last_seen_session_dependency_generations: Some(
+                        session_dependency_generations,
+                    ),
                     mark_initialized: true,
                 }
             }
@@ -403,6 +467,7 @@ impl ObserveState {
                 query,
                 last_seen_tick_seq,
                 writer_key_filter,
+                session_dependency_generations,
             } => {
                 observe_poll_sleep(OBSERVE_TICK_POLL_INTERVAL).await;
                 let observed_ticks =
@@ -411,6 +476,9 @@ impl ObserveState {
                     PollOutcome {
                         maybe_rows: None,
                         update_last_seen_tick_seq: None,
+                        update_last_seen_session_dependency_generations: Some(
+                            session_dependency_generations,
+                        ),
                         mark_initialized: true,
                     }
                 } else {
@@ -427,6 +495,9 @@ impl ObserveState {
                         PollOutcome {
                             maybe_rows: None,
                             update_last_seen_tick_seq: Some(next_last_seen_tick_seq),
+                            update_last_seen_session_dependency_generations: Some(
+                                session_dependency_generations,
+                            ),
                             mark_initialized: true,
                         }
                     } else {
@@ -434,6 +505,9 @@ impl ObserveState {
                         PollOutcome {
                             maybe_rows: Some((rows, None)),
                             update_last_seen_tick_seq: Some(next_last_seen_tick_seq),
+                            update_last_seen_session_dependency_generations: Some(
+                                session_dependency_generations,
+                            ),
                             mark_initialized: true,
                         }
                     }
@@ -455,6 +529,12 @@ impl ObserveState {
         }
         if let Some(last_seen_tick_seq) = outcome.update_last_seen_tick_seq {
             source.last_seen_tick_seq = last_seen_tick_seq;
+        }
+        if let Some(last_seen_session_dependency_generations) =
+            outcome.update_last_seen_session_dependency_generations
+        {
+            source.last_seen_session_dependency_generations =
+                last_seen_session_dependency_generations;
         }
 
         if let Some((rows, state_commit_sequence)) = outcome.maybe_rows {
@@ -486,7 +566,12 @@ impl ObserveState {
             return;
         }
         self.closed = true;
-        let _ = unregister_observe_subscriber(session, &self.source_key, &self.source, self.subscriber_id);
+        let _ = unregister_observe_subscriber(
+            session,
+            &self.source_key,
+            &self.source,
+            self.subscriber_id,
+        );
     }
 }
 
@@ -543,7 +628,9 @@ async fn execute_observe_query(
     extract_single_observe_query_result(result)
 }
 
-fn extract_single_observe_query_result(result: crate::ExecuteResult) -> Result<QueryResult, LixError> {
+fn extract_single_observe_query_result(
+    result: crate::ExecuteResult,
+) -> Result<QueryResult, LixError> {
     let [statement] = result.statements.as_slice() else {
         return Err(errors::unexpected_statement_count_error(
             "observe query",
@@ -595,7 +682,10 @@ fn build_observe_state(session: &Session, query: ObserveQuery) -> Result<Observe
     })
 }
 
-fn observe_source_key_for_session(session: &Session, query: &ObserveQuery) -> Result<String, LixError> {
+fn observe_source_key_for_session(
+    session: &Session,
+    query: &ObserveQuery,
+) -> Result<String, LixError> {
     Ok(format!(
         "{}\n--runtime:{}",
         observe_source_key(query)?,
@@ -679,6 +769,7 @@ fn build_shared_observe_source(
         query,
         state_commits,
         writer_key_filter,
+        dependency_spec.session_dependencies,
     ))
 }
 
@@ -720,10 +811,13 @@ fn unregister_observe_subscriber(
 fn lock_observe_registry<'a>(
     session: &'a Session,
 ) -> Result<MutexGuard<'a, BTreeMap<String, Arc<Mutex<SharedObserveSource>>>>, LixError> {
-    session.observe_shared_sources().lock().map_err(|_| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "observe shared source registry lock poisoned".to_string(),
-    })
+    session
+        .observe_shared_sources()
+        .lock()
+        .map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "observe shared source registry lock poisoned".to_string(),
+        })
 }
 
 fn session_runtime_namespace(session: &Session) -> String {
@@ -846,10 +940,13 @@ fn parse_observe_tick_writer_key(value: &Value) -> Result<Option<String>, LixErr
 #[cfg(test)]
 mod tests {
     use super::{
-        observe_source_key, ObserveEvent, ObserveEvents, ObserveQuery, OBSERVE_TICK_POLL_INTERVAL,
+        build_observe_state, observe_source_key, ObserveEvent, ObserveEvents, ObserveQuery,
+        OBSERVE_TICK_POLL_INTERVAL,
     };
     use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect};
-    use crate::{boot, BootArgs, LixError, NoopWasmRuntime, QueryResult, Session, Value};
+    use crate::{
+        boot, BootArgs, ExecuteOptions, LixError, NoopWasmRuntime, QueryResult, Session, Value,
+    };
     use async_trait::async_trait;
     use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -977,11 +1074,8 @@ mod tests {
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
-            let session = Session::new_for_test(
-                Arc::clone(&engine),
-                "version-test".to_string(),
-                Vec::new(),
-            );
+            let session =
+                Session::new_for_test(Arc::clone(&engine), "version-test".to_string(), Vec::new());
 
             let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
             let mut observed_a = session
@@ -1018,11 +1112,8 @@ mod tests {
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
-            let session = Session::new_for_test(
-                Arc::clone(&engine),
-                "version-test".to_string(),
-                Vec::new(),
-            );
+            let session =
+                Session::new_for_test(Arc::clone(&engine), "version-test".to_string(), Vec::new());
 
             let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
             let mut observed_a = session
@@ -1112,5 +1203,94 @@ mod tests {
         let key_a = observe_source_key(&query_a).expect("first key should be generated");
         let key_b = observe_source_key(&query_b).expect("second key should be generated");
         assert_eq!(key_a, key_b);
+    }
+
+    #[test]
+    fn observe_does_not_reexecute_for_unrelated_session_dependency_changes() {
+        run_observe_test_with_large_stack(|| async move {
+            let observe_query_hits = Arc::new(AtomicUsize::new(0));
+            let engine = Arc::new(boot(BootArgs::new(
+                Box::new(CountingObserveBackend {
+                    observe_query_hits: Arc::clone(&observe_query_hits),
+                }),
+                Arc::new(NoopWasmRuntime),
+            )));
+            let session =
+                Session::new_for_test(Arc::clone(&engine), "version-test".to_string(), Vec::new());
+
+            let mut state = build_observe_state(
+                &session,
+                ObserveQuery::new(
+                    "SELECT 'observe-shared-sentinel' AS marker, lix_active_version_id() AS version_id",
+                    vec![],
+                ),
+            )
+            .expect("observe state should build");
+
+            state
+                .poll_shared_source_once(&session)
+                .await
+                .expect("initial poll should succeed");
+            assert_eq!(observe_query_hits.load(Ordering::SeqCst), 1);
+
+            session.replace_active_account_ids(vec!["acct-a".to_string()]);
+
+            state
+                .poll_shared_source_once(&session)
+                .await
+                .expect("unrelated dependency poll should succeed");
+            assert_eq!(
+                observe_query_hits.load(Ordering::SeqCst),
+                1,
+                "active-account changes should not reexecute observes that only depend on active version",
+            );
+
+            state.close_with_session(&session);
+        });
+    }
+
+    #[test]
+    fn observe_reexecutes_when_public_surface_registry_generation_changes() {
+        run_observe_test_with_large_stack(|| async move {
+            let observe_query_hits = Arc::new(AtomicUsize::new(0));
+            let engine = Arc::new(boot(BootArgs::new(
+                Box::new(CountingObserveBackend {
+                    observe_query_hits: Arc::clone(&observe_query_hits),
+                }),
+                Arc::new(NoopWasmRuntime),
+            )));
+            let session =
+                Session::new_for_test(Arc::clone(&engine), "version-test".to_string(), Vec::new());
+
+            let mut state = build_observe_state(
+                &session,
+                ObserveQuery::new(
+                    "SELECT 'observe-shared-sentinel' AS marker FROM lix_key_value LIMIT 1",
+                    vec![],
+                ),
+            )
+            .expect("observe state should build");
+
+            state
+                .poll_shared_source_once(&session)
+                .await
+                .expect("initial poll should succeed");
+            assert_eq!(observe_query_hits.load(Ordering::SeqCst), 1);
+
+            let mut context = session.new_execution_context(ExecuteOptions::default());
+            context.bump_public_surface_registry_generation();
+
+            state
+                .poll_shared_source_once(&session)
+                .await
+                .expect("registry invalidation poll should succeed");
+            assert_eq!(
+                observe_query_hits.load(Ordering::SeqCst),
+                2,
+                "public-surface observes should reexecute when the session registry generation changes",
+            );
+
+            state.close_with_session(&session);
+        });
     }
 }

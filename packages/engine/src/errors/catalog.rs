@@ -338,8 +338,8 @@ mod tests {
         let change_write_src = include_str!("../sql/public/runtime/mod.rs");
         assert!(change_write_src.contains("read_only_view_write_error("));
 
-        let api_src = include_str!("../api.rs");
-        assert!(api_src.contains("errors::transaction_control_statement_denied_error()"));
-        assert!(api_src.contains("reject_public_create_table("));
+        let session_src = include_str!("../session/mod.rs");
+        assert!(session_src.contains("errors::transaction_control_statement_denied_error()"));
+        assert!(session_src.contains("reject_public_create_table("));
     }
 }

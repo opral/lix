@@ -116,7 +116,10 @@ impl SimulationEngine {
     }
 
     pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
-        self.opened_session().await?.install_plugin(archive_bytes).await
+        self.opened_session()
+            .await?
+            .install_plugin(archive_bytes)
+            .await
     }
 
     pub async fn register_schema(&self, schema: &JsonValue) -> Result<(), LixError> {
@@ -131,7 +134,20 @@ impl SimulationEngine {
     }
 
     pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
-        self.opened_session().await?.switch_version(version_id).await
+        self.opened_session()
+            .await?
+            .switch_version(version_id)
+            .await
+    }
+
+    pub async fn set_active_account_ids(
+        &self,
+        active_account_ids: Vec<String>,
+    ) -> Result<(), LixError> {
+        self.opened_session()
+            .await?
+            .set_active_account_ids(active_account_ids)
+            .await
     }
 
     pub async fn merge_version(
@@ -150,7 +166,10 @@ impl SimulationEngine {
     }
 
     pub async fn undo_with_options(&self, options: UndoOptions) -> Result<UndoResult, LixError> {
-        self.opened_session().await?.undo_with_options(options).await
+        self.opened_session()
+            .await?
+            .undo_with_options(options)
+            .await
     }
 
     pub async fn redo(&self) -> Result<RedoResult, LixError> {
@@ -158,7 +177,10 @@ impl SimulationEngine {
     }
 
     pub async fn redo_with_options(&self, options: RedoOptions) -> Result<RedoResult, LixError> {
-        self.opened_session().await?.redo_with_options(options).await
+        self.opened_session()
+            .await?
+            .redo_with_options(options)
+            .await
     }
 
     pub fn observe(&self, query: ObserveQuery) -> Result<ObserveEvents<'_>, LixError> {
@@ -169,7 +191,9 @@ impl SimulationEngine {
         &self,
         options: ExecuteOptions,
     ) -> Result<SessionTransaction<'_>, LixError> {
-        self.session()?.begin_transaction_with_options(options).await
+        self.session()?
+            .begin_transaction_with_options(options)
+            .await
     }
 
     pub async fn transaction<T, F>(&self, options: ExecuteOptions, f: F) -> Result<T, LixError>
@@ -242,13 +266,10 @@ impl SimulationEngine {
         }
         let session = Arc::new(self.engine.open_workspace_session().await?);
         let _ = self.session.set(Arc::clone(&session));
-        Ok(self
-            .session
-            .get()
-            .map(Arc::clone)
-            .unwrap_or(session))
+        Ok(self.session.get().map(Arc::clone).unwrap_or(session))
     }
 }
+
 
 const DEFAULT_TEST_SCHEMA_PATH: &str = "schema/default.json";
 const DEFAULT_TEST_SCHEMA_JSON: &str = r#"{

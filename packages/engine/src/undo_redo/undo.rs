@@ -32,7 +32,8 @@ async fn undo_in_transaction(
 ) -> Result<UndoResult, LixError> {
     let engine = tx.engine;
     let active_account_ids = tx.context.active_account_ids.clone();
-    let version_id = resolve_target_version_id_in_session(tx, options.version_id.as_deref()).await?;
+    let version_id =
+        resolve_target_version_id_in_session(tx, options.version_id.as_deref()).await?;
     let (result, state_commit_stream_changes) = {
         let transaction = tx.backend_transaction_mut()?;
         let stacks = rebuild_semantic_undo_redo_stacks(transaction, &version_id).await?;
@@ -201,7 +202,7 @@ async fn undo_in_transaction(
                         version_id, target_commit_id, current_head_commit_id
                     )),
                 },
-                active_account_ids: Some(active_account_ids.clone()),
+                active_account_ids: active_account_ids.clone(),
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,

@@ -99,14 +99,13 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
                 .unwrap_or_default(),
             filesystem_state: unit.filesystem_state.clone(),
             preconditions: canonical_preconditions.clone(),
-            active_account_ids: Some(
-                unit.public_write
-                    .planned_write
-                    .command
-                    .execution_context
-                    .active_account_ids
-                    .clone(),
-            ),
+            active_account_ids: unit
+                .public_write
+                .planned_write
+                .command
+                .execution_context
+                .active_account_ids
+                .clone(),
             writer_key: unit.writer_key.clone(),
             should_emit_observe_tick: unit.should_emit_observe_tick(),
         },

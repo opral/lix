@@ -246,21 +246,7 @@ impl SurfaceRegistry {
     }
 
     pub(crate) fn registered_state_surface_schema_keys(&self) -> Vec<String> {
-        let mut schema_keys = self.registered_state_backed_schema_keys();
-        schema_keys.extend(
-            self.descriptors
-                .values()
-                .filter(|descriptor| {
-                    matches!(
-                        descriptor.public_name.as_str(),
-                        "lix_active_version" | "lix_active_account"
-                    )
-                })
-                .filter_map(|descriptor| descriptor.implicit_overrides.fixed_schema_key.clone()),
-        );
-        schema_keys.sort();
-        schema_keys.dedup();
-        schema_keys
+        self.registered_state_backed_schema_keys()
     }
 
     pub(crate) fn register_dynamic_entity_surfaces(
@@ -319,6 +305,9 @@ impl SurfaceRegistry {
 
     fn register_builtin_entity_surfaces(&mut self) {
         for schema_key in builtin_schema_keys() {
+            if !builtin_schema_exposed_as_entity_surface(schema_key) {
+                continue;
+            }
             let Some(schema) = builtin_schema_definition(schema_key) else {
                 continue;
             };
@@ -339,6 +328,10 @@ impl SurfaceRegistry {
             .get(&normalize_surface_name(public_name))
             .is_none_or(|descriptor| descriptor.surface_family == SurfaceFamily::Entity)
     }
+}
+
+fn builtin_schema_exposed_as_entity_surface(schema_key: &str) -> bool {
+    !matches!(schema_key, "lix_active_version" | "lix_active_account")
 }
 
 fn normalize_surface_name(name: &str) -> String {
@@ -418,8 +411,6 @@ fn builtin_surface_descriptors() -> Vec<SurfaceDescriptor> {
         filesystem_surface_descriptor("lix_directory_by_version", SurfaceVariant::ByVersion),
         filesystem_surface_descriptor("lix_directory_history", SurfaceVariant::History),
         admin_surface_descriptor("lix_version", SurfaceVariant::Default),
-        admin_surface_descriptor("lix_active_version", SurfaceVariant::Active),
-        admin_surface_descriptor("lix_active_account", SurfaceVariant::Active),
     ]
 }
 
@@ -559,7 +550,7 @@ fn filesystem_surface_descriptor(name: &str, variant: SurfaceVariant) -> Surface
 
 fn admin_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescriptor {
     let capability = match name {
-        "lix_version" | "lix_active_version" | "lix_active_account" => SurfaceCapability::ReadWrite,
+        "lix_version" => SurfaceCapability::ReadWrite,
         _ => SurfaceCapability::ReadOnly,
     };
 
@@ -1111,8 +1102,6 @@ fn filesystem_column_types(name: &str) -> BTreeMap<String, SurfaceColumnType> {
 
 fn admin_columns(name: &str) -> Vec<String> {
     match name {
-        "lix_active_version" => vec!["id".to_string(), "version_id".to_string()],
-        "lix_active_account" => vec!["id".to_string(), "account_id".to_string()],
         "lix_version" => vec![
             "id".to_string(),
             "name".to_string(),

@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use crate::session::contracts::SessionDependency;
+
 /// Dependency precision communicates whether literal dependency filters are fully
 /// representable by the planner.
 ///
@@ -25,6 +27,7 @@ pub(crate) struct DependencySpec {
     pub(crate) entity_ids: BTreeSet<String>,
     pub(crate) file_ids: BTreeSet<String>,
     pub(crate) version_ids: BTreeSet<String>,
+    pub(crate) session_dependencies: BTreeSet<SessionDependency>,
     pub(crate) writer_filter: DependencyWriterFilter,
     pub(crate) include_untracked: bool,
     pub(crate) depends_on_active_version: bool,
@@ -39,6 +42,7 @@ impl Default for DependencySpec {
             entity_ids: BTreeSet::new(),
             file_ids: BTreeSet::new(),
             version_ids: BTreeSet::new(),
+            session_dependencies: BTreeSet::new(),
             writer_filter: DependencyWriterFilter::default(),
             include_untracked: true,
             depends_on_active_version: false,

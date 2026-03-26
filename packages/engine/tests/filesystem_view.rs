@@ -57,10 +57,7 @@ fn parse_available_columns_from_unknown_column_error(description: &str) -> Vec<S
 
 async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let rows = engine
-        .execute(
-            "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-            &[],
-        )
+        .execute("SELECT lix_active_version_id()", &[])
         .await
         .unwrap();
     assert_eq!(rows.statements[0].rows.len(), 1);
@@ -73,10 +70,9 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
 async fn active_version_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let rows = engine
         .execute(
-            "SELECT v.commit_id \
-             FROM lix_version v \
-             JOIN lix_active_version av ON av.version_id = v.id \
-             ORDER BY av.id \
+            "SELECT commit_id \
+             FROM lix_version \
+             WHERE id = lix_active_version_id() \
              LIMIT 1",
             &[],
         )
@@ -2610,13 +2606,7 @@ simulation_test!(
             .expect("global directory insert should succeed");
 
         engine
-            .execute(
-                &format!(
-                    "UPDATE lix_active_version SET version_id = '{}'",
-                    child_version_id
-                ),
-                &[],
-            )
+            .switch_version(child_version_id.to_string())
             .await
             .expect("active version switch should succeed");
 
@@ -2692,13 +2682,7 @@ simulation_test!(
             .expect("global file insert should succeed");
 
         engine
-            .execute(
-                &format!(
-                    "UPDATE lix_active_version SET version_id = '{}'",
-                    child_version_id
-                ),
-                &[],
-            )
+            .switch_version(child_version_id.to_string())
             .await
             .expect("active version switch should succeed");
 
@@ -2742,13 +2726,7 @@ simulation_test!(
             .expect("global file insert should succeed");
 
         engine
-            .execute(
-                &format!(
-                    "UPDATE lix_active_version SET version_id = '{}'",
-                    child_version_id
-                ),
-                &[],
-            )
+            .switch_version(child_version_id.to_string())
             .await
             .expect("active version switch should succeed");
 
@@ -3128,13 +3106,7 @@ simulation_test!(
             .expect("global file insert should succeed");
 
         engine
-            .execute(
-                &format!(
-                    "UPDATE lix_active_version SET version_id = '{}'",
-                    child_version_id
-                ),
-                &[],
-            )
+            .switch_version(child_version_id.to_string())
             .await
             .expect("active version switch should succeed");
 
@@ -3911,13 +3883,7 @@ simulation_test!(
         assert_text(&before_dir.statements[0].rows[0][0], "/a/");
 
         engine
-            .execute(
-                &format!(
-                    "UPDATE lix_active_version SET version_id = '{version_b}'",
-                    version_b = version_b_sql
-                ),
-                &[],
-            )
+            .switch_version(version_b.to_string())
             .await
             .unwrap();
 

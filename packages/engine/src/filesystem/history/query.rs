@@ -125,6 +125,7 @@ pub(crate) async fn load_file_history_rows(
                 FileHistoryLineageScope::ActiveVersion => StateHistoryLineageScope::ActiveVersion,
                 FileHistoryLineageScope::Standard => StateHistoryLineageScope::Standard,
             },
+            active_version_id: request.active_version_id.clone(),
             root_scope: match &request.root_scope {
                 FileHistoryRootScope::AllRoots => StateHistoryRootScope::AllRoots,
                 FileHistoryRootScope::RequestedRoots(root_commit_ids) => {
@@ -584,6 +585,7 @@ pub(crate) async fn load_directory_history_rows(
                 FileHistoryLineageScope::ActiveVersion => StateHistoryLineageScope::ActiveVersion,
                 FileHistoryLineageScope::Standard => StateHistoryLineageScope::Standard,
             },
+            active_version_id: request.active_version_id.clone(),
             root_scope: match &request.root_scope {
                 FileHistoryRootScope::AllRoots => StateHistoryRootScope::AllRoots,
                 FileHistoryRootScope::RequestedRoots(root_commit_ids) => {

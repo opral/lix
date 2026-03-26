@@ -1,8 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::account::{
-    active_account_file_id, active_account_schema_key, active_account_storage_version_id,
-};
 use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::canonical_json::CanonicalJson;
 use crate::deterministic_mode::build_persist_sequence_highest_sql;
@@ -44,7 +41,6 @@ use super::types::{
 };
 
 const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
-const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";
@@ -83,7 +79,7 @@ pub(crate) struct CreateCommitArgs {
     pub(crate) changes: Vec<ProposedDomainChange>,
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) preconditions: CreateCommitPreconditions,
-    pub(crate) active_account_ids: Option<Vec<String>>,
+    pub(crate) active_account_ids: Vec<String>,
     pub(crate) lane_parent_commit_ids_override: Option<Vec<String>>,
     pub(crate) allow_empty_commit: bool,
     pub(crate) should_emit_observe_tick: bool,
@@ -192,22 +188,17 @@ pub(crate) async fn create_commit(
         .await
         .map_err(backend_error)?;
 
-    let needs_active_accounts = !args
-        .changes
-        .iter()
-        .all(|change| change.schema_key == CHANGE_AUTHOR_SCHEMA_KEY);
     let needs_deterministic_sequence = functions.deterministic_sequence_enabled()
         && !functions.deterministic_sequence_initialized();
     let preflight = {
         let mut executor = TransactionCommitExecutor { transaction };
-        load_create_commit_preflight_state_with_active_accounts(
+        load_create_commit_preflight_state(
             &mut executor,
             &concrete_lane,
             &args.preconditions,
             &args.filesystem_state,
             needs_deterministic_sequence,
-            args.active_account_ids.as_deref(),
-            needs_active_accounts,
+            &args.active_account_ids,
         )
         .await?
     };
@@ -897,14 +888,13 @@ struct CreateCommitPreflightState {
     file_descriptors: BTreeMap<String, ExactFilesystemDescriptorState>,
 }
 
-async fn load_create_commit_preflight_state_with_active_accounts(
+async fn load_create_commit_preflight_state(
     executor: &mut dyn CommitQueryExecutor,
     concrete_lane: &ConcreteWriteLane,
     preconditions: &CreateCommitPreconditions,
     filesystem_state: &FilesystemTransactionState,
     include_deterministic_sequence: bool,
-    provided_active_accounts: Option<&[String]>,
-    include_active_accounts: bool,
+    active_account_ids: &[String],
 ) -> Result<CreateCommitPreflightState, CreateCommitError> {
     let lane_entity_id = match concrete_lane {
         ConcreteWriteLane::Version { version_id } => version_id.as_str(),
@@ -929,13 +919,7 @@ async fn load_create_commit_preflight_state_with_active_accounts(
     } else {
         None
     };
-    let active_accounts = if let Some(active_accounts) = provided_active_accounts {
-        active_accounts.to_vec()
-    } else if include_active_accounts {
-        load_create_commit_active_accounts(executor).await?
-    } else {
-        Vec::new()
-    };
+    let active_accounts = active_account_ids.to_vec();
     let file_descriptors = if filesystem_transaction_state_needs_exact_descriptors(filesystem_state)
     {
         load_create_commit_file_descriptors(executor, filesystem_state, lane_entity_id).await?
@@ -1110,47 +1094,6 @@ async fn load_create_commit_deterministic_sequence_start(
         return Ok(Some(0));
     };
     parse_deterministic_sequence_snapshot(&snapshot_content).map(Some)
-}
-
-async fn load_create_commit_active_accounts(
-    executor: &mut dyn CommitQueryExecutor,
-) -> Result<Vec<String>, CreateCommitError> {
-    let layout = builtin_live_table_layout(active_account_schema_key())
-        .map_err(backend_error)?
-        .ok_or_else(|| {
-            backend_error(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "builtin active account schema must compile to a live layout",
-            ))
-        })?;
-    let account_id_column =
-        live_column_name_for_property(&layout, "account_id").ok_or_else(|| {
-            backend_error(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "active account live layout is missing account_id",
-            ))
-        })?;
-    let sql = format!(
-        "SELECT {account_id_column} \
-         FROM {table_name} \
-         WHERE file_id = '{file_id}' \
-           AND version_id = '{version_id}' \
-           AND untracked = true \
-           AND {account_id_column} IS NOT NULL",
-        account_id_column = quote_ident(account_id_column),
-        table_name = quote_ident(&untracked_live_table_name(active_account_schema_key())),
-        file_id = escape_sql_string(active_account_file_id()),
-        version_id = escape_sql_string(active_account_storage_version_id()),
-    );
-    let result = executor.execute(&sql, &[]).await.map_err(backend_error)?;
-    let mut active_accounts = BTreeSet::new();
-    for row in result.rows {
-        let Some(account_id) = row.first().and_then(value_as_text) else {
-            continue;
-        };
-        active_accounts.insert(account_id);
-    }
-    Ok(active_accounts.into_iter().collect())
 }
 
 async fn load_create_commit_file_descriptors(
@@ -1887,7 +1830,7 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
-                active_account_ids: None,
+                active_account_ids: Vec::new(),
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -1941,6 +1884,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_commit_uses_provided_active_account_ids_without_live_state_fallback() {
+        let mut transaction = FakeTransaction::default();
+        transaction
+            .version_heads
+            .insert("version-a".to_string(), "commit-123".to_string());
+        let mut functions = CountingFunctionProvider::default();
+
+        let result = create_commit(
+            &mut transaction,
+            CreateCommitArgs {
+                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
+                changes: vec![sample_change()],
+                filesystem_state: Default::default(),
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
+                    idempotency_key: CreateCommitIdempotencyKey::Exact(
+                        "idem-active-accounts".to_string(),
+                    ),
+                },
+                active_account_ids: vec!["acct-session".to_string(), "acct-shadow".to_string()],
+                lane_parent_commit_ids_override: None,
+                allow_empty_commit: false,
+                should_emit_observe_tick: false,
+                observe_tick_writer_key: None,
+                writer_key: None,
+            },
+            &mut functions,
+            None,
+        )
+        .await
+        .expect("create_commit should succeed with explicit active accounts");
+
+        let seed = result
+            .applied_output
+            .and_then(|output| output.pending_public_commit_seed)
+            .expect("applied create_commit should produce a pending public commit seed");
+        let commit_snapshot: serde_json::Value =
+            serde_json::from_str(&seed.commit_snapshot_content).expect("commit snapshot JSON");
+        assert_eq!(
+            commit_snapshot.get("author_account_ids"),
+            Some(&serde_json::json!(["acct-session", "acct-shadow"])),
+            "commit attribution should come from typed session-owned active account ids",
+        );
+        assert!(
+            !transaction
+                .executed_sql
+                .iter()
+                .any(|sql| sql.contains("lix_internal_live_v1_lix_active_account")),
+            "create_commit should not read shared active-account live-state rows anymore",
+        );
+    }
+
+    #[tokio::test]
     async fn replays_when_same_idempotency_key_already_committed() {
         let mut transaction = FakeTransaction::default();
         transaction
@@ -1969,7 +1966,7 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
-                active_account_ids: None,
+                active_account_ids: Vec::new(),
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2018,7 +2015,7 @@ mod tests {
                         "fp-1".to_string(),
                     ),
                 },
-                active_account_ids: None,
+                active_account_ids: Vec::new(),
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2056,7 +2053,7 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
-                active_account_ids: None,
+                active_account_ids: Vec::new(),
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2089,7 +2086,7 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
-                active_account_ids: None,
+                active_account_ids: Vec::new(),
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2121,7 +2118,7 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CreateIfMissing,
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-create".to_string()),
                 },
-                active_account_ids: None,
+                active_account_ids: Vec::new(),
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2159,7 +2156,7 @@ mod tests {
                     ),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-global".to_string()),
                 },
-                active_account_ids: None,
+                active_account_ids: Vec::new(),
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2211,7 +2208,7 @@ mod tests {
                         "idem-file-data".to_string(),
                     ),
                 },
-                active_account_ids: None,
+                active_account_ids: Vec::new(),
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2253,7 +2250,7 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
-                active_account_ids: None,
+                active_account_ids: Vec::new(),
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
@@ -2300,7 +2297,7 @@ mod tests {
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
-                active_account_ids: None,
+                active_account_ids: Vec::new(),
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,

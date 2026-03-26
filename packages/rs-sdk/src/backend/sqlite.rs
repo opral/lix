@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use lix_engine::{
-    ImageChunkReader, ImageChunkWriter, LixBackend, LixError, LixBackendTransaction, PreparedBatch,
+    ImageChunkReader, ImageChunkWriter, LixBackend, LixBackendTransaction, LixError, PreparedBatch,
     QueryResult, SqlDialect, Value,
 };
 use rusqlite::{
@@ -116,7 +116,10 @@ impl LixBackend for SqliteBackend {
         }
     }
 
-    async fn begin_savepoint(&self, name: &str) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_savepoint(
+        &self,
+        name: &str,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let mut conn = self.lock_conn()?;
         let inner = conn.as_mut().ok_or_else(sqlite_backend_destroyed_error)?;
         inner

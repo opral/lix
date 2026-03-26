@@ -35,7 +35,8 @@ pub(crate) async fn execute_parsed_statements_in_write_transaction(
     context: &mut ExecutionContext,
 ) -> Result<ExecuteResult, LixError> {
     let dialect = write_transaction.backend_transaction_mut()?.dialect();
-    let program = ExecutionProgram::compile(parsed_statements, params, dialect)?;
+    let runtime_bindings = context.runtime_binding_values()?;
+    let program = ExecutionProgram::compile(parsed_statements, params, dialect, &runtime_bindings)?;
     execute_execution_program_with_write_transaction(
         engine,
         write_transaction,
@@ -55,7 +56,8 @@ pub(crate) async fn execute_parsed_statements_in_borrowed_write_transaction(
     context: &mut ExecutionContext,
 ) -> Result<ExecuteResult, LixError> {
     let dialect = write_transaction.backend_transaction_mut().dialect();
-    let program = ExecutionProgram::compile(parsed_statements, params, dialect)?;
+    let runtime_bindings = context.runtime_binding_values()?;
+    let program = ExecutionProgram::compile(parsed_statements, params, dialect, &runtime_bindings)?;
     execute_execution_program_with_borrowed_write_transaction(
         engine,
         write_transaction,

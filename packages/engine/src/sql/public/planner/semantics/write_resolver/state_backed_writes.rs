@@ -477,6 +477,7 @@ async fn resolve_state_backed_insert_write<P>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
+    let _ = resolved_existing_version_id(backend, planned_write).await?;
     let rows = surface.build_insert_rows(planned_write, functions)?;
     let mut partitions = ResolvedWritePlanBuilder::default();
     let default_execution_mode =
@@ -547,6 +548,7 @@ async fn resolve_state_backed_existing_write(
     pending_transaction_view: Option<&PendingTransactionView>,
     surface: StateBackedSurface<'_>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
+    let _ = resolved_existing_version_id(backend, planned_write).await?;
     let current_rows = match surface {
         StateBackedSurface::State
             if planned_write.command.selector.exact_only

@@ -148,8 +148,6 @@ impl CanonicalWorkingChangesScan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CanonicalAdminKind {
-    ActiveVersion,
-    ActiveAccount,
     Version,
 }
 
@@ -166,8 +164,6 @@ impl CanonicalAdminScan {
         }
 
         let kind = match binding.descriptor.public_name.as_str() {
-            "lix_active_version" => CanonicalAdminKind::ActiveVersion,
-            "lix_active_account" => CanonicalAdminKind::ActiveAccount,
             "lix_version" => CanonicalAdminKind::Version,
             _ => return None,
         };
