@@ -1572,6 +1572,10 @@ mod tests {
             SqlDialect::Sqlite
         }
 
+        fn mode(&self) -> crate::TransactionMode {
+            crate::TransactionMode::Write
+        }
+
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             self.executed_sql.push(sql.to_string());
 

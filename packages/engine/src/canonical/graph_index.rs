@@ -7,7 +7,6 @@ use crate::live_state::{
     builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
 };
 use crate::sql_support::binding::bind_sql;
-use crate::sql_support::text::escape_sql_string;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::Value as EngineValue;
 use crate::{LixError, SqlDialect};
@@ -90,46 +89,6 @@ pub(crate) fn build_commit_graph_node_prepared_batch(
         });
     }
     Ok(batch)
-}
-
-pub(crate) fn build_reachable_commits_for_root_cte_sql(
-    _dialect: SqlDialect,
-    root_commit_id: &str,
-    start_depth: i64,
-    end_depth: i64,
-) -> String {
-    let commit_edge_table = tracked_live_table_name("lix_commit_edge");
-    let edge_parent_expr = quote_ident(&live_payload_column_name("lix_commit_edge", "parent_id"));
-    let edge_child_expr = quote_ident(&live_payload_column_name("lix_commit_edge", "child_id"));
-    format!(
-        "reachable_commit_walk AS ( \
-           SELECT '{root_commit_id}' AS commit_id, 0 AS commit_depth \
-           UNION ALL \
-           SELECT \
-             {edge_parent_expr} AS commit_id, \
-             walk.commit_depth + 1 AS commit_depth \
-           FROM reachable_commit_walk walk \
-           JOIN {commit_edge_table} edge \
-             ON {edge_child_expr} = walk.commit_id \
-           WHERE edge.schema_key = 'lix_commit_edge' \
-             AND edge.version_id = '{global_version}' \
-             AND edge.is_tombstone = 0 \
-             AND {edge_parent_expr} IS NOT NULL \
-             AND walk.commit_depth < {end_depth} \
-         ), \
-         reachable_commits AS ( \
-           SELECT commit_id, MIN(commit_depth) AS commit_depth \
-           FROM reachable_commit_walk \
-           WHERE commit_depth BETWEEN {start_depth} AND {end_depth} \
-           GROUP BY commit_id \
-         ), ",
-        root_commit_id = escape_sql_string(root_commit_id),
-        global_version = GLOBAL_VERSION_ID,
-        start_depth = start_depth,
-        end_depth = end_depth,
-        edge_parent_expr = edge_parent_expr,
-        edge_child_expr = edge_child_expr,
-    )
 }
 
 pub(crate) fn build_reachable_commits_from_requested_cte_sql(

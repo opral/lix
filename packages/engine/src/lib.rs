@@ -18,6 +18,7 @@ pub mod live_state;
 mod lix;
 mod observe;
 mod plugin;
+mod read;
 mod schema;
 pub mod session;
 pub(crate) mod sql;
@@ -45,6 +46,7 @@ pub use backend::prepared::{
 pub use backend::LixBackend;
 pub use backend::LixBackendTransaction;
 pub use backend::SqlDialect;
+pub use backend::TransactionMode;
 pub use canonical_json::CanonicalJson;
 #[doc(hidden)]
 pub use engine::{boot, BootArgs};

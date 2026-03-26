@@ -1,18 +1,19 @@
 use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
 };
-use crate::change_view::TrackedDomainChangeView;
 use crate::errors::schema_not_registered_error;
 use crate::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
 };
-use crate::filesystem::history::{DirectoryHistoryRequest, FileHistoryRequest};
 use crate::filesystem::runtime::{
     binary_blob_writes_from_filesystem_state, delete_targets_from_filesystem_state,
     FilesystemTransactionState,
 };
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::live_state::live_table_layout_from_schema;
+use crate::read::models::{
+    DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest, TrackedDomainChangeView,
+};
 use crate::schema::builtin::builtin_schema_definition;
 use crate::session::contracts::SessionStateDelta;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
@@ -48,8 +49,6 @@ use crate::sql::public::planner::semantics::effective_state_resolver::{
 use crate::sql::public::planner::semantics::write_analysis::analyze_write;
 use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan_with_functions;
 use crate::sql::public::services::state_reader::load_committed_version_head_commit_id;
-use crate::state::history::ensure_state_history_timeline_materialized_for_root;
-use crate::state::history::StateHistoryRequest;
 use crate::state::stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamOperation,
@@ -1633,16 +1632,6 @@ fn expr_has_root_commit_predicate(expr: &Expr) -> bool {
     }
 }
 
-async fn ensure_public_read_history_timeline_roots(
-    backend: &dyn LixBackend,
-    root_commit_ids: &[String],
-) -> Result<(), LixError> {
-    for root_commit_id in root_commit_ids {
-        ensure_state_history_timeline_materialized_for_root(backend, &root_commit_id, 512).await?;
-    }
-    Ok(())
-}
-
 fn requested_history_root_commit_ids_from_selection(selection: Option<&Expr>) -> Vec<String> {
     let mut roots = std::collections::BTreeSet::new();
     if let Some(selection) = selection {
@@ -2853,6 +2842,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
+            _mode: crate::TransactionMode,
         ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),

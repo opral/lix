@@ -669,7 +669,10 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+        async fn begin_transaction(
+            &self,
+            _mode: crate::TransactionMode,
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "transactions not used in fake backend",
@@ -696,6 +699,10 @@ mod tests {
     impl LixBackendTransaction for FakeTransaction {
         fn dialect(&self) -> crate::SqlDialect {
             crate::SqlDialect::Sqlite
+        }
+
+        fn mode(&self) -> crate::TransactionMode {
+            crate::TransactionMode::Write
         }
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {

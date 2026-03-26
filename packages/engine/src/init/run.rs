@@ -6,7 +6,7 @@ use crate::live_state::{
     mark_mode_with_backend, mark_ready_with_backend, try_claim_bootstrap_with_backend,
     LiveStateMode,
 };
-use crate::LixError;
+use crate::{LixError, TransactionMode};
 
 use super::seed::InitExecutor;
 use super::tables::{create_backend_tables, create_builtin_schema_tables};
@@ -19,7 +19,10 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
         return Err(crate::errors::already_initialized_error());
     }
 
-    let mut transaction = engine.backend.begin_transaction().await?;
+    let mut transaction = engine
+        .backend
+        .begin_transaction(TransactionMode::Write)
+        .await?;
     let mut claimed_bootstrap = false;
     let init_result = async {
         {

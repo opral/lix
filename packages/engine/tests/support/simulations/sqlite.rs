@@ -7,7 +7,7 @@ use tokio::sync::OnceCell;
 
 use lix_engine::{
     collapse_prepared_batch_for_dialect, LixBackend, LixBackendTransaction, LixError,
-    PreparedBatch, QueryResult, SqlDialect, Value,
+    PreparedBatch, QueryResult, SqlDialect, TransactionMode, Value,
 };
 
 use crate::support::simulation_test::{Simulation, SimulationBehavior};
@@ -44,6 +44,7 @@ struct SqliteBackend {
 
 struct SqliteLixBackendTransaction {
     conn: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    mode: TransactionMode,
 }
 
 struct SqliteConfig {
@@ -102,27 +103,33 @@ impl LixBackend for SqliteBackend {
         lix_engine::execute_auto_transactional(self, sql, params).await
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_transaction(
+        &self,
+        mode: TransactionMode,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let pool = self.pool().await?;
         let mut conn = pool.acquire().await.map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: err.to_string(),
         })?;
-        sqlx::query("BEGIN")
-            .execute(&mut *conn)
-            .await
-            .map_err(|err| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: err.to_string(),
-            })?;
-        Ok(Box::new(SqliteLixBackendTransaction { conn }))
+        sqlx::query(match mode {
+            TransactionMode::Read | TransactionMode::Deferred => "BEGIN",
+            TransactionMode::Write => "BEGIN IMMEDIATE",
+        })
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: err.to_string(),
+        })?;
+        Ok(Box::new(SqliteLixBackendTransaction { conn, mode }))
     }
 
     async fn begin_savepoint(
         &self,
         _name: &str,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        self.begin_transaction().await
+        self.begin_transaction(TransactionMode::Write).await
     }
 }
 
@@ -130,6 +137,10 @@ impl LixBackend for SqliteBackend {
 impl LixBackendTransaction for SqliteLixBackendTransaction {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
+    }
+
+    fn mode(&self) -> TransactionMode {
+        self.mode
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {

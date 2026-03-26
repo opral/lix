@@ -1,5 +1,6 @@
 use crate::engine::{DeferredTransactionSideEffects, Engine, TransactionBackendAdapter};
 use crate::filesystem::runtime::merge_filesystem_transaction_state;
+use crate::read::contracts::CommittedReadMode;
 use crate::sql::execution::execution_program::ExecutionContext;
 use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
 use crate::sql::public::catalog::SurfaceRegistry;
@@ -9,7 +10,7 @@ use crate::sql::public::runtime::{
 };
 use crate::sql::public::services::pending_reads::{
     bootstrap_public_surface_registry_with_pending_transaction_view,
-    prepared_public_read_transaction_mode, PreparedPublicReadTransactionMode,
+    prepared_public_read_transaction_mode,
 };
 use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError};
@@ -33,7 +34,7 @@ pub(super) fn command_metadata(
         CompiledExecutionRoute::PublicRead(public_read)
             if matches!(
                 prepared_public_read_transaction_mode(public_read),
-                PreparedPublicReadTransactionMode::MaterializedState
+                CommittedReadMode::MaterializedState
             ) =>
         {
             BufferedWriteExecutionRoute::PublicReadMaterializedState

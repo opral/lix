@@ -10,8 +10,9 @@ mod wasm {
         InitResult as EngineInitResult, Lix as CoreLix, LixBackend, LixBackendTransaction,
         LixConfig, LixError, ObserveEvent as EngineObserveEvent,
         ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
-        QueryResult as EngineQueryResult, RedoOptions, RedoResult, SqlDialect, UndoOptions,
-        UndoResult, Value as EngineValue, WasmComponentInstance, WasmLimits, WasmRuntime,
+        QueryResult as EngineQueryResult, RedoOptions, RedoResult, SqlDialect, TransactionMode,
+        UndoOptions, UndoResult, Value as EngineValue, WasmComponentInstance, WasmLimits,
+        WasmRuntime,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -22,6 +23,7 @@ mod wasm {
     #[wasm_bindgen(typescript_custom_section)]
     const LIX_BACKEND_TYPES: &str = r#"
 export type LixSqlDialect = "sqlite" | "postgres";
+export type LixTransactionMode = "read" | "write" | "deferred";
 
 export type LixValue =
   | { kind: "null"; value: null }
@@ -57,7 +59,9 @@ export type LixBackend = {
     sql: string,
     params: LixValue[],
   ): Promise<LixQueryResult> | LixQueryResult;
-  beginTransaction?: () => Promise<LixBackendTransaction> | LixBackendTransaction;
+  beginTransaction?: (
+    mode?: LixTransactionMode,
+  ) => Promise<LixBackendTransaction> | LixBackendTransaction;
   // Should return a SQLite database file payload.
   export_image?: () => Promise<Uint8Array | ArrayBuffer> | Uint8Array | ArrayBuffer;
 };
@@ -1108,6 +1112,7 @@ export type LixObserveEvents = {
         backend: &'a JsBackend,
         kind: JsTransactionKind,
         closed: bool,
+        mode: TransactionMode,
     }
 
     // WASM is single-threaded by default; this avoids Send/Sync bounds in the engine.
@@ -1128,7 +1133,10 @@ export type LixObserveEvents = {
             self.execute_raw(sql, params).await
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+        async fn begin_transaction(
+            &self,
+            mode: TransactionMode,
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             let begin_transaction = Self::get_optional_method(&self.backend, "beginTransaction")?
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_JS_SDK_BACKEND_BEGIN_TRANSACTION_REQUIRED".to_string(),
@@ -1137,7 +1145,11 @@ export type LixObserveEvents = {
                             .to_string(),
                 })?;
             let transaction = begin_transaction
-                .call0(&self.backend)
+                .call1(&self.backend, &JsValue::from_str(match mode {
+                    TransactionMode::Read => "read",
+                    TransactionMode::Write => "write",
+                    TransactionMode::Deferred => "deferred",
+                }))
                 .map_err(js_to_lix_error)?;
             let transaction = Self::await_if_promise(transaction).await?;
             if transaction.is_null() || transaction.is_undefined() {
@@ -1150,6 +1162,7 @@ export type LixObserveEvents = {
                 backend: self,
                 kind: JsTransactionKind::Js { transaction },
                 closed: false,
+                mode,
             }))
         }
 
@@ -1165,6 +1178,7 @@ export type LixObserveEvents = {
                     name: name.to_string(),
                 },
                 closed: false,
+                mode: TransactionMode::Write,
             }))
         }
 
@@ -1191,6 +1205,10 @@ export type LixObserveEvents = {
                 }
                 JsTransactionKind::Savepoint { .. } => self.backend.dialect(),
             }
+        }
+
+        fn mode(&self) -> TransactionMode {
+            self.mode
         }
 
         async fn execute(

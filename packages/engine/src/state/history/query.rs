@@ -9,7 +9,6 @@ use crate::version::{
 };
 use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
-use super::timeline::ensure_state_history_timeline_materialized_for_root;
 use super::types::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest,
     StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
@@ -19,18 +18,6 @@ pub(crate) async fn load_state_history_rows(
     backend: &dyn LixBackend,
     request: &StateHistoryRequest,
 ) -> Result<Vec<StateHistoryRow>, LixError> {
-    let required_depth = request.max_depth.unwrap_or(512);
-    if let StateHistoryRootScope::RequestedRoots(root_commit_ids) = &request.root_scope {
-        for root_commit_id in root_commit_ids {
-            ensure_state_history_timeline_materialized_for_root(
-                backend,
-                root_commit_id,
-                required_depth,
-            )
-            .await?;
-        }
-    }
-
     let sql = build_state_history_query_sql(backend.dialect(), request)?;
     let result = backend.execute(&sql, &[]).await?;
     parse_state_history_rows(result)
@@ -110,12 +97,33 @@ fn build_state_history_source_sql(
 ) -> Result<String, LixError> {
     let version_ref_table = untracked_live_table_name("lix_version_ref");
     let commit_table = tracked_live_table_name("lix_commit");
+    let change_set_element_table = tracked_live_table_name("lix_change_set_element");
     let version_ref_commit_id_column = quote_ident(&live_payload_column_name(
         version_ref_schema_key(),
         "commit_id",
     ));
     let commit_change_set_id_column =
         quote_ident(&live_payload_column_name("lix_commit", "change_set_id"));
+    let cse_change_set_id_column = quote_ident(&live_payload_column_name(
+        "lix_change_set_element",
+        "change_set_id",
+    ));
+    let cse_change_id_column = quote_ident(&live_payload_column_name(
+        "lix_change_set_element",
+        "change_id",
+    ));
+    let cse_entity_id_column = quote_ident(&live_payload_column_name(
+        "lix_change_set_element",
+        "entity_id",
+    ));
+    let cse_schema_key_column = quote_ident(&live_payload_column_name(
+        "lix_change_set_element",
+        "schema_key",
+    ));
+    let cse_file_id_column = quote_ident(&live_payload_column_name(
+        "lix_change_set_element",
+        "file_id",
+    ));
 
     let requested_root_predicates = match &request.root_scope {
         StateHistoryRootScope::RequestedRoots(root_commit_ids) => root_commit_ids
@@ -185,8 +193,11 @@ fn build_state_history_source_sql(
             )
         };
 
-    let reachable_commits_cte_sql =
-        build_reachable_commits_from_requested_cte_sql(dialect, "requested_commits", 512);
+    let reachable_commits_cte_sql = build_reachable_commits_from_requested_cte_sql(
+        dialect,
+        "requested_commits",
+        request.max_depth.unwrap_or(512),
+    );
     let snapshot_projection = match request.content_mode {
         StateHistoryContentMode::MetadataOnly => "NULL AS snapshot_content".to_string(),
         StateHistoryContentMode::IncludeSnapshotContent => {
@@ -214,6 +225,29 @@ fn build_state_history_source_sql(
                AND version_id = '{global_version}' \
                AND is_tombstone = 0 \
            ), \
+           change_set_element_by_version AS ( \
+             SELECT \
+               {cse_change_set_id_column} AS change_set_id, \
+               {cse_change_id_column} AS change_id, \
+               {cse_entity_id_column} AS entity_id, \
+               {cse_schema_key_column} AS schema_key, \
+               {cse_file_id_column} AS file_id, \
+               version_id AS lixcol_version_id \
+             FROM {change_set_element_table} \
+             WHERE schema_key = 'lix_change_set_element' \
+               AND version_id = '{global_version}' \
+               AND is_tombstone = 0 \
+           ), \
+           all_changes AS ( \
+             SELECT \
+               ic.id, \
+               ic.plugin_key, \
+               ic.schema_version, \
+               ic.metadata, \
+               ic.snapshot_id, \
+               ic.created_at \
+             FROM lix_internal_change ic \
+           ), \
            requested_commits AS ( \
              SELECT DISTINCT \
                c.id AS commit_id, \
@@ -230,26 +264,104 @@ fn build_state_history_source_sql(
                rc.root_commit_id, \
                rc.root_version_id, \
                rc.commit_depth, \
-               c.created_at AS commit_created_at \
+               c.created_at AS commit_created_at, \
+               c.change_set_id AS change_set_id \
              FROM reachable_commits rc \
              JOIN commit_by_version c \
                ON c.id = rc.commit_id \
            ), \
+           cse_in_reachable AS ( \
+             SELECT \
+               cse.entity_id AS entity_id, \
+               cse.schema_key AS schema_key, \
+               cse.file_id AS file_id, \
+               cse.change_id AS change_id, \
+               rc.commit_id AS commit_id, \
+               rc.root_commit_id AS root_commit_id, \
+               rc.root_version_id AS root_version_id, \
+               rc.commit_depth AS commit_depth, \
+               rc.commit_created_at AS commit_created_at \
+             FROM change_set_element_by_version cse \
+             JOIN filtered_reachable_commits rc \
+               ON cse.change_set_id = rc.change_set_id \
+             WHERE cse.lixcol_version_id = '{global_version}' \
+           ), \
+           ranked AS ( \
+             SELECT \
+               r.entity_id, \
+               r.schema_key, \
+               r.file_id, \
+               changes.plugin_key, \
+               changes.schema_version, \
+               changes.metadata, \
+               changes.snapshot_id, \
+               r.change_id, \
+               r.commit_id, \
+               r.root_commit_id, \
+               r.root_version_id, \
+               r.commit_depth, \
+               r.commit_created_at, \
+               ROW_NUMBER() OVER ( \
+                 PARTITION BY r.root_commit_id, r.entity_id, r.schema_key, r.file_id, r.commit_depth \
+                 ORDER BY changes.created_at DESC, changes.id DESC \
+               ) AS rn \
+             FROM cse_in_reachable r \
+             JOIN all_changes changes ON changes.id = r.change_id \
+           ), \
+           source_rows AS ( \
+             SELECT \
+               ranked.entity_id, \
+               ranked.schema_key, \
+               ranked.file_id, \
+               ranked.plugin_key, \
+               ranked.schema_version, \
+               ranked.metadata, \
+               ranked.snapshot_id, \
+               ranked.change_id, \
+               ranked.commit_id, \
+               ranked.root_commit_id, \
+               ranked.root_version_id, \
+               ranked.commit_depth, \
+               ranked.commit_created_at \
+             FROM ranked \
+             WHERE ranked.rn = 1 \
+           ), \
            breakpoint_rows AS ( \
              SELECT \
-               bp.root_commit_id, \
-               bp.entity_id, \
-               bp.schema_key, \
-               bp.file_id, \
-               bp.plugin_key, \
-               bp.schema_version, \
-               bp.metadata, \
-               bp.snapshot_id, \
-               bp.change_id, \
-               bp.from_depth \
-             FROM lix_internal_entity_state_timeline_breakpoint bp \
-             JOIN requested_commits requested \
-               ON requested.commit_id = bp.root_commit_id \
+               source.entity_id, \
+               source.schema_key, \
+               source.file_id, \
+               source.plugin_key, \
+               source.schema_version, \
+               source.metadata, \
+               source.snapshot_id, \
+               source.change_id, \
+               source.commit_id, \
+               source.root_commit_id, \
+               source.root_version_id, \
+               source.commit_depth, \
+               source.commit_created_at, \
+               LAG(source.plugin_key) OVER ( \
+                 PARTITION BY source.root_commit_id, source.entity_id, source.schema_key, source.file_id \
+                 ORDER BY source.commit_depth \
+               ) AS prev_plugin_key, \
+               LAG(source.schema_version) OVER ( \
+                 PARTITION BY source.root_commit_id, source.entity_id, source.schema_key, source.file_id \
+                 ORDER BY source.commit_depth \
+               ) AS prev_schema_version, \
+               LAG(source.metadata) OVER ( \
+                 PARTITION BY source.root_commit_id, source.entity_id, source.schema_key, source.file_id \
+                 ORDER BY source.commit_depth \
+               ) AS prev_metadata, \
+               LAG(source.snapshot_id) OVER ( \
+                 PARTITION BY source.root_commit_id, source.entity_id, source.schema_key, source.file_id \
+                 ORDER BY source.commit_depth \
+               ) AS prev_snapshot_id, \
+               LAG(source.change_id) OVER ( \
+                 PARTITION BY source.root_commit_id, source.entity_id, source.schema_key, source.file_id \
+                 ORDER BY source.commit_depth \
+               ) AS prev_change_id \
+             FROM source_rows source \
            ), \
            history_rows AS ( \
              SELECT \
@@ -261,15 +373,18 @@ fn build_state_history_source_sql(
                bp.metadata, \
                bp.snapshot_id, \
                bp.change_id, \
-               rc.commit_id AS commit_id, \
-               rc.commit_created_at AS commit_created_at, \
-               rc.root_commit_id AS root_commit_id, \
-               rc.root_version_id AS version_id, \
-               rc.commit_depth AS depth \
-             FROM filtered_reachable_commits rc \
-             JOIN breakpoint_rows bp \
-               ON bp.root_commit_id = rc.root_commit_id \
-              AND rc.commit_depth = bp.from_depth \
+               bp.commit_id AS commit_id, \
+               bp.commit_created_at AS commit_created_at, \
+               bp.root_commit_id AS root_commit_id, \
+               bp.root_version_id AS version_id, \
+               bp.commit_depth AS depth \
+             FROM breakpoint_rows bp \
+             WHERE bp.prev_plugin_key IS NULL \
+               OR bp.plugin_key != bp.prev_plugin_key \
+               OR bp.schema_version != bp.prev_schema_version \
+               OR COALESCE(bp.metadata, '__LIX_NULL__') != COALESCE(bp.prev_metadata, '__LIX_NULL__') \
+               OR bp.snapshot_id != bp.prev_snapshot_id \
+               OR bp.change_id != bp.prev_change_id \
            ) \
          SELECT \
            h.entity_id AS entity_id, \
@@ -291,6 +406,12 @@ fn build_state_history_source_sql(
         default_root_commits_sql = default_root_commits_sql,
         commit_change_set_id_column = commit_change_set_id_column,
         commit_table = commit_table,
+        change_set_element_table = change_set_element_table,
+        cse_change_set_id_column = cse_change_set_id_column,
+        cse_change_id_column = cse_change_id_column,
+        cse_entity_id_column = cse_entity_id_column,
+        cse_schema_key_column = cse_schema_key_column,
+        cse_file_id_column = cse_file_id_column,
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
         requested_where_sql = requested_where_sql,
         reachable_commits_cte_sql = reachable_commits_cte_sql,

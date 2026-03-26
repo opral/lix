@@ -10,7 +10,9 @@ use lix_engine::live_state::untracked::{
     UntrackedWriteRow,
 };
 use lix_engine::transaction::{ReadContext, TransactionDelta, WriteTransaction};
-use lix_engine::{LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
+use lix_engine::{
+    LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
+};
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
 #[derive(Clone)]
@@ -20,6 +22,7 @@ struct SqliteBackend {
 
 struct SqliteTransaction {
     connection: Arc<Mutex<rusqlite::Connection>>,
+    mode: TransactionMode,
 }
 
 impl SqliteBackend {
@@ -45,13 +48,22 @@ impl LixBackend for SqliteBackend {
         execute_sql(&connection, sql, params)
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_transaction(
+        &self,
+        mode: TransactionMode,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         {
             let connection = self.connection.lock().expect("sqlite connection lock");
-            connection.execute_batch("BEGIN").map_err(sqlite_error)?;
+            connection
+                .execute_batch(match mode {
+                    TransactionMode::Read | TransactionMode::Deferred => "BEGIN",
+                    TransactionMode::Write => "BEGIN IMMEDIATE",
+                })
+                .map_err(sqlite_error)?;
         }
         Ok(Box::new(SqliteTransaction {
             connection: Arc::clone(&self.connection),
+            mode,
         }))
     }
 
@@ -59,7 +71,7 @@ impl LixBackend for SqliteBackend {
         &self,
         _name: &str,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        self.begin_transaction().await
+        self.begin_transaction(TransactionMode::Write).await
     }
 }
 
@@ -67,6 +79,10 @@ impl LixBackend for SqliteBackend {
 impl LixBackendTransaction for SqliteTransaction {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
+    }
+
+    fn mode(&self) -> TransactionMode {
+        self.mode
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
@@ -185,7 +201,7 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
     let timestamp = "2026-03-24T00:00:00Z";
     let read_context = ReadContext::new(&backend, &backend);
     let backend_txn = backend
-        .begin_transaction()
+        .begin_transaction(TransactionMode::Write)
         .await
         .expect("begin transaction should succeed");
 
@@ -252,7 +268,7 @@ async fn isolated_transaction_rejects_staging_after_execute() {
     let timestamp = "2026-03-24T00:00:00Z";
     let read_context = ReadContext::new(&backend, &backend);
     let backend_txn = backend
-        .begin_transaction()
+        .begin_transaction(TransactionMode::Write)
         .await
         .expect("begin transaction should succeed");
 
@@ -286,7 +302,7 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
     let timestamp = "2026-03-24T00:00:00Z";
     let read_context = ReadContext::new(&backend, &backend);
     let backend_txn = backend
-        .begin_transaction()
+        .begin_transaction(TransactionMode::Write)
         .await
         .expect("begin transaction should succeed");
 

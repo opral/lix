@@ -1,14 +1,17 @@
 use super::bind::{bind_public_query, bind_public_statement_sql};
 use super::*;
 use crate::errors::classification::sanitize_lowered_public_sql_error_description;
-use crate::filesystem::history::{
+use crate::live_state::{
+    builtin_live_table_layout, load_live_table_layout_with_backend, LiveTableLayout,
+};
+use crate::read::models::{
     load_directory_history_rows, load_file_history_rows, DirectoryHistoryRequest,
     DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
     FileHistoryRootScope, FileHistoryRow, FileHistoryVersionScope,
 };
-use crate::live_state::{
-    builtin_live_table_layout, load_live_table_layout_with_backend, register_schema,
-    LiveTableLayout,
+use crate::read::models::{
+    load_state_history_rows, StateHistoryContentMode, StateHistoryLineageScope,
+    StateHistoryRequest, StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
 };
 use crate::sql::public::catalog::SurfaceBinding;
 use crate::sql::public::planner::backend::lowerer::{
@@ -18,10 +21,6 @@ use crate::sql::public::planner::backend::lowerer::{
 };
 use crate::sql::public::planner::canonicalize::canonicalize_read;
 use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
-use crate::state::history::{
-    load_state_history_rows, StateHistoryContentMode, StateHistoryLineageScope,
-    StateHistoryRequest, StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
-};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
@@ -55,9 +54,6 @@ pub(crate) async fn execute_public_read_query_strict(
     let lowered = lower_public_read_query_with_details(backend, query, params).await?;
     let mut required_schema_keys = lowered.required_schema_keys;
     required_schema_keys.extend(nested_required_schema_keys);
-    for schema_key in &required_schema_keys {
-        register_schema(backend, schema_key.clone()).await?;
-    }
     let bound = bind_public_query(lowered.query, params, backend.dialect())?;
     let result = backend
         .execute(&bound.sql, &bound.params)
@@ -178,14 +174,10 @@ pub(crate) async fn execute_prepared_public_read(
 async fn execute_lowered_public_read(
     backend: &dyn LixBackend,
     lowered: &LoweredReadProgram,
-    dependency_spec: Option<&DependencySpec>,
+    _dependency_spec: Option<&DependencySpec>,
     public_surfaces: &[String],
     params: &[Value],
 ) -> Result<QueryResult, LixError> {
-    for schema_key in required_schema_keys_from_dependency_spec(dependency_spec) {
-        register_schema(backend, schema_key).await?;
-    }
-
     let mut result = QueryResult {
         rows: Vec::new(),
         columns: Vec::new(),
@@ -5274,12 +5266,6 @@ async fn try_prepare_public_read_via_specialized_optimization(
                     "public read preparation could not bind active history root",
                 )
             })?;
-    ensure_public_read_history_timeline_roots(
-        backend,
-        &requested_history_root_commit_ids_from_selection(structured_read.query.selection.as_ref()),
-    )
-    .await
-    .map_err(|error| LixError::new(error.code, error.description))?;
     let dependency_spec = augment_dependency_spec_for_public_read(
         registry,
         &structured_read,
@@ -5801,12 +5787,6 @@ async fn prepare_public_read_via_surface_lowering(
             "public read preparation failed: direct-only history surfaces do not support broad surface lowering",
         ));
     }
-    ensure_public_read_history_timeline_roots(
-        backend,
-        &read_summary.requested_history_root_commit_ids,
-    )
-    .await
-    .map_err(|error| LixError::new(error.code, error.description))?;
     if read_summary.bound_surface_bindings.is_empty() {
         return Ok(None);
     }

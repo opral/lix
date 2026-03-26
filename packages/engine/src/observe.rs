@@ -1015,7 +1015,10 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+        async fn begin_transaction(
+            &self,
+            _mode: crate::TransactionMode,
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             Ok(Box::new(CountingObserveTransaction {
                 observe_query_hits: Arc::clone(&self.observe_query_hits),
             }))
@@ -1025,7 +1028,7 @@ mod tests {
             &self,
             _name: &str,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            self.begin_transaction().await
+            self.begin_transaction(crate::TransactionMode::Write).await
         }
     }
 
@@ -1033,6 +1036,10 @@ mod tests {
     impl LixBackendTransaction for CountingObserveTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
+        }
+
+        fn mode(&self) -> crate::TransactionMode {
+            crate::TransactionMode::Write
         }
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {

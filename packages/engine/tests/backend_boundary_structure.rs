@@ -8,6 +8,15 @@ fn read_engine_source(relative: &str) -> String {
     fs::read_to_string(path).expect("source file should be readable")
 }
 
+fn read_rs_sdk_source(relative: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("rs-sdk")
+        .join("src")
+        .join(relative);
+    fs::read_to_string(path).expect("rs-sdk source file should be readable")
+}
+
 #[test]
 fn backend_substrate_is_top_level() {
     let lib_source = read_engine_source("lib.rs");
@@ -25,6 +34,10 @@ fn backend_substrate_is_top_level() {
         "backend/prepared.rs",
         "backend/program.rs",
         "backend/program_runner.rs",
+        "read/mod.rs",
+        "read/contracts.rs",
+        "read/models.rs",
+        "read/runtime.rs",
         "sql_support/mod.rs",
         "sql_support/binding.rs",
         "sql_support/placeholders.rs",
@@ -136,5 +149,73 @@ fn prepared_types_are_reexported_from_backend() {
     assert!(
         lib_source.contains("pub use backend::prepared::"),
         "lib.rs should re-export prepared types from backend::prepared"
+    );
+}
+
+#[test]
+fn backend_transaction_modes_are_explicit_and_session_routing_uses_read_runtime() {
+    let backend_source = read_engine_source("backend/mod.rs");
+    assert!(
+        backend_source.contains("pub enum TransactionMode"),
+        "backend transaction modes should be explicit"
+    );
+    assert!(
+        backend_source.contains("mode: TransactionMode"),
+        "backend begin_transaction should require an explicit mode"
+    );
+    assert!(
+        backend_source.contains("fn mode(&self) -> TransactionMode;"),
+        "backend transactions should expose their chosen mode"
+    );
+
+    let session_source = read_engine_source("session/mod.rs");
+    assert!(
+        session_source.contains("begin_read_unit(transaction_mode)"),
+        "session execution should have a committed read path"
+    );
+    assert!(
+        session_source.contains("execute_execution_program_in_committed_read_transaction"),
+        "session execution should route committed reads through read/runtime"
+    );
+}
+
+#[test]
+fn read_subsystem_owns_committed_read_runtime_and_models() {
+    let runtime_read_source = read_engine_source("sql/public/runtime/read.rs");
+    assert!(
+        runtime_read_source.contains("crate::read::models::"),
+        "sql/public/runtime/read.rs should consume committed read models through read/models"
+    );
+
+    let runtime_mod_source = read_engine_source("sql/public/runtime/mod.rs");
+    assert!(
+        runtime_mod_source.contains("crate::read::models::"),
+        "sql/public/runtime/mod.rs should consume committed read models through read/models"
+    );
+
+    let transaction_runtime_source = read_engine_source("transaction/sql_adapter/runtime.rs");
+    assert!(
+        transaction_runtime_source
+            .contains("execute_prepared_public_read_with_pending_transaction_view"),
+        "pending-view reads should remain transaction-owned"
+    );
+
+    let read_runtime_source = read_engine_source("read/runtime.rs");
+    assert!(
+        !read_runtime_source.contains("execute_compiled_execution_step_with_transaction"),
+        "committed read runtime should not delegate back into transaction runtime execution"
+    );
+    assert!(
+        !read_runtime_source.contains("TransactionMode::Deferred"),
+        "committed read runtime should not rely on deferred fallback for public reads"
+    );
+}
+
+#[test]
+fn sqlite_backend_keeps_nested_mode_failures_explicit() {
+    let sqlite_backend_source = read_rs_sdk_source("backend/sqlite.rs");
+    assert!(
+        sqlite_backend_source.contains("cannot open a nested read/deferred transaction"),
+        "sqlite backend should reject nested read/deferred mode requests explicitly"
     );
 }

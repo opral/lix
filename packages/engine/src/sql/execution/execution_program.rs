@@ -343,6 +343,22 @@ impl ExecutionProgram {
     pub(crate) fn source_statements(&self) -> &[Statement] {
         &self.source_statements
     }
+
+    pub(crate) fn is_plain_committed_read(&self) -> bool {
+        self.steps.iter().all(|step| match step {
+            ExecutionProgramStep::TransactionControl => true,
+            ExecutionProgramStep::Statement(step) => {
+                step.bound_template.plan_requirements().read_only_query
+            }
+        })
+    }
+
+    pub(crate) fn steps(&self) -> impl Iterator<Item = &BoundStatementTemplateInstance> {
+        self.steps.iter().filter_map(|step| match step {
+            ExecutionProgramStep::TransactionControl => None,
+            ExecutionProgramStep::Statement(step) => Some(&step.bound_template),
+        })
+    }
 }
 
 pub(crate) async fn execute_execution_program_with_write_transaction(

@@ -5,7 +5,7 @@ use rusqlite::types::{Value as SqliteValue, ValueRef};
 
 use crate::{
     boot, BootArgs, Engine, LixBackend, LixBackendTransaction, LixError, NoopWasmRuntime,
-    QueryResult, Session, SqlDialect, Value,
+    QueryResult, Session, SqlDialect, TransactionMode, Value,
 };
 
 #[derive(Clone)]
@@ -15,6 +15,7 @@ pub(crate) struct InMemorySqliteBackend {
 
 struct InMemorySqliteTransaction {
     connection: Arc<Mutex<rusqlite::Connection>>,
+    mode: TransactionMode,
 }
 
 impl InMemorySqliteBackend {
@@ -40,13 +41,22 @@ impl LixBackend for InMemorySqliteBackend {
         execute_sql(&connection, sql, params)
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_transaction(
+        &self,
+        mode: TransactionMode,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         {
             let connection = self.connection.lock().expect("sqlite connection lock");
-            connection.execute_batch("BEGIN").map_err(sqlite_error)?;
+            connection
+                .execute_batch(match mode {
+                    TransactionMode::Read | TransactionMode::Deferred => "BEGIN",
+                    TransactionMode::Write => "BEGIN IMMEDIATE",
+                })
+                .map_err(sqlite_error)?;
         }
         Ok(Box::new(InMemorySqliteTransaction {
             connection: Arc::clone(&self.connection),
+            mode,
         }))
     }
 
@@ -54,7 +64,7 @@ impl LixBackend for InMemorySqliteBackend {
         &self,
         _name: &str,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        self.begin_transaction().await
+        self.begin_transaction(TransactionMode::Write).await
     }
 }
 
@@ -62,6 +72,10 @@ impl LixBackend for InMemorySqliteBackend {
 impl LixBackendTransaction for InMemorySqliteTransaction {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
+    }
+
+    fn mode(&self) -> TransactionMode {
+        self.mode
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {

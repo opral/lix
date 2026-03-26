@@ -15,6 +15,10 @@ use crate::engine::{
 };
 use crate::errors;
 use crate::live_state::raw::{load_exact_row_with_backend, RawStorage};
+use crate::read::runtime::{
+    execute_execution_program_in_committed_read_transaction,
+    transaction_mode_for_committed_read_program,
+};
 use crate::sql::execution::execution_program::{
     execute_execution_program_with_write_transaction, ExecutionContext, ExecutionProgram,
     SessionExecutionRuntime, SessionExecutionRuntimeHandle,
@@ -29,7 +33,7 @@ use crate::version::{
 };
 use crate::{ExecuteResult, LixError, Value};
 
-use contracts::{SessionDependency, SessionStateSnapshot};
+use contracts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
 use workspace::{
     load_workspace_active_account_ids, persist_workspace_active_account_ids,
     persist_workspace_active_version_id, require_workspace_active_version_id,
@@ -334,8 +338,6 @@ impl Session {
             return Err(errors::transaction_control_statement_denied_error());
         }
 
-        let transaction = self.engine.begin_write_unit().await?;
-        let mut write_transaction = WriteTransaction::new_buffered_write(transaction);
         let mut context = self.new_execution_context(options);
         let runtime_bindings = context.runtime_binding_values()?;
         let program = ExecutionProgram::compile(
@@ -344,6 +346,40 @@ impl Session {
             self.engine.backend.dialect(),
             &runtime_bindings,
         )?;
+
+        if classify_session_execution_mode(&program, explicit_transaction_script)
+            == SessionExecutionMode::CommittedRead
+        {
+            let transaction_mode = transaction_mode_for_committed_read_program(
+                self.engine.as_ref(),
+                &program,
+                allow_internal_sql,
+                &context,
+            )
+            .await?;
+            let mut transaction = self.engine.begin_read_unit(transaction_mode).await?;
+            let result = execute_execution_program_in_committed_read_transaction(
+                self.engine.as_ref(),
+                transaction.as_mut(),
+                &program,
+                allow_internal_sql,
+                &context,
+            )
+            .await;
+            match result {
+                Ok(result) => {
+                    transaction.commit().await?;
+                    return Ok(result);
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            }
+        }
+
+        let transaction = self.engine.begin_write_unit().await?;
+        let mut write_transaction = WriteTransaction::new_buffered_write(transaction);
 
         let result = execute_execution_program_with_write_transaction(
             self.engine.as_ref(),
@@ -508,6 +544,17 @@ impl Session {
             &mut outcome.state_commit_stream_changes,
         ));
         Ok(())
+    }
+}
+
+fn classify_session_execution_mode(
+    program: &ExecutionProgram,
+    explicit_transaction_script: bool,
+) -> SessionExecutionMode {
+    if !explicit_transaction_script && program.is_plain_committed_read() {
+        SessionExecutionMode::CommittedRead
+    } else {
+        SessionExecutionMode::WriteTransaction
     }
 }
 
@@ -689,4 +736,245 @@ fn contains_transaction_control_statement(statements: &[Statement]) -> bool {
                 | Statement::Rollback { .. }
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rusqlite::types::{Value as SqliteValue, ValueRef};
+
+    #[derive(Clone)]
+    struct RecordingBackend {
+        connection: Arc<Mutex<rusqlite::Connection>>,
+        modes: Arc<Mutex<Vec<crate::TransactionMode>>>,
+    }
+
+    struct RecordingTransaction {
+        connection: Arc<Mutex<rusqlite::Connection>>,
+        mode: crate::TransactionMode,
+    }
+
+    impl RecordingBackend {
+        fn new() -> Self {
+            Self {
+                connection: Arc::new(Mutex::new(
+                    rusqlite::Connection::open_in_memory().expect("open sqlite memory db"),
+                )),
+                modes: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn modes(&self) -> Vec<crate::TransactionMode> {
+            self.modes.lock().expect("recorded modes lock").clone()
+        }
+    }
+
+    fn run_with_large_stack<F, Fut>(factory: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        std::thread::Builder::new()
+            .name("session-mode-tests".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime should build")
+                    .block_on(factory());
+            })
+            .expect("session mode test thread should spawn")
+            .join()
+            .expect("session mode test thread should not panic");
+    }
+
+    #[async_trait(?Send)]
+    impl crate::LixBackend for RecordingBackend {
+        fn dialect(&self) -> crate::SqlDialect {
+            crate::SqlDialect::Sqlite
+        }
+
+        async fn execute(
+            &self,
+            sql: &str,
+            params: &[crate::Value],
+        ) -> Result<crate::QueryResult, crate::LixError> {
+            let connection = self.connection.lock().expect("sqlite connection lock");
+            execute_sql(&connection, sql, params)
+        }
+
+        async fn begin_transaction(
+            &self,
+            mode: crate::TransactionMode,
+        ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, crate::LixError> {
+            self.modes.lock().expect("recorded modes lock").push(mode);
+            {
+                let connection = self.connection.lock().expect("sqlite connection lock");
+                connection
+                    .execute_batch(match mode {
+                        crate::TransactionMode::Read | crate::TransactionMode::Deferred => "BEGIN",
+                        crate::TransactionMode::Write => "BEGIN IMMEDIATE",
+                    })
+                    .map_err(sqlite_error)?;
+            }
+            Ok(Box::new(RecordingTransaction {
+                connection: Arc::clone(&self.connection),
+                mode,
+            }))
+        }
+
+        async fn begin_savepoint(
+            &self,
+            name: &str,
+        ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, crate::LixError> {
+            {
+                let connection = self.connection.lock().expect("sqlite connection lock");
+                connection
+                    .execute_batch(&format!("SAVEPOINT {name}"))
+                    .map_err(sqlite_error)?;
+            }
+            self.modes
+                .lock()
+                .expect("recorded modes lock")
+                .push(crate::TransactionMode::Write);
+            Ok(Box::new(RecordingTransaction {
+                connection: Arc::clone(&self.connection),
+                mode: crate::TransactionMode::Write,
+            }))
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl crate::LixBackendTransaction for RecordingTransaction {
+        fn dialect(&self) -> crate::SqlDialect {
+            crate::SqlDialect::Sqlite
+        }
+
+        fn mode(&self) -> crate::TransactionMode {
+            self.mode
+        }
+
+        async fn execute(
+            &mut self,
+            sql: &str,
+            params: &[crate::Value],
+        ) -> Result<crate::QueryResult, crate::LixError> {
+            let connection = self.connection.lock().expect("sqlite connection lock");
+            execute_sql(&connection, sql, params)
+        }
+
+        async fn commit(self: Box<Self>) -> Result<(), crate::LixError> {
+            let connection = self.connection.lock().expect("sqlite connection lock");
+            connection.execute_batch("COMMIT").map_err(sqlite_error)
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<(), crate::LixError> {
+            let connection = self.connection.lock().expect("sqlite connection lock");
+            connection.execute_batch("ROLLBACK").map_err(sqlite_error)
+        }
+    }
+
+    fn test_engine(backend: RecordingBackend) -> Arc<Engine> {
+        Arc::new(crate::boot(crate::BootArgs::new(
+            Box::new(backend),
+            Arc::new(crate::NoopWasmRuntime),
+        )))
+    }
+
+    fn execute_sql(
+        connection: &rusqlite::Connection,
+        sql: &str,
+        params: &[crate::Value],
+    ) -> Result<crate::QueryResult, crate::LixError> {
+        let bindings = params.iter().map(to_sqlite_value).collect::<Vec<_>>();
+        let mut statement = connection.prepare(sql).map_err(sqlite_error)?;
+        let column_count = statement.column_count();
+        let columns = statement
+            .column_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+
+        if column_count == 0 {
+            statement
+                .execute(rusqlite::params_from_iter(bindings))
+                .map_err(sqlite_error)?;
+            return Ok(crate::QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            });
+        }
+
+        let mut rows = statement
+            .query(rusqlite::params_from_iter(bindings))
+            .map_err(sqlite_error)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(sqlite_error)? {
+            let mut values = Vec::with_capacity(column_count);
+            for index in 0..column_count {
+                values.push(from_sqlite_value(row.get_ref(index).map_err(sqlite_error)?));
+            }
+            out.push(values);
+        }
+
+        Ok(crate::QueryResult { rows: out, columns })
+    }
+
+    fn to_sqlite_value(value: &crate::Value) -> SqliteValue {
+        match value {
+            crate::Value::Null => SqliteValue::Null,
+            crate::Value::Boolean(value) => SqliteValue::Integer(i64::from(*value)),
+            crate::Value::Integer(value) => SqliteValue::Integer(*value),
+            crate::Value::Real(value) => SqliteValue::Real(*value),
+            crate::Value::Text(value) => SqliteValue::Text(value.clone()),
+            crate::Value::Json(value) => SqliteValue::Text(value.to_string()),
+            crate::Value::Blob(value) => SqliteValue::Blob(value.clone()),
+        }
+    }
+
+    fn from_sqlite_value(value: ValueRef<'_>) -> crate::Value {
+        match value {
+            ValueRef::Null => crate::Value::Null,
+            ValueRef::Integer(value) => crate::Value::Integer(value),
+            ValueRef::Real(value) => crate::Value::Real(value),
+            ValueRef::Text(value) => {
+                crate::Value::Text(String::from_utf8_lossy(value).into_owned())
+            }
+            ValueRef::Blob(value) => crate::Value::Blob(value.to_vec()),
+        }
+    }
+
+    fn sqlite_error(error: rusqlite::Error) -> crate::LixError {
+        crate::LixError::new("LIX_ERROR_UNKNOWN", error.to_string())
+    }
+
+    #[test]
+    fn plain_reads_use_read_transaction_mode() {
+        run_with_large_stack(|| async move {
+            let backend = RecordingBackend::new();
+            let engine = test_engine(backend.clone());
+            let session = Session::new_for_test(engine, "version-test".to_string(), Vec::new());
+
+            let result = session
+                .execute("SELECT 1", &[])
+                .await
+                .expect("plain read should succeed");
+            assert_eq!(result.statements[0].rows[0][0], crate::Value::Integer(1));
+            assert_eq!(backend.modes(), vec![crate::TransactionMode::Read]);
+        });
+    }
+
+    #[test]
+    fn explicit_transaction_scripts_use_write_transaction_mode() {
+        run_with_large_stack(|| async move {
+            let backend = RecordingBackend::new();
+            let engine = test_engine(backend.clone());
+            let session = Session::new_for_test(engine, "version-test".to_string(), Vec::new());
+
+            let _ = session.execute("BEGIN; SELECT 1; COMMIT;", &[]).await;
+            assert_eq!(backend.modes(), vec![crate::TransactionMode::Write]);
+        });
+    }
 }

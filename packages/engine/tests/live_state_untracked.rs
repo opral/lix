@@ -14,7 +14,9 @@ use lix_engine::live_state::untracked::{
     UntrackedWriteOperation, UntrackedWriteRow,
 };
 use lix_engine::transaction::{ReadContext, TransactionDelta, WriteTransaction};
-use lix_engine::{LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
+use lix_engine::{
+    LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
+};
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
 #[derive(Clone)]
@@ -24,6 +26,7 @@ struct SqliteBackend {
 
 struct SqliteTransaction {
     connection: Arc<Mutex<rusqlite::Connection>>,
+    mode: TransactionMode,
 }
 
 impl SqliteBackend {
@@ -49,13 +52,22 @@ impl LixBackend for SqliteBackend {
         execute_sql(&connection, sql, params)
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_transaction(
+        &self,
+        mode: TransactionMode,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         {
             let connection = self.connection.lock().expect("sqlite connection lock");
-            connection.execute_batch("BEGIN").map_err(sqlite_error)?;
+            connection
+                .execute_batch(match mode {
+                    TransactionMode::Read | TransactionMode::Deferred => "BEGIN",
+                    TransactionMode::Write => "BEGIN IMMEDIATE",
+                })
+                .map_err(sqlite_error)?;
         }
         Ok(Box::new(SqliteTransaction {
             connection: Arc::clone(&self.connection),
+            mode,
         }))
     }
 
@@ -63,7 +75,7 @@ impl LixBackend for SqliteBackend {
         &self,
         _name: &str,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        self.begin_transaction().await
+        self.begin_transaction(TransactionMode::Write).await
     }
 }
 
@@ -71,6 +83,10 @@ impl LixBackend for SqliteBackend {
 impl LixBackendTransaction for SqliteTransaction {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
+    }
+
+    fn mode(&self) -> TransactionMode {
+        self.mode
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
@@ -162,7 +178,7 @@ async fn commit_untracked_rows(
     rows: Vec<UntrackedWriteRow>,
 ) -> Result<(), LixError> {
     let read_context = ReadContext::new(backend, backend);
-    let backend_txn = backend.begin_transaction().await?;
+    let backend_txn = backend.begin_transaction(TransactionMode::Write).await?;
     let mut write_tx = WriteTransaction::new(backend_txn, read_context);
     let schema_keys = rows
         .iter()

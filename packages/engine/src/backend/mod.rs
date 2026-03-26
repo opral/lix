@@ -13,6 +13,13 @@ pub enum SqlDialect {
     Postgres,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionMode {
+    Read,
+    Write,
+    Deferred,
+}
+
 #[async_trait(?Send)]
 pub trait LixBackend: Send + Sync {
     fn dialect(&self) -> SqlDialect;
@@ -24,11 +31,14 @@ pub trait LixBackend: Send + Sync {
     /// IS active, the statement participates in it.
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
 
-    /// Begin an exclusive transaction (`BEGIN IMMEDIATE` for SQLite).
+    /// Begin a transaction using the requested mode.
     ///
     /// The returned handle holds exclusive access to the connection.
     /// All SQL must go through the handle until commit/rollback.
-    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError>;
+    async fn begin_transaction(
+        &self,
+        mode: TransactionMode,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError>;
 
     /// Begin a named savepoint within an active transaction.
     ///
@@ -91,7 +101,7 @@ pub async fn execute_auto_transactional(
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, LixError> {
-    let mut transaction = backend.begin_transaction().await?;
+    let mut transaction = backend.begin_transaction(TransactionMode::Deferred).await?;
     let result = transaction.execute(sql, params).await;
     match result {
         Ok(result) => {
@@ -153,6 +163,7 @@ where
 #[async_trait(?Send)]
 pub trait LixBackendTransaction {
     fn dialect(&self) -> SqlDialect;
+    fn mode(&self) -> TransactionMode;
 
     /// Executes one SQL statement inside the current transaction.
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
@@ -178,7 +189,7 @@ pub async fn execute_statement_with_backend(
     backend: &dyn LixBackend,
     statement: PreparedStatement,
 ) -> Result<QueryResult, LixError> {
-    let mut transaction = backend.begin_transaction().await?;
+    let mut transaction = backend.begin_transaction(TransactionMode::Deferred).await?;
     let result = transaction.execute(&statement.sql, &statement.params).await;
     match result {
         Ok(result) => {
