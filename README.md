@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/assets/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">Embeddable version control system</h3>
+<h3 align="center">Semantic version control system for AI agents</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="97k weekly downloads on NPM"></a>
@@ -17,13 +17,15 @@
 
 ---
 
-Lix is an embeddable version control system that enables Git-like features such as history, versions (branches), diffs, or blame for any file format.
+Lix is an semantic version control system for AI agents. 
+
+Lix is not a git replacement, nor is it explicitly designed for software engineering. The goal is to bring version control to industries other than software engineering like health, finance, policy making, design, etc.
 
 **What makes Lix unique:**
 
-- **Embeddable** - Works on top of your existing SQL database.
-- **Tracks deltas** - Changes are semantically tracked and queryable via SQL.
+- **Semantic tracking** - Understands changes semantically like "This paragraph changed", not "line 5 changed".
 - **Supports any file format** - Tracks changes in `.docx`, `.pdf`, `.json`, etc. via plugins.
+- **Embeddable** - Works as standalone repository, or on top of existing SQL databases.
 
 ---
 
