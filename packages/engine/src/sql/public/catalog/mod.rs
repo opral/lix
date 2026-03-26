@@ -1,9 +1,10 @@
-use crate::cel::CelEvaluator;
+use crate::cel::shared_runtime;
+use crate::schema::annotations::overrides::{collect_lixcol_overrides, LixcolOverrideValue};
 use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
 use crate::schema::schema_from_registered_snapshot;
 use crate::schema::SqlRegisteredSchemaProvider;
 use crate::{LixBackend, LixError};
-use serde_json::{Map as JsonMap, Value as JsonValue};
+use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectName, ObjectNamePart};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -743,9 +744,7 @@ fn entity_surface_spec_from_schema(
         })
         .unwrap_or_default();
 
-    let evaluator = CelEvaluator::new();
-    reject_removed_lixcol_version_override(schema, schema_key)?;
-    let predicate_overrides = collect_override_predicates(schema, schema_key, &evaluator)?;
+    let predicate_overrides = collect_override_predicates(schema, schema_key)?;
 
     Ok(DynamicEntitySurfaceSpec {
         schema_key: schema_key.to_string(),
@@ -769,98 +768,28 @@ fn entity_override_predicates_for_variant(
         .collect()
 }
 
-fn raw_lixcol_override_expression<'a>(schema: &'a JsonValue, key: &str) -> Option<&'a str> {
-    schema
-        .get("x-lix-override-lixcols")
-        .and_then(JsonValue::as_object)
-        .and_then(|overrides| overrides.get(key))
-        .and_then(JsonValue::as_str)
-}
-
-fn reject_removed_lixcol_version_override(
-    schema: &JsonValue,
-    schema_key: &str,
-) -> Result<(), LixError> {
-    if raw_lixcol_override_expression(schema, "lixcol_version_id").is_some() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "schema '{}' uses removed x-lix-override-lixcols.lixcol_version_id support; use lixcol_global for global write scope",
-                schema_key
-            ),
-        });
-    }
-
-    Ok(())
-}
-
-fn evaluate_lixcol_override(
-    schema: &JsonValue,
-    schema_key: &str,
-    key: &str,
-    evaluator: &CelEvaluator,
-) -> Result<Option<JsonValue>, LixError> {
-    let Some(raw_expression) = raw_lixcol_override_expression(schema, key) else {
-        return Ok(None);
-    };
-    let expression = raw_expression.trim();
-    if expression.is_empty() {
-        return Ok(None);
-    }
-    evaluator
-        .evaluate(expression, &JsonMap::new())
-        .map(Some)
-        .map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "invalid x-lix-override-lixcols expression for '{}.{}': {}",
-                schema_key, key, error.description
-            ),
-        })
-}
-
-fn extract_lixcol_scalar_override(
-    schema: &JsonValue,
-    schema_key: &str,
-    key: &str,
-    evaluator: &CelEvaluator,
-) -> Result<Option<SurfaceOverrideValue>, LixError> {
-    let Some(value) = evaluate_lixcol_override(schema, schema_key, key, evaluator)? else {
-        return Ok(None);
-    };
-    match value {
-        JsonValue::Null => Ok(Some(SurfaceOverrideValue::Null)),
-        JsonValue::Bool(value) => Ok(Some(SurfaceOverrideValue::Boolean(value))),
-        JsonValue::Number(value) => Ok(Some(SurfaceOverrideValue::Number(value.to_string()))),
-        JsonValue::String(value) => Ok(Some(SurfaceOverrideValue::String(value))),
-        JsonValue::Array(_) | JsonValue::Object(_) => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "x-lix-override-lixcols '{}.{}' must evaluate to a scalar or null",
-                schema_key, key
-            ),
-        }),
-    }
-}
-
 fn collect_override_predicates(
     schema: &JsonValue,
     schema_key: &str,
-    evaluator: &CelEvaluator,
 ) -> Result<Vec<SurfaceOverridePredicate>, LixError> {
     let mut predicates = Vec::new();
-    for (override_key, column) in [
-        ("lixcol_entity_id", "entity_id"),
-        ("lixcol_file_id", "file_id"),
-        ("lixcol_plugin_key", "plugin_key"),
-        ("lixcol_global", "global"),
-        ("lixcol_metadata", "metadata"),
-        ("lixcol_untracked", "untracked"),
-    ] {
-        let Some(value) =
-            extract_lixcol_scalar_override(schema, schema_key, override_key, evaluator)?
-        else {
+    for override_entry in collect_lixcol_overrides(schema, schema_key, shared_runtime())? {
+        let Some(column) = (match override_entry.key.as_str() {
+            "lixcol_entity_id" => Some("entity_id"),
+            "lixcol_file_id" => Some("file_id"),
+            "lixcol_plugin_key" => Some("plugin_key"),
+            "lixcol_global" => Some("global"),
+            "lixcol_metadata" => Some("metadata"),
+            "lixcol_untracked" => Some("untracked"),
+            _ => None,
+        }) else {
             continue;
+        };
+        let value = match override_entry.value {
+            LixcolOverrideValue::Null => SurfaceOverrideValue::Null,
+            LixcolOverrideValue::Boolean(value) => SurfaceOverrideValue::Boolean(value),
+            LixcolOverrideValue::Number(value) => SurfaceOverrideValue::Number(value),
+            LixcolOverrideValue::String(value) => SurfaceOverrideValue::String(value),
         };
         predicates.push(SurfaceOverridePredicate {
             column: column.to_string(),

@@ -2669,9 +2669,9 @@ mod legacy_plugin_and_cache_tests {
             .expect("file_by_version insert should succeed");
 
             engine
-            .switch_version(version_b.to_string())
-            .await
-            .expect("active-version switch should succeed");
+                .switch_version(version_b.to_string())
+                .await
+                .expect("active-version switch should succeed");
 
             engine
                 .execute(

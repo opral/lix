@@ -4,9 +4,10 @@ use crate::cel::CelEvaluator;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::LixError;
 
-pub(crate) fn apply_schema_defaults_with_functions<P>(
+pub(crate) fn apply_schema_defaults<P>(
     snapshot: &mut JsonMap<String, JsonValue>,
     schema: &JsonValue,
+    evaluator: &CelEvaluator,
     functions: SharedFunctionProvider<P>,
     schema_key: &str,
     schema_version: &str,
@@ -14,18 +15,18 @@ pub(crate) fn apply_schema_defaults_with_functions<P>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    apply_defaults_to_snapshot(
+    apply_schema_defaults_with_context(
         snapshot,
         schema,
         &snapshot.clone(),
-        &CelEvaluator::new(),
+        evaluator,
         functions,
         schema_key,
         schema_version,
     )
 }
 
-pub(crate) fn apply_defaults_to_snapshot<P>(
+pub(crate) fn apply_schema_defaults_with_context<P>(
     snapshot: &mut JsonMap<String, JsonValue>,
     schema: &JsonValue,
     context: &JsonMap<String, JsonValue>,
@@ -83,7 +84,7 @@ mod tests {
     use crate::cel::CelEvaluator;
     use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 
-    use super::apply_defaults_to_snapshot;
+    use super::apply_schema_defaults_with_context;
 
     fn system_functions() -> SharedFunctionProvider<SystemFunctionProvider> {
         SharedFunctionProvider::new(SystemFunctionProvider)
@@ -104,7 +105,7 @@ mod tests {
         snapshot.insert("name".to_string(), JsonValue::String("sample".to_string()));
         let context = snapshot.clone();
 
-        let changed = apply_defaults_to_snapshot(
+        let changed = apply_schema_defaults_with_context(
             &mut snapshot,
             &schema,
             &context,
@@ -137,7 +138,7 @@ mod tests {
         let mut snapshot = JsonMap::new();
         let context = snapshot.clone();
 
-        let changed = apply_defaults_to_snapshot(
+        let changed = apply_schema_defaults_with_context(
             &mut snapshot,
             &schema,
             &context,
@@ -170,7 +171,7 @@ mod tests {
         snapshot.insert("status".to_string(), JsonValue::Null);
         let context = snapshot.clone();
 
-        let changed = apply_defaults_to_snapshot(
+        let changed = apply_schema_defaults_with_context(
             &mut snapshot,
             &schema,
             &context,
@@ -221,7 +222,7 @@ mod tests {
         let mut snapshot = JsonMap::new();
         let context = snapshot.clone();
 
-        let changed = apply_defaults_to_snapshot(
+        let changed = apply_schema_defaults_with_context(
             &mut snapshot,
             &schema,
             &context,

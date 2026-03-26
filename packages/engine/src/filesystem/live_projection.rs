@@ -799,7 +799,9 @@ fn required_active_version_id(
     active_version_id: Option<&str>,
 ) -> Result<&str, LixError> {
     match (scope, active_version_id) {
-        (FilesystemProjectionScope::ActiveVersion, Some(active_version_id)) => Ok(active_version_id),
+        (FilesystemProjectionScope::ActiveVersion, Some(active_version_id)) => {
+            Ok(active_version_id)
+        }
         (FilesystemProjectionScope::ActiveVersion, None) => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "filesystem active-version projection requires a session-requested version id",

@@ -431,12 +431,8 @@ fn lower_broad_public_read_join(
     active_version_id: Option<&str>,
 ) -> Result<sqlparser::ast::Join, LixError> {
     let mut lowered = join.original.clone();
-    lowered.relation = lower_broad_public_read_table_factor(
-        &join.relation,
-        registry,
-        dialect,
-        active_version_id,
-    )?;
+    lowered.relation =
+        lower_broad_public_read_table_factor(&join.relation, registry, dialect, active_version_id)?;
     lower_nested_public_surfaces_in_join_operator(
         &mut lowered.join_operator,
         registry,
@@ -603,14 +599,12 @@ fn lower_nested_public_surfaces_in_set_expr_expressions(
     active_version_id: Option<&str>,
 ) -> Result<(), LixError> {
     match expr {
-        SetExpr::Select(select) => {
-            lower_nested_public_surfaces_in_select_expressions(
-                select,
-                registry,
-                dialect,
-                active_version_id,
-            )
-        }
+        SetExpr::Select(select) => lower_nested_public_surfaces_in_select_expressions(
+            select,
+            registry,
+            dialect,
+            active_version_id,
+        ),
         SetExpr::Query(query) => {
             *query = Box::new(lower_query_via_broad_binding(
                 query.as_ref(),
@@ -925,14 +919,12 @@ fn lower_nested_public_surfaces_in_expr(
             lower_nested_public_surfaces_in_expr(left, registry, dialect, active_version_id)?;
             lower_nested_public_surfaces_in_expr(right, registry, dialect, active_version_id)
         }
-        Expr::Function(function) => {
-            lower_nested_public_surfaces_in_function_args(
-                &mut function.args,
-                registry,
-                dialect,
-                active_version_id,
-            )
-        }
+        Expr::Function(function) => lower_nested_public_surfaces_in_function_args(
+            &mut function.args,
+            registry,
+            dialect,
+            active_version_id,
+        ),
         Expr::Case {
             operand,
             conditions,
@@ -940,7 +932,12 @@ fn lower_nested_public_surfaces_in_expr(
             ..
         } => {
             if let Some(operand) = operand {
-                lower_nested_public_surfaces_in_expr(operand, registry, dialect, active_version_id)?;
+                lower_nested_public_surfaces_in_expr(
+                    operand,
+                    registry,
+                    dialect,
+                    active_version_id,
+                )?;
             }
             for condition in conditions {
                 lower_nested_public_surfaces_in_expr(
@@ -1416,15 +1413,15 @@ fn build_supported_public_read_surface_query(
         SurfaceFamily::Entity => {
             build_builtin_entity_surface_query(&surface_binding, active_version_id)
         }
-        SurfaceFamily::Filesystem => {
-            build_nested_filesystem_surface_query(
-                dialect,
-                active_version_id,
-                &surface_binding.descriptor.public_name,
-            )
-        }
+        SurfaceFamily::Filesystem => build_nested_filesystem_surface_query(
+            dialect,
+            active_version_id,
+            &surface_binding.descriptor.public_name,
+        ),
         SurfaceFamily::Admin => build_public_admin_surface_query(&surface_binding),
-        SurfaceFamily::Change => build_public_change_surface_query(&surface_binding, active_version_id),
+        SurfaceFamily::Change => {
+            build_public_change_surface_query(&surface_binding, active_version_id)
+        }
     }
 }
 

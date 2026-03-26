@@ -1,5 +1,8 @@
 use super::*;
+use crate::cel::shared_runtime;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::schema::annotations::defaults::apply_schema_defaults;
+use crate::schema::annotations::overrides::collect_state_column_overrides;
 use crate::schema::builtin::builtin_schema_definition;
 use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
 use crate::sql::public::planner::ir::CanonicalStateAssignments;
@@ -239,11 +242,15 @@ pub(super) async fn resolve_state_write<P>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
+    let mut provider = SqlRegisteredSchemaProvider::new(backend);
+    let state_schema = load_optional_annotation_schema(&mut provider, planned_write)
+        .await
+        .map_err(write_resolve_backend_error)?;
     resolve_state_backed_write(
         backend,
         planned_write,
         pending_transaction_view,
-        StateBackedSurface::State,
+        StateBackedSurface::State(state_schema.as_ref()),
         functions,
     )
     .await
@@ -274,25 +281,30 @@ where
 }
 
 #[derive(Debug, Clone)]
-struct EntityWriteSchema {
+struct LoadedAnnotationSchema {
     schema: JsonValue,
     schema_key: String,
     schema_version: String,
+    state_defaults: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+struct EntityWriteSchema {
+    annotations: LoadedAnnotationSchema,
     property_columns: Vec<String>,
     primary_key_paths: Vec<Vec<String>>,
-    state_defaults: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Copy)]
 enum StateBackedSurface<'a> {
-    State,
+    State(Option<&'a LoadedAnnotationSchema>),
     Entity(&'a EntityWriteSchema),
 }
 
 impl StateBackedSurface<'_> {
     fn update_context(self) -> &'static str {
         match self {
-            Self::State => "public update resolver",
+            Self::State(_) => "public update resolver",
             Self::Entity(_) => "public entity update resolver",
         }
     }
@@ -306,17 +318,19 @@ impl StateBackedSurface<'_> {
         P: LixFunctionProvider + Send + 'static,
     {
         match self {
-            Self::State => build_state_insert_rows(planned_write),
+            Self::State(schema) => {
+                build_state_insert_rows_with_functions(planned_write, schema, functions)
+            }
             Self::Entity(entity_schema) => build_entity_insert_rows_with_functions(
                 payload_maps(planned_write)?,
                 resolved_version_id(planned_write)?,
                 EntityInsertSemantics {
-                    schema: &entity_schema.schema,
-                    schema_key: &entity_schema.schema_key,
-                    schema_version: &entity_schema.schema_version,
+                    schema: &entity_schema.annotations.schema,
+                    schema_key: &entity_schema.annotations.schema_key,
+                    schema_version: &entity_schema.annotations.schema_version,
                     property_columns: &entity_schema.property_columns,
                     primary_key_paths: &entity_schema.primary_key_paths,
-                    state_defaults: &entity_schema.state_defaults,
+                    state_defaults: &entity_schema.annotations.state_defaults,
                 },
                 functions,
             )
@@ -338,7 +352,7 @@ impl StateBackedSurface<'_> {
         current_row: &ExactEffectiveStateRow,
     ) -> Result<BTreeMap<String, Value>, WriteResolveError> {
         match self {
-            Self::State => {
+            Self::State(_) => {
                 let values = apply_state_assignments(&current_row.values, assignments);
                 ensure_identity_columns_preserved(
                     &current_row.entity_id,
@@ -370,7 +384,7 @@ impl StateBackedSurface<'_> {
         row: &PlannedStateRow,
     ) -> Result<Option<ExactEffectiveStateRow>, WriteResolveError> {
         match self {
-            Self::State => {
+            Self::State(_) => {
                 let version_id = row.version_id.clone().ok_or_else(|| WriteResolveError {
                     message: "public state insert resolver requires a concrete version_id"
                         .to_string(),
@@ -397,7 +411,7 @@ impl StateBackedSurface<'_> {
                 resolve_exact_effective_state_row_with_pending_transaction_view(
                     backend,
                     &ExactEffectiveStateRowRequest {
-                        schema_key: entity_schema.schema_key.clone(),
+                        schema_key: entity_schema.annotations.schema_key.clone(),
                         version_id,
                         row_key: entity_insert_row_key(entity_schema, row)?,
                         include_global_overlay: true,
@@ -418,7 +432,7 @@ impl StateBackedSurface<'_> {
         pending_transaction_view: Option<&PendingTransactionView>,
     ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
         match self {
-            Self::State => {
+            Self::State(_) => {
                 resolve_target_state_rows(backend, planned_write, pending_transaction_view).await
             }
             Self::Entity(entity_schema) => {
@@ -550,7 +564,7 @@ async fn resolve_state_backed_existing_write(
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let _ = resolved_existing_version_id(backend, planned_write).await?;
     let current_rows = match surface {
-        StateBackedSurface::State
+        StateBackedSurface::State(_)
             if planned_write.command.selector.exact_only
                 && state_selector_targets_single_effective_row(planned_write) =>
         {
@@ -681,10 +695,16 @@ fn resolve_state_backed_existing_write_from_rows(
     }
 }
 
-fn build_state_insert_rows(
+fn build_state_insert_rows_with_functions<P>(
     planned_write: &PlannedWrite,
-) -> Result<Vec<PlannedStateRow>, WriteResolveError> {
-    let payloads = payload_maps(planned_write)?;
+    schema: Option<&LoadedAnnotationSchema>,
+    functions: SharedFunctionProvider<P>,
+) -> Result<Vec<PlannedStateRow>, WriteResolveError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
+    let payloads =
+        apply_state_insert_schema_annotations(payload_maps(planned_write)?, schema, functions)?;
     let single_row = payloads.len() == 1;
     let schema_key = resolved_schema_key(planned_write)?;
     let version_id = resolved_version_id(planned_write)?;
@@ -713,6 +733,67 @@ fn build_state_insert_rows(
     }
 
     Ok(rows)
+}
+
+fn apply_state_insert_schema_annotations<P>(
+    payloads: Vec<BTreeMap<String, Value>>,
+    schema: Option<&LoadedAnnotationSchema>,
+    functions: SharedFunctionProvider<P>,
+) -> Result<Vec<BTreeMap<String, Value>>, WriteResolveError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
+    let Some(schema) = schema else {
+        return Ok(payloads);
+    };
+
+    let mut annotated = Vec::with_capacity(payloads.len());
+    for mut payload in payloads {
+        let Some(snapshot_text) = payload.get("snapshot_content").and_then(text_from_value) else {
+            annotated.push(payload);
+            continue;
+        };
+        let JsonValue::Object(mut snapshot) = serde_json::from_str::<JsonValue>(&snapshot_text)
+            .map_err(|error| WriteResolveError {
+                message: format!(
+                    "public state insert resolver could not parse snapshot_content JSON: {error}"
+                ),
+            })?
+        else {
+            return Err(WriteResolveError {
+                message: format!(
+                    "public state insert resolver requires object snapshot_content for schema '{}'",
+                    schema.schema_key
+                ),
+            });
+        };
+
+        apply_schema_defaults(
+            &mut snapshot,
+            &schema.schema,
+            shared_runtime(),
+            functions.clone(),
+            &schema.schema_key,
+            &schema.schema_version,
+        )
+        .map_err(write_resolve_backend_error)?;
+
+        payload.insert(
+            "snapshot_content".to_string(),
+            Value::Text(
+                serde_json::to_string(&JsonValue::Object(snapshot)).map_err(|error| {
+                    WriteResolveError {
+                        message: format!(
+                            "public state insert resolver could not serialize snapshot_content: {error}"
+                        ),
+                    }
+                })?,
+            ),
+        );
+        annotated.push(payload);
+    }
+
+    Ok(annotated)
 }
 
 fn state_selector_targets_single_effective_row(planned_write: &PlannedWrite) -> bool {
@@ -813,7 +894,7 @@ async fn resolve_target_entity_rows(
         let Some(current_row) = resolve_exact_effective_state_row_with_pending_transaction_view(
             backend,
             &ExactEffectiveStateRowRequest {
-                schema_key: entity_schema.schema_key.clone(),
+                schema_key: entity_schema.annotations.schema_key.clone(),
                 version_id,
                 row_key,
                 include_global_overlay: true,
@@ -877,6 +958,25 @@ fn selector_row_version_id(
     })
 }
 
+async fn load_optional_annotation_schema(
+    provider: &mut dyn SchemaProvider,
+    planned_write: &PlannedWrite,
+) -> Result<Option<LoadedAnnotationSchema>, crate::LixError> {
+    let schema_key = resolved_schema_key(planned_write).map_err(write_resolve_to_lix_error)?;
+    let schema = if let Some(schema) = builtin_schema_definition(&schema_key) {
+        schema.clone()
+    } else {
+        match provider.load_latest_schema(&schema_key).await {
+            Ok(schema) => schema,
+            Err(error) if error.description == format!("schema '{}' is not stored", schema_key) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    load_annotation_schema_from_json(schema_key, schema).map(Some)
+}
+
 async fn load_entity_schema(
     provider: &mut dyn SchemaProvider,
     planned_write: &PlannedWrite,
@@ -887,15 +987,9 @@ async fn load_entity_schema(
     } else {
         provider.load_latest_schema(&schema_key).await?
     };
-    let schema_version = schema
-        .get("x-lix-version")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("schema '{}' is missing string x-lix-version", schema_key),
-        })?
-        .to_string();
-    let mut property_columns = schema
+    let annotations = load_annotation_schema_from_json(schema_key.clone(), schema)?;
+    let mut property_columns = annotations
+        .schema
         .get("properties")
         .and_then(JsonValue::as_object)
         .map(|properties| {
@@ -909,7 +1003,8 @@ async fn load_entity_schema(
     property_columns.sort();
     property_columns.dedup();
 
-    let primary_key_paths = schema
+    let primary_key_paths = annotations
+        .schema
         .get("x-lix-primary-key")
         .and_then(JsonValue::as_array)
         .map(|entries| {
@@ -930,41 +1025,39 @@ async fn load_entity_schema(
         .transpose()?
         .unwrap_or_default();
 
+    Ok(EntityWriteSchema {
+        annotations,
+        property_columns,
+        primary_key_paths,
+    })
+}
+
+fn load_annotation_schema_from_json(
+    schema_key: String,
+    schema: JsonValue,
+) -> Result<LoadedAnnotationSchema, crate::LixError> {
+    let schema_version = schema
+        .get("x-lix-version")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("schema '{}' is missing string x-lix-version", schema_key),
+        })?
+        .to_string();
     let mut state_defaults = BTreeMap::new();
     state_defaults.insert(
         "schema_version".to_string(),
         Value::Text(schema_version.clone()),
     );
-    if let Some(overrides) = schema
-        .get("x-lix-override-lixcols")
-        .and_then(JsonValue::as_object)
-    {
-        if overrides.contains_key("lixcol_version_id") {
-            return Err(crate::LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "schema '{}' uses removed x-lix-override-lixcols.lixcol_version_id support; use lixcol_global for global write scope",
-                    schema_key
-                ),
-            });
-        }
-        for (raw_key, expr) in overrides {
-            let Some(expr) = expr.as_str() else {
-                continue;
-            };
-            let Some(key) = entity_state_column_name(raw_key) else {
-                continue;
-            };
-            state_defaults.insert(key.to_string(), parse_literal_override(expr)?);
-        }
-    }
-
-    Ok(EntityWriteSchema {
+    state_defaults.extend(collect_state_column_overrides(
+        &schema,
+        &schema_key,
+        shared_runtime(),
+    )?);
+    Ok(LoadedAnnotationSchema {
         schema,
         schema_key,
         schema_version,
-        property_columns,
-        primary_key_paths,
         state_defaults,
     })
 }
@@ -974,6 +1067,7 @@ fn reject_unsupported_entity_overrides(
     entity_schema: &EntityWriteSchema,
 ) -> Result<(), WriteResolveError> {
     if entity_schema
+        .annotations
         .state_defaults
         .get("global")
         .and_then(bool_from_value)
@@ -989,6 +1083,7 @@ fn reject_unsupported_entity_overrides(
         }
     }
     if entity_schema
+        .annotations
         .state_defaults
         .get("untracked")
         .and_then(bool_from_value)
@@ -1029,7 +1124,7 @@ fn entity_state_row_key(
             assign_state_row_key_value(&mut row_key, key, value)?;
             continue;
         }
-        if let Some(default) = entity_schema.state_defaults.get(key) {
+        if let Some(default) = entity_schema.annotations.state_defaults.get(key) {
             assign_state_row_key_value(&mut row_key, key, default)?;
         }
     }
@@ -1061,48 +1156,11 @@ fn entity_insert_row_key(
             assign_state_row_key_value(&mut row_key, key, value)?;
             continue;
         }
-        if let Some(default) = entity_schema.state_defaults.get(key) {
+        if let Some(default) = entity_schema.annotations.state_defaults.get(key) {
             assign_state_row_key_value(&mut row_key, key, default)?;
         }
     }
     Ok(row_key)
-}
-
-fn entity_state_column_name(column: &str) -> Option<&'static str> {
-    match column.to_ascii_lowercase().as_str() {
-        "lixcol_entity_id" => Some("entity_id"),
-        "lixcol_schema_key" => Some("schema_key"),
-        "lixcol_file_id" => Some("file_id"),
-        "lixcol_plugin_key" => Some("plugin_key"),
-        "lixcol_schema_version" => Some("schema_version"),
-        "lixcol_global" => Some("global"),
-        "lixcol_writer_key" => Some("writer_key"),
-        "lixcol_untracked" => Some("untracked"),
-        "lixcol_metadata" => Some("metadata"),
-        _ => None,
-    }
-}
-
-fn parse_literal_override(expr: &str) -> Result<Value, crate::LixError> {
-    let parsed: JsonValue = serde_json::from_str(expr).map_err(|error| crate::LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("public entity resolver requires literal lixcol overrides: {error}"),
-    })?;
-    Ok(json_value_to_engine_value(&parsed))
-}
-
-fn json_value_to_engine_value(value: &JsonValue) -> Value {
-    match value {
-        JsonValue::Null => Value::Null,
-        JsonValue::Bool(value) => Value::Boolean(*value),
-        JsonValue::String(value) => Value::Text(value.clone()),
-        JsonValue::Number(number) => number
-            .as_i64()
-            .map(Value::Integer)
-            .or_else(|| number.as_f64().map(Value::Real))
-            .unwrap_or_else(|| Value::Text(number.to_string())),
-        JsonValue::Array(_) | JsonValue::Object(_) => Value::Json(value.clone()),
-    }
 }
 
 fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, crate::LixError> {

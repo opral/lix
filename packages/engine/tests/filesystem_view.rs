@@ -3882,10 +3882,7 @@ simulation_test!(
         assert_eq!(before_dir.statements[0].rows.len(), 1);
         assert_text(&before_dir.statements[0].rows[0][0], "/a/");
 
-        engine
-            .switch_version(version_b.to_string())
-            .await
-            .unwrap();
+        engine.switch_version(version_b.to_string()).await.unwrap();
 
         let after_file = engine
             .execute("SELECT path FROM lix_file WHERE id = 'switch-file'", &[])

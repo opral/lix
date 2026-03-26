@@ -1,4 +1,4 @@
-use crate::cel::CelEvaluator;
+use crate::cel::shared_runtime;
 use crate::filesystem::live_projection::{
     build_filesystem_file_projection_sql, FilesystemProjectionScope,
 };
@@ -387,7 +387,7 @@ async fn load_file_paths_for_descriptors(
          ORDER BY f.lixcol_version_id, f.id",
     );
 
-    let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
+    let preprocessed = preprocess_sql(backend, shared_runtime(), &sql, &params).await?;
     let rows = backend
         .execute(&preprocessed.sql, preprocessed.single_statement_params()?)
         .await?;

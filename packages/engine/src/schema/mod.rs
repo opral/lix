@@ -1,5 +1,5 @@
+pub(crate) mod annotations;
 pub(crate) mod builtin;
-pub(crate) mod defaults;
 mod definition;
 mod key;
 mod overlay;

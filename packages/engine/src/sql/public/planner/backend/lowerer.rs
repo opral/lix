@@ -266,7 +266,11 @@ fn build_lowered_read_query(
         .execution_context
         .requested_version_id
         .as_deref();
-    rewrite_nested_filesystem_surfaces_in_select_items(dialect, active_version_id, &mut projection)?;
+    rewrite_nested_filesystem_surfaces_in_select_items(
+        dialect,
+        active_version_id,
+        &mut projection,
+    )?;
 
     let mut selection = selection;
     if let Some(selection) = &mut selection {
@@ -548,9 +552,12 @@ fn rewrite_nested_filesystem_surfaces_in_set_expr(
     top_level: bool,
 ) -> Result<(), LixError> {
     match expr {
-        SetExpr::Select(select) => {
-            rewrite_nested_filesystem_surfaces_in_select(dialect, active_version_id, select, top_level)
-        }
+        SetExpr::Select(select) => rewrite_nested_filesystem_surfaces_in_select(
+            dialect,
+            active_version_id,
+            select,
+            top_level,
+        ),
         SetExpr::Query(query) => {
             rewrite_nested_filesystem_surfaces_in_query(dialect, active_version_id, query, false)
         }
@@ -694,14 +701,12 @@ fn rewrite_nested_filesystem_surfaces_in_table_factor(
         }
         TableFactor::NestedJoin {
             table_with_joins, ..
-        } => {
-            rewrite_nested_filesystem_surfaces_in_table_with_joins(
-                dialect,
-                active_version_id,
-                table_with_joins,
-                false,
-            )
-        }
+        } => rewrite_nested_filesystem_surfaces_in_table_with_joins(
+            dialect,
+            active_version_id,
+            table_with_joins,
+            false,
+        ),
         _ => Ok(()),
     }
 }
@@ -745,21 +750,11 @@ fn rewrite_nested_filesystem_surfaces_in_expr(
             rewrite_nested_filesystem_surfaces_in_query(dialect, active_version_id, query, false)
         }
         Expr::Exists { subquery, .. } => {
-            rewrite_nested_filesystem_surfaces_in_query(
-                dialect,
-                active_version_id,
-                subquery,
-                false,
-            )
+            rewrite_nested_filesystem_surfaces_in_query(dialect, active_version_id, subquery, false)
         }
         Expr::InSubquery { expr, subquery, .. } => {
             rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, expr)?;
-            rewrite_nested_filesystem_surfaces_in_query(
-                dialect,
-                active_version_id,
-                subquery,
-                false,
-            )
+            rewrite_nested_filesystem_surfaces_in_query(dialect, active_version_id, subquery, false)
         }
         _ => Ok(()),
     }
@@ -1188,8 +1183,8 @@ fn build_effective_live_source_sql(
         "change_id",
     ));
     let target_versions_cte = match surface_binding.descriptor.surface_variant {
-        SurfaceVariant::Default => active_target_versions_cte_sql(
-            active_version_id.ok_or_else(|| {
+        SurfaceVariant::Default => {
+            active_target_versions_cte_sql(active_version_id.ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
@@ -1197,8 +1192,8 @@ fn build_effective_live_source_sql(
                         surface_binding.descriptor.public_name
                     ),
                 )
-            })?,
-        ),
+            })?)
+        }
         SurfaceVariant::ByVersion => {
             explicit_target_versions_cte_sql(&schema_keys, &target_version_predicates)
         }
@@ -2581,11 +2576,8 @@ mod tests {
         let statement = statements.pop().expect("single statement");
         let mut execution_context = ExecutionContext::with_dialect(SqlDialect::Sqlite);
         execution_context.requested_version_id = Some("main".to_string());
-        let bound = BoundStatement::from_statement(
-            statement,
-            Vec::<Value>::new(),
-            execution_context,
-        );
+        let bound =
+            BoundStatement::from_statement(statement, Vec::<Value>::new(), execution_context);
         let structured_read = canonicalize_read(bound, registry)
             .expect("query should canonicalize")
             .into_structured_read();

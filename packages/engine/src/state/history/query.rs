@@ -349,15 +349,12 @@ fn quote_ident(value: &str) -> String {
 }
 
 fn required_active_version_id(request: &StateHistoryRequest) -> Result<&str, LixError> {
-    request
-        .active_version_id
-        .as_deref()
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "state history active-version reads require a session-requested version id",
-            )
-        })
+    request.active_version_id.as_deref().ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "state history active-version reads require a session-requested version id",
+        )
+    })
 }
 
 fn live_payload_column_name(schema_key: &str, property_name: &str) -> String {

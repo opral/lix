@@ -491,15 +491,17 @@ simulation_test!(init_creates_active_version_live_table, |sim| async move {
     sim.assert_deterministic(result.statements[0].rows.clone());
 });
 
-simulation_test!(init_does_not_seed_runtime_active_version_rows, |sim| async move {
-    let engine = sim
-        .boot_simulated_engine(None)
-        .await
-        .expect("boot_simulated_engine should succeed");
+simulation_test!(
+    init_does_not_seed_runtime_active_version_rows,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
 
-    engine.initialize().await.unwrap();
+        engine.initialize().await.unwrap();
 
-    let result = engine
+        let result = engine
         .execute(
             "SELECT COUNT(*) FROM lix_internal_live_v1_lix_active_version WHERE untracked = true",
             &[],
@@ -507,23 +509,29 @@ simulation_test!(init_does_not_seed_runtime_active_version_rows, |sim| async mov
         .await
         .unwrap();
 
-    assert_eq!(i64_value(&result.statements[0].rows[0][0], "active_version_row_count"), 0);
-});
+        assert_eq!(
+            i64_value(&result.statements[0].rows[0][0], "active_version_row_count"),
+            0
+        );
+    }
+);
 
-simulation_test!(init_does_not_seed_runtime_active_account_rows, |sim| async move {
-    let mut boot_args = support::simulation_test::SimulationBootArgs::default();
-    boot_args.active_account = Some(BootAccount {
-        id: "account-bootstrap".to_string(),
-        name: "Bootstrap Account".to_string(),
-    });
-    let engine = sim
-        .boot_simulated_engine(Some(boot_args))
-        .await
-        .expect("boot_simulated_engine should succeed");
+simulation_test!(
+    init_does_not_seed_runtime_active_account_rows,
+    |sim| async move {
+        let mut boot_args = support::simulation_test::SimulationBootArgs::default();
+        boot_args.active_account = Some(BootAccount {
+            id: "account-bootstrap".to_string(),
+            name: "Bootstrap Account".to_string(),
+        });
+        let engine = sim
+            .boot_simulated_engine(Some(boot_args))
+            .await
+            .expect("boot_simulated_engine should succeed");
 
-    engine.initialize().await.unwrap();
+        engine.initialize().await.unwrap();
 
-    let result = engine
+        let result = engine
         .execute(
             "SELECT COUNT(*) FROM lix_internal_live_v1_lix_active_account WHERE untracked = true",
             &[],
@@ -531,8 +539,12 @@ simulation_test!(init_does_not_seed_runtime_active_account_rows, |sim| async mov
         .await
         .unwrap();
 
-    assert_eq!(i64_value(&result.statements[0].rows[0][0], "active_account_row_count"), 0);
-});
+        assert_eq!(
+            i64_value(&result.statements[0].rows[0][0], "active_account_row_count"),
+            0
+        );
+    }
+);
 
 simulation_test!(init_creates_snapshot_table, |sim| async move {
     let engine = sim

@@ -270,7 +270,6 @@ impl SimulationEngine {
     }
 }
 
-
 const DEFAULT_TEST_SCHEMA_PATH: &str = "schema/default.json";
 const DEFAULT_TEST_SCHEMA_JSON: &str = r#"{
   "x-lix-key":"json_pointer",

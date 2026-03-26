@@ -409,84 +409,26 @@ mod tests {
     use crate::sql::public::planner::ir::{ExpectedHead, WriteLane};
     use crate::sql::public::planner::semantics::write_analysis::analyze_write;
     use crate::sql::public::planner::semantics::write_resolver::resolve_write_plan;
-    use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
-    use async_trait::async_trait;
-    use serde_json::to_string;
-
-    #[derive(Default)]
-    struct FakeBackend {
-        version_head_commit_id: Option<String>,
-        expected_version_id: Option<String>,
-    }
-
-    #[async_trait(?Send)]
-    impl LixBackend for FakeBackend {
-        fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
-        }
-
-        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("FROM lix_internal_change c")
-                && sql.contains("c.schema_key = 'lix_version_ref'")
-            {
-                if let Some(expected_version_id) = &self.expected_version_id {
-                    assert!(
-                        sql.contains(&format!("c.entity_id = '{}'", expected_version_id)),
-                        "unexpected version ref query: {sql}"
-                    );
-                }
-                let rows = self
-                    .version_head_commit_id
-                    .as_ref()
-                    .map(|commit_id| {
-                        vec![vec![Value::Text(
-                            to_string(&crate::schema::builtin::types::LixVersionRef {
-                                id: self
-                                    .expected_version_id
-                                    .clone()
-                                    .unwrap_or_else(|| "main".to_string()),
-                                commit_id: commit_id.clone(),
-                            })
-                            .expect("version ref JSON"),
-                        )]]
-                    })
-                    .unwrap_or_default();
-                return Ok(QueryResult {
-                    rows,
-                    columns: vec!["snapshot_content".to_string()],
-                });
-            }
-            Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            })
-        }
-
-        async fn begin_transaction(
-            &self,
-        ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
-            Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "transactions are not needed in this test backend".to_string(),
-            })
-        }
-
-        async fn begin_savepoint(
-            &self,
-            _name: &str,
-        ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
-            Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "begin_savepoint not supported in test backend",
-            ))
-        }
-    }
+    use crate::{CreateVersionOptions, Value};
 
     async fn planned_write_with_params(
         sql: &str,
         params: Vec<Value>,
-        requested_version_id: &str,
-    ) -> crate::sql::public::planner::ir::PlannedWrite {
+    ) -> (
+        crate::sql::public::planner::ir::PlannedWrite,
+        crate::test_support::InMemorySqliteBackend,
+    ) {
+        let (backend, _engine, session) = crate::test_support::boot_test_engine()
+            .await
+            .expect("test engine should boot");
+        session
+            .create_version(CreateVersionOptions {
+                id: Some("version-a".to_string()),
+                name: Some("version-a".to_string()),
+                ..CreateVersionOptions::default()
+            })
+            .await
+            .expect("test version should exist");
         let registry = SurfaceRegistry::with_builtin_surfaces();
         let mut statements = parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
@@ -494,7 +436,7 @@ mod tests {
             statement,
             params,
             ExecutionContext {
-                requested_version_id: Some(requested_version_id.to_string()),
+                requested_version_id: Some(session.active_version_id()),
                 writer_key: Some("writer-a".to_string()),
                 ..ExecutionContext::default()
             },
@@ -503,114 +445,133 @@ mod tests {
             canonicalize_write(bound, &registry).expect("write should canonicalize");
         let mut planned_write =
             analyze_write(&canonicalized).expect("write analysis should succeed");
-        let resolved_write_plan = resolve_write_plan(&FakeBackend::default(), &planned_write, None)
+        let resolved_write_plan = resolve_write_plan(&backend, &planned_write, None)
             .await
             .expect("write should resolve");
         planned_write.resolved_write_plan = Some(resolved_write_plan);
-        planned_write
+        (planned_write, backend)
     }
 
     async fn planned_write(
         sql: &str,
-        requested_version_id: &str,
-    ) -> crate::sql::public::planner::ir::PlannedWrite {
-        planned_write_with_params(sql, Vec::new(), requested_version_id).await
+    ) -> (
+        crate::sql::public::planner::ir::PlannedWrite,
+        crate::test_support::InMemorySqliteBackend,
+    ) {
+        planned_write_with_params(sql, Vec::new()).await
     }
 
-    #[tokio::test]
-    async fn builds_tracked_domain_change_batch_for_state_insert() {
-        let planned_write = planned_write(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
-             VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')",
-            "main",
-        )
-        .await;
-
-        let batches = build_domain_change_batch(&planned_write)
-            .expect("domain changes should derive")
-            .into_iter()
-            .next()
-            .expect("tracked writes should produce a batch");
-
-        assert_eq!(
-            batches.write_lane,
-            WriteLane::SingleVersion("version-a".to_string())
-        );
-        assert_eq!(batches.changes.len(), 1);
-        assert_eq!(batches.semantic_effects.len(), 1);
-        assert_eq!(batches.writer_key.as_deref(), Some("writer-a"));
-        assert_eq!(batches.changes[0].schema_version.as_deref(), Some("1"));
-        assert_eq!(batches.changes[0].file_id.as_deref(), Some("lix"));
-        assert_eq!(batches.changes[0].plugin_key.as_deref(), Some("lix"));
+    fn run_with_large_stack<F>(run: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run)
+            .expect("test thread should spawn")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     }
 
-    #[tokio::test]
-    async fn derives_commit_preconditions_against_current_head() {
-        let planned_write = planned_write(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
-             VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')",
-            "main",
-        )
-        .await;
-        let backend = FakeBackend {
-            version_head_commit_id: Some("commit-123".to_string()),
-            expected_version_id: Some("version-a".to_string()),
-        };
+    #[test]
+    fn builds_tracked_domain_change_batch_for_state_insert() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (planned_write, _backend) = planned_write(
+                        "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
+                         VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')"
+                    )
+                    .await;
 
-        let preconditions = derive_commit_preconditions(&backend, &planned_write)
-            .await
-            .expect("preconditions should derive")
-            .into_iter()
-            .next()
-            .expect("tracked writes should require commit preconditions");
+                    let batches = build_domain_change_batch(&planned_write)
+                        .expect("domain changes should derive")
+                        .into_iter()
+                        .next()
+                        .expect("tracked writes should produce a batch");
 
-        assert_eq!(
-            preconditions.write_lane,
-            WriteLane::SingleVersion("version-a".to_string())
-        );
-        assert_eq!(preconditions.expected_head, ExpectedHead::CurrentHead);
-        assert!(
-            preconditions.idempotency_key.0.contains("\"fingerprint\""),
-            "idempotency key should carry a stable payload fingerprint"
-        );
-        assert!(
-            !preconditions.idempotency_key.0.contains("commit-123"),
-            "idempotency key should no longer force a pre-read of the current head"
-        );
+                    assert_eq!(
+                        batches.write_lane,
+                        WriteLane::SingleVersion("version-a".to_string())
+                    );
+                    assert_eq!(batches.changes.len(), 1);
+                    assert_eq!(batches.semantic_effects.len(), 1);
+                    assert_eq!(batches.writer_key.as_deref(), Some("writer-a"));
+                    assert_eq!(batches.changes[0].schema_version.as_deref(), Some("1"));
+                    assert_eq!(batches.changes[0].file_id.as_deref(), Some("lix"));
+                    assert_eq!(batches.changes[0].plugin_key.as_deref(), Some("lix"));
+                })
+        });
     }
 
-    #[tokio::test]
-    async fn derives_compact_commit_preconditions_for_large_blob_payloads() {
-        let planned_write = planned_write_with_params(
-            "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
-             VALUES ($1, $2, $3, 'version-a')",
-            vec![
-                Value::Text("plugin-archive".to_string()),
-                Value::Text("/plugins/json.zip".to_string()),
-                Value::Blob(vec![7; 1024 * 1024]),
-            ],
-            "main",
-        )
-        .await;
-        let backend = FakeBackend {
-            version_head_commit_id: Some("commit-123".to_string()),
-            expected_version_id: Some("version-a".to_string()),
-        };
+    #[test]
+    fn derives_commit_preconditions_against_current_head() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (planned_write, backend) = planned_write(
+                        "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
+                         VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')"
+                    )
+                    .await;
 
-        let preconditions = derive_commit_preconditions(&backend, &planned_write)
-            .await
-            .expect("preconditions should derive")
-            .into_iter()
-            .next()
-            .expect("tracked writes should require commit preconditions");
+                    let preconditions = derive_commit_preconditions(&backend, &planned_write)
+                        .await
+                        .expect("preconditions should derive")
+                        .into_iter()
+                        .next()
+                        .expect("tracked writes should require commit preconditions");
 
-        assert!(
-            preconditions.idempotency_key.0.len() < 512,
-            "idempotency key should stay compact for large blob payloads"
-        );
-        assert!(
-            !preconditions.idempotency_key.0.contains("commit-123"),
-            "idempotency key should stay tip-independent for large payloads"
-        );
+                    assert_eq!(
+                        preconditions.write_lane,
+                        WriteLane::SingleVersion("version-a".to_string())
+                    );
+                    assert_eq!(preconditions.expected_head, ExpectedHead::CurrentHead);
+                    assert!(
+                        preconditions.idempotency_key.0.contains("\"fingerprint\""),
+                        "idempotency key should carry a stable payload fingerprint"
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn derives_compact_commit_preconditions_for_large_blob_payloads() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (planned_write, backend) = planned_write_with_params(
+                        "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
+                         VALUES ($1, $2, $3, 'version-a')",
+                        vec![
+                            Value::Text("plugin-archive".to_string()),
+                            Value::Text("/plugins/json.zip".to_string()),
+                            Value::Blob(vec![7; 1024 * 1024]),
+                        ],
+                    )
+                    .await;
+
+                    let preconditions = derive_commit_preconditions(&backend, &planned_write)
+                        .await
+                        .expect("preconditions should derive")
+                        .into_iter()
+                        .next()
+                        .expect("tracked writes should require commit preconditions");
+
+                    assert!(
+                        preconditions.idempotency_key.0.len() < 512,
+                        "idempotency key should stay compact for large blob payloads"
+                    );
+                })
+        });
     }
 }

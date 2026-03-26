@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use cel::Program;
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -8,6 +8,7 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFuncti
 use crate::LixError;
 
 use super::context::build_context_with_functions;
+use super::error::{cel_parse_error, cel_runtime_error};
 use super::value::cel_to_json;
 
 #[derive(Debug)]
@@ -46,10 +47,10 @@ impl CelEvaluator {
     {
         let compiled = self.compile(expression)?;
         let context = build_context_with_functions(variables, functions)?;
-        let value = compiled.program.execute(&context).map_err(|err| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("failed to evaluate CEL expression '{expression}': {err}"),
-        })?;
+        let value = compiled
+            .program
+            .execute(&context)
+            .map_err(|error| cel_runtime_error(expression, error))?;
         cel_to_json(&value)
     }
 
@@ -58,10 +59,8 @@ impl CelEvaluator {
             return Ok(existing);
         }
 
-        let program = Program::compile(expression).map_err(|err| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("failed to parse CEL expression '{expression}': {err}"),
-        })?;
+        let program =
+            Program::compile(expression).map_err(|error| cel_parse_error(expression, error))?;
         let compiled = Arc::new(CompiledProgram { program });
 
         self.programs
@@ -71,6 +70,11 @@ impl CelEvaluator {
 
         Ok(compiled)
     }
+}
+
+pub(crate) fn shared_runtime() -> &'static CelEvaluator {
+    static SHARED_RUNTIME: OnceLock<CelEvaluator> = OnceLock::new();
+    SHARED_RUNTIME.get_or_init(CelEvaluator::new)
 }
 
 #[cfg(test)]
@@ -152,5 +156,32 @@ mod tests {
             .evaluate("missing_var + '-slug'", &JsonMap::new())
             .expect_err("expected unknown variable error");
         assert!(err.to_string().contains("Undeclared reference"));
+    }
+
+    #[test]
+    fn production_consumers_use_shared_runtime() {
+        for (path, source) in [
+            (
+                "packages/engine/src/plugin/runtime.rs",
+                include_str!("../plugin/runtime.rs"),
+            ),
+            (
+                "packages/engine/src/sql/public/catalog/mod.rs",
+                include_str!("../sql/public/catalog/mod.rs"),
+            ),
+            (
+                "packages/engine/src/sql/public/planner/semantics/state_assignments.rs",
+                include_str!("../sql/public/planner/semantics/state_assignments.rs"),
+            ),
+            (
+                "packages/engine/src/sql/public/planner/semantics/write_resolver/state_backed_writes.rs",
+                include_str!("../sql/public/planner/semantics/write_resolver/state_backed_writes.rs"),
+            ),
+        ] {
+            assert!(
+                !source.contains("CelEvaluator::new()"),
+                "{path} should use the shared CEL runtime owner",
+            );
+        }
     }
 }
