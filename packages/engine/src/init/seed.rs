@@ -4,6 +4,8 @@ use crate::account::{
     active_account_plugin_key, active_account_schema_key, active_account_schema_version,
     active_account_snapshot_content, active_account_storage_version_id,
 };
+use crate::canonical::graph::{build_commit_generation_seed_sql, COMMIT_GRAPH_NODE_TABLE};
+use crate::canonical::readers::load_committed_version_head_commit_id_from_live_state;
 use crate::engine::{builtin_schema_entity_id, Engine, ExecuteOptions, TransactionBackendAdapter};
 use crate::errors;
 use crate::key_value::{
@@ -22,8 +24,6 @@ use crate::state::checkpoint::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot, CHECKPOINT_LABEL_ID,
     CHECKPOINT_LABEL_NAME,
 };
-use crate::canonical::graph::{build_commit_generation_seed_sql, COMMIT_GRAPH_NODE_TABLE};
-use crate::canonical::readers::load_committed_version_head_commit_id_from_live_state;
 use crate::transaction::{
     execute_parsed_statements_in_borrowed_write_transaction, BorrowedWriteTransaction,
 };
@@ -1336,7 +1336,37 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                     "normalized live layout missing child_id for lix_commit_edge",
                 )
             })?;
+        let entity_label_layout =
+            builtin_live_table_layout("lix_entity_label")?.ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "builtin schema layout missing for lix_entity_label",
+                )
+            })?;
+        let entity_label_entity_id =
+            live_column_name_for_property(&entity_label_layout, "entity_id").ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "normalized live layout missing entity_id for lix_entity_label",
+                )
+            })?;
+        let entity_label_schema_key =
+            live_column_name_for_property(&entity_label_layout, "schema_key").ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "normalized live layout missing schema_key for lix_entity_label",
+                )
+            })?;
+        let entity_label_label_id = live_column_name_for_property(&entity_label_layout, "label_id")
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "normalized live layout missing label_id for lix_entity_label",
+                )
+            })?;
         let commit_edge_table = tracked_live_table_name("lix_commit_edge");
+        let entity_label_table = tracked_live_table_name("lix_entity_label");
+        let commit_table = tracked_live_table_name("lix_commit");
         let rows = self
             .execute_internal(
                 &format!(
@@ -1358,25 +1388,28 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                      FROM reachable \
                      JOIN ( \
                        SELECT \
-                         lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
-                         lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
-                         lix_json_extract(snapshot_content, 'label_id') AS label_id \
-                       FROM lix_state_by_version \
+                         {entity_label_entity_id} AS entity_id, \
+                         {entity_label_schema_key} AS schema_key, \
+                         {entity_label_label_id} AS label_id \
+                       FROM {entity_label_table} \
                        WHERE schema_key = 'lix_entity_label' \
                          AND file_id = 'lix' \
                          AND version_id = 'global' \
-                         AND snapshot_content IS NOT NULL \
+                         AND is_tombstone = 0 \
+                         AND {entity_label_entity_id} IS NOT NULL \
+                         AND {entity_label_schema_key} IS NOT NULL \
+                         AND {entity_label_label_id} IS NOT NULL \
                      ) el \
                        ON el.entity_id = reachable.commit_id \
                       AND el.schema_key = 'lix_commit' \
                       AND el.label_id = '{checkpoint_label_id}' \
                      LEFT JOIN ( \
                        SELECT entity_id AS id, created_at \
-                       FROM lix_state_by_version \
+                       FROM {commit_table} \
                        WHERE schema_key = 'lix_commit' \
                          AND file_id = 'lix' \
                          AND version_id = 'global' \
-                         AND snapshot_content IS NOT NULL \
+                         AND is_tombstone = 0 \
                      ) c ON c.id = reachable.commit_id \
                      ORDER BY \
                        reachable.depth ASC, \
@@ -1384,6 +1417,11 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                        reachable.commit_id DESC \
                      LIMIT 1",
                     checkpoint_label_id = escape_sql_string(CHECKPOINT_LABEL_ID),
+                    entity_label_entity_id = quote_ident(&entity_label_entity_id),
+                    entity_label_schema_key = quote_ident(&entity_label_schema_key),
+                    entity_label_label_id = quote_ident(&entity_label_label_id),
+                    entity_label_table = quote_ident(&entity_label_table),
+                    commit_table = quote_ident(&commit_table),
                 )
                 .replace("__PARENT_ID__", commit_edge_parent)
                 .replace("__CHILD_ID__", commit_edge_child),

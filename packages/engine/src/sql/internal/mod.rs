@@ -150,8 +150,14 @@ where
     let mut statements = statements;
     normalize_statement_placeholders_in_batch(&mut statements)?;
     let mut provider = functions.clone();
-    prepare_rewritten_statements_with_backend(backend, statements, params, &mut provider, writer_key)
-        .await
+    prepare_rewritten_statements_with_backend(
+        backend,
+        statements,
+        params,
+        &mut provider,
+        writer_key,
+    )
+    .await
 }
 
 async fn prepare_rewritten_statements_with_backend<P>(

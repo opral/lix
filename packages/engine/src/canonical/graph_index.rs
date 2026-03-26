@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
 
+use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::live_state::{
     builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
 };
@@ -65,6 +66,30 @@ pub(crate) async fn resolve_commit_graph_node_write_rows_with_executor(
     }
 
     Ok(rows)
+}
+
+pub(crate) fn build_commit_graph_node_prepared_batch(
+    rows: &[CommitGraphNodeWriteRow],
+    dialect: SqlDialect,
+) -> Result<PreparedBatch, LixError> {
+    let mut batch = PreparedBatch { steps: Vec::new() };
+    for row in rows {
+        let bound = bind_sql(
+            "INSERT INTO lix_internal_commit_graph_node (commit_id, generation) \
+             VALUES (?1, ?2) \
+             ON CONFLICT (commit_id) DO UPDATE SET generation = excluded.generation",
+            &[
+                EngineValue::Text(row.commit_id.clone()),
+                EngineValue::Integer(row.generation),
+            ],
+            dialect,
+        )?;
+        batch.push_statement(PreparedStatement {
+            sql: bound.sql,
+            params: bound.params,
+        });
+    }
+    Ok(batch)
 }
 
 pub(crate) fn build_reachable_commits_for_root_cte_sql(

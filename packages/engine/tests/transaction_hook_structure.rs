@@ -355,3 +355,37 @@ fn transaction_runtime_uses_normal_internal_execution_not_postprocess_callbacks(
         "sql/internal/mutation_runtime.rs should be removed once internal compatibility syntax is normalization-only"
     );
 }
+
+#[test]
+fn planned_write_runner_is_split_by_apply_owner() {
+    let adapter_mod_source = read_engine_source("transaction/sql_adapter/mod.rs");
+    assert!(
+        adapter_mod_source.contains("mod tracked_apply;"),
+        "transaction/sql_adapter/mod.rs should compile a tracked_apply module"
+    );
+    assert!(
+        adapter_mod_source.contains("mod internal_apply;"),
+        "transaction/sql_adapter/mod.rs should compile an internal_apply module"
+    );
+
+    let runner_source = read_engine_source("transaction/sql_adapter/planned_write_runner.rs");
+    assert!(
+        runner_source.contains("run_public_tracked_append_txn_with_transaction("),
+        "planned_write_runner.rs should delegate tracked append apply"
+    );
+    assert!(
+        runner_source.contains("run_internal_write_txn_with_transaction("),
+        "planned_write_runner.rs should delegate internal apply"
+    );
+    for forbidden in [
+        "append_tracked_with_pending_public_session(",
+        "execute_internal_execution_with_transaction(",
+        "validate_commit_time_write(",
+        "persist_filesystem_payload_domain_changes_direct(",
+    ] {
+        assert!(
+            !runner_source.contains(forbidden),
+            "planned_write_runner.rs should not own `{forbidden}` after the split"
+        );
+    }
+}

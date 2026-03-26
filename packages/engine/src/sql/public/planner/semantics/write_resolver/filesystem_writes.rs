@@ -4,11 +4,9 @@ use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
-use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::filesystem::runtime::{
     FilesystemDescriptorState, FilesystemTransactionFileState, FilesystemTransactionState,
 };
-use crate::transaction::PendingTransactionView;
 use crate::sql::public::planner::semantics::filesystem_assignments::{
     parse_directory_insert_assignments, parse_directory_update_assignments,
     parse_file_insert_assignments, parse_file_update_assignments, DirectoryUpdateAssignments,
@@ -27,6 +25,8 @@ use crate::sql::public::planner::semantics::filesystem_queries::{
     lookup_directory_path_by_id, lookup_file_id_by_path_with_pending_transaction_view,
     DirectoryFilesystemRow, FileFilesystemRow,
 };
+use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::transaction::PendingTransactionView;
 use serde_json::json;
 use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue, ValueWithSpan};
 use std::collections::{BTreeMap, BTreeSet};

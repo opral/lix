@@ -12,7 +12,9 @@ async fn insert_schema(engine: &support::simulation_test::SimulationEngine, sche
             &format!(
                 "INSERT INTO lix_registered_schema (value) VALUES ('{}')",
                 schema.replace('\'', "''")
-            ), &[])
+            ),
+            &[],
+        )
         .await
         .unwrap();
 }

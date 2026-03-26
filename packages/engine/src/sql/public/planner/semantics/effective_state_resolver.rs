@@ -1,6 +1,5 @@
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::sql::common::dependency_spec::DependencySpec;
-use crate::transaction::PendingTransactionView;
 use crate::sql::public::planner::ir::{
     CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
 };
@@ -14,6 +13,7 @@ use crate::sql::public::services::state_reader::{
     CommitQueryExecutor, ExactCommittedStateRow, ExactCommittedStateRowRequest,
     ExactTrackedRowRequest, RawRow, RawStorage, TrackedScanRequest, TrackedTombstoneMarker,
 };
+use crate::transaction::PendingTransactionView;
 use crate::transaction::{PendingSemanticRow, PendingSemanticStorage};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value};
@@ -149,7 +149,9 @@ fn schema_set_for_read(
         schema_set.extend(
             spec.schema_keys
                 .iter()
-                .filter(|schema_key| schema_key.as_str() != "lix_active_version")
+                .filter(|schema_key| {
+                    !(schema_key.as_str() == "lix_active_version" && spec.depends_on_active_version)
+                })
                 .cloned(),
         );
     }
@@ -366,9 +368,7 @@ async fn tracked_exact_row_exists_including_tombstones(
         entity_id: request.row_key.entity_id.clone(),
         file_id: request.row_key.file_id.clone(),
     };
-    if let Some(tombstone) =
-        load_exact_tombstone(&mut executor, &exact_request).await?
-    {
+    if let Some(tombstone) = load_exact_tombstone(&mut executor, &exact_request).await? {
         return Ok(tombstone_matches_row_key(&tombstone, &request.row_key));
     }
 

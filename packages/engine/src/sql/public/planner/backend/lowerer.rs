@@ -6,11 +6,11 @@ use crate::filesystem::live_projection::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
     FilesystemProjectionScope,
 };
+use crate::live_state::shared::snapshot_sql::live_snapshot_select_expr;
 use crate::live_state::{
     builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
     untracked_live_table_name, LiveRowAccess, LiveTableLayout,
 };
-use crate::live_state::shared::snapshot_sql::live_snapshot_select_expr;
 use crate::sql::public::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::public::catalog::{
     SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,

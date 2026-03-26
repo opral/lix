@@ -2,17 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::json;
 
-use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
 use crate::canonical::types::{
     CanonicalCommitOutput, ChangeRow, DerivedCommitApplyInput, DomainChangeInput,
-    GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow,
+    GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow, VersionRefUpdate,
 };
+use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
 use crate::{CanonicalJson, LixError};
 
 const GLOBAL_VERSION: &str = "global";
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const CHANGE_SET_SCHEMA_KEY: &str = "lix_change_set";
-const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
 const CHANGE_SET_ELEMENT_SCHEMA_KEY: &str = "lix_change_set_element";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
@@ -71,7 +70,6 @@ where
 
     let commit_schema = builtin_schema_meta(COMMIT_SCHEMA_KEY)?;
     let change_set_schema = builtin_schema_meta(CHANGE_SET_SCHEMA_KEY)?;
-    let version_ref_schema = builtin_schema_meta(VERSION_REF_SCHEMA_KEY)?;
     let change_set_element_schema = builtin_schema_meta(CHANGE_SET_ELEMENT_SCHEMA_KEY)?;
     let commit_edge_schema = builtin_schema_meta(COMMIT_EDGE_SCHEMA_KEY)?;
     let change_author_schema = builtin_schema_meta(CHANGE_AUTHOR_SCHEMA_KEY)?;
@@ -82,6 +80,7 @@ where
         .map(|change| sanitize_domain_change(change))
         .collect();
     let mut live_state_rows: Vec<MaterializedStateRow> = Vec::new();
+    let mut version_ref_updates: Vec<VersionRefUpdate> = Vec::new();
 
     let mut domain_by_version: BTreeMap<String, Vec<&DomainChangeInput>> = BTreeMap::new();
     for change in &effective_domain_changes {
@@ -400,7 +399,8 @@ where
         commit_snapshot_by_version.insert(version_id.clone(), commit_snapshot);
     }
 
-    // Materialize commit rows and version_ref rows so commit views can resolve immediately.
+    // Materialize commit rows immediately and update version heads through the
+    // untracked system owner.
     for (version_id, meta) in &meta_by_version {
         let change_set_change_id = change_set_change_id_by_version
             .get(version_id)
@@ -456,32 +456,10 @@ where
             lixcol_commit_id: meta.commit_id.clone(),
             writer_key: None,
         });
-
-        live_state_rows.push(MaterializedStateRow {
-            id: generate_uuid(),
-            entity_id: expect_identity(version_id.clone(), "version_ref entity_id"),
-            schema_key: expect_identity(
-                VERSION_REF_SCHEMA_KEY.to_string(),
-                "version_ref schema_key",
-            ),
-            schema_version: expect_identity(
-                version_ref_schema.schema_version.clone(),
-                "version_ref schema_version",
-            ),
-            file_id: expect_identity(version_ref_schema.file_id.clone(), "version_ref file_id"),
-            plugin_key: expect_identity(
-                version_ref_schema.plugin_key.clone(),
-                "version_ref plugin_key",
-            ),
-            snapshot_content: Some(canonical_json(json!({
-                "id": version_id,
-                "commit_id": meta.commit_id,
-            }))?),
-            metadata: None,
+        version_ref_updates.push(VersionRefUpdate {
+            version_id: expect_identity(version_id.clone(), "version_ref version_id"),
+            commit_id: meta.commit_id.clone(),
             created_at: args.timestamp.clone(),
-            lixcol_version_id: expect_identity(GLOBAL_VERSION.to_string(), "global version id"),
-            lixcol_commit_id: meta.commit_id.clone(),
-            writer_key: None,
         });
     }
 
@@ -531,7 +509,7 @@ where
         },
         derived_apply_input: DerivedCommitApplyInput {
             live_state_rows,
-            live_layouts: BTreeMap::new(),
+            version_ref_updates,
         },
     })
 }
@@ -822,9 +800,15 @@ mod tests {
         assert_eq!(materialized_counts.get("lix_change_set_element"), Some(&1));
         assert_eq!(materialized_counts.get("lix_change_set"), Some(&1));
         assert_eq!(materialized_counts.get("lix_commit"), Some(&1));
-        assert_eq!(materialized_counts.get("lix_version_ref"), Some(&1));
         assert_eq!(materialized_counts.get("lix_commit_edge"), Some(&1));
-        assert_eq!(result.derived_apply_input.live_state_rows.len(), 7);
+        assert_eq!(result.derived_apply_input.live_state_rows.len(), 6);
+        assert_eq!(result.derived_apply_input.version_ref_updates.len(), 1);
+        assert_eq!(
+            result.derived_apply_input.version_ref_updates[0]
+                .version_id
+                .as_str(),
+            "version-main"
+        );
 
         let domain_materialized = result
             .derived_apply_input
@@ -910,16 +894,8 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(
-            result
-                .derived_apply_input
-                .live_state_rows
-                .iter()
-                .filter(|row| row.schema_key == "lix_version_ref")
-                .count(),
-            1
-        );
-        assert_eq!(result.derived_apply_input.live_state_rows.len(), 7);
+        assert_eq!(result.derived_apply_input.version_ref_updates.len(), 1);
+        assert_eq!(result.derived_apply_input.live_state_rows.len(), 6);
 
         let commit_row = result
             .canonical_output
@@ -1036,7 +1012,8 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(result.derived_apply_input.live_state_rows.len(), 16);
+        assert_eq!(result.derived_apply_input.live_state_rows.len(), 14);
+        assert_eq!(result.derived_apply_input.version_ref_updates.len(), 2);
 
         let commit_rows: Vec<_> = result
             .canonical_output
@@ -1082,16 +1059,11 @@ mod tests {
 
         let global_tip = result
             .derived_apply_input
-            .live_state_rows
+            .version_ref_updates
             .iter()
-            .find(|row| row.schema_key == "lix_version_ref" && row.entity_id == "global")
+            .find(|update| update.version_id.as_str() == "global")
             .expect("global version_ref should exist");
-        let global_tip_snapshot: serde_json::Value =
-            serde_json::from_str(global_tip.snapshot_content.as_ref().unwrap()).unwrap();
-        let global_commit_id = global_tip_snapshot["commit_id"]
-            .as_str()
-            .expect("commit_id should be string")
-            .to_string();
+        let global_commit_id = global_tip.commit_id.clone();
 
         for cse in result
             .derived_apply_input

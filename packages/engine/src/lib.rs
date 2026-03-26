@@ -36,6 +36,9 @@ pub use schema::{
 
 pub use backend::execute_auto_transactional;
 pub use backend::execute_statement_with_backend;
+pub use backend::prepared::{
+    collapse_prepared_batch_for_dialect, PreparedBatch, PreparedStatement,
+};
 pub use backend::LixBackend;
 pub use backend::LixBackendTransaction;
 pub use backend::SqlDialect;
@@ -57,9 +60,6 @@ pub use live_state::{
 };
 pub use lix::{InitResult, Lix, LixConfig};
 pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
-pub use backend::prepared::{
-    collapse_prepared_batch_for_dialect, PreparedBatch, PreparedStatement,
-};
 pub use state::checkpoint::CreateCheckpointResult;
 pub use state::image::{ImageChunkReader, ImageChunkWriter};
 pub use state::stream::{

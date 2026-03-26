@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-use crate::sql::execution::contracts::requirements::PlanRequirements;
 use crate::filesystem::runtime::{BinaryBlobWrite, FilesystemTransactionState};
+use crate::sql::execution::contracts::requirements::PlanRequirements;
 use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::Statement;
 

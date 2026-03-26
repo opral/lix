@@ -2,15 +2,15 @@ use super::*;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::builtin::builtin_schema_definition;
 use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
-use crate::transaction::PendingTransactionView;
 use crate::sql::public::planner::ir::CanonicalStateAssignments;
 use crate::sql::public::planner::ir::CanonicalStateRowKey;
 use crate::sql::public::planner::semantics::effective_state_resolver::resolve_exact_effective_state_row_with_pending_transaction_view;
 use crate::sql::public::planner::semantics::state_assignments::{
     apply_entity_state_assignments, apply_state_assignments, assignments_from_payload,
-    build_entity_insert_rows_with_functions, build_state_insert_row, ensure_identity_columns_preserved,
-    EntityAssignmentsSemantics, EntityInsertSemantics,
+    build_entity_insert_rows_with_functions, build_state_insert_row,
+    ensure_identity_columns_preserved, EntityAssignmentsSemantics, EntityInsertSemantics,
 };
+use crate::transaction::PendingTransactionView;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 

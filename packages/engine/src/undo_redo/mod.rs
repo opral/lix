@@ -5,7 +5,6 @@ mod undo;
 
 use std::collections::BTreeMap;
 
-use crate::live_state::raw::{load_exact_row_with_executor, RawStorage};
 use crate::canonical::readers::{
     load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,
     load_committed_version_head_commit_id_from_live_state,
@@ -14,6 +13,7 @@ use crate::canonical::readers::{
     ExactCommittedStateRowRequest,
 };
 use crate::canonical::ProposedDomainChange;
+use crate::live_state::raw::{load_exact_row_with_executor, RawStorage};
 use crate::state::stream::StateCommitStreamOperation;
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
@@ -152,9 +152,7 @@ where
     let mut lineage = Vec::new();
     let mut current_commit_id = Some(head_commit_id.to_string());
     while let Some(commit_id) = current_commit_id.take() {
-        let Some(commit) =
-            load_commit_lineage_entry_by_id(executor, &commit_id).await?
-        else {
+        let Some(commit) = load_commit_lineage_entry_by_id(executor, &commit_id).await? else {
             return Err(LixError::unknown(format!(
                 "commit '{}' is missing from lineage lookup",
                 commit_id
@@ -181,8 +179,7 @@ pub(crate) async fn load_target_commit_change_effects(
 ) -> Result<Vec<TargetCommitChangeEffect>, LixError> {
     let mut executor = crate::engine::TransactionBackendAdapter::new(transaction);
     let Some(target_commit) =
-        load_commit_lineage_entry_by_id(&mut executor, target_commit_id)
-            .await?
+        load_commit_lineage_entry_by_id(&mut executor, target_commit_id).await?
     else {
         return Err(LixError::unknown(format!(
             "target commit '{}' is missing",

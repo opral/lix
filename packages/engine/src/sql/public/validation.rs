@@ -15,19 +15,19 @@ use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
     SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,
 };
-use crate::sql_support::binding::bind_sql;
 use crate::sql::execution::contracts::planned_statement::{
     MutationOperation, MutationRow, UpdateValidationPlan,
 };
 use crate::sql::public::catalog::SurfaceFamily;
-use crate::sql::public::services::state_reader::{
-    is_untracked_live_table_name, load_live_row_access, load_live_row_access_for_table,
-    projected_row_snapshot_json, scan_live_rows, snapshot_json_from_row, RawRow, RawStorage,
-};
 use crate::sql::public::planner::ir::{
     InsertOnConflictAction, PlannedStateRow, PlannedWrite, ResolvedWritePlan, WriteMode,
     WriteOperationKind,
 };
+use crate::sql::public::services::state_reader::{
+    is_untracked_live_table_name, load_live_row_access, load_live_row_access_for_table,
+    projected_row_snapshot_json, scan_live_rows, snapshot_json_from_row, RawRow, RawStorage,
+};
+use crate::sql_support::binding::bind_sql;
 use crate::state::checkpoint::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME};
 use crate::{LixBackend, LixError, SqlDialect, Value};
 

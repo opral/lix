@@ -1,3 +1,5 @@
+use crate::backend::program::WriteProgram;
+use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::engine::{
     reject_internal_table_writes, reject_public_create_table, Engine, ExecuteOptions,
 };
@@ -10,10 +12,8 @@ use crate::sql::execution::execution_program::{
     execute_execution_program_with_backend, ExecutionProgram,
 };
 use crate::sql::execution::parse::parse_sql;
-use crate::backend::program_runner::execute_write_program_with_transaction;
-use crate::sql_support::text::escape_sql_string;
 use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
-use crate::backend::program::WriteProgram;
+use crate::sql_support::text::escape_sql_string;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 use sqlparser::ast::Statement;

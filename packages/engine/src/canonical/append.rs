@@ -1,16 +1,16 @@
-use crate::functions::LixFunctionProvider;
 use crate::filesystem::runtime::{
     binary_blob_writes_from_filesystem_state, FilesystemTransactionState,
 };
+use crate::functions::LixFunctionProvider;
 use crate::{LixBackendTransaction, LixError};
 
+use super::create_commit::create_commit;
 pub(crate) use super::create_commit::{
     CreateCommitAppliedOutput, CreateCommitArgs, CreateCommitDisposition, CreateCommitError,
     CreateCommitErrorKind, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
     CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitResult,
     CreateCommitWriteLane,
 };
-use super::create_commit::create_commit;
 use super::pending_session::{
     build_pending_public_commit_session, create_commit_error_to_lix_error,
     merge_public_domain_change_batch_into_pending_commit, pending_session_matches_create_commit,
@@ -55,9 +55,9 @@ pub(crate) async fn append_tracked_with_pending_public_session(
 ) -> Result<BufferedTrackedAppendOutcome, LixError> {
     if let Some(session_slot) = pending_session.as_deref_mut() {
         let can_merge = allow_pending_session_merge
-            && session_slot
-                .as_ref()
-                .is_some_and(|session| pending_session_matches_create_commit(session, &args.preconditions));
+            && session_slot.as_ref().is_some_and(|session| {
+                pending_session_matches_create_commit(session, &args.preconditions)
+            });
         if can_merge {
             let binary_blob_writes =
                 binary_blob_writes_from_filesystem_state(&args.filesystem_state);
@@ -71,9 +71,9 @@ pub(crate) async fn append_tracked_with_pending_public_session(
                     .await
                     .map_err(create_commit_error_to_lix_error)?;
             }
-            let session = session_slot
-                .as_mut()
-                .expect("pending public commit session should exist when merge preconditions match");
+            let session = session_slot.as_mut().expect(
+                "pending public commit session should exist when merge preconditions match",
+            );
             merge_public_domain_change_batch_into_pending_commit(
                 transaction,
                 session,

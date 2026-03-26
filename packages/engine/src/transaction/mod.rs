@@ -14,7 +14,9 @@ pub(crate) mod sql_adapter;
 mod write_plan;
 mod write_runner;
 
-pub use contracts::{CommitOutcome, TransactionCommitOutcome, TransactionDelta, TransactionJournal};
+pub use contracts::{
+    CommitOutcome, TransactionCommitOutcome, TransactionDelta, TransactionJournal,
+};
 pub use execution::WriteTransaction;
 pub(crate) use pending_view::PendingTransactionView;
 pub use read_context::ReadContext;

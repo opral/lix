@@ -1,4 +1,3 @@
-use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::public::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
 use crate::sql::public::core::contracts::{BoundStatement, StatementKind};
 use crate::sql::public::planner::ir::{
@@ -8,6 +7,7 @@ use crate::sql::public::planner::ir::{
     SortKey, StructuredPublicRead, WriteCommand, WriteModeRequest, WriteOperationKind,
     WriteSelector,
 };
+use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, ConflictTarget, Delete, Expr, FromTable, FunctionArg,

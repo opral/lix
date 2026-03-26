@@ -1248,7 +1248,7 @@ fn build_public_state_surface_query(
         return Ok(None);
     };
     let schema_set: BTreeSet<String> = registry
-        .registered_state_backed_schema_keys()
+        .registered_state_surface_schema_keys()
         .into_iter()
         .collect();
     if !schema_set.iter().all(|schema_key| {

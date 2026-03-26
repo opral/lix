@@ -29,10 +29,21 @@ async fn register_test_schema(engine: &SimulationEngine) {
     engine
         .execute(
             "INSERT INTO lix_registered_schema (value) VALUES (\
-             '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
+             lix_json('{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}')\
              )", &[])
         .await
         .unwrap();
+}
+
+async fn insert_version(engine: &SimulationEngine, version_id: &str) {
+    let sql = format!(
+        "INSERT INTO lix_version (\
+         id, name, hidden, commit_id\
+         ) VALUES (\
+         '{version_id}', '{version_id}', false, 'commit-{version_id}'\
+         )",
+    );
+    engine.execute(&sql, &[]).await.unwrap();
 }
 
 fn parse_json(value: &Value) -> JsonValue {
@@ -128,6 +139,35 @@ async fn matching_commit_change_set_ids(
     }
 
     matching_change_set_ids
+}
+
+async fn change_set_element_change_ids_for_change_set(
+    engine: &SimulationEngine,
+    change_set_id: &str,
+) -> BTreeSet<String> {
+    let cse_rows = engine
+        .execute(
+            "SELECT snapshot_content \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'lix_change_set_element'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let mut change_ids = BTreeSet::new();
+    for row in &cse_rows.statements[0].rows {
+        let parsed = parse_json(&row[0]);
+        if parsed["change_set_id"] != *change_set_id {
+            continue;
+        }
+        let Some(change_id) = parsed["change_id"].as_str() else {
+            continue;
+        };
+        change_ids.insert(change_id.to_string());
+    }
+
+    change_ids
 }
 
 async fn active_version_id(engine: &SimulationEngine) -> String {
@@ -358,6 +398,7 @@ simulation_test!(
 
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
+        insert_version(&engine, "version-main").await;
 
         engine
             .execute(
@@ -393,32 +434,8 @@ simulation_test!(
         assert_eq!(matching_change_set_ids.len(), 1);
         let change_set_id = &matching_change_set_ids[0];
 
-        let cse_rows = engine
-            .execute(
-                "SELECT cse.snapshot_content \
-                 FROM lix_state_by_version cse \
-                 JOIN lix_internal_change ch ON ch.id = lix_json_extract(cse.snapshot_content, 'change_id') \
-                 WHERE cse.schema_key = 'lix_change_set_element' \
-                   AND ch.schema_key = 'test_schema'", &[])
-            .await
-            .unwrap();
-
-        let cse_for_change_set = cse_rows.statements[0]
-            .rows
-            .iter()
-            .map(|row| parse_json(&row[0]))
-            .filter(|snapshot| snapshot["change_set_id"] == *change_set_id)
-            .collect::<Vec<_>>();
-
-        let cse_change_ids = cse_for_change_set
-            .iter()
-            .map(|snapshot| {
-                snapshot["change_id"]
-                    .as_str()
-                    .expect("cse change_id should be string")
-                    .to_string()
-            })
-            .collect::<BTreeSet<_>>();
+        let cse_change_ids =
+            change_set_element_change_ids_for_change_set(&engine, change_set_id).await;
         assert!(
             domain_change_ids.is_subset(&cse_change_ids),
             "expected domain change ids {:?} to be subset of change_set {:?}",
@@ -438,6 +455,7 @@ simulation_test!(
 
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
+        insert_version(&engine, "version-main").await;
 
         engine
             .execute(
@@ -478,32 +496,8 @@ simulation_test!(
         assert_eq!(matching_change_set_ids.len(), 1);
         let change_set_id = &matching_change_set_ids[0];
 
-        let cse_rows = engine
-            .execute(
-                "SELECT cse.snapshot_content \
-                 FROM lix_state_by_version cse \
-                 JOIN lix_internal_change ch ON ch.id = lix_json_extract(cse.snapshot_content, 'change_id') \
-                 WHERE cse.schema_key = 'lix_change_set_element' \
-                   AND ch.schema_key = 'test_schema'", &[])
-            .await
-            .unwrap();
-
-        let cse_for_change_set = cse_rows.statements[0]
-            .rows
-            .iter()
-            .map(|row| parse_json(&row[0]))
-            .filter(|snapshot| snapshot["change_set_id"] == *change_set_id)
-            .collect::<Vec<_>>();
-
-        let cse_change_ids = cse_for_change_set
-            .iter()
-            .map(|snapshot| {
-                snapshot["change_id"]
-                    .as_str()
-                    .expect("cse change_id should be string")
-                    .to_string()
-            })
-            .collect::<BTreeSet<_>>();
+        let cse_change_ids =
+            change_set_element_change_ids_for_change_set(&engine, change_set_id).await;
         assert!(
             domain_change_ids.is_subset(&cse_change_ids),
             "expected domain change ids {:?} to be subset of change_set {:?}",

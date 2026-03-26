@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::change_view::TrackedDomainChangeView;
-use crate::live_state::LiveTableLayout;
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
     FileId, VersionId,
@@ -119,6 +118,13 @@ pub struct MaterializedStateRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionRefUpdate {
+    pub version_id: VersionId,
+    pub commit_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalCommitOutput {
     pub changes: Vec<ChangeRow>,
 }
@@ -126,7 +132,7 @@ pub struct CanonicalCommitOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedCommitApplyInput {
     pub live_state_rows: Vec<MaterializedStateRow>,
-    pub live_layouts: BTreeMap<String, LiveTableLayout>,
+    pub version_ref_updates: Vec<VersionRefUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

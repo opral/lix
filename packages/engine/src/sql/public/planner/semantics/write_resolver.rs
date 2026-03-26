@@ -5,13 +5,6 @@ use crate::account::{
 };
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::sql::public::services::pending_reads::{
-    bootstrap_public_surface_registry_with_pending_transaction_view,
-    execute_prepared_public_read_with_pending_transaction_view,
-};
-use crate::sql::public::services::state_reader::{
-    load_exact_live_row, load_version_ref, scan_live_rows, RawStorage,
-};
 use crate::sql::public::catalog::SurfaceFamily;
 use crate::sql::public::planner::ir::{
     CanonicalStateSelector, InsertOnConflictAction, MutationPayload, PlannedStateRow, PlannedWrite,
@@ -29,6 +22,14 @@ use crate::sql::public::planner::semantics::surface_semantics::{
     public_selector_column_name, public_selector_version_column, OverlayLane,
 };
 use crate::sql::public::runtime::try_prepare_public_read_with_registry_and_internal_access;
+use crate::sql::public::services::pending_reads::{
+    bootstrap_public_surface_registry_with_pending_transaction_view,
+    execute_prepared_public_read_with_pending_transaction_view,
+};
+use crate::sql::public::services::state_reader::{
+    load_exact_live_row, load_version_ref, scan_live_rows, RawStorage,
+};
+use crate::transaction::PendingTransactionView;
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
     active_version_schema_version, active_version_snapshot_content,
@@ -38,7 +39,6 @@ use crate::version::{
     version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
     version_ref_schema_version, version_ref_snapshot_content, GLOBAL_VERSION_ID,
 };
-use crate::transaction::PendingTransactionView;
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;

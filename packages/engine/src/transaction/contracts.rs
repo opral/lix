@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
-use crate::live_state::SchemaRegistration;
 use crate::live_state::tracked::{TrackedWriteOperation, TrackedWriteRow};
 use crate::live_state::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
+use crate::live_state::SchemaRegistration;
 use crate::state::stream::StateCommitStreamChange;
 use crate::LixError;
 

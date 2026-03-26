@@ -4,7 +4,9 @@ use crate::state::stream::StateCommitStreamChange;
 use crate::{LixBackendTransaction, LixError};
 
 use super::buffered_write_state::BufferedWriteState;
-use super::contracts::{CommitOutcome, TransactionCommitOutcome, TransactionDelta, TransactionJournal};
+use super::contracts::{
+    CommitOutcome, TransactionCommitOutcome, TransactionDelta, TransactionJournal,
+};
 use super::coordinator::TransactionCoordinator;
 use super::live_state_write_state::LiveStateWriteState;
 use super::read_context::ReadContext;

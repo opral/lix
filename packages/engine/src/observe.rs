@@ -1,9 +1,9 @@
 use crate::engine::Engine;
 use crate::errors;
-use crate::sql_support::binding::parse_sql_statements;
 use crate::sql::execution::dependency_spec::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
 };
+use crate::sql_support::binding::parse_sql_statements;
 use crate::state::stream::StateCommitStream;
 use crate::wire::WireValue;
 use crate::{LixError, QueryResult, Value};

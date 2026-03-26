@@ -16,12 +16,7 @@ pub(crate) fn build_reachable_commits_for_root_cte_sql(
     start_depth: i64,
     end_depth: i64,
 ) -> String {
-    graph_build_reachable_commits_for_root_cte_sql(
-        dialect,
-        root_commit_id,
-        start_depth,
-        end_depth,
-    )
+    graph_build_reachable_commits_for_root_cte_sql(dialect, root_commit_id, start_depth, end_depth)
 }
 
 pub(crate) fn build_reachable_commits_from_requested_cte_sql(

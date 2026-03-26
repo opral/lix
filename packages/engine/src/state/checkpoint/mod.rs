@@ -1,4 +1,5 @@
 mod create_checkpoint;
+mod last_checkpoint;
 
 pub(crate) const CHECKPOINT_LABEL_ID: &str = "lix_label_checkpoint";
 pub(crate) const CHECKPOINT_LABEL_NAME: &str = "checkpoint";
@@ -18,3 +19,4 @@ pub(crate) fn checkpoint_commit_label_snapshot(commit_id: &str) -> String {
 }
 
 pub use create_checkpoint::{create_checkpoint, CreateCheckpointResult};
+pub(crate) use last_checkpoint::apply_public_version_last_checkpoint_side_effects;

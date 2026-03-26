@@ -1,8 +1,8 @@
+use crate::canonical::graph::build_reachable_commits_from_requested_cte_sql;
 use crate::live_state::{
     builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
     untracked_live_table_name,
 };
-use crate::canonical::graph::build_reachable_commits_from_requested_cte_sql;
 use crate::sql_support::text::escape_sql_string;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,

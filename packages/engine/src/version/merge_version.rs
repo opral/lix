@@ -1,21 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::engine::{Engine, EngineTransaction, TransactionBackendAdapter};
-use crate::functions::LixFunctionProvider;
-use crate::live_state::{
-    apply_live_state_scope_in_transaction, live_state_rebuild_plan_with_executor,
-    LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
+use crate::canonical::append::{
+    append_tracked, CreateCommitArgs, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
+    CreateCommitPreconditions, CreateCommitWriteLane,
 };
 use crate::canonical::readers::{
     load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,
     load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
-use crate::canonical::append::{
-    append_tracked, CreateCommitArgs, CreateCommitExpectedHead,
-    CreateCommitIdempotencyKey, CreateCommitPreconditions, CreateCommitWriteLane,
-};
 use crate::canonical::ProposedDomainChange;
+use crate::engine::{Engine, EngineTransaction, TransactionBackendAdapter};
+use crate::functions::LixFunctionProvider;
+use crate::live_state::{
+    apply_live_state_scope_in_transaction, live_state_rebuild_plan_with_executor,
+    LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
+};
 use crate::state::stream::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::{ExecuteOptions, LixError, Value};
 

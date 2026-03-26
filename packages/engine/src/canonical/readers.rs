@@ -1,15 +1,15 @@
 use crate::{LixBackend, LixError};
 
-pub(crate) use super::state_source::{
-    CommitLineageEntry, CommitQueryExecutor, CommittedCanonicalChangeRow, ExactCommittedStateRow,
-    ExactCommittedStateRowRequest,
-};
 use super::state_source::{
     load_canonical_change_row_by_id as state_source_load_canonical_change_row_by_id,
     load_commit_lineage_entry_by_id as state_source_load_commit_lineage_entry_by_id,
     load_committed_version_head_commit_id_from_live_state as state_source_load_committed_version_head_commit_id_from_live_state,
     load_exact_committed_state_row_from_commit_with_executor as state_source_load_exact_committed_state_row_from_commit_with_executor,
     load_exact_committed_state_row_from_live_state as state_source_load_exact_committed_state_row_from_live_state,
+};
+pub(crate) use super::state_source::{
+    CommitLineageEntry, CommitQueryExecutor, CommittedCanonicalChangeRow, ExactCommittedStateRow,
+    ExactCommittedStateRowRequest,
 };
 
 pub(crate) async fn load_committed_version_head_commit_id_from_live_state(
@@ -32,9 +32,7 @@ pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
     state_source_load_exact_committed_state_row_from_commit_with_executor(
-        executor,
-        commit_id,
-        request,
+        executor, commit_id, request,
     )
     .await
 }
