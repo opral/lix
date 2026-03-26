@@ -143,12 +143,7 @@ test("createVersion + switchVersion use the JS API surface", async () => {
 
 	await lix.switchVersion(created.id);
 
-	const active = await lix.execute(
-		"SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-	);
-	const activeRows = statementRows(active);
-	expect(activeRows.length).toBe(1);
-	expect(activeRows[0]?.[0]).toBe(created.id);
+	expect(await lix.activeVersionId()).toBe(created.id);
 	await lix.close();
 });
 
@@ -160,11 +155,8 @@ test("openSession snapshots the caller active version and isolates later switche
 	const worker = await lix.openSession();
 	await worker.switchVersion("global");
 
-	const workspaceActive = await lix.execute("SELECT lix_active_version_id()", []);
-	const workerActive = await worker.execute("SELECT lix_active_version_id()", []);
-
-	expect(statementRows(workspaceActive)[0]?.[0]).toBe(version.id);
-	expect(statementRows(workerActive)[0]?.[0]).toBe("global");
+	expect(await lix.activeVersionId()).toBe(version.id);
+	expect(await worker.activeVersionId()).toBe("global");
 
 	await worker.close();
 	await lix.close();
@@ -177,8 +169,7 @@ test("openSession accepts an explicit activeVersionId override", async () => {
 	const worker = await lix.openSession({
 		activeVersionId: version.id,
 	});
-	const workerActive = await worker.execute("SELECT lix_active_version_id()", []);
-	expect(statementRows(workerActive)[0]?.[0]).toBe(version.id);
+	expect(await worker.activeVersionId()).toBe(version.id);
 
 	await worker.close();
 	await lix.close();
@@ -194,18 +185,10 @@ test("openSession snapshots active accounts and allows explicit overrides", asyn
 		activeAccountIds: ["acct-override"],
 	});
 
-	const workspaceAccounts = await lix.execute("SELECT lix_active_account_ids()", []);
-	const seededAccounts = await seeded.execute("SELECT lix_active_account_ids()", []);
-	const workerAccounts = await worker.execute("SELECT lix_active_account_ids()", []);
-	const overrideAccounts = await overrideWorker.execute(
-		"SELECT lix_active_account_ids()",
-		[],
-	);
-
-	expect(statementRows(workspaceAccounts)[0]?.[0]).toBe("[]");
-	expect(statementRows(seededAccounts)[0]?.[0]).toBe('["acct-parent"]');
-	expect(statementRows(workerAccounts)[0]?.[0]).toBe('["acct-parent"]');
-	expect(statementRows(overrideAccounts)[0]?.[0]).toBe('["acct-override"]');
+	expect(await lix.activeAccountIds()).toEqual([]);
+	expect(await seeded.activeAccountIds()).toEqual(["acct-parent"]);
+	expect(await worker.activeAccountIds()).toEqual(["acct-parent"]);
+	expect(await overrideWorker.activeAccountIds()).toEqual(["acct-override"]);
 
 	await overrideWorker.close();
 	await worker.close();
@@ -223,8 +206,7 @@ test("openLix reopens on the workspace-backed active version", async () => {
 	await lix.close();
 
 	const reopened = await openLix({ backend });
-	const active = await reopened.execute("SELECT lix_active_version_id()", []);
-	expect(statementRows(active)[0]?.[0]).toBe(version.id);
+	expect(await reopened.activeVersionId()).toBe(version.id);
 
 	await reopened.close();
 });
@@ -269,16 +251,17 @@ test("createCheckpoint returns checkpoint metadata and rotates working pointer",
 	expect(checkpoint.id.length).toBeGreaterThan(0);
 	expect(checkpoint.changeSetId.length).toBeGreaterThan(0);
 
+	const activeVersionId = await lix.activeVersionId();
 	const version = await lix.execute(
-		"SELECT av.version_id, v.commit_id \
-     FROM lix_active_version av \
-     JOIN lix_version v ON v.id = av.version_id \
-     ORDER BY av.id LIMIT 1",
-		[],
+		"SELECT commit_id \
+     FROM lix_version \
+     WHERE id = ?1 \
+     LIMIT 1",
+		[activeVersionId],
 	);
 	const versionRows = statementRows(version);
 	expect(versionRows.length).toBe(1);
-	expect(versionRows[0]?.[1]).toBe(checkpoint.id);
+	expect(versionRows[0]?.[0]).toBe(checkpoint.id);
 
 	await lix.close();
 });
@@ -460,21 +443,14 @@ test("openLix defaults boot keyValues to the active version", async () => {
 			},
 		],
 	});
-	const activeVersion = await lix.execute(
-		"SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-		[],
-	);
-	const activeVersionRows = statementRows(activeVersion);
-	expect(activeVersionRows.length).toBe(1);
-	const activeVersionId = activeVersionRows[0]?.[0];
-	expect(typeof activeVersionId).toBe("string");
+	const activeVersionId = await lix.activeVersionId();
 
 	const result = await lix.execute(
 		"SELECT COUNT(*) FROM lix_key_value_by_version \
      WHERE key = ?1 \
        AND lixcol_version_id = ?2 \
        AND lixcol_global = false",
-		["boot-default-active", activeVersionId as string],
+		["boot-default-active", activeVersionId],
 	);
 	const resultRows = statementRows(result);
 	expect(resultRows.length).toBe(1);

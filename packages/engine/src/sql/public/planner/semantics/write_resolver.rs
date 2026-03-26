@@ -47,7 +47,7 @@ use sqlparser::ast::{
     SelectFlavor, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value as SqlValue,
     ValueWithSpan,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 mod filesystem_writes;
 mod state_backed_writes;
@@ -1230,12 +1230,9 @@ fn target_write_lane_for_planned_row(
 
 fn target_write_lane_for_version(
     planned_write: &PlannedWrite,
-    execution_mode: WriteMode,
+    _execution_mode: WriteMode,
     version_id: Option<&str>,
 ) -> Result<Option<WriteLane>, WriteResolveError> {
-    if execution_mode == WriteMode::Untracked {
-        return Ok(None);
-    }
     match &planned_write.scope_proof {
         ScopeProof::ActiveVersion => Ok(Some(WriteLane::ActiveVersion)),
         ScopeProof::SingleVersion(version_id) => Ok(Some(WriteLane::SingleVersion(
@@ -1352,16 +1349,134 @@ fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, W
     }
 }
 
-async fn resolved_existing_version_id(
+fn resolved_version_ids(planned_write: &PlannedWrite) -> Result<Vec<String>, WriteResolveError> {
+    match &planned_write.scope_proof {
+        ScopeProof::ActiveVersion => planned_write
+            .command
+            .execution_context
+            .requested_version_id
+            .clone()
+            .map(|version_id| vec![version_id])
+            .ok_or_else(|| WriteResolveError {
+                message:
+                    "public write resolver requires requested_version_id for ActiveVersion writes"
+                        .to_string(),
+            }),
+        ScopeProof::SingleVersion(version_id) => Ok(vec![version_id.clone()]),
+        ScopeProof::FiniteVersionSet(version_ids) if version_ids.is_empty() => {
+            Err(WriteResolveError {
+                message: "public write resolver requires a concrete version_id".to_string(),
+            })
+        }
+        ScopeProof::FiniteVersionSet(version_ids) => Ok(version_ids.iter().cloned().collect()),
+        ScopeProof::GlobalAdmin => Ok(vec![GLOBAL_VERSION_ID.to_string()]),
+        ScopeProof::Unknown | ScopeProof::Unbounded => Err(WriteResolveError {
+            message: "public write resolver requires a bounded scope proof".to_string(),
+        }),
+    }
+}
+
+pub(super) fn write_mode_request_for_insert_payload(
+    planned_write: &PlannedWrite,
+    payload: &BTreeMap<String, Value>,
+) -> WriteModeRequest {
+    match payload.get("untracked").and_then(bool_from_value) {
+        Some(true) => WriteModeRequest::ForceUntracked,
+        Some(false) => WriteModeRequest::ForceTracked,
+        None => planned_write.command.requested_mode,
+    }
+}
+
+fn surface_forces_global_write_scope(planned_write: &PlannedWrite) -> bool {
+    planned_write
+        .command
+        .target
+        .implicit_overrides
+        .predicate_overrides
+        .iter()
+        .any(|predicate| {
+            predicate.column == "global"
+                && predicate.value
+                    == crate::sql::public::catalog::SurfaceOverrideValue::Boolean(true)
+        })
+}
+
+pub(super) fn resolved_version_id_for_insert_payload(
+    planned_write: &PlannedWrite,
+    payload: &BTreeMap<String, Value>,
+) -> Result<Option<String>, WriteResolveError> {
+    if surface_forces_global_write_scope(planned_write)
+        || payload.get("global").and_then(bool_from_value) == Some(true)
+    {
+        return Ok(Some(GLOBAL_VERSION_ID.to_string()));
+    }
+
+    match planned_write.command.target.default_scope {
+        crate::sql::public::catalog::DefaultScopeSemantics::ActiveVersion => planned_write
+            .command
+            .execution_context
+            .requested_version_id
+            .clone()
+            .map(Some)
+            .ok_or_else(|| WriteResolveError {
+                message:
+                    "public write resolver requires requested_version_id for ActiveVersion writes"
+                        .to_string(),
+            }),
+        crate::sql::public::catalog::DefaultScopeSemantics::ExplicitVersion => payload
+            .get("version_id")
+            .and_then(text_from_value)
+            .map(Some)
+            .ok_or_else(|| WriteResolveError {
+                message: "public write resolver requires a concrete version_id".to_string(),
+            }),
+        crate::sql::public::catalog::DefaultScopeSemantics::GlobalAdmin => {
+            Ok(Some(GLOBAL_VERSION_ID.to_string()))
+        }
+        crate::sql::public::catalog::DefaultScopeSemantics::History
+        | crate::sql::public::catalog::DefaultScopeSemantics::WorkingChanges => {
+            Err(WriteResolveError {
+                message: "public write resolver requires a bounded scope proof".to_string(),
+            })
+        }
+    }
+}
+
+async fn resolved_existing_version_ids(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-) -> Result<Option<String>, WriteResolveError> {
-    let version_id = resolved_version_id(planned_write)?;
-    let Some(version_id) = version_id.as_deref() else {
-        return Ok(None);
-    };
-    validate_public_write_version_target(backend, version_id).await?;
-    Ok(Some(version_id.to_string()))
+) -> Result<Vec<String>, WriteResolveError> {
+    let version_ids = resolved_version_ids(planned_write)?;
+    let mut validated = BTreeSet::new();
+
+    for version_id in &version_ids {
+        if validated.insert(version_id.clone()) {
+            validate_public_write_version_target(backend, version_id).await?;
+        }
+    }
+
+    Ok(version_ids)
+}
+
+pub(super) async fn resolved_insert_version_ids(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+) -> Result<Vec<Option<String>>, WriteResolveError> {
+    let payloads = payload_maps(planned_write)?;
+    let mut validated = BTreeSet::new();
+    let mut version_ids = Vec::with_capacity(payloads.len());
+
+    for payload in &payloads {
+        let version_id = resolved_version_id_for_insert_payload(planned_write, payload)?;
+        if let Some(version_id_ref) = version_id.as_deref() {
+            if validated.insert(version_id_ref.to_string()) {
+                validate_public_write_version_target(backend, version_id_ref).await?;
+            }
+        }
+        version_ids.push(version_id);
+    }
+
+    Ok(version_ids)
 }
 
 async fn validate_public_write_version_target(

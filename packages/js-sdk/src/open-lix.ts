@@ -114,6 +114,8 @@ export type Lix = {
 		params?: ReadonlyArray<LixRuntimeValue>,
 		options?: ExecuteOptions,
 	): Promise<LixRuntimeExecuteResult>;
+	activeVersionId(): Promise<string>;
+	activeAccountIds(): Promise<string[]>;
 	observe(query: ObserveQuery): ObserveEvents;
 	createVersion(args?: CreateVersionOptions): Promise<CreateVersionResult>;
 	createCheckpoint(): Promise<CreateCheckpointResult>;
@@ -245,6 +247,40 @@ function createLixHandle(args: {
 		ensureOpen("execute");
 		const result = await runQueued(() => runExecute(sql, params, options));
 		return decodeCanonicalExecuteResult(result);
+	};
+
+	const activeVersionId = async (): Promise<string> => {
+		ensureOpen("activeVersionId");
+		if (typeof (wasmLix as any).activeVersionId !== "function") {
+			throw new Error("activeVersionId is not available in this wasm build");
+		}
+		const value = await runQueued(() => (wasmLix as any).activeVersionId());
+		if (typeof value !== "string" || value.length === 0) {
+			throw new Error("activeVersionId() must return a non-empty string");
+		}
+		return value;
+	};
+
+	const activeAccountIds = async (): Promise<string[]> => {
+		ensureOpen("activeAccountIds");
+		if (typeof (wasmLix as any).activeAccountIds !== "function") {
+			throw new Error("activeAccountIds is not available in this wasm build");
+		}
+		const value = await runQueued(() => (wasmLix as any).activeAccountIds());
+		if (!Array.isArray(value)) {
+			throw new Error("activeAccountIds() must return an array");
+		}
+		if (
+			value.some(
+				(accountId) =>
+					typeof accountId !== "string" || accountId.length === 0,
+			)
+		) {
+			throw new Error(
+				"activeAccountIds() must return an array of non-empty strings",
+			);
+		}
+		return [...value];
 	};
 
 	const observe = (query: ObserveQuery): ObserveEvents => {
@@ -547,6 +583,8 @@ function createLixHandle(args: {
 
 	return {
 		execute,
+		activeVersionId,
+		activeAccountIds,
 		observe,
 		createVersion,
 		createCheckpoint,

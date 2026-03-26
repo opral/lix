@@ -52,13 +52,14 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
 }
 
 async fn active_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
+    let version_id = engine.active_version_id().await.unwrap();
     let result = engine
         .execute(
-            "SELECT v.commit_id \
-             FROM lix_active_version av \
-             JOIN lix_version v ON v.id = av.version_id \
+            "SELECT commit_id \
+             FROM lix_version \
+             WHERE id = $1 \
              LIMIT 1",
-            &[],
+            &[Value::Text(version_id)],
         )
         .await
         .unwrap();
@@ -66,18 +67,6 @@ async fn active_commit_id(engine: &support::simulation_test::SimulationEngine) -
     match &result.statements[0].rows[0][0] {
         Value::Text(text) => text.clone(),
         other => panic!("expected commit_id text, got {other:?}"),
-    }
-}
-
-async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
-    let result = engine
-        .execute("SELECT version_id FROM lix_active_version LIMIT 1", &[])
-        .await
-        .unwrap();
-    assert_eq!(result.statements[0].rows.len(), 1);
-    match &result.statements[0].rows[0][0] {
-        Value::Text(text) => text.clone(),
-        other => panic!("expected version_id text, got {other:?}"),
     }
 }
 
@@ -102,7 +91,7 @@ simulation_test!(
             .unwrap();
 
         let commit_id = active_commit_id(&engine).await;
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let rows = engine
             .execute(
                 &format!(

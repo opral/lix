@@ -47,21 +47,6 @@ fn unique_key(prefix: &str) -> String {
     format!("{prefix}-{n}")
 }
 
-async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
-    let result = engine
-        .execute(
-            "SELECT version_id \
-             FROM lix_active_version \
-             ORDER BY id \
-             LIMIT 1",
-            &[],
-        )
-        .await
-        .expect("active version id query should succeed");
-    assert_eq!(result.statements[0].rows.len(), 1);
-    as_text(&result.statements[0].rows[0][0])
-}
-
 async fn rotate_working_commit(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
@@ -77,14 +62,17 @@ async fn rotate_working_commit(engine: &support::simulation_test::SimulationEngi
 }
 
 async fn active_version_ref(engine: &support::simulation_test::SimulationEngine) -> String {
+    let version_id = engine
+        .active_version_id()
+        .await
+        .expect("active version id query should succeed");
     let result = engine
         .execute(
-            "SELECT v.commit_id \
-             FROM lix_active_version av \
-             JOIN lix_version v ON v.id = av.version_id \
-             ORDER BY av.id \
+            "SELECT commit_id \
+             FROM lix_version \
+             WHERE id = $1 \
              LIMIT 1",
-            &[],
+            &[Value::Text(version_id)],
         )
         .await
         .expect("active version ref query should succeed");
@@ -318,10 +306,9 @@ simulation_test!(
         let tip_change_set = engine
             .execute(
                 "SELECT c.change_set_id \
-                 FROM lix_active_version av \
-                 JOIN lix_version v ON v.id = av.version_id \
+                 FROM lix_version v \
                  JOIN lix_commit c ON c.id = v.commit_id \
-                 ORDER BY av.id \
+                 WHERE v.id = lix_active_version_id() \
                  LIMIT 1",
                 &[],
             )
@@ -565,7 +552,7 @@ simulation_test!(
         let branch_key_x = unique_key("wc-view-branch-x");
         let branch_key_y = unique_key("wc-view-branch-y");
         let branch_version = unique_key("wc-view-branch-version");
-        let main_version_id = active_version_id(&engine).await;
+        let main_version_id = engine.active_version_id().await.unwrap();
 
         engine
             .create_checkpoint()

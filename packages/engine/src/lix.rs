@@ -68,6 +68,14 @@ impl Lix {
         self.session.execute(sql, params).await
     }
 
+    pub async fn active_version_id(&self) -> Result<String, LixError> {
+        Ok(self.session.active_version_id())
+    }
+
+    pub async fn active_account_ids(&self) -> Result<Vec<String>, LixError> {
+        Ok(self.session.active_account_ids())
+    }
+
     pub async fn execute_with_options(
         &self,
         sql: &str,

@@ -55,18 +55,6 @@ fn parse_available_columns_from_unknown_column_error(description: &str) -> Vec<S
         .collect()
 }
 
-async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
-    let rows = engine
-        .execute("SELECT lix_active_version_id()", &[])
-        .await
-        .unwrap();
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    match &rows.statements[0].rows[0][0] {
-        Value::Text(value) => value.clone(),
-        other => panic!("expected active version id as text, got {other:?}"),
-    }
-}
-
 async fn active_version_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let rows = engine
         .execute(
@@ -273,7 +261,7 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(before.statements[0].rows.len(), 1);
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let before_blob_hash =
             binary_blob_hash_for_file_version(&engine, "file-2", &version_id).await;
 
@@ -594,7 +582,7 @@ simulation_test!(
             .await
             .expect("insert should succeed");
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         engine
             .execute(
                 &format!(
@@ -639,7 +627,7 @@ simulation_test!(
             .await
             .expect("insert should succeed");
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let blob_hash =
             binary_blob_hash_for_file_version(&engine, "qa-manifest-only", &version_id).await;
 
@@ -697,7 +685,7 @@ simulation_test!(
             .await
             .expect("insert should succeed");
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let blob_hash =
             binary_blob_hash_for_file_version(&engine, "qa-unrecoverable", &version_id).await;
 
@@ -998,7 +986,7 @@ simulation_test!(filesystem_file_view_rejects_id_updates, |sim| async move {
         file_update_err.description
     );
 
-    let version_id = active_version_id(&engine).await;
+    let version_id = engine.active_version_id().await.unwrap();
     engine
         .execute(
             "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
@@ -1055,7 +1043,7 @@ simulation_test!(
             directory_update_err.description
         );
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         engine
         .execute(
             "INSERT INTO lix_directory_by_version (id, path, parent_id, name, lixcol_version_id) \
@@ -1166,7 +1154,7 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
         .expect("boot_simulated_engine should succeed");
     engine.initialize().await.unwrap();
 
-    let version_a = active_version_id(&engine).await;
+    let version_a = engine.active_version_id().await.unwrap();
     let version_b = "fs-version-b";
     let version_a_sql = version_a.replace('\'', "''");
     let version_b_sql = version_b.replace('\'', "''");
@@ -1286,7 +1274,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let version_sql = version_id.replace('\'', "''");
 
         engine
@@ -1332,7 +1320,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let version_sql = version_id.replace('\'', "''");
 
         engine
@@ -1396,7 +1384,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let version_sql = version_id.replace('\'', "''");
 
         engine
@@ -1465,7 +1453,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let version_sql = version_id.replace('\'', "''");
 
         engine
@@ -1531,7 +1519,7 @@ simulation_test!(file_by_version_requires_version_id, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
     engine.initialize().await.unwrap();
-    let version_id = active_version_id(&engine).await;
+    let version_id = engine.active_version_id().await.unwrap();
 
     let insert_err = engine
         .execute(
@@ -1647,7 +1635,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let version_a = active_version_id(&engine).await;
+        let version_a = engine.active_version_id().await.unwrap();
         let version_b = "dir-version-b";
         let version_a_sql = version_a.replace('\'', "''");
         let version_b_sql = version_b.replace('\'', "''");
@@ -1762,7 +1750,7 @@ simulation_test!(directory_by_version_requires_version_id, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
     engine.initialize().await.unwrap();
-    let version_id = active_version_id(&engine).await;
+    let version_id = engine.active_version_id().await.unwrap();
 
     let insert_err = engine
         .execute(
@@ -2592,7 +2580,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let parent_version_id = active_version_id(&engine).await;
+        let parent_version_id = engine.active_version_id().await.unwrap();
         let child_version_id = "directory-global-child";
         insert_version(&engine, child_version_id, &parent_version_id).await;
 
@@ -2668,7 +2656,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let parent_version_id = active_version_id(&engine).await;
+        let parent_version_id = engine.active_version_id().await.unwrap();
         let child_version_id = "file-global-child";
         insert_version(&engine, child_version_id, &parent_version_id).await;
 
@@ -2712,7 +2700,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let parent_version_id = active_version_id(&engine).await;
+        let parent_version_id = engine.active_version_id().await.unwrap();
         let child_version_id = "file-global-tombstone-child";
         insert_version(&engine, child_version_id, &parent_version_id).await;
 
@@ -3092,7 +3080,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let parent_version_id = active_version_id(&engine).await;
+        let parent_version_id = engine.active_version_id().await.unwrap();
         let child_version_id = "file-global-update-collision-child";
         insert_version(&engine, child_version_id, &parent_version_id).await;
 
@@ -3254,7 +3242,11 @@ simulation_test!(
             Value::Text(value) => value.clone(),
             other => panic!("expected file commit_id as text, got {other:?}"),
         };
-        let version_id = active_version_id(&engine).await.replace('\'', "''");
+        let version_id = engine
+            .active_version_id()
+            .await
+            .unwrap()
+            .replace('\'', "''");
         let file_descriptor_row = engine
             .execute(
                 &format!(
@@ -3316,7 +3308,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let version_id_sql = version_id.replace('\'', "''");
         let snapshot_content = serde_json::json!({
             "id": "file-path-untracked",
@@ -3465,7 +3457,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let version_id_sql = version_id.replace('\'', "''");
 
         engine
@@ -3544,7 +3536,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let version_id_sql = version_id.replace('\'', "''");
 
         engine
@@ -3712,7 +3704,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    file_path_update_ignores_materialized_row_when_untracked_tombstone_exists,
+    file_path_update_ignores_materialized_row_when_tombstone_exists,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
@@ -3728,19 +3720,15 @@ simulation_test!(
             )
             .await
             .expect("seed file should succeed");
-        let version_id = active_version_id(&engine).await.replace('\'', "''");
 
         engine
             .execute(
-                &format!(
-                    "INSERT INTO lix_state_by_version (\
-                        entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
-                     ) VALUES (\
-                        'file-tombstone-fast-path', 'lix_file_descriptor', 'lix', '{version_id}', 'lix', NULL, '1', true\
-                     )"
-                ), &[])
+                "DELETE FROM lix_file \
+                 WHERE id = 'file-tombstone-fast-path'",
+                &[],
+            )
             .await
-            .expect("seed untracked tombstone should succeed");
+            .expect("seed tombstone should succeed");
 
         engine
             .execute(
@@ -3821,7 +3809,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let version_a = active_version_id(&engine).await;
+        let version_a = engine.active_version_id().await.unwrap();
         let version_b = "filesystem-switch-version-b";
         let version_a_sql = version_a.replace('\'', "''");
         let version_b_sql = version_b.replace('\'', "''");
@@ -4002,7 +3990,11 @@ simulation_test!(
         assert_text(&file_shape_rows.statements[0].rows[0][1], "lixcol");
         assert_text(&file_shape_rows.statements[0].rows[0][2], "json");
 
-        let active_version = active_version_id(&engine).await.replace('\'', "''");
+        let active_version = engine
+            .active_version_id()
+            .await
+            .unwrap()
+            .replace('\'', "''");
         let file_by_version_shape_rows = engine
             .execute(
                 &format!(
@@ -4096,7 +4088,7 @@ simulation_test!(
         .await
         .unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let file_row = engine
             .execute(
                 "SELECT lixcol_change_id FROM lix_file WHERE id = 'change-id-file'",

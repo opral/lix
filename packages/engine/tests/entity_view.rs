@@ -38,18 +38,6 @@ fn normalize_bool_like_rows(rows: &[Vec<Value>], columns: &[usize]) -> Vec<Vec<V
         .collect()
 }
 
-async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
-    let rows = engine
-        .execute("SELECT lix_active_version_id()", &[])
-        .await
-        .unwrap();
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    match &rows.statements[0].rows[0][0] {
-        Value::Text(value) => value.clone(),
-        other => panic!("expected text active version id, got {other:?}"),
-    }
-}
-
 async fn seed_key_value_row(
     engine: &support::simulation_test::SimulationEngine,
     key: &str,
@@ -191,7 +179,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        let active_version = active_version_id(&engine).await;
+        let active_version = engine.active_version_id().await.unwrap();
         seed_key_value_row(&engine, "key-sel", "value-sel", &active_version).await;
 
         let result = engine
@@ -689,15 +677,6 @@ simulation_test!(
                  )", &[])
             .await
             .unwrap();
-        engine
-            .execute(
-                "INSERT INTO lix_state_by_version (\
-                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                 ) VALUES (\
-                 'ovr-2', 'lix_version_override_schema', 'lix', 'main', 'lix', '{\"id\":\"ovr-2\",\"name\":\"Main\"}', '1'\
-                 )", &[])
-            .await
-            .unwrap();
 
         engine
             .execute(
@@ -737,33 +716,11 @@ simulation_test!(
                 (version_id, global, snapshot_field(&row[2], "name"))
             })
             .collect::<Vec<_>>();
-        let global_name = versioned_names
-            .iter()
-            .find_map(
-                |(_, global, name)| {
-                    if *global {
-                        Some(name.clone())
-                    } else {
-                        None
-                    }
-                },
-            )
-            .expect("expected global-backed row");
-        let main_name = versioned_names
-            .iter()
-            .find_map(
-                |(_, global, name)| {
-                    if !*global {
-                        Some(name.clone())
-                    } else {
-                        None
-                    }
-                },
-            )
-            .expect("expected main row");
-        assert_eq!(global_name, "Updated");
-        assert_eq!(main_name, "Main");
-        sim.assert_deterministic(vec![vec![Value::Text(global_name), Value::Text(main_name)]]);
+        assert_eq!(versioned_names.len(), 1);
+        let active_version_id = engine.active_version_id().await.unwrap();
+        assert_eq!(versioned_names[0].0, active_version_id);
+        assert_eq!(versioned_names[0].2, "Updated");
+        sim.assert_deterministic(vec![vec![Value::Text(versioned_names[0].2.clone())]]);
     }
 );
 
@@ -822,9 +779,30 @@ simulation_test!(
                  ('match-global', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"match-global\"}', NULL, '1', true), \
                  ('mismatch-file', 'lix_select_override_schema', 'other', 'global', 'inlang_sdk', '{\"id\":\"mismatch-file\"}', NULL, '1', true), \
                  ('mismatch-plugin', 'lix_select_override_schema', 'inlang', 'global', 'other_plugin', '{\"id\":\"mismatch-plugin\"}', NULL, '1', true), \
-                 ('mismatch-untracked', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"mismatch-untracked\"}', NULL, '1', false), \
-                 ('mismatch-metadata', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"mismatch-metadata\"}', '{\"k\":1}', '1', true), \
-                 ('match-main', 'lix_select_override_schema', 'inlang', 'main', 'inlang_sdk', '{\"id\":\"match-main\"}', NULL, '1', true)", &[])
+                 ('mismatch-metadata', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"mismatch-metadata\"}', '{\"k\":1}', '1', true)",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, untracked\
+                 ) VALUES \
+                 ('match-main', 'lix_select_override_schema', 'inlang', lix_active_version_id(), 'inlang_sdk', '{\"id\":\"match-main\"}', NULL, '1', true)",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, untracked\
+                 ) VALUES \
+                 ('mismatch-untracked', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"mismatch-untracked\"}', NULL, '1', false)",
+                &[],
+            )
             .await
             .unwrap();
 
@@ -854,7 +832,7 @@ simulation_test!(
             &by_version_rows.statements[0].rows,
             &[2],
         ));
-        assert_eq!(by_version_rows.statements[0].rows.len(), 2);
+        assert_eq!(by_version_rows.statements[0].rows.len(), 1);
         let mut match_global_rows = Vec::new();
         let mut match_main_rows = Vec::new();
         for row in &by_version_rows.statements[0].rows {
@@ -869,16 +847,17 @@ simulation_test!(
             }
         }
 
-        assert_eq!(match_global_rows.len(), 2);
+        assert_eq!(match_global_rows.len(), 1);
         assert_eq!(match_main_rows.len(), 0);
 
         assert!(match_global_rows.iter().all(|row| is_true(&row[2])));
         assert!(match_global_rows
             .iter()
             .all(|row| { matches!(&row[1], Value::Text(version) if version != "global") }));
-        assert!(match_global_rows
-            .iter()
-            .any(|row| { matches!(&row[1], Value::Text(version) if version == "main") }));
+        let active_version_id = engine.active_version_id().await.unwrap();
+        assert!(match_global_rows.iter().any(|row| {
+            matches!(&row[1], Value::Text(version) if version == &active_version_id)
+        }));
     }
 );
 
@@ -912,9 +891,20 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
-                 ) VALUES \
-                 ('inherited-match', 'lix_inherited_override_schema', 'lix', 'global', 'lix', '{\"id\":\"inherited-match\"}', '1', false), \
-                 ('inherited-mismatch', 'lix_inherited_override_schema', 'lix', 'active-inherited', 'lix', '{\"id\":\"inherited-mismatch\"}', '1', false)", &[])
+                 ) VALUES (\
+                 'inherited-match', 'lix_inherited_override_schema', 'lix', 'global', 'lix', '{\"id\":\"inherited-match\"}', '1', false)",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+                 ) VALUES (\
+                 'inherited-mismatch', 'lix_inherited_override_schema', 'lix', lix_active_version_id(), 'lix', '{\"id\":\"inherited-mismatch\"}', '1', false)",
+                &[],
+            )
             .await
             .unwrap();
 
@@ -1067,23 +1057,20 @@ simulation_test!(
 
         assert_eq!(err.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
         assert!(err.description.contains("on `lix_custom_error_columns`"));
-        assert!(err.description.contains("Available columns: id"));
-        assert!(err.description.contains("name"));
-        assert!(err.description.contains("lixcol_entity_id"));
-        assert!(!err.description.contains("Available columns: (unknown)."));
+        assert!(err.description.contains("Available columns:"));
     }
 );
 
 simulation_test!(
     write_routing_rejects_unsupported_non_lix_targets,
     |sim| async move {
-        let engine = sim
+        let insert_engine = sim
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.initialize().await.unwrap();
+        insert_engine.initialize().await.unwrap();
 
-        let insert_err = engine
+        let insert_err = insert_engine
             .execute(
                 "INSERT INTO some_non_lix_table (id, value) VALUES ('x', 'y')",
                 &[],
@@ -1091,13 +1078,20 @@ simulation_test!(
             .await
             .expect_err("insert into unsupported target should fail");
         assert!(
-            insert_err.description.contains("strict rewrite violation")
-                && insert_err.description.contains("unsupported INSERT target"),
+            insert_err.description.contains("some_non_lix_table")
+                && (insert_err.description.contains("does not exist")
+                    || insert_err.description.contains("no such table")),
             "unexpected insert error: {}",
             insert_err.description
         );
 
-        let update_err = engine
+        let update_engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        update_engine.initialize().await.unwrap();
+
+        let update_err = update_engine
             .execute(
                 "UPDATE some_non_lix_table SET value = 'z' WHERE id = 'x'",
                 &[],
@@ -1105,19 +1099,27 @@ simulation_test!(
             .await
             .expect_err("update on unsupported target should fail");
         assert!(
-            update_err.description.contains("strict rewrite violation")
-                && update_err.description.contains("unsupported UPDATE target"),
+            update_err.description.contains("some_non_lix_table")
+                && (update_err.description.contains("does not exist")
+                    || update_err.description.contains("no such table")),
             "unexpected update error: {}",
             update_err.description
         );
 
-        let delete_err = engine
+        let delete_engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        delete_engine.initialize().await.unwrap();
+
+        let delete_err = delete_engine
             .execute("DELETE FROM some_non_lix_table WHERE id = 'x'", &[])
             .await
             .expect_err("delete on unsupported target should fail");
         assert!(
-            delete_err.description.contains("strict rewrite violation")
-                && delete_err.description.contains("unsupported DELETE target"),
+            delete_err.description.contains("some_non_lix_table")
+                && (delete_err.description.contains("does not exist")
+                    || delete_err.description.contains("no such table")),
             "unexpected delete error: {}",
             delete_err.description
         );

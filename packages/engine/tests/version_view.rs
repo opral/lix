@@ -565,12 +565,12 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
 
     let deleted_descriptor_rows = engine
         .execute(
-            "SELECT DISTINCT schema_key \
-             FROM lix_state_by_version \
+            "SELECT schema_key, snapshot_content \
+             FROM lix_change \
              WHERE entity_id = 'version-c' \
                AND schema_key = 'lix_version_descriptor' \
                AND snapshot_content IS NULL \
-             ORDER BY schema_key",
+             ORDER BY created_at DESC, id DESC",
             &[],
         )
         .await
@@ -580,6 +580,10 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
     assert_text(
         &deleted_descriptor_rows.statements[0].rows[0][0],
         "lix_version_descriptor",
+    );
+    assert_eq!(
+        deleted_descriptor_rows.statements[0].rows[0][1],
+        Value::Null
     );
 
     let version_ref_rows = engine

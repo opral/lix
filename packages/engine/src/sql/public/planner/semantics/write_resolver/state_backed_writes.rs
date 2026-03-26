@@ -312,18 +312,22 @@ impl StateBackedSurface<'_> {
     fn build_insert_rows<P>(
         self,
         planned_write: &PlannedWrite,
+        row_version_ids: &[Option<String>],
         functions: SharedFunctionProvider<P>,
     ) -> Result<Vec<PlannedStateRow>, WriteResolveError>
     where
         P: LixFunctionProvider + Send + 'static,
     {
         match self {
-            Self::State(schema) => {
-                build_state_insert_rows_with_functions(planned_write, schema, functions)
-            }
+            Self::State(schema) => build_state_insert_rows_with_functions(
+                planned_write,
+                row_version_ids,
+                schema,
+                functions,
+            ),
             Self::Entity(entity_schema) => build_entity_insert_rows_with_functions(
                 payload_maps(planned_write)?,
-                resolved_version_id(planned_write)?,
+                row_version_ids.to_vec(),
                 EntityInsertSemantics {
                     schema: &entity_schema.annotations.schema,
                     schema_key: &entity_schema.annotations.schema_key,
@@ -491,13 +495,19 @@ async fn resolve_state_backed_insert_write<P>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let _ = resolved_existing_version_id(backend, planned_write).await?;
-    let rows = surface.build_insert_rows(planned_write, functions)?;
+    let row_version_ids = resolved_insert_version_ids(backend, planned_write).await?;
+    let rows = surface.build_insert_rows(planned_write, &row_version_ids, functions)?;
+    let payloads = payload_maps(planned_write)?;
+    if rows.len() != payloads.len() {
+        return Err(WriteResolveError {
+            message: "public insert resolver requires one planned row per payload row".to_string(),
+        });
+    }
     let mut partitions = ResolvedWritePlanBuilder::default();
-    let default_execution_mode =
-        default_execution_mode_for_request(planned_write.command.requested_mode);
 
-    for row in rows {
+    for (row, payload) in rows.into_iter().zip(payloads.into_iter()) {
+        let row_requested_mode = write_mode_request_for_insert_payload(planned_write, &payload);
+        let default_execution_mode = default_execution_mode_for_request(row_requested_mode);
         if let Some(conflict) = planned_write.command.on_conflict.as_ref() {
             if let Some(current_row) = surface
                 .resolve_insert_conflict_row(backend, pending_transaction_view, planned_write, &row)
@@ -506,10 +516,8 @@ where
                 if conflict.action == InsertOnConflictAction::DoNothing {
                     continue;
                 }
-                let row_execution_mode = resolve_execution_mode_for_effective_row(
-                    planned_write.command.requested_mode,
-                    &current_row,
-                )?;
+                let row_execution_mode =
+                    resolve_execution_mode_for_effective_row(row_requested_mode, &current_row)?;
                 let row_ref = ResolvedRowRef {
                     entity_id: current_row.entity_id.clone(),
                     schema_key: current_row.schema_key.clone(),
@@ -562,7 +570,7 @@ async fn resolve_state_backed_existing_write(
     pending_transaction_view: Option<&PendingTransactionView>,
     surface: StateBackedSurface<'_>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let _ = resolved_existing_version_id(backend, planned_write).await?;
+    let _ = resolved_existing_version_ids(backend, planned_write).await?;
     let current_rows = match surface {
         StateBackedSurface::State(_)
             if planned_write.command.selector.exact_only
@@ -697,6 +705,7 @@ fn resolve_state_backed_existing_write_from_rows(
 
 fn build_state_insert_rows_with_functions<P>(
     planned_write: &PlannedWrite,
+    row_version_ids: &[Option<String>],
     schema: Option<&LoadedAnnotationSchema>,
     functions: SharedFunctionProvider<P>,
 ) -> Result<Vec<PlannedStateRow>, WriteResolveError>
@@ -705,12 +714,17 @@ where
 {
     let payloads =
         apply_state_insert_schema_annotations(payload_maps(planned_write)?, schema, functions)?;
+    if payloads.len() != row_version_ids.len() {
+        return Err(WriteResolveError {
+            message: "public state insert resolver requires one version target per payload row"
+                .to_string(),
+        });
+    }
     let single_row = payloads.len() == 1;
     let schema_key = resolved_schema_key(planned_write)?;
-    let version_id = resolved_version_id(planned_write)?;
     let mut rows = Vec::with_capacity(payloads.len());
 
-    for payload in payloads {
+    for (payload, version_id) in payloads.into_iter().zip(row_version_ids.iter()) {
         let entity_id = payload
             .get("entity_id")
             .and_then(text_from_value)

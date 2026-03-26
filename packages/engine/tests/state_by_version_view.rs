@@ -35,6 +35,29 @@ fn normalize_bool_like_rows(rows: &[Vec<Value>], columns: &[usize]) -> Vec<Vec<V
         .collect()
 }
 
+fn normalize_global_projection_rows(rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    if index == 1 {
+                        match value {
+                            Value::Text(actual) if actual == "version-a" => {
+                                Value::Text(actual.clone())
+                            }
+                            Value::Text(_) => Value::Text("global".to_string()),
+                            other => panic!("expected text version_id, got {other:?}"),
+                        }
+                    } else {
+                        value.clone()
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
     register_registered_schema_snapshot(
         engine,
@@ -718,6 +741,130 @@ simulation_test!(
                 .contains("lix_state_by_version insert requires version_id"),
             "unexpected error: {}",
             err.description
+        );
+    }
+);
+
+simulation_test!(
+    lix_state_by_version_insert_supports_heterogeneous_row_shapes,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        insert_version(&engine, "version-b").await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+                 ) VALUES \
+                 ('entity-tracked', 'test_state_schema', 'test-file', 'version-a', 'lix', '{\"value\":\"tracked\"}', '1', false), \
+                 ('entity-untracked', 'test_state_schema', 'test-file', 'version-b', 'lix', '{\"value\":\"untracked\"}', '1', true)",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = engine
+            .execute(
+                "SELECT entity_id, version_id, untracked, snapshot_content \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'test_state_schema' \
+                 ORDER BY entity_id",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(normalize_bool_like_rows(&rows.statements[0].rows, &[2]));
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_text(&rows.statements[0].rows[0][0], "entity-tracked");
+        assert_text(&rows.statements[0].rows[0][1], "version-a");
+        assert_boolean_like(&rows.statements[0].rows[0][2], false);
+        assert_text(&rows.statements[0].rows[0][3], "{\"value\":\"tracked\"}");
+        assert_text(&rows.statements[0].rows[1][0], "entity-untracked");
+        assert_text(&rows.statements[0].rows[1][1], "version-b");
+        assert_boolean_like(&rows.statements[0].rows[1][2], true);
+        assert_text(&rows.statements[0].rows[1][3], "{\"value\":\"untracked\"}");
+    }
+);
+
+simulation_test!(
+    lix_state_by_version_insert_supports_global_local_and_tracked_rows_together,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+                 ) VALUES \
+                 ('entity-global-untracked', 'test_state_schema', 'test-file', 'global', 'lix', '{\"value\":\"global-untracked\"}', '1', true), \
+                 ('entity-local-untracked', 'test_state_schema', 'test-file', 'version-a', 'lix', '{\"value\":\"local-untracked\"}', '1', true), \
+                 ('entity-global-tracked', 'test_state_schema', 'test-file', 'global', 'lix', '{\"value\":\"global-tracked\"}', '1', false)",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = engine
+            .execute(
+                "SELECT entity_id, version_id, untracked \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'test_state_schema' \
+                 ORDER BY entity_id",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let normalized = normalize_global_projection_rows(&normalize_bool_like_rows(
+            &rows.statements[0].rows,
+            &[2],
+        ));
+        sim.assert_deterministic(normalized.clone());
+        assert_eq!(normalized.len(), 5);
+        assert_eq!(
+            normalized,
+            vec![
+                vec![
+                    Value::Text("entity-global-tracked".to_string()),
+                    Value::Text("global".to_string()),
+                    Value::Boolean(false),
+                ],
+                vec![
+                    Value::Text("entity-global-tracked".to_string()),
+                    Value::Text("version-a".to_string()),
+                    Value::Boolean(false),
+                ],
+                vec![
+                    Value::Text("entity-global-untracked".to_string()),
+                    Value::Text("global".to_string()),
+                    Value::Boolean(true),
+                ],
+                vec![
+                    Value::Text("entity-global-untracked".to_string()),
+                    Value::Text("version-a".to_string()),
+                    Value::Boolean(true),
+                ],
+                vec![
+                    Value::Text("entity-local-untracked".to_string()),
+                    Value::Text("version-a".to_string()),
+                    Value::Boolean(true),
+                ],
+            ]
         );
     }
 );

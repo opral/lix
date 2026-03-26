@@ -180,10 +180,9 @@ async fn register_plugin_schema(engine: &support::simulation_test::SimulationEng
 async fn active_version_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let rows = engine
         .execute(
-            "SELECT v.commit_id \
-             FROM lix_version v \
-             JOIN lix_active_version av ON av.version_id = v.id \
-             ORDER BY av.id \
+            "SELECT commit_id \
+             FROM lix_version \
+             WHERE id = lix_active_version_id() \
              LIMIT 1",
             &[],
         )
@@ -193,21 +192,6 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
     match &rows.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected active version commit id text, got {other:?}"),
-    }
-}
-
-async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
-    let rows = engine
-        .execute(
-            "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-            &[],
-        )
-        .await
-        .expect("active version query should succeed");
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    match &rows.statements[0].rows[0][0] {
-        Value::Text(value) => value.clone(),
-        other => panic!("expected active version id text, got {other:?}"),
     }
 }
 
@@ -1402,7 +1386,7 @@ simulation_test!(
             )
             .await
             .expect("file insert should succeed");
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let root_commit_id = active_version_commit_id(&engine).await;
 
         let active_rows = engine
@@ -1464,7 +1448,7 @@ simulation_test!(
             )
             .await
             .expect("file insert should succeed");
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let root_commit_id = active_version_commit_id(&engine).await;
 
         let select_star = engine

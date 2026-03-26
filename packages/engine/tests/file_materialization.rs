@@ -411,18 +411,6 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
     }
 }
 
-async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
-    let rows = engine
-        .execute("SELECT lix_active_version_id()", &[])
-        .await
-        .expect("active version query should succeed");
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    match &rows.statements[0].rows[0][0] {
-        Value::Text(value) => value.clone(),
-        other => panic!("expected active version id text, got {other:?}"),
-    }
-}
-
 #[cfg(any())]
 async fn boot_engine_with_json_plugin(
     sim: &support::simulation_test::SimulationArgs,
@@ -2323,7 +2311,7 @@ mod legacy_plugin_and_cache_tests {
         simulations = [sqlite, postgres],
         |sim| async move {
             let engine = boot_engine_with_before_aware_plugin(&sim).await;
-            let active_version_id = active_version_id(&engine).await;
+            let active_version_id = engine.active_version_id().await.unwrap();
 
             engine
             .execute(
@@ -2681,7 +2669,7 @@ mod legacy_plugin_and_cache_tests {
                 .await
                 .expect("file update after active-version switch should succeed");
 
-            assert_eq!(active_version_id(&engine).await, version_b);
+            assert_eq!(engine.active_version_id().await.unwrap(), version_b);
 
             let rows = engine
                 .execute(

@@ -196,6 +196,21 @@ export type LixObserveEvents = {
             execute_result_to_js(result).map_err(js_error)
         }
 
+        #[wasm_bindgen(js_name = activeVersionId)]
+        pub async fn active_version_id(&self) -> Result<String, JsValue> {
+            self.lix.active_version_id().await.map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = activeAccountIds)]
+        pub async fn active_account_ids(&self) -> Result<JsValue, JsValue> {
+            let account_ids = self.lix.active_account_ids().await.map_err(js_error)?;
+            let values = Array::new();
+            for account_id in account_ids {
+                values.push(&JsValue::from_str(&account_id));
+            }
+            Ok(values.into())
+        }
+
         #[wasm_bindgen(js_name = installPlugin)]
         pub async fn install_plugin(&self, archive_bytes: Uint8Array) -> Result<(), JsValue> {
             let mut bytes = vec![0u8; archive_bytes.length() as usize];

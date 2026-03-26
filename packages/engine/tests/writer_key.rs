@@ -24,21 +24,6 @@ fn assert_null(value: &Value) {
     }
 }
 
-async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
-    let rows = engine
-        .execute(
-            "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-            &[],
-        )
-        .await
-        .unwrap();
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    match &rows.statements[0].rows[0][0] {
-        Value::Text(value) => value.clone(),
-        other => panic!("expected active version id as text, got {other:?}"),
-    }
-}
-
 async fn register_writer_key_test_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .register_schema(&json!({
@@ -66,7 +51,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
         register_writer_key_test_schema(&engine).await;
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
 
         engine
             .execute_with_options(
@@ -195,7 +180,7 @@ simulation_test!(
         assert_eq!(file_row.statements[0].rows.len(), 1);
         assert_text(&file_row.statements[0].rows[0][0], "editor:single");
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let state_row = engine
             .execute(
                 &format!(
@@ -249,7 +234,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let rows = engine
             .execute(
                 &format!(
@@ -298,13 +283,14 @@ simulation_test!(
                 "UPDATE lix_state_by_version \
                  SET metadata = '{\"source\":\"update\"}' \
                  WHERE schema_key = 'lix_file_descriptor' \
-                   AND entity_id = 'wk-clear-update'",
+                   AND entity_id = 'wk-clear-update' \
+                   AND version_id = lix_active_version_id()",
                 &[],
             )
             .await
             .unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let state_row = engine
             .execute(
                 &format!(
@@ -349,7 +335,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let tombstone = engine
             .execute(
                 &format!(
@@ -487,13 +473,14 @@ simulation_test!(
                 "UPDATE lix_state_by_version \
                  SET writer_key = 'editor:explicit-update' \
                  WHERE schema_key = 'lix_file_descriptor' \
-                   AND entity_id = 'wk-update-writer'",
+                   AND entity_id = 'wk-update-writer' \
+                   AND version_id = lix_active_version_id()",
                 &[],
             )
             .await
             .unwrap();
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         let state_row = engine
             .execute(
                 &format!(
@@ -526,7 +513,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
         register_writer_key_test_schema(&engine).await;
 
-        let version_id = active_version_id(&engine).await;
+        let version_id = engine.active_version_id().await.unwrap();
         engine
             .execute_with_options(
                 &format!(

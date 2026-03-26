@@ -25,7 +25,7 @@ simulation_test!(allows_valid_snapshot, |sim| async move {
                 "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Ada\"}', '1'\
+             'entity-1', 'test_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Ada\"}', '1'\
              )", &[])
             .await;
 
@@ -34,7 +34,7 @@ simulation_test!(allows_valid_snapshot, |sim| async move {
     let stored = engine
             .execute(
                 "SELECT snapshot_content FROM lix_state_by_version \
-             WHERE schema_key = 'test_schema' AND entity_id = 'entity-1' AND file_id = 'file-1' AND version_id = 'version-1'", &[])
+             WHERE schema_key = 'test_schema' AND entity_id = 'entity-1' AND file_id = 'file-1' AND version_id = lix_active_version_id()", &[])
             .await
             .unwrap();
 
@@ -67,7 +67,7 @@ simulation_test!(rejects_invalid_snapshot, |sim| async move {
                 "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"missing\":\"field\"}', '1'\
+             'entity-1', 'test_schema', 'file-1', lix_active_version_id(), 'lix', '{\"missing\":\"field\"}', '1'\
              )", &[])
             .await;
 
@@ -92,7 +92,7 @@ simulation_test!(requires_registered_schema, |sim| async move {
                 "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
-             'entity-1', 'missing_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Ada\"}', '1'\
+             'entity-1', 'missing_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Ada\"}', '1'\
              )", &[])
             .await;
 
@@ -127,7 +127,7 @@ simulation_test!(rejects_invalid_update, |sim| async move {
                 "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Ada\"}', '1'\
+             'entity-1', 'test_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Ada\"}', '1'\
              )", &[])
             .await
             .unwrap();
@@ -135,7 +135,7 @@ simulation_test!(rejects_invalid_update, |sim| async move {
     let result = engine
             .execute(
                 "UPDATE lix_state_by_version SET snapshot_content = '{\"missing\":\"field\"}' \
-             WHERE entity_id = 'entity-1' AND schema_key = 'test_schema' AND file_id = 'file-1' AND version_id = 'version-1'", &[])
+             WHERE entity_id = 'entity-1' AND schema_key = 'test_schema' AND file_id = 'file-1' AND version_id = lix_active_version_id()", &[])
             .await;
 
     let err = result.expect_err("expected validation error");
@@ -169,7 +169,7 @@ simulation_test!(rejects_update_on_immutable_schema, |sim| async move {
                 "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
-             'entity-1', 'immutable_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Ada\"}', '1'\
+             'entity-1', 'immutable_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Ada\"}', '1'\
              )", &[])
             .await
             .unwrap();
@@ -177,7 +177,7 @@ simulation_test!(rejects_update_on_immutable_schema, |sim| async move {
     let result = engine
             .execute(
                 "UPDATE lix_state_by_version SET snapshot_content = '{\"name\":\"Grace\"}' \
-             WHERE entity_id = 'entity-1' AND schema_key = 'immutable_schema' AND file_id = 'file-1' AND version_id = 'version-1'", &[])
+             WHERE entity_id = 'entity-1' AND schema_key = 'immutable_schema' AND file_id = 'file-1' AND version_id = lix_active_version_id()", &[])
             .await;
 
     let err = result.expect_err("expected immutability error");
@@ -211,7 +211,7 @@ simulation_test!(allows_delete_on_immutable_schema, |sim| async move {
                 "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
-             'entity-1', 'immutable_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Ada\"}', '1'\
+             'entity-1', 'immutable_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Ada\"}', '1'\
              )", &[])
             .await
             .unwrap();
@@ -219,7 +219,7 @@ simulation_test!(allows_delete_on_immutable_schema, |sim| async move {
     let result = engine
             .execute(
                 "DELETE FROM lix_state_by_version \
-             WHERE entity_id = 'entity-1' AND schema_key = 'immutable_schema' AND file_id = 'file-1' AND version_id = 'version-1'", &[])
+             WHERE entity_id = 'entity-1' AND schema_key = 'immutable_schema' AND file_id = 'file-1' AND version_id = lix_active_version_id()", &[])
             .await;
 
     assert!(result.is_ok(), "{result:?}");
@@ -231,12 +231,28 @@ simulation_test!(allows_delete_on_immutable_schema, |sim| async move {
              WHERE schema_key = 'immutable_schema' \
                AND entity_id = 'entity-1' \
                AND file_id = 'file-1' \
-               AND version_id = 'version-1'",
+               AND version_id = lix_active_version_id()",
             &[],
         )
         .await
         .unwrap();
 
-    assert_eq!(stored.statements[0].rows.len(), 1);
-    assert_eq!(stored.statements[0].rows[0][0], Value::Null);
+    assert_eq!(stored.statements[0].rows.len(), 0);
+
+    let deleted_rows = engine
+        .execute(
+            "SELECT snapshot_content \
+             FROM lix_change \
+             WHERE schema_key = 'immutable_schema' \
+               AND entity_id = 'entity-1' \
+               AND file_id = 'file-1' \
+               AND snapshot_content IS NULL \
+             ORDER BY created_at DESC, id DESC",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(deleted_rows.statements[0].rows.len(), 1);
+    assert_eq!(deleted_rows.statements[0].rows[0][0], Value::Null);
 });
