@@ -1,4 +1,6 @@
 mod support;
+#[path = "support/wasmtime_runtime.rs"]
+mod wasmtime_runtime;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -199,7 +201,7 @@ async fn boot_engine_with_json_plugin(
     sim: &support::simulation_test::SimulationArgs,
 ) -> support::simulation_test::SimulationEngine {
     let runtime = Arc::new(
-        support::wasmtime_runtime::TestWasmtimeRuntime::new()
+        wasmtime_runtime::TestWasmtimeRuntime::new()
             .expect("test wasmtime runtime should initialize"),
     ) as Arc<dyn WasmRuntime>;
 

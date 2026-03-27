@@ -10,3 +10,6 @@ members = [
   "packages/cli",
 ]
 exclude = ["packages/plugin-json-v2"]
+
+[profile.test]
+debug = 1
