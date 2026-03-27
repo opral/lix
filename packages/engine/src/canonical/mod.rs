@@ -9,6 +9,6 @@ mod graph_index;
 pub(crate) mod history;
 pub(crate) mod pending_session;
 pub(crate) mod readers;
-mod state_source;
+pub(crate) mod state_source;
 mod types;
 pub(crate) use types::ProposedDomainChange;

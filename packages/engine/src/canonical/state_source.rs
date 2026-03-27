@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::errors::classification::is_missing_relation_error;
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::roots::load_version_ref_with_executor;
+use crate::live_state::schema_access::load_schema_read_contract_with_executor;
 use crate::live_state::{
-    load_live_schema_access_with_executor, scan_tracked_rows_with_executor,
-    scan_untracked_rows_with_executor,
+    scan_tracked_rows_with_executor, scan_untracked_rows_with_executor,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value, VersionId};
@@ -139,7 +139,7 @@ pub(crate) async fn load_exact_committed_state_row_from_live_state_with_executor
     executor: &mut dyn CommitQueryExecutor,
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    let access = load_live_schema_access_with_executor(executor, &request.schema_key).await?;
+    let access = load_schema_read_contract_with_executor(executor, &request.schema_key).await?;
     let mut constraints = vec![ScanConstraint {
         field: ScanField::EntityId,
         operator: ScanOperator::Eq(Value::Text(request.entity_id.clone())),
@@ -374,7 +374,7 @@ pub(crate) async fn load_commit_lineage_entry_by_id(
     executor: &mut dyn CommitQueryExecutor,
     commit_id: &str,
 ) -> Result<Option<CommitLineageEntry>, LixError> {
-    let access = load_live_schema_access_with_executor(executor, "lix_commit").await?;
+    let access = load_schema_read_contract_with_executor(executor, "lix_commit").await?;
     let constraints = vec![
         ScanConstraint {
             field: ScanField::EntityId,

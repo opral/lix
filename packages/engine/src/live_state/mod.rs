@@ -13,8 +13,17 @@ pub mod constraints;
 pub mod effective;
 mod lifecycle;
 mod materialize;
+pub(crate) mod commit_graph_queries;
+pub(crate) mod bootstrap_seed;
+pub(crate) mod bootstrap_tables;
+pub(crate) mod create_commit_queries;
+pub(crate) mod filesystem_projection;
+pub(crate) mod filesystem_queries;
+pub(crate) mod key_value_queries;
+pub(crate) mod pending_reads;
 pub(crate) mod raw;
 pub mod roots;
+pub(crate) mod schema_access;
 pub mod session;
 pub(crate) mod shared;
 mod storage;
@@ -24,7 +33,7 @@ pub mod untracked;
 use crate::backend::QueryExecutor;
 use crate::schema::schema_from_registered_snapshot;
 use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
-use crate::{LixBackend, LixBackendTransaction, LixError, SqlDialect, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError};
 use serde_json::Value as JsonValue;
 
 pub use lifecycle::{CanonicalWatermark, LiveStateMode, LiveStateReadiness};
@@ -46,54 +55,6 @@ pub struct SchemaRegistration {
 impl From<&str> for SchemaRegistration {
     fn from(schema_key: &str) -> Self {
         Self::new(schema_key)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LiveSchemaColumn {
-    pub(crate) property_name: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct LiveSchemaAccess {
-    access: storage::LiveRowAccess,
-    columns: Vec<LiveSchemaColumn>,
-}
-
-impl LiveSchemaAccess {
-    pub(crate) fn raw_access(&self) -> &storage::LiveRowAccess {
-        &self.access
-    }
-
-    pub(crate) fn columns(&self) -> &[LiveSchemaColumn] {
-        &self.columns
-    }
-
-    pub(crate) fn normalized_projection_sql(&self, table_alias: Option<&str>) -> String {
-        self.access.normalized_projection_sql(table_alias)
-    }
-
-    pub(crate) fn normalized_values(
-        &self,
-        snapshot_content: Option<&str>,
-    ) -> Result<std::collections::BTreeMap<String, Value>, LixError> {
-        live_schema_normalized_values(self.access.layout().schema_key.as_str(), None, snapshot_content)
-    }
-
-    pub(crate) fn snapshot_json_from_values(
-        &self,
-        schema_key: &str,
-        values: &std::collections::BTreeMap<String, Value>,
-    ) -> Result<JsonValue, LixError> {
-        snapshot_json_from_values(&self.access, schema_key, values)
-    }
-
-    pub(crate) fn snapshot_text_from_values(
-        &self,
-        schema_key: &str,
-        values: &std::collections::BTreeMap<String, Value>,
-    ) -> Result<String, LixError> {
-        snapshot_text_from_values(&self.access, schema_key, values)
     }
 }
 
@@ -376,144 +337,9 @@ pub(crate) fn snapshot_text_from_values(
     )
 }
 
-pub(crate) async fn load_live_schema_access_with_backend(
-    backend: &dyn LixBackend,
-    schema_key: &str,
-) -> Result<LiveSchemaAccess, LixError> {
-    storage::load_live_row_access_with_backend(backend, schema_key)
-        .await
-        .map(live_schema_access_from_storage)
-}
-
-pub(crate) async fn load_live_schema_access_with_executor(
-    executor: &mut dyn QueryExecutor,
-    schema_key: &str,
-) -> Result<LiveSchemaAccess, LixError> {
-    storage::load_live_row_access_with_executor(executor, schema_key)
-        .await
-        .map(live_schema_access_from_storage)
-}
-
-pub(crate) async fn load_live_schema_access_for_table_name(
-    backend: &dyn LixBackend,
-    table_name: &str,
-) -> Result<Option<LiveSchemaAccess>, LixError> {
-    storage::load_live_row_access_for_table_name(backend, table_name)
-        .await
-        .map(|access| access.map(live_schema_access_from_storage))
-}
-
-pub(crate) fn live_relation_name(schema_key: &str) -> String {
-    storage::tracked_live_table_name(schema_key)
-}
-
-pub(crate) fn live_schema_payload_column_name(
-    schema_key: &str,
-    schema_definition: Option<&JsonValue>,
-    property_name: &str,
-) -> Result<String, LixError> {
-    let layout = live_schema_layout(schema_key, schema_definition)?;
-    storage::live_column_name_for_property(&layout, property_name)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "live schema '{}' does not include property '{}'",
-                    schema_key, property_name
-                ),
-            )
-        })
-}
-
-pub(crate) fn live_schema_normalized_projection_sql(
-    schema_key: &str,
-    schema_definition: Option<&JsonValue>,
-    table_alias: Option<&str>,
-) -> Result<String, LixError> {
-    Ok(storage::LiveRowAccess::new(live_schema_layout(schema_key, schema_definition)?)
-        .normalized_projection_sql(table_alias))
-}
-
-#[cfg(test)]
-pub(crate) fn live_schema_column_names(
-    schema_key: &str,
-    schema_definition: Option<&JsonValue>,
-) -> Result<Vec<String>, LixError> {
-    Ok(live_schema_layout(schema_key, schema_definition)?
-        .columns
-        .into_iter()
-        .map(|column| column.column_name)
-        .collect())
-}
-
-pub(crate) fn live_schema_snapshot_select_expr(
-    schema_key: &str,
-    schema_definition: Option<&JsonValue>,
-    dialect: SqlDialect,
-    table_alias: Option<&str>,
-) -> Result<String, LixError> {
-    Ok(shared::snapshot_sql::live_snapshot_select_expr(
-        &live_schema_layout(schema_key, schema_definition)?,
-        dialect,
-        table_alias,
-    ))
-}
-
-pub(crate) fn live_schema_normalized_values(
-    schema_key: &str,
-    schema_definition: Option<&JsonValue>,
-    snapshot_content: Option<&str>,
-) -> Result<std::collections::BTreeMap<String, Value>, LixError> {
-    storage::normalized_live_column_values(
-        &live_schema_layout(schema_key, schema_definition)?,
-        snapshot_content,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn live_schema_snapshot_text_from_values(
-    schema_key: &str,
-    schema_definition: Option<&JsonValue>,
-    values: &std::collections::BTreeMap<String, Value>,
-) -> Result<String, LixError> {
-    let access = storage::LiveRowAccess::new(live_schema_layout(schema_key, schema_definition)?);
-    snapshot_text_from_values(&access, schema_key, values)
-}
-
-fn live_schema_layout(
-    schema_key: &str,
-    schema_definition: Option<&JsonValue>,
-) -> Result<storage::LiveTableLayout, LixError> {
-    if let Some(schema_definition) = schema_definition {
-        return storage::live_table_layout_from_schema(schema_definition);
-    }
-    storage::builtin_live_table_layout(schema_key)?.ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("missing live schema definition for '{}'", schema_key),
-        )
-    })
-}
-
-fn live_schema_access_from_storage(access: storage::LiveRowAccess) -> LiveSchemaAccess {
-    LiveSchemaAccess {
-        columns: access
-            .columns()
-            .iter()
-            .map(|column| LiveSchemaColumn {
-                property_name: column.property_name.clone(),
-            })
-            .collect(),
-        access,
-    }
-}
-
 #[cfg(test)]
 pub(crate) use lifecycle::LIVE_STATE_SCHEMA_EPOCH;
-pub(crate) use storage::{
-    is_untracked_live_table, logical_snapshot_from_projected_row,
-};
+pub(crate) use storage::is_untracked_live_table;
 
 pub(crate) fn coalesce_live_table_requirements(
     requirements: &[SchemaLiveTableRequirement],

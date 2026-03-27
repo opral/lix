@@ -3,9 +3,9 @@ use crate::filesystem::live_projection::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
     FilesystemProjectionScope,
 };
-use crate::live_state::{
-    live_relation_name, live_schema_normalized_projection_sql, live_schema_payload_column_name,
-    live_schema_snapshot_select_expr,
+use crate::live_state::schema_access::{
+    normalized_projection_sql_for_schema, payload_column_name_for_schema,
+    snapshot_select_expr_for_schema, tracked_relation_name,
 };
 use crate::sql::public::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::public::catalog::{
@@ -1018,8 +1018,8 @@ fn build_state_source_query(
 }
 
 fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError> {
-    let version_descriptor_table = live_relation_name("lix_version_descriptor");
-    let version_ref_table = live_relation_name("lix_version_ref");
+    let version_descriptor_table = tracked_relation_name("lix_version_descriptor");
+    let version_ref_table = tracked_relation_name("lix_version_ref");
     let version_descriptor_name_column = quote_ident(&builtin_payload_column_name(
         version_descriptor_schema_key(),
         "name",
@@ -1170,8 +1170,8 @@ fn build_effective_live_source_sql(
 
     let (target_version_predicates, source_predicates) =
         split_effective_state_pushdown_predicates(pushdown_predicates);
-    let commit_table = live_relation_name("lix_commit");
-    let cse_table = live_relation_name("lix_change_set_element");
+    let commit_table = tracked_relation_name("lix_commit");
+    let cse_table = tracked_relation_name("lix_change_set_element");
     let commit_change_set_id_column =
         quote_ident(&builtin_payload_column_name("lix_commit", "change_set_id"));
     let cse_change_set_id_column = quote_ident(&builtin_payload_column_name(
@@ -1269,7 +1269,7 @@ fn explicit_target_versions_cte_sql(
     schema_keys: &[String],
     target_version_predicates: &[String],
 ) -> String {
-    let version_descriptor_table = live_relation_name("lix_version_descriptor");
+    let version_descriptor_table = tracked_relation_name("lix_version_descriptor");
     let version_descriptor_hidden_column = quote_ident(&builtin_payload_column_name(
         version_descriptor_schema_key(),
         "hidden",
@@ -1297,7 +1297,7 @@ fn explicit_target_versions_cte_sql(
                  FROM {table_name} \
                  WHERE version_id <> '{global_version}' \
                    AND untracked = false",
-                table_name = quote_ident(&live_relation_name(schema_key)),
+                table_name = quote_ident(&tracked_relation_name(schema_key)),
                 global_version = escape_sql_string(GLOBAL_VERSION_ID),
             )
         })
@@ -1307,7 +1307,7 @@ fn explicit_target_versions_cte_sql(
                  FROM {table_name} \
                  WHERE version_id <> '{global_version}' \
                    AND untracked = true",
-                table_name = quote_ident(&live_relation_name(schema_key)),
+                table_name = quote_ident(&tracked_relation_name(schema_key)),
                 global_version = escape_sql_string(GLOBAL_VERSION_ID),
             )
         }))
@@ -1365,9 +1365,9 @@ fn effective_state_schema_winner_rows_sql(
     schema_keys
         .iter()
         .map(|schema_key| {
-            let table_name = quote_ident(&live_relation_name(schema_key));
-            let untracked_table = quote_ident(&live_relation_name(schema_key));
-            let tracked_full_projection = live_schema_normalized_projection_sql(
+            let table_name = quote_ident(&tracked_relation_name(schema_key));
+            let untracked_table = quote_ident(&tracked_relation_name(schema_key));
+            let tracked_full_projection = normalized_projection_sql_for_schema(
                 schema_key,
                 known_live_layouts.get(schema_key),
                 Some("t"),
@@ -1378,7 +1378,7 @@ fn effective_state_schema_winner_rows_sql(
                     error.description
                 )
             });
-            let untracked_full_projection = live_schema_normalized_projection_sql(
+            let untracked_full_projection = normalized_projection_sql_for_schema(
                 schema_key,
                 known_live_layouts.get(schema_key),
                 Some("u"),
@@ -1400,7 +1400,7 @@ fn effective_state_schema_winner_rows_sql(
             let final_snapshot_projection = if include_snapshot_content {
                 format!(
                     "{} AS snapshot_content, ",
-                    live_schema_snapshot_select_expr(
+                    snapshot_select_expr_for_schema(
                         schema_key,
                         known_live_layouts.get(schema_key),
                         dialect,
@@ -1562,7 +1562,7 @@ fn effective_state_schema_winner_rows_sql(
                    AND ranked.is_tombstone = 0",
                 final_snapshot_projection = final_snapshot_projection,
                 ranked_payload_projection = ranked_payload_projection,
-                normalized_ranked_projection = live_schema_normalized_projection_sql(
+                normalized_ranked_projection = normalized_projection_sql_for_schema(
                     schema_key,
                     known_live_layouts.get(schema_key),
                     Some("c"),
@@ -1615,7 +1615,7 @@ fn quote_ident(value: &str) -> String {
 }
 
 fn builtin_payload_column_name(schema_key: &str, property_name: &str) -> String {
-    live_schema_payload_column_name(schema_key, None, property_name).unwrap_or_else(|error| {
+    payload_column_name_for_schema(schema_key, None, property_name).unwrap_or_else(|error| {
         panic!(
             "builtin live schema '{schema_key}' must include '{property_name}': {}",
             error.description
@@ -1766,7 +1766,7 @@ fn render_live_payload_column_expr(
     public_column: &str,
 ) -> String {
     let Ok(column_name) =
-        live_schema_payload_column_name(schema_key, schema_definition, public_column)
+        payload_column_name_for_schema(schema_key, schema_definition, public_column)
     else {
         return "NULL".to_string();
     };
@@ -1806,10 +1806,10 @@ fn build_change_source_query() -> Result<Query, LixError> {
 }
 
 fn build_working_changes_source_query(active_version_id: &str) -> Result<Query, LixError> {
-    let version_ref_table = live_relation_name("lix_version_ref");
-    let commit_tracked_table = live_relation_name("lix_commit");
-    let cse_tracked_table = live_relation_name("lix_change_set_element");
-    let commit_edge_table = live_relation_name("lix_commit_edge");
+    let version_ref_table = tracked_relation_name("lix_version_ref");
+    let commit_tracked_table = tracked_relation_name("lix_commit");
+    let cse_tracked_table = tracked_relation_name("lix_change_set_element");
+    let commit_edge_table = tracked_relation_name("lix_commit_edge");
     let version_ref_commit_id_column = quote_ident(&builtin_payload_column_name(
         version_ref_schema_key(),
         "commit_id",
@@ -2211,14 +2211,14 @@ fn build_working_changes_source_query(active_version_id: &str) -> Result<Query, 
         version_ref_commit_id_column = version_ref_commit_id_column,
         commit_change_set_id_column = commit_change_set_id_column,
         commit_tracked_table = commit_tracked_table,
-        commit_untracked_table = quote_ident(&live_relation_name("lix_commit")),
+        commit_untracked_table = quote_ident(&tracked_relation_name("lix_commit")),
         cse_change_set_id_column = cse_change_set_id_column,
         cse_change_id_column = cse_change_id_column,
         cse_entity_id_column = cse_entity_id_column,
         cse_schema_key_column = cse_schema_key_column,
         cse_file_id_column = cse_file_id_column,
         cse_tracked_table = cse_tracked_table,
-        cse_untracked_table = quote_ident(&live_relation_name("lix_change_set_element")),
+        cse_untracked_table = quote_ident(&tracked_relation_name("lix_change_set_element")),
         commit_edge_table = commit_edge_table,
         commit_edge_parent_id_column = commit_edge_parent_id_column,
         commit_edge_child_id_column = commit_edge_child_id_column,
