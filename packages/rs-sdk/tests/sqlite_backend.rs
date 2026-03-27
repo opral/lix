@@ -203,3 +203,74 @@ async fn sqlite_backend_rejects_nested_deferred_transaction_mode() {
         .await
         .expect("outer rollback should succeed");
 }
+
+#[tokio::test]
+async fn sqlite_backend_rejects_nested_write_transaction_mode() {
+    let backend = SqliteBackend::in_memory().expect("in-memory backend should initialize");
+
+    backend
+        .execute("BEGIN IMMEDIATE TRANSACTION", &[])
+        .await
+        .expect("outer write transaction should succeed");
+
+    let error = match backend.begin_transaction(TransactionMode::Write).await {
+        Ok(_) => panic!("nested write transaction should be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .description
+            .contains("use begin_savepoint(...) for nested write scopes"),
+        "unexpected nested write error: {}",
+        error.description
+    );
+
+    backend
+        .execute("ROLLBACK", &[])
+        .await
+        .expect("outer rollback should succeed");
+}
+
+#[tokio::test]
+async fn sqlite_backend_explicit_savepoint_supports_nested_write_scope() {
+    let backend = SqliteBackend::in_memory().expect("in-memory backend should initialize");
+
+    backend
+        .execute("CREATE TABLE savepoint_test (id TEXT PRIMARY KEY)", &[])
+        .await
+        .expect("schema setup should succeed");
+    backend
+        .execute("BEGIN IMMEDIATE TRANSACTION", &[])
+        .await
+        .expect("outer write transaction should succeed");
+
+    let mut savepoint = backend
+        .begin_savepoint("nested_write")
+        .await
+        .expect("explicit savepoint should succeed");
+    savepoint
+        .execute(
+            "INSERT INTO savepoint_test (id) VALUES ('savepoint-row')",
+            &[],
+        )
+        .await
+        .expect("insert inside savepoint should succeed");
+    savepoint
+        .commit()
+        .await
+        .expect("savepoint release should succeed");
+
+    backend
+        .execute("COMMIT", &[])
+        .await
+        .expect("outer commit should succeed");
+
+    let rows = backend
+        .execute(
+            "SELECT COUNT(*) FROM savepoint_test WHERE id = 'savepoint-row'",
+            &[],
+        )
+        .await
+        .expect("verification query should succeed");
+    assert_eq!(rows.rows[0][0], Value::Integer(1));
+}

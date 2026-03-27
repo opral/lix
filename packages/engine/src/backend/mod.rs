@@ -4,7 +4,7 @@ pub(crate) mod program_runner;
 
 use async_trait::async_trait;
 
-use crate::backend::prepared::{PreparedBatch, PreparedStatement};
+use crate::backend::prepared::PreparedBatch;
 use crate::{ImageChunkReader, ImageChunkWriter, LixError, QueryResult, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,30 +91,6 @@ pub trait LixBackend: Send + Sync {
     }
 }
 
-/// Utility: execute a single statement wrapped in a transaction.
-///
-/// Useful for backends (e.g. test/pool backends) that want auto-transactional
-/// execute() behavior. Production backends like SqliteBackend should NOT use
-/// this — they execute directly on the connection.
-pub async fn execute_auto_transactional(
-    backend: &dyn LixBackend,
-    sql: &str,
-    params: &[Value],
-) -> Result<QueryResult, LixError> {
-    let mut transaction = backend.begin_transaction(TransactionMode::Deferred).await?;
-    let result = transaction.execute(sql, params).await;
-    match result {
-        Ok(result) => {
-            transaction.commit().await?;
-            Ok(result)
-        }
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            Err(error)
-        }
-    }
-}
-
 #[async_trait(?Send)]
 pub(crate) trait QueryExecutor {
     fn dialect(&self) -> SqlDialect;
@@ -183,22 +159,4 @@ pub trait LixBackendTransaction {
     async fn commit(self: Box<Self>) -> Result<(), LixError>;
 
     async fn rollback(self: Box<Self>) -> Result<(), LixError>;
-}
-
-pub async fn execute_statement_with_backend(
-    backend: &dyn LixBackend,
-    statement: PreparedStatement,
-) -> Result<QueryResult, LixError> {
-    let mut transaction = backend.begin_transaction(TransactionMode::Deferred).await?;
-    let result = transaction.execute(&statement.sql, &statement.params).await;
-    match result {
-        Ok(result) => {
-            transaction.commit().await?;
-            Ok(result)
-        }
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            Err(error)
-        }
-    }
 }

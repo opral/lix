@@ -1,7 +1,5 @@
-use crate::live_state::{CanonicalWatermark, SchemaRegistration};
+use crate::live_state::{CanonicalWatermark, SchemaRegistration, SchemaRegistrationSet};
 use crate::{LixBackendTransaction, LixError};
-
-use super::contracts::SchemaRegistrationSet;
 
 pub(crate) struct TransactionCoordinator<'a> {
     backend_txn: Option<Box<dyn LixBackendTransaction + 'a>>,
