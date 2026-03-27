@@ -136,7 +136,7 @@ where
             !write_transaction.buffered_write_journal_is_empty()
                 && !metadata.has_materialization_plan
         }
-        BufferedWriteExecutionRoute::PublicReadMaterializedState => {
+        BufferedWriteExecutionRoute::PublicReadCommitted => {
             !write_transaction.buffered_write_journal_is_empty()
         }
         BufferedWriteExecutionRoute::Other => false,

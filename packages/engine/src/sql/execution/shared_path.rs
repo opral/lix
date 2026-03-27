@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use crate::engine::Engine;
 use crate::functions::SharedFunctionProvider;
 use crate::sql::public::runtime::{
@@ -13,8 +11,11 @@ use crate::sql::public::runtime::{
 use crate::sql::public::validation::{
     validate_batch_local_write, validate_inserts, validate_updates,
 };
-use crate::{LixBackend, LixError, QueryResult, Value};
+use crate::{LixBackend, LixError, Value};
 
+use crate::sql::execution::compiled::{
+    CompiledExecution, CompiledExecutionBody, CompiledInternalExecution,
+};
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::contracts::planned_statement::PlannedStatementSet;
 use crate::sql::execution::contracts::requirements::PlanRequirements;
@@ -29,10 +30,6 @@ use crate::sql::execution::intent::{
 };
 use crate::sql::execution::preprocess::preprocess_with_surfaces_to_plan;
 use crate::sql::execution::runtime_state::ExecutionRuntimeState;
-use crate::transaction::sql_adapter::{
-    CompiledExecution, CompiledExecutionBody, CompiledExecutionStep, CompiledInternalExecution,
-    SqlExecutionOutcome,
-};
 use crate::transaction::PendingTransactionView;
 use sqlparser::ast::Statement;
 
@@ -404,7 +401,7 @@ async fn prepare_public_execution_for_compile(
     Ok(prepared)
 }
 
-pub(crate) async fn compile_execution_step_from_template_instance_with_backend(
+pub(crate) async fn compile_execution_from_template_instance_with_backend(
     engine: &Engine,
     backend: &dyn LixBackend,
     pending_transaction_view: Option<&PendingTransactionView>,
@@ -416,8 +413,8 @@ pub(crate) async fn compile_execution_step_from_template_instance_with_backend(
     public_surface_registry_override: Option<&crate::sql::public::catalog::SurfaceRegistry>,
     runtime_state: Option<&ExecutionRuntimeState>,
     policy: PreparationPolicy,
-) -> Result<CompiledExecutionStep, LixError> {
-    let prepared = compile_execution_with_backend(
+) -> Result<CompiledExecution, LixError> {
+    compile_execution_with_backend(
         engine,
         backend,
         pending_transaction_view,
@@ -435,8 +432,7 @@ pub(crate) async fn compile_execution_step_from_template_instance_with_backend(
             plan_requirements: Some(template_instance.plan_requirements()),
         },
     )
-    .await?;
-    CompiledExecutionStep::compile(prepared, writer_key)
+    .await
 }
 
 fn derived_public_execution_intent(
@@ -559,19 +555,5 @@ mod tests {
         let statements =
             parse_sql_statements("SELECT * FROM lix_file WHERE id = 'f1'").expect("parse");
         assert_eq!(top_level_write_target_name(&statements[0]), None);
-    }
-}
-
-pub(crate) fn empty_public_write_execution_outcome() -> SqlExecutionOutcome {
-    SqlExecutionOutcome {
-        public_result: QueryResult {
-            rows: Vec::new(),
-            columns: Vec::new(),
-        },
-        internal_write_file_cache_targets: BTreeSet::new(),
-        plugin_changes_committed: false,
-        plan_effects_override: Some(PlanEffects::default()),
-        state_commit_stream_changes: Vec::new(),
-        observe_tick_emitted: false,
     }
 }

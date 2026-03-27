@@ -153,7 +153,7 @@ fn read_history_orchestrates_live_roots_through_the_owned_boundary() {
 
 #[test]
 fn filesystem_history_consumes_committed_history_via_read_models() {
-    let source = read_engine_source("filesystem/history/query.rs");
+    let source = read_engine_source("filesystem/history/mod.rs");
     assert!(
         source.contains("crate::read::models::"),
         "filesystem history should consume committed history through read::models"

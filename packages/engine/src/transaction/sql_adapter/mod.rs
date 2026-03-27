@@ -20,7 +20,6 @@ pub(crate) use crate::sql::execution::contracts::effects::{
 pub(crate) use crate::sql::execution::contracts::planned_statement::MutationRow;
 pub(crate) use crate::sql::execution::contracts::result_contract::ResultContract;
 pub(crate) use crate::sql::execution::execution_program::ExecutionContext;
-pub(crate) use crate::sql::execution::shared_path::empty_public_write_execution_outcome;
 pub(crate) use crate::sql::public::planner::ir::{
     OptionalTextPatch, PlannedStateRow, WriteLane, WriteMode,
 };
@@ -46,7 +45,7 @@ pub(crate) use planned_write::{
 };
 pub(crate) use planned_write_runner::execute_planned_write_delta;
 pub(crate) use runtime::{
-    execute_compiled_execution_step_with_transaction, execute_internal_execution_with_transaction,
-    CompiledExecution, CompiledExecutionBody, CompiledExecutionRoute, CompiledExecutionStep,
-    CompiledExecutionStepResult, CompiledInternalExecution, SqlExecutionOutcome,
+    empty_public_write_execution_outcome, execute_compiled_execution_step_with_transaction,
+    execute_internal_execution_with_transaction, CompiledExecutionRoute, CompiledExecutionStep,
+    CompiledExecutionStepResult, SqlExecutionOutcome,
 };

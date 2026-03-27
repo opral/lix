@@ -1,3 +1,4 @@
+pub(crate) mod compiled;
 pub(crate) mod contracts;
 pub(crate) mod dependency_spec;
 pub(crate) mod derive_effects;

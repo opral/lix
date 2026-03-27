@@ -1,6 +1,7 @@
 use crate::engine::{DeferredTransactionSideEffects, Engine, TransactionBackendAdapter};
 use crate::filesystem::runtime::merge_filesystem_transaction_state;
-use crate::read::contracts::CommittedReadMode;
+use crate::read::contracts::PublicReadExecutionMode;
+use crate::sql::execution::compiled::CompiledExecution;
 use crate::sql::execution::execution_program::ExecutionContext;
 use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
 use crate::sql::public::catalog::SurfaceRegistry;
@@ -9,14 +10,13 @@ use crate::sql::public::runtime::{
     PublicWriteExecutionPartition,
 };
 use crate::sql::public::services::pending_reads::{
-    bootstrap_public_surface_registry_with_pending_transaction_view,
-    prepared_public_read_transaction_mode,
+    bootstrap_public_surface_registry_with_pending_transaction_view, public_read_execution_mode,
 };
 use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError};
 
 use super::compile::SqlBufferedWriteCommand;
-use super::{CompiledExecution, CompiledExecutionRoute, SqlExecutionOutcome};
+use super::{CompiledExecutionRoute, SqlExecutionOutcome};
 use crate::transaction::commands::{
     BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteExecutionRoute,
 };
@@ -33,11 +33,11 @@ pub(super) fn command_metadata(
         CompiledExecutionRoute::Internal(_) => BufferedWriteExecutionRoute::Internal,
         CompiledExecutionRoute::PublicRead(public_read)
             if matches!(
-                prepared_public_read_transaction_mode(public_read),
-                CommittedReadMode::MaterializedState
+                public_read_execution_mode(public_read),
+                PublicReadExecutionMode::Committed(_)
             ) =>
         {
-            BufferedWriteExecutionRoute::PublicReadMaterializedState
+            BufferedWriteExecutionRoute::PublicReadCommitted
         }
         CompiledExecutionRoute::PublicRead(_)
         | CompiledExecutionRoute::PlannedWriteDelta(_)
