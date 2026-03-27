@@ -22,7 +22,7 @@ use crate::sql::public::planner::ir::{
     InsertOnConflictAction, PlannedStateRow, PlannedWrite, ResolvedWritePlan, WriteMode,
     WriteOperationKind,
 };
-use crate::live_state::LiveSchemaAccess;
+use crate::live_state::schema_access::LiveReadContract;
 use crate::sql::public::services::state_reader::{
     is_untracked_live_table_name, live_storage_relation_exists, load_live_row_access,
     load_live_row_access_for_table, projected_row_snapshot_json, scan_live_rows,
@@ -1743,7 +1743,7 @@ async fn query_committed_schema_version_rows(
 fn committed_row_from_raw(
     schema_key: &str,
     version_id: &str,
-    access: &LiveSchemaAccess,
+    access: &LiveReadContract,
     row: LiveReadRow,
 ) -> Result<ConstraintCommittedRow, LixError> {
     Ok(ConstraintCommittedRow {

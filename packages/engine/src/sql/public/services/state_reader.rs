@@ -9,6 +9,11 @@ pub(crate) use crate::canonical::readers::{
 };
 use crate::live_state::roots::load_version_ref_with_backend;
 pub(crate) use crate::live_state::roots::VersionRefRow;
+use crate::live_state::schema_access::{
+    logical_snapshot_from_projected_row_with_contract,
+    live_storage_relation_exists_with_backend, load_schema_read_contract_for_table_name,
+    load_schema_read_contract_with_backend, LiveReadContract,
+};
 use crate::live_state::tracked::{
     load_exact_row_with_backend as load_exact_tracked_row_with_backend,
     scan_rows_with_backend as scan_tracked_rows_with_backend,
@@ -25,11 +30,8 @@ use crate::live_state::untracked::{
     scan_rows_with_backend as scan_untracked_rows_with_backend,
     scan_rows_with_executor as scan_untracked_rows_with_executor, UntrackedRow,
 };
-use crate::live_state::{
-    is_untracked_live_table, live_relation_name, load_live_schema_access_for_table_name,
-    load_live_schema_access_with_backend, logical_snapshot_from_projected_row, LiveSchemaAccess,
-};
-use crate::{LixBackend, LixError, SqlDialect, Value};
+use crate::live_state::is_untracked_live_table;
+use crate::{LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiveStorageLane {
@@ -276,39 +278,39 @@ pub(crate) async fn scan_tombstones(
 pub(crate) async fn load_live_row_access(
     backend: &dyn LixBackend,
     schema_key: &str,
-) -> Result<LiveSchemaAccess, LixError> {
-    load_live_schema_access_with_backend(backend, schema_key).await
+) -> Result<LiveReadContract, LixError> {
+    load_schema_read_contract_with_backend(backend, schema_key).await
 }
 
 pub(crate) async fn load_live_row_access_for_table(
     backend: &dyn LixBackend,
     table_name: &str,
-) -> Result<Option<LiveSchemaAccess>, LixError> {
-    load_live_schema_access_for_table_name(backend, table_name).await
+) -> Result<Option<LiveReadContract>, LixError> {
+    load_schema_read_contract_for_table_name(backend, table_name).await
 }
 
 pub(crate) fn normalized_values_from_snapshot(
-    access: &LiveSchemaAccess,
+    access: &LiveReadContract,
     snapshot_content: Option<&str>,
 ) -> Result<std::collections::BTreeMap<String, Value>, LixError> {
     access.normalized_values(snapshot_content)
 }
 
 pub(crate) fn projected_row_snapshot_json(
-    access: Option<&LiveSchemaAccess>,
+    access: Option<&LiveReadContract>,
     schema_key: &str,
     row: &[Value],
     first_projected_column: usize,
     raw_snapshot_index: usize,
 ) -> Result<serde_json::Value, LixError> {
-    logical_snapshot_from_projected_row(
-        access.map(|access| access.raw_access()),
+    logical_snapshot_from_projected_row_with_contract(
+        access,
         schema_key,
         row,
         first_projected_column,
         raw_snapshot_index,
     )
-    .and_then(|value| {
+    .and_then(|value: Option<serde_json::Value>| {
         value.ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -322,14 +324,14 @@ pub(crate) fn projected_row_snapshot_json(
 }
 
 pub(crate) fn snapshot_json_from_row(
-    access: &LiveSchemaAccess,
+    access: &LiveReadContract,
     row: &LiveReadRow,
 ) -> Result<serde_json::Value, LixError> {
     access.snapshot_json_from_values(row.schema_key(), row.values())
 }
 
 pub(crate) fn snapshot_text_from_row(
-    access: &LiveSchemaAccess,
+    access: &LiveReadContract,
     row: &LiveReadRow,
 ) -> Result<String, LixError> {
     access.snapshot_text_from_values(row.schema_key(), row.values())
@@ -345,32 +347,5 @@ pub(crate) async fn live_storage_relation_exists(
     schema_key: &str,
 ) -> Result<bool, LixError> {
     let _ = storage;
-    let relation_name = live_relation_name(schema_key);
-    match backend.dialect() {
-        SqlDialect::Sqlite => {
-            let result = backend
-                .execute(
-                    "SELECT 1 \
-                     FROM sqlite_master \
-                     WHERE name = $1 \
-                       AND type IN ('table', 'view') \
-                     LIMIT 1",
-                    &[Value::Text(relation_name)],
-                )
-                .await?;
-            Ok(!result.rows.is_empty())
-        }
-        SqlDialect::Postgres => {
-            let result = backend
-                .execute(
-                    "SELECT 1 \
-                     FROM information_schema.tables \
-                     WHERE table_name = $1 \
-                     LIMIT 1",
-                    &[Value::Text(relation_name)],
-                )
-                .await?;
-            Ok(!result.rows.is_empty())
-        }
-    }
+    live_storage_relation_exists_with_backend(backend, schema_key).await
 }

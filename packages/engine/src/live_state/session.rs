@@ -1,6 +1,7 @@
 use crate::backend::QueryExecutor;
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::raw::{scan_rows_with_executor, RawStorage};
+use crate::live_state::schema_access::{payload_column_name_for_schema, tracked_relation_name};
 use crate::live_state::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
@@ -27,11 +28,8 @@ pub(crate) async fn load_version_id_by_descriptor_name_with_backend(
     backend: &dyn LixBackend,
     name: &str,
 ) -> Result<Option<String>, LixError> {
-    let name_column = crate::live_state::live_schema_payload_column_name(
-        version_descriptor_schema_key(),
-        None,
-        "name",
-    )?;
+    let name_column =
+        payload_column_name_for_schema(version_descriptor_schema_key(), None, "name")?;
     let result = backend
         .execute(
             &format!(
@@ -43,7 +41,7 @@ pub(crate) async fn load_version_id_by_descriptor_name_with_backend(
                    AND is_tombstone = 0 \
                    AND {name_column} = $4 \
                  LIMIT 1",
-                table_name = crate::live_state::live_relation_name(version_descriptor_schema_key()),
+                table_name = tracked_relation_name(version_descriptor_schema_key()),
                 name_column = name_column,
             ),
             &[

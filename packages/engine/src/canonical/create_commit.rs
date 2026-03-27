@@ -14,11 +14,11 @@ use crate::filesystem::runtime::{
     FILESYSTEM_FILE_SCHEMA_VERSION,
 };
 use crate::functions::LixFunctionProvider;
-use crate::key_value::key_value_schema_key;
-use crate::live_state::{
-    live_relation_name, live_schema_payload_column_name, live_schema_snapshot_select_expr,
-    require_ready_in_transaction,
+use crate::live_state::create_commit_queries::{
+    load_create_commit_deterministic_sequence_start as load_create_commit_deterministic_sequence_start_impl,
+    load_untracked_file_descriptor as load_untracked_file_descriptor_impl,
 };
+use crate::live_state::require_ready_in_transaction;
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::SqlDialect;
@@ -1030,63 +1030,9 @@ async fn load_create_commit_existing_replay(
 async fn load_create_commit_deterministic_sequence_start(
     executor: &mut dyn CommitQueryExecutor,
 ) -> Result<Option<i64>, CreateCommitError> {
-    let value_column = live_schema_payload_column_name(key_value_schema_key(), None, "value")
-        .map_err(backend_error)?;
-    let sql = format!(
-        "SELECT {value_column} \
-         FROM {table_name} \
-         WHERE file_id = '{file_id}' \
-           AND entity_id = 'lix_deterministic_sequence_number' \
-           AND version_id = '{version_id}' \
-           AND untracked = true \
-           AND {value_column} IS NOT NULL \
-         ORDER BY updated_at DESC \
-         LIMIT 1",
-        value_column = quote_ident(&value_column),
-        table_name = quote_ident(&live_relation_name(key_value_schema_key())),
-        file_id = FILESYSTEM_DESCRIPTOR_FILE_ID,
-        version_id = GLOBAL_VERSION_ID,
-    );
-    let result = executor.execute(&sql, &[]).await.map_err(backend_error)?;
-    if let Some(value_json) = result
-        .rows
-        .first()
-        .and_then(|row| row.first())
-        .and_then(value_as_text)
-    {
-        let snapshot_content =
-            format!("{{\"key\":\"lix_deterministic_sequence_number\",\"value\":{value_json}}}");
-        return parse_deterministic_sequence_snapshot(&snapshot_content).map(Some);
-    }
-
-    let tracked = load_exact_committed_state_row_from_live_state_with_executor(
-        executor,
-        &ExactCommittedStateRowRequest {
-            entity_id: "lix_deterministic_sequence_number".to_string(),
-            schema_key: "lix_key_value".to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            exact_filters: BTreeMap::from([
-                (
-                    "file_id".to_string(),
-                    Value::Text(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
-                ),
-                (
-                    "plugin_key".to_string(),
-                    Value::Text(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
-                ),
-            ]),
-        },
-    )
-    .await
-    .map_err(backend_error)?;
-    let Some(snapshot_content) = tracked
-        .as_ref()
-        .and_then(|row| row.values.get("snapshot_content"))
-        .and_then(value_as_text)
-    else {
-        return Ok(Some(0));
-    };
-    parse_deterministic_sequence_snapshot(&snapshot_content).map(Some)
+    load_create_commit_deterministic_sequence_start_impl(executor)
+        .await
+        .map_err(backend_error)
 }
 
 async fn load_create_commit_file_descriptors(
@@ -1144,41 +1090,9 @@ async fn load_untracked_file_descriptor(
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<ExactFilesystemDescriptorState>, CreateCommitError> {
-    let snapshot_expr = live_schema_snapshot_select_expr(
-        FILESYSTEM_FILE_SCHEMA_KEY,
-        None,
-        executor.dialect(),
-        None,
-    )
-    .map_err(|error| CreateCommitError {
-        kind: CreateCommitErrorKind::Internal,
-        message: error.description,
-    })?;
-    let sql = format!(
-        "SELECT {snapshot_expr} AS snapshot_content, metadata \
-         FROM {table_name} \
-         WHERE entity_id = '{entity_id}' \
-           AND file_id = '{file_id}' \
-           AND version_id = '{version_id}' \
-           AND untracked = true \
-           AND {snapshot_expr} IS NOT NULL \
-         ORDER BY updated_at DESC \
-         LIMIT 1",
-        snapshot_expr = snapshot_expr,
-        table_name = quote_ident(&live_relation_name(FILESYSTEM_FILE_SCHEMA_KEY)),
-        entity_id = escape_sql_string(file_id),
-        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
-        version_id = escape_sql_string(version_id),
-    );
-    let result = executor.execute(&sql, &[]).await.map_err(backend_error)?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    let Some(snapshot_content) = row.first().and_then(value_as_text) else {
-        return Ok(None);
-    };
-    let metadata = row.get(1).and_then(value_as_text);
-    parse_file_descriptor_preflight_row(&snapshot_content, metadata, true).map(Some)
+    load_untracked_file_descriptor_impl(executor, file_id, version_id)
+        .await
+        .map_err(backend_error)
 }
 
 async fn load_tracked_file_descriptor(
@@ -1453,7 +1367,7 @@ mod tests {
         FilesystemTransactionFileState, FilesystemTransactionState, OptionalTextPatch,
     };
     use crate::functions::LixFunctionProvider;
-    use crate::live_state::live_schema_normalized_values;
+    use crate::live_state::schema_access::normalized_values_for_schema;
     use crate::version::GLOBAL_VERSION_ID;
     use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
@@ -1464,7 +1378,7 @@ mod tests {
 
     fn fake_version_ref_live_row(version_id: &str, commit_id: &str) -> Vec<Value> {
         let snapshot = crate::version::version_ref_snapshot_content(version_id, commit_id);
-        let normalized = live_schema_normalized_values(
+        let normalized = normalized_values_for_schema(
             crate::version::version_ref_schema_key(),
             None,
             Some(&snapshot),
@@ -1500,7 +1414,7 @@ mod tests {
         })
         .to_string();
         let normalized =
-            live_schema_normalized_values("lix_file_descriptor", None, Some(&snapshot))
+            normalized_values_for_schema("lix_file_descriptor", None, Some(&snapshot))
                 .expect("snapshot should normalize");
         let mut row = vec![
             Value::Text("file-1".to_string()),
