@@ -1,6 +1,6 @@
 use crate::engine::{DeferredTransactionSideEffects, Engine, TransactionBackendAdapter};
 use crate::filesystem::runtime::merge_filesystem_transaction_state;
-use crate::read::contracts::{CommittedReadMode, PublicReadExecutionMode};
+use crate::read::contracts::PublicReadExecutionMode;
 use crate::sql::execution::compiled::CompiledExecution;
 use crate::sql::execution::execution_program::ExecutionContext;
 use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
@@ -34,10 +34,10 @@ pub(super) fn command_metadata(
         CompiledExecutionRoute::PublicRead(public_read)
             if matches!(
                 public_read_execution_mode(public_read),
-                PublicReadExecutionMode::Committed(CommittedReadMode::MaterializedState)
+                PublicReadExecutionMode::Committed(_)
             ) =>
         {
-            BufferedWriteExecutionRoute::PublicReadMaterializedState
+            BufferedWriteExecutionRoute::PublicReadCommitted
         }
         CompiledExecutionRoute::PublicRead(_)
         | CompiledExecutionRoute::PlannedWriteDelta(_)
