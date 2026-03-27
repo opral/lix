@@ -1,6 +1,7 @@
 use crate::engine::{
     normalize_sql_execution_error_with_backend, Engine, TransactionBackendAdapter,
 };
+use crate::session::contracts::SessionExecutionMode;
 use crate::sql::execution::contracts::result_contract::ResultContract;
 use crate::sql::execution::execute_prepared::execute_prepared_with_transaction;
 use crate::sql::execution::execution_program::{
@@ -9,7 +10,6 @@ use crate::sql::execution::execution_program::{
 use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::sql::execution::shared_path::{self, PreparationPolicy};
 use crate::sql::public::runtime::execute_prepared_public_read;
-use crate::session::contracts::SessionExecutionMode;
 use crate::transaction::sql_adapter::CompiledExecutionRoute;
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, TransactionMode};
 

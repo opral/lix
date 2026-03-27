@@ -13,8 +13,8 @@ use crate::canonical::ProposedDomainChange;
 use crate::engine::TransactionBackendAdapter;
 use crate::functions::LixFunctionProvider;
 use crate::live_state::{
-    apply_live_state_scope_in_transaction, live_state_rebuild_plan_with_executor,
-    LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
+    rebuild_scope_in_transaction, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
+    LiveStateRebuildScope,
 };
 use crate::state::stream::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
@@ -161,19 +161,15 @@ async fn merge_version_in_transaction(
         let transaction = tx.backend_transaction_mut()?;
         let mut versions = BTreeSet::new();
         versions.insert(target_version_id.clone());
-        let plan = {
-            let mut executor = &mut *transaction;
-            live_state_rebuild_plan_with_executor(
-                &mut executor,
-                &LiveStateRebuildRequest {
-                    scope: LiveStateRebuildScope::Versions(versions),
-                    debug: LiveStateRebuildDebugMode::Off,
-                    debug_row_limit: 0,
-                },
-            )
-            .await?
-        };
-        let _ = apply_live_state_scope_in_transaction(transaction, &plan).await?;
+        let _ = rebuild_scope_in_transaction(
+            transaction,
+            &LiveStateRebuildRequest {
+                scope: LiveStateRebuildScope::Versions(versions),
+                debug: LiveStateRebuildDebugMode::Off,
+                debug_row_limit: 0,
+            },
+        )
+        .await?;
 
         return Ok(MergeVersionResult {
             outcome: MergeOutcome::FastForwarded,

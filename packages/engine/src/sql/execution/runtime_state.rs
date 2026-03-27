@@ -33,7 +33,9 @@ impl ExecutionRuntimeState {
         engine: &Engine,
         backend: &dyn LixBackend,
     ) -> Result<Self, LixError> {
-        let (settings, functions) = engine.prepare_runtime_functions_with_backend(backend).await?;
+        let (settings, functions) = engine
+            .prepare_runtime_functions_with_backend(backend)
+            .await?;
         Ok(Self {
             settings,
             functions,
@@ -72,15 +74,14 @@ impl ExecutionRuntimeState {
 pub(crate) fn derive_execution_runtime_effects(
     statements: &[Statement],
 ) -> ExecutionRuntimeEffects {
-    statements.iter().fold(
-        ExecutionRuntimeEffects::default(),
-        |effects, statement| {
+    statements
+        .iter()
+        .fold(ExecutionRuntimeEffects::default(), |effects, statement| {
             effects.merge(ExecutionRuntimeEffects {
                 requires_deterministic_sequence_persistence:
                     statement_requires_deterministic_sequence_persistence(statement),
             })
-        },
-    )
+        })
 }
 
 fn statement_requires_deterministic_sequence_persistence(statement: &Statement) -> bool {

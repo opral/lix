@@ -14,7 +14,6 @@ use crate::engine::{
     reject_internal_table_writes, reject_public_create_table, Engine, ExecuteOptions,
 };
 use crate::errors;
-use crate::live_state::raw::{load_exact_row_with_backend, RawStorage};
 use crate::read::runtime::{
     execute_execution_program_in_committed_read_transaction,
     transaction_mode_for_committed_read_program,
@@ -28,10 +27,6 @@ use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::transaction::{TransactionCommitOutcome, WriteTransaction};
-use crate::version::{
-    version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
-    version_descriptor_storage_version_id,
-};
 use crate::{ExecuteResult, LixError, Value};
 
 use contracts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
@@ -355,7 +350,8 @@ impl Session {
         context.set_execution_runtime_state(runtime_state.clone());
 
         let result = match execution_mode {
-            SessionExecutionMode::CommittedRead | SessionExecutionMode::CommittedRuntimeMutation => {
+            SessionExecutionMode::CommittedRead
+            | SessionExecutionMode::CommittedRuntimeMutation => {
                 let transaction_mode =
                     transaction_mode_for_committed_read_program(execution_mode, &runtime_state);
                 let mut transaction = self.engine.begin_read_unit(transaction_mode).await?;
@@ -721,18 +717,8 @@ impl Drop for SessionTransaction<'_> {
 }
 
 async fn ensure_version_exists(session: &Session, version_id: &str) -> Result<(), LixError> {
-    let row = load_exact_row_with_backend(
-        session.engine.backend.as_ref(),
-        RawStorage::Tracked,
-        version_descriptor_schema_key(),
-        version_descriptor_storage_version_id(),
-        version_id,
-        Some(version_descriptor_file_id()),
-    )
-    .await?;
-    if row
-        .as_ref()
-        .is_none_or(|row| row.plugin_key() != version_descriptor_plugin_key())
+    if !crate::live_state::version_exists_with_backend(session.engine.backend.as_ref(), version_id)
+        .await?
     {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",

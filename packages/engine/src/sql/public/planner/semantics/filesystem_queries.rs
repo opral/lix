@@ -4,7 +4,7 @@ use crate::filesystem::live_projection::{
 };
 use crate::filesystem::path::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
 use crate::filesystem::runtime::FilesystemTransactionFileState;
-use crate::live_state::{tracked_live_table_name, untracked_live_table_name};
+use crate::live_state::live_relation_name;
 use crate::sql::common::ast::{lower_statement, parse_sql_statements};
 use crate::sql_support::text::escape_sql_string;
 use crate::transaction::PendingTransactionView;
@@ -1048,7 +1048,7 @@ async fn load_directory_descriptor_by_id(
 ) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
     load_scoped_descriptor_row(
         backend,
-        &tracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
+        &live_relation_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
         FILESYSTEM_DIRECTORY_SCHEMA_KEY,
         &format!("entity_id = '{}'", escape_sql_string(directory_id)),
         &format!("entity_id = '{}'", escape_sql_string(directory_id)),
@@ -1077,7 +1077,7 @@ async fn load_directory_descriptor_by_parent_and_name(
     let name_predicate_untracked = format!("name = '{}'", escape_sql_string(name));
     load_scoped_descriptor_row(
         backend,
-        &tracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
+        &live_relation_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
         FILESYSTEM_DIRECTORY_SCHEMA_KEY,
         &format!("{parent_predicate_tracked} AND {name_predicate_tracked}"),
         &format!("{parent_predicate_untracked} AND {name_predicate_untracked}"),
@@ -1095,7 +1095,7 @@ async fn load_file_descriptor_by_id(
 ) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
     load_scoped_descriptor_row(
         backend,
-        &tracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY),
+        &live_relation_name(FILESYSTEM_FILE_SCHEMA_KEY),
         FILESYSTEM_FILE_SCHEMA_KEY,
         &format!("entity_id = '{}'", escape_sql_string(file_id)),
         &format!("entity_id = '{}'", escape_sql_string(file_id)),
@@ -1133,7 +1133,7 @@ async fn load_file_descriptor_by_path_components(
     };
     load_scoped_descriptor_row(
         backend,
-        &tracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY),
+        &live_relation_name(FILESYSTEM_FILE_SCHEMA_KEY),
         FILESYSTEM_FILE_SCHEMA_KEY,
         &format!(
             "{directory_predicate_tracked} AND {name_predicate_tracked} AND {extension_predicate_tracked}"
@@ -1156,7 +1156,7 @@ fn effective_directory_descriptor_sql(
 ) -> String {
     effective_descriptor_sql(
         dialect,
-        &tracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
+        &live_relation_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
         FILESYSTEM_DIRECTORY_SCHEMA_KEY,
         tracked_base_predicate,
         untracked_base_predicate,
@@ -1174,7 +1174,7 @@ fn effective_file_descriptor_sql(
 ) -> String {
     effective_descriptor_sql(
         dialect,
-        &tracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY),
+        &live_relation_name(FILESYSTEM_FILE_SCHEMA_KEY),
         FILESYSTEM_FILE_SCHEMA_KEY,
         tracked_base_predicate,
         untracked_base_predicate,
@@ -1197,7 +1197,7 @@ fn effective_descriptor_sql(
         file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
         tracked_base_predicate = tracked_base_predicate,
     );
-    let untracked_table = quote_ident(&untracked_live_table_name(schema_key));
+    let untracked_table = quote_ident(&live_relation_name(schema_key));
     let tracked_parent_expr = normalized_descriptor_select_expr(schema_key, "parent_id");
     let tracked_directory_expr = normalized_descriptor_select_expr(schema_key, "directory_id");
     let tracked_name_expr = normalized_descriptor_select_expr(schema_key, "name");
@@ -1467,7 +1467,7 @@ fn visible_directory_descriptor_rows_for_pairs_sql(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let untracked_table = quote_ident(&untracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY));
+    let untracked_table = quote_ident(&live_relation_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY));
     let tracked_parent_expr =
         normalized_descriptor_select_expr(FILESYSTEM_DIRECTORY_SCHEMA_KEY, "parent_id");
     let tracked_name_expr =
@@ -1539,7 +1539,7 @@ fn visible_directory_descriptor_rows_for_pairs_sql(
         tracked_name_expr = tracked_name_expr,
         tracked_hidden_expr = tracked_hidden_expr,
         untracked_table = untracked_table,
-        tracked_table = tracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
+        tracked_table = live_relation_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
         version_id = escape_sql_string(version_id),
         file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
     )
@@ -1562,7 +1562,7 @@ fn visible_file_descriptor_rows_for_triplets_sql(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let untracked_table = quote_ident(&untracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY));
+    let untracked_table = quote_ident(&live_relation_name(FILESYSTEM_FILE_SCHEMA_KEY));
     let tracked_directory_expr =
         normalized_descriptor_select_expr(FILESYSTEM_FILE_SCHEMA_KEY, "directory_id");
     let tracked_name_expr = normalized_descriptor_select_expr(FILESYSTEM_FILE_SCHEMA_KEY, "name");
@@ -1643,7 +1643,7 @@ fn visible_file_descriptor_rows_for_triplets_sql(
         tracked_extension_expr = tracked_extension_expr,
         tracked_hidden_expr = tracked_hidden_expr,
         untracked_table = untracked_table,
-        tracked_table = tracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY),
+        tracked_table = live_relation_name(FILESYSTEM_FILE_SCHEMA_KEY),
         version_id = escape_sql_string(version_id),
         file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
         extension_match_untracked =
@@ -1760,7 +1760,7 @@ fn visible_descriptor_sql(
         file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
         tracked_base_predicate = tracked_base_predicate,
     );
-    let untracked_table = quote_ident(&untracked_live_table_name(schema_key));
+    let untracked_table = quote_ident(&live_relation_name(schema_key));
     let tracked_parent_expr = normalized_descriptor_select_expr(schema_key, "parent_id");
     let tracked_directory_expr = normalized_descriptor_select_expr(schema_key, "directory_id");
     let tracked_name_expr = normalized_descriptor_select_expr(schema_key, "name");
@@ -1836,7 +1836,7 @@ fn merged_visible_descriptor_sql(
         file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
         tracked_base_predicate = tracked_base_predicate,
     );
-    let untracked_table = quote_ident(&untracked_live_table_name(schema_key));
+    let untracked_table = quote_ident(&live_relation_name(schema_key));
     let tracked_parent_expr = normalized_descriptor_select_expr(schema_key, "parent_id");
     let tracked_directory_expr = normalized_descriptor_select_expr(schema_key, "directory_id");
     let tracked_name_expr = normalized_descriptor_select_expr(schema_key, "name");
@@ -1947,7 +1947,7 @@ fn visible_descriptor_rows_sql(
         file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
         tracked_base_predicate = tracked_base_predicate,
     );
-    let untracked_table = quote_ident(&untracked_live_table_name(schema_key));
+    let untracked_table = quote_ident(&live_relation_name(schema_key));
     let tracked_parent_expr = normalized_descriptor_select_expr(schema_key, "parent_id");
     let tracked_directory_expr = normalized_descriptor_select_expr(schema_key, "directory_id");
     let tracked_name_expr = normalized_descriptor_select_expr(schema_key, "name");
@@ -2057,7 +2057,7 @@ fn version_shadow_sql(
            AND {tracked_base} \
          ORDER BY precedence ASC \
          LIMIT 1",
-        untracked_table = quote_ident(&untracked_live_table_name(schema_key)),
+        untracked_table = quote_ident(&live_relation_name(schema_key)),
         tracked_table = tracked_table,
         version_id = escape_sql_string(version_id),
         tracked_base = tracked_base,
@@ -2100,7 +2100,7 @@ fn version_shadow_rows_sql(
            AND untracked = false \
            AND {tracked_base} \
          ORDER BY entity_id ASC, precedence ASC",
-        untracked_table = quote_ident(&untracked_live_table_name(schema_key)),
+        untracked_table = quote_ident(&live_relation_name(schema_key)),
         tracked_table = tracked_table,
         version_id = escape_sql_string(version_id),
         tracked_base = tracked_base,
@@ -2422,7 +2422,7 @@ mod tests {
             {
                 self.projection_seen.store(true, Ordering::SeqCst);
             }
-            if sql.contains(&tracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY))
+            if sql.contains(&live_relation_name(FILESYSTEM_FILE_SCHEMA_KEY))
                 && sql.contains("entity_id = 'file-1'")
             {
                 return Ok(crate::QueryResult {
@@ -2442,7 +2442,7 @@ mod tests {
                     columns: Vec::new(),
                 });
             }
-            if sql.contains(&tracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY))
+            if sql.contains(&live_relation_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY))
                 && sql.contains("entity_id = 'dir-nested'")
             {
                 return Ok(crate::QueryResult {
@@ -2462,7 +2462,7 @@ mod tests {
                     columns: Vec::new(),
                 });
             }
-            if sql.contains(&tracked_live_table_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY))
+            if sql.contains(&live_relation_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY))
                 && sql.contains("entity_id = 'dir-bench'")
             {
                 return Ok(crate::QueryResult {

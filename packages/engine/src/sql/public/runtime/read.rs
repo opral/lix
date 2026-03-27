@@ -1,9 +1,6 @@
 use super::bind::{bind_public_query, bind_public_statement_sql};
 use super::*;
 use crate::errors::classification::sanitize_lowered_public_sql_error_description;
-use crate::live_state::{
-    builtin_live_table_layout, load_live_table_layout_with_backend, LiveTableLayout,
-};
 use crate::read::models::{
     load_directory_history_rows, load_file_history_rows, DirectoryHistoryRequest,
     DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
@@ -19,6 +16,7 @@ use crate::sql::public::planner::backend::lowerer::{
     rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id,
     LoweredReadProgram, LoweredResultColumn, LoweredResultColumns,
 };
+use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
 use crate::sql::public::planner::canonicalize::canonicalize_read;
 use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use serde_json::Value as JsonValue;
@@ -1187,17 +1185,13 @@ fn public_output_columns_from_select(select: &Select) -> Option<Vec<String>> {
 async fn load_known_live_layouts_for_dependency_spec(
     backend: &dyn LixBackend,
     dependency_spec: Option<&DependencySpec>,
-) -> Result<BTreeMap<String, LiveTableLayout>, LixError> {
-    let mut layouts = BTreeMap::new();
+) -> Result<BTreeMap<String, JsonValue>, LixError> {
+    let mut provider = SqlRegisteredSchemaProvider::new(backend);
+    let mut schemas = BTreeMap::new();
     for schema_key in required_schema_keys_from_dependency_spec(dependency_spec) {
-        if let Some(layout) = builtin_live_table_layout(&schema_key)? {
-            layouts.insert(schema_key, layout);
-            continue;
-        }
-        let layout = load_live_table_layout_with_backend(backend, &schema_key).await?;
-        layouts.insert(schema_key, layout);
+        schemas.insert(schema_key.clone(), provider.load_latest_schema(&schema_key).await?);
     }
-    Ok(layouts)
+    Ok(schemas)
 }
 
 async fn load_known_live_layouts_for_public_read(
@@ -1205,8 +1199,9 @@ async fn load_known_live_layouts_for_public_read(
     structured_read: &StructuredPublicRead,
     dependency_spec: Option<&DependencySpec>,
     effective_state_request: Option<&EffectiveStateRequest>,
-) -> Result<BTreeMap<String, LiveTableLayout>, LixError> {
-    let mut layouts = load_known_live_layouts_for_dependency_spec(backend, dependency_spec).await?;
+) -> Result<BTreeMap<String, JsonValue>, LixError> {
+    let mut provider = SqlRegisteredSchemaProvider::new(backend);
+    let mut schemas = load_known_live_layouts_for_dependency_spec(backend, dependency_spec).await?;
     if let Some(request) = effective_state_request {
         if let Some(schema_key) = structured_read
             .surface_binding
@@ -1214,28 +1209,24 @@ async fn load_known_live_layouts_for_public_read(
             .fixed_schema_key
             .as_ref()
         {
-            if !layouts.contains_key(schema_key) {
-                if let Some(layout) = builtin_live_table_layout(schema_key)? {
-                    layouts.insert(schema_key.clone(), layout);
-                } else {
-                    let layout = load_live_table_layout_with_backend(backend, schema_key).await?;
-                    layouts.insert(schema_key.clone(), layout);
-                }
+            if !schemas.contains_key(schema_key) {
+                schemas.insert(
+                    schema_key.clone(),
+                    provider.load_latest_schema(schema_key).await?,
+                );
             }
         }
         for schema_key in &request.schema_set {
-            if layouts.contains_key(schema_key) {
+            if schemas.contains_key(schema_key) {
                 continue;
             }
-            if let Some(layout) = builtin_live_table_layout(schema_key)? {
-                layouts.insert(schema_key.clone(), layout);
-                continue;
-            }
-            let layout = load_live_table_layout_with_backend(backend, schema_key).await?;
-            layouts.insert(schema_key.clone(), layout);
+            schemas.insert(
+                schema_key.clone(),
+                provider.load_latest_schema(schema_key).await?,
+            );
         }
     }
-    Ok(layouts)
+    Ok(schemas)
 }
 
 fn build_direct_state_history_plan(

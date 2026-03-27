@@ -10,7 +10,6 @@ use crate::filesystem::runtime::{
     FilesystemTransactionState,
 };
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
-use crate::live_state::live_table_layout_from_schema;
 use crate::read::models::{
     DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest, TrackedDomainChangeView,
 };
@@ -2194,7 +2193,7 @@ fn schema_live_table_requirements_from_partition(
                 .entry(row.schema_key.clone())
                 .or_insert(SchemaLiveTableRequirement {
                     schema_key: row.schema_key.clone(),
-                    layout: None,
+                    schema_definition: None,
                 });
         }
 
@@ -2209,18 +2208,14 @@ fn schema_live_table_requirements_from_partition(
         let Ok(snapshot) = serde_json::from_str(&snapshot_content) else {
             continue;
         };
-        let Ok((schema_key, schema)) = crate::schema::schema_from_registered_snapshot(&snapshot)
-        else {
-            continue;
-        };
-        let Ok(layout) = live_table_layout_from_schema(&schema) else {
+        let Ok((schema_key, schema)) = crate::schema::schema_from_registered_snapshot(&snapshot) else {
             continue;
         };
         requirements.insert(
             schema_key.schema_key.clone(),
             SchemaLiveTableRequirement {
                 schema_key: schema_key.schema_key,
-                layout: Some(layout),
+                schema_definition: Some(schema),
             },
         );
     }

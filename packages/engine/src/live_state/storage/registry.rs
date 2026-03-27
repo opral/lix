@@ -143,38 +143,14 @@ async fn load_live_table_layout_with_provider(
 fn requirement_from_registration(
     registration: &SchemaRegistration,
 ) -> Result<LiveTableRequirement, LixError> {
-    let layout = match (
-        registration.layout_override(),
-        registration.registered_snapshot(),
-    ) {
-        (Some(layout), _) => Some(layout.clone()),
-        (None, Some(snapshot)) => Some(layout_from_registered_snapshot(
-            registration.schema_key(),
-            snapshot,
-        )?),
-        (None, None) => None,
-    };
+    let layout = registration
+        .schema_definition()
+        .map(live_table_layout_from_schema)
+        .transpose()?;
     Ok(LiveTableRequirement {
         schema_key: registration.schema_key().to_string(),
         layout,
     })
-}
-
-fn layout_from_registered_snapshot(
-    schema_key: &str,
-    snapshot: &JsonValue,
-) -> Result<LiveTableLayout, LixError> {
-    let (key, schema) = schema_from_registered_snapshot(snapshot)?;
-    if key.schema_key != schema_key {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            &format!(
-                "schema registration for '{}' provided snapshot for '{}'",
-                schema_key, key.schema_key
-            ),
-        ));
-    }
-    live_table_layout_from_schema(&schema)
 }
 
 pub(crate) fn compile_registered_live_layout(

@@ -12,8 +12,13 @@ impl Engine {
     pub(crate) async fn prepare_runtime_functions_with_backend(
         &self,
         backend: &dyn LixBackend,
-    ) -> Result<(DeterministicSettings, SharedFunctionProvider<RuntimeFunctionProvider>), LixError>
-    {
+    ) -> Result<
+        (
+            DeterministicSettings,
+            SharedFunctionProvider<RuntimeFunctionProvider>,
+        ),
+        LixError,
+    > {
         let settings = if self.deterministic_boot_pending() {
             self.boot_deterministic_settings()
                 .unwrap_or_else(DeterministicSettings::disabled)

@@ -43,45 +43,10 @@ impl RawRow {
         }
     }
 
-    pub(crate) fn schema_version(&self) -> &str {
-        match self {
-            Self::Tracked(row) => &row.schema_version,
-            Self::Untracked(row) => &row.schema_version,
-        }
-    }
-
-    pub(crate) fn file_id(&self) -> &str {
-        match self {
-            Self::Tracked(row) => &row.file_id,
-            Self::Untracked(row) => &row.file_id,
-        }
-    }
-
-    pub(crate) fn version_id(&self) -> &str {
-        match self {
-            Self::Tracked(row) => &row.version_id,
-            Self::Untracked(row) => &row.version_id,
-        }
-    }
-
     pub(crate) fn plugin_key(&self) -> &str {
         match self {
             Self::Tracked(row) => &row.plugin_key,
             Self::Untracked(row) => &row.plugin_key,
-        }
-    }
-
-    pub(crate) fn metadata(&self) -> Option<&str> {
-        match self {
-            Self::Tracked(row) => row.metadata.as_deref(),
-            Self::Untracked(row) => row.metadata.as_deref(),
-        }
-    }
-
-    pub(crate) fn writer_key(&self) -> Option<&str> {
-        match self {
-            Self::Tracked(row) => row.writer_key.as_deref(),
-            Self::Untracked(row) => row.writer_key.as_deref(),
         }
     }
 
@@ -103,20 +68,6 @@ impl RawRow {
         match self {
             Self::Tracked(row) => row.property_text(property_name),
             Self::Untracked(row) => row.property_text(property_name),
-        }
-    }
-
-    pub(crate) fn change_id(&self) -> Option<&str> {
-        match self {
-            Self::Tracked(row) => row.change_id.as_deref(),
-            Self::Untracked(_) => None,
-        }
-    }
-
-    pub(crate) fn into_tracked(self) -> Option<TrackedRow> {
-        match self {
-            Self::Tracked(row) => Some(row),
-            Self::Untracked(_) => None,
         }
     }
 }
@@ -173,26 +124,6 @@ pub(crate) async fn load_exact_row_with_executor(
         .await
         .map(|row| row.map(RawRow::Untracked)),
     }
-}
-
-pub(crate) async fn scan_rows_with_backend(
-    backend: &dyn LixBackend,
-    storage: RawStorage,
-    schema_key: &str,
-    version_id: &str,
-    constraints: &[ScanConstraint],
-    required_columns: &[String],
-) -> Result<Vec<RawRow>, LixError> {
-    let mut executor = backend;
-    scan_rows_with_executor(
-        &mut executor,
-        storage,
-        schema_key,
-        version_id,
-        constraints,
-        required_columns,
-    )
-    .await
 }
 
 pub(crate) async fn scan_rows_with_executor(
@@ -330,10 +261,13 @@ mod tests {
             values: BTreeMap::from([("name".to_string(), Value::Text("Bea".to_string()))]),
         });
 
-        assert_eq!(tracked.change_id(), Some("chg-1"));
-        assert_eq!(untracked.change_id(), None);
-        assert_eq!(tracked.writer_key(), None);
-        assert!(tracked.clone().into_tracked().is_some());
+        match tracked {
+            RawRow::Tracked(row) => {
+                assert_eq!(row.change_id.as_deref(), Some("chg-1"));
+                assert!(row.writer_key.is_none());
+            }
+            RawRow::Untracked(_) => panic!("expected tracked row"),
+        }
         assert!(matches!(untracked, RawRow::Untracked(_)));
     }
 

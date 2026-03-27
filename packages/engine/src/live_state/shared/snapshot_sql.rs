@@ -1,7 +1,8 @@
 use crate::backend::SqlDialect;
-use crate::live_state::{builtin_live_table_layout, LiveColumnKind, LiveTableLayout};
+use crate::live_state::storage::{builtin_live_table_layout, LiveColumnKind, LiveTableLayout};
 use crate::LixError;
 
+#[allow(dead_code)]
 pub(crate) fn live_snapshot_select_expr_for_schema(
     schema_key: &str,
     dialect: SqlDialect,

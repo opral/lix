@@ -284,11 +284,13 @@ fn build_compiled_execution_schema_registrations(
     let mut registrations = SchemaRegistrationSet::default();
     if let Some(internal) = execution.internal_execution() {
         for requirement in coalesce_live_table_requirements(&internal.live_table_requirements) {
-            match requirement.layout.as_ref() {
-                Some(layout) => registrations.insert(SchemaRegistration::with_layout(
-                    requirement.schema_key.clone(),
-                    layout,
-                )),
+            match requirement.schema_definition.as_ref() {
+                Some(schema_definition) => registrations.insert(
+                    SchemaRegistration::with_schema_definition(
+                        requirement.schema_key.clone(),
+                        schema_definition.clone(),
+                    ),
+                ),
                 None => registrations.insert(requirement.schema_key.clone()),
             }
         }

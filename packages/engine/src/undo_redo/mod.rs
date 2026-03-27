@@ -13,12 +13,7 @@ use crate::canonical::readers::{
     ExactCommittedStateRowRequest,
 };
 use crate::canonical::ProposedDomainChange;
-use crate::live_state::raw::{load_exact_row_with_executor, RawStorage};
 use crate::state::stream::StateCommitStreamOperation;
-use crate::version::{
-    version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
-    version_descriptor_storage_version_id,
-};
 use crate::{LixBackendTransaction, LixError, SessionTransaction};
 
 pub use types::{RedoOptions, RedoResult, UndoOptions, UndoResult};
@@ -58,19 +53,7 @@ async fn ensure_version_exists_with_transaction(
     version_id: &str,
 ) -> Result<(), LixError> {
     let mut executor = crate::engine::TransactionBackendAdapter::new(transaction);
-    let row = load_exact_row_with_executor(
-        &mut executor,
-        RawStorage::Tracked,
-        version_descriptor_schema_key(),
-        version_descriptor_storage_version_id(),
-        version_id,
-        Some(version_descriptor_file_id()),
-    )
-    .await?;
-    if row
-        .as_ref()
-        .is_none_or(|row| row.plugin_key() != version_descriptor_plugin_key())
-    {
+    if !crate::live_state::version_exists_with_executor(&mut executor, version_id).await? {
         return Err(LixError::unknown(format!(
             "version '{}' does not exist",
             version_id

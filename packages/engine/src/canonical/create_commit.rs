@@ -15,10 +15,9 @@ use crate::filesystem::runtime::{
 };
 use crate::functions::LixFunctionProvider;
 use crate::key_value::key_value_schema_key;
-use crate::live_state::shared::snapshot_sql::live_snapshot_select_expr_for_schema;
 use crate::live_state::{
-    builtin_live_table_layout, live_column_name_for_property, require_ready_in_transaction,
-    untracked_live_table_name,
+    live_relation_name, live_schema_payload_column_name, live_schema_snapshot_select_expr,
+    require_ready_in_transaction,
 };
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
@@ -416,7 +415,8 @@ pub(crate) async fn create_commit(
         transaction.dialect(),
     )
     .map_err(backend_error)?;
-    let deterministic_sequence_highest_seen = functions.deterministic_sequence_persist_highest_seen();
+    let deterministic_sequence_highest_seen =
+        functions.deterministic_sequence_persist_highest_seen();
     prepared_batch.extend(
         build_commit_graph_node_prepared_batch(&commit_graph_rows, transaction.dialect())
             .map_err(backend_error)?,
@@ -1030,20 +1030,8 @@ async fn load_create_commit_existing_replay(
 async fn load_create_commit_deterministic_sequence_start(
     executor: &mut dyn CommitQueryExecutor,
 ) -> Result<Option<i64>, CreateCommitError> {
-    let layout = builtin_live_table_layout(key_value_schema_key())
-        .map_err(backend_error)?
-        .ok_or_else(|| {
-            backend_error(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "builtin key-value schema must compile to a live layout",
-            ))
-        })?;
-    let value_column = live_column_name_for_property(&layout, "value").ok_or_else(|| {
-        backend_error(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "key-value live layout is missing value",
-        ))
-    })?;
+    let value_column = live_schema_payload_column_name(key_value_schema_key(), None, "value")
+        .map_err(backend_error)?;
     let sql = format!(
         "SELECT {value_column} \
          FROM {table_name} \
@@ -1054,8 +1042,8 @@ async fn load_create_commit_deterministic_sequence_start(
            AND {value_column} IS NOT NULL \
          ORDER BY updated_at DESC \
          LIMIT 1",
-        value_column = quote_ident(value_column),
-        table_name = quote_ident(&untracked_live_table_name(key_value_schema_key())),
+        value_column = quote_ident(&value_column),
+        table_name = quote_ident(&live_relation_name(key_value_schema_key())),
         file_id = FILESYSTEM_DESCRIPTOR_FILE_ID,
         version_id = GLOBAL_VERSION_ID,
     );
@@ -1156,12 +1144,16 @@ async fn load_untracked_file_descriptor(
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<ExactFilesystemDescriptorState>, CreateCommitError> {
-    let snapshot_expr =
-        live_snapshot_select_expr_for_schema(FILESYSTEM_FILE_SCHEMA_KEY, executor.dialect(), None)
-            .map_err(|error| CreateCommitError {
-                kind: CreateCommitErrorKind::Internal,
-                message: error.description,
-            })?;
+    let snapshot_expr = live_schema_snapshot_select_expr(
+        FILESYSTEM_FILE_SCHEMA_KEY,
+        None,
+        executor.dialect(),
+        None,
+    )
+    .map_err(|error| CreateCommitError {
+        kind: CreateCommitErrorKind::Internal,
+        message: error.description,
+    })?;
     let sql = format!(
         "SELECT {snapshot_expr} AS snapshot_content, metadata \
          FROM {table_name} \
@@ -1173,7 +1165,7 @@ async fn load_untracked_file_descriptor(
          ORDER BY updated_at DESC \
          LIMIT 1",
         snapshot_expr = snapshot_expr,
-        table_name = quote_ident(&untracked_live_table_name(FILESYSTEM_FILE_SCHEMA_KEY)),
+        table_name = quote_ident(&live_relation_name(FILESYSTEM_FILE_SCHEMA_KEY)),
         entity_id = escape_sql_string(file_id),
         file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
         version_id = escape_sql_string(version_id),
@@ -1461,7 +1453,7 @@ mod tests {
         FilesystemTransactionFileState, FilesystemTransactionState, OptionalTextPatch,
     };
     use crate::functions::LixFunctionProvider;
-    use crate::live_state::{builtin_live_table_layout, normalized_live_column_values};
+    use crate::live_state::live_schema_normalized_values;
     use crate::version::GLOBAL_VERSION_ID;
     use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
@@ -1472,11 +1464,12 @@ mod tests {
 
     fn fake_version_ref_live_row(version_id: &str, commit_id: &str) -> Vec<Value> {
         let snapshot = crate::version::version_ref_snapshot_content(version_id, commit_id);
-        let layout = builtin_live_table_layout(crate::version::version_ref_schema_key())
-            .expect("builtin layout should load")
-            .expect("version ref layout should exist");
-        let normalized = normalized_live_column_values(&layout, Some(&snapshot))
-            .expect("snapshot should normalize");
+        let normalized = live_schema_normalized_values(
+            crate::version::version_ref_schema_key(),
+            None,
+            Some(&snapshot),
+        )
+        .expect("snapshot should normalize");
         let mut row = vec![
             Value::Text(version_id.to_string()),
             Value::Text(crate::version::version_ref_schema_key().to_string()),
@@ -1490,13 +1483,8 @@ mod tests {
             Value::Text("2026-03-06T14:22:00.000Z".to_string()),
             Value::Text("2026-03-06T14:22:00.000Z".to_string()),
         ];
-        for column in &layout.columns {
-            row.push(
-                normalized
-                    .get(&column.column_name)
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            );
+        for column_name in ["commit_id"] {
+            row.push(normalized.get(column_name).cloned().unwrap_or(Value::Null));
         }
         row
     }
@@ -1511,11 +1499,9 @@ mod tests {
             "metadata": serde_json::Value::Null,
         })
         .to_string();
-        let layout = builtin_live_table_layout("lix_file_descriptor")
-            .expect("builtin layout should load")
-            .expect("file descriptor layout should exist");
-        let normalized = normalized_live_column_values(&layout, Some(&snapshot))
-            .expect("snapshot should normalize");
+        let normalized =
+            live_schema_normalized_values("lix_file_descriptor", None, Some(&snapshot))
+                .expect("snapshot should normalize");
         let mut row = vec![
             Value::Text("file-1".to_string()),
             Value::Text("lix_file_descriptor".to_string()),
@@ -1530,13 +1516,15 @@ mod tests {
             Value::Text("2026-03-06T14:22:00.000Z".to_string()),
             Value::Text("2026-03-06T14:22:00.000Z".to_string()),
         ];
-        for column in &layout.columns {
-            row.push(
-                normalized
-                    .get(&column.column_name)
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            );
+        for column_name in [
+            "id",
+            "directory_id",
+            "name",
+            "extension",
+            "metadata_json",
+            "hidden",
+        ] {
+            row.push(normalized.get(column_name).cloned().unwrap_or(Value::Null));
         }
         row
     }

@@ -49,7 +49,11 @@ pub(super) async fn run_internal_write_txn_with_transaction(
     }
 
     engine
-        .persist_runtime_sequence_in_transaction(transaction, plan.runtime_state.settings(), plan.runtime_state.provider())
+        .persist_runtime_sequence_in_transaction(
+            transaction,
+            plan.runtime_state.settings(),
+            plan.runtime_state.provider(),
+        )
         .await
         .map_err(|error| LixError {
             code: error.code,

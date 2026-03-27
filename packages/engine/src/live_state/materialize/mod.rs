@@ -3,9 +3,6 @@ mod loader;
 mod plan;
 mod types;
 
-pub(crate) use apply::apply_live_state_scope_in_transaction;
-pub(crate) use plan::live_state_rebuild_plan_with_executor;
-
 pub use types::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
@@ -14,7 +11,8 @@ pub use types::{
     TraversedEdgeDebugRow, VersionAncestryDebugRow, VersionHeadDebugRow,
 };
 
-use crate::{LixBackend, LixError};
+use crate::engine::TransactionBackendAdapter;
+use crate::{LixBackend, LixBackendTransaction, LixError};
 
 pub async fn rebuild_plan(
     backend: &dyn LixBackend,
@@ -23,11 +21,26 @@ pub async fn rebuild_plan(
     plan::live_state_rebuild_plan_internal(backend, req).await
 }
 
+pub(crate) async fn rebuild_plan_with_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    req: &LiveStateRebuildRequest,
+) -> Result<LiveStateRebuildPlan, LixError> {
+    let mut executor = TransactionBackendAdapter::new(transaction);
+    plan::live_state_rebuild_plan_with_executor(&mut executor, req).await
+}
+
 pub async fn apply_rebuild_plan(
     backend: &dyn LixBackend,
     plan: &LiveStateRebuildPlan,
 ) -> Result<LiveStateApplyReport, LixError> {
     apply::apply_live_state_rebuild_plan_internal(backend, plan).await
+}
+
+pub(crate) async fn apply_rebuild_scope_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    plan: &LiveStateRebuildPlan,
+) -> Result<(usize, std::collections::BTreeSet<String>), LixError> {
+    apply::apply_live_state_scope_in_transaction(transaction, plan).await
 }
 
 pub async fn rebuild(
