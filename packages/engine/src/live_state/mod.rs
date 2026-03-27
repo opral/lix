@@ -31,10 +31,10 @@ pub mod tracked;
 pub mod untracked;
 
 use crate::backend::QueryExecutor;
-use crate::schema::schema_from_registered_snapshot;
 use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 
 pub use lifecycle::{CanonicalWatermark, LiveStateMode, LiveStateReadiness};
 pub use materialize::{
@@ -49,7 +49,41 @@ pub use materialize::{
 pub struct SchemaRegistration {
     schema_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    schema_definition: Option<JsonValue>,
+    registered_snapshot: Option<JsonValue>,
+    #[serde(skip, default)]
+    source: SchemaRegistrationSource,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SchemaRegistrationSet {
+    inner: BTreeMap<String, SchemaRegistration>,
+}
+
+impl SchemaRegistrationSet {
+    pub(crate) fn insert(&mut self, registration: impl Into<SchemaRegistration>) {
+        let registration = registration.into();
+        self.inner
+            .insert(registration.schema_key().to_string(), registration);
+    }
+
+    pub(crate) fn extend(&mut self, other: SchemaRegistrationSet) {
+        self.inner.extend(other.inner);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &SchemaRegistration> {
+        self.inner.values()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+enum SchemaRegistrationSource {
+    #[default]
+    StoredLayout,
+    Layout(storage::LiveTableLayout),
 }
 
 impl From<&str> for SchemaRegistration {
@@ -68,7 +102,8 @@ impl SchemaRegistration {
     pub fn new(schema_key: impl Into<String>) -> Self {
         Self {
             schema_key: schema_key.into(),
-            schema_definition: None,
+            registered_snapshot: None,
+            source: SchemaRegistrationSource::StoredLayout,
         }
     }
 
@@ -80,13 +115,10 @@ impl SchemaRegistration {
         schema_key: impl Into<String>,
         registered_snapshot: JsonValue,
     ) -> Self {
-        let schema_key = schema_key.into();
-        let schema_definition = schema_from_registered_snapshot(&registered_snapshot)
-            .ok()
-            .map(|(_, schema)| schema);
         Self {
-            schema_key,
-            schema_definition,
+            schema_key: schema_key.into(),
+            registered_snapshot: Some(registered_snapshot),
+            source: SchemaRegistrationSource::StoredLayout,
         }
     }
 
@@ -96,12 +128,23 @@ impl SchemaRegistration {
     ) -> Self {
         Self {
             schema_key: schema_key.into(),
-            schema_definition: Some(schema_definition),
+            registered_snapshot: None,
+            source: SchemaRegistrationSource::Layout(
+                storage::live_table_layout_from_schema(&schema_definition)
+                    .expect("schema definition should compile to a live layout"),
+            ),
         }
     }
 
-    pub(crate) fn schema_definition(&self) -> Option<&JsonValue> {
-        self.schema_definition.as_ref()
+    pub(crate) fn registered_snapshot(&self) -> Option<&JsonValue> {
+        self.registered_snapshot.as_ref()
+    }
+
+    pub(crate) fn layout_override(&self) -> Option<&storage::LiveTableLayout> {
+        match &self.source {
+            SchemaRegistrationSource::StoredLayout => None,
+            SchemaRegistrationSource::Layout(layout) => Some(layout),
+        }
     }
 }
 

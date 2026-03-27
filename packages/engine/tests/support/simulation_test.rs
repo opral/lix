@@ -15,8 +15,8 @@ use lix_engine::{
     CreateVersionResult, Engine, ExecuteOptions, ExecuteResult, LiveStateApplyReport,
     LiveStateRebuildDebugMode, LiveStateRebuildPlan, LiveStateRebuildReport,
     LiveStateRebuildRequest, LiveStateRebuildScope, LixBackend, LixError, MergeVersionOptions,
-    MergeVersionResult, ObserveEvents, ObserveQuery, RedoOptions, RedoResult, Session,
-    SessionTransaction, UndoOptions, UndoResult, Value, WasmRuntime,
+    MergeVersionResult, NoopWasmRuntime, ObserveEvents, ObserveQuery, RedoOptions, RedoResult,
+    Session, SessionTransaction, UndoOptions, UndoResult, Value, WasmRuntime,
 };
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex as TokioMutex;
@@ -497,10 +497,7 @@ fn enable_timestamp_shuffle_mode(key_values: &mut Vec<BootKeyValue>) {
 }
 
 fn default_simulation_wasm_runtime() -> Arc<dyn WasmRuntime> {
-    Arc::new(
-        crate::support::wasmtime_runtime::TestWasmtimeRuntime::new()
-            .expect("failed to initialize test wasmtime runtime"),
-    ) as Arc<dyn WasmRuntime>
+    Arc::new(NoopWasmRuntime) as Arc<dyn WasmRuntime>
 }
 
 #[derive(Clone)]

@@ -143,10 +143,17 @@ async fn load_live_table_layout_with_provider(
 fn requirement_from_registration(
     registration: &SchemaRegistration,
 ) -> Result<LiveTableRequirement, LixError> {
-    let layout = registration
-        .schema_definition()
-        .map(live_table_layout_from_schema)
-        .transpose()?;
+    let layout = if let Some(layout) = registration.layout_override() {
+        Some(layout.clone())
+    } else {
+        registration
+            .registered_snapshot()
+            .map(|snapshot| {
+                let (_, schema) = schema_from_registered_snapshot(snapshot)?;
+                live_table_layout_from_schema(&schema)
+            })
+            .transpose()?
+    };
     Ok(LiveTableRequirement {
         schema_key: registration.schema_key().to_string(),
         layout,

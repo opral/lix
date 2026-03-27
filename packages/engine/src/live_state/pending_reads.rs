@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::read::contracts::CommittedReadMode;
+use crate::read::contracts::{
+    committed_read_mode_from_prepared_public_read, CommittedReadMode, PublicReadExecutionMode,
+};
 use crate::sql::public::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::sql::public::runtime::{
     decode_public_read_result, execute_prepared_public_read, PreparedPublicRead,
@@ -84,8 +86,8 @@ impl<'a> TransactionReadModel<'a> {
             return execute_prepared_public_read(self.base, public_read).await;
         }
 
-        match prepared_public_read_transaction_mode(public_read) {
-            CommittedReadMode::PendingView => {
+        match public_read_execution_mode(public_read) {
+            PublicReadExecutionMode::PendingView => {
                 let query = live_table_query_from_prepared_public_read(public_read)
                     .expect("pending-view public reads must lower to a typed live-table query");
                 let result = self.execute_live_table_query(&query).await?;
@@ -94,7 +96,8 @@ impl<'a> TransactionReadModel<'a> {
                 }
                 Ok(result)
             }
-            CommittedReadMode::CommittedOnly | CommittedReadMode::MaterializedState => {
+            PublicReadExecutionMode::Committed(CommittedReadMode::CommittedOnly)
+            | PublicReadExecutionMode::Committed(CommittedReadMode::MaterializedState) => {
                 execute_prepared_public_read(self.base, public_read).await
             }
         }
@@ -337,18 +340,12 @@ pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view(
         .await
 }
 
-pub(crate) fn prepared_public_read_transaction_mode(
-    public_read: &PreparedPublicRead,
-) -> CommittedReadMode {
-    if public_read.direct_plan().is_some() {
-        return CommittedReadMode::CommittedOnly;
-    }
-
+pub(crate) fn public_read_execution_mode(public_read: &PreparedPublicRead) -> PublicReadExecutionMode {
     if live_table_query_from_prepared_public_read(public_read).is_some() {
-        return CommittedReadMode::PendingView;
+        return PublicReadExecutionMode::PendingView;
     }
 
-    CommittedReadMode::MaterializedState
+    PublicReadExecutionMode::Committed(committed_read_mode_from_prepared_public_read(public_read))
 }
 
 #[derive(Clone)]
