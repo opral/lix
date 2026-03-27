@@ -1,8 +1,5 @@
-use std::collections::BTreeMap;
-
 use crate::live_state::tracked::{TrackedWriteOperation, TrackedWriteRow};
 use crate::live_state::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
-use crate::live_state::SchemaRegistration;
 use crate::session::contracts::SessionStateDelta;
 use crate::state::stream::StateCommitStreamChange;
 use crate::LixError;
@@ -104,31 +101,6 @@ impl CommitOutcome {
             }
         }
         outcome
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SchemaRegistrationSet {
-    inner: BTreeMap<String, SchemaRegistration>,
-}
-
-impl SchemaRegistrationSet {
-    pub(crate) fn insert(&mut self, registration: impl Into<SchemaRegistration>) {
-        let registration = registration.into();
-        self.inner
-            .insert(registration.schema_key().to_string(), registration);
-    }
-
-    pub(crate) fn extend(&mut self, other: SchemaRegistrationSet) {
-        self.inner.extend(other.inner);
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    pub(crate) fn values(&self) -> impl Iterator<Item = &SchemaRegistration> {
-        self.inner.values()
     }
 }
 

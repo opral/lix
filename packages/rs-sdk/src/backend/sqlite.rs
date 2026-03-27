@@ -105,26 +105,12 @@ impl LixBackend for SqliteBackend {
             }))
         } else {
             match mode {
-                TransactionMode::Write => {
-                    // Nested sqlite write units use savepoints, but the
-                    // mode remains explicitly write-scoped.
-                    static FALLBACK_SP: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
-                    let id = FALLBACK_SP.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let name = format!("sp_auto_{id}");
-                    inner
-                        .execute_batch(&format!("SAVEPOINT {name}"))
-                        .map_err(|err| LixError {
-                            code: "LIX_ERROR_UNKNOWN".to_string(),
-                            description: err.to_string(),
-                        })?;
-                    Ok(Box::new(SqliteTransaction {
-                        conn,
-                        finalized: false,
-                        savepoint_name: Some(name),
-                        mode: TransactionMode::Write,
-                    }))
-                }
+                TransactionMode::Write => Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description:
+                        "sqlite backend cannot open a nested write transaction inside an active transaction; use begin_savepoint(...) for nested write scopes"
+                            .to_string(),
+                }),
                 TransactionMode::Read | TransactionMode::Deferred => Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description:

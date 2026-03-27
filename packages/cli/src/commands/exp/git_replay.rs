@@ -4,8 +4,8 @@ use crate::error::CliError;
 use async_trait::async_trait;
 use lix_rs_sdk::{
     BootKeyValue, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,
-    PreparedBatch as EnginePreparedBatch, QueryResult, SqlDialect, SqliteBackend, Value,
-    WasmtimeRuntime,
+    PreparedBatch as EnginePreparedBatch, QueryResult, SqlDialect, SqliteBackend, TransactionMode,
+    Value, WasmtimeRuntime,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -290,14 +290,21 @@ impl LixBackend for TracingSqliteBackend {
         self.inner.begin_savepoint(name).await
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_transaction(
+        &self,
+        mode: TransactionMode,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let started = Instant::now();
-        let result = self.inner.begin_transaction().await;
+        let result = self.inner.begin_transaction(mode).await;
         match result {
             Ok(inner) => {
                 self.collector.record_operation(
                     "begin_transaction",
-                    None,
+                    Some(match mode {
+                        TransactionMode::Read => "read",
+                        TransactionMode::Write => "write",
+                        TransactionMode::Deferred => "deferred",
+                    }),
                     &[],
                     started.elapsed(),
                     Some(0),
@@ -333,6 +340,10 @@ impl LixBackend for TracingSqliteBackend {
 impl LixBackendTransaction for TracingSqliteTransaction<'_> {
     fn dialect(&self) -> SqlDialect {
         self.inner.dialect()
+    }
+
+    fn mode(&self) -> TransactionMode {
+        self.inner.mode()
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
