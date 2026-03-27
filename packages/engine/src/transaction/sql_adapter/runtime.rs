@@ -15,6 +15,7 @@ use crate::sql::execution::contracts::planned_statement::{
 };
 use crate::sql::execution::contracts::result_contract::ResultContract;
 use crate::sql::execution::execute_prepared::execute_prepared_with_transaction;
+use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::sql::execution::shared_path;
 use crate::sql::public::runtime::{PreparedPublicRead, PreparedPublicWrite};
 use crate::sql::public::services::pending_reads::execute_prepared_public_read_with_pending_transaction_view;
@@ -30,9 +31,7 @@ use crate::transaction::coordinator::apply_schema_registrations_in_transaction;
 
 pub(crate) struct CompiledExecution {
     pub(crate) intent: crate::sql::execution::intent::ExecutionIntent,
-    pub(crate) settings: crate::deterministic_mode::DeterministicSettings,
-    pub(crate) sequence_start: i64,
-    pub(crate) functions: SharedFunctionProvider<RuntimeFunctionProvider>,
+    pub(crate) runtime_state: ExecutionRuntimeState,
     pub(crate) result_contract: ResultContract,
     pub(crate) effects: PlanEffects,
     pub(crate) read_only_query: bool,
@@ -203,7 +202,7 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
                 transaction,
                 internal,
                 step.execution().result_contract,
-                &step.execution().functions,
+                step.execution().runtime_state.provider(),
                 writer_key,
             )
             .await

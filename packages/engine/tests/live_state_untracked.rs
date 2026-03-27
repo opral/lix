@@ -4,10 +4,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use lix_engine::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use lix_engine::live_state::init as init_live_state;
-use lix_engine::live_state::system::{
-    active_version_write_row, load_active_version_with_backend, load_version_ref_with_backend,
-    version_ref_write_row,
-};
+use lix_engine::live_state::roots::{load_version_ref_with_backend, version_ref_write_row};
+use lix_engine::live_state::session::{active_version_write_row, load_active_version_with_backend};
 use lix_engine::live_state::untracked::{
     load_exact_row_with_backend, load_exact_rows_with_backend, scan_rows_with_backend,
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedScanRequest,

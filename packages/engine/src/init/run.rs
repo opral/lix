@@ -78,6 +78,9 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
         init.seed_boot_account()
             .await
             .map_err(|error| init_step_error("seed_boot_account", error))?;
+        init.persist_runtime_state()
+            .await
+            .map_err(|error| init_step_error("persist_runtime_state", error))?;
         drop(init);
         {
             let backend = TransactionBackendAdapter::new(transaction.as_mut());

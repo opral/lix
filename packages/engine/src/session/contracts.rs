@@ -12,6 +12,7 @@ pub enum SessionDependency {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionExecutionMode {
     CommittedRead,
+    CommittedRuntimeMutation,
     WriteTransaction,
 }
 

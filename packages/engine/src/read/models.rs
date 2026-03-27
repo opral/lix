@@ -1,11 +1,11 @@
+pub(crate) use super::history::{
+    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
+    StateHistoryRow, StateHistoryVersionScope,
+};
 pub(crate) use crate::change_view::TrackedDomainChangeView;
 pub(crate) use crate::filesystem::history::{
     DirectoryHistoryRequest, DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope,
     FileHistoryRequest, FileHistoryRootScope, FileHistoryRow, FileHistoryVersionScope,
-};
-pub(crate) use crate::state::history::{
-    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
-    StateHistoryRow, StateHistoryVersionScope,
 };
 use crate::{LixBackend, LixError};
 
@@ -13,7 +13,7 @@ pub(crate) async fn load_state_history_rows(
     backend: &dyn LixBackend,
     request: &StateHistoryRequest,
 ) -> Result<Vec<StateHistoryRow>, LixError> {
-    crate::state::history::load_state_history_rows(backend, request).await
+    super::history::load_state_history_rows(backend, request).await
 }
 
 pub(crate) async fn load_file_history_rows(

@@ -79,6 +79,62 @@ fn guardrail_sql_runtime_uses_single_public_lowering_entrypoint() {
 }
 
 #[test]
+fn guardrail_deterministic_runtime_uses_owned_execution_state_without_post_read_repair() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let session_source =
+        fs::read_to_string(root.join("session/mod.rs")).expect("session/mod.rs should be readable");
+    let shared_path_source = fs::read_to_string(root.join("sql/execution/shared_path.rs"))
+        .expect("shared_path.rs should be readable");
+    let runtime_state_source = fs::read_to_string(root.join("sql/execution/runtime_state.rs"))
+        .expect("runtime_state.rs should be readable");
+
+    assert!(
+        !session_source.contains("persist_runtime_sequence_with_backend"),
+        "session/mod.rs must not reopen a write unit after committed reads to repair deterministic state"
+    );
+    assert!(
+        shared_path_source.contains("runtime_state: Option<&ExecutionRuntimeState>"),
+        "shared_path should accept the owned execution runtime state instead of ad hoc override integers"
+    );
+    assert!(
+        !shared_path_source.contains("sequence_start_override"),
+        "shared_path must not reintroduce sequence_start_override plumbing"
+    );
+    assert!(
+        runtime_state_source.contains("struct ExecutionRuntimeState"),
+        "sql/execution/runtime_state.rs should own execution runtime state"
+    );
+    assert!(
+        runtime_state_source.contains("struct ExecutionRuntimeEffects"),
+        "sql/execution/runtime_state.rs should expose explicit runtime effects for routing"
+    );
+}
+
+#[test]
+fn guardrail_deterministic_sequence_storage_uses_in_transaction_row_locking_contract() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let source = fs::read_to_string(root.join("deterministic_mode/mod.rs"))
+        .expect("deterministic_mode/mod.rs should be readable");
+
+    assert!(
+        source.contains("build_ensure_runtime_sequence_row_sql"),
+        "deterministic mode should ensure the sequence row exists before loading it in transaction"
+    );
+    assert!(
+        source.contains("build_lock_runtime_sequence_row_sql"),
+        "deterministic mode should own the locking read helper for the sequence row"
+    );
+    assert!(
+        source.contains("FOR UPDATE"),
+        "deterministic mode should lock the sequence row on Postgres before allocating counters"
+    );
+    assert!(
+        source.contains("DO NOTHING"),
+        "deterministic mode should initialize the sequence row with insert-if-missing semantics"
+    );
+}
+
+#[test]
 fn guardrail_sql_legacy_contract_adapter_directory_stays_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
@@ -199,7 +255,8 @@ fn guardrail_sql_public_runtime_uses_service_seams_for_storage_and_pending_reads
         for forbidden in [
             "crate::live_state::raw::",
             "crate::live_state::tracked::",
-            "crate::live_state::system::",
+            "crate::live_state::session::",
+            "crate::live_state::roots::",
             "crate::canonical::readers::",
             "shared_path::execute_prepared_public_read_with_pending_transaction_view",
             "shared_path::bootstrap_public_surface_registry_with_pending_transaction_view",

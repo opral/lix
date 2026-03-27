@@ -294,9 +294,8 @@ pub(super) async fn complete_sql_command_execution(
         engine
             .persist_runtime_sequence_in_transaction(
                 transaction,
-                command.compiled.execution().settings,
-                command.compiled.execution().sequence_start,
-                &command.compiled.execution().functions,
+                command.compiled.execution().runtime_state.settings(),
+                command.compiled.execution().runtime_state.provider(),
             )
             .await
             .map_err(|error| LixError {

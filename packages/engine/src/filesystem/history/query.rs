@@ -1,5 +1,5 @@
 use crate::plugin::runtime::load_binary_blob_data_by_hash;
-use crate::state::history::{
+use crate::read::models::{
     load_state_history_rows, StateHistoryContentMode, StateHistoryLineageScope,
     StateHistoryRequest, StateHistoryRootScope, StateHistoryVersionScope,
 };

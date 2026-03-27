@@ -8,6 +8,7 @@ use crate::sql::execution::execution_program::{
     execute_execution_program_with_write_transaction, BoundStatementTemplateInstance,
     ExecutionContext, ExecutionProgram,
 };
+use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::transaction::PendingTransactionView;
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -37,6 +38,12 @@ pub(crate) async fn execute_parsed_statements_in_write_transaction(
     let dialect = write_transaction.backend_transaction_mut()?.dialect();
     let runtime_bindings = context.runtime_binding_values()?;
     let program = ExecutionProgram::compile(parsed_statements, params, dialect, &runtime_bindings)?;
+    ensure_execution_runtime_state_for_write_scope(
+        engine,
+        write_transaction.backend_transaction_mut()?,
+        context,
+    )
+    .await?;
     execute_execution_program_with_write_transaction(
         engine,
         write_transaction,
@@ -58,6 +65,12 @@ pub(crate) async fn execute_parsed_statements_in_borrowed_write_transaction(
     let dialect = write_transaction.backend_transaction_mut().dialect();
     let runtime_bindings = context.runtime_binding_values()?;
     let program = ExecutionProgram::compile(parsed_statements, params, dialect, &runtime_bindings)?;
+    ensure_execution_runtime_state_for_write_scope(
+        engine,
+        write_transaction.backend_transaction_mut(),
+        context,
+    )
+    .await?;
     execute_execution_program_with_borrowed_write_transaction(
         engine,
         write_transaction,
@@ -82,6 +95,12 @@ pub(crate) async fn execute_with_options_in_write_transaction(
         let transaction = write_transaction.backend_transaction_mut()?;
         bind_single_statement_template(transaction, sql, params, allow_internal_tables, context)?
     };
+    ensure_execution_runtime_state_for_write_scope(
+        engine,
+        write_transaction.backend_transaction_mut()?,
+        context,
+    )
+    .await?;
     let mut scope = SqlBufferedWriteScope::Owned(write_transaction);
     execute_bound_statement_template_instance_in_buffered_write_scope(
         engine,
@@ -93,6 +112,20 @@ pub(crate) async fn execute_with_options_in_write_transaction(
         skip_side_effect_collection,
     )
     .await
+}
+
+async fn ensure_execution_runtime_state_for_write_scope(
+    engine: &Engine,
+    transaction: &mut dyn LixBackendTransaction,
+    context: &mut ExecutionContext,
+) -> Result<(), LixError> {
+    if context.execution_runtime_state().is_some() {
+        return Ok(());
+    }
+    let backend = crate::engine::TransactionBackendAdapter::new(transaction);
+    let runtime_state = ExecutionRuntimeState::prepare(engine, &backend).await?;
+    context.set_execution_runtime_state(runtime_state);
+    Ok(())
 }
 
 pub(crate) async fn execute_bound_statement_template_instance_in_write_transaction(

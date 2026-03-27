@@ -15,7 +15,7 @@ pub(super) async fn run_public_untracked_write_txn_with_transaction(
     transaction: &mut dyn LixBackendTransaction,
     plan: &PlannedPublicUntrackedWriteUnit,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    let mut runtime_functions = plan.functions.clone();
+    let mut runtime_functions = plan.runtime_state.provider().clone();
     let timestamp = runtime_functions.timestamp();
 
     if plan.execution.persist_filesystem_payloads_before_write {
@@ -64,9 +64,8 @@ pub(super) async fn run_public_untracked_write_txn_with_transaction(
     engine
         .persist_runtime_sequence_in_transaction(
             transaction,
-            plan.settings,
-            plan.sequence_start,
-            &plan.functions,
+            plan.runtime_state.settings(),
+            plan.runtime_state.provider(),
         )
         .await
         .map_err(|error| LixError {

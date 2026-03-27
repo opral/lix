@@ -6,7 +6,6 @@ use crate::canonical::append::{
     CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
 };
 use crate::canonical::ProposedDomainChange;
-use crate::deterministic_mode::DeterministicSettings;
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::LixFunctionProvider;
 use crate::sql::public::validation::{validate_commit_time_write, SchemaCache};
@@ -65,7 +64,7 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
         return Ok(Some(empty_public_write_execution_outcome()));
     }
 
-    let mut create_commit_functions = unit.functions.clone();
+    let mut create_commit_functions = unit.runtime_state.provider().clone();
     let canonical_preconditions = canonical_create_commit_preconditions_for_tracked_unit(unit)?;
     if pending_commit_session
         .as_ref()
@@ -121,13 +120,10 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
             .deterministic_sequence_persist_highest_seen()
             .is_some()
     {
-        let mut settings = DeterministicSettings::disabled();
-        settings.enabled = create_commit_functions.deterministic_sequence_enabled();
         engine
             .persist_runtime_sequence_in_transaction(
                 transaction,
-                settings,
-                0,
+                unit.runtime_state.settings(),
                 &create_commit_functions,
             )
             .await?;

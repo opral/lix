@@ -1,6 +1,7 @@
 use serde_json::Value as JsonValue;
 
 use crate::backend::prepared::PreparedBatch;
+use crate::engine::TransactionBackendAdapter;
 use crate::errors::classification::is_missing_relation_error;
 use crate::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
 use crate::key_value::{
@@ -12,7 +13,7 @@ use crate::live_state::{
     untracked_live_table_name,
 };
 use crate::sql_support::text::escape_sql_string;
-use crate::{LixBackend, LixError, SqlDialect, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, SqlDialect, Value};
 
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 const SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
@@ -187,6 +188,42 @@ pub(crate) async fn load_runtime_settings(
         .unwrap_or_else(DeterministicSettings::disabled))
 }
 
+pub(crate) async fn load_runtime_sequence_start_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<i64, LixError> {
+    let visible_sequence_start = {
+        let backend = TransactionBackendAdapter::new(transaction);
+        load_runtime_sequence_start(&backend).await?
+    };
+    let ensure_sql =
+        build_ensure_runtime_sequence_row_sql(visible_sequence_start - 1, transaction.dialect());
+    transaction.execute(&ensure_sql, &[]).await?;
+
+    let load_sql = build_lock_runtime_sequence_row_sql(transaction.dialect());
+    let result = transaction.execute(&load_sql, &[]).await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(0);
+    };
+    let Some(value_json) = row.first() else {
+        return Ok(0);
+    };
+    let raw = value_to_string(value_json, "value_json")?;
+    let parsed: JsonValue = serde_json::from_str(&raw).map_err(|err| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!("deterministic sequence value_json invalid JSON: {err}"),
+    })?;
+    Ok(parsed.as_i64().unwrap_or(-1) + 1)
+}
+
+pub(crate) fn build_persist_sequence_highest_batch(
+    highest_seen: i64,
+    dialect: SqlDialect,
+) -> Result<PreparedBatch, LixError> {
+    let mut batch = PreparedBatch { steps: Vec::new() };
+    batch.append_sql(build_update_runtime_sequence_highest_sql(highest_seen, dialect));
+    Ok(batch)
+}
+
 pub(crate) async fn load_runtime_sequence_start(backend: &dyn LixBackend) -> Result<i64, LixError> {
     let values = match load_key_value_payloads(backend, &[SEQUENCE_KEY]).await {
         Ok(values) => values,
@@ -198,16 +235,10 @@ pub(crate) async fn load_runtime_sequence_start(backend: &dyn LixBackend) -> Res
     Ok(highest_seen.unwrap_or(-1) + 1)
 }
 
-pub(crate) fn build_persist_sequence_highest_batch(
+pub(crate) fn build_ensure_runtime_sequence_row_sql(
     highest_seen: i64,
     _dialect: SqlDialect,
-) -> Result<PreparedBatch, LixError> {
-    let mut batch = PreparedBatch { steps: Vec::new() };
-    batch.append_sql(build_persist_sequence_highest_sql(highest_seen));
-    Ok(batch)
-}
-
-pub(crate) fn build_persist_sequence_highest_sql(highest_seen: i64) -> String {
+) -> String {
     let layout = builtin_live_table_layout(key_value_schema_key())
         .expect("builtin key-value schema layout should compile")
         .expect("builtin key-value schema layout should exist");
@@ -222,16 +253,7 @@ pub(crate) fn build_persist_sequence_highest_sql(highest_seen: i64) -> String {
         "INSERT INTO {table_name} \
          (entity_id, schema_key, file_id, version_id, global, plugin_key, metadata, writer_key, schema_version, untracked, created_at, updated_at, {key_column}, {value_column}) \
          VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', FALSE, '{plugin_key}', NULL, NULL, '{schema_version}', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{key_value}', '{value_json}') \
-         ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
-           global = excluded.global, \
-           plugin_key = excluded.plugin_key, \
-           metadata = excluded.metadata, \
-           writer_key = excluded.writer_key, \
-           schema_version = excluded.schema_version, \
-           untracked = excluded.untracked, \
-           {key_column} = excluded.{key_column}, \
-           {value_column} = excluded.{value_column}, \
-           updated_at = CURRENT_TIMESTAMP",
+         ON CONFLICT (entity_id, file_id, version_id, untracked) DO NOTHING",
         table_name = untracked_live_table_name(key_value_schema_key()),
         key_column = key_column,
         value_column = value_column,
@@ -243,6 +265,66 @@ pub(crate) fn build_persist_sequence_highest_sql(highest_seen: i64) -> String {
         version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
         plugin_key = escape_sql_string(key_value_plugin_key()),
         schema_version = escape_sql_string(key_value_schema_version()),
+    )
+}
+
+pub(crate) fn build_lock_runtime_sequence_row_sql(dialect: SqlDialect) -> String {
+    let layout = builtin_live_table_layout(key_value_schema_key())
+        .expect("builtin key-value schema layout should compile")
+        .expect("builtin key-value schema layout should exist");
+    let value_column = live_column_name_for_property(&layout, "value")
+        .expect("key-value live layout should include value");
+    let for_update = match dialect {
+        SqlDialect::Postgres => " FOR UPDATE",
+        SqlDialect::Sqlite => "",
+    };
+
+    format!(
+        "SELECT {value_column} AS value_json \
+         FROM {table_name} \
+         WHERE entity_id = '{entity_id}' \
+           AND schema_key = '{schema_key}' \
+           AND file_id = '{file_id}' \
+           AND version_id = '{version_id}' \
+           AND untracked = true \
+         LIMIT 1{for_update}",
+        value_column = value_column,
+        table_name = untracked_live_table_name(key_value_schema_key()),
+        entity_id = escape_sql_string(SEQUENCE_KEY),
+        schema_key = escape_sql_string(key_value_schema_key()),
+        file_id = escape_sql_string(key_value_file_id()),
+        version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
+        for_update = for_update,
+    )
+}
+
+pub(crate) fn build_update_runtime_sequence_highest_sql(
+    highest_seen: i64,
+    _dialect: SqlDialect,
+) -> String {
+    let layout = builtin_live_table_layout(key_value_schema_key())
+        .expect("builtin key-value schema layout should compile")
+        .expect("builtin key-value schema layout should exist");
+    let value_column = live_column_name_for_property(&layout, "value")
+        .expect("key-value live layout should include value");
+    let value_json = serde_json::to_string(&serde_json::Value::from(highest_seen))
+        .expect("deterministic highest-seen JSON serialization should succeed");
+
+    format!(
+        "UPDATE {table_name} \
+         SET {value_column} = '{value_json}', updated_at = CURRENT_TIMESTAMP \
+         WHERE entity_id = '{entity_id}' \
+           AND schema_key = '{schema_key}' \
+           AND file_id = '{file_id}' \
+           AND version_id = '{version_id}' \
+           AND untracked = true",
+        table_name = untracked_live_table_name(key_value_schema_key()),
+        value_column = value_column,
+        value_json = escape_sql_string(&value_json),
+        entity_id = escape_sql_string(SEQUENCE_KEY),
+        schema_key = escape_sql_string(key_value_schema_key()),
+        file_id = escape_sql_string(key_value_file_id()),
+        version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
     )
 }
 

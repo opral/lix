@@ -28,6 +28,7 @@ use crate::sql::execution::intent::{
     collect_execution_intent_with_backend, ExecutionIntent, IntentCollectionPolicy,
 };
 use crate::sql::execution::preprocess::preprocess_with_surfaces_to_plan;
+use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::transaction::sql_adapter::{
     CompiledExecution, CompiledExecutionBody, CompiledExecutionStep, CompiledInternalExecution,
     SqlExecutionOutcome,
@@ -46,7 +47,6 @@ pub(crate) struct PreparationPolicy {
 struct StaticCompilationArtifacts<'a> {
     ownership_hint: Option<StatementTemplateOwnership>,
     plan_requirements: Option<&'a PlanRequirements>,
-    requires_generated_filesystem_insert_id: Option<bool>,
 }
 
 pub(crate) fn prepared_execution_mutates_public_surface_registry(
@@ -87,18 +87,19 @@ async fn compile_execution_with_backend(
     allow_internal_tables: bool,
     public_surface_registry_override: Option<&crate::sql::public::catalog::SurfaceRegistry>,
     policy: PreparationPolicy,
+    runtime_state: Option<&ExecutionRuntimeState>,
     static_artifacts: StaticCompilationArtifacts<'_>,
 ) -> Result<CompiledExecution, LixError> {
-    let requires_generated_filesystem_insert_id = static_artifacts
-        .requires_generated_filesystem_insert_id
-        .unwrap_or_else(|| {
-            crate::filesystem::statements_require_generated_filesystem_insert_ids(parsed_statements)
-        });
-    let defer_runtime_sequence_load =
-        !allow_internal_tables && !requires_generated_filesystem_insert_id;
-    let (settings, sequence_start, functions) = engine
-        .prepare_runtime_functions_with_backend(backend, defer_runtime_sequence_load)
-        .await?;
+    let owned_runtime_state = match runtime_state {
+        Some(_) => None,
+        None => Some(ExecutionRuntimeState::prepare(engine, backend).await?),
+    };
+    let runtime_state = runtime_state.unwrap_or_else(|| {
+        owned_runtime_state
+            .as_ref()
+            .expect("owned runtime state should exist when no caller-owned state is provided")
+    });
+    let functions = runtime_state.provider().clone();
 
     let mut statements = parsed_statements.to_vec();
     crate::filesystem::ensure_generated_filesystem_insert_ids(&mut statements, &functions)?;
@@ -284,9 +285,7 @@ async fn compile_execution_with_backend(
 
     Ok(CompiledExecution {
         intent,
-        settings,
-        sequence_start,
-        functions,
+        runtime_state: runtime_state.clone(),
         result_contract,
         effects,
         read_only_query: requirements.read_only_query,
@@ -415,6 +414,7 @@ pub(crate) async fn compile_execution_step_from_template_instance_with_backend(
     writer_key: Option<&str>,
     allow_internal_tables: bool,
     public_surface_registry_override: Option<&crate::sql::public::catalog::SurfaceRegistry>,
+    runtime_state: Option<&ExecutionRuntimeState>,
     policy: PreparationPolicy,
 ) -> Result<CompiledExecutionStep, LixError> {
     let prepared = compile_execution_with_backend(
@@ -429,12 +429,10 @@ pub(crate) async fn compile_execution_step_from_template_instance_with_backend(
         allow_internal_tables,
         public_surface_registry_override,
         policy,
+        runtime_state,
         StaticCompilationArtifacts {
             ownership_hint: template_instance.ownership_hint(),
             plan_requirements: Some(template_instance.plan_requirements()),
-            requires_generated_filesystem_insert_id: Some(
-                template_instance.requires_generated_filesystem_insert_id(),
-            ),
         },
     )
     .await?;

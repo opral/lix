@@ -2730,7 +2730,7 @@ mod tests {
         prepare_public_read_strict, DirectPublicReadPlan, PreparedPublicExecution,
         PreparedPublicReadExecution,
     };
-    use crate::state::history::StateHistoryRootScope;
+    use crate::read::models::StateHistoryRootScope;
     use crate::{LixBackend, LixError, QueryResult, Session, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::json;

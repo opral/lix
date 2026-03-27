@@ -24,6 +24,7 @@ use crate::sql::execution::execution_program::{
     SessionExecutionRuntime, SessionExecutionRuntimeHandle,
 };
 use crate::sql::execution::parse::parse_sql;
+use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::transaction::{TransactionCommitOutcome, WriteTransaction};
@@ -347,62 +348,69 @@ impl Session {
             &runtime_bindings,
         )?;
 
-        if classify_session_execution_mode(&program, explicit_transaction_script)
-            == SessionExecutionMode::CommittedRead
-        {
-            let transaction_mode = transaction_mode_for_committed_read_program(
-                self.engine.as_ref(),
-                &program,
-                allow_internal_sql,
-                &context,
-            )
-            .await?;
-            let mut transaction = self.engine.begin_read_unit(transaction_mode).await?;
-            let result = execute_execution_program_in_committed_read_transaction(
-                self.engine.as_ref(),
-                transaction.as_mut(),
-                &program,
-                allow_internal_sql,
-                &context,
-            )
-            .await;
-            match result {
-                Ok(result) => {
-                    transaction.commit().await?;
-                    return Ok(result);
+        let execution_mode = classify_session_execution_mode(&program, explicit_transaction_script);
+        let runtime_state =
+            ExecutionRuntimeState::prepare(self.engine.as_ref(), self.engine.backend.as_ref())
+                .await?;
+        context.set_execution_runtime_state(runtime_state.clone());
+
+        let result = match execution_mode {
+            SessionExecutionMode::CommittedRead | SessionExecutionMode::CommittedRuntimeMutation => {
+                let transaction_mode =
+                    transaction_mode_for_committed_read_program(execution_mode, &runtime_state);
+                let mut transaction = self.engine.begin_read_unit(transaction_mode).await?;
+                let result = execute_execution_program_in_committed_read_transaction(
+                    self.engine.as_ref(),
+                    transaction.as_mut(),
+                    &program,
+                    allow_internal_sql,
+                    &context,
+                )
+                .await;
+                match result {
+                    Ok(result) => {
+                        transaction.commit().await?;
+                        context.clear_execution_runtime_state();
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        context.clear_execution_runtime_state();
+                        Err(error)
+                    }
                 }
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
+            }
+            SessionExecutionMode::WriteTransaction => {
+                let transaction = self.engine.begin_write_unit().await?;
+                let mut write_transaction = WriteTransaction::new_buffered_write(transaction);
+
+                let result = execute_execution_program_with_write_transaction(
+                    self.engine.as_ref(),
+                    &mut write_transaction,
+                    &program,
+                    allow_internal_sql,
+                    &mut context,
+                )
+                .await;
+
+                match result {
+                    Ok(result) => {
+                        context.clear_execution_runtime_state();
+                        let outcome = write_transaction
+                            .commit_buffered_write(self.engine.as_ref(), context)
+                            .await?;
+                        self.apply_transaction_commit_outcome(outcome).await?;
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        let _ = write_transaction.rollback_buffered_write().await;
+                        context.clear_execution_runtime_state();
+                        Err(error)
+                    }
                 }
             }
-        }
-
-        let transaction = self.engine.begin_write_unit().await?;
-        let mut write_transaction = WriteTransaction::new_buffered_write(transaction);
-
-        let result = execute_execution_program_with_write_transaction(
-            self.engine.as_ref(),
-            &mut write_transaction,
-            &program,
-            allow_internal_sql,
-            &mut context,
-        )
-        .await;
-
-        match result {
-            Ok(result) => {
-                let outcome = write_transaction
-                    .commit_buffered_write(self.engine.as_ref(), context)
-                    .await?;
-                self.apply_transaction_commit_outcome(outcome).await?;
-                Ok(result)
-            }
-            Err(error) => {
-                let _ = write_transaction.rollback_buffered_write().await;
-                Err(error)
-            }
-        }
+        };
+        result
     }
 
     pub async fn begin_transaction_with_options(
@@ -552,7 +560,14 @@ fn classify_session_execution_mode(
     explicit_transaction_script: bool,
 ) -> SessionExecutionMode {
     if !explicit_transaction_script && program.is_plain_committed_read() {
-        SessionExecutionMode::CommittedRead
+        if program
+            .runtime_effects()
+            .requires_deterministic_sequence_persistence
+        {
+            SessionExecutionMode::CommittedRuntimeMutation
+        } else {
+            SessionExecutionMode::CommittedRead
+        }
     } else {
         SessionExecutionMode::WriteTransaction
     }
@@ -963,6 +978,33 @@ mod tests {
                 .expect("plain read should succeed");
             assert_eq!(result.statements[0].rows[0][0], crate::Value::Integer(1));
             assert_eq!(backend.modes(), vec![crate::TransactionMode::Read]);
+        });
+    }
+
+    #[test]
+    fn deterministic_reads_classify_as_committed_runtime_mutation() {
+        run_with_large_stack(|| async move {
+            let backend = RecordingBackend::new();
+            let engine = test_engine(backend.clone());
+            let session = Session::new_for_test(engine, "version-test".to_string(), Vec::new());
+            let parsed_statements =
+                parse_sql("SELECT lix_uuid_v7()").expect("parse SQL should succeed");
+            let runtime_bindings = session
+                .new_execution_context(ExecuteOptions::default())
+                .runtime_binding_values()
+                .expect("runtime bindings should succeed");
+            let program = ExecutionProgram::compile(
+                parsed_statements,
+                &[],
+                crate::SqlDialect::Sqlite,
+                &runtime_bindings,
+            )
+            .expect("execution program compilation should succeed");
+
+            assert_eq!(
+                classify_session_execution_mode(&program, false),
+                SessionExecutionMode::CommittedRuntimeMutation
+            );
         });
     }
 

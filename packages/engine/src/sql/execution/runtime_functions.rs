@@ -1,10 +1,10 @@
 use crate::backend::program::WriteProgram;
 use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::deterministic_mode::{
-    build_persist_sequence_highest_batch, load_runtime_sequence_start, load_runtime_settings,
-    DeterministicSettings, RuntimeFunctionProvider,
+    build_persist_sequence_highest_batch, load_runtime_sequence_start_in_transaction,
+    load_runtime_settings, DeterministicSettings, RuntimeFunctionProvider,
 };
-use crate::engine::{Engine, TransactionBackendAdapter};
+use crate::engine::Engine;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::{LixBackend, LixBackendTransaction, LixError};
 
@@ -12,15 +12,8 @@ impl Engine {
     pub(crate) async fn prepare_runtime_functions_with_backend(
         &self,
         backend: &dyn LixBackend,
-        defer_sequence_load: bool,
-    ) -> Result<
-        (
-            DeterministicSettings,
-            i64,
-            SharedFunctionProvider<RuntimeFunctionProvider>,
-        ),
-        LixError,
-    > {
+    ) -> Result<(DeterministicSettings, SharedFunctionProvider<RuntimeFunctionProvider>), LixError>
+    {
         let settings = if self.deterministic_boot_pending() {
             self.boot_deterministic_settings()
                 .unwrap_or_else(DeterministicSettings::disabled)
@@ -32,20 +25,8 @@ impl Engine {
             settings
         };
 
-        let sequence_start = if settings.enabled && !defer_sequence_load {
-            load_runtime_sequence_start(backend).await?
-        } else {
-            0
-        };
-        let functions = SharedFunctionProvider::new(RuntimeFunctionProvider::new(
-            settings,
-            if settings.enabled && defer_sequence_load {
-                None
-            } else {
-                Some(sequence_start)
-            },
-        ));
-        Ok((settings, sequence_start, functions))
+        let functions = SharedFunctionProvider::new(RuntimeFunctionProvider::new(settings, None));
+        Ok((settings, functions))
     }
 
     pub(crate) async fn ensure_runtime_sequence_initialized_in_transaction(
@@ -58,8 +39,7 @@ impl Engine {
         {
             return Ok(());
         }
-        let backend = TransactionBackendAdapter::new(transaction);
-        let sequence_start = load_runtime_sequence_start(&backend).await?;
+        let sequence_start = load_runtime_sequence_start_in_transaction(transaction).await?;
         let mut functions = functions.clone();
         functions.initialize_deterministic_sequence(sequence_start);
         Ok(())
@@ -69,7 +49,6 @@ impl Engine {
         &self,
         transaction: &mut dyn LixBackendTransaction,
         settings: DeterministicSettings,
-        _sequence_start: i64,
         functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
     ) -> Result<(), LixError> {
         if settings.enabled {
@@ -147,23 +126,21 @@ mod tests {
         };
         let engine = boot(BootArgs::new(Box::new(backend), Arc::new(NoopWasmRuntime)));
 
-        let (settings, sequence_start, _) = engine
-            .prepare_runtime_functions_with_backend(engine.backend.as_ref(), false)
+        let (settings, _) = engine
+            .prepare_runtime_functions_with_backend(engine.backend.as_ref())
             .await
             .expect("first runtime preparation should succeed");
         assert!(!settings.enabled);
-        assert_eq!(sequence_start, 0);
         assert_eq!(
             execute_calls.load(Ordering::SeqCst),
             1,
             "first call should read deterministic settings from the backend"
         );
 
-        let (_settings, sequence_start, _) = engine
-            .prepare_runtime_functions_with_backend(engine.backend.as_ref(), false)
+        let (_settings, _) = engine
+            .prepare_runtime_functions_with_backend(engine.backend.as_ref())
             .await
             .expect("second runtime preparation should succeed");
-        assert_eq!(sequence_start, 0);
         assert_eq!(
             execute_calls.load(Ordering::SeqCst),
             1,
@@ -172,11 +149,10 @@ mod tests {
 
         engine.invalidate_deterministic_settings_cache();
 
-        let (_settings, sequence_start, _) = engine
-            .prepare_runtime_functions_with_backend(engine.backend.as_ref(), false)
+        let (_settings, _) = engine
+            .prepare_runtime_functions_with_backend(engine.backend.as_ref())
             .await
             .expect("runtime preparation after invalidation should succeed");
-        assert_eq!(sequence_start, 0);
         assert_eq!(
             execute_calls.load(Ordering::SeqCst),
             2,

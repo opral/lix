@@ -15,7 +15,7 @@ pub(super) async fn run_internal_write_txn_with_transaction(
         transaction,
         &plan.execution,
         plan.result_contract,
-        &plan.functions,
+        plan.runtime_state.provider(),
         plan.writer_key.as_deref(),
     )
     .await
@@ -49,12 +49,7 @@ pub(super) async fn run_internal_write_txn_with_transaction(
     }
 
     engine
-        .persist_runtime_sequence_in_transaction(
-            transaction,
-            plan.settings,
-            plan.sequence_start,
-            &plan.functions,
-        )
+        .persist_runtime_sequence_in_transaction(transaction, plan.runtime_state.settings(), plan.runtime_state.provider())
         .await
         .map_err(|error| LixError {
             code: error.code,

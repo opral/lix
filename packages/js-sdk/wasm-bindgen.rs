@@ -1145,11 +1145,14 @@ export type LixObserveEvents = {
                             .to_string(),
                 })?;
             let transaction = begin_transaction
-                .call1(&self.backend, &JsValue::from_str(match mode {
-                    TransactionMode::Read => "read",
-                    TransactionMode::Write => "write",
-                    TransactionMode::Deferred => "deferred",
-                }))
+                .call1(
+                    &self.backend,
+                    &JsValue::from_str(match mode {
+                        TransactionMode::Read => "read",
+                        TransactionMode::Write => "write",
+                        TransactionMode::Deferred => "deferred",
+                    }),
+                )
                 .map_err(js_to_lix_error)?;
             let transaction = Self::await_if_promise(transaction).await?;
             if transaction.is_null() || transaction.is_undefined() {
