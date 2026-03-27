@@ -38,8 +38,6 @@ pub use schema::{
     validate_lix_schema_definition,
 };
 
-pub use backend::execute_auto_transactional;
-pub use backend::execute_statement_with_backend;
 pub use backend::prepared::{
     collapse_prepared_batch_for_dialect, PreparedBatch, PreparedStatement,
 };

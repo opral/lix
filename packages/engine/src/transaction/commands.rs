@@ -9,7 +9,7 @@ use super::write_plan::PlannedWriteDelta;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BufferedWriteExecutionRoute {
     Internal,
-    PublicReadMaterializedState,
+    PublicReadCommitted,
     Other,
 }
 

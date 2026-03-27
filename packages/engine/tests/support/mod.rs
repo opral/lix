@@ -1,6 +1,5 @@
 pub mod simulation_test;
 pub mod simulations;
-pub mod wasmtime_runtime;
 
 #[macro_export]
 macro_rules! simulation_test {

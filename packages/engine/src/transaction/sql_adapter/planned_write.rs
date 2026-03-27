@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::live_state::{coalesce_live_table_requirements, SchemaRegistration};
+use crate::live_state::{
+    coalesce_live_table_requirements, SchemaRegistration, SchemaRegistrationSet,
+};
+use crate::sql::execution::compiled::{CompiledExecution, CompiledInternalExecution};
 use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::LixError;
 
@@ -11,8 +14,6 @@ use super::{
     PlanEffects, PreparedPublicWrite, PublicWriteExecutionPartition, ResultContract,
     TrackedTxnUnit, UntrackedWriteExecution, WriteMode,
 };
-use super::{CompiledExecution, CompiledInternalExecution};
-use crate::transaction::contracts::SchemaRegistrationSet;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const GLOBAL_VERSION_ID: &str = "global";

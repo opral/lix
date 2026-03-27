@@ -1,23 +1,20 @@
 use std::collections::BTreeSet;
 
-use crate::backend::prepared::PreparedStatement;
 use crate::canonical::pending_session::PendingPublicCommitSession;
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::engine::{
     normalize_sql_execution_error_with_backend, Engine, TransactionBackendAdapter,
 };
 use crate::functions::SharedFunctionProvider;
-use crate::live_state::{coalesce_live_table_requirements, SchemaRegistration};
+use crate::live_state::SchemaRegistrationSet;
+use crate::sql::execution::compiled::{
+    schema_registrations_for_compiled_execution, CompiledExecution, CompiledInternalExecution,
+};
 use crate::sql::execution::contracts::effects::PlanEffects;
 use crate::sql::execution::contracts::executor_error::ExecutorError;
-use crate::sql::execution::contracts::planned_statement::{
-    MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
-};
 use crate::sql::execution::contracts::result_contract::ResultContract;
 use crate::sql::execution::execute_prepared::execute_prepared_with_transaction;
-use crate::sql::execution::runtime_state::ExecutionRuntimeState;
-use crate::sql::execution::shared_path;
-use crate::sql::public::runtime::{PreparedPublicRead, PreparedPublicWrite};
+use crate::sql::public::runtime::PreparedPublicRead;
 use crate::sql::public::services::pending_reads::execute_prepared_public_read_with_pending_transaction_view;
 use crate::state::stream::StateCommitStreamChange;
 use crate::transaction::PendingTransactionView;
@@ -26,56 +23,7 @@ use sqlparser::ast::Statement;
 
 use super::planned_write::{build_planned_write_delta, PlannedWriteDelta};
 use super::planned_write_runner::execute_planned_write_delta;
-use crate::transaction::contracts::SchemaRegistrationSet;
 use crate::transaction::coordinator::apply_schema_registrations_in_transaction;
-
-pub(crate) struct CompiledExecution {
-    pub(crate) intent: crate::sql::execution::intent::ExecutionIntent,
-    pub(crate) runtime_state: ExecutionRuntimeState,
-    pub(crate) result_contract: ResultContract,
-    pub(crate) effects: PlanEffects,
-    pub(crate) read_only_query: bool,
-    pub(crate) body: CompiledExecutionBody,
-}
-
-pub(crate) enum CompiledExecutionBody {
-    PublicRead(PreparedPublicRead),
-    PublicWrite(PreparedPublicWrite),
-    Internal(CompiledInternalExecution),
-}
-
-impl CompiledExecution {
-    pub(crate) fn public_read(&self) -> Option<&PreparedPublicRead> {
-        match &self.body {
-            CompiledExecutionBody::PublicRead(read) => Some(read),
-            CompiledExecutionBody::PublicWrite(_) | CompiledExecutionBody::Internal(_) => None,
-        }
-    }
-
-    pub(crate) fn public_write(&self) -> Option<&PreparedPublicWrite> {
-        match &self.body {
-            CompiledExecutionBody::PublicWrite(write) => Some(write),
-            CompiledExecutionBody::PublicRead(_) | CompiledExecutionBody::Internal(_) => None,
-        }
-    }
-
-    pub(crate) fn internal_execution(&self) -> Option<&CompiledInternalExecution> {
-        match &self.body {
-            CompiledExecutionBody::Internal(internal) => Some(internal),
-            CompiledExecutionBody::PublicRead(_) | CompiledExecutionBody::PublicWrite(_) => None,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct CompiledInternalExecution {
-    pub(crate) prepared_statements: Vec<PreparedStatement>,
-    pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
-    pub(crate) mutations: Vec<MutationRow>,
-    pub(crate) update_validations: Vec<UpdateValidationPlan>,
-    pub(crate) should_refresh_file_cache: bool,
-}
-
 pub(crate) struct CompiledExecutionStep {
     execution: CompiledExecution,
     planned_write_delta: Option<PlannedWriteDelta>,
@@ -99,7 +47,7 @@ impl CompiledExecutionStep {
         execution: CompiledExecution,
         writer_key: Option<&str>,
     ) -> Result<Self, LixError> {
-        let schema_registrations = build_compiled_execution_schema_registrations(&execution);
+        let schema_registrations = schema_registrations_for_compiled_execution(&execution);
         let planned_write_delta = build_planned_write_delta(&execution, writer_key)?;
         Ok(Self {
             execution,
@@ -193,7 +141,7 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
             Ok(CompiledExecutionStepResult::Outcome(execution))
         }
         CompiledExecutionRoute::PublicWriteNoop => Ok(CompiledExecutionStepResult::Outcome(
-            shared_path::empty_public_write_execution_outcome(),
+            empty_public_write_execution_outcome(),
         )),
         CompiledExecutionRoute::Internal(internal) => {
             apply_schema_registrations_in_transaction(transaction, step.schema_registrations())
@@ -239,6 +187,20 @@ pub(crate) struct SqlExecutionOutcome {
     pub(crate) observe_tick_emitted: bool,
 }
 
+pub(crate) fn empty_public_write_execution_outcome() -> SqlExecutionOutcome {
+    SqlExecutionOutcome {
+        public_result: QueryResult {
+            rows: Vec::new(),
+            columns: Vec::new(),
+        },
+        internal_write_file_cache_targets: BTreeSet::new(),
+        plugin_changes_committed: false,
+        plan_effects_override: Some(PlanEffects::default()),
+        state_commit_stream_changes: Vec::new(),
+        observe_tick_emitted: false,
+    }
+}
+
 pub(crate) async fn execute_internal_execution_with_transaction(
     transaction: &mut dyn LixBackendTransaction,
     internal: &CompiledInternalExecution,
@@ -276,24 +238,4 @@ fn public_result_from_contract(
             internal_result.clone()
         }
     }
-}
-
-fn build_compiled_execution_schema_registrations(
-    execution: &CompiledExecution,
-) -> SchemaRegistrationSet {
-    let mut registrations = SchemaRegistrationSet::default();
-    if let Some(internal) = execution.internal_execution() {
-        for requirement in coalesce_live_table_requirements(&internal.live_table_requirements) {
-            match requirement.schema_definition.as_ref() {
-                Some(schema_definition) => registrations.insert(
-                    SchemaRegistration::with_schema_definition(
-                        requirement.schema_key.clone(),
-                        schema_definition.clone(),
-                    ),
-                ),
-                None => registrations.insert(requirement.schema_key.clone()),
-            }
-        }
-    }
-    registrations
 }

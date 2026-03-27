@@ -17,6 +17,14 @@ fn read_rs_sdk_source(relative: &str) -> String {
     fs::read_to_string(path).expect("rs-sdk source file should be readable")
 }
 
+fn read_repo_source(relative: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join(relative);
+    fs::read_to_string(path).expect("repo source file should be readable")
+}
+
 #[test]
 fn backend_substrate_is_top_level() {
     let lib_source = read_engine_source("lib.rs");
@@ -170,7 +178,8 @@ fn backend_transaction_modes_are_explicit_and_session_routing_uses_read_runtime(
 
     let session_source = read_engine_source("session/mod.rs");
     assert!(
-        session_source.contains("begin_read_unit(transaction_mode)"),
+        session_source.contains("prepare_committed_read_program")
+            && session_source.contains("begin_read_unit(prepared_committed_read.transaction_mode)"),
         "session execution should have a committed read path"
     );
     assert!(
@@ -202,12 +211,36 @@ fn read_subsystem_owns_committed_read_runtime_and_models() {
 
     let read_runtime_source = read_engine_source("read/runtime.rs");
     assert!(
-        !read_runtime_source.contains("execute_compiled_execution_step_with_transaction"),
-        "committed read runtime should not delegate back into transaction runtime execution"
+        !read_runtime_source.contains("crate::transaction::sql_adapter::"),
+        "committed read runtime should not import transaction-owned compiled/runtime helpers"
     );
     assert!(
-        !read_runtime_source.contains("TransactionMode::Deferred"),
-        "committed read runtime should not rely on deferred fallback for public reads"
+        read_runtime_source.contains("committed_read_mode_from_prepared_public_read"),
+        "committed read runtime should derive its routing mode from committed read classification"
+    );
+
+    let shared_path_source = read_engine_source("sql/execution/shared_path.rs");
+    assert!(
+        !shared_path_source.contains("crate::transaction::sql_adapter::"),
+        "shared_path.rs should not depend on transaction-owned compiled execution types"
+    );
+
+    let read_models_source = read_engine_source("read/models.rs");
+    for forbidden in [
+        "crate::change_view::",
+        "crate::filesystem::history::",
+        "crate::state::history::",
+    ] {
+        assert!(
+            !read_models_source.contains(forbidden),
+            "read/models.rs should own committed read models instead of forwarding to `{forbidden}`"
+        );
+    }
+
+    let filesystem_history_source = read_engine_source("filesystem/history/mod.rs");
+    assert!(
+        filesystem_history_source.contains("crate::read::models::filesystem_history::"),
+        "filesystem/history/mod.rs should consume the read-owned filesystem history model"
     );
 }
 
@@ -218,4 +251,86 @@ fn sqlite_backend_keeps_nested_mode_failures_explicit() {
         sqlite_backend_source.contains("cannot open a nested read/deferred transaction"),
         "sqlite backend should reject nested read/deferred mode requests explicitly"
     );
+    assert!(
+        sqlite_backend_source.contains("cannot open a nested write transaction"),
+        "sqlite backend should reject nested write mode requests explicitly"
+    );
+    assert!(
+        !sqlite_backend_source.contains("sp_auto_"),
+        "sqlite backend should not synthesize implicit nested savepoints from begin_transaction(...)"
+    );
+}
+
+#[test]
+fn init_no_longer_bootstraps_legacy_timeline_tables() {
+    let init_tables_source = read_engine_source("init/tables.rs");
+    assert!(
+        !init_tables_source.contains("lix_internal_entity_state_timeline_breakpoint"),
+        "init/tables.rs should not create the removed timeline breakpoint table"
+    );
+    assert!(
+        !init_tables_source.contains("lix_internal_timeline_status"),
+        "init/tables.rs should not create the removed timeline status table"
+    );
+}
+
+#[test]
+fn backend_surface_only_exposes_explicit_mode_helpers() {
+    let backend_source = read_engine_source("backend/mod.rs");
+    assert!(
+        !backend_source.contains("execute_auto_transactional"),
+        "backend/mod.rs should not expose the legacy implicit deferred helper"
+    );
+    assert!(
+        !backend_source.contains("execute_statement_with_backend"),
+        "backend/mod.rs should not expose the legacy implicit statement helper"
+    );
+    assert!(
+        !backend_source.contains("execute_with_transaction_mode"),
+        "backend/mod.rs should not expose the legacy public transaction wrapper helper"
+    );
+    assert!(
+        !backend_source.contains("execute_statement_with_transaction_mode"),
+        "backend/mod.rs should not expose the legacy prepared-statement wrapper helper"
+    );
+
+    let lib_source = read_engine_source("lib.rs");
+    assert!(
+        !lib_source.contains("execute_auto_transactional"),
+        "lib.rs should not re-export the legacy implicit deferred helper"
+    );
+    assert!(
+        !lib_source.contains("execute_statement_with_backend"),
+        "lib.rs should not re-export the legacy implicit statement helper"
+    );
+    assert!(
+        !lib_source.contains("execute_with_transaction_mode"),
+        "lib.rs should not re-export the legacy public transaction wrapper helper"
+    );
+    assert!(
+        !lib_source.contains("execute_statement_with_transaction_mode"),
+        "lib.rs should not re-export the legacy prepared-statement wrapper helper"
+    );
+}
+
+#[test]
+fn repo_wide_backend_wrappers_are_mode_aware() {
+    for relative in [
+        "packages/cli/src/commands/exp/git_replay.rs",
+        "packages/engine/benches/lix_file_recursive_update.rs",
+        "packages/engine/benches/lix_file_update.rs",
+        "packages/engine/benches/lix_file_insert_history.rs",
+        "packages/engine/benches/support/sqlite_backend.rs",
+    ] {
+        let source = read_repo_source(relative);
+        assert!(
+            !source.contains("async fn begin_transaction(&self)"),
+            "{relative} should not expose zero-argument begin_transaction()"
+        );
+        assert!(
+            source.contains("mode: TransactionMode")
+                || source.contains("mode: lix_engine::TransactionMode"),
+            "{relative} should thread explicit transaction modes"
+        );
+    }
 }

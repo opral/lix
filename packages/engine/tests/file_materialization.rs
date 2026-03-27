@@ -1,4 +1,6 @@
 mod support;
+#[path = "support/wasmtime_runtime.rs"]
+mod wasmtime_runtime;
 
 use async_trait::async_trait;
 #[cfg(any())]
@@ -90,7 +92,7 @@ struct BeforeAwareInstance;
 
 #[cfg(any())]
 struct JsonWithTxtNoopRuntime {
-    inner: support::wasmtime_runtime::TestWasmtimeRuntime,
+    inner: wasmtime_runtime::TestWasmtimeRuntime,
 }
 
 #[cfg(any())]
@@ -101,7 +103,7 @@ struct TxtNoopInstance;
 impl JsonWithTxtNoopRuntime {
     fn new() -> Self {
         Self {
-            inner: support::wasmtime_runtime::TestWasmtimeRuntime::new()
+            inner: wasmtime_runtime::TestWasmtimeRuntime::new()
                 .expect("test wasmtime runtime should initialize"),
         }
     }
@@ -416,7 +418,7 @@ async fn boot_engine_with_json_plugin(
     sim: &support::simulation_test::SimulationArgs,
 ) -> support::simulation_test::SimulationEngine {
     let runtime = Arc::new(
-        support::wasmtime_runtime::TestWasmtimeRuntime::new()
+        wasmtime_runtime::TestWasmtimeRuntime::new()
             .expect("test wasmtime runtime should initialize"),
     ) as Arc<dyn WasmRuntime>;
 
@@ -1231,7 +1233,7 @@ mod legacy_plugin_and_cache_tests {
         simulations = [sqlite, postgres],
         |sim| async move {
             let runtime = Arc::new(
-                support::wasmtime_runtime::TestWasmtimeRuntime::new()
+                wasmtime_runtime::TestWasmtimeRuntime::new()
                     .expect("test wasmtime runtime should initialize"),
             ) as Arc<dyn WasmRuntime>;
 
@@ -1341,7 +1343,7 @@ mod legacy_plugin_and_cache_tests {
         simulations = [sqlite, postgres],
         |sim| async move {
             let runtime = Arc::new(
-                support::wasmtime_runtime::TestWasmtimeRuntime::new()
+                wasmtime_runtime::TestWasmtimeRuntime::new()
                     .expect("test wasmtime runtime should initialize"),
             ) as Arc<dyn WasmRuntime>;
 
@@ -1440,7 +1442,7 @@ mod legacy_plugin_and_cache_tests {
         simulations = [sqlite, postgres],
         |sim| async move {
             let runtime = Arc::new(
-                support::wasmtime_runtime::TestWasmtimeRuntime::new()
+                wasmtime_runtime::TestWasmtimeRuntime::new()
                     .expect("test wasmtime runtime should initialize"),
             ) as Arc<dyn WasmRuntime>;
 

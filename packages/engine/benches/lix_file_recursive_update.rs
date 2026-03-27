@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use lix_engine::{
-    boot, BootArgs, BootKeyValue, Engine, LixBackend, LixBackendTransaction, LixError,
-    NoopWasmRuntime, QueryResult, SqlDialect, Value,
+    boot, BootArgs, BootKeyValue, LixBackend, LixBackendTransaction, LixError, NoopWasmRuntime,
+    QueryResult, Session, SqlDialect, TransactionMode, Value,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -59,7 +59,7 @@ fn bench_lix_file_recursive_update(c: &mut Criterion) {
 }
 
 struct BenchFixture {
-    engine: Engine,
+    session: Session,
     next_revision: usize,
     _tempdir: TempDir,
 }
@@ -122,7 +122,7 @@ impl BenchFixture {
     fn update_once(&mut self, runtime: &Runtime) {
         let payload = payload_for_revision(self.next_revision);
         runtime
-            .block_on(self.engine.execute(
+            .block_on(self.session.execute(
                 "UPDATE lix_file SET data = ? WHERE id = ?",
                 &[Value::Blob(payload), Value::Text(FILE_ID.to_string())],
             ))
@@ -159,13 +159,16 @@ fn build_fixture_with_trace(
         lixcol_untracked: None,
     });
 
-    let engine = boot(boot_args);
+    let engine = Arc::new(boot(boot_args));
     runtime
         .block_on(engine.initialize())
         .expect("engine initialization should succeed");
+    let session = runtime
+        .block_on(engine.open_workspace_session())
+        .expect("workspace session should open");
 
     runtime
-        .block_on(engine.execute(
+        .block_on(session.execute(
             "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?)",
             &[
                 Value::Text(FILE_ID.to_string()),
@@ -177,7 +180,7 @@ fn build_fixture_with_trace(
 
     for revision in 1..=history_depth {
         runtime
-            .block_on(engine.execute(
+            .block_on(session.execute(
                 "UPDATE lix_file SET data = ? WHERE id = ?",
                 &[
                     Value::Blob(payload_for_revision(revision)),
@@ -188,7 +191,7 @@ fn build_fixture_with_trace(
     }
 
     BenchFixture {
-        engine,
+        session,
         next_revision: history_depth + 1,
         _tempdir: tempdir,
     }
@@ -334,12 +337,19 @@ impl LixBackend for TracingBenchBackend {
         result
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_transaction(
+        &self,
+        mode: TransactionMode,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let started = std::time::Instant::now();
-        let tx = self.inner.begin_transaction().await?;
+        let tx = self.inner.begin_transaction(mode).await?;
         self.collector.push(
             "begin_transaction",
-            None,
+            Some(match mode {
+                TransactionMode::Read => "read",
+                TransactionMode::Write => "write",
+                TransactionMode::Deferred => "deferred",
+            }),
             started.elapsed().as_secs_f64() * 1000.0,
         );
         Ok(Box::new(TracingBenchTransaction {
@@ -370,6 +380,10 @@ impl LixBackend for TracingBenchBackend {
 impl LixBackendTransaction for TracingBenchTransaction<'_> {
     fn dialect(&self) -> SqlDialect {
         self.inner.dialect()
+    }
+
+    fn mode(&self) -> TransactionMode {
+        self.inner.mode()
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
