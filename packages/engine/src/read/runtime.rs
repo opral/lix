@@ -6,18 +6,28 @@ use crate::sql::execution::execute_prepared::execute_prepared_with_transaction;
 use crate::sql::execution::execution_program::{
     BoundStatementTemplateInstance, ExecutionContext, ExecutionProgram,
 };
+use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::sql::execution::shared_path::{self, PreparationPolicy};
 use crate::sql::public::runtime::execute_prepared_public_read;
+use crate::session::contracts::SessionExecutionMode;
 use crate::transaction::sql_adapter::CompiledExecutionRoute;
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, TransactionMode};
 
-pub(crate) async fn transaction_mode_for_committed_read_program(
-    _engine: &Engine,
-    _program: &ExecutionProgram,
-    _allow_internal_tables: bool,
-    _context: &ExecutionContext,
-) -> Result<TransactionMode, LixError> {
-    Ok(TransactionMode::Read)
+pub(crate) fn transaction_mode_for_committed_read_program(
+    execution_mode: SessionExecutionMode,
+    runtime_state: &ExecutionRuntimeState,
+) -> TransactionMode {
+    match execution_mode {
+        SessionExecutionMode::CommittedRead => TransactionMode::Read,
+        SessionExecutionMode::CommittedRuntimeMutation => {
+            if runtime_state.settings().enabled {
+                TransactionMode::Write
+            } else {
+                TransactionMode::Read
+            }
+        }
+        SessionExecutionMode::WriteTransaction => TransactionMode::Write,
+    }
 }
 
 async fn execute_bound_statement_template_instance_in_committed_read_transaction(
@@ -28,6 +38,14 @@ async fn execute_bound_statement_template_instance_in_committed_read_transaction
     context: &ExecutionContext,
 ) -> Result<QueryResult, LixError> {
     let parsed_statements = std::slice::from_ref(bound_statement_template.statement());
+    let runtime_state = context.execution_runtime_state().expect(
+        "committed execution should install an execution runtime state before step compilation",
+    );
+    if runtime_state.settings().enabled && transaction.mode() == TransactionMode::Write {
+        runtime_state
+            .ensure_sequence_initialized_in_transaction(engine, transaction)
+            .await?;
+    }
     let compiled = match shared_path::compile_execution_step_from_template_instance_with_backend(
         engine,
         &TransactionBackendAdapter::new(transaction),
@@ -38,6 +56,7 @@ async fn execute_bound_statement_template_instance_in_committed_read_transaction
         context.options.writer_key.as_deref(),
         allow_internal_tables,
         Some(&context.public_surface_registry),
+        Some(runtime_state),
         PreparationPolicy {
             skip_side_effect_collection: false,
         },
@@ -134,6 +153,12 @@ pub(crate) async fn execute_execution_program_in_committed_read_transaction(
         .await?;
         results.push(result);
     }
+
+    context
+        .execution_runtime_state()
+        .expect("committed execution should retain its runtime state until flush")
+        .flush_in_transaction(engine, transaction)
+        .await?;
 
     Ok(ExecuteResult {
         statements: results,

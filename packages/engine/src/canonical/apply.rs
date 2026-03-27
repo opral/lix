@@ -1,4 +1,4 @@
-use crate::live_state::system::version_ref_write_row;
+use crate::live_state::roots::version_ref_write_row;
 use crate::live_state::tracked::{
     TrackedWriteBatch, TrackedWriteOperation, TrackedWriteParticipant, TrackedWriteRow,
 };

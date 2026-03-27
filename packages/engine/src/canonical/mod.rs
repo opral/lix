@@ -6,6 +6,7 @@ mod create_commit;
 mod generate_commit;
 pub(crate) mod graph;
 mod graph_index;
+pub(crate) mod history;
 pub(crate) mod pending_session;
 pub(crate) mod readers;
 mod state_source;

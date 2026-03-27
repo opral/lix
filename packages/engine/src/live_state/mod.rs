@@ -3,7 +3,7 @@
 //! `live_state` owns:
 //! - lifecycle initialization and readiness checks
 //! - schema-scoped storage initialization
-//! - raw, system, tracked, untracked, and effective row access
+//! - raw, session, roots, tracked, untracked, and effective row access
 //! - rebuild planning and apply
 //!
 //! Future hook-in work should target the entrypoints exported here instead of
@@ -14,9 +14,10 @@ pub mod effective;
 mod lifecycle;
 mod materialize;
 pub(crate) mod raw;
+pub mod roots;
+pub mod session;
 pub(crate) mod shared;
 mod storage;
-pub mod system;
 pub mod tracked;
 pub mod untracked;
 

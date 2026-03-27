@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::canonical_json::CanonicalJson;
-use crate::deterministic_mode::build_persist_sequence_highest_sql;
+use crate::deterministic_mode::{
+    build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
+};
 use crate::filesystem::runtime::{
     build_binary_blob_fastcdc_write_program, compile_filesystem_transaction_state_from_state,
     filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
@@ -394,54 +396,57 @@ pub(crate) async fn create_commit(
     )
     .await
     .map_err(backend_error)?;
-    let operational_apply_input = OperationalCommitApplyInput {
-        idempotency_write: CommitIdempotencyWrite {
-            write_lane: lane_storage_key(&concrete_lane),
-            idempotency_key: resolved_idempotency.legacy_key.clone(),
-            idempotency_kind: resolved_idempotency.kind.to_string(),
-            idempotency_value: resolved_idempotency.value.clone(),
-            parent_head_snapshot_content: resolved_idempotency.parent_head_snapshot_content.clone(),
-            commit_id: committed_head.clone(),
-            created_at: timestamp.clone(),
-        },
-        deterministic_sequence_highest_seen: functions
-            .deterministic_sequence_persist_highest_seen(),
-        observe_tick: args.should_emit_observe_tick.then(|| ObserveTickWrite {
-            writer_key: args.observe_tick_writer_key.clone(),
-        }),
+    let idempotency_write = CommitIdempotencyWrite {
+        write_lane: lane_storage_key(&concrete_lane),
+        idempotency_key: resolved_idempotency.legacy_key.clone(),
+        idempotency_kind: resolved_idempotency.kind.to_string(),
+        idempotency_value: resolved_idempotency.value.clone(),
+        parent_head_snapshot_content: resolved_idempotency.parent_head_snapshot_content.clone(),
+        commit_id: committed_head.clone(),
+        created_at: timestamp.clone(),
     };
+    let observe_tick = args.should_emit_observe_tick.then(|| ObserveTickWrite {
+        writer_key: args.observe_tick_writer_key.clone(),
+    });
     let pending_public_commit_seed =
         build_pending_public_commit_seed(&canonical_output, &derived_apply_input)?;
-    let applied_output = CreateCommitAppliedOutput {
-        canonical_output,
-        derived_apply_input,
-        operational_apply_input,
-        pending_public_commit_seed,
-    };
     let mut prepared_batch = build_prepared_batch_from_canonical_output(
-        &applied_output.canonical_output,
+        &canonical_output,
         functions,
         transaction.dialect(),
     )
     .map_err(backend_error)?;
+    let deterministic_sequence_highest_seen = functions.deterministic_sequence_persist_highest_seen();
     prepared_batch.extend(
         build_commit_graph_node_prepared_batch(&commit_graph_rows, transaction.dialect())
             .map_err(backend_error)?,
     );
-    prepared_batch.append_sql(insert_idempotency_row_sql(
-        &applied_output.operational_apply_input.idempotency_write,
-    ));
-    if let Some(highest_seen) = applied_output
-        .operational_apply_input
-        .deterministic_sequence_highest_seen
-    {
-        prepared_batch.append_sql(build_persist_sequence_highest_sql(highest_seen));
+    prepared_batch.append_sql(insert_idempotency_row_sql(&idempotency_write));
+    if let Some(highest_seen) = deterministic_sequence_highest_seen {
+        prepared_batch.append_sql(build_ensure_runtime_sequence_row_sql(
+            highest_seen,
+            transaction.dialect(),
+        ));
+        prepared_batch.append_sql(build_update_runtime_sequence_highest_sql(
+            highest_seen,
+            transaction.dialect(),
+        ));
     }
-    if let Some(observe_tick) = applied_output.operational_apply_input.observe_tick.as_ref() {
+    if let Some(observe_tick) = observe_tick.as_ref() {
         prepared_batch.append_sql(build_observe_tick_insert_sql(
             observe_tick.writer_key.as_deref(),
         ));
     }
+    let applied_output = CreateCommitAppliedOutput {
+        canonical_output,
+        derived_apply_input,
+        operational_apply_input: OperationalCommitApplyInput {
+            idempotency_write,
+            deterministic_sequence_highest_seen,
+            observe_tick,
+        },
+        pending_public_commit_seed,
+    };
     // NOTE: watermark is intentionally NOT written here. It is written once
     // at transaction-commit time by the caller, so that multi-statement
     // transactions (including merged commits) always end with a consistent

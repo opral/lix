@@ -170,8 +170,8 @@ async fn undo_in_transaction(
         }
 
         let backend = crate::engine::TransactionBackendAdapter::new(transaction);
-        let (_settings, _sequence_start, functions) = engine
-            .prepare_runtime_functions_with_backend(&backend, true)
+        let (_settings, functions) = engine
+            .prepare_runtime_functions_with_backend(&backend)
             .await?;
         engine
             .ensure_runtime_sequence_initialized_in_transaction(transaction, &functions)

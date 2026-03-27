@@ -109,6 +109,10 @@ fn canonical_readers_and_graph_surfaces_exist_and_are_used() {
         canonical_mod.contains("pub(crate) mod readers;"),
         "canonical/mod.rs should expose canonical::readers"
     );
+    assert!(
+        canonical_mod.contains("pub(crate) mod history;"),
+        "canonical/mod.rs should expose canonical::history"
+    );
 
     let effective_state_source =
         read_engine_source("sql/public/planner/semantics/effective_state_resolver.rs");
@@ -123,10 +127,26 @@ fn canonical_readers_and_graph_surfaces_exist_and_are_used() {
         "sql/public/runtime should use the sql/public state_reader seam for committed-state lookups"
     );
 
-    let history_query_source = read_engine_source("state/history/query.rs");
+    let history_query_source = read_engine_source("canonical/history.rs");
     assert!(
-        history_query_source.contains("crate::canonical::graph::"),
-        "state/history/query.rs should use canonical::graph"
+        history_query_source.contains("FROM lix_internal_change commit_change"),
+        "canonical/history.rs should build history from canonical change rows"
+    );
+    assert!(
+        !history_query_source.contains("tracked_live_table_name("),
+        "canonical/history.rs should not name tracked live tables directly"
+    );
+    assert!(
+        !history_query_source.contains("builtin_live_table_layout"),
+        "canonical/history.rs should not depend on live table layout helpers"
+    );
+    assert!(
+        !history_query_source.contains("live_column_name_for_property"),
+        "canonical/history.rs should not depend on live payload column-name helpers"
+    );
+    assert!(
+        !history_query_source.contains("crate::live_state::"),
+        "canonical/history.rs should not resolve live-state storage or roots directly"
     );
 
     let merge_source = read_engine_source("version/merge_version.rs");

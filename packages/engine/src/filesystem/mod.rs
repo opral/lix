@@ -10,12 +10,6 @@ pub(crate) mod live_projection;
 pub(crate) mod path;
 pub(crate) mod runtime;
 
-pub(crate) fn statements_require_generated_filesystem_insert_ids(statements: &[Statement]) -> bool {
-    statements
-        .iter()
-        .any(statement_requires_generated_filesystem_insert_id)
-}
-
 pub(crate) fn ensure_generated_filesystem_insert_ids<P: LixFunctionProvider>(
     statements: &mut [Statement],
     functions: &SharedFunctionProvider<P>,

@@ -4,7 +4,7 @@ use crate::errors::classification::is_missing_relation_error;
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::load_live_row_access_with_executor;
 use crate::live_state::raw::{scan_rows_with_executor, snapshot_text, RawStorage};
-use crate::live_state::system::load_version_ref_with_executor;
+use crate::live_state::roots::load_version_ref_with_executor;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value, VersionId};
 
@@ -632,6 +632,33 @@ mod tests {
         (row, snapshot)
     }
 
+    fn fake_version_ref_live_row(version_id: &str, commit_id: &str) -> Vec<Value> {
+        let layout = builtin_live_table_layout(crate::version::version_ref_schema_key())
+            .expect("builtin layout should load")
+            .expect("version ref layout should exist");
+        let mut row = vec![
+            Value::Text(version_id.to_string()),
+            Value::Text(crate::version::version_ref_schema_key().to_string()),
+            Value::Text(crate::version::version_ref_schema_version().to_string()),
+            Value::Text(crate::version::version_ref_file_id().to_string()),
+            Value::Text(crate::version::version_ref_storage_version_id().to_string()),
+            Value::Boolean(true),
+            Value::Text(crate::version::version_ref_plugin_key().to_string()),
+            Value::Null,
+            Value::Null,
+            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
+            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
+        ];
+        for column in &layout.columns {
+            row.push(match column.property_name.as_str() {
+                "id" => Value::Text(version_id.to_string()),
+                "commit_id" => Value::Text(commit_id.to_string()),
+                _ => Value::Null,
+            });
+        }
+        row
+    }
+
     struct ExactCommittedStateBackend {
         live_table_query_seen: Arc<AtomicBool>,
     }
@@ -872,5 +899,69 @@ mod tests {
         );
         assert_eq!(row.entity_id, "file-1");
         assert_eq!(row.source_change_id.as_deref(), Some("change-fallback"));
+    }
+
+    struct LiveVersionHeadBackend {
+        live_query_seen: Arc<AtomicBool>,
+        canonical_query_seen: Arc<AtomicBool>,
+    }
+
+    #[async_trait(?Send)]
+    impl LixBackend for LiveVersionHeadBackend {
+        fn dialect(&self) -> crate::SqlDialect {
+            crate::SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            if sql.contains("lix_internal_live_v1_lix_version_ref") {
+                self.live_query_seen.store(true, Ordering::SeqCst);
+                return Ok(QueryResult {
+                    rows: vec![fake_version_ref_live_row("v1", "commit-live")],
+                    columns: Vec::new(),
+                });
+            }
+            if sql.contains("FROM lix_internal_change c")
+                && sql.contains("c.schema_key = 'lix_version_ref'")
+            {
+                self.canonical_query_seen.store(true, Ordering::SeqCst);
+            }
+            Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            })
+        }
+
+        async fn begin_transaction(
+            &self,
+            _mode: crate::TransactionMode,
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+            Ok(Box::new(UnusedTransaction))
+        }
+
+        async fn begin_savepoint(
+            &self,
+            _name: &str,
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+            self.begin_transaction(crate::TransactionMode::Write).await
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_version_head_reads_live_version_ref_when_present() {
+        let live_query_seen = Arc::new(AtomicBool::new(false));
+        let canonical_query_seen = Arc::new(AtomicBool::new(false));
+        let backend = LiveVersionHeadBackend {
+            live_query_seen: Arc::clone(&live_query_seen),
+            canonical_query_seen: Arc::clone(&canonical_query_seen),
+        };
+
+        let mut executor = &backend;
+        let commit_id = load_committed_version_head_commit_id_from_live_state(&mut executor, "v1")
+            .await
+            .expect("live version head lookup should succeed");
+
+        assert!(live_query_seen.load(Ordering::SeqCst));
+        assert!(!canonical_query_seen.load(Ordering::SeqCst));
+        assert_eq!(commit_id.as_deref(), Some("commit-live"));
     }
 }

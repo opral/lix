@@ -91,54 +91,6 @@ pub(crate) fn build_commit_graph_node_prepared_batch(
     Ok(batch)
 }
 
-pub(crate) fn build_reachable_commits_from_requested_cte_sql(
-    _dialect: SqlDialect,
-    requested_commits_cte_name: &str,
-    max_depth: i64,
-) -> String {
-    let commit_edge_table = tracked_live_table_name("lix_commit_edge");
-    let edge_parent_expr = quote_ident(&live_payload_column_name("lix_commit_edge", "parent_id"));
-    let edge_child_expr = quote_ident(&live_payload_column_name("lix_commit_edge", "child_id"));
-    format!(
-        "reachable_commit_walk AS ( \
-           SELECT \
-             requested.commit_id AS commit_id, \
-             requested.commit_id AS root_commit_id, \
-             requested.root_version_id AS root_version_id, \
-             0 AS commit_depth \
-           FROM {requested_commits_cte_name} requested \
-           UNION ALL \
-           SELECT \
-             {edge_parent_expr} AS commit_id, \
-             walk.root_commit_id AS root_commit_id, \
-             walk.root_version_id AS root_version_id, \
-             walk.commit_depth + 1 AS commit_depth \
-           FROM reachable_commit_walk walk \
-           JOIN {commit_edge_table} edge \
-             ON {edge_child_expr} = walk.commit_id \
-           WHERE edge.schema_key = 'lix_commit_edge' \
-             AND edge.version_id = '{global_version}' \
-             AND edge.is_tombstone = 0 \
-             AND {edge_parent_expr} IS NOT NULL \
-             AND walk.commit_depth < {max_depth} \
-         ), \
-         reachable_commits AS ( \
-           SELECT \
-             commit_id, \
-             root_commit_id, \
-             root_version_id, \
-             MIN(commit_depth) AS commit_depth \
-           FROM reachable_commit_walk \
-           GROUP BY commit_id, root_commit_id, root_version_id \
-         ), ",
-        requested_commits_cte_name = requested_commits_cte_name,
-        global_version = GLOBAL_VERSION_ID,
-        max_depth = max_depth,
-        edge_parent_expr = edge_parent_expr,
-        edge_child_expr = edge_child_expr,
-    )
-}
-
 #[allow(dead_code)]
 pub(crate) fn build_exact_commit_depth_cte_sql(
     _dialect: SqlDialect,

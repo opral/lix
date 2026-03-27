@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
-use crate::functions::SharedFunctionProvider;
 use crate::live_state::{coalesce_live_table_requirements, SchemaRegistration};
+use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::LixError;
 
 use super::{
@@ -22,9 +21,7 @@ const GLOBAL_VERSION_ID: &str = "global";
 pub(crate) struct PlannedPublicUntrackedWriteUnit {
     pub(crate) execution: UntrackedWriteExecution,
     pub(crate) filesystem_state: FilesystemTransactionState,
-    pub(crate) functions: SharedFunctionProvider<RuntimeFunctionProvider>,
-    pub(crate) settings: DeterministicSettings,
-    pub(crate) sequence_start: i64,
+    pub(crate) runtime_state: ExecutionRuntimeState,
     pub(crate) writer_key: Option<String>,
 }
 
@@ -34,9 +31,7 @@ pub(crate) struct PlannedInternalWriteUnit {
     pub(crate) effects: PlanEffects,
     pub(crate) result_contract: ResultContract,
     pub(crate) filesystem_state: FilesystemTransactionState,
-    pub(crate) functions: SharedFunctionProvider<RuntimeFunctionProvider>,
-    pub(crate) settings: DeterministicSettings,
-    pub(crate) sequence_start: i64,
+    pub(crate) runtime_state: ExecutionRuntimeState,
     pub(crate) writer_key: Option<String>,
 }
 
@@ -372,9 +367,7 @@ pub(crate) fn build_planned_write_plan(
                             PlannedPublicUntrackedWriteUnit {
                                 execution: untracked.clone(),
                                 filesystem_state: prepared.intent.filesystem_state.clone(),
-                                functions: prepared.functions.clone(),
-                                settings: prepared.settings,
-                                sequence_start: prepared.sequence_start,
+                                runtime_state: prepared.runtime_state.clone(),
                                 writer_key: writer_key.map(str::to_string),
                             },
                         ));
@@ -391,9 +384,7 @@ pub(crate) fn build_planned_write_plan(
             effects: prepared.effects.clone(),
             result_contract: prepared.result_contract,
             filesystem_state: prepared.intent.filesystem_state.clone(),
-            functions: prepared.functions.clone(),
-            settings: prepared.settings,
-            sequence_start: prepared.sequence_start,
+            runtime_state: prepared.runtime_state.clone(),
             writer_key: writer_key.map(str::to_string),
         }));
     }

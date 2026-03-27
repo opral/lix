@@ -31,6 +31,14 @@ pub(super) async fn compile_sql_buffered_write_command(
 ) -> Result<SqlBufferedWriteCommand, LixError> {
     let writer_key = context.options.writer_key.clone();
     let parsed_statements = std::slice::from_ref(bound_statement_template.statement());
+    let runtime_state = context
+        .execution_runtime_state()
+        .expect("write execution should install an execution runtime state before compilation");
+    if runtime_state.settings().enabled {
+        runtime_state
+            .ensure_sequence_initialized_in_transaction(engine, transaction)
+            .await?;
+    }
     let backend = TransactionBackendAdapter::new(transaction);
     let compiled = match shared_path::compile_execution_step_from_template_instance_with_backend(
         engine,
@@ -42,6 +50,7 @@ pub(super) async fn compile_sql_buffered_write_command(
         writer_key.as_deref(),
         allow_internal_tables,
         Some(&context.public_surface_registry),
+        Some(runtime_state),
         shared_path::PreparationPolicy {
             skip_side_effect_collection,
         },

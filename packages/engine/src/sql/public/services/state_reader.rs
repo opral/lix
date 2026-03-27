@@ -9,8 +9,8 @@ use crate::live_state::raw::{
     load_exact_row_with_backend, scan_rows_with_backend, scan_rows_with_executor, snapshot_json,
 };
 pub(crate) use crate::live_state::raw::{RawRow, RawStorage};
-use crate::live_state::system::load_version_ref_with_backend;
-pub(crate) use crate::live_state::system::VersionRefRow;
+use crate::live_state::roots::load_version_ref_with_backend;
+pub(crate) use crate::live_state::roots::VersionRefRow;
 use crate::live_state::tracked::{
     load_exact_tombstone_with_executor, scan_tombstones_with_executor,
 };

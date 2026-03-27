@@ -293,8 +293,8 @@ async fn merge_version_in_transaction(
     let active_account_ids = tx.context.active_account_ids.clone();
     let transaction = tx.backend_transaction_mut()?;
     let backend = TransactionBackendAdapter::new(transaction);
-    let (_settings, _sequence_start, functions) = engine
-        .prepare_runtime_functions_with_backend(&backend, true)
+    let (_settings, functions) = engine
+        .prepare_runtime_functions_with_backend(&backend)
         .await?;
     engine
         .ensure_runtime_sequence_initialized_in_transaction(transaction, &functions)

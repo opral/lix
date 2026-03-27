@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use lix_engine::live_state::system::version_ref_write_row;
+use lix_engine::live_state::roots::version_ref_write_row;
 use lix_engine::live_state::tracked::{
     load_exact_row_with_backend, ExactTrackedRowRequest, TrackedWriteOperation, TrackedWriteRow,
 };

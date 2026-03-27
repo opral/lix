@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::engine::{Engine, ExecuteOptions};
 use crate::sql::execution::contracts::requirements::PlanRequirements;
+use crate::sql::execution::runtime_state::ExecutionRuntimeEffects;
+use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::sql::internal::script::coalesce_state_surface_inserts_in_transactions;
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::sql::public::runtime::{
@@ -80,6 +82,7 @@ pub(crate) struct ExecutionContext {
     session_runtime: SessionExecutionRuntimeHandle,
     pub(crate) active_version_id: String,
     pub(crate) active_account_ids: Vec<String>,
+    execution_runtime_state: Option<ExecutionRuntimeState>,
 }
 
 impl ExecutionContext {
@@ -96,6 +99,7 @@ impl ExecutionContext {
             session_runtime,
             active_version_id,
             active_account_ids,
+            execution_runtime_state: None,
         }
     }
 
@@ -125,6 +129,18 @@ impl ExecutionContext {
 
     pub(crate) fn session_runtime(&self) -> SessionExecutionRuntimeHandle {
         Arc::clone(&self.session_runtime)
+    }
+
+    pub(crate) fn execution_runtime_state(&self) -> Option<&ExecutionRuntimeState> {
+        self.execution_runtime_state.as_ref()
+    }
+
+    pub(crate) fn set_execution_runtime_state(&mut self, runtime_state: ExecutionRuntimeState) {
+        self.execution_runtime_state = Some(runtime_state);
+    }
+
+    pub(crate) fn clear_execution_runtime_state(&mut self) {
+        self.execution_runtime_state = None;
     }
 
     pub(crate) fn runtime_binding_values(&self) -> Result<RuntimeBindingValues, LixError> {
@@ -163,7 +179,6 @@ pub(crate) struct StatementTemplate {
     binding_template: StatementBindingTemplate,
     ownership_hint: Option<StatementTemplateOwnership>,
     plan_requirements: PlanRequirements,
-    requires_generated_filesystem_insert_id: bool,
 }
 
 impl StatementTemplate {
@@ -223,10 +238,6 @@ impl StatementTemplate {
                     crate::sql::execution::derive_requirements::derive_plan_requirements(
                         std::slice::from_ref(&statement),
                     ),
-                requires_generated_filesystem_insert_id:
-                    crate::filesystem::statements_require_generated_filesystem_insert_ids(
-                        std::slice::from_ref(&statement),
-                    ),
                 ownership_hint,
             },
             next_placeholder_state,
@@ -245,7 +256,6 @@ impl StatementTemplate {
             params: bound.params,
             ownership_hint: self.ownership_hint,
             plan_requirements: self.plan_requirements.clone(),
-            requires_generated_filesystem_insert_id: self.requires_generated_filesystem_insert_id,
         })
     }
 }
@@ -256,7 +266,6 @@ pub(crate) struct BoundStatementTemplateInstance {
     params: Vec<Value>,
     ownership_hint: Option<StatementTemplateOwnership>,
     plan_requirements: PlanRequirements,
-    requires_generated_filesystem_insert_id: bool,
 }
 
 impl BoundStatementTemplateInstance {
@@ -274,10 +283,6 @@ impl BoundStatementTemplateInstance {
 
     pub(crate) fn plan_requirements(&self) -> &PlanRequirements {
         &self.plan_requirements
-    }
-
-    pub(crate) fn requires_generated_filesystem_insert_id(&self) -> bool {
-        self.requires_generated_filesystem_insert_id
     }
 }
 
@@ -351,6 +356,17 @@ impl ExecutionProgram {
                 step.bound_template.plan_requirements().read_only_query
             }
         })
+    }
+
+    pub(crate) fn runtime_effects(&self) -> ExecutionRuntimeEffects {
+        self.steps.iter().fold(
+            ExecutionRuntimeEffects::default(),
+            |effects, step| match step {
+                ExecutionProgramStep::TransactionControl => effects,
+                ExecutionProgramStep::Statement(step) => effects
+                    .merge(step.bound_template.plan_requirements().runtime_effects),
+            },
+        )
     }
 
     pub(crate) fn steps(&self) -> impl Iterator<Item = &BoundStatementTemplateInstance> {

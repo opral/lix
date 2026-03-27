@@ -1,6 +1,5 @@
-use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::filesystem::runtime::FilesystemTransactionState;
-use crate::functions::SharedFunctionProvider;
+use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::transaction::sql_adapter::CompiledExecution;
 
 use super::{PreparedPublicWrite, TrackedWriteExecution};
@@ -11,7 +10,7 @@ pub(crate) struct TrackedTxnUnit {
     pub(crate) public_write: PreparedPublicWrite,
     pub(crate) execution: TrackedWriteExecution,
     pub(crate) filesystem_state: FilesystemTransactionState,
-    pub(crate) functions: SharedFunctionProvider<RuntimeFunctionProvider>,
+    pub(crate) runtime_state: ExecutionRuntimeState,
     pub(crate) writer_key: Option<String>,
 }
 
@@ -45,7 +44,7 @@ pub(crate) fn build_tracked_txn_unit(
         public_write: public_write.clone(),
         execution: execution.clone(),
         filesystem_state: prepared.intent.filesystem_state.clone(),
-        functions: prepared.functions.clone(),
+        runtime_state: prepared.runtime_state.clone(),
         writer_key: writer_key.map(str::to_string),
     }
 }

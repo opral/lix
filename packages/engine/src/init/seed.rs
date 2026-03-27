@@ -17,6 +17,7 @@ use crate::live_state::{
 use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
 use crate::sql::execution::execution_program::{ExecutionContext, SessionExecutionRuntime};
 use crate::sql::execution::parse::parse_sql;
+use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::sql_support::text::escape_sql_string;
 use crate::state::checkpoint::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot, CHECKPOINT_LABEL_ID,
@@ -106,43 +107,44 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     }
 
     async fn generate_runtime_uuid(&mut self) -> Result<String, LixError> {
-        let (settings, sequence_start, functions) = {
-            let backend =
-                TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
-            self.engine
-                .prepare_runtime_functions_with_backend(&backend, false)
-                .await?
-        };
-        let uuid = functions.call_uuid_v7();
-        self.engine
-            .persist_runtime_sequence_in_transaction(
+        let runtime_state = self.ensure_runtime_state().await?;
+        runtime_state
+            .ensure_sequence_initialized_in_transaction(
+                self.engine,
                 self.write_transaction.backend_transaction_mut(),
-                settings,
-                sequence_start,
-                &functions,
             )
             .await?;
-        Ok(uuid)
+        Ok(runtime_state.provider().call_uuid_v7())
     }
 
     async fn generate_runtime_timestamp(&mut self) -> Result<String, LixError> {
-        let (settings, sequence_start, functions) = {
-            let backend =
-                TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
-            self.engine
-                .prepare_runtime_functions_with_backend(&backend, false)
-                .await?
-        };
-        let timestamp = functions.call_timestamp();
-        self.engine
-            .persist_runtime_sequence_in_transaction(
+        let runtime_state = self.ensure_runtime_state().await?;
+        runtime_state
+            .ensure_sequence_initialized_in_transaction(
+                self.engine,
                 self.write_transaction.backend_transaction_mut(),
-                settings,
-                sequence_start,
-                &functions,
             )
             .await?;
-        Ok(timestamp)
+        Ok(runtime_state.provider().call_timestamp())
+    }
+
+    pub(crate) async fn persist_runtime_state(&mut self) -> Result<(), LixError> {
+        let Some(runtime_state) = self.context.execution_runtime_state().cloned() else {
+            return Ok(());
+        };
+        runtime_state
+            .flush_in_transaction(self.engine, self.write_transaction.backend_transaction_mut())
+            .await
+    }
+
+    async fn ensure_runtime_state(&mut self) -> Result<ExecutionRuntimeState, LixError> {
+        if let Some(runtime_state) = self.context.execution_runtime_state().cloned() {
+            return Ok(runtime_state);
+        }
+        let backend = TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
+        let runtime_state = ExecutionRuntimeState::prepare(self.engine, &backend).await?;
+        self.context.set_execution_runtime_state(runtime_state.clone());
+        Ok(runtime_state)
     }
 
     async fn load_latest_commit_id(&mut self) -> Result<Option<String>, LixError> {

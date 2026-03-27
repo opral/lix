@@ -1,0 +1,350 @@
+use crate::canonical::history::{
+    build_state_history_source_sql, CanonicalHistoryContentMode, CanonicalHistoryRootFacts,
+    CanonicalHistoryRootSelection, CanonicalRootCommit,
+};
+use crate::live_state::roots::{
+    resolve_history_root_facts_with_backend, HistoryRootFacts, HistoryRootTraversal,
+    RootCommitResolutionRequest, RootCommitScope, RootLineageScope, RootVersionScope,
+};
+use crate::live_state::session::load_active_version_with_backend;
+use crate::sql_support::text::escape_sql_string;
+use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum StateHistoryContentMode {
+    MetadataOnly,
+    #[default]
+    IncludeSnapshotContent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum StateHistoryOrder {
+    #[default]
+    EntityFileSchemaDepthAsc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum StateHistoryRootScope {
+    #[default]
+    AllRoots,
+    RequestedRoots(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum StateHistoryLineageScope {
+    #[default]
+    Standard,
+    ActiveVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum StateHistoryVersionScope {
+    #[default]
+    Any,
+    RequestedVersions(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct StateHistoryRequest {
+    pub(crate) root_scope: StateHistoryRootScope,
+    pub(crate) lineage_scope: StateHistoryLineageScope,
+    pub(crate) active_version_id: Option<String>,
+    pub(crate) version_scope: StateHistoryVersionScope,
+    pub(crate) entity_ids: Vec<String>,
+    pub(crate) file_ids: Vec<String>,
+    pub(crate) schema_keys: Vec<String>,
+    pub(crate) plugin_keys: Vec<String>,
+    pub(crate) min_depth: Option<i64>,
+    pub(crate) max_depth: Option<i64>,
+    pub(crate) content_mode: StateHistoryContentMode,
+    pub(crate) order: StateHistoryOrder,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StateHistoryRow {
+    pub(crate) entity_id: String,
+    pub(crate) schema_key: String,
+    pub(crate) file_id: String,
+    pub(crate) plugin_key: String,
+    pub(crate) snapshot_content: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) schema_version: String,
+    pub(crate) change_id: String,
+    pub(crate) commit_id: String,
+    pub(crate) commit_created_at: String,
+    pub(crate) root_commit_id: String,
+    pub(crate) depth: i64,
+    pub(crate) version_id: String,
+}
+
+pub(crate) async fn load_state_history_rows(
+    backend: &dyn LixBackend,
+    request: &StateHistoryRequest,
+) -> Result<Vec<StateHistoryRow>, LixError> {
+    let resolved_active_version_id = resolve_active_version_id(backend, request).await?;
+    let root_facts = resolve_history_root_facts_with_backend(
+        backend,
+        root_commit_resolution_request(request, resolved_active_version_id.as_deref()),
+    )
+    .await?;
+    let sql = build_state_history_query_sql(
+        backend.dialect(),
+        request,
+        &canonical_history_root_facts(root_facts),
+    )?;
+    let result = backend.execute(&sql, &[]).await?;
+    parse_state_history_rows(result)
+}
+
+async fn resolve_active_version_id(
+    backend: &dyn LixBackend,
+    request: &StateHistoryRequest,
+) -> Result<Option<String>, LixError> {
+    match request.lineage_scope {
+        StateHistoryLineageScope::Standard => Ok(None),
+        StateHistoryLineageScope::ActiveVersion => {
+            if let Some(active_version_id) = request.active_version_id.clone() {
+                return Ok(Some(active_version_id));
+            }
+            let active_version = load_active_version_with_backend(backend)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "state history active-version reads require an active version",
+                    )
+                })?;
+            Ok(Some(active_version.version_id))
+        }
+    }
+}
+
+fn build_state_history_query_sql(
+    dialect: SqlDialect,
+    request: &StateHistoryRequest,
+    root_facts: &CanonicalHistoryRootFacts,
+) -> Result<String, LixError> {
+    let source_sql = build_state_history_source_sql(
+        dialect,
+        root_facts,
+        match request.content_mode {
+            StateHistoryContentMode::MetadataOnly => CanonicalHistoryContentMode::MetadataOnly,
+            StateHistoryContentMode::IncludeSnapshotContent => {
+                CanonicalHistoryContentMode::IncludeSnapshotContent
+            }
+        },
+        request.max_depth,
+    )?;
+
+    let mut predicates = Vec::new();
+    if !request.entity_ids.is_empty() {
+        predicates.push(render_text_in_predicate(
+            "history.entity_id",
+            &request.entity_ids,
+        ));
+    }
+    if !request.file_ids.is_empty() {
+        predicates.push(render_text_in_predicate(
+            "history.file_id",
+            &request.file_ids,
+        ));
+    }
+    if !request.schema_keys.is_empty() {
+        predicates.push(render_text_in_predicate(
+            "history.schema_key",
+            &request.schema_keys,
+        ));
+    }
+    if !request.plugin_keys.is_empty() {
+        predicates.push(render_text_in_predicate(
+            "history.plugin_key",
+            &request.plugin_keys,
+        ));
+    }
+    if let Some(min_depth) = request.min_depth {
+        predicates.push(format!("history.depth >= {min_depth}"));
+    }
+    if let Some(max_depth) = request.max_depth {
+        predicates.push(format!("history.depth <= {max_depth}"));
+    }
+
+    let where_sql = render_where_clause_sql(&predicates, "WHERE ");
+    let order_sql = match request.order {
+        StateHistoryOrder::EntityFileSchemaDepthAsc => {
+            "ORDER BY history.entity_id ASC, history.file_id ASC, history.schema_key ASC, history.depth ASC"
+        }
+    };
+
+    Ok(format!(
+        "SELECT \
+           history.entity_id, \
+           history.schema_key, \
+           history.file_id, \
+           history.plugin_key, \
+           history.snapshot_content, \
+           history.metadata, \
+           history.schema_version, \
+           history.change_id, \
+           history.commit_id, \
+           history.commit_created_at, \
+           history.root_commit_id, \
+           history.depth, \
+           history.version_id \
+         FROM ({source_sql}) history \
+         {where_sql} \
+         {order_sql}",
+        source_sql = source_sql,
+        where_sql = where_sql,
+        order_sql = order_sql,
+    ))
+}
+
+fn root_commit_resolution_request<'a>(
+    request: &'a StateHistoryRequest,
+    active_version_id: Option<&'a str>,
+) -> RootCommitResolutionRequest<'a> {
+    RootCommitResolutionRequest {
+        lineage_scope: match request.lineage_scope {
+            StateHistoryLineageScope::Standard => RootLineageScope::Standard,
+            StateHistoryLineageScope::ActiveVersion => RootLineageScope::ActiveVersion,
+        },
+        active_version_id,
+        root_scope: match &request.root_scope {
+            StateHistoryRootScope::AllRoots => RootCommitScope::AllRoots,
+            StateHistoryRootScope::RequestedRoots(root_commit_ids) => {
+                RootCommitScope::RequestedRoots(root_commit_ids)
+            }
+        },
+        version_scope: match &request.version_scope {
+            StateHistoryVersionScope::Any => RootVersionScope::Any,
+            StateHistoryVersionScope::RequestedVersions(version_ids) => {
+                RootVersionScope::RequestedVersions(version_ids)
+            }
+        },
+    }
+}
+
+fn canonical_history_root_facts(root_facts: HistoryRootFacts) -> CanonicalHistoryRootFacts {
+    CanonicalHistoryRootFacts {
+        traversal: match root_facts.traversal {
+            HistoryRootTraversal::AllRoots => CanonicalHistoryRootSelection::AllRoots,
+            HistoryRootTraversal::RequestedRootCommitIds(root_commit_ids) => {
+                CanonicalHistoryRootSelection::RequestedRootCommitIds(root_commit_ids)
+            }
+            HistoryRootTraversal::ResolvedRootCommits(root_commits) => {
+                CanonicalHistoryRootSelection::ResolvedRootCommits(
+                    root_commits
+                        .into_iter()
+                        .map(|root| CanonicalRootCommit {
+                            commit_id: root.commit_id,
+                            version_id: root.version_id,
+                        })
+                        .collect(),
+                )
+            }
+        },
+        root_version_refs: root_facts
+            .root_version_refs
+            .into_iter()
+            .map(|root| CanonicalRootCommit {
+                commit_id: root.commit_id,
+                version_id: root.version_id,
+            })
+            .collect(),
+    }
+}
+
+fn parse_state_history_rows(result: QueryResult) -> Result<Vec<StateHistoryRow>, LixError> {
+    let mut rows = Vec::with_capacity(result.rows.len());
+    for row in result.rows {
+        rows.push(StateHistoryRow {
+            entity_id: required_text_value(&row, 0, "entity_id")?,
+            schema_key: required_text_value(&row, 1, "schema_key")?,
+            file_id: required_text_value(&row, 2, "file_id")?,
+            plugin_key: required_text_value(&row, 3, "plugin_key")?,
+            snapshot_content: optional_text_value(&row, 4, "snapshot_content")?,
+            metadata: optional_text_value(&row, 5, "metadata")?,
+            schema_version: required_text_value(&row, 6, "schema_version")?,
+            change_id: required_text_value(&row, 7, "change_id")?,
+            commit_id: required_text_value(&row, 8, "commit_id")?,
+            commit_created_at: required_text_value(&row, 9, "commit_created_at")?,
+            root_commit_id: required_text_value(&row, 10, "root_commit_id")?,
+            depth: required_integer_value(&row, 11, "depth")?,
+            version_id: required_text_value(&row, 12, "version_id")?,
+        });
+    }
+    Ok(rows)
+}
+
+fn render_text_in_predicate(column: &str, values: &[String]) -> String {
+    if values.len() == 1 {
+        return format!("{column} = '{}'", escape_sql_string(&values[0]));
+    }
+    format!(
+        "{column} IN ({})",
+        values
+            .iter()
+            .map(|value| format!("'{}'", escape_sql_string(value)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn render_where_clause_sql(predicates: &[String], prefix: &str) -> String {
+    if predicates.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}{}", predicates.join(" AND "))
+    }
+}
+
+fn required_text_value(row: &[Value], index: usize, field: &str) -> Result<String, LixError> {
+    match row.get(index) {
+        Some(Value::Text(value)) => Ok(value.clone()),
+        Some(other) => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("expected text for {field}, got {other:?}"),
+        }),
+        None => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("missing column {field} at index {index}"),
+        }),
+    }
+}
+
+fn optional_text_value(
+    row: &[Value],
+    index: usize,
+    field: &str,
+) -> Result<Option<String>, LixError> {
+    match row.get(index) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Text(value)) => Ok(Some(value.clone())),
+        Some(other) => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("expected nullable text for {field}, got {other:?}"),
+        }),
+    }
+}
+
+fn required_integer_value(row: &[Value], index: usize, field: &str) -> Result<i64, LixError> {
+    match row.get(index) {
+        Some(value) => match value {
+            Value::Integer(value) => Ok(*value),
+            Value::Real(value) => Ok(*value as i64),
+            Value::Text(value) => value.parse::<i64>().map_err(|_| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!("expected integer for {field}, got {value:?}"),
+            }),
+            other => Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!("expected integer for {field}, got {other:?}"),
+            }),
+        },
+        None => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("missing column {field} at index {index}"),
+        }),
+    }
+}
