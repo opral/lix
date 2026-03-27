@@ -363,8 +363,9 @@ impl ExecutionProgram {
             ExecutionRuntimeEffects::default(),
             |effects, step| match step {
                 ExecutionProgramStep::TransactionControl => effects,
-                ExecutionProgramStep::Statement(step) => effects
-                    .merge(step.bound_template.plan_requirements().runtime_effects),
+                ExecutionProgramStep::Statement(step) => {
+                    effects.merge(step.bound_template.plan_requirements().runtime_effects)
+                }
             },
         )
     }

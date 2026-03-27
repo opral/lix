@@ -27,7 +27,7 @@ use crate::sql::public::services::pending_reads::{
     execute_prepared_public_read_with_pending_transaction_view,
 };
 use crate::sql::public::services::state_reader::{
-    load_exact_live_row, load_version_ref, scan_live_rows, RawStorage,
+    load_exact_live_row, load_version_ref, scan_live_rows, LiveStorageLane,
 };
 use crate::transaction::PendingTransactionView;
 use crate::version::{
@@ -551,7 +551,7 @@ async fn load_active_version_admin_rows(
     let required_columns = vec!["version_id".to_string()];
     let rows = scan_live_rows(
         backend,
-        RawStorage::Untracked,
+        LiveStorageLane::Untracked,
         active_version_schema_key(),
         active_version_storage_version_id(),
         &constraints,
@@ -627,7 +627,7 @@ async fn load_active_account_admin_rows(
     let required_columns = vec!["account_id".to_string()];
     let rows = scan_live_rows(
         backend,
-        RawStorage::Untracked,
+        LiveStorageLane::Untracked,
         active_account_schema_key(),
         active_account_storage_version_id(),
         &constraints,
@@ -921,15 +921,14 @@ async fn load_version_admin_row(
 ) -> Result<Option<VersionAdminRow>, crate::LixError> {
     let Some(descriptor_row) = load_exact_live_row(
         backend,
-        RawStorage::Tracked,
+        LiveStorageLane::Tracked,
         version_descriptor_schema_key(),
         version_descriptor_storage_version_id(),
         version_id,
         Some(version_descriptor_file_id()),
     )
     .await?
-    .filter(|row| row.plugin_key() == version_descriptor_plugin_key())
-    .and_then(|row| row.into_tracked()) else {
+    .filter(|row| row.plugin_key() == version_descriptor_plugin_key()) else {
         return Ok(None);
     };
     let pointer_row = load_version_ref(backend, version_id).await?;
@@ -937,7 +936,7 @@ async fn load_version_admin_row(
         id: version_id.to_string(),
         name: descriptor_row.property_text("name").unwrap_or_default(),
         hidden: descriptor_row
-            .values
+            .values()
             .get("hidden")
             .and_then(value_as_bool)
             .unwrap_or(false),
@@ -945,7 +944,7 @@ async fn load_version_admin_row(
             .as_ref()
             .map(|row| row.commit_id.clone())
             .unwrap_or_default(),
-        descriptor_change_id: descriptor_row.change_id,
+        descriptor_change_id: descriptor_row.change_id().map(ToOwned::to_owned),
         pointer_change_id: None,
     }))
 }
@@ -1489,7 +1488,7 @@ async fn validate_public_write_version_target(
 
     let descriptor_exists = load_exact_live_row(
         backend,
-        RawStorage::Tracked,
+        LiveStorageLane::Tracked,
         version_descriptor_schema_key(),
         version_descriptor_storage_version_id(),
         version_id,
@@ -1498,7 +1497,6 @@ async fn validate_public_write_version_target(
     .await
     .map_err(write_resolve_backend_error)?
     .filter(|row| row.plugin_key() == version_descriptor_plugin_key())
-    .and_then(|row| row.into_tracked())
     .is_some();
     if !descriptor_exists {
         return Err(WriteResolveError {

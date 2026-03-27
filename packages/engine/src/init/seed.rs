@@ -11,8 +11,7 @@ use crate::key_value::{
     KEY_VALUE_GLOBAL_VERSION,
 };
 use crate::live_state::{
-    builtin_live_table_layout, live_column_name_for_property, normalized_live_column_values,
-    tracked_live_table_name, untracked_live_table_name,
+    live_relation_name, live_schema_normalized_values, live_schema_payload_column_name,
 };
 use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
 use crate::sql::execution::execution_program::{ExecutionContext, SessionExecutionRuntime};
@@ -133,7 +132,10 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             return Ok(());
         };
         runtime_state
-            .flush_in_transaction(self.engine, self.write_transaction.backend_transaction_mut())
+            .flush_in_transaction(
+                self.engine,
+                self.write_transaction.backend_transaction_mut(),
+            )
             .await
     }
 
@@ -141,9 +143,11 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         if let Some(runtime_state) = self.context.execution_runtime_state().cloned() {
             return Ok(runtime_state);
         }
-        let backend = TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
+        let backend =
+            TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
         let runtime_state = ExecutionRuntimeState::prepare(self.engine, &backend).await?;
-        self.context.set_execution_runtime_state(runtime_state.clone());
+        self.context
+            .set_execution_runtime_state(runtime_state.clone());
         Ok(runtime_state)
     }
 
@@ -157,7 +161,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             return Ok(Some(commit_id));
         }
 
-        let commit_table = tracked_live_table_name("lix_commit");
+        let commit_table = live_relation_name("lix_commit");
         let has_commits = self
             .execute_backend(
                 &format!(
@@ -317,7 +321,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         path: &str,
         parent_id: Option<&str>,
     ) -> Result<String, LixError> {
-        let table_name = quote_ident(&tracked_live_table_name("lix_directory_descriptor"));
+        let table_name = quote_ident(&live_relation_name("lix_directory_descriptor"));
         let name = system_directory_name(path);
         let existing = match parent_id {
             Some(parent_id) => {
@@ -655,7 +659,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                        AND schema_key = 'lix_commit' \
                        AND file_id = 'lix' \
                        AND version_id = 'global'",
-                table = quote_ident(&tracked_live_table_name("lix_commit")),
+                table = quote_ident(&live_relation_name("lix_commit")),
                 set_sql = set_sql,
             ),
             &[Value::Text(commit_id.to_string())],
@@ -666,7 +670,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     }
 
     pub(crate) async fn seed_lix_id(&mut self) -> Result<(), LixError> {
-        let table = tracked_live_table_name(key_value_schema_key());
+        let table = live_relation_name(key_value_schema_key());
         let check_sql = format!(
             "SELECT 1 \
              FROM {table} \
@@ -810,7 +814,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             return Ok(());
         }
 
-        let commit_table = tracked_live_table_name("lix_commit");
+        let commit_table = live_relation_name("lix_commit");
         let commit_count_result = self
             .execute_backend(
                 &format!(
@@ -839,7 +843,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             return Ok(());
         };
         let bootstrap_commit_id = self.load_global_version_commit_id().await?;
-        let account_table = tracked_live_table_name(account_schema_key());
+        let account_table = live_relation_name(account_schema_key());
 
         let exists = self
             .execute_backend(
@@ -885,7 +889,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         name: &str,
         change_id: &str,
     ) -> Result<(), LixError> {
-        let table = tracked_live_table_name(version_descriptor_schema_key());
+        let table = live_relation_name(version_descriptor_schema_key());
         let check_sql = format!(
             "SELECT 1 \
              FROM {table} \
@@ -908,12 +912,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let snapshot_content =
             version_descriptor_snapshot_content(entity_id, name, entity_id == GLOBAL_VERSION_ID);
         let timestamp = self.generate_runtime_timestamp().await?;
-        builtin_live_table_layout(version_descriptor_schema_key())?.ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "builtin version descriptor schema must compile to a live layout",
-            )
-        })?;
         let normalized_values =
             normalized_seed_values(version_descriptor_schema_key(), Some(&snapshot_content))?;
         let insert_sql = format!(
@@ -985,7 +983,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
              ) VALUES (\
              '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{change_id}', NULL, NULL, 0, '{timestamp}', '{timestamp}'{normalized_literals}\
              )",
-            table = quote_ident(&tracked_live_table_name(schema_key)),
+            table = quote_ident(&live_relation_name(schema_key)),
             entity_id = escape_sql_string(entity_id),
             schema_key = escape_sql_string(schema_key),
             schema_version = escape_sql_string(schema_version),
@@ -1041,7 +1039,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
              ) VALUES (\
              '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', NULL, NULL, true, '{timestamp}', '{timestamp}'{normalized_literals}\
              )",
-            table = quote_ident(&untracked_live_table_name(schema_key)),
+            table = quote_ident(&live_relation_name(schema_key)),
             entity_id = escape_sql_string(entity_id),
             schema_key = escape_sql_string(schema_key),
             schema_version = escape_sql_string(schema_version),
@@ -1108,7 +1106,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         &mut self,
         name: &str,
     ) -> Result<Option<String>, LixError> {
-        let table = tracked_live_table_name(version_descriptor_schema_key());
+        let table = live_relation_name(version_descriptor_schema_key());
         let name_column = quote_ident(&live_payload_column_name(
             version_descriptor_schema_key(),
             "name",
@@ -1156,13 +1154,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         commit_id: &str,
     ) -> Result<(), LixError> {
         let snapshot_content = version_ref_snapshot_content(entity_id, commit_id);
-        let table = untracked_live_table_name(version_ref_schema_key());
-        builtin_live_table_layout(version_ref_schema_key())?.ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "builtin version ref schema must compile to a live layout",
-            )
-        })?;
+        let table = live_relation_name(version_ref_schema_key());
         let check_sql = format!(
             "SELECT 1 \
              FROM {table} \
@@ -1271,58 +1263,19 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         &mut self,
         head_commit_id: &str,
     ) -> Result<Option<String>, LixError> {
-        let commit_edge_layout =
-            builtin_live_table_layout("lix_commit_edge")?.ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "builtin schema layout missing for lix_commit_edge",
-                )
-            })?;
-        let commit_edge_parent = live_column_name_for_property(&commit_edge_layout, "parent_id")
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "normalized live layout missing parent_id for lix_commit_edge",
-                )
-            })?;
-        let commit_edge_child = live_column_name_for_property(&commit_edge_layout, "child_id")
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "normalized live layout missing child_id for lix_commit_edge",
-                )
-            })?;
-        let entity_label_layout =
-            builtin_live_table_layout("lix_entity_label")?.ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "builtin schema layout missing for lix_entity_label",
-                )
-            })?;
+        let commit_edge_parent =
+            live_schema_payload_column_name("lix_commit_edge", None, "parent_id")?;
+        let commit_edge_child =
+            live_schema_payload_column_name("lix_commit_edge", None, "child_id")?;
         let entity_label_entity_id =
-            live_column_name_for_property(&entity_label_layout, "entity_id").ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "normalized live layout missing entity_id for lix_entity_label",
-                )
-            })?;
+            live_schema_payload_column_name("lix_entity_label", None, "entity_id")?;
         let entity_label_schema_key =
-            live_column_name_for_property(&entity_label_layout, "schema_key").ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "normalized live layout missing schema_key for lix_entity_label",
-                )
-            })?;
-        let entity_label_label_id = live_column_name_for_property(&entity_label_layout, "label_id")
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "normalized live layout missing label_id for lix_entity_label",
-                )
-            })?;
-        let commit_edge_table = tracked_live_table_name("lix_commit_edge");
-        let entity_label_table = tracked_live_table_name("lix_entity_label");
-        let commit_table = tracked_live_table_name("lix_commit");
+            live_schema_payload_column_name("lix_entity_label", None, "schema_key")?;
+        let entity_label_label_id =
+            live_schema_payload_column_name("lix_entity_label", None, "label_id")?;
+        let commit_edge_table = live_relation_name("lix_commit_edge");
+        let entity_label_table = live_relation_name("lix_entity_label");
+        let commit_table = live_relation_name("lix_commit");
         let rows = self
             .execute_internal(
                 &format!(
@@ -1379,8 +1332,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                     entity_label_table = quote_ident(&entity_label_table),
                     commit_table = quote_ident(&commit_table),
                 )
-                .replace("__PARENT_ID__", commit_edge_parent)
-                .replace("__CHILD_ID__", commit_edge_child),
+                .replace("__PARENT_ID__", &commit_edge_parent)
+                .replace("__CHILD_ID__", &commit_edge_child),
                 &[Value::Text(head_commit_id.to_string())],
             )
             .await?;
@@ -1619,11 +1572,7 @@ fn normalized_seed_values(
     schema_key: &str,
     snapshot_content: Option<&str>,
 ) -> Result<Vec<(String, Value)>, LixError> {
-    let layout = builtin_live_table_layout(schema_key)?;
-    let Some(layout) = layout.as_ref() else {
-        return Ok(Vec::new());
-    };
-    Ok(normalized_live_column_values(layout, snapshot_content)?
+    Ok(live_schema_normalized_values(schema_key, None, snapshot_content)?
         .into_iter()
         .collect())
 }
@@ -1671,14 +1620,12 @@ fn quote_ident(value: &str) -> String {
 }
 
 fn live_payload_column_name(schema_key: &str, property_name: &str) -> String {
-    let layout = builtin_live_table_layout(schema_key)
-        .expect("builtin live layout lookup should succeed")
-        .expect("builtin live layout should exist");
-    live_column_name_for_property(&layout, property_name)
-        .unwrap_or_else(|| {
-            panic!("builtin live layout '{schema_key}' must include '{property_name}'")
-        })
-        .to_string()
+    live_schema_payload_column_name(schema_key, None, property_name).unwrap_or_else(|error| {
+        panic!(
+            "builtin live schema '{schema_key}' must include '{property_name}': {}",
+            error.description
+        )
+    })
 }
 
 fn system_directory_name(path: &str) -> String {

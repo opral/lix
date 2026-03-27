@@ -10,7 +10,6 @@ use crate::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::{tracked_live_table_name, untracked_live_table_name};
 use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
     SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,
@@ -23,13 +22,15 @@ use crate::sql::public::planner::ir::{
     InsertOnConflictAction, PlannedStateRow, PlannedWrite, ResolvedWritePlan, WriteMode,
     WriteOperationKind,
 };
+use crate::live_state::LiveSchemaAccess;
 use crate::sql::public::services::state_reader::{
-    is_untracked_live_table_name, load_live_row_access, load_live_row_access_for_table,
-    projected_row_snapshot_json, scan_live_rows, snapshot_json_from_row, RawRow, RawStorage,
+    is_untracked_live_table_name, live_storage_relation_exists, load_live_row_access,
+    load_live_row_access_for_table, projected_row_snapshot_json, scan_live_rows,
+    snapshot_json_from_row, LiveReadRow, LiveStorageLane,
 };
 use crate::sql_support::binding::bind_sql;
 use crate::state::checkpoint::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME};
-use crate::{LixBackend, LixError, SqlDialect, Value};
+use crate::{LixBackend, LixError, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const CHECKPOINT_LABEL_SCHEMA_KEY: &str = "lix_label";
@@ -1647,11 +1648,11 @@ async fn query_committed_scope_rows(
     backend: &dyn LixBackend,
     scope: &ConstraintScopeKey,
 ) -> Result<Vec<ConstraintCommittedRow>, LixError> {
-    let relation_name = match scope.storage {
-        ConstraintStorageKind::Tracked => tracked_live_table_name(&scope.schema_key),
-        ConstraintStorageKind::Untracked => untracked_live_table_name(&scope.schema_key),
+    let storage = match scope.storage {
+        ConstraintStorageKind::Tracked => LiveStorageLane::Tracked,
+        ConstraintStorageKind::Untracked => LiveStorageLane::Untracked,
     };
-    if !relation_exists(backend, &relation_name).await? {
+    if !live_storage_relation_exists(backend, storage, &scope.schema_key).await? {
         return Ok(Vec::new());
     }
     let access = load_live_row_access(backend, &scope.schema_key).await?;
@@ -1668,7 +1669,7 @@ async fn query_committed_scope_rows(
     match scope.storage {
         ConstraintStorageKind::Tracked => scan_live_rows(
             backend,
-            RawStorage::Tracked,
+            LiveStorageLane::Tracked,
             &scope.schema_key,
             &scope.version_id,
             &constraints,
@@ -1680,7 +1681,7 @@ async fn query_committed_scope_rows(
         .collect(),
         ConstraintStorageKind::Untracked => scan_live_rows(
             backend,
-            RawStorage::Untracked,
+            LiveStorageLane::Untracked,
             &scope.schema_key,
             &scope.version_id,
             &constraints,
@@ -1697,11 +1698,11 @@ async fn query_committed_schema_version_rows(
     backend: &dyn LixBackend,
     scope: &ConstraintSchemaVersionKey,
 ) -> Result<Vec<ConstraintCommittedRow>, LixError> {
-    let relation_name = match scope.storage {
-        ConstraintStorageKind::Tracked => tracked_live_table_name(&scope.schema_key),
-        ConstraintStorageKind::Untracked => untracked_live_table_name(&scope.schema_key),
+    let storage = match scope.storage {
+        ConstraintStorageKind::Tracked => LiveStorageLane::Tracked,
+        ConstraintStorageKind::Untracked => LiveStorageLane::Untracked,
     };
-    if !relation_exists(backend, &relation_name).await? {
+    if !live_storage_relation_exists(backend, storage, &scope.schema_key).await? {
         return Ok(Vec::new());
     }
     let access = load_live_row_access(backend, &scope.schema_key).await?;
@@ -1714,7 +1715,7 @@ async fn query_committed_schema_version_rows(
     match scope.storage {
         ConstraintStorageKind::Tracked => scan_live_rows(
             backend,
-            RawStorage::Tracked,
+            LiveStorageLane::Tracked,
             &scope.schema_key,
             &scope.version_id,
             &[],
@@ -1726,7 +1727,7 @@ async fn query_committed_schema_version_rows(
         .collect(),
         ConstraintStorageKind::Untracked => scan_live_rows(
             backend,
-            RawStorage::Untracked,
+            LiveStorageLane::Untracked,
             &scope.schema_key,
             &scope.version_id,
             &[],
@@ -1742,8 +1743,8 @@ async fn query_committed_schema_version_rows(
 fn committed_row_from_raw(
     schema_key: &str,
     version_id: &str,
-    access: &crate::live_state::LiveRowAccess,
-    row: RawRow,
+    access: &LiveSchemaAccess,
+    row: LiveReadRow,
 ) -> Result<ConstraintCommittedRow, LixError> {
     Ok(ConstraintCommittedRow {
         identity: ConstraintRowIdentity {
@@ -1755,38 +1756,6 @@ fn committed_row_from_raw(
         schema_version: row.schema_version().to_string(),
         snapshot: snapshot_json_from_row(access, &row)?,
     })
-}
-
-async fn relation_exists(backend: &dyn LixBackend, relation_name: &str) -> Result<bool, LixError> {
-    let result = match backend.dialect() {
-        SqlDialect::Sqlite => {
-            backend
-                .execute(
-                    "SELECT 1 \
-                     FROM sqlite_master \
-                     WHERE name = $1 \
-                       AND type IN ('table', 'view') \
-                     LIMIT 1",
-                    &[Value::Text(relation_name.to_string())],
-                )
-                .await?
-        }
-        SqlDialect::Postgres => {
-            backend
-                .execute(
-                    "SELECT 1 \
-                     FROM pg_catalog.pg_class c \
-                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE n.nspname = current_schema() \
-                       AND c.relname = $1 \
-                     LIMIT 1",
-                    &[Value::Text(relation_name.to_string())],
-                )
-                .await?
-        }
-    };
-
-    Ok(!result.rows.is_empty())
 }
 
 fn extract_pointer_tuple(

@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value as JsonValue;
 
 use crate::backend::prepared::{PreparedBatch, PreparedStatement};
-use crate::live_state::{
-    builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
-};
+use crate::live_state::{live_relation_name, live_schema_payload_column_name};
 use crate::sql_support::binding::bind_sql;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::Value as EngineValue;
@@ -98,7 +96,7 @@ pub(crate) fn build_exact_commit_depth_cte_sql(
     target_placeholder: &str,
     fallback_depth_placeholder: &str,
 ) -> String {
-    let commit_edge_table = tracked_live_table_name("lix_commit_edge");
+    let commit_edge_table = live_relation_name("lix_commit_edge");
     let edge_parent_expr = quote_ident(&live_payload_column_name("lix_commit_edge", "parent_id"));
     let edge_child_expr = quote_ident(&live_payload_column_name("lix_commit_edge", "child_id"));
     format!(
@@ -258,8 +256,8 @@ fn parse_commit_edge_snapshot(raw: &str) -> Result<Option<(String, String)>, Lix
 }
 
 pub(crate) fn build_commit_generation_seed_sql() -> String {
-    let commit_table = tracked_live_table_name("lix_commit");
-    let commit_edge_table = tracked_live_table_name("lix_commit_edge");
+    let commit_table = live_relation_name("lix_commit");
+    let commit_edge_table = live_relation_name("lix_commit_edge");
     let commit_edge_parent_id_column =
         quote_ident(&live_payload_column_name("lix_commit_edge", "parent_id"));
     let commit_edge_child_id_column =
@@ -320,12 +318,10 @@ fn quote_ident(value: &str) -> String {
 }
 
 fn live_payload_column_name(schema_key: &str, property_name: &str) -> String {
-    let layout = builtin_live_table_layout(schema_key)
-        .expect("builtin live layout lookup should succeed")
-        .expect("builtin live layout should exist");
-    live_column_name_for_property(&layout, property_name)
-        .unwrap_or_else(|| {
-            panic!("builtin live layout '{schema_key}' must include '{property_name}'")
-        })
-        .to_string()
+    live_schema_payload_column_name(schema_key, None, property_name).unwrap_or_else(|error| {
+        panic!(
+            "builtin live schema '{schema_key}' must include '{property_name}': {}",
+            error.description
+        )
+    })
 }

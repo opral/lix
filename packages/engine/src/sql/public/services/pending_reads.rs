@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
 
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::raw::{scan_rows_with_backend, snapshot_text, RawRow, RawStorage};
-use crate::live_state::{load_live_row_access_with_backend, normalized_live_column_values};
 use crate::read::contracts::CommittedReadMode;
 use crate::sql::public::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::sql::public::runtime::{
     decode_public_read_result, execute_prepared_public_read, PreparedPublicRead,
+};
+use crate::live_state::LiveSchemaAccess;
+use crate::sql::public::services::state_reader::{
+    load_live_row_access, normalized_values_from_snapshot, scan_live_rows, snapshot_text_from_row,
+    LiveReadRow, LiveStorageLane,
 };
 use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::transaction::{
@@ -142,7 +145,7 @@ impl<'a> TransactionReadModel<'a> {
         &self,
         query: &LiveTableOverlayQuery,
     ) -> Result<QueryResult, LixError> {
-        let access = load_live_row_access_with_backend(self.base, &query.schema_key).await?;
+        let access = load_live_row_access(self.base, &query.schema_key).await?;
         let constraints = scan_constraints_from_live_filters(&query.filters);
         let required_columns = access
             .columns()
@@ -150,9 +153,9 @@ impl<'a> TransactionReadModel<'a> {
             .map(|column| column.property_name.clone())
             .collect::<Vec<_>>();
         let mut rows = match query.storage {
-            PendingSemanticStorage::Tracked => scan_rows_with_backend(
+            PendingSemanticStorage::Tracked => scan_live_rows(
                 self.base,
-                RawStorage::Tracked,
+                LiveStorageLane::Tracked,
                 &query.schema_key,
                 &query.version_id,
                 &constraints,
@@ -162,9 +165,9 @@ impl<'a> TransactionReadModel<'a> {
             .into_iter()
             .map(|row| visible_live_row_from_raw(&access, row))
             .collect::<Result<Vec<_>, _>>()?,
-            PendingSemanticStorage::Untracked => scan_rows_with_backend(
+            PendingSemanticStorage::Untracked => scan_live_rows(
                 self.base,
-                RawStorage::Untracked,
+                LiveStorageLane::Untracked,
                 &query.schema_key,
                 &query.version_id,
                 &constraints,
@@ -251,7 +254,7 @@ impl<'a> TransactionReadModel<'a> {
     fn apply_filesystem_overlay_to_rows(
         &self,
         query: &LiveTableOverlayQuery,
-        access: &crate::live_state::LiveRowAccess,
+        access: &LiveSchemaAccess,
         rows: &mut BTreeMap<OverlayVisibleLiveRowIdentity, OverlayVisibleLiveRow>,
     ) {
         let Some(overlay) = self.filesystem_overlay.as_ref() else {
@@ -772,10 +775,10 @@ fn scan_constraints_from_live_filters(filters: &[LiveFilter]) -> Vec<ScanConstra
 }
 
 fn visible_live_row_from_raw(
-    access: &crate::live_state::LiveRowAccess,
-    row: RawRow,
+    access: &LiveSchemaAccess,
+    row: LiveReadRow,
 ) -> Result<OverlayVisibleLiveRow, LixError> {
-    let snapshot_content = snapshot_text(access, &row)?;
+    let snapshot_content = snapshot_text_from_row(access, &row)?;
     Ok(OverlayVisibleLiveRow {
         entity_id: row.entity_id().to_string(),
         schema_key: row.schema_key().to_string(),
@@ -792,7 +795,7 @@ fn visible_live_row_from_raw(
 }
 
 fn visible_live_row_from_pending(
-    access: &crate::live_state::LiveRowAccess,
+    access: &LiveSchemaAccess,
     pending: &PendingSemanticRow,
 ) -> Result<OverlayVisibleLiveRow, LixError> {
     Ok(OverlayVisibleLiveRow {
@@ -806,15 +809,12 @@ fn visible_live_row_from_pending(
         change_id: None,
         snapshot_content: pending.snapshot_content.clone(),
         is_tombstone: pending.tombstone,
-        normalized_values: normalized_live_column_values(
-            access.layout(),
-            pending.snapshot_content.as_deref(),
-        )?,
+        normalized_values: normalized_values_from_snapshot(access, pending.snapshot_content.as_deref())?,
     })
 }
 
 fn visible_live_row_from_pending_filesystem_state(
-    access: &crate::live_state::LiveRowAccess,
+    access: &LiveSchemaAccess,
     pending: &crate::filesystem::runtime::FilesystemTransactionFileState,
 ) -> Option<OverlayVisibleLiveRow> {
     let descriptor = pending.descriptor.as_ref()?;
@@ -842,8 +842,7 @@ fn visible_live_row_from_pending_filesystem_state(
         change_id: None,
         snapshot_content: Some(snapshot_content.clone()),
         is_tombstone: false,
-        normalized_values: normalized_live_column_values(access.layout(), Some(&snapshot_content))
-            .ok()?,
+        normalized_values: normalized_values_from_snapshot(access, Some(&snapshot_content)).ok()?,
     })
 }
 

@@ -415,11 +415,13 @@ fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> Schem
                 for requirement in coalesce_live_table_requirements(
                     &tracked.execution.schema_live_table_requirements,
                 ) {
-                    match requirement.layout.as_ref() {
-                        Some(layout) => registrations.insert(SchemaRegistration::with_layout(
-                            requirement.schema_key.clone(),
-                            layout,
-                        )),
+                    match requirement.schema_definition.as_ref() {
+                        Some(schema_definition) => registrations.insert(
+                            SchemaRegistration::with_schema_definition(
+                                requirement.schema_key.clone(),
+                                schema_definition.clone(),
+                            ),
+                        ),
                         None => registrations.insert(requirement.schema_key.clone()),
                     }
                 }
@@ -433,11 +435,13 @@ fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> Schem
                 for requirement in
                     coalesce_live_table_requirements(&internal.execution.live_table_requirements)
                 {
-                    match requirement.layout.as_ref() {
-                        Some(layout) => registrations.insert(SchemaRegistration::with_layout(
-                            requirement.schema_key.clone(),
-                            layout,
-                        )),
+                    match requirement.schema_definition.as_ref() {
+                        Some(schema_definition) => registrations.insert(
+                            SchemaRegistration::with_schema_definition(
+                                requirement.schema_key.clone(),
+                                schema_definition.clone(),
+                            ),
+                        ),
                         None => registrations.insert(requirement.schema_key.clone()),
                     }
                 }

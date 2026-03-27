@@ -3,10 +3,9 @@ use crate::filesystem::live_projection::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
     FilesystemProjectionScope,
 };
-use crate::live_state::shared::snapshot_sql::live_snapshot_select_expr;
 use crate::live_state::{
-    builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
-    untracked_live_table_name, LiveRowAccess, LiveTableLayout,
+    live_relation_name, live_schema_normalized_projection_sql, live_schema_payload_column_name,
+    live_schema_snapshot_select_expr,
 };
 use crate::sql::public::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::public::catalog::{
@@ -23,6 +22,7 @@ use crate::sql::public::planner::semantics::effective_state_resolver::{
 };
 use crate::version::{version_descriptor_schema_key, version_ref_schema_key, GLOBAL_VERSION_ID};
 use crate::{LixError, SqlDialect};
+use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
@@ -128,7 +128,7 @@ pub(crate) fn lower_read_for_execution_with_layouts(
     structured_read: &StructuredPublicRead,
     effective_state_request: Option<&EffectiveStateRequest>,
     effective_state_plan: Option<&EffectiveStatePlan>,
-    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<Option<LoweredReadProgram>, LixError> {
     let result_columns = lowered_result_columns(structured_read);
     match structured_read.surface_binding.descriptor.surface_family {
@@ -217,7 +217,7 @@ fn lower_state_read_for_execution(
     canonicalized: &StructuredPublicRead,
     effective_state_request: &EffectiveStateRequest,
     effective_state_plan: &EffectiveStatePlan,
-    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<Option<Statement>, LixError> {
     if let Some(error) =
         state_read_exposed_column_error(&canonicalized.surface_binding, effective_state_request)
@@ -454,7 +454,7 @@ fn lower_entity_read_for_execution(
     canonicalized: &StructuredPublicRead,
     effective_state_request: &EffectiveStateRequest,
     effective_state_plan: &EffectiveStatePlan,
-    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<Option<Statement>, LixError> {
     if canonicalized.query.uses_wildcard_projection() {
         return Ok(None);
@@ -1000,7 +1000,7 @@ fn build_state_source_query(
     surface_binding: &SurfaceBinding,
     effective_state_request: &EffectiveStateRequest,
     pushdown_predicates: &[String],
-    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<Option<Query>, LixError> {
     let sql = match surface_binding.descriptor.surface_variant {
         SurfaceVariant::Default | SurfaceVariant::ByVersion => build_effective_state_source_sql(
@@ -1018,17 +1018,17 @@ fn build_state_source_query(
 }
 
 fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError> {
-    let version_descriptor_table = tracked_live_table_name("lix_version_descriptor");
-    let version_ref_table = untracked_live_table_name("lix_version_ref");
-    let version_descriptor_name_column = quote_ident(&live_payload_column_name(
+    let version_descriptor_table = live_relation_name("lix_version_descriptor");
+    let version_ref_table = live_relation_name("lix_version_ref");
+    let version_descriptor_name_column = quote_ident(&builtin_payload_column_name(
         version_descriptor_schema_key(),
         "name",
     ));
-    let version_descriptor_hidden_column = quote_ident(&live_payload_column_name(
+    let version_descriptor_hidden_column = quote_ident(&builtin_payload_column_name(
         version_descriptor_schema_key(),
         "hidden",
     ));
-    let version_ref_commit_id_column = quote_ident(&live_payload_column_name(
+    let version_ref_commit_id_column = quote_ident(&builtin_payload_column_name(
         version_ref_schema_key(),
         "commit_id",
     ));
@@ -1081,7 +1081,7 @@ fn build_entity_source_query(
     surface_binding: &SurfaceBinding,
     effective_state_request: &EffectiveStateRequest,
     pushdown_predicates: &[String],
-    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<Option<Query>, LixError> {
     let projection = entity_projection_sql(surface_binding, effective_state_request);
     let projection = if projection.is_empty() {
@@ -1131,7 +1131,7 @@ fn build_effective_state_source_sql(
     effective_state_request: &EffectiveStateRequest,
     surface_binding: &SurfaceBinding,
     pushdown_predicates: &[String],
-    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<String, LixError> {
     build_effective_live_source_sql(
         dialect,
@@ -1150,7 +1150,7 @@ fn build_effective_live_source_sql(
     effective_state_request: &EffectiveStateRequest,
     surface_binding: &SurfaceBinding,
     pushdown_predicates: &[String],
-    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
     include_snapshot_content: bool,
 ) -> Result<String, LixError> {
     let schema_keys = effective_state_request
@@ -1170,15 +1170,15 @@ fn build_effective_live_source_sql(
 
     let (target_version_predicates, source_predicates) =
         split_effective_state_pushdown_predicates(pushdown_predicates);
-    let commit_table = tracked_live_table_name("lix_commit");
-    let cse_table = tracked_live_table_name("lix_change_set_element");
+    let commit_table = live_relation_name("lix_commit");
+    let cse_table = live_relation_name("lix_change_set_element");
     let commit_change_set_id_column =
-        quote_ident(&live_payload_column_name("lix_commit", "change_set_id"));
-    let cse_change_set_id_column = quote_ident(&live_payload_column_name(
+        quote_ident(&builtin_payload_column_name("lix_commit", "change_set_id"));
+    let cse_change_set_id_column = quote_ident(&builtin_payload_column_name(
         "lix_change_set_element",
         "change_set_id",
     ));
-    let cse_change_id_column = quote_ident(&live_payload_column_name(
+    let cse_change_id_column = quote_ident(&builtin_payload_column_name(
         "lix_change_set_element",
         "change_id",
     ));
@@ -1269,8 +1269,8 @@ fn explicit_target_versions_cte_sql(
     schema_keys: &[String],
     target_version_predicates: &[String],
 ) -> String {
-    let version_descriptor_table = tracked_live_table_name("lix_version_descriptor");
-    let version_descriptor_hidden_column = quote_ident(&live_payload_column_name(
+    let version_descriptor_table = live_relation_name("lix_version_descriptor");
+    let version_descriptor_hidden_column = quote_ident(&builtin_payload_column_name(
         version_descriptor_schema_key(),
         "hidden",
     ));
@@ -1297,7 +1297,7 @@ fn explicit_target_versions_cte_sql(
                  FROM {table_name} \
                  WHERE version_id <> '{global_version}' \
                    AND untracked = false",
-                table_name = quote_ident(&tracked_live_table_name(schema_key)),
+                table_name = quote_ident(&live_relation_name(schema_key)),
                 global_version = escape_sql_string(GLOBAL_VERSION_ID),
             )
         })
@@ -1307,7 +1307,7 @@ fn explicit_target_versions_cte_sql(
                  FROM {table_name} \
                  WHERE version_id <> '{global_version}' \
                    AND untracked = true",
-                table_name = quote_ident(&untracked_live_table_name(schema_key)),
+                table_name = quote_ident(&live_relation_name(schema_key)),
                 global_version = escape_sql_string(GLOBAL_VERSION_ID),
             )
         }))
@@ -1358,26 +1358,37 @@ fn effective_state_schema_winner_rows_sql(
     schema_keys: &[String],
     source_predicates: &[String],
     effective_state_request: &EffectiveStateRequest,
-    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
     include_snapshot_content: bool,
 ) -> String {
     let payload_columns = effective_state_payload_columns(effective_state_request, surface_binding);
     schema_keys
         .iter()
         .map(|schema_key| {
-            let table_name = quote_ident(&tracked_live_table_name(schema_key));
-            let untracked_table = quote_ident(&untracked_live_table_name(schema_key));
-            let access =
-                known_live_access_for_schema(schema_key, known_live_layouts).unwrap_or_else(
-                    |error| {
-                        panic!(
-                            "live layout lookup for '{schema_key}' failed: {}",
-                            error.description
-                        )
-                    },
-                );
-            let tracked_full_projection = access.normalized_projection_sql(Some("t"));
-            let untracked_full_projection = access.normalized_projection_sql(Some("u"));
+            let table_name = quote_ident(&live_relation_name(schema_key));
+            let untracked_table = quote_ident(&live_relation_name(schema_key));
+            let tracked_full_projection = live_schema_normalized_projection_sql(
+                schema_key,
+                known_live_layouts.get(schema_key),
+                Some("t"),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "live layout lookup for '{schema_key}' failed: {}",
+                    error.description
+                )
+            });
+            let untracked_full_projection = live_schema_normalized_projection_sql(
+                schema_key,
+                known_live_layouts.get(schema_key),
+                Some("u"),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "live layout lookup for '{schema_key}' failed: {}",
+                    error.description
+                )
+            });
             let ranked_payload_projection = render_state_payload_projection_list(
                 dialect,
                 surface_binding,
@@ -1389,7 +1400,18 @@ fn effective_state_schema_winner_rows_sql(
             let final_snapshot_projection = if include_snapshot_content {
                 format!(
                     "{} AS snapshot_content, ",
-                    live_snapshot_select_expr(access.layout(), dialect, Some("ranked"))
+                    live_schema_snapshot_select_expr(
+                        schema_key,
+                        known_live_layouts.get(schema_key),
+                        dialect,
+                        Some("ranked"),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "live layout lookup for '{schema_key}' failed: {}",
+                            error.description
+                        )
+                    })
                 )
             } else {
                 String::new()
@@ -1540,8 +1562,17 @@ fn effective_state_schema_winner_rows_sql(
                    AND ranked.is_tombstone = 0",
                 final_snapshot_projection = final_snapshot_projection,
                 ranked_payload_projection = ranked_payload_projection,
-                normalized_ranked_projection =
-                    access.normalized_projection_sql(Some("c")),
+                normalized_ranked_projection = live_schema_normalized_projection_sql(
+                    schema_key,
+                    known_live_layouts.get(schema_key),
+                    Some("c"),
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "live layout lookup for '{schema_key}' failed: {}",
+                        error.description
+                    )
+                }),
                 global_version = escape_sql_string(GLOBAL_VERSION_ID),
                 tracked_full_projection = tracked_full_projection,
                 tracked_predicates = tracked_predicates,
@@ -1583,15 +1614,13 @@ fn quote_ident(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-fn live_payload_column_name(schema_key: &str, property_name: &str) -> String {
-    let layout = builtin_live_table_layout(schema_key)
-        .expect("builtin live layout lookup should succeed")
-        .expect("builtin live layout should exist");
-    live_column_name_for_property(&layout, property_name)
-        .unwrap_or_else(|| {
-            panic!("builtin live layout '{schema_key}' must include '{property_name}'")
-        })
-        .to_string()
+fn builtin_payload_column_name(schema_key: &str, property_name: &str) -> String {
+    live_schema_payload_column_name(schema_key, None, property_name).unwrap_or_else(|error| {
+        panic!(
+            "builtin live schema '{schema_key}' must include '{property_name}': {}",
+            error.description
+        )
+    })
 }
 
 fn effective_state_payload_columns(
@@ -1699,27 +1728,24 @@ fn render_state_payload_projection_list(
     schema_key: &str,
     table_alias: &str,
     payload_columns: &[String],
-    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> String {
     if payload_columns.is_empty() {
         return String::new();
     }
-
-    let layout =
-        known_live_layout_for_schema(schema_key, known_live_layouts).unwrap_or_else(|error| {
-            panic!(
-                "live layout lookup for '{schema_key}' failed: {}",
-                error.description
-            )
-        });
 
     format!(
         ", {}",
         payload_columns
             .iter()
             .map(|column| {
-                let expression =
-                    render_live_payload_column_expr(dialect, &layout, table_alias, column);
+                let expression = render_live_payload_column_expr(
+                    dialect,
+                    schema_key,
+                    known_live_layouts.get(schema_key),
+                    table_alias,
+                    column,
+                );
                 let alias = if entity_surface_uses_payload_alias(surface_binding, column) {
                     entity_surface_payload_alias(column)
                 } else {
@@ -1732,47 +1758,22 @@ fn render_state_payload_projection_list(
     )
 }
 
-fn known_live_layout_for_schema(
-    schema_key: &str,
-    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
-) -> Result<LiveTableLayout, LixError> {
-    if let Some(layout) = known_live_layouts.get(schema_key) {
-        return Ok(layout.clone());
-    }
-    builtin_live_table_layout(schema_key)?.ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            &format!("missing normalized live layout for schema '{}'", schema_key),
-        )
-    })
-}
-
-fn known_live_access_for_schema(
-    schema_key: &str,
-    known_live_layouts: &BTreeMap<String, LiveTableLayout>,
-) -> Result<LiveRowAccess, LixError> {
-    known_live_layout_for_schema(schema_key, known_live_layouts).map(LiveRowAccess::new)
-}
-
 fn render_live_payload_column_expr(
     dialect: SqlDialect,
-    layout: &LiveTableLayout,
+    schema_key: &str,
+    schema_definition: Option<&JsonValue>,
     table_alias: &str,
     public_column: &str,
 ) -> String {
-    let Some(column_name) = live_column_name_for_property(layout, public_column) else {
-        return "NULL".to_string();
-    };
-    let Some(column_spec) = layout
-        .columns
-        .iter()
-        .find(|column| column.column_name == column_name)
+    let Ok(column_name) =
+        live_schema_payload_column_name(schema_key, schema_definition, public_column)
     else {
         return "NULL".to_string();
     };
-    let qualified = format!("{}.{}", quote_ident(table_alias), quote_ident(column_name));
-    match column_spec.kind {
-        crate::live_state::LiveColumnKind::JsonText => match dialect {
+    let qualified = format!("{}.{}", quote_ident(table_alias), quote_ident(&column_name));
+    match public_column {
+        "metadata" => qualified,
+        _ => match dialect {
             SqlDialect::Sqlite => format!(
                 "CASE WHEN {qualified} IS NULL THEN NULL ELSE json_extract({qualified}, '$') || '' END"
             ),
@@ -1780,7 +1781,6 @@ fn render_live_payload_column_expr(
                 "CASE WHEN {qualified} IS NULL THEN NULL ELSE (CAST({qualified} AS JSONB) #>> '{{}}') END"
             ),
         },
-        _ => qualified,
     }
 }
 
@@ -1806,40 +1806,40 @@ fn build_change_source_query() -> Result<Query, LixError> {
 }
 
 fn build_working_changes_source_query(active_version_id: &str) -> Result<Query, LixError> {
-    let version_ref_table = untracked_live_table_name("lix_version_ref");
-    let commit_tracked_table = tracked_live_table_name("lix_commit");
-    let cse_tracked_table = tracked_live_table_name("lix_change_set_element");
-    let commit_edge_table = tracked_live_table_name("lix_commit_edge");
-    let version_ref_commit_id_column = quote_ident(&live_payload_column_name(
+    let version_ref_table = live_relation_name("lix_version_ref");
+    let commit_tracked_table = live_relation_name("lix_commit");
+    let cse_tracked_table = live_relation_name("lix_change_set_element");
+    let commit_edge_table = live_relation_name("lix_commit_edge");
+    let version_ref_commit_id_column = quote_ident(&builtin_payload_column_name(
         version_ref_schema_key(),
         "commit_id",
     ));
     let commit_change_set_id_column =
-        quote_ident(&live_payload_column_name("lix_commit", "change_set_id"));
-    let cse_change_set_id_column = quote_ident(&live_payload_column_name(
+        quote_ident(&builtin_payload_column_name("lix_commit", "change_set_id"));
+    let cse_change_set_id_column = quote_ident(&builtin_payload_column_name(
         "lix_change_set_element",
         "change_set_id",
     ));
-    let cse_change_id_column = quote_ident(&live_payload_column_name(
+    let cse_change_id_column = quote_ident(&builtin_payload_column_name(
         "lix_change_set_element",
         "change_id",
     ));
-    let cse_entity_id_column = quote_ident(&live_payload_column_name(
+    let cse_entity_id_column = quote_ident(&builtin_payload_column_name(
         "lix_change_set_element",
         "entity_id",
     ));
-    let cse_schema_key_column = quote_ident(&live_payload_column_name(
+    let cse_schema_key_column = quote_ident(&builtin_payload_column_name(
         "lix_change_set_element",
         "schema_key",
     ));
-    let cse_file_id_column = quote_ident(&live_payload_column_name(
+    let cse_file_id_column = quote_ident(&builtin_payload_column_name(
         "lix_change_set_element",
         "file_id",
     ));
     let commit_edge_child_id_column =
-        quote_ident(&live_payload_column_name("lix_commit_edge", "child_id"));
+        quote_ident(&builtin_payload_column_name("lix_commit_edge", "child_id"));
     let commit_edge_parent_id_column =
-        quote_ident(&live_payload_column_name("lix_commit_edge", "parent_id"));
+        quote_ident(&builtin_payload_column_name("lix_commit_edge", "parent_id"));
     let active_version_cte = format!(
         "active_version AS ( \
             SELECT '{active_version_id}' AS version_id \
@@ -2211,14 +2211,14 @@ fn build_working_changes_source_query(active_version_id: &str) -> Result<Query, 
         version_ref_commit_id_column = version_ref_commit_id_column,
         commit_change_set_id_column = commit_change_set_id_column,
         commit_tracked_table = commit_tracked_table,
-        commit_untracked_table = quote_ident(&untracked_live_table_name("lix_commit")),
+        commit_untracked_table = quote_ident(&live_relation_name("lix_commit")),
         cse_change_set_id_column = cse_change_set_id_column,
         cse_change_id_column = cse_change_id_column,
         cse_entity_id_column = cse_entity_id_column,
         cse_schema_key_column = cse_schema_key_column,
         cse_file_id_column = cse_file_id_column,
         cse_tracked_table = cse_tracked_table,
-        cse_untracked_table = quote_ident(&untracked_live_table_name("lix_change_set_element")),
+        cse_untracked_table = quote_ident(&live_relation_name("lix_change_set_element")),
         commit_edge_table = commit_edge_table,
         commit_edge_parent_id_column = commit_edge_parent_id_column,
         commit_edge_child_id_column = commit_edge_child_id_column,
@@ -2553,12 +2553,12 @@ mod tests {
         lower_read_for_execution_with_layouts, rewrite_supported_public_read_surfaces_in_statement,
         LoweredReadProgram,
     };
-    use crate::live_state::{LiveColumnKind, LiveColumnSpec, LiveTableLayout};
     use crate::sql::public::catalog::SurfaceRegistry;
     use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql::public::planner::canonicalize::canonicalize_read;
     use crate::sql::public::planner::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
     use crate::sql::public::planner::semantics::effective_state_resolver::build_effective_state;
+    use serde_json::{json, Value as JsonValue};
     use crate::{SqlDialect, Value};
     use std::collections::BTreeMap;
 
@@ -2569,7 +2569,7 @@ mod tests {
     fn lowered_program_with_layouts(
         registry: &SurfaceRegistry,
         sql: &str,
-        known_live_layouts: &BTreeMap<String, LiveTableLayout>,
+        known_live_layouts: &BTreeMap<String, JsonValue>,
     ) -> Option<LoweredReadProgram> {
         let mut statements =
             crate::sql::public::core::parser::parse_sql_script(sql).expect("SQL should parse");
@@ -2723,25 +2723,16 @@ mod tests {
         let mut known_live_layouts = BTreeMap::new();
         known_live_layouts.insert(
             "message".to_string(),
-            LiveTableLayout {
-                schema_key: "message".to_string(),
-                columns: vec![
-                    LiveColumnSpec {
-                        property_name: "body".to_string(),
-                        column_name: "body".to_string(),
-                        kind: LiveColumnKind::String,
-                        required: false,
-                        nullable: false,
-                    },
-                    LiveColumnSpec {
-                        property_name: "id".to_string(),
-                        column_name: "id".to_string(),
-                        kind: LiveColumnKind::String,
-                        required: true,
-                        nullable: false,
-                    },
-                ],
-            },
+            json!({
+                "x-lix-key": "message",
+                "x-lix-version": "1",
+                "type": "object",
+                "properties": {
+                    "body": { "type": "string" },
+                    "id": { "type": "string" }
+                },
+                "required": ["id"]
+            }),
         );
 
         let lowered = lowered_program_with_layouts(

@@ -2,9 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::errors::classification::is_missing_relation_error;
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::load_live_row_access_with_executor;
-use crate::live_state::raw::{scan_rows_with_executor, snapshot_text, RawStorage};
 use crate::live_state::roots::load_version_ref_with_executor;
+use crate::live_state::{
+    load_live_schema_access_with_executor, scan_tracked_rows_with_executor,
+    scan_untracked_rows_with_executor,
+};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value, VersionId};
 
@@ -137,7 +139,7 @@ pub(crate) async fn load_exact_committed_state_row_from_live_state_with_executor
     executor: &mut dyn CommitQueryExecutor,
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    let access = load_live_row_access_with_executor(executor, &request.schema_key).await?;
+    let access = load_live_schema_access_with_executor(executor, &request.schema_key).await?;
     let mut constraints = vec![ScanConstraint {
         field: ScanField::EntityId,
         operator: ScanOperator::Eq(Value::Text(request.entity_id.clone())),
@@ -172,9 +174,8 @@ pub(crate) async fn load_exact_committed_state_row_from_live_state_with_executor
             operator: ScanOperator::Eq(Value::Text(schema_version.to_string())),
         });
     }
-    let mut rows = scan_rows_with_executor(
+    let mut rows = scan_tracked_rows_with_executor(
         executor,
-        RawStorage::Tracked,
         &request.schema_key,
         &request.version_id,
         &constraints,
@@ -198,13 +199,7 @@ pub(crate) async fn load_exact_committed_state_row_from_live_state_with_executor
         ));
     }
     let row = rows.remove(0);
-    let snapshot_content = snapshot_text(&access, &row)?;
-    let Some(row) = row.into_tracked() else {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked committed-state lookup returned untracked row",
-        ));
-    };
+    let snapshot_content = access.snapshot_text_from_values(&row.schema_key, &row.values)?;
     let mut values = BTreeMap::new();
     values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
     values.insert(
@@ -379,7 +374,7 @@ pub(crate) async fn load_commit_lineage_entry_by_id(
     executor: &mut dyn CommitQueryExecutor,
     commit_id: &str,
 ) -> Result<Option<CommitLineageEntry>, LixError> {
-    let access = load_live_row_access_with_executor(executor, "lix_commit").await?;
+    let access = load_live_schema_access_with_executor(executor, "lix_commit").await?;
     let constraints = vec![
         ScanConstraint {
             field: ScanField::EntityId,
@@ -399,9 +394,8 @@ pub(crate) async fn load_commit_lineage_entry_by_id(
         .iter()
         .map(|column| column.property_name.clone())
         .collect::<Vec<_>>();
-    let mut tracked_rows = scan_rows_with_executor(
+    let mut tracked_rows = scan_tracked_rows_with_executor(
         executor,
-        RawStorage::Tracked,
         "lix_commit",
         GLOBAL_VERSION_ID,
         &constraints,
@@ -409,11 +403,10 @@ pub(crate) async fn load_commit_lineage_entry_by_id(
     )
     .await?;
     let snapshot_content = if let Some(row) = tracked_rows.pop() {
-        snapshot_text(&access, &row)?
+        access.snapshot_text_from_values(&row.schema_key, &row.values)?
     } else {
-        let mut untracked_rows = scan_rows_with_executor(
+        let mut untracked_rows = scan_untracked_rows_with_executor(
             executor,
-            RawStorage::Untracked,
             "lix_commit",
             GLOBAL_VERSION_ID,
             &constraints,
@@ -423,7 +416,7 @@ pub(crate) async fn load_commit_lineage_entry_by_id(
         let Some(row) = untracked_rows.pop() else {
             return Ok(None);
         };
-        snapshot_text(&access, &row)?
+        access.snapshot_text_from_values(&row.schema_key, &row.values)?
     };
     if snapshot_content.is_empty() {
         return Ok(None);
@@ -592,17 +585,17 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
 mod tests {
     use super::*;
     use crate::backend::LixBackendTransaction;
-    use crate::live_state::{builtin_live_table_layout, LiveRowAccess};
+    use crate::live_state::{
+        live_schema_column_names, live_schema_normalized_values, live_schema_snapshot_text_from_values,
+    };
     use crate::QueryResult;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     fn mock_normalized_live_row(schema_key: &str) -> (Vec<Value>, String) {
-        let layout = builtin_live_table_layout(schema_key)
-            .expect("builtin live layout should compile")
-            .expect("builtin schema should exist");
-        let access = LiveRowAccess::new(layout.clone());
+        let normalized = live_schema_normalized_values(schema_key, None, Some("{\"id\":\"file-1\"}"))
+            .expect("builtin schema should normalize");
         let mut row = vec![
             Value::Text("file-1".to_string()),
             Value::Text(schema_key.to_string()),
@@ -617,25 +610,24 @@ mod tests {
             Value::Text("2026-03-06T14:22:00.000Z".to_string()),
             Value::Text("2026-03-06T14:22:00.000Z".to_string()),
         ];
-        for column in &layout.columns {
-            let value = if column.property_name == "id" {
-                Value::Text("file-1".to_string())
-            } else {
-                Value::Null
-            };
-            row.push(value);
+        for column_name in live_schema_column_names(schema_key, None)
+            .expect("builtin schema should expose column names")
+        {
+            row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
         }
-        let snapshot = access
-            .logical_snapshot_text_from_row(&row, 12)
-            .expect("live snapshot reconstruction should succeed")
-            .expect("live snapshot should be present");
+        let snapshot = live_schema_snapshot_text_from_values(schema_key, None, &normalized)
+            .expect("live snapshot reconstruction should succeed");
         (row, snapshot)
     }
 
     fn fake_version_ref_live_row(version_id: &str, commit_id: &str) -> Vec<Value> {
-        let layout = builtin_live_table_layout(crate::version::version_ref_schema_key())
-            .expect("builtin layout should load")
-            .expect("version ref layout should exist");
+        let snapshot = crate::version::version_ref_snapshot_content(version_id, commit_id);
+        let normalized = live_schema_normalized_values(
+            crate::version::version_ref_schema_key(),
+            None,
+            Some(&snapshot),
+        )
+        .expect("version ref snapshot should normalize");
         let mut row = vec![
             Value::Text(version_id.to_string()),
             Value::Text(crate::version::version_ref_schema_key().to_string()),
@@ -649,12 +641,10 @@ mod tests {
             Value::Text("2026-03-06T14:22:00.000Z".to_string()),
             Value::Text("2026-03-06T14:22:00.000Z".to_string()),
         ];
-        for column in &layout.columns {
-            row.push(match column.property_name.as_str() {
-                "id" => Value::Text(version_id.to_string()),
-                "commit_id" => Value::Text(commit_id.to_string()),
-                _ => Value::Null,
-            });
+        for column_name in live_schema_column_names(crate::version::version_ref_schema_key(), None)
+            .expect("version ref schema should expose column names")
+        {
+            row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
         }
         row
     }
@@ -672,7 +662,9 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("FROM \"lix_internal_live_v1_lix_file_descriptor\"") {
+            let file_descriptor_table =
+                format!("FROM \"{}\"", crate::live_state::live_relation_name("lix_file_descriptor"));
+            if sql.contains(&file_descriptor_table) {
                 self.live_table_query_seen.store(true, Ordering::SeqCst);
                 let (row, _) = mock_normalized_live_row("lix_file_descriptor");
                 return Ok(QueryResult {
@@ -782,8 +774,11 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("FROM \"lix_internal_live_v1_lix_file_descriptor\"")
-                || sql.contains("FROM lix_internal_live_v1_lix_version_ref")
+            let file_descriptor_table =
+                format!("FROM \"{}\"", crate::live_state::live_relation_name("lix_file_descriptor"));
+            let version_ref_table =
+                format!("FROM {}", crate::live_state::live_relation_name("lix_version_ref"));
+            if sql.contains(&file_descriptor_table) || sql.contains(&version_ref_table)
             {
                 return Err(LixError::new("LIX_ERROR_UNKNOWN", "no such table"));
             }
@@ -913,7 +908,7 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("lix_internal_live_v1_lix_version_ref") {
+            if sql.contains(&crate::live_state::live_relation_name("lix_version_ref")) {
                 self.live_query_seen.store(true, Ordering::SeqCst);
                 return Ok(QueryResult {
                     rows: vec![fake_version_ref_live_row("v1", "commit-live")],

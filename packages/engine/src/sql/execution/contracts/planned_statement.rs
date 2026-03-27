@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
 
-use crate::live_state::LiveTableLayout;
 use crate::{LixError, Value};
 use sqlparser::ast::Expr;
 
@@ -11,7 +10,7 @@ use crate::backend::prepared::PreparedStatement;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SchemaLiveTableRequirement {
     pub(crate) schema_key: String,
-    pub(crate) layout: Option<LiveTableLayout>,
+    pub(crate) schema_definition: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

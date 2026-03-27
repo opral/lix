@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::sql::ast::lowering::lower_statement;
 pub(crate) use crate::sql_support::binding::PlaceholderState;
+use serde_json::Value as JsonValue;
 pub(crate) type SchemaLiveTableRequirement =
     crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
 pub(crate) type MutationRow = crate::sql::execution::contracts::planned_statement::MutationRow;
@@ -78,7 +79,7 @@ pub(crate) async fn rewrite_statement_with_backend<P>(
     statement: Statement,
     _params: &[Value],
     _writer_key: Option<&str>,
-    _known_live_layouts: &BTreeMap<String, crate::live_state::LiveTableLayout>,
+    _known_live_schema_definitions: &BTreeMap<String, JsonValue>,
     _provider: &mut P,
 ) -> Result<RewriteOutput, LixError>
 where
@@ -172,7 +173,7 @@ where
 {
     let mut rewritten = Vec::with_capacity(statements.len());
     let mut live_table_requirements: Vec<SchemaLiveTableRequirement> = Vec::new();
-    let mut known_live_layouts = BTreeMap::<String, crate::live_state::LiveTableLayout>::new();
+    let mut known_live_schema_definitions = BTreeMap::<String, JsonValue>::new();
     let mut mutations: Vec<MutationRow> = Vec::new();
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
 
@@ -182,7 +183,7 @@ where
             statement,
             params,
             writer_key,
-            &known_live_layouts,
+            &known_live_schema_definitions,
             provider,
         ))
         .await
@@ -204,8 +205,9 @@ where
             &mut update_validations,
         )?;
         for requirement in &live_table_requirements {
-            if let Some(layout) = requirement.layout.as_ref() {
-                known_live_layouts.insert(requirement.schema_key.clone(), layout.clone());
+            if let Some(schema_definition) = requirement.schema_definition.as_ref() {
+                known_live_schema_definitions
+                    .insert(requirement.schema_key.clone(), schema_definition.clone());
             }
         }
     }

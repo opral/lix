@@ -11,7 +11,8 @@ use crate::sql::public::services::state_reader::{
     load_exact_committed_state_row, load_exact_tombstone, load_live_row_access,
     normalized_values_from_snapshot, scan_live_rows_with_executor_ref, scan_tombstones,
     CommitQueryExecutor, ExactCommittedStateRow, ExactCommittedStateRowRequest,
-    ExactTrackedRowRequest, RawRow, RawStorage, TrackedScanRequest, TrackedTombstoneMarker,
+    ExactTrackedRowRequest, LiveReadRow, LiveStorageLane, TrackedScanRequest,
+    TrackedTombstoneMarker,
 };
 use crate::transaction::PendingTransactionView;
 use crate::transaction::{PendingSemanticRow, PendingSemanticStorage};
@@ -501,7 +502,7 @@ async fn load_exact_untracked_state_row(
 ) -> Result<Option<ExactUntrackedStateRow>, LixError> {
     let mut rows = scan_live_rows_with_executor_ref(
         executor,
-        RawStorage::Untracked,
+        LiveStorageLane::Untracked,
         &request.schema_key,
         &request.version_id,
         &row_key_constraints(&request.row_key),
@@ -593,7 +594,7 @@ fn tombstone_matches_row_key(row: &TrackedTombstoneMarker, row_key: &CanonicalSt
             .is_none_or(|schema_version| row.schema_version.as_deref() == Some(schema_version))
 }
 
-fn untracked_row_matches_row_key(row: &RawRow, row_key: &CanonicalStateRowKey) -> bool {
+fn untracked_row_matches_row_key(row: &LiveReadRow, row_key: &CanonicalStateRowKey) -> bool {
     row_key
         .writer_key
         .as_deref()

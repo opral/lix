@@ -1,4 +1,5 @@
 use super::*;
+use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::public::planner::ir::{
     BroadPublicReadJoin, BroadPublicReadQuery, BroadPublicReadRelation, BroadPublicReadSelect,
     BroadPublicReadSetExpr, BroadPublicReadStatement, BroadPublicReadTableFactor,
@@ -1438,12 +1439,10 @@ fn build_public_state_surface_query(
         .registered_state_surface_schema_keys()
         .into_iter()
         .collect();
-    if !schema_set.iter().all(|schema_key| {
-        builtin_live_table_layout(schema_key)
-            .ok()
-            .flatten()
-            .is_some()
-    }) {
+    if !schema_set
+        .iter()
+        .all(|schema_key| builtin_schema_definition(schema_key).is_some())
+    {
         return Ok(None);
     }
     let request = EffectiveStateRequest {
@@ -1506,7 +1505,7 @@ fn build_builtin_entity_surface_query(
             ),
         });
     };
-    if builtin_live_table_layout(&schema_key)?.is_none() {
+    if builtin_schema_definition(&schema_key).is_none() {
         return Ok(None);
     }
     let Some(state_scan) = CanonicalStateScan::from_surface_binding(surface_binding.clone()) else {

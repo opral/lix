@@ -8,10 +8,7 @@ use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
 };
-use crate::live_state::{
-    builtin_live_table_layout, live_column_name_for_property, tracked_live_table_name,
-    untracked_live_table_name,
-};
+use crate::live_state::{live_relation_name, live_schema_payload_column_name};
 use crate::sql_support::text::escape_sql_string;
 use crate::{LixBackend, LixBackendTransaction, LixError, SqlDialect, Value};
 
@@ -220,7 +217,10 @@ pub(crate) fn build_persist_sequence_highest_batch(
     dialect: SqlDialect,
 ) -> Result<PreparedBatch, LixError> {
     let mut batch = PreparedBatch { steps: Vec::new() };
-    batch.append_sql(build_update_runtime_sequence_highest_sql(highest_seen, dialect));
+    batch.append_sql(build_update_runtime_sequence_highest_sql(
+        highest_seen,
+        dialect,
+    ));
     Ok(batch)
 }
 
@@ -239,13 +239,10 @@ pub(crate) fn build_ensure_runtime_sequence_row_sql(
     highest_seen: i64,
     _dialect: SqlDialect,
 ) -> String {
-    let layout = builtin_live_table_layout(key_value_schema_key())
-        .expect("builtin key-value schema layout should compile")
-        .expect("builtin key-value schema layout should exist");
-    let key_column = live_column_name_for_property(&layout, "key")
-        .expect("key-value live layout should include key");
-    let value_column = live_column_name_for_property(&layout, "value")
-        .expect("key-value live layout should include value");
+    let key_column = live_schema_payload_column_name(key_value_schema_key(), None, "key")
+        .expect("key-value live schema should include key");
+    let value_column = live_schema_payload_column_name(key_value_schema_key(), None, "value")
+        .expect("key-value live schema should include value");
     let value_json = serde_json::to_string(&serde_json::Value::from(highest_seen))
         .expect("deterministic highest-seen JSON serialization should succeed");
 
@@ -254,7 +251,7 @@ pub(crate) fn build_ensure_runtime_sequence_row_sql(
          (entity_id, schema_key, file_id, version_id, global, plugin_key, metadata, writer_key, schema_version, untracked, created_at, updated_at, {key_column}, {value_column}) \
          VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', FALSE, '{plugin_key}', NULL, NULL, '{schema_version}', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{key_value}', '{value_json}') \
          ON CONFLICT (entity_id, file_id, version_id, untracked) DO NOTHING",
-        table_name = untracked_live_table_name(key_value_schema_key()),
+        table_name = live_relation_name(key_value_schema_key()),
         key_column = key_column,
         value_column = value_column,
         entity_id = escape_sql_string(SEQUENCE_KEY),
@@ -269,11 +266,8 @@ pub(crate) fn build_ensure_runtime_sequence_row_sql(
 }
 
 pub(crate) fn build_lock_runtime_sequence_row_sql(dialect: SqlDialect) -> String {
-    let layout = builtin_live_table_layout(key_value_schema_key())
-        .expect("builtin key-value schema layout should compile")
-        .expect("builtin key-value schema layout should exist");
-    let value_column = live_column_name_for_property(&layout, "value")
-        .expect("key-value live layout should include value");
+    let value_column = live_schema_payload_column_name(key_value_schema_key(), None, "value")
+        .expect("key-value live schema should include value");
     let for_update = match dialect {
         SqlDialect::Postgres => " FOR UPDATE",
         SqlDialect::Sqlite => "",
@@ -289,7 +283,7 @@ pub(crate) fn build_lock_runtime_sequence_row_sql(dialect: SqlDialect) -> String
            AND untracked = true \
          LIMIT 1{for_update}",
         value_column = value_column,
-        table_name = untracked_live_table_name(key_value_schema_key()),
+        table_name = live_relation_name(key_value_schema_key()),
         entity_id = escape_sql_string(SEQUENCE_KEY),
         schema_key = escape_sql_string(key_value_schema_key()),
         file_id = escape_sql_string(key_value_file_id()),
@@ -302,11 +296,8 @@ pub(crate) fn build_update_runtime_sequence_highest_sql(
     highest_seen: i64,
     _dialect: SqlDialect,
 ) -> String {
-    let layout = builtin_live_table_layout(key_value_schema_key())
-        .expect("builtin key-value schema layout should compile")
-        .expect("builtin key-value schema layout should exist");
-    let value_column = live_column_name_for_property(&layout, "value")
-        .expect("key-value live layout should include value");
+    let value_column = live_schema_payload_column_name(key_value_schema_key(), None, "value")
+        .expect("key-value live schema should include value");
     let value_json = serde_json::to_string(&serde_json::Value::from(highest_seen))
         .expect("deterministic highest-seen JSON serialization should succeed");
 
@@ -318,7 +309,7 @@ pub(crate) fn build_update_runtime_sequence_highest_sql(
            AND file_id = '{file_id}' \
            AND version_id = '{version_id}' \
            AND untracked = true",
-        table_name = untracked_live_table_name(key_value_schema_key()),
+        table_name = live_relation_name(key_value_schema_key()),
         value_column = value_column,
         value_json = escape_sql_string(&value_json),
         entity_id = escape_sql_string(SEQUENCE_KEY),
@@ -336,7 +327,7 @@ async fn load_key_value_payloads(
         return Ok(std::collections::BTreeMap::new());
     }
 
-    let table_name = tracked_live_table_name(key_value_schema_key());
+    let table_name = live_relation_name(key_value_schema_key());
     let untracked_value_expr = "\"u\".\"value_json\"";
     let tracked_value_expr = "\"t\".\"value_json\"";
     let in_list = entity_ids
@@ -363,7 +354,7 @@ async fn load_key_value_payloads(
              AND is_tombstone = 0\
          ) visible_key_values \
          ORDER BY entity_id ASC, precedence ASC",
-        untracked_table = untracked_live_table_name(key_value_schema_key()),
+        untracked_table = live_relation_name(key_value_schema_key()),
         untracked_value_expr = untracked_value_expr,
         in_list = in_list,
         version_id = escape_sql_string(KEY_VALUE_GLOBAL_VERSION),
