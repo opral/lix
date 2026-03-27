@@ -97,30 +97,6 @@ const INIT_STATEMENTS: &[&str] = &[
      ON lix_internal_undo_redo_operation (version_id, created_at)",
     "CREATE INDEX idx_lix_internal_undo_redo_operation_target \
      ON lix_internal_undo_redo_operation (target_commit_id)",
-    "CREATE TABLE lix_internal_entity_state_timeline_breakpoint (\
-     root_commit_id TEXT NOT NULL,\
-     entity_id TEXT NOT NULL,\
-     schema_key TEXT NOT NULL,\
-     file_id TEXT NOT NULL,\
-     from_depth BIGINT NOT NULL,\
-     plugin_key TEXT NOT NULL,\
-     schema_version TEXT NOT NULL,\
-     metadata TEXT,\
-     snapshot_id TEXT NOT NULL,\
-     change_id TEXT NOT NULL,\
-     PRIMARY KEY (root_commit_id, entity_id, schema_key, file_id, from_depth)\
-     )",
-    "CREATE INDEX idx_lix_internal_entity_state_timeline_breakpoint_root_depth \
-     ON lix_internal_entity_state_timeline_breakpoint (root_commit_id, from_depth)",
-    "CREATE INDEX idx_lix_internal_entity_state_timeline_breakpoint_lookup \
-     ON lix_internal_entity_state_timeline_breakpoint (root_commit_id, entity_id, file_id, schema_key, from_depth)",
-    "CREATE INDEX idx_lix_internal_entity_state_timeline_breakpoint_filters \
-     ON lix_internal_entity_state_timeline_breakpoint (root_commit_id, file_id, plugin_key, schema_key, entity_id, from_depth)",
-    "CREATE TABLE lix_internal_timeline_status (\
-     root_commit_id TEXT PRIMARY KEY,\
-     built_max_depth BIGINT NOT NULL,\
-     built_at TEXT NOT NULL\
-     )",
     "CREATE TABLE lix_internal_binary_blob_store (\
      blob_hash TEXT PRIMARY KEY,\
      data BYTEA NOT NULL,\

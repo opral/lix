@@ -16,8 +16,7 @@ use crate::engine::{
 use crate::errors;
 use crate::live_state::raw::{load_exact_row_with_backend, RawStorage};
 use crate::read::runtime::{
-    execute_execution_program_in_committed_read_transaction,
-    transaction_mode_for_committed_read_program,
+    execute_execution_program_in_committed_read_transaction, prepare_committed_read_program,
 };
 use crate::sql::execution::execution_program::{
     execute_execution_program_with_write_transaction, ExecutionContext, ExecutionProgram,
@@ -347,7 +346,6 @@ impl Session {
             self.engine.backend.dialect(),
             &runtime_bindings,
         )?;
-
         let execution_mode = classify_session_execution_mode(&program, explicit_transaction_script);
         let runtime_state =
             ExecutionRuntimeState::prepare(self.engine.as_ref(), self.engine.backend.as_ref())
@@ -356,13 +354,22 @@ impl Session {
 
         let result = match execution_mode {
             SessionExecutionMode::CommittedRead | SessionExecutionMode::CommittedRuntimeMutation => {
-                let transaction_mode =
-                    transaction_mode_for_committed_read_program(execution_mode, &runtime_state);
-                let mut transaction = self.engine.begin_read_unit(transaction_mode).await?;
+                let prepared_committed_read = prepare_committed_read_program(
+                    self.engine.as_ref(),
+                    &program,
+                    allow_internal_sql,
+                    &context,
+                    execution_mode,
+                )
+                .await?;
+                let mut transaction = self
+                    .engine
+                    .begin_read_unit(prepared_committed_read.transaction_mode)
+                    .await?;
                 let result = execute_execution_program_in_committed_read_transaction(
                     self.engine.as_ref(),
                     transaction.as_mut(),
-                    &program,
+                    &prepared_committed_read,
                     allow_internal_sql,
                     &context,
                 )
@@ -783,6 +790,10 @@ mod tests {
         fn modes(&self) -> Vec<crate::TransactionMode> {
             self.modes.lock().expect("recorded modes lock").clone()
         }
+
+        fn clear_modes(&self) {
+            self.modes.lock().expect("recorded modes lock").clear();
+        }
     }
 
     fn run_with_large_stack<F, Fut>(factory: F)
@@ -1017,6 +1028,88 @@ mod tests {
 
             let _ = session.execute("BEGIN; SELECT 1; COMMIT;", &[]).await;
             assert_eq!(backend.modes(), vec![crate::TransactionMode::Write]);
+        });
+    }
+
+    #[test]
+    fn history_public_reads_use_deferred_transaction_mode() {
+        run_with_large_stack(|| async move {
+            let backend = RecordingBackend::new();
+            let engine = test_engine(backend.clone());
+            engine
+                .initialize()
+                .await
+                .expect("engine init should succeed");
+            backend.clear_modes();
+            let session = engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open");
+
+            let result = session
+                .execute("SELECT COUNT(*) AS c FROM lix_state_history", &[])
+                .await
+                .expect("direct public history read should succeed");
+            assert_eq!(result.statements[0].rows.len(), 1);
+            assert_eq!(backend.modes(), vec![crate::TransactionMode::Deferred]);
+        });
+    }
+
+    #[test]
+    fn lowered_committed_public_reads_use_read_transaction_mode() {
+        run_with_large_stack(|| async move {
+            let backend = RecordingBackend::new();
+            let engine = test_engine(backend.clone());
+            engine
+                .initialize()
+                .await
+                .expect("engine init should succeed");
+            backend.clear_modes();
+            let session = engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open");
+
+            let result = session
+                .execute("SELECT id FROM lix_version ORDER BY id LIMIT 1", &[])
+                .await
+                .expect("materialized public read should succeed");
+            assert_eq!(result.statements[0].rows.len(), 1);
+            assert_eq!(backend.modes(), vec![crate::TransactionMode::Read]);
+        });
+    }
+
+    #[test]
+    fn lowered_committed_only_public_reads_use_read_transaction_mode() {
+        run_with_large_stack(|| async move {
+            let backend = RecordingBackend::new();
+            let engine = test_engine(backend.clone());
+            engine
+                .initialize()
+                .await
+                .expect("engine init should succeed");
+            let session = engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open");
+
+            for sql in [
+                "SELECT id FROM lix_change WHERE entity_id = 'entity-1'",
+                "SELECT entity_id FROM lix_working_changes WHERE schema_key = 'lix_key_value'",
+                "SELECT id FROM lix_file WHERE id = 'file-1'",
+                "SELECT id FROM lix_directory_by_version WHERE id = 'dir-1' AND lixcol_version_id = 'global'",
+            ] {
+                backend.clear_modes();
+                session
+                    .execute(sql, &[])
+                    .await
+                    .unwrap_or_else(|error| panic!("lowered committed-only read should succeed for `{sql}`: {error:?}"));
+                assert_eq!(
+                    backend.modes(),
+                    vec![crate::TransactionMode::Read],
+                    "lowered committed-only read should stay on TransactionMode::Read for `{sql}`",
+                );
+            }
         });
     }
 }

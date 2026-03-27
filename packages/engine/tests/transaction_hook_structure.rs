@@ -258,14 +258,34 @@ fn execution_program_is_a_thin_client_for_adapter_runtime() {
         );
     }
 
+    let compiled_source = read_engine_source("sql/execution/compiled.rs");
+    assert!(
+        compiled_source.contains("struct CompiledExecution"),
+        "sql/execution/compiled.rs should own neutral compiled execution types"
+    );
+    assert!(
+        compiled_source.contains("enum CompiledExecutionBody"),
+        "sql/execution/compiled.rs should own the compiled execution body split"
+    );
+    assert!(
+        !compiled_source.contains("crate::transaction::"),
+        "sql/execution/compiled.rs should not depend on transaction-owned contracts"
+    );
+
     let adapter_source = read_engine_source("transaction/sql_adapter/runtime.rs");
     assert!(
-        adapter_source.contains("struct CompiledExecution"),
-        "transaction/sql_adapter/runtime.rs should own compiled execution runtime types"
+        !adapter_source.contains("struct CompiledExecution {"),
+        "transaction/sql_adapter/runtime.rs should not own neutral compiled execution types anymore"
     );
     assert!(
         adapter_source.contains("fn execute_compiled_execution_step_with_transaction"),
         "transaction/sql_adapter/runtime.rs should own compiled step execution"
+    );
+
+    let adapter_mod_source = read_engine_source("transaction/sql_adapter/mod.rs");
+    assert!(
+        !adapter_mod_source.contains("pub(crate) use crate::sql::execution::compiled::"),
+        "transaction/sql_adapter/mod.rs should not re-export the neutral compiled execution model"
     );
 }
 

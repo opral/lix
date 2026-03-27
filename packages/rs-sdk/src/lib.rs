@@ -7,7 +7,7 @@ pub use lix_engine::{
     CreateVersionOptions, CreateVersionResult, ExecuteOptions, ExecuteResult, InitResult, Lix,
     LixBackend, LixBackendTransaction, LixConfig, LixError, MergeOutcome, MergeVersionOptions,
     MergeVersionResult, ObserveEvent, ObserveEventsOwned, ObserveQuery, PreparedBatch,
-    PreparedStatement, QueryResult, RedoOptions, RedoResult, SqlDialect, UndoOptions, UndoResult,
-    Value, WasmComponentInstance, WasmLimits, WasmRuntime,
+    PreparedStatement, QueryResult, RedoOptions, RedoResult, SqlDialect, TransactionMode,
+    UndoOptions, UndoResult, Value, WasmComponentInstance, WasmLimits, WasmRuntime,
 };
 pub use wasmtime_runtime::WasmtimeRuntime;

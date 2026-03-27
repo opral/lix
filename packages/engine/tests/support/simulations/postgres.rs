@@ -219,7 +219,18 @@ impl LixBackend for PostgresBackend {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        lix_engine::execute_auto_transactional(self, sql, params).await
+        let mut transaction = self.begin_transaction(TransactionMode::Deferred).await?;
+        let result = transaction.execute(sql, params).await;
+        match result {
+            Ok(result) => {
+                transaction.commit().await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn begin_transaction(

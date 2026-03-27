@@ -1,5 +1,6 @@
 use lix_engine::{
-    LixBackend, LixBackendTransaction, LixError, PreparedBatch, QueryResult, SqlDialect, Value,
+    LixBackend, LixBackendTransaction, LixError, PreparedBatch, QueryResult, SqlDialect,
+    TransactionMode, Value,
 };
 use rusqlite::{params_from_iter, Connection, Row};
 use std::path::Path;
@@ -13,6 +14,7 @@ struct BenchSqliteTransaction<'a> {
     conn: MutexGuard<'a, Connection>,
     finalized: bool,
     savepoint_name: Option<String>,
+    mode: TransactionMode,
 }
 
 impl BenchSqliteBackend {
@@ -60,23 +62,40 @@ impl LixBackend for BenchSqliteBackend {
         execute_sql(&conn, sql, params)
     }
 
-    async fn begin_transaction(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    async fn begin_transaction(
+        &self,
+        mode: TransactionMode,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let conn = self.lock_conn()?;
         let savepoint_name = if conn.is_autocommit() {
-            conn.execute_batch("BEGIN IMMEDIATE")
-                .map_err(sqlite_error)?;
+            conn.execute_batch(match mode {
+                TransactionMode::Read | TransactionMode::Deferred => "BEGIN TRANSACTION",
+                TransactionMode::Write => "BEGIN IMMEDIATE",
+            })
+            .map_err(sqlite_error)?;
             None
         } else {
-            let name = fallback_savepoint_name();
-            conn.execute_batch(&format!("SAVEPOINT {}", quote_savepoint_name(&name)))
-                .map_err(sqlite_error)?;
-            Some(name)
+            match mode {
+                TransactionMode::Write => {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "sqlite benchmark backend cannot open a nested write transaction inside an active transaction; use begin_savepoint(...) for nested write scopes",
+                    ));
+                }
+                TransactionMode::Read | TransactionMode::Deferred => {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "sqlite benchmark backend cannot open a nested read/deferred transaction inside an active transaction",
+                    ));
+                }
+            }
         };
 
         Ok(Box::new(BenchSqliteTransaction {
             conn,
             finalized: false,
             savepoint_name,
+            mode,
         }))
     }
 
@@ -92,6 +111,7 @@ impl LixBackend for BenchSqliteBackend {
             conn,
             finalized: false,
             savepoint_name: Some(name.to_string()),
+            mode: TransactionMode::Write,
         }))
     }
 }
@@ -100,6 +120,10 @@ impl LixBackend for BenchSqliteBackend {
 impl LixBackendTransaction for BenchSqliteTransaction<'_> {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
+    }
+
+    fn mode(&self) -> TransactionMode {
+        self.mode
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
@@ -227,12 +251,6 @@ fn to_sql_value(value: Value) -> rusqlite::types::Value {
 
 fn quote_savepoint_name(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-fn fallback_savepoint_name() -> String {
-    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    format!("sp_auto_{id}")
 }
 
 fn sqlite_error(error: impl std::fmt::Display) -> LixError {
