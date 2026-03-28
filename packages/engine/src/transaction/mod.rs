@@ -11,6 +11,8 @@ mod overlay;
 mod pending_view;
 mod read_context;
 pub(crate) mod sql_adapter;
+#[cfg(test)]
+mod tests;
 mod write_plan;
 mod write_runner;
 
