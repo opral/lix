@@ -21,7 +21,6 @@
 //! `sql/*` should keep reading query surfaces served here.
 
 pub mod constraints;
-pub(crate) mod create_commit_queries;
 pub mod effective;
 pub(crate) mod filesystem_projection;
 pub(crate) mod filesystem_queries;
