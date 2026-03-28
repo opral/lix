@@ -222,6 +222,7 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
         },
         internal_write_file_cache_targets: BTreeSet::new(),
         plugin_changes_committed,
+        canonical_commit_receipt: append_outcome.receipt,
         plan_effects_override: Some(plan_effects_override),
         state_commit_stream_changes: Vec::new(),
         observe_tick_emitted: plugin_changes_committed && unit.should_emit_observe_tick(),

@@ -20,7 +20,7 @@ use crate::SqlDialect;
 use crate::{CanonicalSchemaKey, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
 
-use super::apply::apply_derived_live_state_rows_in_transaction;
+use super::apply::apply_projected_live_state_rows_best_effort_in_transaction;
 use super::change_log::build_prepared_batch_from_canonical_output;
 use super::create_commit_preflight::{
     load_create_commit_deterministic_sequence_start as load_create_commit_deterministic_sequence_start_impl,
@@ -30,6 +30,10 @@ use super::generate_commit::generate_commit;
 use super::graph_index::{
     build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
 };
+use super::receipt::{
+    latest_canonical_watermark_from_change_rows, CanonicalCommitReceipt, UpdatedVersionRef,
+};
+use super::refs::apply_committed_version_ref_updates_in_transaction;
 use super::roots::load_committed_version_head_commit_id;
 use super::state_source::{
     load_exact_committed_state_row_at_version_head_with_executor, load_version_info_for_versions,
@@ -97,6 +101,7 @@ pub(crate) enum CreateCommitDisposition {
 pub(crate) struct CreateCommitResult {
     pub(crate) disposition: CreateCommitDisposition,
     pub(crate) committed_head: String,
+    pub(crate) receipt: Option<CanonicalCommitReceipt>,
     pub(crate) applied_output: Option<CreateCommitAppliedOutput>,
     pub(crate) applied_domain_changes: Vec<ProposedDomainChange>,
 }
@@ -226,6 +231,7 @@ pub(crate) async fn create_commit(
                 return Ok(CreateCommitResult {
                     disposition: CreateCommitDisposition::Replay,
                     committed_head: current.to_string(),
+                    receipt: None,
                     applied_output: None,
                     applied_domain_changes: Vec::new(),
                 });
@@ -254,6 +260,7 @@ pub(crate) async fn create_commit(
                 return Ok(CreateCommitResult {
                     disposition: CreateCommitDisposition::Replay,
                     committed_head: current.to_string(),
+                    receipt: None,
                     applied_output: None,
                     applied_domain_changes: Vec::new(),
                 });
@@ -275,6 +282,7 @@ pub(crate) async fn create_commit(
         return Ok(CreateCommitResult {
             disposition: CreateCommitDisposition::Replay,
             committed_head: commit_id,
+            receipt: None,
             applied_output: None,
             applied_domain_changes: Vec::new(),
         });
@@ -311,6 +319,7 @@ pub(crate) async fn create_commit(
         return Ok(CreateCommitResult {
             disposition: CreateCommitDisposition::Replay,
             committed_head: current_head.unwrap_or_default(),
+            receipt: None,
             applied_output: None,
             applied_domain_changes: Vec::new(),
         });
@@ -384,6 +393,12 @@ pub(crate) async fn create_commit(
     let committed_head = extract_committed_head_id(&generated_commit, &concrete_lane)?;
     let canonical_output = generated_commit.canonical_output;
     let derived_apply_input = generated_commit.derived_apply_input;
+    let updated_version_refs = generated_commit.updated_version_refs;
+    let receipt = build_canonical_commit_receipt(
+        committed_head.clone(),
+        &canonical_output,
+        &updated_version_refs,
+    )?;
     let mut executor = &mut *transaction;
     let commit_graph_rows = resolve_commit_graph_node_write_rows_with_executor(
         &mut executor,
@@ -460,13 +475,21 @@ pub(crate) async fn create_commit(
     execute_write_program_with_transaction(transaction, write_program)
         .await
         .map_err(backend_error)?;
-    apply_derived_live_state_rows_in_transaction(transaction, &applied_output.derived_apply_input)
+    apply_committed_version_ref_updates_in_transaction(transaction, &receipt.updated_version_refs)
         .await
         .map_err(backend_error)?;
+    apply_projected_live_state_rows_best_effort_in_transaction(
+        transaction,
+        &applied_output.derived_apply_input,
+        &receipt.canonical_watermark,
+    )
+    .await
+    .map_err(backend_error)?;
 
     Ok(CreateCommitResult {
         disposition: CreateCommitDisposition::Applied,
         committed_head,
+        receipt: Some(receipt),
         applied_output: Some(applied_output),
         applied_domain_changes,
     })
@@ -1268,8 +1291,7 @@ fn extract_committed_head_id(
         ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
     };
     let update = commit_result
-        .derived_apply_input
-        .version_ref_updates
+        .updated_version_refs
         .iter()
         .find(|update| update.version_id.as_str() == version_id)
         .ok_or_else(|| CreateCommitError {
@@ -1289,6 +1311,30 @@ fn extract_committed_head_id(
         });
     }
     Ok(update.commit_id.clone())
+}
+
+fn build_canonical_commit_receipt(
+    commit_id: String,
+    canonical_output: &CanonicalCommitOutput,
+    updated_version_refs: &[UpdatedVersionRef],
+) -> Result<CanonicalCommitReceipt, CreateCommitError> {
+    let canonical_watermark = latest_canonical_watermark_from_change_rows(
+        &canonical_output.changes,
+    )
+    .ok_or_else(|| CreateCommitError {
+        kind: CreateCommitErrorKind::Internal,
+        message: "canonical commit receipt requires at least one canonical change row".to_string(),
+    })?;
+    let affected_versions = updated_version_refs
+        .iter()
+        .map(|update| update.version_id.to_string())
+        .collect();
+    Ok(CanonicalCommitReceipt {
+        commit_id,
+        canonical_watermark,
+        updated_version_refs: updated_version_refs.to_vec(),
+        affected_versions,
+    })
 }
 
 fn insert_idempotency_row_sql(idempotency: &CommitIdempotencyWrite) -> String {
@@ -1353,11 +1399,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        create_commit, CreateCommitArgs, CreateCommitDisposition, CreateCommitError,
-        CreateCommitErrorKind, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
-        CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
+        build_canonical_commit_receipt, create_commit, CreateCommitArgs, CreateCommitDisposition,
+        CreateCommitError, CreateCommitErrorKind, CreateCommitExpectedHead,
+        CreateCommitIdempotencyKey, CreateCommitInvariantChecker, CreateCommitPreconditions,
+        CreateCommitWriteLane,
     };
     use crate::backend::prepared::{collapse_prepared_batch_for_dialect, PreparedBatch};
+    use crate::canonical::receipt::UpdatedVersionRef;
+    use crate::canonical::types::{CanonicalCommitOutput, ChangeRow};
     use crate::filesystem::runtime::{
         FilesystemTransactionFileState, FilesystemTransactionState, OptionalTextPatch,
     };
@@ -1366,7 +1415,10 @@ mod tests {
         live_schema_column_names, schema_access::normalized_values_for_schema,
     };
     use crate::version::GLOBAL_VERSION_ID;
-    use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
+    use crate::{
+        CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
+        LixBackendTransaction, LixError, QueryResult, SqlDialect, Value, VersionId,
+    };
     use async_trait::async_trait;
     use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor};
     use sqlparser::dialect::GenericDialect;
@@ -1464,6 +1516,8 @@ mod tests {
         idempotency_rows: HashMap<(String, String, String, String), String>,
         executed_sql: Vec<String>,
         live_state_mode: Option<String>,
+        latest_watermark: Option<(String, String)>,
+        fail_projected_live_state_writes: bool,
     }
 
     #[async_trait(?Send)]
@@ -1497,6 +1551,19 @@ mod tests {
                         "latest_change_created_at".to_string(),
                         "schema_epoch".to_string(),
                     ],
+                });
+            }
+            if sql.contains("FROM lix_internal_change")
+                && sql.contains("ORDER BY created_at DESC, id DESC")
+            {
+                return Ok(QueryResult {
+                    rows: self
+                        .latest_watermark
+                        .clone()
+                        .into_iter()
+                        .map(|(id, created_at)| vec![Value::Text(id), Value::Text(created_at)])
+                        .collect(),
+                    columns: vec!["id".to_string(), "created_at".to_string()],
                 });
             }
 
@@ -1550,6 +1617,16 @@ mod tests {
                         "name".to_string(),
                     ],
                 });
+            }
+            if self.fail_projected_live_state_writes
+                && sql.contains("lix_internal_live_v1_")
+                && !sql.contains("lix_internal_live_v1_lix_version_ref")
+                && !sql.contains("FROM lix_internal_live_state_status")
+            {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "simulated projected live-state write failure",
+                ));
             }
             if sql.contains("FROM lix_internal_change c")
                 && sql.contains("c.schema_key = 'lix_version_ref'")
@@ -1623,6 +1700,12 @@ mod tests {
                     .expect("commit id should be present");
                 self.idempotency_rows
                     .insert((lane, kind, value, parent_head_snapshot_content), commit_id);
+            }
+            if extract_statement_from_batch(sql, "INSERT INTO lix_internal_change ").is_some() {
+                self.latest_watermark = Some((
+                    "change-watermark".to_string(),
+                    "2026-03-06T14:22:00.000Z".to_string(),
+                ));
             }
             if let Some(status_sql) =
                 extract_statement_from_batch(sql, "INSERT INTO lix_internal_live_state_status ")
@@ -1784,6 +1867,60 @@ mod tests {
                 .iter()
                 .any(|sql| sql.contains("INSERT INTO lix_internal_live_state_status ")),
             "create_commit must NOT write the watermark — the caller stamps it at commit time"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_commit_keeps_canonical_commit_when_projected_live_state_apply_fails() {
+        let mut transaction = FakeTransaction {
+            version_heads: HashMap::from([("version-a".to_string(), "commit-123".to_string())]),
+            latest_watermark: Some((
+                "change-watermark".to_string(),
+                "2026-03-06T14:22:00.000Z".to_string(),
+            )),
+            fail_projected_live_state_writes: true,
+            ..Default::default()
+        };
+        let mut functions = CountingFunctionProvider::default();
+
+        let result = create_commit(
+            &mut transaction,
+            CreateCommitArgs {
+                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
+                changes: vec![sample_change()],
+                filesystem_state: Default::default(),
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
+                    idempotency_key: CreateCommitIdempotencyKey::Exact(
+                        "idem-projection-failure".to_string(),
+                    ),
+                },
+                active_account_ids: Vec::new(),
+                lane_parent_commit_ids_override: None,
+                allow_empty_commit: false,
+                should_emit_observe_tick: false,
+                observe_tick_writer_key: None,
+                writer_key: None,
+            },
+            &mut functions,
+            None,
+        )
+        .await
+        .expect("canonical commit should succeed even if projected live-state writes fail");
+
+        assert_eq!(result.disposition, CreateCommitDisposition::Applied);
+        assert!(
+            transaction
+                .executed_sql
+                .iter()
+                .any(|sql| sql.contains("lix_internal_live_v1_lix_version_ref")),
+            "committed version refs should still be written on the required path",
+        );
+        assert_eq!(
+            transaction.live_state_mode.as_deref(),
+            Some("needs_rebuild"),
+            "projection failure should record replay work instead of aborting canonical commit",
         );
     }
 
@@ -2321,5 +2458,56 @@ mod tests {
             }) => Some(text.as_str()),
             _ => None,
         }
+    }
+
+    #[test]
+    fn canonical_commit_receipt_uses_latest_change_as_watermark() {
+        let canonical_output = CanonicalCommitOutput {
+            changes: vec![
+                ChangeRow {
+                    id: "change-1".to_string(),
+                    entity_id: EntityId::new("entity-1").expect("valid entity id"),
+                    schema_key: CanonicalSchemaKey::new("lix_key_value").expect("valid schema key"),
+                    schema_version: CanonicalSchemaVersion::new("1").expect("valid schema version"),
+                    file_id: FileId::new("lix").expect("valid file id"),
+                    plugin_key: CanonicalPluginKey::new("lix").expect("valid plugin key"),
+                    snapshot_content: None,
+                    metadata: None,
+                    created_at: "2026-03-06T14:22:00.000Z".to_string(),
+                },
+                ChangeRow {
+                    id: "change-2".to_string(),
+                    entity_id: EntityId::new("entity-2").expect("valid entity id"),
+                    schema_key: CanonicalSchemaKey::new("lix_key_value").expect("valid schema key"),
+                    schema_version: CanonicalSchemaVersion::new("1").expect("valid schema version"),
+                    file_id: FileId::new("lix").expect("valid file id"),
+                    plugin_key: CanonicalPluginKey::new("lix").expect("valid plugin key"),
+                    snapshot_content: None,
+                    metadata: None,
+                    created_at: "2026-03-06T14:22:01.000Z".to_string(),
+                },
+            ],
+        };
+        let updated_version_refs = vec![UpdatedVersionRef {
+            version_id: VersionId::new("version-a").expect("valid version id"),
+            commit_id: "commit-123".to_string(),
+            created_at: "2026-03-06T14:22:01.000Z".to_string(),
+        }];
+
+        let receipt = build_canonical_commit_receipt(
+            "commit-123".to_string(),
+            &canonical_output,
+            &updated_version_refs,
+        )
+        .expect("receipt should build");
+
+        assert_eq!(receipt.commit_id, "commit-123");
+        assert_eq!(receipt.canonical_watermark.change_id, "change-2");
+        assert_eq!(
+            receipt.canonical_watermark.created_at,
+            "2026-03-06T14:22:01.000Z"
+        );
+        assert_eq!(receipt.updated_version_refs, updated_version_refs);
+        assert_eq!(receipt.affected_versions, vec!["version-a".to_string()]);
     }
 }

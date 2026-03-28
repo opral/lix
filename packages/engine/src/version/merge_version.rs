@@ -288,40 +288,53 @@ async fn merge_version_in_transaction(
 
     let engine = tx.engine;
     let active_account_ids = tx.context.active_account_ids.clone();
-    let transaction = tx.backend_transaction_mut()?;
-    let backend = TransactionBackendAdapter::new(transaction);
-    let (_settings, functions) = engine
-        .prepare_runtime_functions_with_backend(&backend)
-        .await?;
-    engine
-        .ensure_runtime_sequence_initialized_in_transaction(transaction, &functions)
-        .await?;
-    let mut functions = functions;
-    let merge_result = append_tracked(
-        transaction,
-        CreateCommitArgs {
-            timestamp: Some(functions.timestamp()),
-            changes: proposed_changes,
-            filesystem_state: Default::default(),
-            preconditions: CreateCommitPreconditions {
-                write_lane: CreateCommitWriteLane::Version(target_version_id.clone()),
-                expected_head: CreateCommitExpectedHead::CommitId(target_head.clone()),
-                idempotency_key: CreateCommitIdempotencyKey::Exact(format!(
-                    "merge:{}:{}:{}:{}",
-                    source_version_id, target_version_id, source_head, target_head
-                )),
+    let (target_head_after_commit_id, created_merge_commit_id, receipt) = {
+        let transaction = tx.backend_transaction_mut()?;
+        let backend = TransactionBackendAdapter::new(transaction);
+        let (_settings, functions) = engine
+            .prepare_runtime_functions_with_backend(&backend)
+            .await?;
+        engine
+            .ensure_runtime_sequence_initialized_in_transaction(transaction, &functions)
+            .await?;
+        let mut functions = functions;
+        let merge_result = append_tracked(
+            transaction,
+            CreateCommitArgs {
+                timestamp: Some(functions.timestamp()),
+                changes: proposed_changes,
+                filesystem_state: Default::default(),
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version(target_version_id.clone()),
+                    expected_head: CreateCommitExpectedHead::CommitId(target_head.clone()),
+                    idempotency_key: CreateCommitIdempotencyKey::Exact(format!(
+                        "merge:{}:{}:{}:{}",
+                        source_version_id, target_version_id, source_head, target_head
+                    )),
+                },
+                active_account_ids,
+                lane_parent_commit_ids_override: Some(vec![
+                    target_head.clone(),
+                    source_head.clone(),
+                ]),
+                allow_empty_commit: true,
+                should_emit_observe_tick: false,
+                observe_tick_writer_key: None,
+                writer_key: None,
             },
-            active_account_ids,
-            lane_parent_commit_ids_override: Some(vec![target_head.clone(), source_head.clone()]),
-            allow_empty_commit: true,
-            should_emit_observe_tick: false,
-            observe_tick_writer_key: None,
-            writer_key: None,
-        },
-        &mut functions,
-        None,
-    )
-    .await?;
+            &mut functions,
+            None,
+        )
+        .await?;
+        (
+            merge_result.committed_head.clone(),
+            Some(merge_result.committed_head.clone()),
+            merge_result.receipt.clone(),
+        )
+    };
+    if let Some(receipt) = receipt {
+        tx.record_canonical_commit_receipt(receipt)?;
+    }
 
     tx.record_state_commit_stream_changes(stream_changes)?;
 
@@ -332,8 +345,8 @@ async fn merge_version_in_transaction(
         merge_base_commit_id,
         source_head_before_commit_id: source_head,
         target_head_before_commit_id: target_head,
-        target_head_after_commit_id: merge_result.committed_head.clone(),
-        created_merge_commit_id: Some(merge_result.committed_head),
+        target_head_after_commit_id,
+        created_merge_commit_id,
         applied_change_count,
         created_tombstone_count,
     })

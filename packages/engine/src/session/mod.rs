@@ -1,5 +1,4 @@
 pub mod contracts;
-pub(crate) mod workspace;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -26,13 +25,13 @@ use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
 use crate::sql::public::catalog::SurfaceRegistry;
 use crate::transaction::{TransactionCommitOutcome, WriteTransaction};
-use crate::{ExecuteResult, LixError, Value};
-
-use contracts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
-use workspace::{
+use crate::workspace::{
     load_workspace_active_account_ids, persist_workspace_active_account_ids,
     persist_workspace_active_version_id, require_workspace_active_version_id,
 };
+use crate::{ExecuteResult, LixError, Value};
+
+use contracts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct OpenSessionOptions {
@@ -49,8 +48,8 @@ enum Persistence {
 
 pub struct Session {
     engine: Arc<Engine>,
-    // Session-local runtime state. Workspace sessions persist these values back
-    // through `session/workspace.rs`; extra sessions keep them ephemeral.
+    // Session-local runtime state. Workspace sessions persist these selectors
+    // through `crate::workspace`; extra sessions keep them ephemeral.
     active_version_id: RwLock<String>,
     active_account_ids: RwLock<Vec<String>>,
     public_surface_registry: RwLock<SurfaceRegistry>,
@@ -596,6 +595,17 @@ impl<'a> SessionTransaction<'a> {
             .as_mut()
             .ok_or_else(|| LixError::unknown("transaction is no longer active"))?
             .record_state_commit_stream_changes(changes);
+        Ok(())
+    }
+
+    pub(crate) fn record_canonical_commit_receipt(
+        &mut self,
+        receipt: crate::canonical::CanonicalCommitReceipt,
+    ) -> Result<(), LixError> {
+        self.write_transaction
+            .as_mut()
+            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?
+            .record_canonical_commit_receipt(receipt);
         Ok(())
     }
 

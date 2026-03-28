@@ -1,7 +1,6 @@
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
-use crate::live_state::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
 use crate::schema::builtin::types::{LixActiveVersion, LixVersionDescriptor, LixVersionRef};
 use crate::schema::builtin::{
     builtin_schema_definition, builtin_schema_json, decode_lixcol_literal,
@@ -147,28 +146,6 @@ pub(crate) fn version_ref_snapshot_content(id: &str, commit_id: &str) -> String 
         commit_id: commit_id.to_string(),
     })
     .expect("lix_version_ref snapshot serialization must succeed")
-}
-
-pub(crate) fn version_ref_write_row(
-    version_id: &str,
-    commit_id: &str,
-    timestamp: &str,
-) -> UntrackedWriteRow {
-    UntrackedWriteRow {
-        entity_id: version_id.to_string(),
-        schema_key: version_ref_schema_key().to_string(),
-        schema_version: version_ref_schema_version().to_string(),
-        file_id: version_ref_file_id().to_string(),
-        version_id: version_ref_storage_version_id().to_string(),
-        global: true,
-        plugin_key: version_ref_plugin_key().to_string(),
-        metadata: None,
-        writer_key: None,
-        snapshot_content: Some(version_ref_snapshot_content(version_id, commit_id)),
-        created_at: Some(timestamp.to_string()),
-        updated_at: timestamp.to_string(),
-        operation: UntrackedWriteOperation::Upsert,
-    }
 }
 
 fn active_version_schema_metadata() -> &'static SchemaMetadata {

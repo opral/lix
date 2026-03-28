@@ -1,20 +1,53 @@
 use crate::live_state::tracked::{
     TrackedWriteBatch, TrackedWriteOperation, TrackedWriteParticipant, TrackedWriteRow,
 };
-use crate::live_state::untracked::{UntrackedWriteBatch, UntrackedWriteParticipant};
-use crate::version::{version_ref_write_row, GLOBAL_VERSION_ID};
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError};
 
-use super::types::{DerivedCommitApplyInput, MaterializedStateRow, VersionRefUpdate};
+use super::receipt::CanonicalWatermark;
+use super::types::{DerivedCommitApplyInput, MaterializedStateRow};
 
-pub(crate) async fn apply_derived_live_state_rows_in_transaction(
+pub(crate) async fn apply_projected_live_state_rows_best_effort_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    derived_apply_input: &DerivedCommitApplyInput,
+    canonical_watermark: &CanonicalWatermark,
+) -> Result<(), LixError> {
+    if derived_apply_input.live_state_rows.is_empty() {
+        return Ok(());
+    }
+
+    if crate::live_state::require_ready_in_transaction(transaction)
+        .await
+        .is_err()
+    {
+        crate::live_state::mark_needs_rebuild_at_canonical_watermark_in_transaction(
+            transaction,
+            canonical_watermark,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if let Err(_projection_error) =
+        apply_projected_live_state_rows_in_transaction(transaction, derived_apply_input).await
+    {
+        crate::live_state::mark_needs_rebuild_at_canonical_watermark_in_transaction(
+            transaction,
+            canonical_watermark,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn apply_projected_live_state_rows_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     derived_apply_input: &DerivedCommitApplyInput,
 ) -> Result<(), LixError> {
     let batch = tracked_write_batch_from_derived_apply_input(derived_apply_input);
     TrackedWriteParticipant::apply_write_batch(transaction, &batch).await?;
-    let version_ref_batch = version_ref_write_batch_from_derived_apply_input(derived_apply_input);
-    UntrackedWriteParticipant::apply_write_batch(transaction, &version_ref_batch).await
+    Ok(())
 }
 
 pub(crate) fn tracked_write_batch_from_derived_apply_input(
@@ -24,16 +57,6 @@ pub(crate) fn tracked_write_batch_from_derived_apply_input(
         .live_state_rows
         .iter()
         .map(tracked_write_row_from_materialized)
-        .collect()
-}
-
-pub(crate) fn version_ref_write_batch_from_derived_apply_input(
-    derived_apply_input: &DerivedCommitApplyInput,
-) -> UntrackedWriteBatch {
-    derived_apply_input
-        .version_ref_updates
-        .iter()
-        .map(version_ref_write_row_from_update)
         .collect()
 }
 
@@ -64,14 +87,4 @@ fn tracked_write_row_from_materialized(row: &MaterializedStateRow) -> TrackedWri
             TrackedWriteOperation::Tombstone
         },
     }
-}
-
-fn version_ref_write_row_from_update(
-    update: &VersionRefUpdate,
-) -> crate::live_state::untracked::UntrackedWriteRow {
-    version_ref_write_row(
-        update.version_id.as_str(),
-        &update.commit_id,
-        &update.created_at,
-    )
 }

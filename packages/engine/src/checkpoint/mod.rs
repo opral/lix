@@ -1,6 +1,6 @@
 //! Checkpoint subsystem boundary.
 //!
-//! `checkpoint` is a derived subsystem layered on canonical history. It owns
+//! `checkpoint` is a derived subsystem layered on canonical changes. It owns
 //! checkpoint-specific acceleration and policy, such as checkpoint labels and
 //! last-checkpoint helpers.
 //!

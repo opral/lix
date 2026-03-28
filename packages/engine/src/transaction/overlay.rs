@@ -10,6 +10,11 @@ use crate::LixError;
 
 use super::contracts::TransactionDelta;
 
+/// Session-local pending-write overlay.
+///
+/// This structure is disposable bookkeeping for uncommitted transaction state.
+/// Dropping or rebuilding it must not change committed meaning or canonical
+/// ref state.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PendingWriteOverlay {
     tracked_rows: BTreeMap<RowIdentity, TrackedRow>,

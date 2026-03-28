@@ -1,16 +1,20 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
+use crate::canonical::refs::{
+    committed_version_ref_mirror_write_row, load_committed_version_ref_with_backend,
+};
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::init as init_live_state;
-use crate::live_state::roots::{load_version_ref_with_backend, version_ref_write_row};
-use crate::live_state::session::{active_version_write_row, load_active_version_with_backend};
 use crate::live_state::untracked::{
     load_exact_row_with_backend, load_exact_rows_with_backend, scan_rows_with_backend,
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedScanRequest,
     UntrackedWriteOperation, UntrackedWriteRow,
 };
 use crate::transaction::{ReadContext, TransactionDelta, WriteTransaction};
+use crate::workspace::{
+    load_workspace_active_version_row_with_backend, workspace_active_version_write_row,
+};
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
 };
@@ -203,22 +207,22 @@ async fn live_untracked_state_roundtrips_helper_rows() {
     commit_untracked_rows(
         &backend,
         vec![
-            active_version_write_row("active-row", "main", timestamp),
-            version_ref_write_row("main", "commit-1", timestamp),
-            version_ref_write_row("other", "commit-2", timestamp),
+            workspace_active_version_write_row("active-row", "main", timestamp),
+            committed_version_ref_mirror_write_row("main", "commit-1", timestamp),
+            committed_version_ref_mirror_write_row("other", "commit-2", timestamp),
         ],
     )
     .await
     .expect("helper row transaction should succeed");
 
-    let active_version = load_active_version_with_backend(&backend)
+    let active_version = load_workspace_active_version_row_with_backend(&backend)
         .await
         .expect("active version lookup should succeed")
         .expect("active version row should exist");
     assert_eq!(active_version.entity_id, "active-row");
     assert_eq!(active_version.version_id, "main");
 
-    let version_ref = load_version_ref_with_backend(&backend, "main")
+    let version_ref = load_committed_version_ref_with_backend(&backend, "main")
         .await
         .expect("version ref lookup should succeed")
         .expect("version ref row should exist");
@@ -310,7 +314,9 @@ async fn live_untracked_state_delete_removes_rows() {
         .expect("live_state init should succeed");
     commit_untracked_rows(
         &backend,
-        vec![version_ref_write_row("main", "commit-1", timestamp)],
+        vec![committed_version_ref_mirror_write_row(
+            "main", "commit-1", timestamp,
+        )],
     )
     .await
     .expect("initial version ref transaction should succeed");
@@ -336,7 +342,7 @@ async fn live_untracked_state_delete_removes_rows() {
     .await
     .expect("delete transaction should succeed");
 
-    let version_ref = load_version_ref_with_backend(&backend, "main")
+    let version_ref = load_committed_version_ref_with_backend(&backend, "main")
         .await
         .expect("version ref lookup should succeed");
     assert!(version_ref.is_none());

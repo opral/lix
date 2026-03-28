@@ -12,7 +12,7 @@ use crate::{
 };
 use serde_json::{json, Value as JsonValue};
 
-use super::apply::apply_derived_live_state_rows_in_transaction;
+use super::apply::apply_projected_live_state_rows_best_effort_in_transaction;
 use super::change_log::build_prepared_batch_from_canonical_output;
 use super::create_commit::{
     CreateCommitAppliedOutput, CreateCommitError, CreateCommitExpectedHead,
@@ -22,10 +22,14 @@ use super::generate_commit::generate_commit;
 use super::graph_index::{
     build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
 };
+use super::receipt::{
+    latest_canonical_watermark_from_change_rows, CanonicalCommitReceipt, UpdatedVersionRef,
+};
+use super::refs::apply_committed_version_ref_updates_in_transaction;
 use super::state_source::{load_version_info_for_versions, CommitQueryExecutor};
 use super::types::{
     DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow,
-    ProposedDomainChange, VersionInfo, VersionRefUpdate,
+    ProposedDomainChange, VersionInfo,
 };
 
 #[derive(Debug, Clone)]
@@ -152,7 +156,7 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
     active_account_ids: &[String],
     functions: &mut dyn LixFunctionProvider,
     timestamp: &str,
-) -> Result<(), LixError> {
+) -> Result<CanonicalCommitReceipt, LixError> {
     let domain_changes = changes
         .iter()
         .map(|change| {
@@ -373,11 +377,10 @@ fn rewrite_generated_commit_result_for_pending_session(
         writer_key: None,
     });
 
-    let version_ref_updates = generated
-        .derived_apply_input
-        .version_ref_updates
+    let updated_version_refs = generated
+        .updated_version_refs
         .into_iter()
-        .map(|update| VersionRefUpdate {
+        .map(|update| UpdatedVersionRef {
             version_id: update.version_id,
             commit_id: session.commit_id.clone(),
             created_at: timestamp.to_string(),
@@ -393,10 +396,8 @@ fn rewrite_generated_commit_result_for_pending_session(
                 .take(domain_change_count)
                 .collect(),
         },
-        derived_apply_input: super::types::DerivedCommitApplyInput {
-            live_state_rows,
-            version_ref_updates,
-        },
+        derived_apply_input: super::types::DerivedCommitApplyInput { live_state_rows },
+        updated_version_refs,
     })
 }
 
@@ -482,7 +483,7 @@ async fn execute_generated_commit_result(
     result: GenerateCommitResult,
     binary_blob_writes: &[BinaryBlobWrite],
     functions: &mut dyn LixFunctionProvider,
-) -> Result<(), LixError> {
+) -> Result<CanonicalCommitReceipt, LixError> {
     let mut executor = &mut *transaction;
     let commit_graph_rows = resolve_commit_graph_node_write_rows_with_executor(
         &mut executor,
@@ -511,8 +512,50 @@ async fn execute_generated_commit_result(
     }
     program.push_batch(prepared);
     execute_write_program_with_transaction(transaction, program).await?;
-    apply_derived_live_state_rows_in_transaction(transaction, &result.derived_apply_input).await?;
-    Ok(())
+    let receipt = canonical_commit_receipt_from_generated_result(&result)?;
+    apply_committed_version_ref_updates_in_transaction(transaction, &receipt.updated_version_refs)
+        .await?;
+    apply_projected_live_state_rows_best_effort_in_transaction(
+        transaction,
+        &result.derived_apply_input,
+        &receipt.canonical_watermark,
+    )
+    .await?;
+    Ok(receipt)
+}
+
+fn canonical_commit_receipt_from_generated_result(
+    result: &GenerateCommitResult,
+) -> Result<CanonicalCommitReceipt, LixError> {
+    let canonical_watermark = latest_canonical_watermark_from_change_rows(
+        &result.canonical_output.changes,
+    )
+    .ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "pending public commit execution requires at least one canonical change row",
+        )
+    })?;
+    let commit_id = result
+        .updated_version_refs
+        .first()
+        .map(|update| update.commit_id.clone())
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "pending public commit execution requires at least one committed version ref update",
+            )
+        })?;
+    Ok(CanonicalCommitReceipt {
+        commit_id,
+        canonical_watermark,
+        updated_version_refs: result.updated_version_refs.clone(),
+        affected_versions: result
+            .updated_version_refs
+            .iter()
+            .map(|update| update.version_id.to_string())
+            .collect(),
+    })
 }
 
 pub(crate) fn create_commit_error_to_lix_error(error: CreateCommitError) -> LixError {

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::canonical::CanonicalWatermark;
 use crate::errors::classification::is_missing_relation_error;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -56,12 +57,6 @@ impl LiveStateMode {
             _ => None,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalWatermark {
-    pub change_id: String,
-    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +211,70 @@ pub(crate) async fn finalize_commit_in_transaction(
     Ok(watermark)
 }
 
+pub(crate) async fn advance_commit_replay_boundary_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<(), LixError> {
+    let watermark = load_latest_canonical_watermark_in_transaction(transaction)
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "live_state::advance_commit_replay_boundary expected a canonical watermark",
+            )
+        })?;
+    advance_commit_replay_boundary_to_watermark_in_transaction(transaction, &watermark).await
+}
+
+pub(crate) async fn advance_commit_replay_boundary_to_watermark_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    watermark: &CanonicalWatermark,
+) -> Result<(), LixError> {
+    ensure_live_state_status_row_in_transaction(transaction).await?;
+
+    let snapshot = load_live_state_snapshot_in_transaction(transaction).await?;
+    let mode = match snapshot.status.as_ref().map(|status| status.mode) {
+        Some(LiveStateMode::Ready) => LiveStateMode::Ready,
+        _ => LiveStateMode::NeedsRebuild,
+    };
+
+    transaction
+        .execute(
+            &build_set_live_state_mode_with_watermark_sql(mode, &watermark),
+            &[],
+        )
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn mark_needs_rebuild_at_latest_canonical_watermark_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<CanonicalWatermark, LixError> {
+    let watermark = load_latest_canonical_watermark_in_transaction(transaction)
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "live_state::mark_needs_rebuild expected a canonical watermark",
+            )
+        })?;
+    mark_needs_rebuild_at_canonical_watermark_in_transaction(transaction, &watermark).await?;
+    Ok(watermark)
+}
+
+pub(crate) async fn mark_needs_rebuild_at_canonical_watermark_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    watermark: &CanonicalWatermark,
+) -> Result<(), LixError> {
+    ensure_live_state_status_row_in_transaction(transaction).await?;
+    transaction
+        .execute(
+            &build_set_live_state_mode_with_watermark_sql(LiveStateMode::NeedsRebuild, &watermark),
+            &[],
+        )
+        .await?;
+    Ok(())
+}
+
 pub(crate) async fn mark_live_state_mode_with_backend(
     backend: &dyn LixBackend,
     mode: LiveStateMode,
@@ -292,6 +351,18 @@ pub(crate) async fn load_latest_canonical_watermark_in_transaction(
     parse_latest_canonical_watermark(&result)
 }
 
+async fn ensure_live_state_status_row_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<(), LixError> {
+    transaction
+        .execute(LIVE_STATE_STATUS_CREATE_TABLE_SQL, &[])
+        .await?;
+    transaction
+        .execute(LIVE_STATE_STATUS_SEED_ROW_SQL, &[])
+        .await?;
+    Ok(())
+}
+
 fn parse_latest_canonical_watermark(
     result: &QueryResult,
 ) -> Result<Option<CanonicalWatermark>, LixError> {
@@ -305,11 +376,35 @@ fn parse_latest_canonical_watermark(
 }
 
 pub(crate) fn build_set_live_state_mode_sql(mode: LiveStateMode) -> String {
+    build_upsert_live_state_status_sql(mode, None)
+}
+
+pub(crate) fn build_mark_live_state_ready_sql(watermark: &CanonicalWatermark) -> String {
+    build_set_live_state_mode_with_watermark_sql(LiveStateMode::Ready, watermark)
+}
+
+pub(crate) fn build_set_live_state_mode_with_watermark_sql(
+    mode: LiveStateMode,
+    watermark: &CanonicalWatermark,
+) -> String {
+    build_upsert_live_state_status_sql(mode, Some(watermark))
+}
+
+fn build_upsert_live_state_status_sql(
+    mode: LiveStateMode,
+    watermark: Option<&CanonicalWatermark>,
+) -> String {
+    let latest_change_id_sql = watermark
+        .map(|value| format!("'{}'", escape_sql_string(&value.change_id)))
+        .unwrap_or_else(|| "NULL".to_string());
+    let latest_change_created_at_sql = watermark
+        .map(|value| format!("'{}'", escape_sql_string(&value.created_at)))
+        .unwrap_or_else(|| "NULL".to_string());
     format!(
         "INSERT INTO {table} (\
          singleton_id, mode, latest_change_id, latest_change_created_at, schema_epoch, updated_at\
          ) VALUES (\
-         {singleton_id}, '{mode}', NULL, NULL, '{schema_epoch}', CURRENT_TIMESTAMP\
+         {singleton_id}, '{mode}', {change_id}, {created_at}, '{schema_epoch}', CURRENT_TIMESTAMP\
          ) ON CONFLICT (singleton_id) DO UPDATE SET \
          mode = excluded.mode, \
          latest_change_id = excluded.latest_change_id, \
@@ -319,26 +414,8 @@ pub(crate) fn build_set_live_state_mode_sql(mode: LiveStateMode) -> String {
         table = LIVE_STATE_STATUS_TABLE,
         singleton_id = LIVE_STATE_STATUS_SINGLETON_ID,
         mode = mode.as_str(),
-        schema_epoch = LIVE_STATE_SCHEMA_EPOCH,
-    )
-}
-
-pub(crate) fn build_mark_live_state_ready_sql(watermark: &CanonicalWatermark) -> String {
-    format!(
-        "INSERT INTO {table} (\
-         singleton_id, mode, latest_change_id, latest_change_created_at, schema_epoch, updated_at\
-         ) VALUES (\
-         {singleton_id}, 'ready', '{change_id}', '{created_at}', '{schema_epoch}', CURRENT_TIMESTAMP\
-         ) ON CONFLICT (singleton_id) DO UPDATE SET \
-         mode = excluded.mode, \
-         latest_change_id = excluded.latest_change_id, \
-         latest_change_created_at = excluded.latest_change_created_at, \
-         schema_epoch = excluded.schema_epoch, \
-         updated_at = excluded.updated_at",
-        table = LIVE_STATE_STATUS_TABLE,
-        singleton_id = LIVE_STATE_STATUS_SINGLETON_ID,
-        change_id = escape_sql_string(&watermark.change_id),
-        created_at = escape_sql_string(&watermark.created_at),
+        change_id = latest_change_id_sql,
+        created_at = latest_change_created_at_sql,
         schema_epoch = LIVE_STATE_SCHEMA_EPOCH,
     )
 }
@@ -693,6 +770,7 @@ mod tests {
     struct FakeTransaction {
         status_row: Option<Vec<Value>>,
         latest_watermark: Option<(String, String)>,
+        executed_sql: Vec<String>,
     }
 
     #[async_trait(?Send)]
@@ -706,6 +784,7 @@ mod tests {
         }
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            self.executed_sql.push(sql.to_string());
             if sql.contains("WITH status AS")
                 && sql.contains("lix_internal_live_state_status")
                 && sql.contains("lix_internal_change")
@@ -745,6 +824,19 @@ mod tests {
                         "latest_change_created_at".to_string(),
                         "schema_epoch".to_string(),
                     ],
+                });
+            }
+            if sql.contains("FROM lix_internal_change")
+                && sql.contains("ORDER BY created_at DESC, id DESC")
+            {
+                return Ok(QueryResult {
+                    rows: self
+                        .latest_watermark
+                        .clone()
+                        .into_iter()
+                        .map(|(id, created_at)| vec![Value::Text(id), Value::Text(created_at)])
+                        .collect(),
+                    columns: vec!["id".to_string(), "created_at".to_string()],
                 });
             }
             Ok(QueryResult {
@@ -835,6 +927,7 @@ mod tests {
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
             ]),
             latest_watermark: None,
+            executed_sql: Vec::new(),
         };
 
         let error = require_ready_in_transaction(&mut transaction)
@@ -871,10 +964,63 @@ mod tests {
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
             ]),
             latest_watermark: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            executed_sql: Vec::new(),
         };
 
         require_ready_in_transaction(&mut transaction)
             .await
             .expect("inflight watermark drift inside transaction should be allowed");
+    }
+
+    #[tokio::test]
+    async fn commit_replay_boundary_marks_ready_when_live_state_is_ready() {
+        let mut transaction = FakeTransaction {
+            status_row: Some(vec![
+                Value::Text("ready".to_string()),
+                Value::Text("change-1".to_string()),
+                Value::Text("2026-03-15T01:02:02Z".to_string()),
+                Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
+            ]),
+            latest_watermark: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            executed_sql: Vec::new(),
+        };
+
+        advance_commit_replay_boundary_in_transaction(&mut transaction)
+            .await
+            .expect("replay-boundary update should succeed");
+        assert!(
+            transaction.executed_sql.iter().any(|sql| sql
+                .contains("INSERT INTO lix_internal_live_state_status ")
+                && sql.contains("'ready'")
+                && sql.contains("'change-2'")),
+            "ready live-state status should advance to the latest canonical watermark",
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_replay_boundary_marks_needs_rebuild_when_live_state_is_not_ready() {
+        let mut transaction = FakeTransaction {
+            status_row: Some(vec![
+                Value::Text("needs_rebuild".to_string()),
+                Value::Text("change-1".to_string()),
+                Value::Text("2026-03-15T01:02:02Z".to_string()),
+                Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
+            ]),
+            latest_watermark: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            executed_sql: Vec::new(),
+        };
+
+        advance_commit_replay_boundary_in_transaction(&mut transaction)
+            .await
+            .expect("replay-boundary update should succeed");
+        assert!(
+            transaction
+                .executed_sql
+                .iter()
+                .any(|sql| sql.contains("INSERT INTO lix_internal_live_state_status ")
+                    && sql.contains("'needs_rebuild'")
+                    && sql.contains("'change-2'")),
+            "non-ready live-state status should keep a durable replay boundary instead of claiming readiness",
+        );
     }
 }

@@ -544,7 +544,7 @@ mod tests {
 
         assert!(
             canonical_query_seen.load(Ordering::SeqCst),
-            "canonical exact-state lookup should read canonical history"
+            "canonical exact-state lookup should read canonical changes"
         );
         assert_eq!(row.entity_id, "file-1");
         assert_eq!(row.source_change_id.as_deref(), Some("change-fallback"));

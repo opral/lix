@@ -1,17 +1,14 @@
 use std::collections::BTreeMap;
 
 use crate::backend::QueryExecutor;
-use crate::live_state::constraints::ScanConstraint;
 use crate::live_state::storage::{json_value_from_live_row_cell, LiveRowAccess};
 use crate::live_state::tracked::{
-    load_exact_row_with_executor as load_exact_tracked_row_with_executor,
-    scan_rows_with_executor as scan_tracked_rows_with_executor, ExactTrackedRowRequest, TrackedRow,
-    TrackedScanRequest,
+    load_exact_row_with_executor as load_exact_tracked_row_with_executor, ExactTrackedRowRequest,
+    TrackedRow,
 };
 use crate::live_state::untracked::{
     load_exact_row_with_executor as load_exact_untracked_row_with_executor,
-    scan_rows_with_executor as scan_untracked_rows_with_executor, ExactUntrackedRowRequest,
-    UntrackedRow, UntrackedScanRequest,
+    ExactUntrackedRowRequest, UntrackedRow,
 };
 use crate::{LixBackend, LixError, Value};
 use serde_json::Value as JsonValue;
@@ -29,13 +26,6 @@ pub(crate) enum RawRow {
 }
 
 impl RawRow {
-    pub(crate) fn entity_id(&self) -> &str {
-        match self {
-            Self::Tracked(row) => &row.entity_id,
-            Self::Untracked(row) => &row.entity_id,
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn schema_key(&self) -> &str {
         match self {
@@ -51,25 +41,11 @@ impl RawRow {
         }
     }
 
-    pub(crate) fn updated_at(&self) -> &str {
-        match self {
-            Self::Tracked(row) => &row.updated_at,
-            Self::Untracked(row) => &row.updated_at,
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn values(&self) -> &BTreeMap<String, Value> {
         match self {
             Self::Tracked(row) => &row.values,
             Self::Untracked(row) => &row.values,
-        }
-    }
-
-    pub(crate) fn property_text(&self, property_name: &str) -> Option<String> {
-        match self {
-            Self::Tracked(row) => row.property_text(property_name),
-            Self::Untracked(row) => row.property_text(property_name),
         }
     }
 }
@@ -125,40 +101,6 @@ pub(crate) async fn load_exact_row_with_executor(
         )
         .await
         .map(|row| row.map(RawRow::Untracked)),
-    }
-}
-
-pub(crate) async fn scan_rows_with_executor(
-    executor: &mut dyn QueryExecutor,
-    storage: RawStorage,
-    schema_key: &str,
-    version_id: &str,
-    constraints: &[ScanConstraint],
-    required_columns: &[String],
-) -> Result<Vec<RawRow>, LixError> {
-    match storage {
-        RawStorage::Tracked => scan_tracked_rows_with_executor(
-            executor,
-            &TrackedScanRequest {
-                schema_key: schema_key.to_string(),
-                version_id: version_id.to_string(),
-                constraints: constraints.to_vec(),
-                required_columns: required_columns.to_vec(),
-            },
-        )
-        .await
-        .map(|rows| rows.into_iter().map(RawRow::Tracked).collect()),
-        RawStorage::Untracked => scan_untracked_rows_with_executor(
-            executor,
-            &UntrackedScanRequest {
-                schema_key: schema_key.to_string(),
-                version_id: version_id.to_string(),
-                constraints: constraints.to_vec(),
-                required_columns: required_columns.to_vec(),
-            },
-        )
-        .await
-        .map(|rows| rows.into_iter().map(RawRow::Untracked).collect()),
     }
 }
 
