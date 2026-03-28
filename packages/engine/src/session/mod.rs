@@ -234,7 +234,7 @@ impl Session {
     }
 
     pub async fn create_checkpoint(&self) -> Result<crate::CreateCheckpointResult, LixError> {
-        crate::state::checkpoint::create_checkpoint_in_session(self).await
+        crate::checkpoint::create_checkpoint_in_session(self).await
     }
 
     pub async fn merge_version(

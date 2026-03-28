@@ -10,6 +10,9 @@ pub(crate) async fn apply_public_version_last_checkpoint_side_effects(
     public_write: &PreparedPublicWrite,
     batch: &DomainChangeBatch,
 ) -> Result<(), LixError> {
+    // Public writes to `lix_version` keep the derived checkpoint pointer cache
+    // in sync. This is convenience state only; canonical history remains the
+    // source of truth if the cache is rebuilt.
     if public_write
         .planned_write
         .command

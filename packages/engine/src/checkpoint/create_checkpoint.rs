@@ -41,6 +41,7 @@ async fn create_checkpoint_in_transaction(
     if global_commit_id != local_commit_id {
         ensure_checkpoint_label_on_commit(tx, &global_commit_id).await?;
     }
+    // Keep the derived checkpoint pointer cache warm for the active version.
     tx.execute_internal(
         "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
          VALUES ($1, $2) \
@@ -52,6 +53,8 @@ async fn create_checkpoint_in_transaction(
         ],
     )
     .await?;
+    // The global lane mirrors the same derived cache contract and remains
+    // rebuildable from canonical heads plus checkpoint labels.
     tx.execute_internal(
         "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
          VALUES ($1, $2) \

@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 
+use crate::checkpoint::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME};
 use crate::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
@@ -29,7 +30,6 @@ use crate::sql::public::services::state_reader::{
     snapshot_json_from_row, LiveReadRow, LiveStorageLane,
 };
 use crate::sql_support::binding::bind_sql;
-use crate::state::checkpoint::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME};
 use crate::{LixBackend, LixError, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";

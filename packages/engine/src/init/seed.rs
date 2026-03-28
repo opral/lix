@@ -78,6 +78,10 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             .await
     }
 
+    pub(crate) fn backend_adapter(&mut self) -> TransactionBackendAdapter<'_> {
+        TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut())
+    }
+
     pub(crate) async fn generate_runtime_uuid(&mut self) -> Result<String, LixError> {
         let runtime_state = self.ensure_runtime_state().await?;
         runtime_state
