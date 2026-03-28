@@ -14,11 +14,6 @@ use crate::filesystem::runtime::{
     FILESYSTEM_FILE_SCHEMA_VERSION,
 };
 use crate::functions::LixFunctionProvider;
-use crate::live_state::create_commit_queries::{
-    load_create_commit_deterministic_sequence_start as load_create_commit_deterministic_sequence_start_impl,
-    load_untracked_file_descriptor as load_untracked_file_descriptor_impl,
-};
-use crate::live_state::require_ready_in_transaction;
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::SqlDialect;
@@ -27,6 +22,10 @@ use async_trait::async_trait;
 
 use super::apply::apply_derived_live_state_rows_in_transaction;
 use super::change_log::build_prepared_batch_from_canonical_output;
+use super::create_commit_preflight::{
+    load_create_commit_deterministic_sequence_start as load_create_commit_deterministic_sequence_start_impl,
+    load_untracked_file_descriptor as load_untracked_file_descriptor_impl,
+};
 use super::generate_commit::generate_commit;
 use super::graph_index::{
     build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
@@ -185,9 +184,6 @@ pub(crate) async fn create_commit(
 
     let concrete_lane = concrete_lane(&args.preconditions)?;
     validate_change_versions(&args.changes, &args.filesystem_state, &concrete_lane)?;
-    require_ready_in_transaction(transaction)
-        .await
-        .map_err(backend_error)?;
 
     let needs_deterministic_sequence = functions.deterministic_sequence_enabled()
         && !functions.deterministic_sequence_initialized();
@@ -2136,46 +2132,6 @@ mod tests {
                 .iter()
                 .any(|sql| sql.contains("FROM \"lix_internal_live_v1_lix_file_descriptor\"")),
             "data-only filesystem ops should not require descriptor preflight reads"
-        );
-    }
-
-    #[tokio::test]
-    async fn rejects_create_commit_when_live_state_is_not_ready() {
-        let mut transaction = FakeTransaction {
-            live_state_mode: Some("needs_rebuild".to_string()),
-            ..FakeTransaction::default()
-        };
-        let mut functions = CountingFunctionProvider::default();
-
-        let error = create_commit(
-            &mut transaction,
-            CreateCommitArgs {
-                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
-                changes: vec![sample_change()],
-                filesystem_state: Default::default(),
-                preconditions: CreateCommitPreconditions {
-                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
-                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
-                    idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
-                },
-                active_account_ids: Vec::new(),
-                lane_parent_commit_ids_override: None,
-                allow_empty_commit: false,
-                should_emit_observe_tick: false,
-                observe_tick_writer_key: None,
-                writer_key: None,
-            },
-            &mut functions,
-            None,
-        )
-        .await
-        .expect_err("live-state readiness should gate create_commit");
-
-        assert_eq!(error.kind, CreateCommitErrorKind::Internal);
-        assert!(
-            error.message.contains("live state is not ready"),
-            "unexpected error: {}",
-            error.message
         );
     }
 

@@ -20,6 +20,7 @@ pub(crate) mod apply;
 mod change_log;
 #[allow(dead_code)]
 mod create_commit;
+mod create_commit_preflight;
 mod generate_commit;
 pub(crate) mod graph;
 mod graph_index;

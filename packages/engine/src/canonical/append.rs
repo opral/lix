@@ -2,6 +2,7 @@ use crate::filesystem::runtime::{
     binary_blob_writes_from_filesystem_state, FilesystemTransactionState,
 };
 use crate::functions::LixFunctionProvider;
+use crate::live_state::require_ready_in_transaction;
 use crate::{LixBackendTransaction, LixError};
 
 use super::create_commit::create_commit;
@@ -28,6 +29,7 @@ pub(crate) struct BufferedTrackedAppendArgs {
     pub(crate) should_emit_observe_tick: bool,
 }
 
+#[derive(Debug)]
 pub(crate) struct BufferedTrackedAppendOutcome {
     pub(crate) disposition: CreateCommitDisposition,
     pub(crate) applied_output: Option<CreateCommitAppliedOutput>,
@@ -35,7 +37,25 @@ pub(crate) struct BufferedTrackedAppendOutcome {
     pub(crate) merged_into_pending_session: bool,
 }
 
+async fn require_live_state_ready_for_append(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<(), LixError> {
+    // Live-state readiness is an operational gate for append orchestration.
+    // Canonical commit generation itself should stay focused on commit semantics.
+    require_ready_in_transaction(transaction).await
+}
+
 pub(crate) async fn append_tracked(
+    transaction: &mut dyn LixBackendTransaction,
+    args: CreateCommitArgs,
+    functions: &mut dyn LixFunctionProvider,
+    invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
+) -> Result<CreateCommitResult, LixError> {
+    require_live_state_ready_for_append(transaction).await?;
+    append_tracked_unchecked(transaction, args, functions, invariant_checker).await
+}
+
+async fn append_tracked_unchecked(
     transaction: &mut dyn LixBackendTransaction,
     args: CreateCommitArgs,
     functions: &mut dyn LixFunctionProvider,
@@ -54,6 +74,8 @@ pub(crate) async fn append_tracked_with_pending_public_session(
     mut pending_session: Option<&mut Option<PendingPublicCommitSession>>,
     allow_pending_session_merge: bool,
 ) -> Result<BufferedTrackedAppendOutcome, LixError> {
+    require_live_state_ready_for_append(transaction).await?;
+
     if let Some(session_slot) = pending_session.as_deref_mut() {
         let can_merge = allow_pending_session_merge
             && session_slot.as_ref().is_some_and(|session| {
@@ -95,7 +117,7 @@ pub(crate) async fn append_tracked_with_pending_public_session(
     }
 
     let write_lane = args.preconditions.write_lane.clone();
-    let create_result = append_tracked(
+    let create_result = append_tracked_unchecked(
         transaction,
         CreateCommitArgs {
             timestamp: args.timestamp,
@@ -135,4 +157,192 @@ pub(crate) async fn append_tracked_with_pending_public_session(
         applied_domain_changes: create_result.applied_domain_changes,
         merged_into_pending_session: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        append_tracked, append_tracked_with_pending_public_session, BufferedTrackedAppendArgs,
+        CreateCommitArgs, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
+        CreateCommitPreconditions, CreateCommitWriteLane, PendingPublicCommitSession,
+    };
+    use crate::functions::LixFunctionProvider;
+    use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value};
+    use async_trait::async_trait;
+
+    #[derive(Default)]
+    struct NoopFunctionProvider;
+
+    impl LixFunctionProvider for NoopFunctionProvider {
+        fn uuid_v7(&mut self) -> String {
+            "uuid-1".to_string()
+        }
+
+        fn timestamp(&mut self) -> String {
+            "2026-03-06T14:22:00.000Z".to_string()
+        }
+    }
+
+    #[derive(Default)]
+    struct GateTransaction {
+        live_state_mode: Option<String>,
+    }
+
+    #[async_trait(?Send)]
+    impl LixBackendTransaction for GateTransaction {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        fn mode(&self) -> TransactionMode {
+            TransactionMode::Write
+        }
+
+        async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            if sql.contains("FROM lix_internal_live_state_status") {
+                return Ok(QueryResult {
+                    rows: vec![vec![
+                        Value::Text(
+                            self.live_state_mode
+                                .clone()
+                                .unwrap_or_else(|| "ready".to_string()),
+                        ),
+                        Value::Null,
+                        Value::Null,
+                        Value::Text(crate::live_state::LIVE_STATE_SCHEMA_EPOCH.to_string()),
+                    ]],
+                    columns: vec![
+                        "mode".to_string(),
+                        "latest_change_id".to_string(),
+                        "latest_change_created_at".to_string(),
+                        "schema_epoch".to_string(),
+                    ],
+                });
+            }
+
+            Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            })
+        }
+
+        async fn execute_batch(
+            &mut self,
+            _batch: &crate::backend::prepared::PreparedBatch,
+        ) -> Result<QueryResult, LixError> {
+            Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            })
+        }
+
+        async fn commit(self: Box<Self>) -> Result<(), LixError> {
+            Ok(())
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+            Ok(())
+        }
+    }
+
+    fn sample_change() -> crate::canonical::ProposedDomainChange {
+        crate::canonical::ProposedDomainChange {
+            entity_id: "entity-1".try_into().unwrap(),
+            schema_key: "lix_key_value".try_into().unwrap(),
+            schema_version: Some("1".try_into().unwrap()),
+            file_id: Some("lix".try_into().unwrap()),
+            plugin_key: Some("lix".try_into().unwrap()),
+            snapshot_content: Some("{\"key\":\"hello\"}".to_string()),
+            metadata: None,
+            version_id: "version-a".try_into().unwrap(),
+            writer_key: Some("writer-a".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn append_tracked_rejects_when_live_state_is_not_ready() {
+        let mut transaction = GateTransaction {
+            live_state_mode: Some("needs_rebuild".to_string()),
+        };
+        let mut functions = NoopFunctionProvider;
+
+        let error = append_tracked(
+            &mut transaction,
+            CreateCommitArgs {
+                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
+                changes: vec![sample_change()],
+                filesystem_state: Default::default(),
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
+                    idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
+                },
+                active_account_ids: Vec::new(),
+                lane_parent_commit_ids_override: None,
+                allow_empty_commit: false,
+                should_emit_observe_tick: false,
+                observe_tick_writer_key: None,
+                writer_key: None,
+            },
+            &mut functions,
+            None,
+        )
+        .await
+        .expect_err("append_tracked should gate on live-state readiness");
+
+        assert!(
+            error.description.contains("live state is not ready"),
+            "unexpected error: {}",
+            error.description
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_public_append_rejects_when_live_state_is_not_ready() {
+        let mut transaction = GateTransaction {
+            live_state_mode: Some("needs_rebuild".to_string()),
+        };
+        let mut functions = NoopFunctionProvider;
+        let mut pending_session = Some(PendingPublicCommitSession {
+            lane: CreateCommitWriteLane::Version("version-a".to_string()),
+            commit_id: "commit-123".to_string(),
+            change_set_id: "change-set-1".to_string(),
+            commit_change_id: "change-1".to_string(),
+            commit_change_snapshot_id: "snapshot-1".to_string(),
+            commit_materialized_change_id: "mat-change-1".to_string(),
+            commit_schema_version: "1".to_string(),
+            commit_file_id: "lix".to_string(),
+            commit_plugin_key: "lix".to_string(),
+            commit_snapshot: serde_json::json!({ "change_set_id": "change-set-1" }),
+        });
+
+        let error = append_tracked_with_pending_public_session(
+            &mut transaction,
+            BufferedTrackedAppendArgs {
+                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
+                changes: vec![sample_change()],
+                filesystem_state: Default::default(),
+                preconditions: CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
+                    idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
+                },
+                active_account_ids: Vec::new(),
+                writer_key: None,
+                should_emit_observe_tick: false,
+            },
+            &mut functions,
+            None,
+            Some(&mut pending_session),
+            true,
+        )
+        .await
+        .expect_err("pending public append should gate on live-state readiness");
+
+        assert!(
+            error.description.contains("live state is not ready"),
+            "unexpected error: {}",
+            error.description
+        );
+    }
 }
