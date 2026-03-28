@@ -34,7 +34,7 @@ async fn undo_in_transaction(
     let active_account_ids = tx.context.active_account_ids.clone();
     let version_id =
         resolve_target_version_id_in_session(tx, options.version_id.as_deref()).await?;
-    let (result, state_commit_stream_changes) = {
+    let (result, state_commit_stream_changes, canonical_commit_receipt) = {
         let transaction = tx.backend_transaction_mut()?;
         let stacks = rebuild_semantic_undo_redo_stacks(transaction, &version_id).await?;
         let target_commit_id = stacks.undo_stack.last().cloned().ok_or_else(|| {
@@ -213,6 +213,7 @@ async fn undo_in_transaction(
             None,
         )
         .await?;
+        let canonical_commit_receipt = create_result.receipt.clone();
         let inverse_commit_id = create_result.committed_head;
         insert_undo_redo_operation_in_transaction(
             transaction,
@@ -233,9 +234,13 @@ async fn undo_in_transaction(
                 inverse_commit_id,
             },
             state_commit_stream_changes,
+            canonical_commit_receipt,
         )
     };
 
+    if let Some(receipt) = canonical_commit_receipt {
+        tx.record_canonical_commit_receipt(receipt)?;
+    }
     tx.record_state_commit_stream_changes(state_commit_stream_changes)?;
     Ok(result)
 }

@@ -1,4 +1,5 @@
-use crate::live_state::{CanonicalWatermark, SchemaRegistration, SchemaRegistrationSet};
+use crate::canonical::CanonicalWatermark;
+use crate::live_state::{SchemaRegistration, SchemaRegistrationSet};
 use crate::{LixBackendTransaction, LixError};
 
 pub(crate) struct TransactionCoordinator<'a> {
@@ -34,19 +35,19 @@ impl<'a> TransactionCoordinator<'a> {
         crate::live_state::finalize_commit_in_transaction(transaction).await
     }
 
-    pub(crate) async fn finalize_live_state_allow_missing_watermark(
+    pub(crate) async fn advance_live_state_replay_boundary_for_commit(
         &mut self,
+        canonical_watermark: Option<&CanonicalWatermark>,
     ) -> Result<(), LixError> {
-        match self.finalize_live_state().await {
-            Ok(_) => Ok(()),
-            Err(error)
-                if error.description
-                    == "live_state::finalize_commit expected a canonical watermark" =>
-            {
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
+        let Some(canonical_watermark) = canonical_watermark else {
+            return Ok(());
+        };
+        let transaction = self.backend_transaction_mut()?;
+        crate::live_state::advance_commit_replay_boundary_to_watermark_in_transaction(
+            transaction,
+            canonical_watermark,
+        )
+        .await
     }
 
     pub(crate) async fn commit(&mut self) -> Result<(), LixError> {

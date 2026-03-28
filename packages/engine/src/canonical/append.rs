@@ -2,7 +2,6 @@ use crate::filesystem::runtime::{
     binary_blob_writes_from_filesystem_state, FilesystemTransactionState,
 };
 use crate::functions::LixFunctionProvider;
-use crate::live_state::require_ready_in_transaction;
 use crate::{LixBackendTransaction, LixError};
 
 use super::create_commit::create_commit;
@@ -17,6 +16,7 @@ use super::pending_session::{
     merge_public_domain_change_batch_into_pending_commit, pending_session_matches_create_commit,
     PendingPublicCommitSession,
 };
+use super::receipt::CanonicalCommitReceipt;
 use super::ProposedDomainChange;
 
 pub(crate) struct BufferedTrackedAppendArgs {
@@ -32,17 +32,10 @@ pub(crate) struct BufferedTrackedAppendArgs {
 #[derive(Debug)]
 pub(crate) struct BufferedTrackedAppendOutcome {
     pub(crate) disposition: CreateCommitDisposition,
+    pub(crate) receipt: Option<CanonicalCommitReceipt>,
     pub(crate) applied_output: Option<CreateCommitAppliedOutput>,
     pub(crate) applied_domain_changes: Vec<ProposedDomainChange>,
     pub(crate) merged_into_pending_session: bool,
-}
-
-async fn require_live_state_ready_for_append(
-    transaction: &mut dyn LixBackendTransaction,
-) -> Result<(), LixError> {
-    // Live-state readiness is an operational gate for append orchestration.
-    // Canonical commit generation itself should stay focused on commit semantics.
-    require_ready_in_transaction(transaction).await
 }
 
 pub(crate) async fn append_tracked(
@@ -51,7 +44,6 @@ pub(crate) async fn append_tracked(
     functions: &mut dyn LixFunctionProvider,
     invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
 ) -> Result<CreateCommitResult, LixError> {
-    require_live_state_ready_for_append(transaction).await?;
     append_tracked_unchecked(transaction, args, functions, invariant_checker).await
 }
 
@@ -74,8 +66,6 @@ pub(crate) async fn append_tracked_with_pending_public_session(
     mut pending_session: Option<&mut Option<PendingPublicCommitSession>>,
     allow_pending_session_merge: bool,
 ) -> Result<BufferedTrackedAppendOutcome, LixError> {
-    require_live_state_ready_for_append(transaction).await?;
-
     if let Some(session_slot) = pending_session.as_deref_mut() {
         let can_merge = allow_pending_session_merge
             && session_slot.as_ref().is_some_and(|session| {
@@ -97,7 +87,7 @@ pub(crate) async fn append_tracked_with_pending_public_session(
             let session = session_slot.as_mut().expect(
                 "pending public commit session should exist when merge preconditions match",
             );
-            merge_public_domain_change_batch_into_pending_commit(
+            let receipt = merge_public_domain_change_batch_into_pending_commit(
                 transaction,
                 session,
                 &args.changes,
@@ -109,6 +99,7 @@ pub(crate) async fn append_tracked_with_pending_public_session(
             .await?;
             return Ok(BufferedTrackedAppendOutcome {
                 disposition: CreateCommitDisposition::Applied,
+                receipt: Some(receipt),
                 applied_output: None,
                 applied_domain_changes: args.changes,
                 merged_into_pending_session: true,
@@ -153,6 +144,7 @@ pub(crate) async fn append_tracked_with_pending_public_session(
 
     Ok(BufferedTrackedAppendOutcome {
         disposition: create_result.disposition,
+        receipt: create_result.receipt,
         applied_output: create_result.applied_output,
         applied_domain_changes: create_result.applied_domain_changes,
         merged_into_pending_session: false,
@@ -260,7 +252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_tracked_rejects_when_live_state_is_not_ready() {
+    async fn append_tracked_does_not_preemptively_reject_when_live_state_is_not_ready() {
         let mut transaction = GateTransaction {
             live_state_mode: Some("needs_rebuild".to_string()),
         };
@@ -288,17 +280,17 @@ mod tests {
             None,
         )
         .await
-        .expect_err("append_tracked should gate on live-state readiness");
+        .expect_err("append_tracked should continue past live-state readiness");
 
         assert!(
-            error.description.contains("live state is not ready"),
+            !error.description.contains("live state is not ready"),
             "unexpected error: {}",
             error.description
         );
     }
 
     #[tokio::test]
-    async fn pending_public_append_rejects_when_live_state_is_not_ready() {
+    async fn pending_public_append_does_not_preemptively_reject_when_live_state_is_not_ready() {
         let mut transaction = GateTransaction {
             live_state_mode: Some("needs_rebuild".to_string()),
         };
@@ -316,7 +308,7 @@ mod tests {
             commit_snapshot: serde_json::json!({ "change_set_id": "change-set-1" }),
         });
 
-        let error = append_tracked_with_pending_public_session(
+        let outcome = append_tracked_with_pending_public_session(
             &mut transaction,
             BufferedTrackedAppendArgs {
                 timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
@@ -337,12 +329,15 @@ mod tests {
             true,
         )
         .await
-        .expect_err("pending public append should gate on live-state readiness");
+        .expect("pending public append should continue past live-state readiness");
 
         assert!(
-            error.description.contains("live state is not ready"),
-            "unexpected error: {}",
-            error.description
+            outcome.merged_into_pending_session,
+            "pending public append should still merge into the pending session",
+        );
+        assert!(
+            outcome.receipt.is_some(),
+            "pending public append should still produce a canonical commit receipt",
         );
     }
 }

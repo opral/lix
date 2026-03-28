@@ -6,8 +6,8 @@ use crate::canonical::roots::{
     resolve_history_root_facts_with_backend, HistoryRootFacts, HistoryRootTraversal,
     RootCommitResolutionRequest, RootCommitScope, RootLineageScope, RootVersionScope,
 };
-use crate::live_state::session::load_active_version_with_backend;
 use crate::sql_support::text::escape_sql_string;
+use crate::workspace::require_workspace_active_version_id;
 use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
 #[allow(dead_code)]
@@ -107,15 +107,7 @@ async fn resolve_active_version_id(
             if let Some(active_version_id) = request.active_version_id.clone() {
                 return Ok(Some(active_version_id));
             }
-            let active_version = load_active_version_with_backend(backend)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        "state history active-version reads require an active version",
-                    )
-                })?;
-            Ok(Some(active_version.version_id))
+            Ok(Some(require_workspace_active_version_id(backend).await?))
         }
     }
 }

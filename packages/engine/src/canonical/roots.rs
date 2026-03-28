@@ -1,19 +1,9 @@
 use crate::backend::QueryExecutor;
-use crate::errors::classification::is_missing_relation_error;
-use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::raw::{load_exact_row_with_executor, scan_rows_with_executor, RawStorage};
-use crate::schema::builtin::types::LixVersionRef;
-use crate::version::{
-    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-    version_ref_schema_version, version_ref_storage_version_id,
-};
-use crate::{LixBackend, LixError, Value};
+use crate::{LixBackend, LixError};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VersionRefRow {
-    pub(crate) version_id: String,
-    pub(crate) commit_id: String,
-}
+use super::refs::{
+    load_all_committed_version_refs_with_executor, load_committed_version_ref_with_executor,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedRootCommit {
@@ -64,90 +54,7 @@ pub(crate) async fn load_committed_version_head_commit_id(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
 ) -> Result<Option<String>, LixError> {
-    if let Some(version_ref) = load_version_ref_with_executor(executor, version_id).await? {
-        if version_ref.commit_id.is_empty() {
-            return Ok(None);
-        }
-        return Ok(Some(version_ref.commit_id));
-    }
-
-    let Some(version_ref) = load_version_ref_from_canonical(executor, version_id).await? else {
-        return Ok(None);
-    };
-    if version_ref.commit_id.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(version_ref.commit_id))
-}
-
-pub(crate) async fn load_version_ref_with_backend(
-    backend: &dyn LixBackend,
-    version_id: &str,
-) -> Result<Option<VersionRefRow>, LixError> {
-    let mut executor = backend;
-    load_version_ref_with_executor(&mut executor, version_id).await
-}
-
-async fn load_version_ref_from_canonical(
-    executor: &mut dyn QueryExecutor,
-    version_id: &str,
-) -> Result<Option<VersionRefRow>, LixError> {
-    let sql = format!(
-        "SELECT s.content AS snapshot_content \
-         FROM lix_internal_change c \
-         LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-         WHERE c.schema_key = '{schema_key}' \
-           AND c.schema_version = '{schema_version}' \
-           AND c.entity_id = '{entity_id}' \
-           AND c.file_id = '{file_id}' \
-           AND c.plugin_key = '{plugin_key}' \
-           AND s.content IS NOT NULL \
-         ORDER BY c.created_at DESC, c.id DESC \
-         LIMIT 1",
-        schema_key = escape_sql_string(version_ref_schema_key()),
-        schema_version = escape_sql_string(version_ref_schema_version()),
-        entity_id = escape_sql_string(version_id),
-        file_id = escape_sql_string(version_ref_file_id()),
-        plugin_key = escape_sql_string(version_ref_plugin_key()),
-    );
-
-    let snapshot_content = match executor.execute(&sql, &[]).await {
-        Ok(result) => result.rows.first().and_then(|row| row.first()).cloned(),
-        Err(err) if is_missing_relation_error(&err) => None,
-        Err(err) => return Err(err),
-    };
-    parse_version_ref_snapshot(snapshot_content.as_ref()).map(|version_ref| {
-        version_ref.map(|version_ref| VersionRefRow {
-            version_id: version_ref.id,
-            commit_id: version_ref.commit_id,
-        })
-    })
-}
-
-fn parse_version_ref_snapshot(value: Option<&Value>) -> Result<Option<LixVersionRef>, LixError> {
-    let Some(raw_snapshot) = value else {
-        return Ok(None);
-    };
-    let raw_snapshot = match raw_snapshot {
-        Value::Text(value) => value,
-        Value::Null => return Ok(None),
-        _ => {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "version ref snapshot_content must be text".to_string(),
-            });
-        }
-    };
-
-    let snapshot: LixVersionRef = serde_json::from_str(raw_snapshot).map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("version ref snapshot_content invalid JSON: {error}"),
-    })?;
-    Ok(Some(snapshot))
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
+    super::refs::load_committed_version_head_commit_id(executor, version_id).await
 }
 
 pub(crate) async fn load_head_commit_id_for_version(
@@ -225,7 +132,9 @@ async fn load_scoped_root_version_refs_with_executor(
         Some(version_ids) => {
             let mut rows = Vec::new();
             for version_id in version_ids {
-                if let Some(row) = load_version_ref_with_executor(executor, version_id).await? {
+                if let Some(row) =
+                    load_committed_version_ref_with_executor(executor, version_id).await?
+                {
                     if !row.commit_id.is_empty() {
                         rows.push(ResolvedRootCommit {
                             commit_id: row.commit_id,
@@ -249,71 +158,14 @@ async fn load_scoped_root_version_refs_with_executor(
 async fn load_all_root_version_refs_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<Vec<ResolvedRootCommit>, LixError> {
-    let constraints = vec![
-        ScanConstraint {
-            field: ScanField::FileId,
-            operator: ScanOperator::Eq(Value::Text(version_ref_file_id().to_string())),
-        },
-        ScanConstraint {
-            field: ScanField::PluginKey,
-            operator: ScanOperator::Eq(Value::Text(version_ref_plugin_key().to_string())),
-        },
-    ];
-    let required_columns = vec!["commit_id".to_string()];
-    let rows = scan_rows_with_executor(
-        executor,
-        RawStorage::Untracked,
-        version_ref_schema_key(),
-        version_ref_storage_version_id(),
-        &constraints,
-        &required_columns,
-    )
-    .await?;
-    let mut resolved = Vec::new();
-    for row in rows {
-        let Some(commit_id) = row.property_text("commit_id") else {
-            continue;
-        };
-        if commit_id.is_empty() {
-            continue;
-        }
-        resolved.push(ResolvedRootCommit {
-            commit_id,
-            version_id: row.entity_id().to_string(),
-        });
-    }
-    Ok(resolved)
-}
-
-async fn load_version_ref_with_executor(
-    executor: &mut dyn QueryExecutor,
-    version_id: &str,
-) -> Result<Option<VersionRefRow>, LixError> {
-    let Some(row) = load_exact_row_with_executor(
-        executor,
-        RawStorage::Untracked,
-        version_ref_schema_key(),
-        version_ref_storage_version_id(),
-        version_id,
-        Some(version_ref_file_id()),
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    if row.plugin_key() != version_ref_plugin_key() {
-        return Ok(None);
-    }
-    let commit_id = row.property_text("commit_id").ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("version ref row for '{version_id}' is missing commit_id"),
-        )
-    })?;
-    Ok(Some(VersionRefRow {
-        version_id: row.entity_id().to_string(),
-        commit_id,
-    }))
+    Ok(load_all_committed_version_refs_with_executor(executor)
+        .await?
+        .into_iter()
+        .map(|row| ResolvedRootCommit {
+            commit_id: row.commit_id,
+            version_id: row.version_id,
+        })
+        .collect())
 }
 
 fn build_history_root_facts(

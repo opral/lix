@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::canonical::pending_session::PendingPublicCommitSession;
+use crate::canonical::CanonicalCommitReceipt;
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::engine::{
     normalize_sql_execution_error_with_backend, Engine, TransactionBackendAdapter,
@@ -182,6 +183,7 @@ pub(crate) struct SqlExecutionOutcome {
     pub(crate) public_result: QueryResult,
     pub(crate) internal_write_file_cache_targets: BTreeSet<(String, String)>,
     pub(crate) plugin_changes_committed: bool,
+    pub(crate) canonical_commit_receipt: Option<CanonicalCommitReceipt>,
     pub(crate) plan_effects_override: Option<PlanEffects>,
     pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
     pub(crate) observe_tick_emitted: bool,
@@ -195,6 +197,7 @@ pub(crate) fn empty_public_write_execution_outcome() -> SqlExecutionOutcome {
         },
         internal_write_file_cache_targets: BTreeSet::new(),
         plugin_changes_committed: false,
+        canonical_commit_receipt: None,
         plan_effects_override: Some(PlanEffects::default()),
         state_commit_stream_changes: Vec::new(),
         observe_tick_emitted: false,
@@ -219,6 +222,7 @@ pub(crate) async fn execute_internal_execution_with_transaction(
         public_result,
         internal_write_file_cache_targets: BTreeSet::new(),
         plugin_changes_committed: false,
+        canonical_commit_receipt: None,
         plan_effects_override: None,
         state_commit_stream_changes: Vec::new(),
         observe_tick_emitted: false,

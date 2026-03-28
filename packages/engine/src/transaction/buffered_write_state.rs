@@ -1,3 +1,4 @@
+use crate::canonical::{CanonicalCommitReceipt, CanonicalWatermark};
 use crate::engine::Engine;
 use crate::LixBackendTransaction;
 use crate::LixError;
@@ -15,6 +16,7 @@ pub(crate) struct BufferedWriteState {
     journal: BufferedWriteJournal,
     pending_public_commit_session: Option<PendingPublicCommitSession>,
     commit_outcome: TransactionCommitOutcome,
+    latest_canonical_commit_receipt: Option<CanonicalCommitReceipt>,
     observe_tick_emitted: bool,
 }
 
@@ -53,6 +55,26 @@ impl BufferedWriteState {
 
     pub(crate) fn commit_outcome_mut(&mut self) -> &mut TransactionCommitOutcome {
         &mut self.commit_outcome
+    }
+
+    pub(crate) fn record_canonical_commit_receipt(&mut self, receipt: CanonicalCommitReceipt) {
+        let should_replace = self
+            .latest_canonical_commit_receipt
+            .as_ref()
+            .is_none_or(|current| {
+                receipt
+                    .canonical_watermark
+                    .is_newer_than(&current.canonical_watermark)
+            });
+        if should_replace {
+            self.latest_canonical_commit_receipt = Some(receipt);
+        }
+    }
+
+    pub(crate) fn latest_canonical_watermark(&self) -> Option<&CanonicalWatermark> {
+        self.latest_canonical_commit_receipt
+            .as_ref()
+            .map(|receipt| &receipt.canonical_watermark)
     }
 
     pub(crate) fn mark_public_surface_registry_refresh_pending(&mut self) {
@@ -144,5 +166,8 @@ fn apply_buffered_write_execution_outcome(
         state_commit_stream_changes,
         ..TransactionCommitOutcome::default()
     });
+    if let Some(receipt) = execution.canonical_commit_receipt {
+        state.record_canonical_commit_receipt(receipt);
+    }
     state.observe_tick_emitted |= execution.observe_tick_emitted;
 }

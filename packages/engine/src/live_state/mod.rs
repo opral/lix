@@ -7,7 +7,7 @@
 //! `live_state` owns:
 //! - lifecycle initialization and readiness checks for live-state serving
 //! - schema-scoped storage initialization
-//! - raw, session, tracked, untracked, and effective row access
+//! - raw, tracked, untracked, and effective row access
 //! - rebuild planning and apply for visible-row materialization
 //! - read-only passthrough query surfaces for canonical-owned facts when
 //!   SQL/public reads need them
@@ -30,22 +30,21 @@ mod lifecycle;
 mod materialize;
 pub(crate) mod pending_reads;
 pub(crate) mod raw;
-pub mod roots;
 pub(crate) mod schema_access;
-pub mod session;
 pub(crate) mod shared;
 mod storage;
 pub mod tracked;
 pub mod untracked;
 
 use crate::backend::QueryExecutor;
+pub use crate::canonical::CanonicalWatermark;
 use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
 pub use init::init;
-pub use lifecycle::{CanonicalWatermark, LiveStateMode, LiveStateReadiness};
+pub use lifecycle::{LiveStateMode, LiveStateReadiness};
 pub use materialize::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
@@ -252,6 +251,22 @@ pub(crate) async fn load_latest_canonical_watermark(
     backend: &dyn LixBackend,
 ) -> Result<Option<CanonicalWatermark>, LixError> {
     lifecycle::load_latest_canonical_watermark(backend).await
+}
+
+pub(crate) async fn mark_needs_rebuild_at_canonical_watermark_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    watermark: &CanonicalWatermark,
+) -> Result<(), LixError> {
+    lifecycle::mark_needs_rebuild_at_canonical_watermark_in_transaction(transaction, watermark)
+        .await
+}
+
+pub(crate) async fn advance_commit_replay_boundary_to_watermark_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    watermark: &CanonicalWatermark,
+) -> Result<(), LixError> {
+    lifecycle::advance_commit_replay_boundary_to_watermark_in_transaction(transaction, watermark)
+        .await
 }
 
 pub(crate) async fn mark_mode_with_backend(

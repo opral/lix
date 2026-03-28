@@ -1555,7 +1555,7 @@ impl Visitor for PublicRelationCollectorVisitor<'_> {
 async fn load_active_version_id_for_public_read(
     backend: &dyn LixBackend,
 ) -> Result<String, LixError> {
-    crate::session::workspace::require_workspace_active_version_id(backend).await
+    crate::workspace::require_workspace_active_version_id(backend).await
 }
 
 async fn maybe_bind_active_history_root(

@@ -6,6 +6,8 @@ use crate::{
     FileId, VersionId,
 };
 
+use super::receipt::UpdatedVersionRef;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProposedDomainChange {
     pub(crate) entity_id: EntityId,
@@ -118,13 +120,6 @@ pub struct MaterializedStateRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VersionRefUpdate {
-    pub version_id: VersionId,
-    pub commit_id: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalCommitOutput {
     pub changes: Vec<ChangeRow>,
 }
@@ -132,11 +127,11 @@ pub struct CanonicalCommitOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedCommitApplyInput {
     pub live_state_rows: Vec<MaterializedStateRow>,
-    pub version_ref_updates: Vec<VersionRefUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateCommitResult {
     pub canonical_output: CanonicalCommitOutput,
     pub derived_apply_input: DerivedCommitApplyInput,
+    pub updated_version_refs: Vec<UpdatedVersionRef>,
 }

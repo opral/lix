@@ -83,6 +83,7 @@ pub(super) async fn run_public_untracked_write_txn_with_transaction(
         },
         internal_write_file_cache_targets: BTreeSet::new(),
         plugin_changes_committed: false,
+        canonical_commit_receipt: None,
         plan_effects_override: Some(plan.execution.semantic_effects.clone()),
         state_commit_stream_changes: Vec::new(),
         observe_tick_emitted: false,

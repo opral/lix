@@ -1,5 +1,6 @@
+use crate::canonical::{CanonicalCommitReceipt, CanonicalWatermark};
 use crate::engine::Engine;
-use crate::live_state::{CanonicalWatermark, SchemaRegistration};
+use crate::live_state::SchemaRegistration;
 use crate::state::stream::StateCommitStreamChange;
 use crate::{LixBackendTransaction, LixError};
 
@@ -85,8 +86,12 @@ impl<'a> WriteTransaction<'a> {
     }
 
     pub(crate) async fn finalize_live_state_for_commit(&mut self) -> Result<(), LixError> {
+        let canonical_watermark = self
+            .buffered_write_state
+            .as_ref()
+            .and_then(BufferedWriteState::latest_canonical_watermark);
         self.coordinator
-            .finalize_live_state_allow_missing_watermark()
+            .advance_live_state_replay_boundary_for_commit(canonical_watermark)
             .await
     }
 
@@ -234,6 +239,12 @@ impl<'a> WriteTransaction<'a> {
     ) {
         if let Some(write_state) = self.buffered_write_state.as_mut() {
             write_state.record_state_commit_stream_changes(changes);
+        }
+    }
+
+    pub(crate) fn record_canonical_commit_receipt(&mut self, receipt: CanonicalCommitReceipt) {
+        if let Some(write_state) = self.buffered_write_state.as_mut() {
+            write_state.record_canonical_commit_receipt(receipt);
         }
     }
 

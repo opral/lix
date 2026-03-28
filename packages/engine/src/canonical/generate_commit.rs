@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::json;
 
+use crate::canonical::receipt::UpdatedVersionRef;
 use crate::canonical::types::{
     CanonicalCommitOutput, ChangeRow, DerivedCommitApplyInput, DomainChangeInput,
-    GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow, VersionRefUpdate,
+    GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow,
 };
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
 use crate::{CanonicalJson, LixError};
@@ -80,7 +81,7 @@ where
         .map(|change| sanitize_domain_change(change))
         .collect();
     let mut live_state_rows: Vec<MaterializedStateRow> = Vec::new();
-    let mut version_ref_updates: Vec<VersionRefUpdate> = Vec::new();
+    let mut updated_version_refs: Vec<UpdatedVersionRef> = Vec::new();
 
     let mut domain_by_version: BTreeMap<String, Vec<&DomainChangeInput>> = BTreeMap::new();
     for change in &effective_domain_changes {
@@ -456,7 +457,7 @@ where
             lixcol_commit_id: meta.commit_id.clone(),
             writer_key: None,
         });
-        version_ref_updates.push(VersionRefUpdate {
+        updated_version_refs.push(UpdatedVersionRef {
             version_id: expect_identity(version_id.clone(), "version_ref version_id"),
             commit_id: meta.commit_id.clone(),
             created_at: args.timestamp.clone(),
@@ -507,10 +508,8 @@ where
         canonical_output: CanonicalCommitOutput {
             changes: output_changes,
         },
-        derived_apply_input: DerivedCommitApplyInput {
-            live_state_rows,
-            version_ref_updates,
-        },
+        derived_apply_input: DerivedCommitApplyInput { live_state_rows },
+        updated_version_refs,
     })
 }
 
@@ -802,11 +801,9 @@ mod tests {
         assert_eq!(materialized_counts.get("lix_commit"), Some(&1));
         assert_eq!(materialized_counts.get("lix_commit_edge"), Some(&1));
         assert_eq!(result.derived_apply_input.live_state_rows.len(), 6);
-        assert_eq!(result.derived_apply_input.version_ref_updates.len(), 1);
+        assert_eq!(result.updated_version_refs.len(), 1);
         assert_eq!(
-            result.derived_apply_input.version_ref_updates[0]
-                .version_id
-                .as_str(),
+            result.updated_version_refs[0].version_id.as_str(),
             "version-main"
         );
 
@@ -894,7 +891,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(result.derived_apply_input.version_ref_updates.len(), 1);
+        assert_eq!(result.updated_version_refs.len(), 1);
         assert_eq!(result.derived_apply_input.live_state_rows.len(), 6);
 
         let commit_row = result
@@ -1013,7 +1010,7 @@ mod tests {
             2
         );
         assert_eq!(result.derived_apply_input.live_state_rows.len(), 14);
-        assert_eq!(result.derived_apply_input.version_ref_updates.len(), 2);
+        assert_eq!(result.updated_version_refs.len(), 2);
 
         let commit_rows: Vec<_> = result
             .canonical_output
@@ -1058,8 +1055,7 @@ mod tests {
         );
 
         let global_tip = result
-            .derived_apply_input
-            .version_ref_updates
+            .updated_version_refs
             .iter()
             .find(|update| update.version_id.as_str() == "global")
             .expect("global version_ref should exist");
