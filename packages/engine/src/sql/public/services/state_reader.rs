@@ -7,12 +7,13 @@ use crate::canonical::readers::{
 pub(crate) use crate::canonical::readers::{
     CommitQueryExecutor, ExactCommittedStateRow, ExactCommittedStateRowRequest,
 };
+use crate::live_state::is_untracked_live_table;
 use crate::live_state::roots::load_version_ref_with_backend;
 pub(crate) use crate::live_state::roots::VersionRefRow;
 use crate::live_state::schema_access::{
-    logical_snapshot_from_projected_row_with_contract,
     live_storage_relation_exists_with_backend, load_schema_read_contract_for_table_name,
-    load_schema_read_contract_with_backend, LiveReadContract,
+    load_schema_read_contract_with_backend, logical_snapshot_from_projected_row_with_contract,
+    LiveReadContract,
 };
 use crate::live_state::tracked::{
     load_exact_row_with_backend as load_exact_tracked_row_with_backend,
@@ -30,7 +31,6 @@ use crate::live_state::untracked::{
     scan_rows_with_backend as scan_untracked_rows_with_backend,
     scan_rows_with_executor as scan_untracked_rows_with_executor, UntrackedRow,
 };
-use crate::live_state::is_untracked_live_table;
 use crate::{LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

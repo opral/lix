@@ -16,6 +16,9 @@ use std::time::Duration;
 
 const OBSERVE_TICK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const OBSERVE_FOLLOWER_POLL_INTERVAL: Duration = Duration::from_millis(25);
+mod init;
+
+pub(crate) use init::init;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObserveQuery {

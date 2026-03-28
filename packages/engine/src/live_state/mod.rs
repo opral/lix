@@ -9,17 +9,16 @@
 //! Future hook-in work should target the entrypoints exported here instead of
 //! reaching into `storage/` or lifecycle internals directly.
 
-pub mod constraints;
-pub mod effective;
-mod lifecycle;
-mod materialize;
 pub(crate) mod commit_graph_queries;
-pub(crate) mod bootstrap_seed;
-pub(crate) mod bootstrap_tables;
+pub mod constraints;
 pub(crate) mod create_commit_queries;
+pub mod effective;
 pub(crate) mod filesystem_projection;
 pub(crate) mod filesystem_queries;
+mod init;
 pub(crate) mod key_value_queries;
+mod lifecycle;
+mod materialize;
 pub(crate) mod pending_reads;
 pub(crate) mod raw;
 pub mod roots;
@@ -36,6 +35,7 @@ use crate::{LixBackend, LixBackendTransaction, LixError};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
+pub use init::init;
 pub use lifecycle::{CanonicalWatermark, LiveStateMode, LiveStateReadiness};
 pub use materialize::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
@@ -146,10 +146,6 @@ impl SchemaRegistration {
             SchemaRegistrationSource::Layout(layout) => Some(layout),
         }
     }
-}
-
-pub async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    lifecycle::init(backend).await
 }
 
 pub async fn require_ready(backend: &dyn LixBackend) -> Result<(), LixError> {
@@ -378,6 +374,37 @@ pub(crate) fn snapshot_text_from_values(
             )
         },
     )
+}
+
+#[cfg(test)]
+pub(crate) fn live_relation_name(schema_key: &str) -> String {
+    schema_access::tracked_relation_name(schema_key)
+}
+
+#[cfg(test)]
+pub(crate) fn live_schema_column_names(
+    schema_key: &str,
+    schema_definition: Option<&JsonValue>,
+) -> Result<Vec<String>, LixError> {
+    schema_access::schema_column_names(schema_key, schema_definition)
+}
+
+#[cfg(test)]
+pub(crate) fn live_schema_normalized_values(
+    schema_key: &str,
+    schema_definition: Option<&JsonValue>,
+    snapshot_content: Option<&str>,
+) -> Result<std::collections::BTreeMap<String, crate::Value>, LixError> {
+    schema_access::normalized_values_for_schema(schema_key, schema_definition, snapshot_content)
+}
+
+#[cfg(test)]
+pub(crate) fn live_schema_snapshot_text_from_values(
+    schema_key: &str,
+    schema_definition: Option<&JsonValue>,
+    values: &std::collections::BTreeMap<String, crate::Value>,
+) -> Result<String, LixError> {
+    schema_access::snapshot_text_from_schema_values(schema_key, schema_definition, values)
 }
 
 #[cfg(test)]

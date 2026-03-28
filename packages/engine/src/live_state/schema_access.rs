@@ -30,7 +30,7 @@ impl LiveReadContract {
         &self,
         snapshot_content: Option<&str>,
     ) -> Result<std::collections::BTreeMap<String, Value>, LixError> {
-        normalized_values_for_schema(self.access.layout().schema_key.as_str(), None, snapshot_content)
+        super::storage::normalized_live_column_values(self.access.layout(), snapshot_content)
     }
 
     pub(crate) fn snapshot_json_from_values(
@@ -75,6 +75,12 @@ pub(crate) async fn load_schema_read_contract_for_table_name(
     super::storage::load_live_row_access_for_table_name(backend, table_name)
         .await
         .map(|access| access.map(read_contract_from_storage))
+}
+
+pub(crate) fn live_read_contract_from_layout(
+    layout: super::storage::LiveTableLayout,
+) -> LiveReadContract {
+    read_contract_from_storage(super::storage::LiveRowAccess::new(layout))
 }
 
 pub(crate) async fn live_storage_relation_exists_with_backend(
@@ -139,8 +145,10 @@ pub(crate) fn normalized_projection_sql_for_schema(
     schema_definition: Option<&JsonValue>,
     table_alias: Option<&str>,
 ) -> Result<String, LixError> {
-    Ok(super::storage::LiveRowAccess::new(schema_layout(schema_key, schema_definition)?)
-        .normalized_projection_sql(table_alias))
+    Ok(
+        super::storage::LiveRowAccess::new(schema_layout(schema_key, schema_definition)?)
+            .normalized_projection_sql(table_alias),
+    )
 }
 
 pub(crate) fn snapshot_select_expr_for_schema(

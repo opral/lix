@@ -1,15 +1,24 @@
 use std::time::Duration;
 
+use crate::account;
+use crate::canonical;
 use crate::engine::{Engine, TransactionBackendAdapter};
+use crate::filesystem;
+use crate::key_value;
+use crate::live_state;
 use crate::live_state::{
-    init as init_live_state, load_latest_canonical_watermark, load_mode_with_backend,
-    mark_mode_with_backend, mark_ready_with_backend, try_claim_bootstrap_with_backend,
-    LiveStateMode,
+    load_latest_canonical_watermark, load_mode_with_backend, mark_mode_with_backend,
+    mark_ready_with_backend, try_claim_bootstrap_with_backend, LiveStateMode,
 };
+use crate::observe;
+use crate::schema;
+use crate::state::checkpoint;
+use crate::undo_redo;
+use crate::version;
 use crate::{LixError, TransactionMode};
 
-use super::seed::InitExecutor;
-use super::tables::{create_backend_tables, create_builtin_schema_tables};
+use super::tables::prepare_backend_for_init;
+use super::InitExecutor;
 
 pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
     engine.try_mark_init_in_progress()?;
@@ -27,12 +36,39 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
     let init_result = async {
         {
             let backend = TransactionBackendAdapter::new(transaction.as_mut());
-            create_backend_tables(&backend)
+            prepare_backend_for_init(&backend)
                 .await
-                .map_err(|error| init_step_error("create_backend_tables", error))?;
-            init_live_state(&backend)
+                .map_err(|error| init_step_error("prepare_backend_for_init", error))?;
+            live_state::init(&backend)
                 .await
                 .map_err(|error| init_step_error("live_state::init", error))?;
+            schema::init(&backend)
+                .await
+                .map_err(|error| init_step_error("schema::init", error))?;
+            canonical::init(&backend)
+                .await
+                .map_err(|error| init_step_error("canonical::init", error))?;
+            filesystem::init(&backend)
+                .await
+                .map_err(|error| init_step_error("filesystem::init", error))?;
+            checkpoint::init(&backend)
+                .await
+                .map_err(|error| init_step_error("checkpoint::init", error))?;
+            undo_redo::init(&backend)
+                .await
+                .map_err(|error| init_step_error("undo_redo::init", error))?;
+            observe::init(&backend)
+                .await
+                .map_err(|error| init_step_error("observe::init", error))?;
+            key_value::init(&backend)
+                .await
+                .map_err(|error| init_step_error("key_value::init", error))?;
+            version::init(&backend)
+                .await
+                .map_err(|error| init_step_error("version::init", error))?;
+            account::init(&backend)
+                .await
+                .map_err(|error| init_step_error("account::init", error))?;
         }
         {
             let backend = TransactionBackendAdapter::new(transaction.as_mut());
@@ -42,42 +78,29 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
         }
         claimed_bootstrap = true;
 
-        {
-            let backend = TransactionBackendAdapter::new(transaction.as_mut());
-            create_builtin_schema_tables(&backend)
-                .await
-                .map_err(|error| init_step_error("create_builtin_schema_tables", error))?;
-        }
         let mut init = InitExecutor::new(engine, transaction.as_mut())
             .map_err(|error| init_step_error("init_executor", error))?;
-        init.seed_builtin_schemas()
+        schema::seed_bootstrap(&mut init)
             .await
-            .map_err(|error| init_step_error("seed_builtin_schemas", error))?;
-        let default_active_version_id = init
-            .seed_default_versions()
+            .map_err(|error| init_step_error("schema::seed_bootstrap", error))?;
+        let default_active_version_id = version::seed_bootstrap(&mut init)
             .await
-            .map_err(|error| init_step_error("seed_default_versions", error))?;
-        init.seed_global_system_directories()
+            .map_err(|error| init_step_error("version::seed_bootstrap", error))?;
+        filesystem::seed_bootstrap(&mut init)
             .await
-            .map_err(|error| init_step_error("seed_global_system_directories", error))?;
-        init.seed_commit_graph_nodes()
+            .map_err(|error| init_step_error("filesystem::seed_bootstrap", error))?;
+        canonical::seed_bootstrap(&mut init)
             .await
-            .map_err(|error| init_step_error("seed_commit_graph_nodes", error))?;
-        init.seed_lix_id()
+            .map_err(|error| init_step_error("canonical::seed_bootstrap", error))?;
+        checkpoint::seed_bootstrap(&mut init)
             .await
-            .map_err(|error| init_step_error("seed_lix_id", error))?;
-        init.seed_default_checkpoint_label()
+            .map_err(|error| init_step_error("checkpoint::seed_bootstrap", error))?;
+        key_value::seed_bootstrap(&mut init, &default_active_version_id)
             .await
-            .map_err(|error| init_step_error("seed_default_checkpoint_label", error))?;
-        init.rebuild_internal_last_checkpoint()
+            .map_err(|error| init_step_error("key_value::seed_bootstrap", error))?;
+        account::seed_bootstrap(&mut init)
             .await
-            .map_err(|error| init_step_error("rebuild_internal_last_checkpoint", error))?;
-        init.seed_boot_key_values(&default_active_version_id)
-            .await
-            .map_err(|error| init_step_error("seed_boot_key_values", error))?;
-        init.seed_boot_account()
-            .await
-            .map_err(|error| init_step_error("seed_boot_account", error))?;
+            .map_err(|error| init_step_error("account::seed_bootstrap", error))?;
         init.persist_runtime_state()
             .await
             .map_err(|error| init_step_error("persist_runtime_state", error))?;

@@ -10,13 +10,13 @@ use crate::read::models::{
     load_state_history_rows, StateHistoryContentMode, StateHistoryLineageScope,
     StateHistoryRequest, StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
 };
+use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
 use crate::sql::public::catalog::SurfaceBinding;
 use crate::sql::public::planner::backend::lowerer::{
     lower_read_for_execution_with_layouts,
     rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id,
     LoweredReadProgram, LoweredResultColumn, LoweredResultColumns,
 };
-use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
 use crate::sql::public::planner::canonicalize::canonicalize_read;
 use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use serde_json::Value as JsonValue;
@@ -1189,7 +1189,10 @@ async fn load_known_live_layouts_for_dependency_spec(
     let mut provider = SqlRegisteredSchemaProvider::new(backend);
     let mut schemas = BTreeMap::new();
     for schema_key in required_schema_keys_from_dependency_spec(dependency_spec) {
-        schemas.insert(schema_key.clone(), provider.load_latest_schema(&schema_key).await?);
+        schemas.insert(
+            schema_key.clone(),
+            provider.load_latest_schema(&schema_key).await?,
+        );
     }
     Ok(schemas)
 }

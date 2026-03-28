@@ -38,8 +38,10 @@ pub(crate) async fn prepare_committed_read_program(
     let runtime_state = context.execution_runtime_state().expect(
         "committed execution should install an execution runtime state before step preparation",
     );
-    let precompile_steps = !matches!(execution_mode, SessionExecutionMode::CommittedRuntimeMutation)
-        || !runtime_state.settings().enabled;
+    let precompile_steps = !matches!(
+        execution_mode,
+        SessionExecutionMode::CommittedRuntimeMutation
+    ) || !runtime_state.settings().enabled;
     let mut mode =
         baseline_transaction_mode_for_committed_read_program(execution_mode, runtime_state);
     let mut steps = Vec::new();
@@ -104,12 +106,9 @@ async fn compile_bound_statement_template_instance_for_committed_read(
     .await
     {
         Ok(compiled) => Ok(compiled),
-        Err(error) => Err(normalize_sql_execution_error_with_backend(
-            backend,
-            error,
-            parsed_statements,
-        )
-        .await),
+        Err(error) => {
+            Err(normalize_sql_execution_error_with_backend(backend, error, parsed_statements).await)
+        }
     }
 }
 
@@ -212,7 +211,11 @@ pub(crate) async fn execute_execution_program_in_committed_read_transaction(
                 .await?,
             )
         };
-        let compiled = step.compiled.as_ref().or(compiled_on_demand.as_ref()).expect(
+        let compiled = step
+            .compiled
+            .as_ref()
+            .or(compiled_on_demand.as_ref())
+            .expect(
             "compiled committed read step should be available after eager or on-demand preparation",
         );
 

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
+use crate::live_state::schema_access::{live_read_contract_from_layout, LiveReadContract};
 use crate::read::contracts::{
     committed_read_mode_from_prepared_public_read, CommittedReadMode, PublicReadExecutionMode,
 };
@@ -8,10 +9,9 @@ use crate::sql::public::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::sql::public::runtime::{
     decode_public_read_result, execute_prepared_public_read, PreparedPublicRead,
 };
-use crate::live_state::schema_access::LiveReadContract;
 use crate::sql::public::services::state_reader::{
-    load_live_row_access, normalized_values_from_snapshot, scan_live_rows, snapshot_text_from_row,
-    LiveReadRow, LiveStorageLane,
+    normalized_values_from_snapshot, scan_live_rows, snapshot_text_from_row, LiveReadRow,
+    LiveStorageLane,
 };
 use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::transaction::{
@@ -26,6 +26,7 @@ use sqlparser::ast::{
 };
 
 const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
+const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const GLOBAL_VERSION_ID: &str = "global";
 
 struct TransactionReadModel<'a> {
@@ -104,9 +105,6 @@ impl<'a> TransactionReadModel<'a> {
     }
 
     async fn visible_registered_schema_rows(&self) -> Result<BTreeMap<String, String>, LixError> {
-        let Some(overlay) = self.registered_schema_overlay.as_ref() else {
-            return Ok(BTreeMap::new());
-        };
         let sql = format!(
             "SELECT snapshot_content FROM {table} \
              WHERE version_id = '{global_version}' \
@@ -131,16 +129,37 @@ impl<'a> TransactionReadModel<'a> {
             let (key, _) = crate::schema::schema_from_registered_snapshot(&snapshot)?;
             rows.insert(key.entity_id(), snapshot_content.clone());
         }
-        for (entity_id, pending) in overlay.visible_entries() {
-            match pending.snapshot_content.as_ref() {
-                Some(snapshot_content) => {
-                    rows.insert(entity_id.to_string(), snapshot_content.clone());
-                }
-                None => {
-                    rows.remove(entity_id);
+
+        if let Some(overlay) = self.registered_schema_overlay.as_ref() {
+            for (entity_id, pending) in overlay.visible_entries() {
+                match pending.snapshot_content.as_ref() {
+                    Some(snapshot_content) => {
+                        rows.insert(entity_id.to_string(), snapshot_content.clone());
+                    }
+                    None => {
+                        rows.remove(entity_id);
+                    }
                 }
             }
         }
+
+        if let Some(overlay) = self.semantic_overlay.as_ref() {
+            for row in overlay.visible_rows(PendingSemanticStorage::Tracked, REGISTERED_SCHEMA_KEY)
+            {
+                if row.version_id != GLOBAL_VERSION_ID {
+                    continue;
+                }
+                match row.snapshot_content.as_ref().filter(|_| !row.tombstone) {
+                    Some(snapshot_content) => {
+                        rows.insert(row.entity_id.clone(), snapshot_content.clone());
+                    }
+                    None => {
+                        rows.remove(&row.entity_id);
+                    }
+                }
+            }
+        }
+
         Ok(rows)
     }
 
@@ -148,7 +167,7 @@ impl<'a> TransactionReadModel<'a> {
         &self,
         query: &LiveTableOverlayQuery,
     ) -> Result<QueryResult, LixError> {
-        let access = load_live_row_access(self.base, &query.schema_key).await?;
+        let access = self.load_live_row_access(&query.schema_key).await?;
         let constraints = scan_constraints_from_live_filters(&query.filters);
         let required_columns = access
             .columns()
@@ -254,6 +273,21 @@ impl<'a> TransactionReadModel<'a> {
         })
     }
 
+    async fn load_live_row_access(&self, schema_key: &str) -> Result<LiveReadContract, LixError> {
+        if let Some(layout) = super::storage::builtin_live_table_layout(schema_key)? {
+            return Ok(live_read_contract_from_layout(layout));
+        }
+
+        let rows = self
+            .visible_registered_schema_rows()
+            .await?
+            .into_values()
+            .map(|snapshot_content| vec![Value::Text(snapshot_content)])
+            .collect::<Vec<_>>();
+        let layout = super::storage::compile_registered_live_layout(schema_key, rows)?;
+        Ok(live_read_contract_from_layout(layout))
+    }
+
     fn apply_filesystem_overlay_to_rows(
         &self,
         query: &LiveTableOverlayQuery,
@@ -340,7 +374,9 @@ pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view(
         .await
 }
 
-pub(crate) fn public_read_execution_mode(public_read: &PreparedPublicRead) -> PublicReadExecutionMode {
+pub(crate) fn public_read_execution_mode(
+    public_read: &PreparedPublicRead,
+) -> PublicReadExecutionMode {
     if live_table_query_from_prepared_public_read(public_read).is_some() {
         return PublicReadExecutionMode::PendingView;
     }
@@ -806,7 +842,10 @@ fn visible_live_row_from_pending(
         change_id: None,
         snapshot_content: pending.snapshot_content.clone(),
         is_tombstone: pending.tombstone,
-        normalized_values: normalized_values_from_snapshot(access, pending.snapshot_content.as_deref())?,
+        normalized_values: normalized_values_from_snapshot(
+            access,
+            pending.snapshot_content.as_deref(),
+        )?,
     })
 }
 

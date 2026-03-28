@@ -77,8 +77,12 @@ pub(crate) async fn load_untracked_file_descriptor(
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<ExactFilesystemDescriptorState>, LixError> {
-    let snapshot_expr =
-        snapshot_select_expr_for_schema(FILESYSTEM_FILE_SCHEMA_KEY, None, executor.dialect(), None)?;
+    let snapshot_expr = snapshot_select_expr_for_schema(
+        FILESYSTEM_FILE_SCHEMA_KEY,
+        None,
+        executor.dialect(),
+        None,
+    )?;
     let sql = format!(
         "SELECT {snapshot_expr} AS snapshot_content, metadata \
          FROM {table_name} \

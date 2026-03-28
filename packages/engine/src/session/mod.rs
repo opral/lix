@@ -348,7 +348,8 @@ impl Session {
         context.set_execution_runtime_state(runtime_state.clone());
 
         let result = match execution_mode {
-            SessionExecutionMode::CommittedRead | SessionExecutionMode::CommittedRuntimeMutation => {
+            SessionExecutionMode::CommittedRead
+            | SessionExecutionMode::CommittedRuntimeMutation => {
                 let prepared_committed_read = prepare_committed_read_program(
                     self.engine.as_ref(),
                     &program,

@@ -1367,7 +1367,9 @@ mod tests {
         FilesystemTransactionFileState, FilesystemTransactionState, OptionalTextPatch,
     };
     use crate::functions::LixFunctionProvider;
-    use crate::live_state::schema_access::normalized_values_for_schema;
+    use crate::live_state::{
+        live_schema_column_names, schema_access::normalized_values_for_schema,
+    };
     use crate::version::GLOBAL_VERSION_ID;
     use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
@@ -1397,8 +1399,10 @@ mod tests {
             Value::Text("2026-03-06T14:22:00.000Z".to_string()),
             Value::Text("2026-03-06T14:22:00.000Z".to_string()),
         ];
-        for column_name in ["commit_id"] {
-            row.push(normalized.get(column_name).cloned().unwrap_or(Value::Null));
+        for column_name in live_schema_column_names(crate::version::version_ref_schema_key(), None)
+            .expect("version ref schema should expose column names")
+        {
+            row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
         }
         row
     }
@@ -1413,9 +1417,8 @@ mod tests {
             "metadata": serde_json::Value::Null,
         })
         .to_string();
-        let normalized =
-            normalized_values_for_schema("lix_file_descriptor", None, Some(&snapshot))
-                .expect("snapshot should normalize");
+        let normalized = normalized_values_for_schema("lix_file_descriptor", None, Some(&snapshot))
+            .expect("snapshot should normalize");
         let mut row = vec![
             Value::Text("file-1".to_string()),
             Value::Text("lix_file_descriptor".to_string()),
@@ -1430,15 +1433,10 @@ mod tests {
             Value::Text("2026-03-06T14:22:00.000Z".to_string()),
             Value::Text("2026-03-06T14:22:00.000Z".to_string()),
         ];
-        for column_name in [
-            "id",
-            "directory_id",
-            "name",
-            "extension",
-            "metadata_json",
-            "hidden",
-        ] {
-            row.push(normalized.get(column_name).cloned().unwrap_or(Value::Null));
+        for column_name in live_schema_column_names("lix_file_descriptor", None)
+            .expect("file descriptor schema should expose column names")
+        {
+            row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
         }
         row
     }

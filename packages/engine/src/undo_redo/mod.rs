@@ -1,3 +1,4 @@
+mod init;
 mod redo;
 mod store;
 mod types;
@@ -16,6 +17,7 @@ use crate::canonical::ProposedDomainChange;
 use crate::state::stream::StateCommitStreamOperation;
 use crate::{LixBackendTransaction, LixError, SessionTransaction};
 
+pub(crate) use init::init;
 pub use types::{RedoOptions, RedoResult, UndoOptions, UndoResult};
 pub(crate) use types::{SemanticUndoRedoStacks, UndoRedoOperationKind, UndoRedoOperationRecord};
 
