@@ -6,6 +6,7 @@ pub(crate) mod canonical;
 mod canonical_json;
 mod cel;
 mod change_view;
+pub(crate) mod checkpoint;
 mod deterministic_mode;
 mod engine;
 mod errors;
@@ -46,6 +47,7 @@ pub use backend::LixBackendTransaction;
 pub use backend::SqlDialect;
 pub use backend::TransactionMode;
 pub use canonical_json::CanonicalJson;
+pub use checkpoint::CreateCheckpointResult;
 #[doc(hidden)]
 pub use engine::{boot, BootArgs};
 pub use engine::{BootAccount, BootKeyValue, Engine, ExecuteOptions};
@@ -64,7 +66,6 @@ pub use live_state::{
 pub use lix::{InitResult, Lix, LixConfig};
 pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
 pub use session::{OpenSessionOptions, Session, SessionTransaction};
-pub use state::checkpoint::CreateCheckpointResult;
 pub use state::image::{ImageChunkReader, ImageChunkWriter};
 pub use state::stream::{
     StateCommitStream, StateCommitStreamBatch, StateCommitStreamChange, StateCommitStreamFilter,

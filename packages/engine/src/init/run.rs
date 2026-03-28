@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::account;
 use crate::canonical;
+use crate::checkpoint;
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::filesystem;
 use crate::key_value;
@@ -12,7 +13,6 @@ use crate::live_state::{
 };
 use crate::observe;
 use crate::schema;
-use crate::state::checkpoint;
 use crate::undo_redo;
 use crate::version;
 use crate::{LixError, TransactionMode};

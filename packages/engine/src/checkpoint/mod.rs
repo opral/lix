@@ -8,6 +8,16 @@
 //! from canonical facts unless the engine deliberately promotes some checkpoint
 //! state into canonical ownership later.
 //!
+//! Checkpoint-managed rows currently split into two buckets:
+//!
+//! - The system-managed checkpoint label row plus commit-label links are the
+//!   persisted checkpoint policy state.
+//! - `lix_internal_last_checkpoint` is a rebuildable derived table.
+//!
+//! The pointer table is a convenience cache over canonical version heads plus
+//! checkpoint labels; correctness must not depend on it being the only source
+//! of truth.
+//!
 mod create_checkpoint;
 mod init;
 mod last_checkpoint;

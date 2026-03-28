@@ -6,10 +6,10 @@ use crate::canonical::append::{
     CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
 };
 use crate::canonical::ProposedDomainChange;
+use crate::checkpoint::apply_public_version_last_checkpoint_side_effects;
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::LixFunctionProvider;
 use crate::sql::public::validation::{validate_commit_time_write, SchemaCache};
-use crate::state::checkpoint::apply_public_version_last_checkpoint_side_effects;
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
 use super::{

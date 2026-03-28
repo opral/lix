@@ -1,7 +1,10 @@
-use crate::init::seed::{quote_ident, text_value};
+use std::collections::BTreeSet;
+
+use crate::canonical::readers::load_commit_lineage_entry_by_id;
+use crate::init::seed::text_value;
 use crate::init::tables::execute_init_statements;
 use crate::init::InitExecutor;
-use crate::live_state::schema_access::{payload_column_name_for_schema, tracked_relation_name};
+use crate::sql_support::text::escape_sql_string;
 use crate::Value;
 use crate::{LixBackend, LixError};
 
@@ -15,7 +18,7 @@ const CHECKPOINT_INIT_STATEMENTS: &[&str] = &[
 ];
 
 pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    execute_init_statements(backend, "state::checkpoint", CHECKPOINT_INIT_STATEMENTS).await
+    execute_init_statements(backend, "checkpoint", CHECKPOINT_INIT_STATEMENTS).await
 }
 
 pub(crate) async fn seed_bootstrap(executor: &mut InitExecutor<'_, '_>) -> Result<(), LixError> {
@@ -187,6 +190,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             ));
         };
 
+        // `lix_internal_last_checkpoint` is derived convenience state. Rebuild it
+        // from canonical version heads plus system-managed checkpoint labels.
         self.execute_backend("DELETE FROM lix_internal_last_checkpoint", &[])
             .await?;
 
@@ -222,84 +227,121 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         &mut self,
         head_commit_id: &str,
     ) -> Result<Option<String>, LixError> {
-        let commit_edge_parent =
-            payload_column_name_for_schema("lix_commit_edge", None, "parent_id")?;
-        let commit_edge_child =
-            payload_column_name_for_schema("lix_commit_edge", None, "child_id")?;
-        let entity_label_entity_id =
-            payload_column_name_for_schema("lix_entity_label", None, "entity_id")?;
-        let entity_label_schema_key =
-            payload_column_name_for_schema("lix_entity_label", None, "schema_key")?;
-        let entity_label_label_id =
-            payload_column_name_for_schema("lix_entity_label", None, "label_id")?;
-        let commit_edge_table = tracked_relation_name("lix_commit_edge");
-        let entity_label_table = tracked_relation_name("lix_entity_label");
-        let commit_table = tracked_relation_name("lix_commit");
+        let mut frontier = vec![head_commit_id.to_string()];
+        let mut visited = BTreeSet::new();
+
+        while !frontier.is_empty() {
+            frontier.retain(|commit_id| visited.insert(commit_id.clone()));
+            if frontier.is_empty() {
+                break;
+            }
+
+            if let Some(checkpoint_commit_id) = self
+                .select_best_checkpoint_commit_from_candidates(&frontier)
+                .await?
+            {
+                return Ok(Some(checkpoint_commit_id));
+            }
+
+            let mut next_frontier = BTreeSet::new();
+            for commit_id in &frontier {
+                let lineage = {
+                    let mut backend = self.backend_adapter();
+                    load_commit_lineage_entry_by_id(&mut backend, commit_id).await?
+                };
+                let Some(lineage) = lineage else {
+                    continue;
+                };
+                for parent_commit_id in lineage.parent_commit_ids {
+                    if !parent_commit_id.is_empty() && !visited.contains(&parent_commit_id) {
+                        next_frontier.insert(parent_commit_id);
+                    }
+                }
+            }
+            frontier = next_frontier.into_iter().collect();
+        }
+
+        Ok(None)
+    }
+
+    async fn select_best_checkpoint_commit_from_candidates(
+        &mut self,
+        commit_ids: &[String],
+    ) -> Result<Option<String>, LixError> {
+        if commit_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let label_entity_ids = commit_ids
+            .iter()
+            .map(|commit_id| super::checkpoint_commit_label_entity_id(commit_id))
+            .collect::<Vec<_>>();
+        let label_in_list = label_entity_ids
+            .iter()
+            .map(|entity_id| format!("'{}'", escape_sql_string(entity_id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let label_rows = self
+            .execute_internal(
+                &format!(
+                    "SELECT entity_id \
+                     FROM lix_state_by_version \
+                     WHERE entity_id IN ({label_in_list}) \
+                       AND schema_key = 'lix_entity_label' \
+                       AND file_id = 'lix' \
+                       AND version_id = 'global' \
+                       AND snapshot_content IS NOT NULL"
+                ),
+                &[],
+            )
+            .await?;
+        let [label_statement] = label_rows.statements.as_slice() else {
+            return Err(crate::errors::unexpected_statement_count_error(
+                "checkpoint label candidate query",
+                1,
+                label_rows.statements.len(),
+            ));
+        };
+        let labeled_entity_ids = label_statement
+            .rows
+            .iter()
+            .map(|row| text_value(row.first(), "lix_state_by_version.entity_id"))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let labeled_commit_ids = commit_ids
+            .iter()
+            .filter(|commit_id| {
+                labeled_entity_ids.contains(&super::checkpoint_commit_label_entity_id(commit_id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if labeled_commit_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let commit_in_list = labeled_commit_ids
+            .iter()
+            .map(|commit_id| format!("'{}'", escape_sql_string(commit_id)))
+            .collect::<Vec<_>>()
+            .join(", ");
         let rows = self
             .execute_internal(
                 &format!(
-                    "WITH RECURSIVE reachable(commit_id, depth) AS ( \
-                       SELECT $1 AS commit_id, 0 AS depth \
-                       UNION ALL \
-                       SELECT \
-                         edge.__PARENT_ID__ AS commit_id, \
-                         reachable.depth + 1 AS depth \
-                       FROM reachable \
-                       JOIN {commit_edge_table} edge \
-                         ON edge.__CHILD_ID__ = reachable.commit_id \
-                       WHERE edge.schema_key = 'lix_commit_edge' \
-                         AND edge.version_id = 'global' \
-                         AND edge.is_tombstone = 0 \
-                         AND edge.__PARENT_ID__ IS NOT NULL \
-                     ) \
-                     SELECT reachable.commit_id \
-                     FROM reachable \
-                     JOIN ( \
-                       SELECT \
-                         {entity_label_entity_id} AS entity_id, \
-                         {entity_label_schema_key} AS schema_key, \
-                         {entity_label_label_id} AS label_id \
-                       FROM {entity_label_table} \
-                       WHERE schema_key = 'lix_entity_label' \
-                         AND file_id = 'lix' \
-                         AND version_id = 'global' \
-                         AND is_tombstone = 0 \
-                         AND {entity_label_entity_id} IS NOT NULL \
-                         AND {entity_label_schema_key} IS NOT NULL \
-                         AND {entity_label_label_id} IS NOT NULL \
-                     ) el \
-                       ON el.entity_id = reachable.commit_id \
-                      AND el.schema_key = 'lix_commit' \
-                      AND el.label_id = '{checkpoint_label_id}' \
-                     LEFT JOIN ( \
-                       SELECT entity_id AS id, created_at \
-                       FROM {commit_table} \
-                       WHERE schema_key = 'lix_commit' \
-                         AND file_id = 'lix' \
-                         AND version_id = 'global' \
-                         AND is_tombstone = 0 \
-                     ) c ON c.id = reachable.commit_id \
-                     ORDER BY \
-                       reachable.depth ASC, \
-                       c.created_at DESC, \
-                       reachable.commit_id DESC \
-                     LIMIT 1",
-                    checkpoint_label_id =
-                        crate::sql_support::text::escape_sql_string(super::CHECKPOINT_LABEL_ID),
-                    entity_label_entity_id = quote_ident(&entity_label_entity_id),
-                    entity_label_schema_key = quote_ident(&entity_label_schema_key),
-                    entity_label_label_id = quote_ident(&entity_label_label_id),
-                    entity_label_table = quote_ident(&entity_label_table),
-                    commit_table = quote_ident(&commit_table),
-                )
-                .replace("__PARENT_ID__", &commit_edge_parent)
-                .replace("__CHILD_ID__", &commit_edge_child),
-                &[Value::Text(head_commit_id.to_string())],
+                    "SELECT entity_id AS id \
+                     FROM lix_internal_change \
+                     WHERE schema_key = 'lix_commit' \
+                       AND file_id = 'lix' \
+                       AND plugin_key = 'lix' \
+                       AND entity_id IN ({commit_in_list}) \
+                     GROUP BY entity_id \
+                     ORDER BY MAX(created_at) DESC, entity_id DESC \
+                     LIMIT 1"
+                ),
+                &[],
             )
             .await?;
         let [statement] = rows.statements.as_slice() else {
             return Err(crate::errors::unexpected_statement_count_error(
-                "resolve checkpoint ancestor query",
+                "checkpoint candidate ordering query",
                 1,
                 rows.statements.len(),
             ));
@@ -307,6 +349,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let Some(first) = statement.rows.first() else {
             return Ok(None);
         };
-        Ok(Some(text_value(first.get(0), "checkpoint ancestor id")?))
+        Ok(Some(text_value(first.get(0), "lix_commit.id")?))
     }
 }
