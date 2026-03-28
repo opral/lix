@@ -10,3 +10,6 @@ pub use contracts::{
 pub use resolve::{
     overlay_lanes, overlay_lanes_for_version, resolve_effective_row, resolve_effective_rows,
 };
+
+#[cfg(test)]
+mod tests;

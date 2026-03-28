@@ -5,6 +5,8 @@ mod init;
 mod key;
 mod overlay;
 mod provider;
+#[cfg(test)]
+mod tests;
 
 pub use definition::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,
