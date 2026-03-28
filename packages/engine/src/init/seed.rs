@@ -1,4 +1,4 @@
-use crate::canonical::readers::load_committed_version_head_commit_id_from_live_state;
+use crate::canonical::readers::load_committed_version_head_commit_id;
 use crate::engine::{Engine, ExecuteOptions, TransactionBackendAdapter};
 use crate::live_state::schema_access::{
     normalized_values_for_schema, payload_column_name_for_schema, tracked_relation_name,
@@ -128,8 +128,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let mut backend =
             TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
         if let Some(commit_id) =
-            load_committed_version_head_commit_id_from_live_state(&mut backend, GLOBAL_VERSION_ID)
-                .await?
+            load_committed_version_head_commit_id(&mut backend, GLOBAL_VERSION_ID).await?
         {
             return Ok(Some(commit_id));
         }

@@ -36,6 +36,7 @@ impl RawRow {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn schema_key(&self) -> &str {
         match self {
             Self::Tracked(row) => &row.schema_key,
@@ -57,6 +58,7 @@ impl RawRow {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn values(&self) -> &BTreeMap<String, Value> {
         match self {
             Self::Tracked(row) => &row.values,
@@ -160,20 +162,9 @@ pub(crate) async fn scan_rows_with_executor(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn snapshot_json(access: &LiveRowAccess, row: &RawRow) -> Result<JsonValue, LixError> {
     snapshot_json_from_values(access, row.schema_key(), row.values())
-}
-
-pub(crate) fn snapshot_text(access: &LiveRowAccess, row: &RawRow) -> Result<String, LixError> {
-    serde_json::to_string(&snapshot_json(access, row)?).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            &format!(
-                "failed to serialize live snapshot for schema '{}': {error}",
-                row.schema_key()
-            ),
-        )
-    })
 }
 
 pub(crate) fn snapshot_json_from_values(

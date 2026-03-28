@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::canonical::readers::{
-    load_committed_version_head_commit_id_from_live_state,
-    load_exact_committed_state_row_from_live_state,
+    load_committed_version_head_commit_id as load_canonical_committed_version_head_commit_id,
+    load_exact_committed_state_row_at_version_head,
 };
 pub(crate) use crate::canonical::readers::{
     CommitQueryExecutor, ExactCommittedStateRow, ExactCommittedStateRowRequest,
@@ -142,14 +142,14 @@ pub(crate) async fn load_committed_version_head_commit_id(
     version_id: &str,
 ) -> Result<Option<String>, LixError> {
     let mut executor = backend;
-    load_committed_version_head_commit_id_from_live_state(&mut executor, version_id).await
+    load_canonical_committed_version_head_commit_id(&mut executor, version_id).await
 }
 
 pub(crate) async fn load_exact_committed_state_row(
     backend: &dyn LixBackend,
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    load_exact_committed_state_row_from_live_state(backend, request).await
+    load_exact_committed_state_row_at_version_head(backend, request).await
 }
 
 pub(crate) async fn scan_live_rows(

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::canonical::readers::{
     load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,
-    load_committed_version_head_commit_id_from_live_state,
+    load_committed_version_head_commit_id,
     load_exact_committed_state_row_from_commit_with_executor, CommitLineageEntry,
     CommitQueryExecutor, CommittedCanonicalChangeRow, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
@@ -70,7 +70,7 @@ pub(crate) async fn rebuild_semantic_undo_redo_stacks(
 ) -> Result<SemanticUndoRedoStacks, LixError> {
     let mut executor = crate::engine::TransactionBackendAdapter::new(transaction);
     let Some(head_commit_id) =
-        load_committed_version_head_commit_id_from_live_state(&mut executor, version_id).await?
+        load_committed_version_head_commit_id(&mut executor, version_id).await?
     else {
         return Ok(SemanticUndoRedoStacks::default());
     };

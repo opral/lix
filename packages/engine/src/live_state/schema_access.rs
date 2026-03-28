@@ -1,4 +1,3 @@
-use crate::backend::QueryExecutor;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 
@@ -55,15 +54,6 @@ pub(crate) async fn load_schema_read_contract_with_backend(
     schema_key: &str,
 ) -> Result<LiveReadContract, LixError> {
     super::storage::load_live_row_access_with_backend(backend, schema_key)
-        .await
-        .map(read_contract_from_storage)
-}
-
-pub(crate) async fn load_schema_read_contract_with_executor(
-    executor: &mut dyn QueryExecutor,
-    schema_key: &str,
-) -> Result<LiveReadContract, LixError> {
-    super::storage::load_live_row_access_with_executor(executor, schema_key)
         .await
         .map(read_contract_from_storage)
 }
@@ -201,16 +191,6 @@ pub(crate) fn schema_column_names(
         .into_iter()
         .map(|column| column.column_name)
         .collect())
-}
-
-#[cfg(test)]
-pub(crate) fn snapshot_text_from_schema_values(
-    schema_key: &str,
-    schema_definition: Option<&JsonValue>,
-    values: &std::collections::BTreeMap<String, Value>,
-) -> Result<String, LixError> {
-    let access = super::storage::LiveRowAccess::new(schema_layout(schema_key, schema_definition)?);
-    super::snapshot_text_from_values(&access, schema_key, values)
 }
 
 fn schema_layout(

@@ -1,13 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::errors::classification::is_missing_relation_error;
-use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::roots::load_version_ref_with_executor;
-use crate::live_state::schema_access::load_schema_read_contract_with_executor;
-use crate::live_state::{scan_tracked_rows_with_executor, scan_untracked_rows_with_executor};
-use crate::version::GLOBAL_VERSION_ID;
+use crate::schema::builtin::types::LixCommit;
 use crate::{LixBackend, LixError, Value, VersionId};
 
+use super::roots::{load_committed_version_head_commit_id, load_head_commit_id_for_version};
 use super::types::{VersionInfo, VersionSnapshot};
 
 const CANONICAL_FALLBACK_MAX_COMMIT_DEPTH: usize = 2048;
@@ -53,39 +50,6 @@ pub(crate) struct ExactCommittedStateRowRequest {
 
 pub(crate) use crate::backend::QueryExecutor as CommitQueryExecutor;
 
-pub(crate) async fn load_committed_version_head_commit_id_from_live_state(
-    executor: &mut dyn CommitQueryExecutor,
-    version_id: &str,
-) -> Result<Option<String>, LixError> {
-    if let Some(pointer) = load_version_ref_with_executor(executor, version_id).await? {
-        if pointer.commit_id.is_empty() {
-            return Ok(None);
-        }
-        return Ok(Some(pointer.commit_id));
-    }
-
-    Ok(None)
-}
-
-#[cfg(test)]
-pub(crate) async fn reconstruct_committed_version_head_commit_id_from_canonical(
-    executor: &mut dyn CommitQueryExecutor,
-    version_id: &str,
-) -> Result<Option<String>, LixError> {
-    let Some(snapshot_content) =
-        load_version_ref_snapshot_content_from_canonical(executor, version_id).await?
-    else {
-        return Ok(None);
-    };
-    let Some(pointer) = parse_version_ref_snapshot(&snapshot_content)? else {
-        return Ok(None);
-    };
-    if pointer.commit_id.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(pointer.commit_id))
-}
-
 pub(crate) async fn load_version_info_for_versions(
     executor: &mut dyn CommitQueryExecutor,
     version_ids: &BTreeSet<String>,
@@ -107,8 +71,7 @@ pub(crate) async fn load_version_info_for_versions(
         );
     }
     for version_id in version_ids {
-        if let Some(commit_id) =
-            load_committed_version_head_commit_id_from_live_state(executor, version_id).await?
+        if let Some(commit_id) = load_committed_version_head_commit_id(executor, version_id).await?
         {
             versions.insert(
                 version_id.clone(),
@@ -125,114 +88,26 @@ pub(crate) async fn load_version_info_for_versions(
     Ok(versions)
 }
 
-pub(crate) async fn load_exact_committed_state_row_from_live_state(
+pub(crate) async fn load_exact_committed_state_row_at_version_head(
     backend: &dyn LixBackend,
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
     let mut executor = backend;
-    load_exact_committed_state_row_from_live_state_with_executor(&mut executor, request).await
+    load_exact_committed_state_row_at_version_head_with_executor(&mut executor, request).await
 }
 
-pub(crate) async fn load_exact_committed_state_row_from_live_state_with_executor(
+pub(crate) async fn load_exact_committed_state_row_at_version_head_with_executor(
     executor: &mut dyn CommitQueryExecutor,
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    let access = load_schema_read_contract_with_executor(executor, &request.schema_key).await?;
-    let mut constraints = vec![ScanConstraint {
-        field: ScanField::EntityId,
-        operator: ScanOperator::Eq(Value::Text(request.entity_id.clone())),
-    }];
-    if let Some(file_id) = request
-        .exact_filters
-        .get("file_id")
-        .and_then(text_from_value)
-    {
-        constraints.push(ScanConstraint {
-            field: ScanField::FileId,
-            operator: ScanOperator::Eq(Value::Text(file_id.to_string())),
-        });
-    }
-    if let Some(plugin_key) = request
-        .exact_filters
-        .get("plugin_key")
-        .and_then(text_from_value)
-    {
-        constraints.push(ScanConstraint {
-            field: ScanField::PluginKey,
-            operator: ScanOperator::Eq(Value::Text(plugin_key.to_string())),
-        });
-    }
-    if let Some(schema_version) = request
-        .exact_filters
-        .get("schema_version")
-        .and_then(text_from_value)
-    {
-        constraints.push(ScanConstraint {
-            field: ScanField::SchemaVersion,
-            operator: ScanOperator::Eq(Value::Text(schema_version.to_string())),
-        });
-    }
-    let mut rows = scan_tracked_rows_with_executor(
-        executor,
-        &request.schema_key,
-        &request.version_id,
-        &constraints,
-        &access
-            .columns()
-            .iter()
-            .map(|column| column.property_name.clone())
-            .collect::<Vec<_>>(),
-    )
-    .await?;
-    if rows.is_empty() {
+    let Some(head_commit_id) =
+        load_head_commit_id_for_version(executor, &request.version_id).await?
+    else {
         return Ok(None);
-    }
-    if rows.len() > 1 {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            &format!(
-                "expected at most one committed tracked row for schema '{}' entity '{}' version '{}'",
-                request.schema_key, request.entity_id, request.version_id
-            ),
-        ));
-    }
-    let row = rows.remove(0);
-    let snapshot_content = access.snapshot_text_from_values(&row.schema_key, &row.values)?;
-    let mut values = BTreeMap::new();
-    values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
-    values.insert(
-        "schema_key".to_string(),
-        Value::Text(row.schema_key.clone()),
-    );
-    values.insert(
-        "schema_version".to_string(),
-        Value::Text(row.schema_version.clone()),
-    );
-    values.insert("file_id".to_string(), Value::Text(row.file_id.clone()));
-    values.insert(
-        "version_id".to_string(),
-        Value::Text(row.version_id.clone()),
-    );
-    values.insert(
-        "plugin_key".to_string(),
-        Value::Text(row.plugin_key.clone()),
-    );
-    values.insert(
-        "snapshot_content".to_string(),
-        Value::Text(snapshot_content),
-    );
-    if let Some(metadata) = row.metadata.clone() {
-        values.insert("metadata".to_string(), Value::Text(metadata));
-    }
-    Ok(Some(ExactCommittedStateRow {
-        entity_id: row.entity_id,
-        schema_key: row.schema_key,
-        file_id: row.file_id,
-        version_id: row.version_id,
-        values,
-        writer_key: row.writer_key,
-        source_change_id: row.change_id,
-    }))
+    };
+
+    load_exact_committed_state_row_from_commit_with_executor(executor, &head_commit_id, request)
+        .await
 }
 
 pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
@@ -372,60 +247,38 @@ pub(crate) async fn load_commit_lineage_entry_by_id(
     executor: &mut dyn CommitQueryExecutor,
     commit_id: &str,
 ) -> Result<Option<CommitLineageEntry>, LixError> {
-    let access = load_schema_read_contract_with_executor(executor, "lix_commit").await?;
-    let constraints = vec![
-        ScanConstraint {
-            field: ScanField::EntityId,
-            operator: ScanOperator::Eq(Value::Text(commit_id.to_string())),
-        },
-        ScanConstraint {
-            field: ScanField::FileId,
-            operator: ScanOperator::Eq(Value::Text("lix".to_string())),
-        },
-        ScanConstraint {
-            field: ScanField::PluginKey,
-            operator: ScanOperator::Eq(Value::Text("lix".to_string())),
-        },
-    ];
-    let required_columns = access
-        .columns()
-        .iter()
-        .map(|column| column.property_name.clone())
-        .collect::<Vec<_>>();
-    let mut tracked_rows = scan_tracked_rows_with_executor(
-        executor,
-        "lix_commit",
-        GLOBAL_VERSION_ID,
-        &constraints,
-        &required_columns,
-    )
-    .await?;
-    let snapshot_content = if let Some(row) = tracked_rows.pop() {
-        access.snapshot_text_from_values(&row.schema_key, &row.values)?
-    } else {
-        let mut untracked_rows = scan_untracked_rows_with_executor(
-            executor,
-            "lix_commit",
-            GLOBAL_VERSION_ID,
-            &constraints,
-            &required_columns,
-        )
-        .await?;
-        let Some(row) = untracked_rows.pop() else {
-            return Ok(None);
-        };
-        access.snapshot_text_from_values(&row.schema_key, &row.values)?
+    let sql = format!(
+        "SELECT s.content AS snapshot_content \
+         FROM lix_internal_change c \
+         LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+         WHERE c.schema_key = 'lix_commit' \
+           AND c.entity_id = '{commit_id}' \
+           AND c.file_id = 'lix' \
+           AND c.plugin_key = 'lix' \
+           AND s.content IS NOT NULL \
+         ORDER BY c.created_at DESC, c.id DESC \
+         LIMIT 1",
+        commit_id = escape_sql_string(commit_id),
+    );
+    let result = match executor.execute(&sql, &[]).await {
+        Ok(result) => result,
+        Err(err) if is_missing_relation_error(&err) => return Ok(None),
+        Err(err) => return Err(err),
     };
-    if snapshot_content.is_empty() {
+    let Some(snapshot_content) = result
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(text_from_value)
+    else {
         return Ok(None);
-    }
-    let parsed: crate::schema::builtin::types::LixCommit = serde_json::from_str(&snapshot_content)
-        .map_err(|error| {
-            LixError::unknown(format!(
-                "commit snapshot_content invalid JSON for '{}': {error}",
-                commit_id
-            ))
-        })?;
+    };
+    let parsed: LixCommit = serde_json::from_str(&snapshot_content).map_err(|error| {
+        LixError::unknown(format!(
+            "commit snapshot_content invalid JSON for '{}': {error}",
+            commit_id
+        ))
+    })?;
     Ok(Some(CommitLineageEntry {
         id: parsed.id,
         change_ids: parsed.change_ids,
@@ -459,77 +312,6 @@ pub(crate) async fn load_canonical_change_row_by_id(
         metadata: row.get(7).and_then(text_from_value),
         created_at: required_text(row, 8, "lix_internal_change.created_at")?,
     }))
-}
-
-#[cfg(test)]
-async fn load_version_ref_snapshot_content_from_canonical(
-    executor: &mut dyn CommitQueryExecutor,
-    version_id: &str,
-) -> Result<Option<Value>, LixError> {
-    let sql = format!(
-        "SELECT s.content AS snapshot_content \
-         FROM lix_internal_change c \
-         LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-         WHERE c.schema_key = '{schema_key}' \
-           AND c.entity_id = '{entity_id}' \
-           AND c.file_id = '{file_id}' \
-           AND c.plugin_key = '{plugin_key}' \
-           AND s.content IS NOT NULL \
-         ORDER BY c.created_at DESC, c.id DESC \
-         LIMIT 1",
-        schema_key = escape_sql_string(version_ref_schema_key()),
-        entity_id = escape_sql_string(version_id),
-        file_id = escape_sql_string(version_ref_file_id()),
-        plugin_key = escape_sql_string(version_ref_plugin_key()),
-    );
-
-    match executor.execute(&sql, &[]).await {
-        Ok(result) => Ok(result.rows.first().and_then(|row| row.first()).cloned()),
-        Err(err) if is_missing_relation_error(&err) => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-#[cfg(test)]
-pub(crate) async fn reconstruct_exact_committed_state_row_from_canonical(
-    executor: &mut dyn CommitQueryExecutor,
-    request: &ExactCommittedStateRowRequest,
-) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    let Some(head_commit_id) =
-        reconstruct_committed_version_head_commit_id_from_canonical(executor, &request.version_id)
-            .await?
-    else {
-        return Ok(None);
-    };
-
-    load_exact_committed_state_row_from_commit_with_executor(executor, &head_commit_id, request)
-        .await
-}
-
-#[cfg(test)]
-use crate::schema::builtin::types::LixVersionRef;
-
-#[cfg(test)]
-use crate::version::{version_ref_file_id, version_ref_plugin_key, version_ref_schema_key};
-
-#[cfg(test)]
-fn parse_version_ref_snapshot(value: &Value) -> Result<Option<LixVersionRef>, LixError> {
-    let raw_snapshot = match value {
-        Value::Text(value) => value,
-        Value::Null => return Ok(None),
-        _ => {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "version ref snapshot_content must be text".to_string(),
-            });
-        }
-    };
-
-    let snapshot: LixVersionRef = serde_json::from_str(raw_snapshot).map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("version ref snapshot_content invalid JSON: {error}"),
-    })?;
-    Ok(Some(snapshot))
 }
 
 fn text_from_value(value: &Value) -> Option<String> {
@@ -583,149 +365,14 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
 mod tests {
     use super::*;
     use crate::backend::LixBackendTransaction;
-    use crate::live_state::schema_access::payload_column_name_for_schema;
-    use crate::live_state::{
-        live_schema_column_names, live_schema_normalized_values,
-        live_schema_snapshot_text_from_values,
-    };
-    use crate::schema::builtin::builtin_schema_definition;
+    use crate::canonical::roots::load_head_commit_id_for_version;
     use crate::QueryResult;
     use async_trait::async_trait;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    fn mock_normalized_live_row(schema_key: &str) -> (Vec<Value>, String) {
-        let snapshot_content = match schema_key {
-            "lix_file_descriptor" => serde_json::json!({
-                "id": "file-1",
-                "directory_id": serde_json::Value::Null,
-                "name": "contract",
-                "extension": "txt",
-                "metadata": serde_json::Value::Null,
-                "hidden": false,
-            })
-            .to_string(),
-            _ => "{\"id\":\"file-1\"}".to_string(),
-        };
-        let normalized = live_schema_normalized_values(schema_key, None, Some(&snapshot_content))
-            .expect("builtin schema should normalize");
-        let mut row = vec![
-            Value::Text("file-1".to_string()),
-            Value::Text(schema_key.to_string()),
-            Value::Text("1".to_string()),
-            Value::Text("lix".to_string()),
-            Value::Text("v1".to_string()),
-            Value::Boolean(false),
-            Value::Text("lix".to_string()),
-            Value::Text("{\"k\":\"v\"}".to_string()),
-            Value::Text("change-1".to_string()),
-            Value::Null,
-            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
-            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
-        ];
-        for column_name in live_schema_column_names(schema_key, None)
-            .expect("builtin schema should expose column names")
-        {
-            row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
-        }
-        let mut property_names = builtin_schema_definition(schema_key)
-            .and_then(|schema| schema.get("properties"))
-            .and_then(serde_json::Value::as_object)
-            .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
-            .expect("builtin schema should expose properties");
-        property_names.sort();
-
-        let values = property_names
-            .into_iter()
-            .map(|property_name| {
-                let column_name = payload_column_name_for_schema(schema_key, None, &property_name)
-                    .expect("builtin schema property should map to live column");
-                (
-                    property_name,
-                    normalized.get(&column_name).cloned().unwrap_or(Value::Null),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let snapshot = live_schema_snapshot_text_from_values(schema_key, None, &values)
-            .expect("live snapshot reconstruction should succeed");
-        (row, snapshot)
-    }
-
-    fn fake_version_ref_live_row(version_id: &str, commit_id: &str) -> Vec<Value> {
-        let snapshot = crate::version::version_ref_snapshot_content(version_id, commit_id);
-        let normalized = live_schema_normalized_values(
-            crate::version::version_ref_schema_key(),
-            None,
-            Some(&snapshot),
-        )
-        .expect("version ref snapshot should normalize");
-        let mut row = vec![
-            Value::Text(version_id.to_string()),
-            Value::Text(crate::version::version_ref_schema_key().to_string()),
-            Value::Text(crate::version::version_ref_schema_version().to_string()),
-            Value::Text(crate::version::version_ref_file_id().to_string()),
-            Value::Text(crate::version::version_ref_storage_version_id().to_string()),
-            Value::Boolean(true),
-            Value::Text(crate::version::version_ref_plugin_key().to_string()),
-            Value::Null,
-            Value::Null,
-            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
-            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
-        ];
-        for column_name in live_schema_column_names(crate::version::version_ref_schema_key(), None)
-            .expect("version ref schema should expose column names")
-        {
-            row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
-        }
-        row
-    }
-
-    struct ExactCommittedStateBackend {
-        live_table_query_seen: Arc<AtomicBool>,
-    }
-
     struct UnusedTransaction;
-
-    #[async_trait(?Send)]
-    impl LixBackend for ExactCommittedStateBackend {
-        fn dialect(&self) -> crate::SqlDialect {
-            crate::SqlDialect::Sqlite
-        }
-
-        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            let file_descriptor_table = format!(
-                "FROM \"{}\"",
-                crate::live_state::live_relation_name("lix_file_descriptor")
-            );
-            if sql.contains(&file_descriptor_table) {
-                self.live_table_query_seen.store(true, Ordering::SeqCst);
-                let (row, _) = mock_normalized_live_row("lix_file_descriptor");
-                return Ok(QueryResult {
-                    rows: vec![row],
-                    columns: Vec::new(),
-                });
-            }
-            Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            })
-        }
-
-        async fn begin_transaction(
-            &self,
-            _mode: crate::TransactionMode,
-        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            Ok(Box::new(UnusedTransaction))
-        }
-
-        async fn begin_savepoint(
-            &self,
-            _name: &str,
-        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            self.begin_transaction(crate::TransactionMode::Write).await
-        }
-    }
 
     #[async_trait(?Send)]
     impl LixBackendTransaction for UnusedTransaction {
@@ -755,46 +402,6 @@ mod tests {
         async fn rollback(self: Box<Self>) -> Result<(), LixError> {
             Ok(())
         }
-    }
-
-    #[tokio::test]
-    async fn exact_committed_state_reads_authoritative_live_table() {
-        let live_table_query_seen = Arc::new(AtomicBool::new(false));
-        let backend = ExactCommittedStateBackend {
-            live_table_query_seen: Arc::clone(&live_table_query_seen),
-        };
-
-        let row = load_exact_committed_state_row_from_live_state(
-            &backend,
-            &ExactCommittedStateRowRequest {
-                entity_id: "file-1".to_string(),
-                schema_key: "lix_file_descriptor".to_string(),
-                version_id: "v1".to_string(),
-                exact_filters: BTreeMap::from([
-                    ("file_id".to_string(), Value::Text("lix".to_string())),
-                    ("plugin_key".to_string(), Value::Text("lix".to_string())),
-                    ("schema_version".to_string(), Value::Text("1".to_string())),
-                ]),
-            },
-        )
-        .await
-        .expect("exact committed live row lookup should succeed")
-        .expect("exact committed live row should exist");
-
-        assert!(
-            live_table_query_seen.load(Ordering::SeqCst),
-            "exact committed state should read directly from the authoritative live table"
-        );
-        assert_eq!(row.entity_id, "file-1");
-        assert_eq!(row.schema_key, "lix_file_descriptor");
-        assert_eq!(row.file_id, "lix");
-        assert_eq!(row.version_id, "v1");
-        assert_eq!(row.source_change_id.as_deref(), Some("change-1"));
-        let (_, expected_snapshot) = mock_normalized_live_row("lix_file_descriptor");
-        assert_eq!(
-            row.values.get("snapshot_content"),
-            Some(&Value::Text(expected_snapshot))
-        );
     }
 
     struct CanonicalFallbackBackend {
@@ -859,6 +466,17 @@ mod tests {
                     ],
                 });
             }
+            if sql.contains("FROM lix_internal_change c")
+                && sql.contains("c.schema_key = 'lix_commit'")
+            {
+                self.canonical_query_seen.store(true, Ordering::SeqCst);
+                return Ok(QueryResult {
+                    rows: vec![vec![Value::Text(
+                        "{\"id\":\"commit-1\",\"change_ids\":[\"change-fallback\"],\"parent_commit_ids\":[\"parent-1\"]}".to_string(),
+                    )]],
+                    columns: vec!["snapshot_content".to_string()],
+                });
+            }
             Ok(QueryResult {
                 rows: Vec::new(),
                 columns: Vec::new(),
@@ -881,34 +499,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canonical_version_head_reconstruction_reads_journal() {
+    async fn canonical_version_head_contract_falls_back_to_journal() {
         let canonical_query_seen = Arc::new(AtomicBool::new(false));
         let backend = CanonicalFallbackBackend {
             canonical_query_seen: Arc::clone(&canonical_query_seen),
         };
 
         let mut executor = &backend;
-        let commit_id =
-            reconstruct_committed_version_head_commit_id_from_canonical(&mut executor, "v1")
-                .await
-                .expect("canonical version head reconstruction should succeed");
+        let commit_id = load_head_commit_id_for_version(&mut executor, "v1")
+            .await
+            .expect("canonical version head lookup should succeed");
 
         assert!(
             canonical_query_seen.load(Ordering::SeqCst),
-            "canonical version head reconstruction should read canonical changes"
+            "canonical version head lookup should read canonical changes when live mirrors are absent"
         );
         assert_eq!(commit_id.as_deref(), Some("commit-1"));
     }
 
     #[tokio::test]
-    async fn canonical_exact_state_reconstruction_walks_commit_history() {
+    async fn canonical_exact_state_contract_walks_commit_history() {
         let canonical_query_seen = Arc::new(AtomicBool::new(false));
         let backend = CanonicalFallbackBackend {
             canonical_query_seen: Arc::clone(&canonical_query_seen),
         };
 
         let mut executor = &backend;
-        let row = reconstruct_exact_committed_state_row_from_canonical(
+        let row = load_exact_committed_state_row_at_version_head_with_executor(
             &mut executor,
             &ExactCommittedStateRowRequest {
                 entity_id: "file-1".to_string(),
@@ -922,78 +539,33 @@ mod tests {
             },
         )
         .await
-        .expect("canonical exact-state reconstruction should succeed")
-        .expect("canonical exact-state reconstruction should return a row");
+        .expect("canonical exact-state lookup should succeed")
+        .expect("canonical exact-state lookup should return a row");
 
         assert!(
             canonical_query_seen.load(Ordering::SeqCst),
-            "canonical exact-state reconstruction should read canonical history"
+            "canonical exact-state lookup should read canonical history"
         );
         assert_eq!(row.entity_id, "file-1");
         assert_eq!(row.source_change_id.as_deref(), Some("change-fallback"));
     }
 
-    struct LiveVersionHeadBackend {
-        live_query_seen: Arc<AtomicBool>,
-        canonical_query_seen: Arc<AtomicBool>,
-    }
-
-    #[async_trait(?Send)]
-    impl LixBackend for LiveVersionHeadBackend {
-        fn dialect(&self) -> crate::SqlDialect {
-            crate::SqlDialect::Sqlite
-        }
-
-        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains(&crate::live_state::live_relation_name("lix_version_ref")) {
-                self.live_query_seen.store(true, Ordering::SeqCst);
-                return Ok(QueryResult {
-                    rows: vec![fake_version_ref_live_row("v1", "commit-live")],
-                    columns: Vec::new(),
-                });
-            }
-            if sql.contains("FROM lix_internal_change c")
-                && sql.contains("c.schema_key = 'lix_version_ref'")
-            {
-                self.canonical_query_seen.store(true, Ordering::SeqCst);
-            }
-            Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            })
-        }
-
-        async fn begin_transaction(
-            &self,
-            _mode: crate::TransactionMode,
-        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            Ok(Box::new(UnusedTransaction))
-        }
-
-        async fn begin_savepoint(
-            &self,
-            _name: &str,
-        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            self.begin_transaction(crate::TransactionMode::Write).await
-        }
-    }
-
     #[tokio::test]
-    async fn committed_version_head_reads_live_version_ref_when_present() {
-        let live_query_seen = Arc::new(AtomicBool::new(false));
+    async fn canonical_commit_lineage_contract_reads_commit_snapshot_from_journal() {
         let canonical_query_seen = Arc::new(AtomicBool::new(false));
-        let backend = LiveVersionHeadBackend {
-            live_query_seen: Arc::clone(&live_query_seen),
+        let backend = CanonicalFallbackBackend {
             canonical_query_seen: Arc::clone(&canonical_query_seen),
         };
 
         let mut executor = &backend;
-        let commit_id = load_committed_version_head_commit_id_from_live_state(&mut executor, "v1")
+        let entry = load_commit_lineage_entry_by_id(&mut executor, "commit-1")
             .await
-            .expect("live version head lookup should succeed");
+            .expect("canonical lineage lookup should succeed")
+            .expect("canonical lineage lookup should return a row");
 
-        assert!(live_query_seen.load(Ordering::SeqCst));
-        assert!(!canonical_query_seen.load(Ordering::SeqCst));
-        assert_eq!(commit_id.as_deref(), Some("commit-live"));
+        assert!(canonical_query_seen.load(Ordering::SeqCst));
+        assert_eq!(entry.id, "commit-1");
+        assert_eq!(entry.change_ids, vec!["change-fallback".to_string()]);
+        assert_eq!(entry.parent_commit_ids, vec!["parent-1".to_string()]);
     }
 }

@@ -3,15 +3,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value as JsonValue;
 
 use crate::backend::prepared::{PreparedBatch, PreparedStatement};
-use crate::live_state::commit_graph_queries::{
-    build_commit_generation_seed_sql as build_commit_generation_seed_sql_impl,
-    build_exact_commit_depth_cte_sql as build_exact_commit_depth_cte_sql_impl,
-};
 use crate::sql_support::binding::bind_sql;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::Value as EngineValue;
 use crate::{LixError, SqlDialect};
 
+use super::graph_sql::{
+    build_commit_generation_seed_sql as build_commit_generation_seed_sql_impl,
+    build_exact_commit_depth_cte_sql as build_exact_commit_depth_cte_sql_impl,
+};
 use super::state_source::CommitQueryExecutor;
 use super::types::MaterializedStateRow;
 

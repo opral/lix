@@ -1,3 +1,13 @@
+//! Checkpoint subsystem boundary.
+//!
+//! `checkpoint` is a derived subsystem layered on canonical history. It owns
+//! checkpoint-specific acceleration and policy, such as checkpoint labels and
+//! last-checkpoint helpers.
+//!
+//! `checkpoint` is not canonical truth by default. It should remain rebuildable
+//! from canonical facts unless the engine deliberately promotes some checkpoint
+//! state into canonical ownership later.
+//!
 mod create_checkpoint;
 mod init;
 mod last_checkpoint;

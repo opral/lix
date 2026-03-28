@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::json;
 
@@ -7,17 +7,17 @@ use super::types::{
     LatestVisibleWinnerDebugRow, LiveStateRebuildDebugMode, LiveStateRebuildDebugTrace,
     LiveStateRebuildPlan, LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning,
     LiveStateWrite, LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
-    TraversedEdgeDebugRow, VersionAncestryDebugRow, VersionHeadDebugRow,
+    TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 use crate::backend::QueryExecutor;
-use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::raw::{scan_rows_with_executor, snapshot_text, RawStorage};
-use crate::schema::builtin::types::LixVersionRef;
-use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
-use crate::version::{
-    version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id, GLOBAL_VERSION_ID,
+use crate::canonical::lineage::{
+    build_version_commit_depth_map, build_version_head_map, collect_commit_edges,
+    min_depth_by_commit, VersionCommitDepthMap, VersionHeadMap,
 };
-use crate::{CanonicalJson, LixBackend, LixError, Value};
+use crate::canonical::roots::load_all_version_head_commit_ids;
+use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
+use crate::version::GLOBAL_VERSION_ID;
+use crate::{CanonicalJson, LixBackend, LixError};
 
 #[derive(Debug, Clone)]
 struct VisibleRow {
@@ -63,14 +63,6 @@ struct BuiltinProjectionSchemaMeta {
     plugin_key: String,
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone)]
-struct ResolvedVersionRef {
-    change: ChangeRecord,
-    owner_commit_id: String,
-    target_commit_id: Option<String>,
-}
-
 pub(crate) async fn live_state_rebuild_plan_internal(
     backend: &dyn LixBackend,
     req: &LiveStateRebuildRequest,
@@ -88,9 +80,14 @@ pub(crate) async fn live_state_rebuild_plan_with_executor(
     let mut warnings = Vec::new();
 
     let all_commit_edges = build_all_commit_edges(&data, &mut stats);
-    let version_refs =
-        load_version_heads_from_untracked(executor, &mut warnings, &mut stats).await?;
-    let commit_graph = build_commit_graph(&version_refs, &all_commit_edges, &mut stats);
+    let version_refs = load_version_heads_from_canonical(executor, &mut stats).await?;
+    let commit_graph = build_version_commit_depth_map(&version_refs, &all_commit_edges);
+    stats.push(StageStat {
+        stage: "commit_graph".to_string(),
+        input_rows: version_refs.values().map(|rows| rows.len()).sum::<usize>()
+            + all_commit_edges.len(),
+        output_rows: commit_graph.len(),
+    });
 
     let latest_visible_state = build_latest_visible_state(
         &data,
@@ -101,14 +98,7 @@ pub(crate) async fn live_state_rebuild_plan_with_executor(
     );
 
     let target_versions = resolve_target_versions(req, &version_refs, &data, &latest_visible_state);
-    let version_ancestry =
-        build_version_ancestry(&data, &target_versions, &mut warnings, &mut stats);
-    let final_state = build_final_state(
-        &latest_visible_state,
-        &version_ancestry,
-        &target_versions,
-        &mut stats,
-    );
+    let final_state = build_final_state(&latest_visible_state, &target_versions, &mut stats);
     let writes = build_writes(&final_state)?;
 
     let debug = build_debug_trace(
@@ -116,7 +106,6 @@ pub(crate) async fn live_state_rebuild_plan_with_executor(
         &version_refs,
         &commit_graph,
         &all_commit_edges,
-        &version_ancestry,
         &latest_visible_state,
         &final_state,
     )?;
@@ -148,26 +137,20 @@ fn build_all_commit_edges(
     data: &LoadedData,
     stats: &mut Vec<StageStat>,
 ) -> BTreeSet<(String, String)> {
-    let mut edges = BTreeSet::new();
-
-    for commit in data.commits.values() {
-        for parent_id in &commit.snapshot.parent_commit_ids {
-            if parent_id.is_empty() || commit.entity_id.is_empty() {
-                continue;
-            }
-            edges.insert((parent_id.clone(), commit.entity_id.clone()));
-        }
-    }
-
-    for edge in &data.commit_edges {
-        if edge.snapshot.parent_id.is_empty() || edge.snapshot.child_id.is_empty() {
-            continue;
-        }
-        edges.insert((
-            edge.snapshot.parent_id.clone(),
-            edge.snapshot.child_id.clone(),
-        ));
-    }
+    let edges = collect_commit_edges(
+        data.commits.values().map(|commit| {
+            (
+                commit.entity_id.clone(),
+                commit.snapshot.parent_commit_ids.clone(),
+            )
+        }),
+        data.commit_edges.iter().map(|edge| {
+            (
+                edge.snapshot.parent_id.clone(),
+                edge.snapshot.child_id.clone(),
+            )
+        }),
+    );
 
     stats.push(StageStat {
         stage: "all_commit_edges".to_string(),
@@ -178,216 +161,10 @@ fn build_all_commit_edges(
     edges
 }
 
-#[cfg(test)]
-fn resolve_version_ref_candidates(
-    data: &LoadedData,
-    all_commit_edges: &BTreeSet<(String, String)>,
-    commit_causal_rank: &BTreeMap<String, usize>,
-    change_commit_by_change_id: &BTreeMap<String, String>,
-    warnings: &mut Vec<LiveStateRebuildWarning>,
-    stats: &mut Vec<StageStat>,
-) -> BTreeMap<String, Vec<ResolvedVersionRef>> {
-    let parents_by_child = parents_by_child(all_commit_edges);
-    let mut ancestor_memo = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut by_version = BTreeMap::<String, Vec<ResolvedVersionRef>>::new();
-
-    for change in data.changes.values() {
-        if change.schema_key != "lix_version_ref" {
-            continue;
-        }
-
-        let parsed = match change.snapshot_content.as_deref() {
-            Some(snapshot_raw) => match serde_json::from_str::<LixVersionRef>(snapshot_raw) {
-                Ok(parsed) => Some(parsed),
-                Err(error) => {
-                    warnings.push(LiveStateRebuildWarning {
-                        code: "invalid_version_ref_snapshot".to_string(),
-                        message: format!(
-                            "lix_version_ref change '{}' has invalid snapshot JSON: {}",
-                            change.id, error
-                        ),
-                    });
-                    None
-                }
-            },
-            None => None,
-        };
-
-        let version_id = parsed
-            .as_ref()
-            .map(|parsed| parsed.id.clone())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| change.entity_id.clone());
-
-        let owner_commit_id = change_commit_by_change_id
-            .get(&change.id)
-            .cloned()
-            .or_else(|| {
-                parsed
-                    .as_ref()
-                    .map(|parsed| parsed.commit_id.clone())
-                    .filter(|value| !value.is_empty())
-            });
-
-        let Some(owner_commit_id) = owner_commit_id else {
-            warnings.push(LiveStateRebuildWarning {
-                code: "orphan_version_ref_change".to_string(),
-                message: format!(
-                    "lix_version_ref change '{}' for version '{}' is not linked from any commit",
-                    change.id, version_id
-                ),
-            });
-            continue;
-        };
-
-        by_version
-            .entry(version_id)
-            .or_default()
-            .push(ResolvedVersionRef {
-                change: change.clone(),
-                owner_commit_id,
-                target_commit_id: parsed
-                    .as_ref()
-                    .map(|parsed| parsed.commit_id.clone())
-                    .filter(|value| !value.is_empty()),
-            });
-    }
-
-    let mut resolved = BTreeMap::new();
-    for (version_id, candidates) in by_version {
-        let owner_commits = candidates
-            .iter()
-            .map(|candidate| candidate.owner_commit_id.clone())
-            .collect::<BTreeSet<_>>();
-        let maximal_owner_commits = maximal_commits(
-            &owner_commits,
-            &parents_by_child,
-            &commit_causal_rank,
-            &mut ancestor_memo,
-        );
-        if maximal_owner_commits.len() > 1 {
-            warnings.push(LiveStateRebuildWarning {
-                code: "divergent_version_ref_history".to_string(),
-                message: format!(
-                    "version '{}' has multiple visible lix_version_ref winners: {}",
-                    version_id,
-                    maximal_owner_commits
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            });
-        }
-
-        let mut winners = Vec::new();
-        for owner_commit_id in maximal_owner_commits {
-            let mut owner_candidates = candidates
-                .iter()
-                .filter(|candidate| candidate.owner_commit_id == owner_commit_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            owner_candidates.sort_by(|left, right| {
-                right
-                    .change
-                    .created_at
-                    .cmp(&left.change.created_at)
-                    .then_with(|| right.change.id.cmp(&left.change.id))
-            });
-            if let Some(winner) = owner_candidates.into_iter().next() {
-                winners.push(winner);
-            }
-        }
-        if !winners.is_empty() {
-            resolved.insert(version_id, winners);
-        }
-    }
-
-    stats.push(StageStat {
-        stage: "version_refs".to_string(),
-        input_rows: data
-            .changes
-            .values()
-            .filter(|change| change.schema_key == "lix_version_ref")
-            .count(),
-        output_rows: resolved.values().map(|rows| rows.len()).sum(),
-    });
-
-    resolved
-}
-
-#[cfg(test)]
-fn build_version_refs(
-    resolved_version_refs: &BTreeMap<String, Vec<ResolvedVersionRef>>,
-    stats: &mut Vec<StageStat>,
-) -> BTreeMap<String, Vec<String>> {
-    let mut heads = BTreeMap::new();
-    for (version_id, rows) in resolved_version_refs {
-        let mut head_commit_ids = rows
-            .iter()
-            .filter_map(|row| row.target_commit_id.clone())
-            .collect::<Vec<_>>();
-        head_commit_ids.sort();
-        head_commit_ids.dedup();
-        if !head_commit_ids.is_empty() {
-            heads.insert(version_id.clone(), head_commit_ids);
-        }
-    }
-
-    stats.push(StageStat {
-        stage: "version_ref_heads".to_string(),
-        input_rows: resolved_version_refs.values().map(|rows| rows.len()).sum(),
-        output_rows: heads.values().map(|rows| rows.len()).sum(),
-    });
-
-    heads
-}
-
-fn build_commit_graph(
-    version_refs: &BTreeMap<String, Vec<String>>,
-    all_commit_edges: &BTreeSet<(String, String)>,
-    stats: &mut Vec<StageStat>,
-) -> BTreeMap<(String, String), usize> {
-    let parent_by_child = parents_by_child(all_commit_edges);
-
-    let mut queue = VecDeque::new();
-    for (version_id, tips) in version_refs {
-        for tip in tips {
-            queue.push_back((version_id.clone(), tip.clone(), 0usize));
-        }
-    }
-
-    let mut min_depth: BTreeMap<(String, String), usize> = BTreeMap::new();
-    while let Some((version_id, commit_id, depth)) = queue.pop_front() {
-        let key = (version_id.clone(), commit_id.clone());
-        if let Some(existing_depth) = min_depth.get(&key) {
-            if *existing_depth <= depth {
-                continue;
-            }
-        }
-        min_depth.insert(key, depth);
-
-        if let Some(parents) = parent_by_child.get(&commit_id) {
-            for parent_id in parents {
-                queue.push_back((version_id.clone(), parent_id.clone(), depth + 1));
-            }
-        }
-    }
-
-    stats.push(StageStat {
-        stage: "commit_graph".to_string(),
-        input_rows: version_refs.values().map(|rows| rows.len()).sum::<usize>()
-            + all_commit_edges.len(),
-        output_rows: min_depth.len(),
-    });
-
-    min_depth
-}
-
 fn build_latest_visible_state(
     data: &LoadedData,
-    commit_graph: &BTreeMap<(String, String), usize>,
-    version_refs: &BTreeMap<String, Vec<String>>,
+    commit_graph: &VersionCommitDepthMap,
+    version_refs: &VersionHeadMap,
     warnings: &mut Vec<LiveStateRebuildWarning>,
     stats: &mut Vec<StageStat>,
 ) -> Vec<VisibleRow> {
@@ -507,8 +284,8 @@ fn build_latest_visible_state(
 
 fn build_global_projection_rows(
     data: &LoadedData,
-    commit_graph: &BTreeMap<(String, String), usize>,
-    version_refs: &BTreeMap<String, Vec<String>>,
+    commit_graph: &VersionCommitDepthMap,
+    version_refs: &VersionHeadMap,
     warnings: &mut Vec<LiveStateRebuildWarning>,
 ) -> Vec<VisibleRow> {
     let version_descriptor_schema = builtin_projection_schema_meta("lix_version_descriptor");
@@ -771,68 +548,16 @@ fn build_global_projection_rows(
     resolve_projection_candidates(candidates)
 }
 
-async fn load_version_heads_from_untracked(
+async fn load_version_heads_from_canonical(
     executor: &mut dyn QueryExecutor,
-    warnings: &mut Vec<LiveStateRebuildWarning>,
     stats: &mut Vec<StageStat>,
-) -> Result<BTreeMap<String, Vec<String>>, LixError> {
-    let access =
-        crate::live_state::storage::load_live_row_access_with_executor(executor, "lix_version_ref")
-            .await?;
-    let constraints = vec![ScanConstraint {
-        field: ScanField::FileId,
-        operator: ScanOperator::Eq(Value::Text(version_ref_file_id().to_string())),
-    }];
-    let required_columns = access
-        .columns()
-        .iter()
-        .map(|column| column.property_name.clone())
-        .collect::<Vec<_>>();
-    let rows = scan_rows_with_executor(
-        executor,
-        RawStorage::Untracked,
-        version_ref_schema_key(),
-        version_ref_storage_version_id(),
-        &constraints,
-        &required_columns,
-    )
-    .await?;
-    let mut heads = BTreeMap::<String, Vec<String>>::new();
-    for row in rows {
-        if row.property_text("commit_id").is_none() {
-            continue;
-        }
-        let snapshot_raw = snapshot_text(&access, &row)?;
-        if snapshot_raw.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<LixVersionRef>(&snapshot_raw) {
-            Ok(snapshot) if !snapshot.id.is_empty() && !snapshot.commit_id.is_empty() => {
-                heads
-                    .entry(snapshot.id)
-                    .or_default()
-                    .push(snapshot.commit_id);
-            }
-            Ok(_) => {}
-            Err(error) => warnings.push(LiveStateRebuildWarning {
-                code: "invalid_version_ref_snapshot".to_string(),
-                message: format!(
-                    "untracked lix_version_ref '{}' has invalid snapshot JSON: {}",
-                    row.entity_id(),
-                    error
-                ),
-            }),
-        }
-    }
-
-    for values in heads.values_mut() {
-        values.sort();
-        values.dedup();
-    }
+) -> Result<VersionHeadMap, LixError> {
+    let root_version_refs = load_all_version_head_commit_ids(executor).await?;
+    let heads = build_version_head_map(&root_version_refs);
 
     stats.push(StageStat {
         stage: "version_ref_heads".to_string(),
-        input_rows: heads.values().map(|rows| rows.len()).sum(),
+        input_rows: root_version_refs.len(),
         output_rows: heads.values().map(|rows| rows.len()).sum(),
     });
 
@@ -857,172 +582,8 @@ fn resolve_projection_candidates(
     rows
 }
 
-fn min_depth_by_commit(
-    commit_graph: &BTreeMap<(String, String), usize>,
-) -> BTreeMap<String, usize> {
-    let mut min_depth = BTreeMap::new();
-    for ((_, commit_id), depth) in commit_graph {
-        min_depth
-            .entry(commit_id.clone())
-            .and_modify(|existing: &mut usize| {
-                if *depth < *existing {
-                    *existing = *depth;
-                }
-            })
-            .or_insert(*depth);
-    }
-    min_depth
-}
-
 fn canonical_json_value(value: serde_json::Value) -> CanonicalJson {
     CanonicalJson::from_value(value).expect("materialization plan should emit valid canonical JSON")
-}
-
-fn parents_by_child(
-    all_commit_edges: &BTreeSet<(String, String)>,
-) -> BTreeMap<String, Vec<String>> {
-    let mut parent_by_child = BTreeMap::new();
-    for (parent, child) in all_commit_edges {
-        parent_by_child
-            .entry(child.clone())
-            .or_insert_with(Vec::new)
-            .push(parent.clone());
-    }
-    for parents in parent_by_child.values_mut() {
-        parents.sort();
-        parents.dedup();
-    }
-    parent_by_child
-}
-
-#[cfg(test)]
-fn maximal_commits(
-    candidate_commit_ids: &BTreeSet<String>,
-    parents_by_child: &BTreeMap<String, Vec<String>>,
-    commit_causal_rank: &BTreeMap<String, usize>,
-    ancestor_memo: &mut BTreeMap<String, BTreeSet<String>>,
-) -> BTreeSet<String> {
-    let mut maximal = BTreeSet::new();
-    for candidate in candidate_commit_ids {
-        let dominated = candidate_commit_ids.iter().any(|other| {
-            candidate != other
-                && ancestors_for_commit(other, parents_by_child, ancestor_memo).contains(candidate)
-        });
-        if !dominated {
-            maximal.insert(candidate.clone());
-        }
-    }
-
-    if maximal.is_empty() {
-        if let Some(last) = candidate_commit_ids.iter().max_by(|left, right| {
-            let left_rank = commit_causal_rank.get(*left).copied().unwrap_or(0);
-            let right_rank = commit_causal_rank.get(*right).copied().unwrap_or(0);
-            left_rank.cmp(&right_rank).then_with(|| left.cmp(right))
-        }) {
-            maximal.insert(last.clone());
-        }
-    }
-
-    maximal
-}
-
-#[cfg(test)]
-fn ancestors_for_commit(
-    commit_id: &str,
-    parents_by_child: &BTreeMap<String, Vec<String>>,
-    ancestor_memo: &mut BTreeMap<String, BTreeSet<String>>,
-) -> BTreeSet<String> {
-    if let Some(existing) = ancestor_memo.get(commit_id) {
-        return existing.clone();
-    }
-
-    let mut ancestors = BTreeSet::new();
-    if let Some(parents) = parents_by_child.get(commit_id) {
-        for parent_id in parents {
-            ancestors.insert(parent_id.clone());
-            ancestors.extend(ancestors_for_commit(
-                parent_id,
-                parents_by_child,
-                ancestor_memo,
-            ));
-        }
-    }
-
-    ancestor_memo.insert(commit_id.to_string(), ancestors.clone());
-    ancestors
-}
-
-#[cfg(test)]
-fn build_commit_causal_rank(
-    data: &LoadedData,
-    all_commit_edges: &BTreeSet<(String, String)>,
-) -> BTreeMap<String, usize> {
-    let mut parents_by_child = BTreeMap::<String, Vec<String>>::new();
-    for commit_id in data.commits.keys() {
-        parents_by_child.entry(commit_id.clone()).or_default();
-    }
-    for (parent_id, child_id) in all_commit_edges {
-        parents_by_child
-            .entry(child_id.clone())
-            .or_default()
-            .push(parent_id.clone());
-    }
-    for parents in parents_by_child.values_mut() {
-        parents.sort();
-        parents.dedup();
-    }
-
-    let mut memo = BTreeMap::<String, usize>::new();
-    for commit_id in data.commits.keys() {
-        let mut active = BTreeSet::new();
-        let _ = commit_causal_rank_for_commit(commit_id, &parents_by_child, &mut memo, &mut active);
-    }
-    memo
-}
-
-#[cfg(test)]
-fn commit_causal_rank_for_commit(
-    commit_id: &str,
-    parents_by_child: &BTreeMap<String, Vec<String>>,
-    memo: &mut BTreeMap<String, usize>,
-    active: &mut BTreeSet<String>,
-) -> usize {
-    if let Some(rank) = memo.get(commit_id).copied() {
-        return rank;
-    }
-    if !active.insert(commit_id.to_string()) {
-        return 0;
-    }
-
-    let rank = match parents_by_child.get(commit_id) {
-        Some(parents) if !parents.is_empty() => {
-            1 + parents
-                .iter()
-                .map(|parent_id| {
-                    commit_causal_rank_for_commit(parent_id, parents_by_child, memo, active)
-                })
-                .max()
-                .unwrap_or(0)
-        }
-        _ => 0,
-    };
-
-    active.remove(commit_id);
-    memo.insert(commit_id.to_string(), rank);
-    rank
-}
-
-#[cfg(test)]
-fn build_change_commit_index(data: &LoadedData) -> BTreeMap<String, String> {
-    let mut index = BTreeMap::new();
-    for commit in data.commits.values() {
-        for change_id in &commit.snapshot.change_ids {
-            index
-                .entry(change_id.clone())
-                .or_insert_with(|| commit.entity_id.clone());
-        }
-    }
-    index
 }
 
 fn builtin_projection_schema_meta(schema_key: &str) -> BuiltinProjectionSchemaMeta {
@@ -1078,7 +639,7 @@ fn builtin_projection_schema_meta(schema_key: &str) -> BuiltinProjectionSchemaMe
 
 fn resolve_target_versions(
     req: &LiveStateRebuildRequest,
-    version_refs: &BTreeMap<String, Vec<String>>,
+    version_refs: &VersionHeadMap,
     data: &LoadedData,
     latest_visible_state: &[VisibleRow],
 ) -> BTreeSet<String> {
@@ -1100,30 +661,8 @@ fn resolve_target_versions(
     }
 }
 
-fn build_version_ancestry(
-    data: &LoadedData,
-    target_versions: &BTreeSet<String>,
-    _warnings: &mut Vec<LiveStateRebuildWarning>,
-    stats: &mut Vec<StageStat>,
-) -> BTreeMap<String, Vec<(String, usize)>> {
-    let mut ancestry: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
-
-    for version_id in target_versions {
-        ancestry.insert(version_id.clone(), vec![(version_id.clone(), 0usize)]);
-    }
-
-    stats.push(StageStat {
-        stage: "version_ancestry".to_string(),
-        input_rows: data.version_descriptors.len(),
-        output_rows: ancestry.values().map(|rows| rows.len()).sum(),
-    });
-
-    ancestry
-}
-
 fn build_final_state(
     latest_visible_state: &[VisibleRow],
-    version_ancestry: &BTreeMap<String, Vec<(String, usize)>>,
     target_versions: &BTreeSet<String>,
     stats: &mut Vec<StageStat>,
 ) -> Vec<FinalStateRow> {
@@ -1137,42 +676,36 @@ fn build_final_state(
 
     let mut rows = Vec::new();
     for version_id in target_versions {
-        let Some(ancestry) = version_ancestry.get(version_id) else {
+        let Some(candidates) = visible_by_version.get(version_id) else {
             continue;
         };
 
         let mut chosen: BTreeMap<(String, String, String), FinalStateRow> = BTreeMap::new();
-        for (ancestor_id, _depth) in ancestry {
-            let Some(candidates) = visible_by_version.get(ancestor_id) else {
+        let mut sorted_candidates = candidates.clone();
+        sorted_candidates.sort_by(|a, b| {
+            a.schema_key
+                .cmp(&b.schema_key)
+                .then_with(|| a.file_id.cmp(&b.file_id))
+                .then_with(|| a.entity_id.cmp(&b.entity_id))
+                .then_with(|| a.change_id.cmp(&b.change_id))
+        });
+
+        for candidate in sorted_candidates {
+            let key = (
+                candidate.entity_id.clone(),
+                candidate.schema_key.clone(),
+                candidate.file_id.clone(),
+            );
+            if chosen.contains_key(&key) {
                 continue;
-            };
-
-            let mut sorted_candidates = candidates.clone();
-            sorted_candidates.sort_by(|a, b| {
-                a.schema_key
-                    .cmp(&b.schema_key)
-                    .then_with(|| a.file_id.cmp(&b.file_id))
-                    .then_with(|| a.entity_id.cmp(&b.entity_id))
-                    .then_with(|| a.change_id.cmp(&b.change_id))
-            });
-
-            for candidate in sorted_candidates {
-                let key = (
-                    candidate.entity_id.clone(),
-                    candidate.schema_key.clone(),
-                    candidate.file_id.clone(),
-                );
-                if chosen.contains_key(&key) {
-                    continue;
-                }
-                chosen.insert(
-                    key,
-                    FinalStateRow {
-                        version_id: version_id.clone(),
-                        source: candidate.clone(),
-                    },
-                );
             }
+            chosen.insert(
+                key,
+                FinalStateRow {
+                    version_id: version_id.clone(),
+                    source: candidate.clone(),
+                },
+            );
         }
 
         rows.extend(chosen.into_values());
@@ -1247,10 +780,9 @@ fn build_writes(final_state: &[FinalStateRow]) -> Result<Vec<LiveStateWrite>, Li
 
 fn build_debug_trace(
     req: &LiveStateRebuildRequest,
-    version_refs: &BTreeMap<String, Vec<String>>,
-    commit_graph: &BTreeMap<(String, String), usize>,
+    version_refs: &VersionHeadMap,
+    commit_graph: &VersionCommitDepthMap,
     all_commit_edges: &BTreeSet<(String, String)>,
-    version_ancestry: &BTreeMap<String, Vec<(String, usize)>>,
     latest_visible_state: &[VisibleRow],
     final_state: &[FinalStateRow],
 ) -> Result<Option<LiveStateRebuildDebugTrace>, LixError> {
@@ -1289,20 +821,6 @@ fn build_debug_trace(
                     child_id: child_id.clone(),
                 });
             }
-        }
-    }
-
-    let mut ancestry_rows = Vec::new();
-    for (version_id, rows) in version_ancestry {
-        for (ancestor_version_id, inheritance_depth) in rows {
-            ancestry_rows.push(VersionAncestryDebugRow {
-                version_id: require_identity(version_id.clone(), "debug ancestry version_id")?,
-                ancestor_version_id: require_identity(
-                    ancestor_version_id.clone(),
-                    "debug ancestry ancestor_version_id",
-                )?,
-                inheritance_depth: *inheritance_depth,
-            });
         }
     }
 
@@ -1363,7 +881,6 @@ fn build_debug_trace(
         heads_by_version: heads_by_version.into_iter().take(limit).collect(),
         traversed_commits: traversed_commits.into_iter().take(limit).collect(),
         traversed_edges: traversed_edges.into_iter().take(limit).collect(),
-        version_ancestry: ancestry_rows.into_iter().take(limit).collect(),
         latest_visible_winners,
         scope_winners,
     }))
@@ -1380,115 +897,4 @@ where
             value
         ))
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::loader::{CommitEdgeRecord, CommitRecord, VersionDescriptorRecord};
-    use super::*;
-    use crate::schema::builtin::types::LixCommit;
-
-    fn change_record(
-        id: &str,
-        entity_id: &str,
-        schema_key: &str,
-        snapshot_content: Option<CanonicalJson>,
-    ) -> ChangeRecord {
-        ChangeRecord {
-            id: id.to_string(),
-            entity_id: entity_id.to_string(),
-            schema_key: schema_key.to_string(),
-            schema_version: "1".to_string(),
-            file_id: "lix".to_string(),
-            plugin_key: "lix".to_string(),
-            snapshot_content,
-            metadata: None,
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-        }
-    }
-
-    fn commit_record(id: &str, change_ids: &[&str], parent_commit_ids: &[&str]) -> CommitRecord {
-        CommitRecord {
-            id: format!("chg~{id}"),
-            entity_id: id.to_string(),
-            snapshot: LixCommit {
-                id: id.to_string(),
-                change_set_id: Some(format!("cs~{id}")),
-                change_ids: change_ids.iter().map(|value| value.to_string()).collect(),
-                author_account_ids: Vec::new(),
-                parent_commit_ids: parent_commit_ids
-                    .iter()
-                    .map(|value| value.to_string())
-                    .collect(),
-            },
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-        }
-    }
-
-    #[test]
-    fn version_ref_resolution_prefers_reset_owner_over_target_commit_maxima() {
-        let data = LoadedData {
-            changes: BTreeMap::from([
-                (
-                    "ref-child".to_string(),
-                    change_record(
-                        "ref-child",
-                        "main",
-                        "lix_version_ref",
-                        Some(canonical_json_value(
-                            json!({ "id": "main", "commit_id": "commit-child" }),
-                        )),
-                    ),
-                ),
-                (
-                    "ref-reset".to_string(),
-                    change_record(
-                        "ref-reset",
-                        "main",
-                        "lix_version_ref",
-                        Some(canonical_json_value(
-                            json!({ "id": "main", "commit_id": "commit-root" }),
-                        )),
-                    ),
-                ),
-            ]),
-            commits: BTreeMap::from([
-                (
-                    "commit-root".to_string(),
-                    commit_record("commit-root", &[], &[]),
-                ),
-                (
-                    "commit-child".to_string(),
-                    commit_record("commit-child", &["ref-child"], &["commit-root"]),
-                ),
-                (
-                    "commit-reset".to_string(),
-                    commit_record("commit-reset", &["ref-reset"], &["commit-child"]),
-                ),
-            ]),
-            version_descriptors: BTreeMap::<String, VersionDescriptorRecord>::new(),
-            commit_edges: Vec::<CommitEdgeRecord>::new(),
-        };
-
-        let mut stats = Vec::new();
-        let mut warnings = Vec::new();
-        let all_commit_edges = build_all_commit_edges(&data, &mut stats);
-        let commit_causal_rank = build_commit_causal_rank(&data, &all_commit_edges);
-        let change_commit_by_change_id = build_change_commit_index(&data);
-        let resolved = resolve_version_ref_candidates(
-            &data,
-            &all_commit_edges,
-            &commit_causal_rank,
-            &change_commit_by_change_id,
-            &mut warnings,
-            &mut stats,
-        );
-        let version_refs = build_version_refs(&resolved, &mut stats);
-
-        assert!(warnings.is_empty());
-        assert_eq!(
-            version_refs.get("main"),
-            Some(&vec!["commit-root".to_string()])
-        );
-    }
 }
