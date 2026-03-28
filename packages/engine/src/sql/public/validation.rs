@@ -10,6 +10,7 @@ use crate::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
+use crate::live_state::schema_access::LiveReadContract;
 use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
     SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,
@@ -22,7 +23,6 @@ use crate::sql::public::planner::ir::{
     InsertOnConflictAction, PlannedStateRow, PlannedWrite, ResolvedWritePlan, WriteMode,
     WriteOperationKind,
 };
-use crate::live_state::schema_access::LiveReadContract;
 use crate::sql::public::services::state_reader::{
     is_untracked_live_table_name, live_storage_relation_exists, load_live_row_access,
     load_live_row_access_for_table, projected_row_snapshot_json, scan_live_rows,

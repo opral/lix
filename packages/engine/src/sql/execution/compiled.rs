@@ -64,12 +64,12 @@ pub(crate) fn schema_registrations_for_compiled_execution(
     if let Some(internal) = execution.internal_execution() {
         for requirement in coalesce_live_table_requirements(&internal.live_table_requirements) {
             match requirement.schema_definition.as_ref() {
-                Some(schema_definition) => registrations.insert(
-                    SchemaRegistration::with_schema_definition(
+                Some(schema_definition) => {
+                    registrations.insert(SchemaRegistration::with_schema_definition(
                         requirement.schema_key.clone(),
                         schema_definition.clone(),
-                    ),
-                ),
+                    ))
+                }
                 None => registrations.insert(requirement.schema_key.clone()),
             }
         }

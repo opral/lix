@@ -1,6 +1,6 @@
 use crate::filesystem::runtime::FilesystemTransactionState;
-use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::sql::execution::compiled::CompiledExecution;
+use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 
 use super::{PreparedPublicWrite, TrackedWriteExecution};
 

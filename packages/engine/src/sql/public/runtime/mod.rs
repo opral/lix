@@ -2208,7 +2208,8 @@ fn schema_live_table_requirements_from_partition(
         let Ok(snapshot) = serde_json::from_str(&snapshot_content) else {
             continue;
         };
-        let Ok((schema_key, schema)) = crate::schema::schema_from_registered_snapshot(&snapshot) else {
+        let Ok((schema_key, schema)) = crate::schema::schema_from_registered_snapshot(&snapshot)
+        else {
             continue;
         };
         requirements.insert(

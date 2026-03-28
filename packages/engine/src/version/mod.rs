@@ -8,10 +8,12 @@ use crate::schema::builtin::{
 use crate::LixError;
 
 mod create_version;
+mod init;
 mod merge_version;
 
 pub(crate) use create_version::create_version_in_session;
 pub use create_version::{CreateVersionOptions, CreateVersionResult};
+pub(crate) use init::{init, seed_bootstrap};
 pub(crate) use merge_version::merge_version_in_session;
 pub use merge_version::{
     ExpectedVersionHeads, MergeOutcome, MergeVersionOptions, MergeVersionResult,

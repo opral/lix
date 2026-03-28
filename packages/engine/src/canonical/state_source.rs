@@ -4,9 +4,7 @@ use crate::errors::classification::is_missing_relation_error;
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::roots::load_version_ref_with_executor;
 use crate::live_state::schema_access::load_schema_read_contract_with_executor;
-use crate::live_state::{
-    scan_tracked_rows_with_executor, scan_untracked_rows_with_executor,
-};
+use crate::live_state::{scan_tracked_rows_with_executor, scan_untracked_rows_with_executor};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value, VersionId};
 
@@ -585,16 +583,32 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
 mod tests {
     use super::*;
     use crate::backend::LixBackendTransaction;
+    use crate::live_state::schema_access::payload_column_name_for_schema;
     use crate::live_state::{
-        live_schema_column_names, live_schema_normalized_values, live_schema_snapshot_text_from_values,
+        live_schema_column_names, live_schema_normalized_values,
+        live_schema_snapshot_text_from_values,
     };
+    use crate::schema::builtin::builtin_schema_definition;
     use crate::QueryResult;
     use async_trait::async_trait;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     fn mock_normalized_live_row(schema_key: &str) -> (Vec<Value>, String) {
-        let normalized = live_schema_normalized_values(schema_key, None, Some("{\"id\":\"file-1\"}"))
+        let snapshot_content = match schema_key {
+            "lix_file_descriptor" => serde_json::json!({
+                "id": "file-1",
+                "directory_id": serde_json::Value::Null,
+                "name": "contract",
+                "extension": "txt",
+                "metadata": serde_json::Value::Null,
+                "hidden": false,
+            })
+            .to_string(),
+            _ => "{\"id\":\"file-1\"}".to_string(),
+        };
+        let normalized = live_schema_normalized_values(schema_key, None, Some(&snapshot_content))
             .expect("builtin schema should normalize");
         let mut row = vec![
             Value::Text("file-1".to_string()),
@@ -615,7 +629,25 @@ mod tests {
         {
             row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
         }
-        let snapshot = live_schema_snapshot_text_from_values(schema_key, None, &normalized)
+        let mut property_names = builtin_schema_definition(schema_key)
+            .and_then(|schema| schema.get("properties"))
+            .and_then(serde_json::Value::as_object)
+            .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+            .expect("builtin schema should expose properties");
+        property_names.sort();
+
+        let values = property_names
+            .into_iter()
+            .map(|property_name| {
+                let column_name = payload_column_name_for_schema(schema_key, None, &property_name)
+                    .expect("builtin schema property should map to live column");
+                (
+                    property_name,
+                    normalized.get(&column_name).cloned().unwrap_or(Value::Null),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let snapshot = live_schema_snapshot_text_from_values(schema_key, None, &values)
             .expect("live snapshot reconstruction should succeed");
         (row, snapshot)
     }
@@ -662,8 +694,10 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            let file_descriptor_table =
-                format!("FROM \"{}\"", crate::live_state::live_relation_name("lix_file_descriptor"));
+            let file_descriptor_table = format!(
+                "FROM \"{}\"",
+                crate::live_state::live_relation_name("lix_file_descriptor")
+            );
             if sql.contains(&file_descriptor_table) {
                 self.live_table_query_seen.store(true, Ordering::SeqCst);
                 let (row, _) = mock_normalized_live_row("lix_file_descriptor");
@@ -774,12 +808,15 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            let file_descriptor_table =
-                format!("FROM \"{}\"", crate::live_state::live_relation_name("lix_file_descriptor"));
-            let version_ref_table =
-                format!("FROM {}", crate::live_state::live_relation_name("lix_version_ref"));
-            if sql.contains(&file_descriptor_table) || sql.contains(&version_ref_table)
-            {
+            let file_descriptor_table = format!(
+                "FROM \"{}\"",
+                crate::live_state::live_relation_name("lix_file_descriptor")
+            );
+            let version_ref_table = format!(
+                "FROM {}",
+                crate::live_state::live_relation_name("lix_version_ref")
+            );
+            if sql.contains(&file_descriptor_table) || sql.contains(&version_ref_table) {
                 return Err(LixError::new("LIX_ERROR_UNKNOWN", "no such table"));
             }
             if sql.contains("FROM lix_internal_change c")

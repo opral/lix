@@ -997,7 +997,6 @@ async fn resolve_file_update_target(
             extension: next_extension,
             path: next_path.unwrap_or_default(),
             hidden: next_hidden,
-            version_id: version_id.to_string(),
             untracked: current_row.untracked,
             metadata: next_metadata,
             change_id: current_row.change_id.clone(),

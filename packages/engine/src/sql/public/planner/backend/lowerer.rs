@@ -1771,9 +1771,12 @@ fn render_live_payload_column_expr(
         return "NULL".to_string();
     };
     let qualified = format!("{}.{}", quote_ident(table_alias), quote_ident(&column_name));
+    // Plain typed payload columns are already normalized in storage. Only JSON-text
+    // payload columns need dialect-specific extraction to turn scalar JSON values
+    // like `"value-a"` back into public-facing `value-a`.
     match public_column {
         "metadata" => qualified,
-        _ => match dialect {
+        _ if column_name.ends_with("_json") => match dialect {
             SqlDialect::Sqlite => format!(
                 "CASE WHEN {qualified} IS NULL THEN NULL ELSE json_extract({qualified}, '$') || '' END"
             ),
@@ -1781,6 +1784,7 @@ fn render_live_payload_column_expr(
                 "CASE WHEN {qualified} IS NULL THEN NULL ELSE (CAST({qualified} AS JSONB) #>> '{{}}') END"
             ),
         },
+        _ => qualified,
     }
 }
 
@@ -2558,8 +2562,8 @@ mod tests {
     use crate::sql::public::planner::canonicalize::canonicalize_read;
     use crate::sql::public::planner::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
     use crate::sql::public::planner::semantics::effective_state_resolver::build_effective_state;
-    use serde_json::{json, Value as JsonValue};
     use crate::{SqlDialect, Value};
+    use serde_json::{json, Value as JsonValue};
     use std::collections::BTreeMap;
 
     fn lowered_program(registry: &SurfaceRegistry, sql: &str) -> Option<LoweredReadProgram> {
@@ -2797,6 +2801,27 @@ mod tests {
         assert_eq!(
             lowered.pushdown_decision.residual_predicates,
             vec!["entity_id = 'entity-1'".to_string()]
+        );
+    }
+
+    #[test]
+    fn projects_entity_string_payloads_without_json_wrappers() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let lowered = lowered_program(
+            &registry,
+            "SELECT change_id FROM lix_change_set_element \
+             WHERE entity_id = 'entity-1' AND schema_key = 'lix_file_descriptor'",
+        )
+        .expect("change-set element read should lower");
+        let lowered_sql = lowered.statements[0].to_string();
+
+        assert!(
+            !lowered_sql.contains("json_extract(\"ranked\".\"change_id\""),
+            "string payload columns should not be wrapped in sqlite JSON extraction: {lowered_sql}"
+        );
+        assert!(
+            !lowered_sql.contains("json_extract(\"ranked\".\"entity_id\""),
+            "string payload predicates should not rely on sqlite JSON extraction: {lowered_sql}"
         );
     }
 
