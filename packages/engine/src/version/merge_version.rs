@@ -6,6 +6,7 @@ use crate::canonical::append::{
 };
 use crate::canonical::readers::{
     load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,
+    load_committed_version_head_commit_id,
     load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
@@ -342,34 +343,15 @@ async fn load_version_head_commit_id(
     tx: &mut SessionTransaction<'_>,
     version_id: &str,
 ) -> Result<String, LixError> {
-    let result = tx
-        .execute(
-            "SELECT commit_id FROM lix_version WHERE id = $1 LIMIT 1",
-            &[Value::Text(version_id.to_string())],
-        )
-        .await?;
-    let [statement] = result.statements.as_slice() else {
-        return Err(LixError::unknown(
-            "expected one statement for version head lookup",
-        ));
-    };
-    let Some(row) = statement.rows.first() else {
+    let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
+    let Some(commit_id) = load_committed_version_head_commit_id(&mut executor, version_id).await?
+    else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("version '{}' does not exist", version_id),
         ));
     };
-    match row.first() {
-        Some(Value::Text(commit_id)) if !commit_id.is_empty() => Ok(commit_id.clone()),
-        Some(other) => Err(LixError::unknown(format!(
-            "expected text commit_id for version '{}', got {other:?}",
-            version_id
-        ))),
-        None => Err(LixError::unknown(format!(
-            "version '{}' is missing commit_id",
-            version_id
-        ))),
-    }
+    Ok(commit_id)
 }
 
 fn validate_expected_heads(

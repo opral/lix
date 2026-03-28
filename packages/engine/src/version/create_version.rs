@@ -1,3 +1,5 @@
+use crate::canonical::readers::load_committed_version_head_commit_id;
+use crate::engine::TransactionBackendAdapter;
 use crate::{errors, ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -89,28 +91,10 @@ async fn load_active_source_version(
     tx: &mut SessionTransaction<'_>,
 ) -> Result<SourceVersion, LixError> {
     let version_id = tx.context.active_version_id.clone();
-    let source = tx
-        .execute(
-            "SELECT id, commit_id FROM lix_version WHERE id = $1 LIMIT 1",
-            &[Value::Text(version_id.clone())],
-        )
-        .await?;
-    let [statement] = source.statements.as_slice() else {
-        return Err(errors::unexpected_statement_count_error(
-            "create version source query",
-            1,
-            source.statements.len(),
-        ));
-    };
-    let Some(row) = statement.rows.first() else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("source version '{version_id}' does not exist"),
-        });
-    };
+    let commit_id = load_required_version_head_commit_id(tx, &version_id).await?;
     Ok(SourceVersion {
-        version_id: text_at(row, 0, "lix_version.id")?,
-        commit_id: text_at(row, 1, "lix_version.commit_id")?,
+        version_id,
+        commit_id,
     })
 }
 
@@ -123,29 +107,26 @@ async fn load_explicit_source_version(
         "source_version_id",
     )?
     .expect("source_version_id should remain present after normalization");
-    let source = tx
-        .execute(
-            "SELECT id, commit_id FROM lix_version WHERE id = $1 LIMIT 1",
-            &[Value::Text(source_version_id.clone())],
-        )
-        .await?;
-    let [statement] = source.statements.as_slice() else {
-        return Err(errors::unexpected_statement_count_error(
-            "create version source query",
-            1,
-            source.statements.len(),
-        ));
-    };
-    let Some(row) = statement.rows.first() else {
+    let commit_id = load_required_version_head_commit_id(tx, &source_version_id).await?;
+    Ok(SourceVersion {
+        version_id: source_version_id,
+        commit_id,
+    })
+}
+
+async fn load_required_version_head_commit_id(
+    tx: &mut SessionTransaction<'_>,
+    version_id: &str,
+) -> Result<String, LixError> {
+    let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
+    let Some(commit_id) = load_committed_version_head_commit_id(&mut executor, version_id).await?
+    else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("source version '{source_version_id}' does not exist"),
+            description: format!("source version '{version_id}' does not exist"),
         });
     };
-    Ok(SourceVersion {
-        version_id: text_at(row, 0, "lix_version.id")?,
-        commit_id: text_at(row, 1, "lix_version.commit_id")?,
-    })
+    Ok(commit_id)
 }
 
 async fn generate_uuid(tx: &mut SessionTransaction<'_>) -> Result<String, LixError> {
