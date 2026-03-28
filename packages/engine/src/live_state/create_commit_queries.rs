@@ -43,7 +43,7 @@ pub(crate) async fn load_create_commit_deterministic_sequence_start(
     }
 
     let tracked =
-        crate::canonical::state_source::load_exact_committed_state_row_from_live_state_with_executor(
+        crate::canonical::state_source::load_exact_committed_state_row_at_version_head_with_executor(
             executor,
             &crate::canonical::state_source::ExactCommittedStateRowRequest {
                 entity_id: "lix_deterministic_sequence_number".to_string(),

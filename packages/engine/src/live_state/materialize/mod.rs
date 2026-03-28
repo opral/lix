@@ -8,7 +8,7 @@ pub use types::{
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
     LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning, LiveStateWrite,
     LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
-    TraversedEdgeDebugRow, VersionAncestryDebugRow, VersionHeadDebugRow,
+    TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 
 use crate::engine::TransactionBackendAdapter;

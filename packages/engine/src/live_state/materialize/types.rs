@@ -92,13 +92,6 @@ pub struct TraversedEdgeDebugRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct VersionAncestryDebugRow {
-    pub version_id: VersionId,
-    pub ancestor_version_id: VersionId,
-    pub inheritance_depth: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LatestVisibleWinnerDebugRow {
     pub version_id: VersionId,
     pub entity_id: EntityId,
@@ -123,7 +116,6 @@ pub struct LiveStateRebuildDebugTrace {
     pub heads_by_version: Vec<VersionHeadDebugRow>,
     pub traversed_commits: Vec<TraversedCommitDebugRow>,
     pub traversed_edges: Vec<TraversedEdgeDebugRow>,
-    pub version_ancestry: Vec<VersionAncestryDebugRow>,
     pub latest_visible_winners: Vec<LatestVisibleWinnerDebugRow>,
     pub scope_winners: Vec<ScopeWinnerDebugRow>,
 }

@@ -31,9 +31,9 @@ use super::generate_commit::generate_commit;
 use super::graph_index::{
     build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
 };
+use super::roots::load_committed_version_head_commit_id;
 use super::state_source::{
-    load_committed_version_head_commit_id_from_live_state,
-    load_exact_committed_state_row_from_live_state_with_executor, load_version_info_for_versions,
+    load_exact_committed_state_row_at_version_head_with_executor, load_version_info_for_versions,
     CommitQueryExecutor, ExactCommittedStateRowRequest,
 };
 use super::types::{
@@ -649,7 +649,7 @@ async fn proposed_domain_change_is_noop(
     let Some(schema_version) = change.schema_version.clone() else {
         return Ok(false);
     };
-    let current = load_exact_committed_state_row_from_live_state_with_executor(
+    let current = load_exact_committed_state_row_at_version_head_with_executor(
         executor,
         &ExactCommittedStateRowRequest {
             entity_id: change.entity_id.to_string(),
@@ -680,7 +680,7 @@ async fn proposed_domain_change_is_noop(
                 return Ok(true);
             }
 
-            let global_current = load_exact_committed_state_row_from_live_state_with_executor(
+            let global_current = load_exact_committed_state_row_at_version_head_with_executor(
                 executor,
                 &ExactCommittedStateRowRequest {
                     entity_id: change.entity_id.to_string(),
@@ -905,10 +905,9 @@ async fn load_create_commit_preflight_state(
         ConcreteWriteLane::Version { version_id } => version_id.as_str(),
         ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
     };
-    let current_head =
-        load_committed_version_head_commit_id_from_live_state(executor, lane_entity_id)
-            .await
-            .map_err(backend_error)?;
+    let current_head = load_committed_version_head_commit_id(executor, lane_entity_id)
+        .await
+        .map_err(backend_error)?;
     let current_head_snapshot = current_head
         .as_ref()
         .map(|commit_id| version_ref_snapshot_content(lane_entity_id, commit_id));
@@ -1100,7 +1099,7 @@ async fn load_tracked_file_descriptor(
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<ExactFilesystemDescriptorState>, CreateCommitError> {
-    let row = load_exact_committed_state_row_from_live_state_with_executor(
+    let row = load_exact_committed_state_row_at_version_head_with_executor(
         executor,
         &ExactCommittedStateRowRequest {
             entity_id: file_id.to_string(),

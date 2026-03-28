@@ -2,7 +2,7 @@ use crate::canonical::history::{
     build_state_history_source_sql, CanonicalHistoryContentMode, CanonicalHistoryRootFacts,
     CanonicalHistoryRootSelection, CanonicalRootCommit,
 };
-use crate::live_state::roots::{
+use crate::canonical::roots::{
     resolve_history_root_facts_with_backend, HistoryRootFacts, HistoryRootTraversal,
     RootCommitResolutionRequest, RootCommitScope, RootLineageScope, RootVersionScope,
 };

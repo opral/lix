@@ -59,7 +59,7 @@ pub use live_state::{
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
     LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning, LiveStateWrite,
     LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
-    TraversedEdgeDebugRow, VersionAncestryDebugRow, VersionHeadDebugRow,
+    TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 pub use lix::{InitResult, Lix, LixConfig};
 pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};

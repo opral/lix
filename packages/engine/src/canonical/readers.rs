@@ -1,29 +1,29 @@
 use crate::{LixBackend, LixError};
 
+use super::roots::load_committed_version_head_commit_id as roots_load_committed_version_head_commit_id;
 use super::state_source::{
     load_canonical_change_row_by_id as state_source_load_canonical_change_row_by_id,
     load_commit_lineage_entry_by_id as state_source_load_commit_lineage_entry_by_id,
-    load_committed_version_head_commit_id_from_live_state as state_source_load_committed_version_head_commit_id_from_live_state,
+    load_exact_committed_state_row_at_version_head as state_source_load_exact_committed_state_row_at_version_head,
     load_exact_committed_state_row_from_commit_with_executor as state_source_load_exact_committed_state_row_from_commit_with_executor,
-    load_exact_committed_state_row_from_live_state as state_source_load_exact_committed_state_row_from_live_state,
 };
 pub(crate) use super::state_source::{
     CommitLineageEntry, CommitQueryExecutor, CommittedCanonicalChangeRow, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
 
-pub(crate) async fn load_committed_version_head_commit_id_from_live_state(
+pub(crate) async fn load_committed_version_head_commit_id(
     executor: &mut dyn CommitQueryExecutor,
     version_id: &str,
 ) -> Result<Option<String>, LixError> {
-    state_source_load_committed_version_head_commit_id_from_live_state(executor, version_id).await
+    roots_load_committed_version_head_commit_id(executor, version_id).await
 }
 
-pub(crate) async fn load_exact_committed_state_row_from_live_state(
+pub(crate) async fn load_exact_committed_state_row_at_version_head(
     backend: &dyn LixBackend,
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    state_source_load_exact_committed_state_row_from_live_state(backend, request).await
+    state_source_load_exact_committed_state_row_at_version_head(backend, request).await
 }
 
 pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(

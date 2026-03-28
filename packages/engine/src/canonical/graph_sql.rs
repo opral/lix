@@ -115,3 +115,28 @@ fn payload_column_name(schema_key: &str, property_name: &str) -> String {
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_commit_depth_sql_targets_commit_edge_live_rows() {
+        let sql = build_exact_commit_depth_cte_sql(SqlDialect::Sqlite, "?1", "?2", "?3");
+
+        assert!(sql.contains("lix_commit_edge"));
+        assert!(sql.contains("target_commit_depth AS"));
+        assert!(sql.contains("reachable.depth < ?3"));
+    }
+
+    #[test]
+    fn commit_generation_seed_sql_targets_commit_graph_node_table() {
+        let sql = build_commit_generation_seed_sql();
+        let commit_table = tracked_relation_name("lix_commit");
+        let commit_edge_table = tracked_relation_name("lix_commit_edge");
+
+        assert!(sql.contains("INSERT INTO lix_internal_commit_graph_node"));
+        assert!(sql.contains(&format!("FROM {commit_table}")));
+        assert!(sql.contains(&format!("FROM {commit_edge_table}")));
+    }
+}

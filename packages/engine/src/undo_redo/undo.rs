@@ -2,7 +2,7 @@ use crate::canonical::append::{
     append_tracked, CreateCommitArgs, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
     CreateCommitPreconditions, CreateCommitWriteLane,
 };
-use crate::canonical::readers::load_committed_version_head_commit_id_from_live_state;
+use crate::canonical::readers::load_committed_version_head_commit_id;
 use crate::functions::LixFunctionProvider;
 use crate::{LixError, Session, SessionTransaction};
 
@@ -180,7 +180,7 @@ async fn undo_in_transaction(
         let timestamp = functions.timestamp();
         let mut head_executor = crate::engine::TransactionBackendAdapter::new(transaction);
         let current_head_commit_id =
-            load_committed_version_head_commit_id_from_live_state(&mut head_executor, &version_id)
+            load_committed_version_head_commit_id(&mut head_executor, &version_id)
                 .await?
                 .ok_or_else(|| {
                     LixError::unknown(format!(
