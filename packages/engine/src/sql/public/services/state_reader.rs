@@ -3,13 +3,12 @@ use std::collections::BTreeMap;
 use crate::canonical::readers::{
     load_committed_version_head_commit_id as load_canonical_committed_version_head_commit_id,
     load_exact_committed_state_row_at_version_head,
+    load_version_ref_with_backend as load_canonical_version_ref_with_backend,
 };
 pub(crate) use crate::canonical::readers::{
-    CommitQueryExecutor, ExactCommittedStateRow, ExactCommittedStateRowRequest,
+    CommitQueryExecutor, ExactCommittedStateRow, ExactCommittedStateRowRequest, VersionRefRow,
 };
 use crate::live_state::is_untracked_live_table;
-use crate::live_state::roots::load_version_ref_with_backend;
-pub(crate) use crate::live_state::roots::VersionRefRow;
 use crate::live_state::schema_access::{
     live_storage_relation_exists_with_backend, load_schema_read_contract_for_table_name,
     load_schema_read_contract_with_backend, logical_snapshot_from_projected_row_with_contract,
@@ -258,7 +257,7 @@ pub(crate) async fn load_version_ref(
     backend: &dyn LixBackend,
     version_id: &str,
 ) -> Result<Option<VersionRefRow>, LixError> {
-    load_version_ref_with_backend(backend, version_id).await
+    load_canonical_version_ref_with_backend(backend, version_id).await
 }
 
 pub(crate) async fn load_exact_tombstone(

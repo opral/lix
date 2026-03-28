@@ -1,9 +1,8 @@
-use crate::live_state::roots::version_ref_write_row;
 use crate::live_state::tracked::{
     TrackedWriteBatch, TrackedWriteOperation, TrackedWriteParticipant, TrackedWriteRow,
 };
 use crate::live_state::untracked::{UntrackedWriteBatch, UntrackedWriteParticipant};
-use crate::version::GLOBAL_VERSION_ID;
+use crate::version::{version_ref_write_row, GLOBAL_VERSION_ID};
 use crate::{LixBackendTransaction, LixError};
 
 use super::types::{DerivedCommitApplyInput, MaterializedStateRow, VersionRefUpdate};

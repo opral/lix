@@ -1,6 +1,8 @@
 use crate::{LixBackend, LixError};
 
 use super::roots::load_committed_version_head_commit_id as roots_load_committed_version_head_commit_id;
+use super::roots::load_version_ref_with_backend as roots_load_version_ref_with_backend;
+pub(crate) use super::roots::VersionRefRow;
 use super::state_source::{
     load_canonical_change_row_by_id as state_source_load_canonical_change_row_by_id,
     load_commit_lineage_entry_by_id as state_source_load_commit_lineage_entry_by_id,
@@ -24,6 +26,13 @@ pub(crate) async fn load_exact_committed_state_row_at_version_head(
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
     state_source_load_exact_committed_state_row_at_version_head(backend, request).await
+}
+
+pub(crate) async fn load_version_ref_with_backend(
+    backend: &dyn LixBackend,
+    version_id: &str,
+) -> Result<Option<VersionRefRow>, LixError> {
+    roots_load_version_ref_with_backend(backend, version_id).await
 }
 
 pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(

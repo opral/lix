@@ -10,9 +10,9 @@ use crate::version::{
 use crate::{LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct VersionRefPointer {
-    version_id: String,
-    commit_id: String,
+pub(crate) struct VersionRefRow {
+    pub(crate) version_id: String,
+    pub(crate) commit_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,26 +64,34 @@ pub(crate) async fn load_committed_version_head_commit_id(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
 ) -> Result<Option<String>, LixError> {
-    if let Some(pointer) = load_version_ref_pointer_with_executor(executor, version_id).await? {
-        if pointer.commit_id.is_empty() {
+    if let Some(version_ref) = load_version_ref_with_executor(executor, version_id).await? {
+        if version_ref.commit_id.is_empty() {
             return Ok(None);
         }
-        return Ok(Some(pointer.commit_id));
+        return Ok(Some(version_ref.commit_id));
     }
 
-    let Some(pointer) = load_version_ref_pointer_from_canonical(executor, version_id).await? else {
+    let Some(version_ref) = load_version_ref_from_canonical(executor, version_id).await? else {
         return Ok(None);
     };
-    if pointer.commit_id.is_empty() {
+    if version_ref.commit_id.is_empty() {
         return Ok(None);
     }
-    Ok(Some(pointer.commit_id))
+    Ok(Some(version_ref.commit_id))
 }
 
-async fn load_version_ref_pointer_from_canonical(
+pub(crate) async fn load_version_ref_with_backend(
+    backend: &dyn LixBackend,
+    version_id: &str,
+) -> Result<Option<VersionRefRow>, LixError> {
+    let mut executor = backend;
+    load_version_ref_with_executor(&mut executor, version_id).await
+}
+
+async fn load_version_ref_from_canonical(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
-) -> Result<Option<VersionRefPointer>, LixError> {
+) -> Result<Option<VersionRefRow>, LixError> {
     let sql = format!(
         "SELECT s.content AS snapshot_content \
          FROM lix_internal_change c \
@@ -108,10 +116,10 @@ async fn load_version_ref_pointer_from_canonical(
         Err(err) if is_missing_relation_error(&err) => None,
         Err(err) => return Err(err),
     };
-    parse_version_ref_snapshot(snapshot_content.as_ref()).map(|pointer| {
-        pointer.map(|pointer| VersionRefPointer {
-            version_id: pointer.id,
-            commit_id: pointer.commit_id,
+    parse_version_ref_snapshot(snapshot_content.as_ref()).map(|version_ref| {
+        version_ref.map(|version_ref| VersionRefRow {
+            version_id: version_ref.id,
+            commit_id: version_ref.commit_id,
         })
     })
 }
@@ -217,9 +225,7 @@ async fn load_scoped_root_version_refs_with_executor(
         Some(version_ids) => {
             let mut rows = Vec::new();
             for version_id in version_ids {
-                if let Some(row) =
-                    load_version_ref_pointer_with_executor(executor, version_id).await?
-                {
+                if let Some(row) = load_version_ref_with_executor(executor, version_id).await? {
                     if !row.commit_id.is_empty() {
                         rows.push(ResolvedRootCommit {
                             commit_id: row.commit_id,
@@ -279,10 +285,10 @@ async fn load_all_root_version_refs_with_executor(
     Ok(resolved)
 }
 
-async fn load_version_ref_pointer_with_executor(
+async fn load_version_ref_with_executor(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
-) -> Result<Option<VersionRefPointer>, LixError> {
+) -> Result<Option<VersionRefRow>, LixError> {
     let Some(row) = load_exact_row_with_executor(
         executor,
         RawStorage::Untracked,
@@ -304,7 +310,7 @@ async fn load_version_ref_pointer_with_executor(
             format!("version ref row for '{version_id}' is missing commit_id"),
         )
     })?;
-    Ok(Some(VersionRefPointer {
+    Ok(Some(VersionRefRow {
         version_id: row.entity_id().to_string(),
         commit_id,
     }))
