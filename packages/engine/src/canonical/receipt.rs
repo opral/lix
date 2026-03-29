@@ -1,19 +1,7 @@
+use crate::live_state::ReplayCursor;
 use crate::VersionId;
 
 use super::types::ChangeRow;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalWatermark {
-    pub change_ordinal: i64,
-    pub change_id: String,
-    pub created_at: String,
-}
-
-impl CanonicalWatermark {
-    pub(crate) fn is_newer_than(&self, other: &Self) -> bool {
-        self.change_ordinal > other.change_ordinal
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatedVersionRef {
@@ -22,21 +10,22 @@ pub struct UpdatedVersionRef {
     pub created_at: String,
 }
 
+/// Durable output of a canonical commit.
+///
+/// `commit_id`, `updated_version_refs`, and `affected_versions` describe the
+/// semantic outcome. `replay_cursor` is included so local derived projections
+/// can catch up without becoming canonical truth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalCommitReceipt {
     pub commit_id: String,
-    pub canonical_watermark: CanonicalWatermark,
+    pub replay_cursor: ReplayCursor,
     pub updated_version_refs: Vec<UpdatedVersionRef>,
     pub affected_versions: Vec<String>,
 }
 
-pub(crate) fn latest_canonical_watermark_from_change_rows(
-    changes: &[ChangeRow],
-    starting_change_ordinal: i64,
-) -> Option<CanonicalWatermark> {
-    changes.last().map(|change| CanonicalWatermark {
-        change_ordinal: starting_change_ordinal + (changes.len() as i64) - 1,
-        change_id: change.id.clone(),
-        created_at: change.created_at.clone(),
-    })
+pub(crate) fn latest_replay_cursor_from_change_rows(changes: &[ChangeRow]) -> Option<ReplayCursor> {
+    changes
+        .iter()
+        .map(|change| ReplayCursor::new(change.id.clone(), change.created_at.clone()))
+        .max()
 }

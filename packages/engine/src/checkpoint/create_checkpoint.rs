@@ -1,5 +1,4 @@
 use super::{checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot};
-use crate::canonical::load_next_change_ordinal_with_executor;
 use crate::canonical::readers::load_commit_lineage_entry_by_id;
 use crate::engine::TransactionBackendAdapter;
 use crate::init::seed::{
@@ -203,10 +202,6 @@ async fn insert_canonical_checkpoint_label_change(
     created_at: &str,
 ) -> Result<(), LixError> {
     let snapshot_id = format!("{change_id}~snapshot");
-    let next_change_ordinal = {
-        let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
-        load_next_change_ordinal_with_executor(&mut executor).await?
-    };
     tx.backend_transaction_mut()?
         .execute(
             "INSERT INTO lix_internal_snapshot (id, content) \
@@ -221,13 +216,12 @@ async fn insert_canonical_checkpoint_label_change(
     tx.backend_transaction_mut()?
         .execute(
             "INSERT INTO lix_internal_change (\
-             id, change_ordinal, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
+             id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
              ) \
-             SELECT $1, $2, $3, 'lix_entity_label', '1', 'lix', 'lix', $4, NULL, $5 \
+             SELECT $1, $2, 'lix_entity_label', '1', 'lix', 'lix', $3, NULL, $4 \
              WHERE NOT EXISTS (SELECT 1 FROM lix_internal_change WHERE id = $1)",
             &[
                 Value::Text(change_id.to_string()),
-                Value::Integer(next_change_ordinal),
                 Value::Text(entity_id.to_string()),
                 Value::Text(snapshot_id),
                 Value::Text(created_at.to_string()),

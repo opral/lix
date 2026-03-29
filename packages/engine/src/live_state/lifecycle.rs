@@ -1,8 +1,11 @@
 #![allow(dead_code)]
 
-use crate::canonical::CanonicalWatermark;
 use crate::errors::classification::is_missing_relation_error;
-use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
+use crate::init::tables::add_column_if_missing;
+use crate::live_state::ReplayCursor;
+use crate::{
+    CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, QueryResult, Value,
+};
 
 pub(crate) const LIVE_STATE_SCHEMA_EPOCH: &str = "1";
 pub(crate) const LIVE_STATE_STATUS_TABLE: &str = "lix_internal_live_state_status";
@@ -12,16 +15,16 @@ pub(crate) const LIVE_STATE_STATUS_CREATE_TABLE_SQL: &str =
     "CREATE TABLE IF NOT EXISTS lix_internal_live_state_status (\
      singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),\
      mode TEXT NOT NULL,\
-     latest_change_ordinal BIGINT,\
      latest_change_id TEXT,\
      latest_change_created_at TEXT,\
+     applied_committed_frontier TEXT,\
      schema_epoch TEXT NOT NULL,\
      updated_at TEXT NOT NULL\
      )";
 
 pub(crate) const LIVE_STATE_STATUS_SEED_ROW_SQL: &str =
     "INSERT INTO lix_internal_live_state_status (\
-     singleton_id, mode, latest_change_ordinal, latest_change_id, latest_change_created_at, schema_epoch, updated_at\
+     singleton_id, mode, latest_change_id, latest_change_created_at, applied_committed_frontier, schema_epoch, updated_at\
      ) \
      SELECT 1, 'uninitialized', NULL, NULL, NULL, '1', '1970-01-01T00:00:00Z' \
      WHERE NOT EXISTS (\
@@ -64,20 +67,27 @@ impl LiveStateMode {
 struct LiveStateStatusRow {
     mode: LiveStateMode,
     schema_epoch: String,
-    watermark: Option<CanonicalWatermark>,
+    replay_cursor: Option<ReplayCursor>,
+    applied_committed_frontier: Option<CommittedVersionFrontier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LiveStateSnapshot {
     status: Option<LiveStateStatusRow>,
-    pub(crate) latest_canonical_watermark: Option<CanonicalWatermark>,
+    pub(crate) latest_replay_cursor: Option<ReplayCursor>,
+    pub(crate) current_committed_frontier: CommittedVersionFrontier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LiveStateProjectionStatus {
     pub(crate) mode: LiveStateMode,
-    pub(crate) applied_watermark: Option<CanonicalWatermark>,
-    pub(crate) latest_canonical_watermark: Option<CanonicalWatermark>,
+    /// Replica-local replay cursor used to resume scanning canonical storage.
+    pub(crate) applied_cursor: Option<ReplayCursor>,
+    pub(crate) latest_cursor: Option<ReplayCursor>,
+    /// Semantic frontier actually served by the current live-state projection.
+    pub(crate) applied_committed_frontier: Option<CommittedVersionFrontier>,
+    /// Current committed frontier resolved from canonical refs.
+    pub(crate) current_committed_frontier: CommittedVersionFrontier,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,28 +101,28 @@ pub(crate) fn evaluate_live_state_transaction_eligibility(
     snapshot: &LiveStateSnapshot,
 ) -> LiveStateReadiness {
     let Some(status) = snapshot.status.as_ref() else {
-        return if snapshot.latest_canonical_watermark.is_some() {
-            LiveStateReadiness::NeedsRebuild
-        } else {
+        return if snapshot.current_committed_frontier.is_empty() {
             LiveStateReadiness::Uninitialized
+        } else {
+            LiveStateReadiness::NeedsRebuild
         };
     };
 
     match status.mode {
         LiveStateMode::Uninitialized => {
-            if snapshot.latest_canonical_watermark.is_some() {
-                LiveStateReadiness::NeedsRebuild
-            } else {
+            if snapshot.current_committed_frontier.is_empty() {
                 LiveStateReadiness::Uninitialized
+            } else {
+                LiveStateReadiness::NeedsRebuild
             }
         }
         LiveStateMode::Bootstrapping | LiveStateMode::Rebuilding | LiveStateMode::NeedsRebuild => {
             LiveStateReadiness::NeedsRebuild
         }
         // Inside an open write transaction the canonical change head may advance
-        // before the transaction stamps the live-state watermark at commit time.
-        // Transaction eligibility therefore validates owner state and schema epoch,
-        // not watermark equality.
+        // before the transaction stamps the live-state replay cursor at commit
+        // time. Transaction eligibility therefore validates owner state and
+        // schema epoch, not cursor equality.
         LiveStateMode::Ready => {
             if status.schema_epoch == LIVE_STATE_SCHEMA_EPOCH {
                 LiveStateReadiness::Ready
@@ -125,19 +135,19 @@ pub(crate) fn evaluate_live_state_transaction_eligibility(
 
 pub(crate) fn evaluate_live_state_snapshot(snapshot: &LiveStateSnapshot) -> LiveStateReadiness {
     let Some(status) = snapshot.status.as_ref() else {
-        return if snapshot.latest_canonical_watermark.is_some() {
-            LiveStateReadiness::NeedsRebuild
-        } else {
+        return if snapshot.current_committed_frontier.is_empty() {
             LiveStateReadiness::Uninitialized
+        } else {
+            LiveStateReadiness::NeedsRebuild
         };
     };
 
     match status.mode {
         LiveStateMode::Uninitialized => {
-            if snapshot.latest_canonical_watermark.is_some() {
-                LiveStateReadiness::NeedsRebuild
-            } else {
+            if snapshot.current_committed_frontier.is_empty() {
                 LiveStateReadiness::Uninitialized
+            } else {
+                LiveStateReadiness::NeedsRebuild
             }
         }
         LiveStateMode::Bootstrapping | LiveStateMode::Rebuilding | LiveStateMode::NeedsRebuild => {
@@ -145,7 +155,8 @@ pub(crate) fn evaluate_live_state_snapshot(snapshot: &LiveStateSnapshot) -> Live
         }
         LiveStateMode::Ready => {
             let ready = status.schema_epoch == LIVE_STATE_SCHEMA_EPOCH
-                && status.watermark == snapshot.latest_canonical_watermark;
+                && status.applied_committed_frontier.as_ref()
+                    == Some(&snapshot.current_committed_frontier);
             if ready {
                 LiveStateReadiness::Ready
             } else {
@@ -173,6 +184,13 @@ pub async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
     backend
         .execute(LIVE_STATE_STATUS_CREATE_TABLE_SQL, &[])
         .await?;
+    add_column_if_missing(
+        backend,
+        LIVE_STATE_STATUS_TABLE,
+        "applied_committed_frontier",
+        "TEXT",
+    )
+    .await?;
     backend.execute(LIVE_STATE_STATUS_SEED_ROW_SQL, &[]).await?;
     Ok(())
 }
@@ -197,42 +215,55 @@ pub(crate) async fn require_ready_in_transaction(
     }
 }
 
-pub async fn finalize_commit(backend: &dyn LixBackend) -> Result<CanonicalWatermark, LixError> {
-    let watermark = load_latest_canonical_watermark(backend)
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "live_state::finalize_commit expected a canonical watermark",
-            )
-        })?;
-    mark_live_state_ready_with_backend(backend, &watermark).await?;
-    Ok(watermark)
+pub async fn finalize_commit(backend: &dyn LixBackend) -> Result<ReplayCursor, LixError> {
+    let cursor = load_latest_replay_cursor(backend).await?.ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "live_state::finalize_commit expected a replay cursor",
+        )
+    })?;
+    mark_live_state_ready_with_backend(backend, &cursor).await?;
+    Ok(cursor)
 }
 
 pub(crate) async fn finalize_commit_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-) -> Result<CanonicalWatermark, LixError> {
-    let watermark = load_latest_canonical_watermark_in_transaction(transaction)
+) -> Result<ReplayCursor, LixError> {
+    let cursor = load_latest_replay_cursor_in_transaction(transaction)
         .await?
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "live_state::finalize_commit expected a canonical watermark",
+                "live_state::finalize_commit expected a replay cursor",
             )
         })?;
+    let frontier = load_current_committed_frontier_in_transaction(transaction).await?;
     transaction
-        .execute(&build_mark_live_state_ready_sql(&watermark), &[])
+        .execute(&build_mark_live_state_ready_sql(&cursor, &frontier), &[])
         .await?;
-    Ok(watermark)
+    Ok(cursor)
 }
 
-pub(crate) async fn mark_live_state_ready_at_canonical_watermark_in_transaction(
+pub(crate) async fn mark_live_state_ready_at_replay_cursor_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    watermark: &CanonicalWatermark,
+    cursor: &ReplayCursor,
 ) -> Result<(), LixError> {
+    let frontier = load_current_committed_frontier_in_transaction(transaction).await?;
     transaction
-        .execute(&build_mark_live_state_ready_sql(watermark), &[])
+        .execute(&build_mark_live_state_ready_sql(cursor, &frontier), &[])
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn mark_live_state_ready_without_replay_cursor_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<(), LixError> {
+    let frontier = load_current_committed_frontier_in_transaction(transaction).await?;
+    transaction
+        .execute(
+            &build_mark_live_state_ready_without_cursor_sql(&frontier),
+            &[],
+        )
         .await?;
     Ok(())
 }
@@ -240,20 +271,20 @@ pub(crate) async fn mark_live_state_ready_at_canonical_watermark_in_transaction(
 pub(crate) async fn advance_commit_replay_boundary_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<(), LixError> {
-    let watermark = load_latest_canonical_watermark_in_transaction(transaction)
+    let cursor = load_latest_replay_cursor_in_transaction(transaction)
         .await?
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "live_state::advance_commit_replay_boundary expected a canonical watermark",
+                "live_state::advance_commit_replay_boundary expected a replay cursor",
             )
         })?;
-    advance_commit_replay_boundary_to_watermark_in_transaction(transaction, &watermark).await
+    advance_commit_replay_boundary_to_cursor_in_transaction(transaction, &cursor).await
 }
 
-pub(crate) async fn advance_commit_replay_boundary_to_watermark_in_transaction(
+pub(crate) async fn advance_commit_replay_boundary_to_cursor_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    watermark: &CanonicalWatermark,
+    cursor: &ReplayCursor,
 ) -> Result<(), LixError> {
     ensure_live_state_status_row_in_transaction(transaction).await?;
 
@@ -262,39 +293,56 @@ pub(crate) async fn advance_commit_replay_boundary_to_watermark_in_transaction(
         Some(LiveStateMode::Ready) => LiveStateMode::Ready,
         _ => LiveStateMode::NeedsRebuild,
     };
+    let applied_frontier = if mode == LiveStateMode::Ready {
+        Some(snapshot.current_committed_frontier.clone())
+    } else {
+        snapshot
+            .status
+            .as_ref()
+            .and_then(|status| status.applied_committed_frontier.clone())
+    };
 
     transaction
         .execute(
-            &build_set_live_state_mode_with_watermark_sql(mode, &watermark),
+            &build_set_live_state_mode_with_cursor_and_frontier_sql(
+                mode,
+                cursor,
+                applied_frontier.as_ref(),
+            ),
             &[],
         )
         .await?;
     Ok(())
 }
 
-pub(crate) async fn mark_needs_rebuild_at_latest_canonical_watermark_in_transaction(
+pub(crate) async fn mark_needs_rebuild_at_latest_replay_cursor_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-) -> Result<CanonicalWatermark, LixError> {
-    let watermark = load_latest_canonical_watermark_in_transaction(transaction)
+) -> Result<ReplayCursor, LixError> {
+    let cursor = load_latest_replay_cursor_in_transaction(transaction)
         .await?
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "live_state::mark_needs_rebuild expected a canonical watermark",
+                "live_state::mark_needs_rebuild expected a replay cursor",
             )
         })?;
-    mark_needs_rebuild_at_canonical_watermark_in_transaction(transaction, &watermark).await?;
-    Ok(watermark)
+    mark_needs_rebuild_at_replay_cursor_in_transaction(transaction, &cursor).await?;
+    Ok(cursor)
 }
 
-pub(crate) async fn mark_needs_rebuild_at_canonical_watermark_in_transaction(
+pub(crate) async fn mark_needs_rebuild_at_replay_cursor_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    watermark: &CanonicalWatermark,
+    cursor: &ReplayCursor,
 ) -> Result<(), LixError> {
     ensure_live_state_status_row_in_transaction(transaction).await?;
+    let applied_frontier = load_current_applied_frontier_in_transaction(transaction).await?;
     transaction
         .execute(
-            &build_set_live_state_mode_with_watermark_sql(LiveStateMode::NeedsRebuild, &watermark),
+            &build_set_live_state_mode_with_cursor_and_frontier_sql(
+                LiveStateMode::NeedsRebuild,
+                cursor,
+                applied_frontier.as_ref(),
+            ),
             &[],
         )
         .await?;
@@ -313,10 +361,13 @@ pub(crate) async fn mark_live_state_mode_with_backend(
 
 pub(crate) async fn mark_live_state_ready_with_backend(
     backend: &dyn LixBackend,
-    watermark: &CanonicalWatermark,
+    cursor: &ReplayCursor,
 ) -> Result<(), LixError> {
+    let frontier =
+        crate::canonical::refs::load_current_committed_version_frontier_with_backend(backend)
+            .await?;
     backend
-        .execute(&build_mark_live_state_ready_sql(watermark), &[])
+        .execute(&build_mark_live_state_ready_sql(cursor, &frontier), &[])
         .await?;
     Ok(())
 }
@@ -334,9 +385,9 @@ pub(crate) async fn try_claim_live_state_bootstrap_with_backend(
         .execute(
             "UPDATE lix_internal_live_state_status \
              SET mode = 'bootstrapping', \
-                 latest_change_ordinal = NULL, \
                  latest_change_id = NULL, \
                  latest_change_created_at = NULL, \
+                 applied_committed_frontier = NULL, \
                  schema_epoch = $1, \
                  updated_at = CURRENT_TIMESTAMP \
              WHERE singleton_id = 1 \
@@ -348,34 +399,34 @@ pub(crate) async fn try_claim_live_state_bootstrap_with_backend(
     Ok(result.rows.first().is_some())
 }
 
-pub(crate) async fn load_latest_canonical_watermark(
+pub(crate) async fn load_latest_replay_cursor(
     backend: &dyn LixBackend,
-) -> Result<Option<CanonicalWatermark>, LixError> {
+) -> Result<Option<ReplayCursor>, LixError> {
     let result = backend
         .execute(
-            "SELECT change_ordinal, id, created_at \
+            "SELECT id, created_at \
              FROM lix_internal_change \
-             ORDER BY change_ordinal DESC \
+             ORDER BY created_at DESC, id DESC \
              LIMIT 1",
             &[],
         )
         .await?;
-    parse_latest_canonical_watermark(&result)
+    parse_latest_replay_cursor(&result)
 }
 
-pub(crate) async fn load_latest_canonical_watermark_in_transaction(
+pub(crate) async fn load_latest_replay_cursor_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-) -> Result<Option<CanonicalWatermark>, LixError> {
+) -> Result<Option<ReplayCursor>, LixError> {
     let result = transaction
         .execute(
-            "SELECT change_ordinal, id, created_at \
+            "SELECT id, created_at \
              FROM lix_internal_change \
-             ORDER BY change_ordinal DESC \
+             ORDER BY created_at DESC, id DESC \
              LIMIT 1",
             &[],
         )
         .await?;
-    parse_latest_canonical_watermark(&result)
+    parse_latest_replay_cursor(&result)
 }
 
 async fn ensure_live_state_status_row_in_transaction(
@@ -384,71 +435,101 @@ async fn ensure_live_state_status_row_in_transaction(
     transaction
         .execute(LIVE_STATE_STATUS_CREATE_TABLE_SQL, &[])
         .await?;
+    if !live_state_status_column_exists_in_transaction(transaction, "applied_committed_frontier")
+        .await?
+    {
+        transaction
+            .execute(
+                "ALTER TABLE lix_internal_live_state_status \
+                 ADD COLUMN applied_committed_frontier TEXT",
+                &[],
+            )
+            .await?;
+    }
     transaction
         .execute(LIVE_STATE_STATUS_SEED_ROW_SQL, &[])
         .await?;
     Ok(())
 }
 
-fn parse_latest_canonical_watermark(
-    result: &QueryResult,
-) -> Result<Option<CanonicalWatermark>, LixError> {
+fn parse_latest_replay_cursor(result: &QueryResult) -> Result<Option<ReplayCursor>, LixError> {
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
-    Ok(Some(CanonicalWatermark {
-        change_ordinal: integer_value(row.first(), "lix_internal_change.change_ordinal")?,
-        change_id: text_value(row.get(1), "lix_internal_change.id")?,
-        created_at: text_value(row.get(2), "lix_internal_change.created_at")?,
-    }))
+    Ok(Some(ReplayCursor::new(
+        text_value(row.first(), "lix_internal_change.id")?,
+        text_value(row.get(1), "lix_internal_change.created_at")?,
+    )))
 }
 
 pub(crate) fn build_set_live_state_mode_sql(mode: LiveStateMode) -> String {
-    build_upsert_live_state_status_sql(mode, None)
+    build_upsert_live_state_status_sql(mode, None, None)
 }
 
-pub(crate) fn build_mark_live_state_ready_sql(watermark: &CanonicalWatermark) -> String {
-    build_set_live_state_mode_with_watermark_sql(LiveStateMode::Ready, watermark)
-}
-
-pub(crate) fn build_set_live_state_mode_with_watermark_sql(
-    mode: LiveStateMode,
-    watermark: &CanonicalWatermark,
+pub(crate) fn build_mark_live_state_ready_sql(
+    cursor: &ReplayCursor,
+    frontier: &CommittedVersionFrontier,
 ) -> String {
-    build_upsert_live_state_status_sql(mode, Some(watermark))
+    build_set_live_state_mode_with_cursor_and_frontier_sql(
+        LiveStateMode::Ready,
+        cursor,
+        Some(frontier),
+    )
+}
+
+pub(crate) fn build_mark_live_state_ready_without_cursor_sql(
+    frontier: &CommittedVersionFrontier,
+) -> String {
+    build_upsert_live_state_status_sql(LiveStateMode::Ready, None, Some(frontier))
+}
+
+pub(crate) fn build_set_live_state_mode_with_cursor_sql(
+    mode: LiveStateMode,
+    cursor: &ReplayCursor,
+) -> String {
+    build_set_live_state_mode_with_cursor_and_frontier_sql(mode, cursor, None)
+}
+
+pub(crate) fn build_set_live_state_mode_with_cursor_and_frontier_sql(
+    mode: LiveStateMode,
+    cursor: &ReplayCursor,
+    frontier: Option<&CommittedVersionFrontier>,
+) -> String {
+    build_upsert_live_state_status_sql(mode, Some(cursor), frontier)
 }
 
 fn build_upsert_live_state_status_sql(
     mode: LiveStateMode,
-    watermark: Option<&CanonicalWatermark>,
+    cursor: Option<&ReplayCursor>,
+    frontier: Option<&CommittedVersionFrontier>,
 ) -> String {
-    let latest_change_ordinal_sql = watermark
-        .map(|value| value.change_ordinal.to_string())
-        .unwrap_or_else(|| "NULL".to_string());
-    let latest_change_id_sql = watermark
+    let latest_change_id_sql = cursor
         .map(|value| format!("'{}'", escape_sql_string(&value.change_id)))
         .unwrap_or_else(|| "NULL".to_string());
-    let latest_change_created_at_sql = watermark
+    let latest_change_created_at_sql = cursor
         .map(|value| format!("'{}'", escape_sql_string(&value.created_at)))
+        .unwrap_or_else(|| "NULL".to_string());
+    let applied_frontier_sql = frontier
+        .map(|frontier| format!("'{}'", escape_sql_string(&frontier.to_json_string())))
         .unwrap_or_else(|| "NULL".to_string());
     format!(
         "INSERT INTO {table} (\
-         singleton_id, mode, latest_change_ordinal, latest_change_id, latest_change_created_at, schema_epoch, updated_at\
+         singleton_id, mode, latest_change_id, latest_change_created_at, applied_committed_frontier, schema_epoch, updated_at\
          ) VALUES (\
-         {singleton_id}, '{mode}', {change_ordinal}, {change_id}, {created_at}, '{schema_epoch}', CURRENT_TIMESTAMP\
+         {singleton_id}, '{mode}', {change_id}, {created_at}, {frontier}, '{schema_epoch}', CURRENT_TIMESTAMP\
          ) ON CONFLICT (singleton_id) DO UPDATE SET \
          mode = excluded.mode, \
-         latest_change_ordinal = excluded.latest_change_ordinal, \
          latest_change_id = excluded.latest_change_id, \
          latest_change_created_at = excluded.latest_change_created_at, \
+         applied_committed_frontier = excluded.applied_committed_frontier, \
          schema_epoch = excluded.schema_epoch, \
          updated_at = excluded.updated_at",
         table = LIVE_STATE_STATUS_TABLE,
         singleton_id = LIVE_STATE_STATUS_SINGLETON_ID,
         mode = mode.as_str(),
-        change_ordinal = latest_change_ordinal_sql,
         change_id = latest_change_id_sql,
         created_at = latest_change_created_at_sql,
+        frontier = applied_frontier_sql,
         schema_epoch = LIVE_STATE_SCHEMA_EPOCH,
     )
 }
@@ -456,85 +537,108 @@ fn build_upsert_live_state_status_sql(
 async fn load_live_state_status_row_with_backend(
     backend: &dyn LixBackend,
 ) -> Result<LiveStateStatusRow, LixError> {
+    Ok(load_nullable_live_state_status_with_backend(backend)
+        .await?
+        .unwrap_or_else(default_live_state_status))
+}
+
+async fn load_live_state_snapshot_with_backend(
+    backend: &dyn LixBackend,
+) -> Result<LiveStateSnapshot, LixError> {
+    Ok(LiveStateSnapshot {
+        status: load_nullable_live_state_status_with_backend(backend).await?,
+        latest_replay_cursor: load_latest_replay_cursor(backend).await?,
+        current_committed_frontier:
+            crate::canonical::refs::load_current_committed_version_frontier_with_backend(backend)
+                .await?,
+    })
+}
+
+async fn load_live_state_snapshot_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<LiveStateSnapshot, LixError> {
+    Ok(LiveStateSnapshot {
+        status: load_nullable_live_state_status_in_transaction(transaction).await?,
+        latest_replay_cursor: load_latest_replay_cursor_in_transaction(transaction).await?,
+        current_committed_frontier: load_current_committed_frontier_in_transaction(transaction)
+            .await?,
+    })
+}
+
+async fn load_nullable_live_state_status_with_backend(
+    backend: &dyn LixBackend,
+) -> Result<Option<LiveStateStatusRow>, LixError> {
     let result = backend
         .execute(
-            "SELECT mode, latest_change_ordinal, latest_change_id, latest_change_created_at, schema_epoch \
+            "SELECT mode, latest_change_id, latest_change_created_at, schema_epoch, applied_committed_frontier \
              FROM lix_internal_live_state_status \
              WHERE singleton_id = 1 \
              LIMIT 1",
             &[],
         )
         .await;
-    parse_live_state_status_result(result)
+    parse_nullable_live_state_status_result(result)
 }
 
-async fn load_live_state_snapshot_with_backend(
-    backend: &dyn LixBackend,
-) -> Result<LiveStateSnapshot, LixError> {
-    let result = backend
-        .execute(&build_load_live_state_snapshot_sql(), &[])
-        .await;
-    parse_live_state_snapshot_result(result)
-}
-
-async fn load_live_state_snapshot_in_transaction(
+async fn load_nullable_live_state_status_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-) -> Result<LiveStateSnapshot, LixError> {
+) -> Result<Option<LiveStateStatusRow>, LixError> {
     let result = transaction
-        .execute(&build_load_live_state_snapshot_sql(), &[])
+        .execute(
+            "SELECT mode, latest_change_id, latest_change_created_at, schema_epoch, applied_committed_frontier \
+             FROM lix_internal_live_state_status \
+             WHERE singleton_id = 1 \
+             LIMIT 1",
+            &[],
+        )
         .await;
-    parse_live_state_snapshot_result(result)
+    parse_nullable_live_state_status_result(result)
 }
 
-fn parse_live_state_status_result(
+fn parse_nullable_live_state_status_result(
     result: Result<QueryResult, LixError>,
-) -> Result<LiveStateStatusRow, LixError> {
+) -> Result<Option<LiveStateStatusRow>, LixError> {
     let result = match result {
         Ok(result) => result,
-        Err(error) if is_missing_relation_error(&error) => return Ok(default_live_state_status()),
+        Err(error) if is_missing_relation_error(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
     let Some(row) = result.rows.first() else {
-        return Ok(default_live_state_status());
+        return Ok(None);
     };
-    live_state_status_row_from_values(row)
-}
-
-fn parse_live_state_snapshot_result(
-    result: Result<QueryResult, LixError>,
-) -> Result<LiveStateSnapshot, LixError> {
-    let result = match result {
-        Ok(result) => result,
-        Err(error) if is_missing_relation_error(&error) => return Ok(default_live_state_snapshot()),
-        Err(error) => return Err(error),
-    };
-    let Some(row) = result.rows.first() else {
-        return Ok(default_live_state_snapshot());
-    };
-
-    let status = parse_nullable_live_state_status(row)?;
-    let latest_canonical_watermark =
-        parse_nullable_canonical_watermark(row.get(5), row.get(6), row.get(7))?;
-    Ok(LiveStateSnapshot {
-        status,
-        latest_canonical_watermark,
-    })
+    Ok(Some(live_state_status_row_from_values(row)?))
 }
 
 fn projection_status_from_snapshot(snapshot: LiveStateSnapshot) -> LiveStateProjectionStatus {
+    let readiness = evaluate_live_state_snapshot(&snapshot);
     let LiveStateSnapshot {
         status,
-        latest_canonical_watermark,
+        latest_replay_cursor,
+        current_committed_frontier,
     } = snapshot;
-    let (mode, applied_watermark) = match status {
-        Some(status) => (status.mode, status.watermark),
-        None if latest_canonical_watermark.is_some() => (LiveStateMode::NeedsRebuild, None),
-        None => (LiveStateMode::Uninitialized, None),
+    let (raw_mode, applied_cursor, applied_committed_frontier) = match status {
+        Some(status) => (
+            status.mode,
+            status.replay_cursor,
+            status.applied_committed_frontier,
+        ),
+        None => (LiveStateMode::Uninitialized, None, None),
+    };
+    let mode = match readiness {
+        LiveStateReadiness::Ready => LiveStateMode::Ready,
+        LiveStateReadiness::Uninitialized => LiveStateMode::Uninitialized,
+        LiveStateReadiness::NeedsRebuild => match raw_mode {
+            LiveStateMode::Bootstrapping => LiveStateMode::Bootstrapping,
+            LiveStateMode::Rebuilding => LiveStateMode::Rebuilding,
+            _ => LiveStateMode::NeedsRebuild,
+        },
     };
     LiveStateProjectionStatus {
         mode,
-        applied_watermark,
-        latest_canonical_watermark,
+        applied_cursor,
+        latest_cursor: latest_replay_cursor,
+        applied_committed_frontier,
+        current_committed_frontier,
     }
 }
 
@@ -546,32 +650,24 @@ fn live_state_status_row_from_values(row: &[Value]) -> Result<LiveStateStatusRow
             &format!("invalid live state mode '{mode_text}'"),
         ));
     };
-    let latest_change_ordinal = optional_integer_value(row.get(1))?;
-    let latest_change_id = optional_text_value(row.get(2))?;
-    let latest_change_created_at = optional_text_value(row.get(3))?;
-    let watermark = match (
-        latest_change_ordinal,
-        latest_change_id,
-        latest_change_created_at,
-    ) {
-        (Some(change_ordinal), Some(change_id), Some(created_at)) => Some(CanonicalWatermark {
-            change_ordinal,
-            change_id,
-            created_at,
-        }),
-        (None, None, None) => None,
+    let latest_change_id = optional_text_value(row.get(1))?;
+    let latest_change_created_at = optional_text_value(row.get(2))?;
+    let replay_cursor = match (latest_change_id, latest_change_created_at) {
+        (Some(change_id), Some(created_at)) => Some(ReplayCursor::new(change_id, created_at)),
+        (None, None) => None,
         _ => {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "live state watermark is partially populated",
+                "live state replay cursor is partially populated",
             ))
         }
     };
 
     Ok(LiveStateStatusRow {
         mode,
-        schema_epoch: text_value(row.get(4), "lix_internal_live_state_status.schema_epoch")?,
-        watermark,
+        schema_epoch: text_value(row.get(3), "lix_internal_live_state_status.schema_epoch")?,
+        replay_cursor,
+        applied_committed_frontier: parse_nullable_committed_frontier(row.get(4))?,
     })
 }
 
@@ -579,102 +675,42 @@ fn default_live_state_status() -> LiveStateStatusRow {
     LiveStateStatusRow {
         mode: LiveStateMode::Uninitialized,
         schema_epoch: LIVE_STATE_SCHEMA_EPOCH.to_string(),
-        watermark: None,
+        replay_cursor: None,
+        applied_committed_frontier: None,
     }
 }
 
 fn default_live_state_snapshot() -> LiveStateSnapshot {
     LiveStateSnapshot {
         status: None,
-        latest_canonical_watermark: None,
+        latest_replay_cursor: None,
+        current_committed_frontier: CommittedVersionFrontier::default(),
     }
 }
 
-fn parse_nullable_live_state_status(row: &[Value]) -> Result<Option<LiveStateStatusRow>, LixError> {
-    if row.is_empty() {
-        return Ok(None);
-    }
-    match optional_text_value(row.first())? {
-        None => {
-            let latest_change_ordinal = optional_integer_value(row.get(1))?;
-            let latest_change_id = optional_text_value(row.get(2))?;
-            let latest_change_created_at = optional_text_value(row.get(3))?;
-            let schema_epoch = optional_text_value(row.get(4))?;
-            if latest_change_ordinal.is_some()
-                || latest_change_id.is_some()
-                || latest_change_created_at.is_some()
-                || schema_epoch.is_some()
-            {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "live state status row is partially populated",
-                ));
-            }
-            Ok(None)
-        }
-        Some(mode_text) => {
-            let Some(mode) = LiveStateMode::parse(&mode_text) else {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    &format!("invalid live state mode '{mode_text}'"),
-                ));
-            };
-            let latest_change_ordinal = optional_integer_value(row.get(1))?;
-            let latest_change_id = optional_text_value(row.get(2))?;
-            let latest_change_created_at = optional_text_value(row.get(3))?;
-            let watermark = match (
-                latest_change_ordinal,
-                latest_change_id,
-                latest_change_created_at,
-            ) {
-                (Some(change_ordinal), Some(change_id), Some(created_at)) => {
-                    Some(CanonicalWatermark {
-                        change_ordinal,
-                        change_id,
-                        created_at,
-                    })
-                }
-                (None, None, None) => None,
-                _ => {
-                    return Err(LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        "live state watermark is partially populated",
-                    ))
-                }
-            };
-
-            Ok(Some(LiveStateStatusRow {
-                mode,
-                schema_epoch: text_value(
-                    row.get(4),
-                    "lix_internal_live_state_status.schema_epoch",
-                )?,
-                watermark,
-            }))
-        }
-    }
-}
-
-fn parse_nullable_canonical_watermark(
-    change_ordinal: Option<&Value>,
+fn parse_nullable_replay_cursor(
     change_id: Option<&Value>,
     created_at: Option<&Value>,
-) -> Result<Option<CanonicalWatermark>, LixError> {
+) -> Result<Option<ReplayCursor>, LixError> {
     match (
-        optional_integer_value(change_ordinal)?,
         optional_text_value(change_id)?,
         optional_text_value(created_at)?,
     ) {
-        (Some(change_ordinal), Some(change_id), Some(created_at)) => Ok(Some(CanonicalWatermark {
-            change_ordinal,
-            change_id,
-            created_at,
-        })),
-        (None, None, None) => Ok(None),
+        (Some(change_id), Some(created_at)) => Ok(Some(ReplayCursor::new(change_id, created_at))),
+        (None, None) => Ok(None),
         _ => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "canonical live-state watermark is partially populated",
+            "latest replay cursor is partially populated",
         )),
+    }
+}
+
+fn parse_nullable_committed_frontier(
+    value: Option<&Value>,
+) -> Result<Option<CommittedVersionFrontier>, LixError> {
+    match optional_text_value(value)? {
+        Some(value) => Ok(Some(CommittedVersionFrontier::from_json_str(&value)?)),
+        None => Ok(None),
     }
 }
 
@@ -697,26 +733,6 @@ fn text_value(value: Option<&Value>, field: &str) -> Result<String, LixError> {
     }
 }
 
-fn integer_value(value: Option<&Value>, field: &str) -> Result<i64, LixError> {
-    match value {
-        Some(Value::Integer(number)) => Ok(*number),
-        Some(Value::Text(text)) => text.parse::<i64>().map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                &format!("{field} is invalid integer text: {error}"),
-            )
-        }),
-        Some(other) => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            &format!("{field} is not an integer: {other:?}"),
-        )),
-        None => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            &format!("{field} is missing"),
-        )),
-    }
-}
-
 fn optional_text_value(value: Option<&Value>) -> Result<Option<String>, LixError> {
     match value {
         None | Some(Value::Null) => Ok(None),
@@ -729,49 +745,60 @@ fn optional_text_value(value: Option<&Value>) -> Result<Option<String>, LixError
     }
 }
 
-fn optional_integer_value(value: Option<&Value>) -> Result<Option<i64>, LixError> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Integer(number)) => Ok(Some(*number)),
-        Some(Value::Text(text)) => text.parse::<i64>().map(Some).map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                &format!("invalid nullable integer text: {error}"),
-            )
-        }),
-        Some(other) => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            &format!("expected nullable integer-like value, got {other:?}"),
-        )),
-    }
-}
-
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn build_load_live_state_snapshot_sql() -> String {
-    "WITH status AS (\
-       SELECT mode, latest_change_ordinal, latest_change_id, latest_change_created_at, schema_epoch \
-       FROM lix_internal_live_state_status \
-       WHERE singleton_id = 1 \
-       LIMIT 1\
-     ), canonical AS (\
-       SELECT change_ordinal, id, created_at \
-       FROM lix_internal_change \
-       ORDER BY change_ordinal DESC \
-       LIMIT 1\
-     ) \
-     SELECT \
-       (SELECT mode FROM status), \
-       (SELECT latest_change_ordinal FROM status), \
-       (SELECT latest_change_id FROM status), \
-       (SELECT latest_change_created_at FROM status), \
-       (SELECT schema_epoch FROM status), \
-       (SELECT change_ordinal FROM canonical), \
-       (SELECT id FROM canonical), \
-       (SELECT created_at FROM canonical)"
-        .to_string()
+async fn load_current_committed_frontier_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<CommittedVersionFrontier, LixError> {
+    let mut executor = transaction;
+    crate::canonical::refs::load_current_committed_version_frontier_with_executor(&mut executor)
+        .await
+}
+
+async fn load_current_applied_frontier_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<Option<CommittedVersionFrontier>, LixError> {
+    Ok(load_nullable_live_state_status_in_transaction(transaction)
+        .await?
+        .and_then(|status| status.applied_committed_frontier))
+}
+
+async fn live_state_status_column_exists_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    column: &str,
+) -> Result<bool, LixError> {
+    let exists = match transaction.dialect() {
+        crate::SqlDialect::Sqlite => {
+            transaction
+                .execute(
+                    "SELECT 1 \
+                     FROM pragma_table_info('lix_internal_live_state_status') \
+                     WHERE name = $1 \
+                     LIMIT 1",
+                    &[Value::Text(column.to_string())],
+                )
+                .await?
+        }
+        crate::SqlDialect::Postgres => {
+            transaction
+                .execute(
+                    "SELECT 1 \
+                     FROM information_schema.columns \
+                     WHERE table_schema = current_schema() \
+                       AND table_name = $1 \
+                       AND column_name = $2 \
+                     LIMIT 1",
+                    &[
+                        Value::Text(LIVE_STATE_STATUS_TABLE.to_string()),
+                        Value::Text(column.to_string()),
+                    ],
+                )
+                .await?
+        }
+    };
+    Ok(!exists.rows.is_empty())
 }
 
 #[cfg(test)]
@@ -779,11 +806,13 @@ mod tests {
     use super::*;
     use crate::backend::SqlDialect;
     use async_trait::async_trait;
+    use std::collections::BTreeMap;
 
     #[derive(Default)]
     struct FakeBackend {
         status_row: Option<Vec<Value>>,
-        latest_watermark: Option<(i64, String, String)>,
+        latest_cursor: Option<(String, String)>,
+        version_heads: BTreeMap<String, String>,
         executed_sql: std::sync::Mutex<Vec<String>>,
     }
 
@@ -795,43 +824,10 @@ mod tests {
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             self.executed_sql.lock().unwrap().push(sql.to_string());
-            if sql.contains("WITH status AS")
-                && sql.contains("lix_internal_live_state_status")
-                && sql.contains("lix_internal_change")
-            {
-                let mut row = self.status_row.clone().unwrap_or_else(|| {
-                    vec![
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                    ]
-                });
-                match &self.latest_watermark {
-                    Some((ordinal, id, created_at)) => {
-                        row.push(Value::Integer(*ordinal));
-                        row.push(Value::Text(id.clone()));
-                        row.push(Value::Text(created_at.clone()));
-                    }
-                    None => {
-                        row.push(Value::Null);
-                        row.push(Value::Null);
-                        row.push(Value::Null);
-                    }
-                }
+            if is_committed_version_frontier_query(sql) {
                 return Ok(QueryResult {
-                    rows: vec![row],
-                    columns: vec![
-                        "mode".to_string(),
-                        "latest_change_ordinal".to_string(),
-                        "latest_change_id".to_string(),
-                        "latest_change_created_at".to_string(),
-                        "schema_epoch".to_string(),
-                        "change_ordinal".to_string(),
-                        "id".to_string(),
-                        "created_at".to_string(),
-                    ],
+                    rows: version_ref_rows(&self.version_heads),
+                    columns: vec!["version_id".to_string(), "commit_id".to_string()],
                 });
             }
             if sql.contains("FROM lix_internal_live_state_status") {
@@ -839,34 +835,24 @@ mod tests {
                     rows: self.status_row.clone().into_iter().collect(),
                     columns: vec![
                         "mode".to_string(),
-                        "latest_change_ordinal".to_string(),
                         "latest_change_id".to_string(),
                         "latest_change_created_at".to_string(),
                         "schema_epoch".to_string(),
+                        "applied_committed_frontier".to_string(),
                     ],
                 });
             }
             if sql.contains("FROM lix_internal_change")
-                && sql.contains("ORDER BY change_ordinal DESC")
+                && sql.contains("ORDER BY created_at DESC, id DESC")
             {
                 return Ok(QueryResult {
                     rows: self
-                        .latest_watermark
+                        .latest_cursor
                         .clone()
                         .into_iter()
-                        .map(|(ordinal, id, created_at)| {
-                            vec![
-                                Value::Integer(ordinal),
-                                Value::Text(id),
-                                Value::Text(created_at),
-                            ]
-                        })
+                        .map(|(id, created_at)| vec![Value::Text(id), Value::Text(created_at)])
                         .collect(),
-                    columns: vec![
-                        "change_ordinal".to_string(),
-                        "id".to_string(),
-                        "created_at".to_string(),
-                    ],
+                    columns: vec!["id".to_string(), "created_at".to_string()],
                 });
             }
             Ok(QueryResult {
@@ -898,7 +884,8 @@ mod tests {
 
     struct FakeTransaction {
         status_row: Option<Vec<Value>>,
-        latest_watermark: Option<(i64, String, String)>,
+        latest_cursor: Option<(String, String)>,
+        version_heads: BTreeMap<String, String>,
         executed_sql: Vec<String>,
     }
 
@@ -914,43 +901,10 @@ mod tests {
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             self.executed_sql.push(sql.to_string());
-            if sql.contains("WITH status AS")
-                && sql.contains("lix_internal_live_state_status")
-                && sql.contains("lix_internal_change")
-            {
-                let mut row = self.status_row.clone().unwrap_or_else(|| {
-                    vec![
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                    ]
-                });
-                match &self.latest_watermark {
-                    Some((ordinal, id, created_at)) => {
-                        row.push(Value::Integer(*ordinal));
-                        row.push(Value::Text(id.clone()));
-                        row.push(Value::Text(created_at.clone()));
-                    }
-                    None => {
-                        row.push(Value::Null);
-                        row.push(Value::Null);
-                        row.push(Value::Null);
-                    }
-                }
+            if is_committed_version_frontier_query(sql) {
                 return Ok(QueryResult {
-                    rows: vec![row],
-                    columns: vec![
-                        "mode".to_string(),
-                        "latest_change_ordinal".to_string(),
-                        "latest_change_id".to_string(),
-                        "latest_change_created_at".to_string(),
-                        "schema_epoch".to_string(),
-                        "change_ordinal".to_string(),
-                        "id".to_string(),
-                        "created_at".to_string(),
-                    ],
+                    rows: version_ref_rows(&self.version_heads),
+                    columns: vec!["version_id".to_string(), "commit_id".to_string()],
                 });
             }
             if sql.contains("FROM lix_internal_live_state_status") {
@@ -958,34 +912,24 @@ mod tests {
                     rows: self.status_row.clone().into_iter().collect(),
                     columns: vec![
                         "mode".to_string(),
-                        "latest_change_ordinal".to_string(),
                         "latest_change_id".to_string(),
                         "latest_change_created_at".to_string(),
                         "schema_epoch".to_string(),
+                        "applied_committed_frontier".to_string(),
                     ],
                 });
             }
             if sql.contains("FROM lix_internal_change")
-                && sql.contains("ORDER BY change_ordinal DESC")
+                && sql.contains("ORDER BY created_at DESC, id DESC")
             {
                 return Ok(QueryResult {
                     rows: self
-                        .latest_watermark
+                        .latest_cursor
                         .clone()
                         .into_iter()
-                        .map(|(ordinal, id, created_at)| {
-                            vec![
-                                Value::Integer(ordinal),
-                                Value::Text(id),
-                                Value::Text(created_at),
-                            ]
-                        })
+                        .map(|(id, created_at)| vec![Value::Text(id), Value::Text(created_at)])
                         .collect(),
-                    columns: vec![
-                        "change_ordinal".to_string(),
-                        "id".to_string(),
-                        "created_at".to_string(),
-                    ],
+                    columns: vec!["id".to_string(), "created_at".to_string()],
                 });
             }
             Ok(QueryResult {
@@ -1003,6 +947,36 @@ mod tests {
         }
     }
 
+    fn is_committed_version_frontier_query(sql: &str) -> bool {
+        sql.contains("version_ref_facts")
+            && sql.contains("current_refs")
+            && sql.contains("SELECT version_id, commit_id")
+    }
+
+    fn version_ref_rows(version_heads: &BTreeMap<String, String>) -> Vec<Vec<Value>> {
+        version_heads
+            .iter()
+            .map(|(version_id, commit_id)| {
+                vec![
+                    Value::Text(version_id.clone()),
+                    Value::Text(commit_id.clone()),
+                ]
+            })
+            .collect()
+    }
+
+    fn frontier_json(entries: &[(&str, &str)]) -> String {
+        CommittedVersionFrontier {
+            version_heads: entries
+                .iter()
+                .map(|(version_id, commit_id)| {
+                    ((*version_id).to_string(), (*commit_id).to_string())
+                })
+                .collect(),
+        }
+        .to_json_string()
+    }
+
     #[tokio::test]
     async fn readiness_is_uninitialized_without_canonical_state() {
         let backend = FakeBackend::default();
@@ -1013,20 +987,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_is_ready_when_status_matches_latest_canonical_change() {
+    async fn readiness_is_ready_when_applied_frontier_matches_current_frontier() {
         let backend = FakeBackend {
             status_row: Some(vec![
                 Value::Text("ready".to_string()),
-                Value::Integer(2),
-                Value::Text("change-2".to_string()),
-                Value::Text("2026-03-15T01:02:03Z".to_string()),
+                Value::Text("change-1".to_string()),
+                Value::Text("2026-03-15T01:02:02Z".to_string()),
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
+                Value::Text(frontier_json(&[("main", "commit-2")])),
             ]),
-            latest_watermark: Some((
-                2,
-                "change-2".to_string(),
-                "2026-03-15T01:02:03Z".to_string(),
-            )),
+            latest_cursor: Some(("change-3".to_string(), "2026-03-15T01:02:04Z".to_string())),
+            version_heads: BTreeMap::from([("main".to_string(), "commit-2".to_string())]),
             executed_sql: std::sync::Mutex::new(Vec::new()),
         };
 
@@ -1041,16 +1012,13 @@ mod tests {
         let backend = FakeBackend {
             status_row: Some(vec![
                 Value::Text("ready".to_string()),
-                Value::Integer(1),
                 Value::Text("change-1".to_string()),
                 Value::Text("2026-03-15T01:02:02Z".to_string()),
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
+                Value::Text(frontier_json(&[("main", "commit-1")])),
             ]),
-            latest_watermark: Some((
-                2,
-                "change-2".to_string(),
-                "2026-03-15T01:02:03Z".to_string(),
-            )),
+            latest_cursor: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            version_heads: BTreeMap::from([("main".to_string(), "commit-2".to_string())]),
             executed_sql: std::sync::Mutex::new(Vec::new()),
         };
 
@@ -1061,17 +1029,16 @@ mod tests {
         );
 
         let executed_sql = backend.executed_sql.lock().unwrap().clone();
-        assert_eq!(executed_sql.len(), 1);
         assert!(
-            !executed_sql[0]
+            executed_sql.iter().all(|sql| !sql
                 .to_ascii_lowercase()
-                .contains("insert into lix_internal_live_state_status"),
+                .contains("insert into lix_internal_live_state_status")),
             "observer path must not mutate live-state status"
         );
         assert!(
-            !executed_sql[0]
+            executed_sql.iter().all(|sql| !sql
                 .to_ascii_lowercase()
-                .contains("update lix_internal_live_state_status"),
+                .contains("update lix_internal_live_state_status")),
             "observer path must not mutate live-state status"
         );
     }
@@ -1083,10 +1050,11 @@ mod tests {
                 Value::Text("needs_rebuild".to_string()),
                 Value::Null,
                 Value::Null,
-                Value::Null,
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
+                Value::Null,
             ]),
-            latest_watermark: None,
+            latest_cursor: None,
+            version_heads: BTreeMap::new(),
             executed_sql: Vec::new(),
         };
 
@@ -1100,14 +1068,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_without_status_but_with_canonical_state_requires_rebuild() {
+    async fn readiness_without_status_but_with_replayed_canonical_state_requires_rebuild() {
         let backend = FakeBackend {
             status_row: None,
-            latest_watermark: Some((
-                2,
-                "change-2".to_string(),
-                "2026-03-15T01:02:03Z".to_string(),
-            )),
+            latest_cursor: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            version_heads: BTreeMap::from([("main".to_string(), "commit-2".to_string())]),
             executed_sql: std::sync::Mutex::new(Vec::new()),
         };
 
@@ -1119,26 +1084,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_ready_check_allows_inflight_watermark_drift() {
+    async fn transaction_ready_check_allows_inflight_cursor_drift() {
         let mut transaction = FakeTransaction {
             status_row: Some(vec![
                 Value::Text("ready".to_string()),
-                Value::Integer(1),
                 Value::Text("change-1".to_string()),
                 Value::Text("2026-03-15T01:02:02Z".to_string()),
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
+                Value::Text(frontier_json(&[("main", "commit-1")])),
             ]),
-            latest_watermark: Some((
-                2,
-                "change-2".to_string(),
-                "2026-03-15T01:02:03Z".to_string(),
-            )),
+            latest_cursor: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            version_heads: BTreeMap::from([("main".to_string(), "commit-2".to_string())]),
             executed_sql: Vec::new(),
         };
 
         require_ready_in_transaction(&mut transaction)
             .await
-            .expect("inflight watermark drift inside transaction should be allowed");
+            .expect("inflight cursor drift inside transaction should be allowed");
     }
 
     #[tokio::test]
@@ -1146,16 +1108,13 @@ mod tests {
         let mut transaction = FakeTransaction {
             status_row: Some(vec![
                 Value::Text("ready".to_string()),
-                Value::Integer(1),
                 Value::Text("change-1".to_string()),
                 Value::Text("2026-03-15T01:02:02Z".to_string()),
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
+                Value::Text(frontier_json(&[("main", "commit-1")])),
             ]),
-            latest_watermark: Some((
-                2,
-                "change-2".to_string(),
-                "2026-03-15T01:02:03Z".to_string(),
-            )),
+            latest_cursor: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            version_heads: BTreeMap::from([("main".to_string(), "commit-2".to_string())]),
             executed_sql: Vec::new(),
         };
 
@@ -1166,8 +1125,9 @@ mod tests {
             transaction.executed_sql.iter().any(|sql| sql
                 .contains("INSERT INTO lix_internal_live_state_status ")
                 && sql.contains("'ready'")
-                && sql.contains("'change-2'")),
-            "ready live-state status should advance to the latest canonical watermark",
+                && sql.contains("'change-2'")
+                && sql.contains("commit-2")),
+            "ready live-state status should advance to the latest replay cursor",
         );
     }
 
@@ -1176,16 +1136,13 @@ mod tests {
         let mut transaction = FakeTransaction {
             status_row: Some(vec![
                 Value::Text("needs_rebuild".to_string()),
-                Value::Integer(1),
                 Value::Text("change-1".to_string()),
                 Value::Text("2026-03-15T01:02:02Z".to_string()),
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
+                Value::Text(frontier_json(&[("main", "commit-1")])),
             ]),
-            latest_watermark: Some((
-                2,
-                "change-2".to_string(),
-                "2026-03-15T01:02:03Z".to_string(),
-            )),
+            latest_cursor: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            version_heads: BTreeMap::from([("main".to_string(), "commit-2".to_string())]),
             executed_sql: Vec::new(),
         };
 
@@ -1198,7 +1155,8 @@ mod tests {
                 .iter()
                 .any(|sql| sql.contains("INSERT INTO lix_internal_live_state_status ")
                     && sql.contains("'needs_rebuild'")
-                    && sql.contains("'change-2'")),
+                    && sql.contains("'change-2'")
+                    && sql.contains("commit-1")),
             "non-ready live-state status should keep a durable replay boundary instead of claiming readiness",
         );
     }

@@ -1,15 +1,25 @@
-//! Canonical history subsystem boundary.
+//! Canonical committed-history subsystem boundary.
 //!
 //! `canonical` owns the semantic meaning of committed history. Use this module
 //! when the question is "what happened?" or "what state does commit/root X
 //! mean?".
 //!
+//! The intended model is:
+//! - canonical changes are the only semantic source of truth
+//! - commit graph facts are a canonical projection derived from those changes
+//! - canonical refs select committed heads/roots in that graph
+//! - committed meaning/state is resolved from commit-graph facts plus
+//!   canonical refs
+//!
 //! `canonical` owns:
+//! - canonical change facts for canonical-owned entities such as `lix_commit`,
+//!   `lix_commit_edge`, `lix_change_set`, and `lix_change_set_element`
 //! - commit DAG interpretation and canonical history indexes
 //! - head/root resolution
 //! - commit-addressed and root-addressed state lookup
-//! - canonical writes for canonical-owned entities such as `lix_commit`,
-//!   `lix_commit_edge`, `lix_change_set`, and `lix_change_set_element`
+//!
+//! Derived mirrors, replay cursors, and storage-local append order may help
+//! execution, but they must not redefine committed semantics.
 //!
 //! `checkpoint` depends on canonical as a derived acceleration layer.
 //! `live_state` may mirror canonical facts as read-only query surfaces for
@@ -35,8 +45,6 @@ pub(crate) mod roots;
 pub(crate) mod state_source;
 mod types;
 pub(crate) mod version_state;
-pub(crate) use change_log::load_next_change_ordinal_with_executor;
 pub(crate) use init::{init, seed_bootstrap};
 pub(crate) use receipt::CanonicalCommitReceipt;
-pub use receipt::CanonicalWatermark;
 pub(crate) use types::ProposedDomainChange;

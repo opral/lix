@@ -7,6 +7,7 @@ mod canonical_json;
 mod cel;
 mod change_view;
 pub(crate) mod checkpoint;
+mod committed_frontier;
 mod deterministic_mode;
 mod engine;
 mod errors;
@@ -48,6 +49,7 @@ pub use backend::SqlDialect;
 pub use backend::TransactionMode;
 pub use canonical_json::CanonicalJson;
 pub use checkpoint::CreateCheckpointResult;
+pub use committed_frontier::CommittedVersionFrontier;
 #[doc(hidden)]
 pub use engine::{boot, BootArgs};
 pub use engine::{BootAccount, BootKeyValue, Engine, ExecuteOptions};

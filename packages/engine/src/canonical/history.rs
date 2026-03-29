@@ -40,13 +40,15 @@ pub(crate) fn build_state_history_source_sql(
         "parent_rows",
         "parent_commit_id",
     );
-    let (change_join_sql, change_value_expr) = json_array_text_join_sql(
-        dialect,
-        "COALESCE(commit_headers.commit_snapshot_content, '{}')",
-        "change_ids",
-        "change_rows",
-        "change_id",
-    );
+    let (change_join_sql, change_value_expr, change_position_expr) =
+        json_array_text_join_with_position_sql(
+            dialect,
+            "COALESCE(commit_headers.commit_snapshot_content, '{}')",
+            "change_ids",
+            "change_rows",
+            "change_id",
+            "change_position",
+        );
     let snapshot_projection = match content_mode {
         CanonicalHistoryContentMode::MetadataOnly => "NULL AS snapshot_content".to_string(),
         CanonicalHistoryContentMode::IncludeSnapshotContent => {
@@ -125,7 +127,7 @@ pub(crate) fn build_state_history_source_sql(
                reachable.root_version_id AS root_version_id, \
                reachable.commit_depth AS commit_depth, \
                commit_headers.commit_created_at AS commit_created_at, \
-               changes.created_at AS change_created_at \
+               {change_position_expr} AS change_position \
              FROM reachable_commits reachable \
              JOIN canonical_commit_headers commit_headers \
                ON commit_headers.commit_id = reachable.commit_id \
@@ -150,7 +152,7 @@ pub(crate) fn build_state_history_source_sql(
                members.commit_created_at, \
                ROW_NUMBER() OVER ( \
                  PARTITION BY members.root_commit_id, members.entity_id, members.schema_key, members.file_id, members.commit_depth \
-                 ORDER BY members.change_created_at DESC, members.change_id DESC \
+                 ORDER BY members.change_position DESC \
                ) AS rn \
              FROM commit_members members \
            ), \
@@ -255,6 +257,7 @@ pub(crate) fn build_state_history_source_sql(
         parent_value_expr = parent_value_expr,
         change_join_sql = change_join_sql,
         change_value_expr = change_value_expr,
+        change_position_expr = change_position_expr,
         max_depth = max_depth.unwrap_or(512),
         snapshot_projection = snapshot_projection,
         snapshot_join = snapshot_join,
@@ -395,6 +398,30 @@ fn json_array_text_join_sql(
                 "JOIN LATERAL jsonb_array_elements_text(CAST({json_column} AS JSONB) -> '{field}') AS {alias}({value_column}) ON TRUE"
             ),
             format!("{alias}.{value_column}"),
+        ),
+    }
+}
+
+fn json_array_text_join_with_position_sql(
+    dialect: SqlDialect,
+    json_column: &str,
+    field: &str,
+    alias: &str,
+    value_column: &str,
+    position_column: &str,
+) -> (String, String, String) {
+    match dialect {
+        SqlDialect::Sqlite => (
+            format!("JOIN json_each({json_column}, '$.{field}') AS {alias}"),
+            format!("{alias}.value"),
+            format!("CAST({alias}.key AS INTEGER)"),
+        ),
+        SqlDialect::Postgres => (
+            format!(
+                "JOIN LATERAL jsonb_array_elements_text(CAST({json_column} AS JSONB) -> '{field}') WITH ORDINALITY AS {alias}({value_column}, {position_column}) ON TRUE"
+            ),
+            format!("{alias}.{value_column}"),
+            format!("{alias}.{position_column}"),
         ),
     }
 }

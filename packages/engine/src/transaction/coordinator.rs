@@ -1,5 +1,5 @@
-use crate::canonical::{CanonicalCommitReceipt, CanonicalWatermark};
-use crate::live_state::{SchemaRegistration, SchemaRegistrationSet};
+use crate::canonical::CanonicalCommitReceipt;
+use crate::live_state::{ReplayCursor, SchemaRegistration, SchemaRegistrationSet};
 use crate::{LixBackendTransaction, LixError};
 
 pub(crate) struct TransactionCoordinator<'a> {
@@ -30,7 +30,7 @@ impl<'a> TransactionCoordinator<'a> {
         apply_schema_registrations_in_transaction(transaction, &registrations).await
     }
 
-    pub(crate) async fn finalize_live_state(&mut self) -> Result<CanonicalWatermark, LixError> {
+    pub(crate) async fn finalize_live_state(&mut self) -> Result<ReplayCursor, LixError> {
         let transaction = self.backend_transaction_mut()?;
         crate::live_state::projection::mark_live_state_projection_ready_in_transaction(transaction)
             .await

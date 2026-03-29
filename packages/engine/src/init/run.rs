@@ -7,10 +7,10 @@ use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::filesystem;
 use crate::key_value;
 use crate::live_state;
+use crate::live_state::projection::replay::load_latest_live_state_replay_cursor_with_backend;
 use crate::live_state::{
-    load_latest_canonical_watermark, load_mode_with_backend, mark_mode_with_backend,
-    try_claim_bootstrap_with_backend, LiveStateMode, LiveStateRebuildDebugMode,
-    LiveStateRebuildRequest, LiveStateRebuildScope,
+    load_mode_with_backend, mark_mode_with_backend, try_claim_bootstrap_with_backend,
+    LiveStateMode, LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
 };
 use crate::observe;
 use crate::schema;
@@ -128,18 +128,16 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
         .map_err(|error| init_step_error("live_state::rebuild_scope_in_transaction", error))?;
         {
             let backend = TransactionBackendAdapter::new(transaction.as_mut());
-            let watermark = load_latest_canonical_watermark(&backend)
+            let cursor = load_latest_live_state_replay_cursor_with_backend(&backend)
                 .await?
                 .ok_or_else(|| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
-                        "initialize expected canonical watermark after bootstrap seeding",
+                        "initialize expected replay cursor after bootstrap seeding",
                     )
                 })?;
-            live_state::projection::mark_live_state_projection_ready_with_backend(
-                &backend, &watermark,
-            )
-            .await
+            live_state::projection::mark_live_state_projection_ready_with_backend(&backend, &cursor)
+                .await
         }
     }
     .await;

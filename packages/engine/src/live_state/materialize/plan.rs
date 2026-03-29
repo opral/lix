@@ -15,6 +15,7 @@ use crate::canonical::lineage::{
     min_depth_by_commit, VersionCommitDepthMap, VersionHeadMap,
 };
 use crate::canonical::roots::load_all_version_head_commit_ids;
+use crate::live_state::ReplayCursor;
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{CanonicalJson, LixBackend, LixError};
@@ -23,7 +24,7 @@ use crate::{CanonicalJson, LixBackend, LixError};
 struct VisibleRow {
     version_id: String,
     commit_id: String,
-    change_ordinal: i64,
+    replay_cursor: ReplayCursor,
     change_id: String,
     entity_id: String,
     schema_key: String,
@@ -222,7 +223,7 @@ fn build_latest_visible_state(
         rows.sort_by(|a, b| {
             a.depth
                 .cmp(&b.depth)
-                .then_with(|| b.change.change_ordinal.cmp(&a.change.change_ordinal))
+                .then_with(|| b.change.replay_cursor.cmp(&a.change.replay_cursor))
         });
 
         let Some(winner) = rows.first() else {
@@ -233,7 +234,7 @@ fn build_latest_visible_state(
         created_candidates.sort_by(|a, b| {
             b.depth
                 .cmp(&a.depth)
-                .then_with(|| a.change.change_ordinal.cmp(&b.change.change_ordinal))
+                .then_with(|| a.change.replay_cursor.cmp(&b.change.replay_cursor))
         });
         let created_at = created_candidates
             .first()
@@ -243,7 +244,7 @@ fn build_latest_visible_state(
         winners.push(VisibleRow {
             version_id: winner.source_version_id.clone(),
             commit_id: winner.commit_id.clone(),
-            change_ordinal: winner.change.change_ordinal,
+            replay_cursor: winner.change.replay_cursor.clone(),
             change_id: winner.change.id.clone(),
             entity_id: winner.change.entity_id.clone(),
             schema_key: winner.change.schema_key.clone(),
@@ -270,7 +271,7 @@ fn build_latest_visible_state(
             .then_with(|| a.schema_key.cmp(&b.schema_key))
             .then_with(|| a.file_id.cmp(&b.file_id))
             .then_with(|| a.entity_id.cmp(&b.entity_id))
-            .then_with(|| a.change_ordinal.cmp(&b.change_ordinal))
+            .then_with(|| a.replay_cursor.cmp(&b.replay_cursor))
     });
 
     stats.push(StageStat {
@@ -313,7 +314,7 @@ fn build_global_projection_rows(
         let row = VisibleRow {
             version_id: GLOBAL_VERSION_ID.to_string(),
             commit_id: effective_commit_id,
-            change_ordinal: descriptor.change_ordinal,
+            replay_cursor: descriptor.replay_cursor.clone(),
             change_id: descriptor.id.clone(),
             entity_id: descriptor.entity_id.clone(),
             schema_key: version_descriptor_schema.schema_key.clone(),
@@ -343,7 +344,7 @@ fn build_global_projection_rows(
             continue;
         }
         match latest_version_ref_changes.get(&change.entity_id) {
-            Some(existing) if existing.change_ordinal >= change.change_ordinal => {}
+            Some(existing) if existing.replay_cursor >= change.replay_cursor => {}
             _ => {
                 latest_version_ref_changes.insert(change.entity_id.clone(), change);
             }
@@ -364,7 +365,7 @@ fn build_global_projection_rows(
         let row = VisibleRow {
             version_id: GLOBAL_VERSION_ID.to_string(),
             commit_id: effective_commit_id,
-            change_ordinal: change.change_ordinal,
+            replay_cursor: change.replay_cursor.clone(),
             change_id: change.id.clone(),
             entity_id: change.entity_id.clone(),
             schema_key: version_ref_schema.schema_key.clone(),
@@ -404,7 +405,7 @@ fn build_global_projection_rows(
         let row = VisibleRow {
             version_id: GLOBAL_VERSION_ID.to_string(),
             commit_id: GLOBAL_VERSION_ID.to_string(),
-            change_ordinal: change.change_ordinal,
+            replay_cursor: change.replay_cursor.clone(),
             change_id: change.id.clone(),
             entity_id: change.entity_id.clone(),
             schema_key: version_descriptor_schema.schema_key.clone(),
@@ -447,7 +448,7 @@ fn build_global_projection_rows(
         let commit_row = VisibleRow {
             version_id: GLOBAL_VERSION_ID.to_string(),
             commit_id: commit.entity_id.clone(),
-            change_ordinal: commit_change.change_ordinal,
+            replay_cursor: commit_change.replay_cursor.clone(),
             change_id: commit_change.id.clone(),
             entity_id: commit.entity_id.clone(),
             schema_key: commit_schema.schema_key.clone(),
@@ -494,7 +495,7 @@ fn build_global_projection_rows(
                 let cse_row = VisibleRow {
                     version_id: GLOBAL_VERSION_ID.to_string(),
                     commit_id: commit.entity_id.clone(),
-                    change_ordinal: change.change_ordinal,
+                    replay_cursor: change.replay_cursor.clone(),
                     change_id: change.id.clone(),
                     entity_id: format!("{}~{}", change_set_id, change.id),
                     schema_key: change_set_element_schema.schema_key.clone(),
@@ -533,7 +534,7 @@ fn build_global_projection_rows(
                     let author_row = VisibleRow {
                         version_id: GLOBAL_VERSION_ID.to_string(),
                         commit_id: commit.entity_id.clone(),
-                        change_ordinal: commit_change.change_ordinal,
+                        replay_cursor: commit_change.replay_cursor.clone(),
                         change_id: commit_change.id.clone(),
                         entity_id: format!("{}~{}", change.id, account_id),
                         schema_key: change_author_schema.schema_key.clone(),
@@ -572,7 +573,7 @@ fn build_global_projection_rows(
             let edge_row = VisibleRow {
                 version_id: GLOBAL_VERSION_ID.to_string(),
                 commit_id: commit.entity_id.clone(),
-                change_ordinal: commit_change.change_ordinal,
+                replay_cursor: commit_change.replay_cursor.clone(),
                 change_id: commit_change.id.clone(),
                 entity_id: format!("{}~{}", parent_id, commit.entity_id),
                 schema_key: commit_edge_schema.schema_key.clone(),
@@ -778,7 +779,7 @@ fn build_final_state(
             .then_with(|| a.source.schema_key.cmp(&b.source.schema_key))
             .then_with(|| a.source.file_id.cmp(&b.source.file_id))
             .then_with(|| a.source.entity_id.cmp(&b.source.entity_id))
-            .then_with(|| a.source.change_ordinal.cmp(&b.source.change_ordinal))
+            .then_with(|| a.source.replay_cursor.cmp(&b.source.replay_cursor))
     });
 
     stats.push(StageStat {

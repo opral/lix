@@ -1,3 +1,10 @@
+//! Committed-state resolution over canonical history.
+//!
+//! Semantically, committed meaning/state is resolved from canonical refs plus
+//! commit-graph facts derived from canonical changes. This module answers that
+//! question directly from canonical-owned data, independent of live-state
+//! replay status and other derived mirrors.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::errors::classification::is_missing_relation_error;
@@ -116,6 +123,10 @@ pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
     head_commit_id: &str,
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
+    // Resolve committed state by walking the canonical commit lineage selected
+    // by the requested head commit and then choosing the nearest visible change
+    // for the requested entity. This is semantic resolution, not live-state
+    // replay.
     let (parent_join_sql, parent_value_expr) = json_array_text_join_sql(
         executor.dialect(),
         "commit_snapshot.content",
@@ -123,13 +134,15 @@ pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
         "parent_rows",
         "parent_id",
     );
-    let (change_join_sql, change_value_expr) = json_array_text_join_sql(
-        executor.dialect(),
-        "commit_snapshot.content",
-        "change_ids",
-        "change_rows",
-        "change_id",
-    );
+    let (change_join_sql, change_value_expr, change_position_expr) =
+        json_array_text_join_with_position_sql(
+            executor.dialect(),
+            "commit_snapshot.content",
+            "change_ids",
+            "change_rows",
+            "change_id",
+            "change_position",
+        );
 
     let mut filters = vec![
         format!("c.entity_id = '{}'", escape_sql_string(&request.entity_id)),
@@ -169,7 +182,7 @@ pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
            FROM commit_walk \
            GROUP BY commit_id \
          ), ranked_changes AS ( \
-           SELECT c.entity_id, c.schema_key, c.schema_version, c.file_id, '{version_id}' AS version_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.id AS change_id, reachable_commits.depth, c.created_at \
+           SELECT c.entity_id, c.schema_key, c.schema_version, c.file_id, '{version_id}' AS version_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.id AS change_id, reachable_commits.depth, {change_position_expr} AS change_position \
            FROM reachable_commits \
            JOIN lix_internal_change commit_change \
              ON commit_change.schema_key = 'lix_commit' \
@@ -185,7 +198,7 @@ pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
          ) \
          SELECT entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, metadata, change_id \
          FROM ranked_changes \
-         ORDER BY depth ASC, change_id DESC \
+         ORDER BY depth ASC, change_position DESC \
          LIMIT 1",
         head_commit_id = escape_sql_string(head_commit_id),
         parent_value_expr = parent_value_expr,
@@ -194,6 +207,7 @@ pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
         version_id = escape_sql_string(&request.version_id),
         change_join_sql = change_join_sql,
         change_value_expr = change_value_expr,
+        change_position_expr = change_position_expr,
         filters = filters.join(" AND "),
     );
 
@@ -257,7 +271,6 @@ pub(crate) async fn load_commit_lineage_entry_by_id(
            AND c.file_id = 'lix' \
            AND c.plugin_key = 'lix' \
            AND s.content IS NOT NULL \
-         ORDER BY c.change_ordinal DESC \
          LIMIT 1",
         commit_id = escape_sql_string(commit_id),
     );
@@ -351,6 +364,30 @@ fn json_array_text_join_sql(
     }
 }
 
+fn json_array_text_join_with_position_sql(
+    dialect: crate::SqlDialect,
+    json_column: &str,
+    field: &str,
+    alias: &str,
+    value_column: &str,
+    position_column: &str,
+) -> (String, String, String) {
+    match dialect {
+        crate::SqlDialect::Sqlite => (
+            format!("JOIN json_each({json_column}, '$.{field}') AS {alias}"),
+            format!("{alias}.value"),
+            format!("CAST({alias}.key AS INTEGER)"),
+        ),
+        crate::SqlDialect::Postgres => (
+            format!(
+                "JOIN LATERAL jsonb_array_elements_text(CAST({json_column} AS JSONB) -> '{field}') WITH ORDINALITY AS {alias}({value_column}, {position_column}) ON TRUE"
+            ),
+            format!("{alias}.{value_column}"),
+            format!("{alias}.{position_column}"),
+        ),
+    }
+}
+
 fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, LixError> {
     match row.get(index) {
         Some(Value::Text(value)) if !value.is_empty() => Ok(value.clone()),
@@ -428,15 +465,14 @@ mod tests {
             if sql.contains(&file_descriptor_table) || sql.contains(&version_ref_table) {
                 return Err(LixError::new("LIX_ERROR_UNKNOWN", "no such table"));
             }
-            if sql.contains("FROM lix_internal_change c")
-                && sql.contains("c.schema_key = 'lix_version_ref'")
-            {
+            if sql.contains("FROM current_refs") && sql.contains("schema_key = 'lix_version_ref'") {
                 self.canonical_query_seen.store(true, Ordering::SeqCst);
                 return Ok(QueryResult {
-                    rows: vec![vec![Value::Text(
-                        "{\"id\":\"v1\",\"commit_id\":\"commit-1\"}".to_string(),
-                    )]],
-                    columns: vec!["snapshot_content".to_string()],
+                    rows: vec![vec![
+                        Value::Text("v1".to_string()),
+                        Value::Text("commit-1".to_string()),
+                    ]],
+                    columns: vec!["version_id".to_string(), "commit_id".to_string()],
                 });
             }
             if sql.contains("WITH RECURSIVE commit_walk")

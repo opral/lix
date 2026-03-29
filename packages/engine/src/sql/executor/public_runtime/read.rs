@@ -154,7 +154,11 @@ async fn ensure_surface_read_freshness(
         return Ok(());
     }
 
-    let status = crate::live_state::load_projection_status_with_backend(backend).await?;
+    let status =
+        crate::live_state::projection::status::load_live_state_projection_status_with_backend(
+            backend,
+        )
+        .await?;
     if matches!(
         status.mode,
         crate::live_state::LiveStateMode::Ready | crate::live_state::LiveStateMode::Bootstrapping
@@ -174,21 +178,36 @@ fn public_read_projection_stale_error(
     } else {
         format!("surface(s) {}", surface_names.join(", "))
     };
-    let applied = format_optional_watermark(status.applied_watermark.as_ref());
-    let latest = format_optional_watermark(status.latest_canonical_watermark.as_ref());
+    let applied = format_optional_replay_cursor(status.applied_cursor.as_ref());
+    let latest = format_optional_replay_cursor(status.latest_cursor.as_ref());
+    let applied_frontier =
+        format_optional_committed_frontier(status.applied_committed_frontier.as_ref());
+    let current_frontier = format_committed_frontier(&status.current_committed_frontier);
     LixError::new(
         crate::errors::ErrorCode::LiveStateNotReady.as_str(),
         format!(
-            "Public read for {surfaces} requires fresh live-state projections, but live_state is {:?}. Applied watermark: {applied}. Latest canonical watermark: {latest}. Canonical history/change reads may proceed while stale, but current-state projection reads must wait for replay or rebuild.",
+            "Public read for {surfaces} requires fresh live-state projections, but live_state is {:?}. Applied committed frontier: {applied_frontier}. Current committed frontier: {current_frontier}. Applied replay cursor: {applied}. Latest replay cursor: {latest}. Canonical history/change reads may proceed while stale, but current-state projection reads must wait for replay or rebuild.",
             status.mode
         ),
     )
 }
 
-fn format_optional_watermark(watermark: Option<&crate::canonical::CanonicalWatermark>) -> String {
-    watermark
-        .map(|watermark| format!("{}@{}", watermark.change_id, watermark.created_at))
+fn format_optional_replay_cursor(cursor: Option<&crate::live_state::ReplayCursor>) -> String {
+    cursor
+        .map(|cursor| format!("{}@{}", cursor.change_id, cursor.created_at))
         .unwrap_or_else(|| "(none)".to_string())
+}
+
+fn format_optional_committed_frontier(
+    frontier: Option<&crate::CommittedVersionFrontier>,
+) -> String {
+    frontier
+        .map(format_committed_frontier)
+        .unwrap_or_else(|| "(none)".to_string())
+}
+
+fn format_committed_frontier(frontier: &crate::CommittedVersionFrontier) -> String {
+    frontier.describe()
 }
 
 async fn execute_lowered_public_read(

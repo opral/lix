@@ -1,10 +1,17 @@
+use std::collections::BTreeMap;
+
 use crate::backend::QueryExecutor;
-use crate::errors::classification::is_missing_relation_error;
 use crate::version::{
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
-    version_descriptor_schema_key, version_descriptor_schema_version,
+    version_descriptor_schema_key, version_descriptor_schema_version, GLOBAL_VERSION_ID,
 };
-use crate::{LixBackend, LixError, Value};
+use crate::{LixBackend, LixError, SqlDialect, Value};
+
+use super::readers::load_committed_version_head_commit_id;
+use super::refs::load_all_committed_version_refs_with_executor;
+use super::state_source::{
+    load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRowRequest,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VersionDescriptorRow {
@@ -26,77 +33,57 @@ pub(crate) async fn load_version_descriptor_with_executor(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
 ) -> Result<Option<VersionDescriptorRow>, LixError> {
-    let sql = format!(
-        "SELECT c.id AS change_id, s.content AS snapshot_content \
-         FROM lix_internal_change c \
-         LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-         WHERE c.schema_key = '{schema_key}' \
-           AND c.schema_version = '{schema_version}' \
-           AND c.entity_id = '{entity_id}' \
-           AND c.file_id = '{file_id}' \
-           AND c.plugin_key = '{plugin_key}' \
-         ORDER BY c.change_ordinal DESC \
-         LIMIT 1",
-        schema_key = escape_sql_string(version_descriptor_schema_key()),
-        schema_version = escape_sql_string(version_descriptor_schema_version()),
-        entity_id = escape_sql_string(version_id),
-        file_id = escape_sql_string(version_descriptor_file_id()),
-        plugin_key = escape_sql_string(version_descriptor_plugin_key()),
-    );
-    let result = match executor.execute(&sql, &[]).await {
-        Ok(result) => result,
-        Err(err) if is_missing_relation_error(&err) => return Ok(None),
-        Err(err) => return Err(err),
-    };
-    let Some(row) = result.rows.first() else {
+    let Some(global_head_commit_id) =
+        load_committed_version_head_commit_id(executor, GLOBAL_VERSION_ID).await?
+    else {
         return Ok(None);
     };
-    let Some(Value::Text(snapshot_content)) = row.get(1) else {
+    let row = load_exact_committed_state_row_from_commit_with_executor(
+        executor,
+        &global_head_commit_id,
+        &ExactCommittedStateRowRequest {
+            entity_id: version_id.to_string(),
+            schema_key: version_descriptor_schema_key().to_string(),
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            exact_filters: BTreeMap::from([
+                (
+                    "file_id".to_string(),
+                    Value::Text(version_descriptor_file_id().to_string()),
+                ),
+                (
+                    "plugin_key".to_string(),
+                    Value::Text(version_descriptor_plugin_key().to_string()),
+                ),
+                (
+                    "schema_version".to_string(),
+                    Value::Text(version_descriptor_schema_version().to_string()),
+                ),
+            ]),
+        },
+    )
+    .await?;
+    let Some(row) = row else {
         return Ok(None);
     };
-    let change_id = optional_text_value(row.first())?;
-    Ok(Some(parse_descriptor_row(snapshot_content, change_id)?))
+    let Some(Value::Text(snapshot_content)) = row.values.get("snapshot_content") else {
+        return Ok(None);
+    };
+    Ok(Some(parse_descriptor_row(
+        snapshot_content,
+        row.source_change_id,
+    )?))
 }
 
 pub(crate) async fn load_all_version_descriptors_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<Vec<VersionDescriptorRow>, LixError> {
-    let sql = format!(
-        "WITH ranked AS (\
-             SELECT c.entity_id, \
-                    c.id AS change_id, \
-                    s.content AS snapshot_content, \
-                    ROW_NUMBER() OVER (PARTITION BY c.entity_id ORDER BY c.change_ordinal DESC) AS rn \
-             FROM lix_internal_change c \
-             LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-             WHERE c.schema_key = '{schema_key}' \
-               AND c.schema_version = '{schema_version}' \
-               AND c.file_id = '{file_id}' \
-               AND c.plugin_key = '{plugin_key}'\
-         ) \
-         SELECT entity_id, change_id, snapshot_content \
-         FROM ranked \
-         WHERE rn = 1 \
-           AND snapshot_content IS NOT NULL \
-         ORDER BY entity_id ASC",
-        schema_key = escape_sql_string(version_descriptor_schema_key()),
-        schema_version = escape_sql_string(version_descriptor_schema_version()),
-        file_id = escape_sql_string(version_descriptor_file_id()),
-        plugin_key = escape_sql_string(version_descriptor_plugin_key()),
-    );
-    let result = match executor.execute(&sql, &[]).await {
-        Ok(result) => result,
-        Err(err) if is_missing_relation_error(&err) => return Ok(Vec::new()),
-        Err(err) => return Err(err),
-    };
-
     let mut descriptors = Vec::new();
-    for row in &result.rows {
-        let Some(Value::Text(snapshot_content)) = row.get(2) else {
-            continue;
-        };
-        let change_id = optional_text_value(row.get(1))?;
-        descriptors.push(parse_descriptor_row(snapshot_content, change_id)?);
+    for version_ref in load_all_committed_version_refs_with_executor(executor).await? {
+        if let Some(descriptor) =
+            load_version_descriptor_with_executor(executor, &version_ref.version_id).await?
+        {
+            descriptors.push(descriptor);
+        }
     }
     descriptors.sort_by(|left, right| left.version_id.cmp(&right.version_id));
     Ok(descriptors)
@@ -140,51 +127,110 @@ pub(crate) async fn version_exists_with_executor(
         .is_some())
 }
 
-pub(crate) fn build_admin_version_source_sql() -> String {
+pub(crate) fn build_admin_version_source_sql(dialect: SqlDialect) -> String {
+    let current_refs_cte_sql = build_current_version_refs_unique_cte_sql(dialect);
+    let name_expr = json_text_extract_sql(dialect, "d.snapshot_content", "name");
+    let hidden_expr = json_boolean_extract_sql(dialect, "d.snapshot_content", "hidden");
+    let (parent_join_sql, parent_value_expr) = json_array_text_join_sql(
+        dialect,
+        "commit_headers.commit_snapshot_content",
+        "parent_commit_ids",
+        "parent_rows",
+        "parent_commit_id",
+    );
+    let (change_join_sql, change_value_expr, change_position_expr) =
+        json_array_text_join_with_position_sql(
+            dialect,
+            "commit_headers.commit_snapshot_content",
+            "change_ids",
+            "change_rows",
+            "change_id",
+            "change_position",
+        );
     format!(
-        "WITH descriptor_ranked AS (\
-             SELECT c.entity_id, \
-                    s.content AS snapshot_content, \
-                    ROW_NUMBER() OVER (PARTITION BY c.entity_id ORDER BY c.change_ordinal DESC) AS rn \
-             FROM lix_internal_change c \
-             LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-             WHERE c.schema_key = '{descriptor_schema_key}' \
-               AND c.schema_version = '{descriptor_schema_version}' \
-               AND c.file_id = '{descriptor_file_id}' \
-               AND c.plugin_key = '{descriptor_plugin_key}'\
+        "WITH RECURSIVE \
+         {current_refs_cte_sql}\
+         global_head AS ( \
+             SELECT commit_id \
+             FROM current_refs \
+             WHERE version_id = '{global_version}' \
          ), \
-         ref_ranked AS (\
-             SELECT c.entity_id, \
-                    s.content AS snapshot_content, \
-                    ROW_NUMBER() OVER (PARTITION BY c.entity_id ORDER BY c.change_ordinal DESC) AS rn \
-             FROM lix_internal_change c \
-             LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-             WHERE c.schema_key = '{ref_schema_key}' \
-               AND c.schema_version = '{ref_schema_version}' \
-               AND c.file_id = '{ref_file_id}' \
-               AND c.plugin_key = '{ref_plugin_key}'\
+         reachable_global_commit_walk AS ( \
+             SELECT commit_id, 0 AS depth \
+             FROM global_head \
+             UNION ALL \
+             SELECT \
+               {parent_value_expr} AS commit_id, \
+               walk.depth + 1 AS depth \
+             FROM reachable_global_commit_walk walk \
+             JOIN canonical_commit_headers commit_headers \
+               ON commit_headers.commit_id = walk.commit_id \
+             {parent_join_sql} \
+             WHERE {parent_value_expr} IS NOT NULL \
+         ), \
+         reachable_global_commits AS ( \
+             SELECT commit_id, MIN(depth) AS depth \
+             FROM reachable_global_commit_walk \
+             GROUP BY commit_id \
+         ), \
+         descriptor_members AS ( \
+             SELECT \
+               descriptor_change.entity_id AS entity_id, \
+               descriptor_change.id AS change_id, \
+               descriptor_snapshot.content AS snapshot_content, \
+               reachable.depth AS depth, \
+               {change_position_expr} AS change_position \
+             FROM reachable_global_commits reachable \
+             JOIN canonical_commit_headers commit_headers \
+               ON commit_headers.commit_id = reachable.commit_id \
+             {change_join_sql} \
+             JOIN lix_internal_change descriptor_change \
+               ON descriptor_change.id = {change_value_expr} \
+             LEFT JOIN lix_internal_snapshot descriptor_snapshot \
+               ON descriptor_snapshot.id = descriptor_change.snapshot_id \
+             WHERE descriptor_change.schema_key = '{descriptor_schema_key}' \
+               AND descriptor_change.schema_version = '{descriptor_schema_version}' \
+               AND descriptor_change.file_id = '{descriptor_file_id}' \
+               AND descriptor_change.plugin_key = '{descriptor_plugin_key}' \
+         ), \
+         ranked_descriptors AS ( \
+             SELECT \
+               entity_id, \
+               snapshot_content, \
+               ROW_NUMBER() OVER ( \
+                 PARTITION BY entity_id \
+                 ORDER BY depth ASC, change_position DESC \
+               ) AS rn \
+             FROM descriptor_members \
+         ), \
+         descriptor_state AS ( \
+             SELECT entity_id, snapshot_content \
+             FROM ranked_descriptors \
+             WHERE rn = 1 \
+               AND snapshot_content IS NOT NULL \
          ) \
          SELECT \
              d.entity_id AS id, \
-             COALESCE(lix_json_extract(d.snapshot_content, 'name'), '') AS name, \
-             COALESCE(lix_json_extract_boolean(d.snapshot_content, 'hidden'), false) AS hidden, \
-             COALESCE(lix_json_extract(r.snapshot_content, 'commit_id'), '') AS commit_id \
-         FROM descriptor_ranked d \
-         LEFT JOIN ref_ranked r \
-           ON r.entity_id = d.entity_id \
-          AND r.rn = 1 \
-          AND r.snapshot_content IS NOT NULL \
-         WHERE d.rn = 1 \
-           AND d.snapshot_content IS NOT NULL \
+             COALESCE({name_expr}, '') AS name, \
+             COALESCE({hidden_expr}, false) AS hidden, \
+             COALESCE(r.commit_id, '') AS commit_id \
+         FROM descriptor_state d \
+         LEFT JOIN current_refs r \
+           ON r.version_id = d.entity_id \
          ORDER BY d.entity_id ASC",
+        current_refs_cte_sql = current_refs_cte_sql,
+        global_version = escape_sql_string(GLOBAL_VERSION_ID),
+        parent_join_sql = parent_join_sql,
+        parent_value_expr = parent_value_expr,
+        change_join_sql = change_join_sql,
+        change_value_expr = change_value_expr,
+        change_position_expr = change_position_expr,
+        name_expr = name_expr,
+        hidden_expr = hidden_expr,
         descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
         descriptor_schema_version = escape_sql_string(version_descriptor_schema_version()),
         descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
         descriptor_plugin_key = escape_sql_string(version_descriptor_plugin_key()),
-        ref_schema_key = escape_sql_string(crate::version::version_ref_schema_key()),
-        ref_schema_version = escape_sql_string(crate::version::version_ref_schema_version()),
-        ref_file_id = escape_sql_string(crate::version::version_ref_file_id()),
-        ref_plugin_key = escape_sql_string(crate::version::version_ref_plugin_key()),
     )
 }
 
@@ -201,18 +247,164 @@ fn parse_descriptor_row(
     })
 }
 
-fn optional_text_value(value: Option<&Value>) -> Result<Option<String>, LixError> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Text(text)) => Ok(Some(text.clone())),
-        Some(Value::Integer(number)) => Ok(Some(number.to_string())),
-        Some(other) => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            &format!("expected nullable text-like version descriptor field, got {other:?}"),
-        )),
+fn escape_sql_string(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn build_current_version_refs_unique_cte_sql(dialect: SqlDialect) -> String {
+    let (parent_join_sql, parent_value_expr) = json_array_text_join_sql(
+        dialect,
+        "commit_headers.commit_snapshot_content",
+        "parent_commit_ids",
+        "parent_rows",
+        "parent_commit_id",
+    );
+    let commit_id_expr = json_text_extract_sql(dialect, "ref_snapshot.content", "commit_id");
+    format!(
+        "canonical_commit_headers AS ( \
+             SELECT \
+               commit_change.entity_id AS commit_id, \
+               commit_snapshot.content AS commit_snapshot_content \
+             FROM lix_internal_change commit_change \
+             LEFT JOIN lix_internal_snapshot commit_snapshot \
+               ON commit_snapshot.id = commit_change.snapshot_id \
+             WHERE commit_change.schema_key = 'lix_commit' \
+               AND commit_change.file_id = 'lix' \
+               AND commit_change.plugin_key = 'lix' \
+               AND commit_snapshot.content IS NOT NULL \
+         ), \
+         version_ref_facts AS ( \
+             SELECT DISTINCT \
+               ref_change.entity_id AS version_id, \
+               {commit_id_expr} AS commit_id \
+             FROM lix_internal_change ref_change \
+             LEFT JOIN lix_internal_snapshot ref_snapshot \
+               ON ref_snapshot.id = ref_change.snapshot_id \
+             WHERE ref_change.schema_key = '{ref_schema_key}' \
+               AND ref_change.schema_version = '{ref_schema_version}' \
+               AND ref_change.file_id = '{ref_file_id}' \
+               AND ref_change.plugin_key = '{ref_plugin_key}' \
+               AND ref_snapshot.content IS NOT NULL \
+               AND COALESCE({commit_id_expr}, '') <> '' \
+         ), \
+         ancestry_walk AS ( \
+             SELECT \
+               facts.version_id AS version_id, \
+               facts.commit_id AS head_commit_id, \
+               facts.commit_id AS ancestor_commit_id \
+             FROM version_ref_facts facts \
+             UNION ALL \
+             SELECT \
+               walk.version_id AS version_id, \
+               walk.head_commit_id AS head_commit_id, \
+               {parent_value_expr} AS ancestor_commit_id \
+             FROM ancestry_walk walk \
+             JOIN canonical_commit_headers commit_headers \
+               ON commit_headers.commit_id = walk.ancestor_commit_id \
+             {parent_join_sql} \
+             WHERE {parent_value_expr} IS NOT NULL \
+         ), \
+         overshadowed AS ( \
+             SELECT DISTINCT \
+               older.version_id AS version_id, \
+               older.commit_id AS commit_id \
+             FROM version_ref_facts older \
+             JOIN ancestry_walk walk \
+               ON walk.version_id = older.version_id \
+              AND walk.ancestor_commit_id = older.commit_id \
+              AND walk.head_commit_id <> older.commit_id \
+         ), \
+         current_ref_candidates AS ( \
+             SELECT \
+               facts.version_id AS version_id, \
+               facts.commit_id AS commit_id \
+             FROM version_ref_facts facts \
+             LEFT JOIN overshadowed \
+               ON overshadowed.version_id = facts.version_id \
+              AND overshadowed.commit_id = facts.commit_id \
+             WHERE overshadowed.commit_id IS NULL \
+         ), \
+         current_ref_counts AS ( \
+             SELECT version_id, COUNT(*) AS candidate_count \
+             FROM current_ref_candidates \
+             GROUP BY version_id \
+         ), \
+         current_refs AS ( \
+             SELECT \
+               candidates.version_id AS version_id, \
+               candidates.commit_id AS commit_id \
+             FROM current_ref_candidates candidates \
+             JOIN current_ref_counts counts \
+               ON counts.version_id = candidates.version_id \
+             WHERE counts.candidate_count = 1 \
+         ), ",
+        ref_schema_key = escape_sql_string(crate::version::version_ref_schema_key()),
+        ref_schema_version = escape_sql_string(crate::version::version_ref_schema_version()),
+        ref_file_id = escape_sql_string(crate::version::version_ref_file_id()),
+        ref_plugin_key = escape_sql_string(crate::version::version_ref_plugin_key()),
+        parent_value_expr = parent_value_expr,
+        parent_join_sql = parent_join_sql,
+        commit_id_expr = commit_id_expr,
+    )
+}
+
+fn json_array_text_join_sql(
+    dialect: SqlDialect,
+    json_column: &str,
+    field: &str,
+    alias: &str,
+    value_column: &str,
+) -> (String, String) {
+    match dialect {
+        SqlDialect::Sqlite => (
+            format!("JOIN json_each({json_column}, '$.{field}') AS {alias}"),
+            format!("{alias}.value"),
+        ),
+        SqlDialect::Postgres => (
+            format!(
+                "JOIN LATERAL jsonb_array_elements_text(CAST({json_column} AS JSONB) -> '{field}') AS {alias}({value_column}) ON TRUE"
+            ),
+            format!("{alias}.{value_column}"),
+        ),
     }
 }
 
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
+fn json_array_text_join_with_position_sql(
+    dialect: SqlDialect,
+    json_column: &str,
+    field: &str,
+    alias: &str,
+    value_column: &str,
+    position_column: &str,
+) -> (String, String, String) {
+    match dialect {
+        SqlDialect::Sqlite => (
+            format!("JOIN json_each({json_column}, '$.{field}') AS {alias}"),
+            format!("{alias}.value"),
+            format!("CAST({alias}.key AS INTEGER)"),
+        ),
+        SqlDialect::Postgres => (
+            format!(
+                "JOIN LATERAL jsonb_array_elements_text(CAST({json_column} AS JSONB) -> '{field}') WITH ORDINALITY AS {alias}({value_column}, {position_column}) ON TRUE"
+            ),
+            format!("{alias}.{value_column}"),
+            format!("{alias}.{position_column}"),
+        ),
+    }
+}
+
+fn json_text_extract_sql(dialect: SqlDialect, json_column: &str, field: &str) -> String {
+    match dialect {
+        SqlDialect::Sqlite => format!("json_extract({json_column}, '$.{field}')"),
+        SqlDialect::Postgres => format!("CAST({json_column} AS JSONB) ->> '{field}'"),
+    }
+}
+
+fn json_boolean_extract_sql(dialect: SqlDialect, json_column: &str, field: &str) -> String {
+    match dialect {
+        SqlDialect::Sqlite => format!("json_extract({json_column}, '$.{field}')"),
+        SqlDialect::Postgres => {
+            format!("CAST((CAST({json_column} AS JSONB) ->> '{field}') AS BOOLEAN)")
+        }
+    }
 }
