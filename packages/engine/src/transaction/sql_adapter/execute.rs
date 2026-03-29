@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use sqlparser::ast::Statement;
+use std::time::Duration;
 
 use crate::canonical::pending_session::PendingPublicCommitSession;
 use crate::engine::{DeferredTransactionSideEffects, Engine};
@@ -34,10 +35,17 @@ pub(crate) async fn execute_parsed_statements_in_write_transaction(
     params: &[Value],
     allow_internal_tables: bool,
     context: &mut ExecutionContext,
+    parse_duration: Option<Duration>,
 ) -> Result<ExecuteResult, LixError> {
     let dialect = write_transaction.backend_transaction_mut()?.dialect();
     let runtime_bindings = context.runtime_binding_values()?;
-    let program = ExecutionProgram::compile(parsed_statements, params, dialect, &runtime_bindings)?;
+    let program = ExecutionProgram::compile(
+        parsed_statements,
+        params,
+        dialect,
+        &runtime_bindings,
+        parse_duration,
+    )?;
     ensure_execution_runtime_state_for_write_scope(
         engine,
         write_transaction.backend_transaction_mut()?,
@@ -61,10 +69,17 @@ pub(crate) async fn execute_parsed_statements_in_borrowed_write_transaction(
     params: &[Value],
     allow_internal_tables: bool,
     context: &mut ExecutionContext,
+    parse_duration: Option<Duration>,
 ) -> Result<ExecuteResult, LixError> {
     let dialect = write_transaction.backend_transaction_mut().dialect();
     let runtime_bindings = context.runtime_binding_values()?;
-    let program = ExecutionProgram::compile(parsed_statements, params, dialect, &runtime_bindings)?;
+    let program = ExecutionProgram::compile(
+        parsed_statements,
+        params,
+        dialect,
+        &runtime_bindings,
+        parse_duration,
+    )?;
     ensure_execution_runtime_state_for_write_scope(
         engine,
         write_transaction.backend_transaction_mut(),

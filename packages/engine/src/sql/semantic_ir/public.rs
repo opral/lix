@@ -4,21 +4,16 @@ use super::canonicalize::{
 use super::internal::NormalizedInternalStatements;
 use super::statement::BoundStatement;
 use crate::errors::schema_not_registered_error;
-use crate::sql::backend::PushdownDecision;
 use crate::sql::catalog::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
 use crate::sql::logical_plan::public_ir::{
-    CanonicalStateScan, CommitPreconditions, PlannedWrite, ReadCommand, ReadContract, ReadPlan,
-    ResolvedWritePlan, SchemaProof, ScopeProof, StructuredPublicRead, TargetSetProof, WriteCommand,
+    CanonicalStateScan, PlannedWrite, ReadCommand, ReadContract, ReadPlan, StructuredPublicRead,
 };
 use crate::sql::logical_plan::{
     DependencySpec, DirectPublicReadPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan,
 };
-use crate::sql::optimizer::OptimizerPassTrace;
-use crate::sql::physical_plan::PhysicalPlan;
 use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
-use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     build_effective_state, EffectiveStatePlan, EffectiveStateRequest,
 };
@@ -26,36 +21,9 @@ use crate::sql::semantic_ir::semantics::write_analysis::{analyze_write, WriteAna
 use crate::sql::services::state_reader::load_committed_version_head_commit_id;
 use crate::{LixBackend, LixError};
 use sqlparser::ast::{
-    AnalyzeFormatKind, BinaryOperator, DescribeAlias, Expr, Ident, SetExpr, Statement, TableFactor,
-    UtilityOption, Value as SqlValue,
+    BinaryOperator, Expr, Ident, SetExpr, Statement, TableFactor, Value as SqlValue,
 };
 use std::collections::BTreeSet;
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ExplainOptions {
-    pub(crate) describe_alias: DescribeAlias,
-    pub(crate) analyze: bool,
-    pub(crate) verbose: bool,
-    pub(crate) query_plan: bool,
-    pub(crate) estimate: bool,
-    pub(crate) format: Option<AnalyzeFormatKind>,
-    pub(crate) options: Option<Vec<UtilityOption>>,
-}
-
-impl ExplainOptions {
-    pub(crate) fn wrap(self, statement: SemanticStatement) -> SemanticStatement {
-        SemanticStatement::Explain(ExplainedStatement {
-            options: self,
-            statement: Box::new(statement),
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ExplainedStatement {
-    pub(crate) options: ExplainOptions,
-    pub(crate) statement: Box<SemanticStatement>,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PublicReadSemantics {
@@ -63,16 +31,6 @@ pub(crate) struct PublicReadSemantics {
     pub(crate) structured_read: Option<StructuredPublicRead>,
     pub(crate) effective_state_request: Option<EffectiveStateRequest>,
     pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
-}
-
-impl PublicReadSemantics {
-    pub(crate) fn semantic_statement(&self, explain: Option<ExplainOptions>) -> SemanticStatement {
-        let statement = SemanticStatement::PublicRead(self.clone());
-        match explain {
-            Some(explain) => explain.wrap(statement),
-            None => statement,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -192,10 +150,6 @@ impl PublicWriteSemantics {
     ) -> Result<Self, CanonicalizeError> {
         canonicalize_write(bound_statement, registry).map(|canonicalized| Self { canonicalized })
     }
-
-    pub(crate) fn semantic_statement(&self) -> SemanticStatement {
-        SemanticStatement::PublicWrite(self.clone())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -226,7 +180,6 @@ pub(crate) enum SemanticStatement {
     PublicRead(PublicReadSemantics),
     PublicWrite(PublicWriteSemantics),
     Internal(NormalizedInternalStatements),
-    Explain(ExplainedStatement),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,35 +206,11 @@ impl BoundPublicLeaf {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct PublicWriteInvariantTrace {
     pub(crate) batch_local_checks: Vec<String>,
     pub(crate) commit_time_checks: Vec<String>,
     pub(crate) physical_checks: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct PublicExecutionDebugTrace {
-    pub(crate) semantic_statement: Option<SemanticStatement>,
-    pub(crate) bound_statements: Vec<BoundStatement>,
-    pub(crate) optimizer_passes: Vec<OptimizerPassTrace>,
-    pub(crate) physical_plan: Option<PhysicalPlan>,
-    pub(crate) surface_bindings: Vec<String>,
-    pub(crate) bound_public_leaves: Vec<BoundPublicLeaf>,
-    pub(crate) dependency_spec: Option<DependencySpec>,
-    pub(crate) effective_state_request: Option<EffectiveStateRequest>,
-    pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
-    pub(crate) pushdown_decision: Option<PushdownDecision>,
-    pub(crate) write_command: Option<WriteCommand>,
-    pub(crate) scope_proof: Option<ScopeProof>,
-    pub(crate) schema_proof: Option<SchemaProof>,
-    pub(crate) target_set_proof: Option<TargetSetProof>,
-    pub(crate) resolved_write_plan: Option<ResolvedWritePlan>,
-    pub(crate) domain_change_batches: Vec<DomainChangeBatch>,
-    pub(crate) commit_preconditions: Vec<CommitPreconditions>,
-    pub(crate) invariant_trace: Option<PublicWriteInvariantTrace>,
-    pub(crate) write_phase_trace: Vec<String>,
-    pub(crate) lowered_sql: Vec<String>,
 }
 
 fn try_build_direct_state_history_structured_read(

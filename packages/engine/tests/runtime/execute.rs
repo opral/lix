@@ -32,25 +32,6 @@ simulation_test!(select_works_after_init, |sim| async move {
     assert_eq!(result.statements[0].rows[0][0], Value::Integer(2));
 });
 
-simulation_test!(explain_lix_state_query_works, |sim| async move {
-    let engine = sim
-        .boot_simulated_engine(None)
-        .await
-        .expect("boot_simulated_engine should succeed");
-    engine.initialize().await.unwrap();
-
-    let result = engine
-        .execute(
-            "EXPLAIN SELECT COUNT(*) FROM lix_state WHERE file_id = 'missing' AND plugin_key = 'plugin_json'", &[])
-        .await
-        .unwrap();
-
-    assert!(
-        !result.statements[0].rows.is_empty(),
-        "EXPLAIN over lix_state should return a plan"
-    );
-});
-
 simulation_test!(
     dml_without_returning_returns_empty_public_rowset,
     |sim| async move {

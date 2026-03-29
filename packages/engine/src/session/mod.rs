@@ -23,7 +23,9 @@ use crate::sql::executor::execution_program::{
 };
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
+#[cfg(test)]
 use crate::sql::parser::parse_sql;
+use crate::sql::parser::parse_sql_with_timing;
 use crate::transaction::{TransactionCommitOutcome, WriteTransaction};
 use crate::workspace::{
     load_workspace_active_account_ids, persist_workspace_active_account_ids,
@@ -317,7 +319,8 @@ impl Session {
     ) -> Result<ExecuteResult, LixError> {
         let allow_internal_sql = allow_internal_tables || self.engine.access_to_internal();
 
-        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
+        let parsed = parse_sql_with_timing(sql).map_err(LixError::from)?;
+        let parsed_statements = parsed.statements;
         if !allow_internal_sql {
             reject_public_create_table(&parsed_statements)?;
             reject_internal_table_writes(&parsed_statements)?;
@@ -339,6 +342,7 @@ impl Session {
             params,
             self.engine.backend.dialect(),
             &runtime_bindings,
+            Some(parsed.parse_duration),
         )?;
         let execution_mode = classify_session_execution_mode(&program, explicit_transaction_script);
         let runtime_state =
@@ -640,7 +644,8 @@ impl<'a> SessionTransaction<'a> {
         sql: &str,
         params: &[Value],
     ) -> Result<crate::ExecuteResult, LixError> {
-        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
+        let parsed = parse_sql_with_timing(sql).map_err(LixError::from)?;
+        let parsed_statements = parsed.statements;
         if !self.engine.access_to_internal() {
             reject_public_create_table(&parsed_statements)?;
             reject_internal_table_writes(&parsed_statements)?;
@@ -656,6 +661,7 @@ impl<'a> SessionTransaction<'a> {
             params,
             self.engine.access_to_internal(),
             &mut self.context,
+            Some(parsed.parse_duration),
         )
         .await
     }
@@ -666,7 +672,8 @@ impl<'a> SessionTransaction<'a> {
         sql: &str,
         params: &[Value],
     ) -> Result<crate::ExecuteResult, LixError> {
-        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
+        let parsed = parse_sql_with_timing(sql).map_err(LixError::from)?;
+        let parsed_statements = parsed.statements;
         let write_transaction = self.write_transaction.as_mut().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
@@ -678,6 +685,7 @@ impl<'a> SessionTransaction<'a> {
             params,
             true,
             &mut self.context,
+            Some(parsed.parse_duration),
         )
         .await
     }
@@ -1008,6 +1016,7 @@ mod tests {
                 &[],
                 crate::SqlDialect::Sqlite,
                 &runtime_bindings,
+                None,
             )
             .expect("execution program compilation should succeed");
 

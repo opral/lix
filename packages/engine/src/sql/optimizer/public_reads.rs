@@ -29,8 +29,7 @@ pub(crate) struct OptimizedPublicReadStatement {
 const DIRECT_HISTORY_STRATEGY_PASS: OptimizerPassMetadata = OptimizerPassMetadata {
     name: "public-read.choose-direct-history-strategy",
     order: 10,
-    description:
-        "choose direct history execution only for eligible history surfaces outside EXPLAIN",
+    description: "choose direct history execution for eligible history surfaces",
 };
 
 const BROAD_SURFACE_REWRITE_PASS: OptimizerPassMetadata = OptimizerPassMetadata {
@@ -50,32 +49,27 @@ pub(crate) fn public_read_pass_registry() -> &'static OptimizerPassRegistry {
 
 pub(crate) fn choose_specialized_public_read_strategy(
     binding: &SurfaceBinding,
-    explain_requested: bool,
 ) -> DirectExecutionStrategyDecision {
     choose_specialized_public_read_strategy_with_settings(
         binding,
-        explain_requested,
         &OptimizerPassSettings::default(),
     )
 }
 
 fn choose_specialized_public_read_strategy_with_settings(
     binding: &SurfaceBinding,
-    explain_requested: bool,
     settings: &OptimizerPassSettings,
 ) -> DirectExecutionStrategyDecision {
     let metadata = public_read_pass_registry().passes[0];
-    let direct_execution = is_direct_only_history_surface(binding) && !explain_requested;
+    let direct_execution = is_direct_only_history_surface(binding);
     let trace = run_infallible_pass(metadata, settings, || {
         let mut diagnostics = vec![format!(
-            "surface '{}' family={:?} variant={:?}",
+            "surface '{}' family={} variant={}",
             binding.descriptor.public_name,
-            binding.descriptor.surface_family,
-            binding.descriptor.surface_variant
+            surface_family_name(binding.descriptor.surface_family),
+            surface_variant_name(binding.descriptor.surface_variant)
         )];
-        if explain_requested {
-            diagnostics.push("EXPLAIN requested; forcing lowered SQL strategy".to_string());
-        } else if direct_execution {
+        if direct_execution {
             diagnostics.push("direct history execution strategy selected".to_string());
         } else {
             diagnostics.push("surface is not eligible for direct history execution".to_string());
@@ -88,6 +82,25 @@ fn choose_specialized_public_read_strategy_with_settings(
     DirectExecutionStrategyDecision {
         direct_execution,
         pass_traces: vec![trace],
+    }
+}
+
+fn surface_family_name(family: SurfaceFamily) -> &'static str {
+    match family {
+        SurfaceFamily::State => "state",
+        SurfaceFamily::Entity => "entity",
+        SurfaceFamily::Filesystem => "filesystem",
+        SurfaceFamily::Admin => "admin",
+        SurfaceFamily::Change => "change",
+    }
+}
+
+fn surface_variant_name(variant: SurfaceVariant) -> &'static str {
+    match variant {
+        SurfaceVariant::Default => "default",
+        SurfaceVariant::ByVersion => "by_version",
+        SurfaceVariant::History => "history",
+        SurfaceVariant::WorkingChanges => "working_changes",
     }
 }
 
@@ -253,7 +266,7 @@ mod tests {
         let binding = SurfaceRegistry::with_builtin_surfaces()
             .bind_relation_name("lix_state_history")
             .expect("builtin history surface should bind");
-        let decision = choose_specialized_public_read_strategy(&binding, false);
+        let decision = choose_specialized_public_read_strategy(&binding);
 
         assert!(decision.direct_execution);
         assert_eq!(decision.pass_traces.len(), 1);

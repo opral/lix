@@ -10,6 +10,8 @@ mod entity;
 mod entity_by_version;
 #[path = "sql_surfaces/entity_history.rs"]
 mod entity_history;
+#[path = "sql_surfaces/explain.rs"]
+mod explain;
 #[path = "sql_surfaces/key_value.rs"]
 mod key_value;
 #[path = "sql_surfaces/on_conflict_views.rs"]

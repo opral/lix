@@ -22,15 +22,18 @@ use crate::sql::catalog::{
 use crate::sql::executor::contracts::effects::PlanEffects;
 use crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::sql::executor::intent::authoritative_binary_blob_write_targets;
+use crate::sql::explain::{
+    build_public_write_explain_artifacts, unwrap_explain_statement, ExplainArtifacts, ExplainStage,
+    ExplainTimingCollector, PublicWriteExplainBuildInput,
+};
 use crate::sql::logical_plan::public_ir::{
     CommitPreconditions, PlannedWrite, StructuredPublicRead, WriteOperationKind,
 };
 use crate::sql::logical_plan::{
     verify_logical_plan, DependencySpec, LogicalPlan, PublicReadLogicalPlan,
 };
-use crate::sql::physical_plan::compile_lowered_read_statement;
 use crate::sql::physical_plan::{
-    LoweredReadProgram, PhysicalPlan, PreparedPublicReadExecution, PreparedPublicWriteExecution,
+    LoweredReadProgram, PreparedPublicReadExecution, PreparedPublicWriteExecution,
     PublicWriteExecutionPartition, PublicWriteMaterialization, TrackedWriteExecution,
     UntrackedWriteExecution,
 };
@@ -43,8 +46,8 @@ use crate::sql::semantic_ir::semantics::effective_state_resolver::{
 };
 use crate::sql::semantic_ir::semantics::write_resolver::resolve_write_plan_with_functions;
 use crate::sql::semantic_ir::{
-    analyze_public_write_semantics, BoundPublicLeaf, BoundStatement, ExecutionContext,
-    ExplainOptions, PublicExecutionDebugTrace, PublicWriteInvariantTrace, PublicWriteSemantics,
+    analyze_public_write_semantics, BoundStatement, ExecutionContext, PublicWriteInvariantTrace,
+    PublicWriteSemantics,
 };
 use crate::state::stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
@@ -64,6 +67,7 @@ use sqlparser::ast::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PublicReadOptimization {
@@ -81,7 +85,7 @@ pub(crate) struct PreparedPublicRead {
     pub(crate) bound_parameters: Vec<Value>,
     pub(crate) runtime_bindings: RuntimeBindingValues,
     pub(crate) public_output_columns: Option<Vec<String>>,
-    pub(crate) debug_trace: PublicExecutionDebugTrace,
+    pub(crate) explain: ExplainArtifacts,
 }
 
 pub(crate) use read::{decode_public_read_result, execute_prepared_public_read};
@@ -109,6 +113,10 @@ impl PreparedPublicRead {
             PreparedPublicReadExecution::Direct(_) => None,
         }
     }
+
+    pub(crate) fn surface_bindings(&self) -> &[String] {
+        &self.explain.executor_artifacts.surface_bindings
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,7 +125,7 @@ pub(crate) struct PreparedPublicWrite {
     pub(crate) planned_write: PlannedWrite,
     pub(crate) domain_change_batches: Vec<DomainChangeBatch>,
     pub(crate) execution: PreparedPublicWriteExecution,
-    pub(crate) debug_trace: PublicExecutionDebugTrace,
+    pub(crate) explain: ExplainArtifacts,
 }
 
 impl PreparedPublicWrite {
@@ -200,6 +208,7 @@ pub(crate) async fn prepare_public_execution_with_registry_and_internal_access_a
     writer_key: Option<&str>,
     allow_internal_tables: bool,
     pending_transaction_view: Option<&PendingTransactionView>,
+    parse_duration: Option<Duration>,
     functions: SharedFunctionProvider<P>,
 ) -> Result<Option<PreparedPublicExecution>, LixError>
 where
@@ -223,6 +232,7 @@ where
                 active_account_ids,
                 writer_key,
                 pending_transaction_view,
+                parse_duration,
                 functions,
             )
             .await?;
@@ -254,6 +264,7 @@ where
                 active_version_id,
                 writer_key,
                 allow_internal_tables,
+                parse_duration,
             )
             .await?
             .map(PreparedPublicExecution::Read)
@@ -286,6 +297,7 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
         active_account_ids,
         writer_key,
         allow_internal_tables,
+        None,
         SharedFunctionProvider::new(SystemFunctionProvider),
     )
     .await
@@ -299,6 +311,7 @@ pub(crate) async fn prepare_public_execution_with_internal_access_and_functions<
     active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
+    parse_duration: Option<Duration>,
     functions: SharedFunctionProvider<P>,
 ) -> Result<Option<PreparedPublicExecution>, LixError>
 where
@@ -317,6 +330,7 @@ where
             writer_key,
             allow_internal_tables,
             None,
+            parse_duration,
             functions,
         )
         .await;
@@ -335,6 +349,7 @@ where
         writer_key,
         allow_internal_tables,
         None,
+        parse_duration,
         functions,
     )
     .await
@@ -369,6 +384,7 @@ pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
     active_version_id: &str,
     writer_key: Option<&str>,
     allow_internal_tables: bool,
+    parse_duration: Option<Duration>,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
     read::try_prepare_public_read_with_registry_and_internal_access(
         backend,
@@ -378,6 +394,7 @@ pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
         active_version_id,
         writer_key,
         allow_internal_tables,
+        parse_duration,
     )
     .await
 }
@@ -1084,75 +1101,6 @@ fn expr_string_literal(expr: &Expr) -> Option<&str> {
     }
 }
 
-fn explain_query_statement(statement: &Statement) -> Option<(Statement, Option<ExplainOptions>)> {
-    match statement {
-        Statement::Query(_) => Some((statement.clone(), None)),
-        Statement::Explain {
-            describe_alias,
-            analyze,
-            verbose,
-            query_plan,
-            estimate,
-            statement,
-            format,
-            options,
-        } => match statement.as_ref() {
-            Statement::Query(_) => Some((
-                statement.as_ref().clone(),
-                Some(ExplainOptions {
-                    describe_alias: describe_alias.clone(),
-                    analyze: *analyze,
-                    verbose: *verbose,
-                    query_plan: *query_plan,
-                    estimate: *estimate,
-                    format: format.clone(),
-                    options: options.clone(),
-                }),
-            )),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn wrap_lowered_read_for_explain(
-    program: LoweredReadProgram,
-    envelope: Option<&ExplainOptions>,
-    dialect: crate::SqlDialect,
-) -> Result<LoweredReadProgram, LixError> {
-    let Some(envelope) = envelope else {
-        return Ok(program);
-    };
-
-    let statements = program
-        .statements
-        .into_iter()
-        .map(|statement| {
-            compile_lowered_read_statement(
-                dialect,
-                statement.bindings.minimum_param_count,
-                Statement::Explain {
-                    describe_alias: envelope.describe_alias,
-                    analyze: envelope.analyze,
-                    verbose: envelope.verbose,
-                    query_plan: envelope.query_plan,
-                    estimate: envelope.estimate,
-                    statement: Box::new(statement.shell_statement),
-                    format: envelope.format.clone(),
-                    options: envelope.options.clone(),
-                },
-                statement.relation_render_nodes,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(LoweredReadProgram {
-        statements,
-        pushdown_decision: program.pushdown_decision,
-        result_columns: program.result_columns,
-    })
-}
-
 pub(crate) async fn try_prepare_public_write_with_functions<P>(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
@@ -1160,6 +1108,7 @@ pub(crate) async fn try_prepare_public_write_with_functions<P>(
     active_version_id: &str,
     active_account_ids: &[String],
     writer_key: Option<&str>,
+    parse_duration: Option<Duration>,
     functions: SharedFunctionProvider<P>,
 ) -> Result<Option<PreparedPublicWrite>, LixError>
 where
@@ -1181,6 +1130,7 @@ where
         active_account_ids,
         writer_key,
         None,
+        parse_duration,
         functions,
     )
     .await
@@ -1195,6 +1145,7 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions<P>(
     active_account_ids: &[String],
     writer_key: Option<&str>,
     pending_transaction_view: Option<&PendingTransactionView>,
+    parse_duration: Option<Duration>,
     functions: SharedFunctionProvider<P>,
 ) -> Result<Option<PreparedPublicWrite>, LixError>
 where
@@ -1204,7 +1155,10 @@ where
         return Ok(None);
     }
 
-    let statement = parsed_statements[0].clone();
+    let explained = unwrap_explain_statement(&parsed_statements[0])?;
+    let statement = explained.statement;
+    let explain_request = explained.request;
+    let bind_started = Instant::now();
     let bound_statement = bind_statement(
         statement,
         params.to_vec(),
@@ -1215,8 +1169,11 @@ where
             active_account_ids: active_account_ids.to_vec(),
         },
     );
+    let mut stage_timings = ExplainTimingCollector::new(parse_duration);
+    stage_timings.record(ExplainStage::Bind, bind_started.elapsed());
     let filesystem_target_name =
         top_level_filesystem_write_target_name(&bound_statement.statement).map(str::to_string);
+    let semantic_started = Instant::now();
     let semantics = match PublicWriteSemantics::prepare(bound_statement.clone(), &registry) {
         Ok(semantics) => semantics,
         Err(error) => {
@@ -1243,6 +1200,8 @@ where
             }
         }
     };
+    stage_timings.record(ExplainStage::SemanticAnalysis, semantic_started.elapsed());
+    let logical_started = Instant::now();
     let mut write_analysis = match analyze_public_write_semantics(&semantics) {
         Ok(write_analysis) => write_analysis,
         Err(error) => {
@@ -1256,6 +1215,8 @@ where
     };
     let canonicalized = &write_analysis.semantics.canonicalized;
     let mut planned_write = write_analysis.planned_write.clone();
+    stage_timings.record(ExplainStage::LogicalPlanning, logical_started.elapsed());
+    let physical_started = Instant::now();
     let resolved_write_plan = match resolve_write_plan_with_functions(
         backend,
         &planned_write,
@@ -1313,32 +1274,21 @@ where
             "public write target must route through explicit public materialization",
         )
     })?;
+    stage_timings.record(ExplainStage::PhysicalPlanning, physical_started.elapsed());
+    let write_phase_trace = public_write_phase_trace();
+    let explain = build_public_write_explain_artifacts(PublicWriteExplainBuildInput {
+        request: explain_request,
+        semantics: write_analysis.semantics.clone(),
+        planned_write: planned_write.clone(),
+        execution: execution.clone(),
+        domain_change_batches: domain_change_batches.clone(),
+        invariant_trace: invariant_trace.clone(),
+        write_phase_trace: write_phase_trace.clone(),
+        stage_timings: stage_timings.finish(),
+    });
 
     Ok(Some(PreparedPublicWrite {
-        debug_trace: PublicExecutionDebugTrace {
-            semantic_statement: Some(write_analysis.semantics.semantic_statement()),
-            bound_statements: vec![bound_statement],
-            optimizer_passes: Vec::new(),
-            physical_plan: Some(PhysicalPlan::PublicWrite(execution.clone())),
-            surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
-            bound_public_leaves: vec![BoundPublicLeaf::from_surface_binding(
-                &canonicalized.surface_binding,
-            )],
-            dependency_spec: None,
-            effective_state_request: None,
-            effective_state_plan: None,
-            pushdown_decision: None,
-            write_command: Some(canonicalized.write_command.clone()),
-            scope_proof: Some(planned_write.scope_proof.clone()),
-            schema_proof: Some(planned_write.schema_proof.clone()),
-            target_set_proof: planned_write.target_set_proof.clone(),
-            resolved_write_plan: Some(resolved_write_plan),
-            domain_change_batches: domain_change_batches.clone(),
-            commit_preconditions: commit_preconditions.clone(),
-            invariant_trace,
-            write_phase_trace: public_write_phase_trace(),
-            lowered_sql: Vec::new(),
-        },
+        explain,
         planned_write,
         domain_change_batches,
         execution,
@@ -1817,6 +1767,7 @@ fn top_level_filesystem_write_target_name(statement: &Statement) -> Option<&'sta
 
 fn top_level_write_target_name(statement: &Statement) -> Option<String> {
     match statement {
+        Statement::Explain { statement, .. } => top_level_write_target_name(statement.as_ref()),
         Statement::Insert(insert) => match &insert.table {
             sqlparser::ast::TableObject::TableName(name) => Some(name.to_string()),
             _ => None,
@@ -2263,10 +2214,13 @@ mod tests {
         .await
         .expect("builtin entity read should canonicalize");
 
-        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_key_value"]);
+        assert_eq!(
+            prepared.explain.executor_artifacts.surface_bindings,
+            vec!["lix_key_value"]
+        );
         assert_eq!(
             prepared
-                .debug_trace
+                .explain
                 .optimizer_passes
                 .iter()
                 .map(|pass| pass.name)
@@ -2300,15 +2254,18 @@ mod tests {
         );
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .residual_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .residual_predicates
+                .clone(),
             vec!["key = 'hello'".to_string()]
         );
         let lowered_sql = prepared
-            .debug_trace
+            .explain
+            .executor_artifacts
             .lowered_sql
             .first()
             .expect("live public entity read should lower");
@@ -2353,7 +2310,10 @@ mod tests {
         .await
         .expect("registered-schema entity read should canonicalize");
 
-        assert_eq!(prepared.debug_trace.surface_bindings, vec!["message"]);
+        assert_eq!(
+            prepared.explain.executor_artifacts.surface_bindings,
+            vec!["message"]
+        );
         assert_eq!(
             prepared
                 .structured_read()
@@ -2367,7 +2327,8 @@ mod tests {
         assert!(prepared.dependency_spec().is_some());
         assert!(prepared.effective_state_plan().is_some());
         let lowered_sql = prepared
-            .debug_trace
+            .explain
+            .executor_artifacts
             .lowered_sql
             .first()
             .expect("registered-schema entity read should lower");
@@ -2412,8 +2373,7 @@ mod tests {
                     .expect("registered-schema derived public query should prepare through backend registry")
                     .expect("registered-schema derived public query should lower through backend registry");
                     let lowered_sql = prepared
-                        .debug_trace
-                        .lowered_sql
+                        .explain.executor_artifacts.lowered_sql
                         .first()
                         .expect("registered-schema derived public query should lower");
 
@@ -2451,23 +2411,26 @@ mod tests {
         .expect("builtin entity by-version read should canonicalize");
 
         assert_eq!(
-            prepared.debug_trace.surface_bindings,
+            prepared.explain.executor_artifacts.surface_bindings,
             vec!["lix_key_value_by_version"]
         );
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .residual_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .residual_predicates
+                .clone(),
             vec![
                 "key = 'hello'".to_string(),
                 "lixcol_version_id = 'version-a'".to_string()
             ]
         );
         let lowered_sql = prepared
-            .debug_trace
+            .explain
+            .executor_artifacts
             .lowered_sql
             .first()
             .expect("entity by-version read should lower");
@@ -2501,12 +2464,12 @@ mod tests {
                     .expect("builtin entity history read should canonicalize");
 
                     assert_eq!(
-                        prepared.debug_trace.surface_bindings,
+                        prepared.explain.executor_artifacts.surface_bindings,
                         vec!["lix_key_value_history"]
                     );
                     assert_eq!(
                         prepared
-                            .debug_trace
+                            .explain
                             .optimizer_passes
                             .iter()
                             .map(|pass| pass.name)
@@ -2515,11 +2478,13 @@ mod tests {
                     );
                     assert_eq!(
                         prepared
-                            .debug_trace
-                            .pushdown_decision
+                            .explain
+                            .executor_artifacts
+                            .pushdown
                             .as_ref()
-                            .expect("pushdown decision should be recorded")
-                            .residual_predicate_sql(),
+                            .expect("pushdown trace should be recorded")
+                            .residual_predicates
+                            .clone(),
                         vec!["key = 'hello'".to_string()]
                     );
                     match &prepared.execution {
@@ -2530,7 +2495,7 @@ mod tests {
                                 plan.request.root_scope,
                                 StateHistoryRootScope::RequestedRoots(vec![active_commit_id])
                             );
-                            assert!(prepared.debug_trace.lowered_sql.is_empty());
+                            assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
                         }
                         _ => {
                             panic!("entity history read should use direct entity-history execution")
@@ -2557,7 +2522,10 @@ mod tests {
         .await
         .expect("change read should canonicalize");
 
-        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_change"]);
+        assert_eq!(
+            prepared.explain.executor_artifacts.surface_bindings,
+            vec!["lix_change"]
+        );
         assert!(prepared.effective_state_request().is_none());
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
@@ -2569,15 +2537,18 @@ mod tests {
         );
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .residual_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .residual_predicates
+                .clone(),
             vec!["entity_id = 'entity-1'".to_string()]
         );
         let lowered_sql = prepared
-            .debug_trace
+            .explain
+            .executor_artifacts
             .lowered_sql
             .first()
             .expect("change read should lower");
@@ -2603,7 +2574,7 @@ mod tests {
         .expect("working-changes read should canonicalize");
 
         assert_eq!(
-            prepared.debug_trace.surface_bindings,
+            prepared.explain.executor_artifacts.surface_bindings,
             vec!["lix_working_changes"]
         );
         assert!(prepared.effective_state_request().is_none());
@@ -2617,15 +2588,18 @@ mod tests {
         );
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .residual_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .residual_predicates
+                .clone(),
             vec!["schema_key = 'lix_key_value'".to_string()]
         );
         let lowered_sql = prepared
-            .debug_trace
+            .explain
+            .executor_artifacts
             .lowered_sql
             .first()
             .expect("working-changes read should lower");
@@ -2648,7 +2622,10 @@ mod tests {
         .await
         .expect("filesystem read should canonicalize");
 
-        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_file"]);
+        assert_eq!(
+            prepared.explain.executor_artifacts.surface_bindings,
+            vec!["lix_file"]
+        );
         assert!(prepared.effective_state_request().is_none());
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
@@ -2672,15 +2649,18 @@ mod tests {
             .contains(&crate::session::contracts::SessionDependency::ActiveVersion));
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .residual_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .residual_predicates
+                .clone(),
             vec!["id = 'file-1'".to_string()]
         );
         let lowered_sql = prepared
-            .debug_trace
+            .explain
+            .executor_artifacts
             .lowered_sql
             .first()
             .expect("filesystem read should lower");
@@ -2707,25 +2687,28 @@ mod tests {
         .expect("filesystem by-version read should canonicalize");
 
         assert_eq!(
-            prepared.debug_trace.surface_bindings,
+            prepared.explain.executor_artifacts.surface_bindings,
             vec!["lix_directory_by_version"]
         );
         assert!(prepared.effective_state_request().is_none());
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .residual_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .residual_predicates
+                .clone(),
             vec![
                 "id = 'dir-1'".to_string(),
                 "lixcol_version_id = 'version-a'".to_string()
             ]
         );
         let lowered_sql = prepared
-            .debug_trace
+            .explain
+            .executor_artifacts
             .lowered_sql
             .first()
             .expect("filesystem by-version read should lower");
@@ -2752,18 +2735,20 @@ mod tests {
         .expect("filesystem history read should canonicalize");
 
         assert_eq!(
-            prepared.debug_trace.surface_bindings,
+            prepared.explain.executor_artifacts.surface_bindings,
             vec!["lix_file_history"]
         );
         assert!(prepared.effective_state_request().is_none());
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .accepted_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .accepted_predicates
+                .clone(),
             vec!["root_commit_id = 'commit-1'".to_string()]
         );
         match &prepared.execution {
@@ -2774,7 +2759,7 @@ mod tests {
                         "commit-1".to_string()
                     ])
                 );
-                assert!(prepared.debug_trace.lowered_sql.is_empty());
+                assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
             }
             PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(_)) => {
                 panic!("filesystem history read should not use state-history direct plan")
@@ -2811,16 +2796,18 @@ mod tests {
         .expect("filesystem by-version history read should canonicalize");
 
         assert_eq!(
-            prepared.debug_trace.surface_bindings,
+            prepared.explain.executor_artifacts.surface_bindings,
             vec!["lix_file_history_by_version"]
         );
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .accepted_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .accepted_predicates
+                .clone(),
             vec![
                 "root_commit_id = 'commit-1'".to_string(),
                 "version_id = 'version-a'".to_string()
@@ -2834,7 +2821,7 @@ mod tests {
                         "version-a".to_string()
                     ])
                 );
-                assert!(prepared.debug_trace.lowered_sql.is_empty());
+                assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
             }
             PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(_)) => {
                 panic!(
@@ -2875,16 +2862,18 @@ mod tests {
         .expect("directory history read should canonicalize");
 
         assert_eq!(
-            prepared.debug_trace.surface_bindings,
+            prepared.explain.executor_artifacts.surface_bindings,
             vec!["lix_directory_history"]
         );
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .accepted_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .accepted_predicates
+                .clone(),
             vec![
                 "root_commit_id = 'commit-1'".to_string(),
                 "id = 'dir-1'".to_string()
@@ -2899,7 +2888,7 @@ mod tests {
                     ])
                 );
                 assert_eq!(plan.request.directory_ids, vec!["dir-1".to_string()]);
-                assert!(prepared.debug_trace.lowered_sql.is_empty());
+                assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
             }
             PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(_)) => {
                 panic!("directory history read should not use state-history direct plan")
@@ -3010,7 +2999,7 @@ mod tests {
                                 plan.request.root_scope,
                                 StateHistoryRootScope::RequestedRoots(vec![active_commit_id])
                             );
-                            assert!(prepared.debug_trace.lowered_sql.is_empty());
+                            assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
                         }
                         _ => {
                             panic!("entity history read should use direct entity-history execution")
@@ -3021,27 +3010,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_explain_over_history_surfaces() {
+    async fn prepares_explain_over_history_surfaces_without_backend_rewrite() {
         let backend = FakeBackend::default();
-        let error = prepare_public_execution(
+        let prepared = prepare_public_execution(
             &backend,
-            &parse_one("EXPLAIN SELECT key FROM lix_key_value_history WHERE key = 'hello'"),
+            &parse_one(
+                "EXPLAIN SELECT key FROM lix_key_value_history \
+                 WHERE root_commit_id = 'root-1' AND key = 'hello'",
+            ),
             &[],
             "main",
             &[],
             None,
         )
         .await
-        .expect_err("history EXPLAIN should be rejected");
+        .expect("history EXPLAIN should prepare")
+        .expect("history EXPLAIN should route through public execution");
 
-        assert!(
-            error.description.contains("EXPLAIN is not supported")
-                || error
-                    .description
-                    .contains("direct-only history surfaces do not support broad surface lowering"),
-            "{}",
-            error.description
-        );
+        match prepared {
+            PreparedPublicExecution::Read(prepared) => {
+                assert_eq!(
+                    prepared.explain.executor_artifacts.surface_bindings,
+                    vec!["lix_key_value_history"]
+                );
+                assert!(
+                    prepared.explain.executor_artifacts.lowered_sql.is_empty(),
+                    "history EXPLAIN should stay on direct execution instead of lowering backend SQL"
+                );
+            }
+            PreparedPublicExecution::Write(_) => {
+                panic!("history EXPLAIN must not route through public write execution")
+            }
+        }
     }
 
     #[tokio::test]
@@ -3059,22 +3059,29 @@ mod tests {
         .await
         .expect("explain state read should canonicalize");
 
-        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_state"]);
+        assert_eq!(
+            prepared.explain.executor_artifacts.surface_bindings,
+            vec!["lix_state"]
+        );
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .accepted_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .accepted_predicates
+                .clone(),
             vec!["schema_key = 'lix_key_value'".to_string()]
         );
         let lowered_sql = prepared
-            .debug_trace
+            .explain
+            .executor_artifacts
             .lowered_sql
             .first()
             .expect("explain state read should lower");
-        assert!(lowered_sql.starts_with("EXPLAIN SELECT"));
+        assert!(!lowered_sql.starts_with("EXPLAIN SELECT"));
+        assert!(prepared.explain.request.is_some());
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
     }
 
@@ -3221,12 +3228,13 @@ mod tests {
         assert!(prepared.structured_read().is_none());
         assert!(prepared.dependency_spec().is_some());
         assert_eq!(
-            prepared.debug_trace.surface_bindings,
+            prepared.explain.executor_artifacts.surface_bindings,
             vec!["lix_state", "lix_state_by_version"]
         );
         assert_eq!(
             prepared
-                .debug_trace
+                .explain
+                .executor_artifacts
                 .bound_public_leaves
                 .iter()
                 .map(|leaf| leaf.public_name.as_str())
@@ -3241,7 +3249,8 @@ mod tests {
             DependencyPrecision::Conservative
         );
         let lowered_sql = prepared
-            .debug_trace
+            .explain
+            .executor_artifacts
             .lowered_sql
             .first()
             .expect("surface-expanded read should lower");
@@ -3273,9 +3282,13 @@ mod tests {
         .expect("group-by/having public read should prepare through public lowering");
 
         assert!(prepared.structured_read().is_none());
-        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_state"]);
+        assert_eq!(
+            prepared.explain.executor_artifacts.surface_bindings,
+            vec!["lix_state"]
+        );
         let lowered_sql = prepared
-            .debug_trace
+            .explain
+            .executor_artifacts
             .lowered_sql
             .first()
             .expect("group-by/having read should lower");
@@ -3327,24 +3340,29 @@ mod tests {
 
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .accepted_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .accepted_predicates
+                .clone(),
             vec!["schema_key = 'lix_key_value'".to_string()]
         );
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .residual_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .residual_predicates
+                .clone(),
             Vec::<String>::new()
         );
         let lowered_sql = prepared
-            .debug_trace
+            .explain
+            .executor_artifacts
             .lowered_sql
             .first()
             .expect("state read should lower");
@@ -3369,18 +3387,21 @@ mod tests {
 
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .accepted_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .accepted_predicates
+                .clone(),
             vec![
                 "version_id = 'v1'".to_string(),
                 "schema_key = 'lix_key_value'".to_string()
             ]
         );
         let lowered_sql = prepared
-            .debug_trace
+            .explain
+            .executor_artifacts
             .lowered_sql
             .first()
             .expect("state-by-version read should lower");
@@ -3408,11 +3429,13 @@ mod tests {
 
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .accepted_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .accepted_predicates
+                .clone(),
             vec!["root_commit_id = 'commit-1'".to_string()]
         );
         match &prepared.execution {
@@ -3421,7 +3444,7 @@ mod tests {
                     plan.request.root_scope,
                     StateHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
                 );
-                assert!(prepared.debug_trace.lowered_sql.is_empty());
+                assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
             }
             PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(_)) => {
                 panic!("state-history read should not use entity-history direct plan")
@@ -3460,11 +3483,13 @@ mod tests {
 
         assert_eq!(
             prepared
-                .debug_trace
-                .pushdown_decision
+                .explain
+                .executor_artifacts
+                .pushdown
                 .as_ref()
-                .expect("pushdown decision should be recorded")
-                .accepted_predicate_sql(),
+                .expect("pushdown trace should be recorded")
+                .accepted_predicates
+                .clone(),
             vec!["root_commit_id = 'commit-1'".to_string()]
         );
         match &prepared.execution {
@@ -3473,7 +3498,7 @@ mod tests {
                     plan.request.root_scope,
                     StateHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
                 );
-                assert!(prepared.debug_trace.lowered_sql.is_empty());
+                assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
             }
             _ => panic!("grouped state-history read should use direct state-history execution"),
         }
@@ -3497,7 +3522,8 @@ mod tests {
         .expect("nested filesystem subquery should prepare through public lowering");
 
         let lowered_sql = prepared
-            .debug_trace
+            .explain
+            .executor_artifacts
             .lowered_sql
             .first()
             .expect("nested filesystem subquery should lower");
@@ -3530,8 +3556,13 @@ mod tests {
                     .await
                     .expect("session runtime function read should prepare through public lowering");
 
-                    assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_version"]);
-                    if let Some(lowered_sql) = prepared.debug_trace.lowered_sql.first() {
+                    assert_eq!(
+                        prepared.explain.executor_artifacts.surface_bindings,
+                        vec!["lix_version"]
+                    );
+                    if let Some(lowered_sql) =
+                        prepared.explain.executor_artifacts.lowered_sql.first()
+                    {
                         assert!(!lowered_sql.contains("FROM lix_version"));
                         assert!(lowered_sql.contains("FROM lix_internal_change c"));
                         assert!(lowered_sql.contains("lix_version_descriptor"));

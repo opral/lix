@@ -1,7 +1,7 @@
 use crate::change_view::TrackedDomainChangeView;
 use crate::sql::logical_plan::public_ir::{
     CommitPreconditions, ExpectedHead, IdempotencyKey, MutationPayload, PlannedStateRow,
-    PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode,
+    PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode, WriteOperationKind,
 };
 use crate::{LixBackend, LixError};
 use serde_json::{json, Map, Value as JsonValue};
@@ -239,9 +239,9 @@ fn build_idempotency_key(
 ) -> Result<IdempotencyKey, DomainChangeError> {
     let summarized = json!({
         "surface": planned_write.command.target.descriptor.public_name,
-        "operation": format!("{:?}", planned_write.command.operation_kind),
+        "operation": write_operation_kind_name(planned_write.command.operation_kind),
         "partition_index": partition_index,
-        "lane": format!("{:?}", write_lane),
+        "lane": write_lane_name(write_lane),
         "writer_key": planned_write.command.execution_context.writer_key,
         "payload": summarize_mutation_payload(&planned_write.command.payload),
         "resolved_rows": summarize_partition_rows(partition),
@@ -254,13 +254,29 @@ fn build_idempotency_key(
     Ok(IdempotencyKey(
         json!({
             "surface": planned_write.command.target.descriptor.public_name,
-            "operation": format!("{:?}", planned_write.command.operation_kind),
+            "operation": write_operation_kind_name(planned_write.command.operation_kind),
             "partition_index": partition_index,
-            "lane": format!("{:?}", write_lane),
+            "lane": write_lane_name(write_lane),
             "fingerprint": fingerprint,
         })
         .to_string(),
     ))
+}
+
+fn write_operation_kind_name(kind: WriteOperationKind) -> &'static str {
+    match kind {
+        WriteOperationKind::Insert => "insert",
+        WriteOperationKind::Update => "update",
+        WriteOperationKind::Delete => "delete",
+    }
+}
+
+fn write_lane_name(lane: &WriteLane) -> &'static str {
+    match lane {
+        WriteLane::ActiveVersion => "active_version",
+        WriteLane::SingleVersion(_) => "single_version",
+        WriteLane::GlobalAdmin => "global_admin",
+    }
 }
 
 fn summarize_partition_rows(partition: &ResolvedWritePartition) -> JsonValue {

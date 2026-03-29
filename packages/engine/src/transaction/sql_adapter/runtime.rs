@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use crate::canonical::pending_session::PendingPublicCommitSession;
 use crate::canonical::CanonicalCommitReceipt;
@@ -32,6 +33,7 @@ pub(crate) struct CompiledExecutionStep {
 }
 
 pub(crate) enum CompiledExecutionRoute<'a> {
+    Explain(&'a crate::sql::explain::ExplainArtifacts),
     PublicRead(&'a PreparedPublicRead),
     PlannedWriteDelta(&'a PlannedWriteDelta),
     PublicWriteNoop,
@@ -49,7 +51,11 @@ impl CompiledExecutionStep {
         writer_key: Option<&str>,
     ) -> Result<Self, LixError> {
         let schema_registrations = schema_registrations_for_compiled_execution(&execution);
-        let planned_write_delta = build_planned_write_delta(&execution, writer_key)?;
+        let planned_write_delta = if execution.explain().is_some() {
+            None
+        } else {
+            build_planned_write_delta(&execution, writer_key)?
+        };
         Ok(Self {
             execution,
             planned_write_delta,
@@ -70,18 +76,27 @@ impl CompiledExecutionStep {
     }
 
     pub(crate) fn has_materialization_plan(&self) -> bool {
+        if self.execution.explain().is_some() {
+            return false;
+        }
         self.planned_write_delta
             .as_ref()
             .is_some_and(|delta| !delta.materialization_plan().units.is_empty())
     }
 
     pub(crate) fn is_bufferable_write(&self, statement: &Statement) -> bool {
+        if self.execution.explain().is_some() {
+            return false;
+        }
         self.planned_write_delta.is_some()
             && !matches!(self.execution.result_contract, ResultContract::DmlReturning)
             && !matches!(statement, Statement::Query(_) | Statement::Explain { .. })
     }
 
     pub(crate) fn route(&self) -> CompiledExecutionRoute<'_> {
+        if let Some(explain) = self.execution.plain_explain() {
+            return CompiledExecutionRoute::Explain(explain);
+        }
         if let Some(public_read) = self.execution.public_read() {
             return CompiledExecutionRoute::PublicRead(public_read);
         }
@@ -109,8 +124,12 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
     writer_key: Option<&str>,
 ) -> Result<CompiledExecutionStepResult, LixError> {
     match step.route() {
+        CompiledExecutionRoute::Explain(explain) => Ok(CompiledExecutionStepResult::Immediate(
+            explain.render_query_result()?,
+        )),
         CompiledExecutionRoute::PublicRead(public_read) => {
             let backend = TransactionBackendAdapter::new(transaction);
+            let execution_started = Instant::now();
             let public_result = match execute_prepared_public_read_with_pending_transaction_view(
                 &backend,
                 pending_transaction_view,
@@ -129,6 +148,14 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
                     return Err(normalized);
                 }
             };
+            if let Some(explain) = step.execution().analyzed_explain() {
+                return Ok(CompiledExecutionStepResult::Immediate(
+                    explain.render_analyzed_query_result(
+                        &public_result,
+                        execution_started.elapsed(),
+                    )?,
+                ));
+            }
             Ok(CompiledExecutionStepResult::Immediate(public_result))
         }
         CompiledExecutionRoute::PlannedWriteDelta(delta) => {
@@ -147,6 +174,7 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
         CompiledExecutionRoute::Internal(internal) => {
             apply_schema_registrations_in_transaction(transaction, step.schema_registrations())
                 .await?;
+            let execution_started = Instant::now();
             match execute_internal_execution_with_transaction(
                 transaction,
                 internal,
@@ -157,7 +185,17 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
             .await
             .map_err(LixError::from)
             {
-                Ok(execution) => Ok(CompiledExecutionStepResult::Outcome(execution)),
+                Ok(execution) => {
+                    if let Some(explain) = step.execution().analyzed_explain() {
+                        return Ok(CompiledExecutionStepResult::Immediate(
+                            explain.render_analyzed_query_result(
+                                &execution.public_result,
+                                execution_started.elapsed(),
+                            )?,
+                        ));
+                    }
+                    Ok(CompiledExecutionStepResult::Outcome(execution))
+                }
                 Err(error) => {
                     let backend = TransactionBackendAdapter::new(transaction);
                     let normalized = normalize_sql_execution_error_with_backend(

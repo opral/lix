@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::engine::{Engine, ExecuteOptions};
 use crate::sql::binder::{
@@ -247,12 +248,14 @@ impl StatementTemplate {
         &self,
         params: &[Value],
         runtime_bindings: &RuntimeBindingValues,
+        parse_duration: Option<Duration>,
     ) -> Result<BoundStatementTemplateInstance, LixError> {
         let bound =
             bind_statement_binding_template(&self.binding_template, params, runtime_bindings)?;
         Ok(BoundStatementTemplateInstance {
             statement: bound.statement,
             params: bound.params,
+            parse_duration,
             ownership_hint: self.ownership_hint,
             plan_requirements: self.plan_requirements.clone(),
         })
@@ -263,6 +266,7 @@ impl StatementTemplate {
 pub(crate) struct BoundStatementTemplateInstance {
     statement: Statement,
     params: Vec<Value>,
+    parse_duration: Option<Duration>,
     ownership_hint: Option<StatementTemplateOwnership>,
     plan_requirements: PlanRequirements,
 }
@@ -274,6 +278,10 @@ impl BoundStatementTemplateInstance {
 
     pub(crate) fn params(&self) -> &[Value] {
         &self.params
+    }
+
+    pub(crate) fn parse_duration(&self) -> Option<Duration> {
+        self.parse_duration
     }
 
     pub(crate) fn ownership_hint(&self) -> Option<StatementTemplateOwnership> {
@@ -318,9 +326,13 @@ impl ExecutionProgram {
         params: &[Value],
         dialect: SqlDialect,
         runtime_bindings: &RuntimeBindingValues,
+        parse_duration: Option<Duration>,
     ) -> Result<Self, LixError> {
         let source_statements =
             coalesce_state_surface_inserts_in_transactions(original_statements)?;
+        let single_statement_parse_duration = (source_statements.len() == 1)
+            .then_some(parse_duration)
+            .flatten();
         let mut steps = Vec::with_capacity(source_statements.len());
         let mut placeholder_state = PlaceholderState::new();
         for statement in source_statements.iter().cloned() {
@@ -331,7 +343,8 @@ impl ExecutionProgram {
 
             let (template, next_placeholder_state) =
                 StatementTemplate::compile(statement, dialect, params.len(), placeholder_state)?;
-            let bound_template = template.bind(params, runtime_bindings)?;
+            let bound_template =
+                template.bind(params, runtime_bindings, single_statement_parse_duration)?;
             placeholder_state = next_placeholder_state;
             steps.push(ExecutionProgramStep::Statement(ExecutionProgramStatement {
                 bound_template,
