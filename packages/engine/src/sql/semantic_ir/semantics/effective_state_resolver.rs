@@ -1,8 +1,8 @@
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::sql::logical_plan::DependencySpec;
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
 };
+use crate::sql::logical_plan::DependencySpec;
 use crate::sql::semantic_ir::semantics::surface_semantics::{
     canonical_filter_column_name, effective_state_pushdown_predicates, overlay_lanes,
     overlay_lanes_for_version, OverlayLane,
@@ -724,12 +724,12 @@ async fn exact_effective_state_row_from_pending(
 #[cfg(test)]
 mod tests {
     use super::{build_effective_state, OverlayLane, StateSourceAuthority};
-    use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::binder::bind_statement;
-    use crate::sql::semantic_ir::ExecutionContext;
-    use crate::sql::semantic_ir::canonicalize::canonicalize_read;
+    use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::logical_plan::public_ir::StructuredPublicRead;
+    use crate::sql::semantic_ir::canonicalize::canonicalize_read;
     use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
+    use crate::sql::semantic_ir::ExecutionContext;
     use crate::{SqlDialect, Value};
 
     fn structured_read(

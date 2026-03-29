@@ -396,13 +396,13 @@ fn resolved_row_writer_key(
 #[cfg(test)]
 mod tests {
     use super::{build_domain_change_batch, derive_commit_preconditions};
-    use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::binder::bind_statement;
-    use crate::sql::semantic_ir::ExecutionContext;
-    use crate::sql::semantic_ir::canonicalize::canonicalize_write;
+    use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::logical_plan::public_ir::{ExpectedHead, WriteLane};
+    use crate::sql::semantic_ir::canonicalize::canonicalize_write;
     use crate::sql::semantic_ir::semantics::write_analysis::analyze_write;
     use crate::sql::semantic_ir::semantics::write_resolver::resolve_write_plan;
+    use crate::sql::semantic_ir::ExecutionContext;
     use crate::{CreateVersionOptions, Value};
 
     async fn planned_write_with_params(

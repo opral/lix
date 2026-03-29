@@ -1,6 +1,6 @@
 use crate::read::models::{DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest};
 use crate::sql::catalog::SurfaceBinding;
-use crate::sql::physical_plan::lowerer::LoweredResultColumns;
+use crate::sql::physical_plan::LoweredResultColumns;
 use crate::Value;
 
 #[derive(Debug, Clone, PartialEq)]

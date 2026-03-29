@@ -1,10 +1,10 @@
 use crate::session::contracts::SessionDependency;
-use crate::sql::logical_plan::{DependencyPrecision, DependencySpec};
 use crate::sql::catalog::{SurfaceBinding, SurfaceFamily};
 use crate::sql::logical_plan::public_ir::{
     CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan,
     CanonicalWorkingChangesScan, FilesystemKind, ReadPlan, StructuredPublicRead, VersionScope,
 };
+use crate::sql::logical_plan::{DependencyPrecision, DependencySpec};
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
 use sqlparser::ast::{
@@ -78,7 +78,7 @@ pub(crate) fn derive_dependency_spec_from_structured_public_read(
         }
         collect_literal_filters_from_expr(
             predicate,
-            &structured_read.bound_statement.bound_parameters,
+            &structured_read.bound_parameters,
             &mut placeholder_state,
             &mut spec,
         );
@@ -284,9 +284,7 @@ fn dependency_spec_for_state_like_surface(binding: &SurfaceBinding) -> Dependenc
             crate::sql::catalog::DefaultScopeSemantics::ExplicitVersion => {
                 Some(VersionScope::ExplicitVersion)
             }
-            crate::sql::catalog::DefaultScopeSemantics::History => {
-                Some(VersionScope::History)
-            }
+            crate::sql::catalog::DefaultScopeSemantics::History => Some(VersionScope::History),
             crate::sql::catalog::DefaultScopeSemantics::GlobalAdmin
             | crate::sql::catalog::DefaultScopeSemantics::WorkingChanges => None,
         };
@@ -584,12 +582,12 @@ fn add_filter_literal(column: FilterColumn, value: String, spec: &mut Dependency
 mod tests {
     use super::derive_dependency_spec_from_structured_public_read;
     use crate::session::contracts::SessionDependency;
-    use crate::sql::logical_plan::DependencyPrecision;
-    use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::binder::bind_statement;
-    use crate::sql::semantic_ir::ExecutionContext;
-    use crate::sql::semantic_ir::canonicalize::canonicalize_read;
+    use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::logical_plan::public_ir::StructuredPublicRead;
+    use crate::sql::logical_plan::DependencyPrecision;
+    use crate::sql::semantic_ir::canonicalize::canonicalize_read;
+    use crate::sql::semantic_ir::ExecutionContext;
     use crate::{SqlDialect, Value};
 
     fn structured_read(

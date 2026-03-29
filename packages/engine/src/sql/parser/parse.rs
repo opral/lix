@@ -1,5 +1,5 @@
-use crate::LixError;
 use crate::sql::executor::contracts::planner_error::PlannerError;
+use crate::LixError;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::{Parser, ParserError};

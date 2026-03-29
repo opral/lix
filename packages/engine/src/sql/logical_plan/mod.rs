@@ -16,11 +16,11 @@ pub(crate) use direct_reads::{
     DirectPublicReadPlan, DirectStateHistoryField, DirectoryHistoryAggregate,
     DirectoryHistoryDirectReadPlan, DirectoryHistoryPredicate, DirectoryHistoryProjection,
     DirectoryHistorySortKey, EntityHistoryDirectReadPlan, EntityHistoryPredicate,
-    EntityHistoryProjection, EntityHistorySortKey, FileHistoryAggregate,
-    FileHistoryDirectReadPlan, FileHistoryPredicate, FileHistoryProjection, FileHistorySortKey,
-    StateHistoryAggregate, StateHistoryAggregatePredicate, StateHistoryDirectReadPlan,
-    StateHistoryPredicate, StateHistoryProjection, StateHistoryProjectionValue,
-    StateHistorySortKey, StateHistorySortValue,
+    EntityHistoryProjection, EntityHistorySortKey, FileHistoryAggregate, FileHistoryDirectReadPlan,
+    FileHistoryPredicate, FileHistoryProjection, FileHistorySortKey, StateHistoryAggregate,
+    StateHistoryAggregatePredicate, StateHistoryDirectReadPlan, StateHistoryPredicate,
+    StateHistoryProjection, StateHistoryProjectionValue, StateHistorySortKey,
+    StateHistorySortValue,
 };
 pub(crate) use plan::{
     InternalLogicalPlan, LogicalPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan,

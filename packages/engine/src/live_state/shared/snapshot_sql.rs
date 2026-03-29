@@ -29,57 +29,54 @@ pub(crate) fn live_snapshot_select_expr(
     }
 }
 
-fn sqlite_live_snapshot_select_expr(
-    layout: &LiveTableLayout,
-    table_alias: Option<&str>,
-) -> String {
+fn sqlite_live_snapshot_select_expr(layout: &LiveTableLayout, table_alias: Option<&str>) -> String {
     layout
         .columns
         .iter()
         .fold("json('{}')".to_string(), |current, column| {
-            format!(
-                "json_patch({current}, {fragment})",
-                current = current,
-                fragment = sqlite_live_snapshot_fragment(column, table_alias),
-            )
+            sqlite_live_snapshot_step(&current, column, table_alias)
         })
 }
 
-fn sqlite_live_snapshot_fragment(
+fn sqlite_live_snapshot_step(
+    current: &str,
     column: &crate::live_state::storage::LiveColumnSpec,
     table_alias: Option<&str>,
 ) -> String {
     let column_ref = qualified_column_ref(table_alias, &column.column_name);
-    let property_name = escape_sql_string_literal(&column.property_name);
+    let json_path = escape_sql_string_literal(&format!("$.{}", column.property_name));
     let value_expr = match column.kind {
         LiveColumnKind::JsonText => format!(
-            "CASE WHEN {column_ref} IS NULL THEN NULL ELSE json({column_ref}) END",
+            "CASE WHEN {column_ref} IS NULL THEN json('null') ELSE json({column_ref}) END",
             column_ref = column_ref,
         ),
         LiveColumnKind::Boolean => format!(
             "CASE \
-                WHEN {column_ref} IS NULL THEN NULL \
+                WHEN {column_ref} IS NULL THEN json('null') \
                 WHEN {column_ref} = 0 THEN json('false') \
                 ELSE json('true') \
              END",
             column_ref = column_ref,
         ),
-        LiveColumnKind::String | LiveColumnKind::Integer | LiveColumnKind::Number => {
-            column_ref.clone()
-        }
+        LiveColumnKind::String | LiveColumnKind::Integer | LiveColumnKind::Number => format!(
+            "CASE WHEN {column_ref} IS NULL THEN json('null') ELSE {column_ref} END",
+            column_ref = column_ref,
+        ),
     };
-    let object_expr = format!(
-        "json_object('{property_name}', {value_expr})",
-        property_name = property_name,
+    let set_expr = format!(
+        "json_set({current}, '{json_path}', {value_expr})",
+        current = current,
+        json_path = json_path,
         value_expr = value_expr,
     );
     if column.preserve_null_in_logical_snapshot() {
-        object_expr
+        set_expr
     } else {
         format!(
-            "CASE WHEN {column_ref} IS NULL THEN json('{{}}') ELSE {object_expr} END",
+            "CASE WHEN {column_ref} IS NULL THEN {current} ELSE {set_expr} END",
             column_ref = column_ref,
-            object_expr = object_expr,
+            current = current,
+            set_expr = set_expr,
         )
     }
 }

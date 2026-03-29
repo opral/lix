@@ -8,9 +8,9 @@ use crate::sql::executor::execute_prepared::execute_prepared_with_transaction;
 use crate::sql::executor::execution_program::{
     BoundStatementTemplateInstance, ExecutionContext, ExecutionProgram,
 };
+use crate::sql::executor::public_runtime::execute_prepared_public_read;
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::sql::executor::shared_path::{self, PreparationPolicy};
-use crate::sql::executor::public_runtime::execute_prepared_public_read;
 use crate::sql::logical_plan::ResultContract;
 use crate::{
     ExecuteResult, LixBackend, LixBackendTransaction, LixError, QueryResult, TransactionMode,

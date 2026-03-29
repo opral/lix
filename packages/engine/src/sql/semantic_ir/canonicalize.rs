@@ -3,8 +3,7 @@ use crate::sql::logical_plan::public_ir::{
     CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan,
     CanonicalWorkingChangesScan, InsertOnConflict, InsertOnConflictAction, MutationPayload,
     NormalizedPublicReadQuery, PredicateSpec, ProjectionExpr, ReadCommand, ReadContract, ReadPlan,
-    SortKey, StructuredPublicRead, WriteCommand, WriteModeRequest, WriteOperationKind,
-    WriteSelector,
+    SortKey, WriteCommand, WriteModeRequest, WriteOperationKind, WriteSelector,
 };
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::semantic_ir::{BoundStatement, ExecutionContext, StatementKind};
@@ -30,6 +29,7 @@ impl CanonicalizeError {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CanonicalizedRead {
     pub(crate) bound_statement: BoundStatement,
@@ -38,10 +38,25 @@ pub(crate) struct CanonicalizedRead {
     pub(crate) query: NormalizedPublicReadQuery,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CanonicalizedReadParts {
+    pub(crate) surface_binding: SurfaceBinding,
+    pub(crate) read_command: ReadCommand,
+    pub(crate) query: NormalizedPublicReadQuery,
+}
+
+#[cfg(test)]
 impl CanonicalizedRead {
-    pub(crate) fn structured_read(&self) -> StructuredPublicRead {
-        StructuredPublicRead {
-            bound_statement: self.bound_statement.clone(),
+    pub(crate) fn structured_read(
+        &self,
+    ) -> crate::sql::logical_plan::public_ir::StructuredPublicRead {
+        crate::sql::logical_plan::public_ir::StructuredPublicRead {
+            bound_parameters: self.bound_statement.bound_parameters.clone(),
+            requested_version_id: self
+                .bound_statement
+                .execution_context
+                .requested_version_id
+                .clone(),
             surface_binding: self.surface_binding.clone(),
             read_command: self.read_command.clone(),
             query: self.query.clone(),
@@ -56,10 +71,25 @@ pub(crate) struct CanonicalizedWrite {
     pub(crate) write_command: WriteCommand,
 }
 
+#[cfg(test)]
 pub(crate) fn canonicalize_read(
     bound_statement: BoundStatement,
     registry: &SurfaceRegistry,
 ) -> Result<CanonicalizedRead, CanonicalizeError> {
+    let parts = canonicalize_read_parts(&bound_statement, registry)?;
+
+    Ok(CanonicalizedRead {
+        bound_statement,
+        surface_binding: parts.surface_binding,
+        read_command: parts.read_command,
+        query: parts.query,
+    })
+}
+
+pub(crate) fn canonicalize_read_parts(
+    bound_statement: &BoundStatement,
+    registry: &SurfaceRegistry,
+) -> Result<CanonicalizedReadParts, CanonicalizeError> {
     if bound_statement.statement_kind != StatementKind::Query {
         return Err(CanonicalizeError::unsupported(
             "public day-1 canonicalizer only supports query statements",
@@ -168,8 +198,7 @@ pub(crate) fn canonicalize_read(
         };
     }
 
-    Ok(CanonicalizedRead {
-        bound_statement,
+    Ok(CanonicalizedReadParts {
         surface_binding,
         read_command: ReadCommand {
             root,
@@ -1845,12 +1874,12 @@ fn expr_to_u64(expr: &Expr) -> Result<u64, CanonicalizeError> {
 #[cfg(test)]
 mod tests {
     use super::{canonicalize_read, canonicalize_write};
-    use crate::sql::catalog::{DynamicEntitySurfaceSpec, SurfaceRegistry};
     use crate::sql::binder::bind_statement;
-    use crate::sql::semantic_ir::{BoundStatement, ExecutionContext};
+    use crate::sql::catalog::{DynamicEntitySurfaceSpec, SurfaceRegistry};
     use crate::sql::logical_plan::public_ir::{
         MutationPayload, ReadContract, ReadPlan, VersionScope, WriteModeRequest, WriteOperationKind,
     };
+    use crate::sql::semantic_ir::{BoundStatement, ExecutionContext};
     use crate::Value;
     use serde_json::json;
     use std::collections::BTreeMap;

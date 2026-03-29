@@ -1,10 +1,10 @@
 use crate::sql::catalog::SurfaceOverrideValue;
-use crate::sql::semantic_ir::canonicalize::{
-    evaluate_public_write_expr_to_value, CanonicalizedWrite,
-};
 use crate::sql::logical_plan::public_ir::{
     MutationPayload, PlannedWrite, SchemaProof, ScopeProof, StateSourceKind, TargetSetProof,
     WriteModeRequest,
+};
+use crate::sql::semantic_ir::canonicalize::{
+    evaluate_public_write_expr_to_value, CanonicalizedWrite,
 };
 use crate::sql::semantic_ir::semantics::surface_semantics::canonical_filter_column_name;
 use crate::version::GLOBAL_VERSION_ID;
@@ -86,12 +86,8 @@ fn analyze_write_scope(
             Ok(write_scope_for_explicit_version_surface(canonicalized))
         }
         crate::sql::catalog::DefaultScopeSemantics::History => Ok(ScopeProof::Unbounded),
-        crate::sql::catalog::DefaultScopeSemantics::GlobalAdmin => {
-            Ok(ScopeProof::GlobalAdmin)
-        }
-        crate::sql::catalog::DefaultScopeSemantics::WorkingChanges => {
-            Ok(ScopeProof::Unknown)
-        }
+        crate::sql::catalog::DefaultScopeSemantics::GlobalAdmin => Ok(ScopeProof::GlobalAdmin),
+        crate::sql::catalog::DefaultScopeSemantics::WorkingChanges => Ok(ScopeProof::Unknown),
     }
 }
 
@@ -559,11 +555,11 @@ fn selector_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<
 #[cfg(test)]
 mod tests {
     use super::analyze_write;
-    use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::binder::bind_statement;
-    use crate::sql::semantic_ir::ExecutionContext;
-    use crate::sql::semantic_ir::canonicalize::canonicalize_write;
+    use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::logical_plan::public_ir::{SchemaProof, ScopeProof, TargetSetProof};
+    use crate::sql::semantic_ir::canonicalize::canonicalize_write;
+    use crate::sql::semantic_ir::ExecutionContext;
     use std::collections::BTreeSet;
 
     fn canonicalized_write(

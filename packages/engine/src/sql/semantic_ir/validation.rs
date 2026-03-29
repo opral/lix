@@ -16,10 +16,11 @@ use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
     SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,
 };
+use crate::sql::binder::bind_sql;
+use crate::sql::catalog::SurfaceFamily;
 use crate::sql::executor::contracts::planned_statement::{
     MutationOperation, MutationRow, UpdateValidationPlan,
 };
-use crate::sql::catalog::SurfaceFamily;
 use crate::sql::logical_plan::public_ir::{
     InsertOnConflictAction, PlannedStateRow, PlannedWrite, ResolvedWritePlan, WriteMode,
     WriteOperationKind,
@@ -29,7 +30,6 @@ use crate::sql::services::state_reader::{
     load_live_row_access_for_table, projected_row_snapshot_json, scan_live_rows,
     snapshot_json_from_row, LiveReadRow, LiveStorageLane,
 };
-use crate::sql::binder::bind_sql;
 use crate::{LixBackend, LixError, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";

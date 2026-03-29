@@ -6,8 +6,8 @@ use crate::sql::executor::contracts::effects::PlanEffects;
 use crate::sql::executor::contracts::planned_statement::{
     MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
-use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::sql::executor::public_runtime::{PreparedPublicRead, PreparedPublicWrite};
+use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::sql::logical_plan::ResultContract;
 
 #[derive(Clone)]

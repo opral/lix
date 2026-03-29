@@ -7,36 +7,36 @@ use crate::filesystem::runtime::{
     binary_blob_writes_from_filesystem_state, delete_targets_from_filesystem_state,
     FilesystemTransactionState,
 };
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::read::models::TrackedDomainChangeView;
 use crate::schema::builtin::builtin_schema_definition;
 use crate::session::contracts::SessionStateDelta;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
-use crate::sql::ast::lowering::lower_statement;
+use crate::sql::backend::PushdownDecision;
+use crate::sql::binder::bind_statement;
+use crate::sql::binder::RuntimeBindingValues;
+use crate::sql::catalog::{SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
 use crate::sql::executor::contracts::effects::PlanEffects;
 use crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::sql::executor::intent::authoritative_binary_blob_write_targets;
-use crate::sql::backend::PushdownDecision;
-use crate::sql::catalog::{SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
-use crate::sql::binder::bind_statement;
-use crate::sql::physical_plan::lowerer::{
-    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id,
-    summarize_bound_public_read_statement_with_registry, LoweredReadProgram,
-};
-use crate::sql::semantic_ir::canonicalize::CanonicalizedWrite;
-use crate::sql::semantic_ir::{
-    analyze_public_write_semantics, BoundPublicLeaf, BoundStatement, ExecutionContext,
-    ExplainOptions, PublicExecutionDebugTrace, PublicWriteInvariantTrace, PublicWriteSemantics,
-};
-use crate::sql::logical_plan::{
-    verify_logical_plan, DependencySpec, DirectPublicReadPlan, LogicalPlan,
-    PublicReadLogicalPlan,
-};
 use crate::sql::logical_plan::public_ir::{
     CommitPreconditions, PlannedWrite, StructuredPublicRead, WriteOperationKind,
 };
+#[cfg(test)]
+use crate::sql::logical_plan::DirectPublicReadPlan;
+use crate::sql::logical_plan::{
+    verify_logical_plan, DependencySpec, LogicalPlan, PublicReadLogicalPlan,
+};
+use crate::sql::physical_plan::compile_lowered_read_statement;
+use crate::sql::physical_plan::lowerer::summarize_bound_public_read_statement_with_registry;
+use crate::sql::physical_plan::{
+    LoweredReadProgram, PhysicalPlan, PreparedPublicReadExecution, PreparedPublicWriteExecution,
+    PublicWriteExecutionPartition, PublicWriteMaterialization, TrackedWriteExecution,
+    UntrackedWriteExecution,
+};
+use crate::sql::semantic_ir::canonicalize::CanonicalizedWrite;
 use crate::sql::semantic_ir::semantics::domain_changes::{
     build_domain_change_batch, derive_commit_preconditions, DomainChangeBatch,
 };
@@ -44,6 +44,10 @@ use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     EffectiveStatePlan, EffectiveStateRequest,
 };
 use crate::sql::semantic_ir::semantics::write_resolver::resolve_write_plan_with_functions;
+use crate::sql::semantic_ir::{
+    analyze_public_write_semantics, BoundPublicLeaf, BoundStatement, ExecutionContext,
+    ExplainOptions, PublicExecutionDebugTrace, PublicWriteInvariantTrace, PublicWriteSemantics,
+};
 use crate::state::stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamOperation,
@@ -64,15 +68,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PreparedPublicReadExecution {
-    LoweredSql(LoweredReadProgram),
-    Direct(DirectPublicReadPlan),
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PreparedPublicRead {
     pub(crate) logical_plan: PublicReadLogicalPlan,
     pub(crate) execution: PreparedPublicReadExecution,
+    pub(crate) bound_parameters: Vec<Value>,
+    pub(crate) runtime_bindings: RuntimeBindingValues,
     pub(crate) public_output_columns: Option<Vec<String>>,
     pub(crate) debug_trace: PublicExecutionDebugTrace,
 }
@@ -102,7 +102,6 @@ impl PreparedPublicRead {
             PreparedPublicReadExecution::Direct(_) => None,
         }
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,45 +127,12 @@ impl PreparedPublicWrite {
             PreparedPublicWriteExecution::Materialize(materialization) => Some(materialization),
         }
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PublicSurfaceRegistryMutation {
     UpsertRegisteredSchemaSnapshot { snapshot: JsonValue },
     RemoveDynamicSchema { schema_key: String },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PreparedPublicWriteExecution {
-    Noop,
-    Materialize(PublicWriteMaterialization),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PublicWriteMaterialization {
-    pub(crate) partitions: Vec<PublicWriteExecutionPartition>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PublicWriteExecutionPartition {
-    Tracked(TrackedWriteExecution),
-    Untracked(UntrackedWriteExecution),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TrackedWriteExecution {
-    pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
-    pub(crate) domain_change_batch: Option<DomainChangeBatch>,
-    pub(crate) create_preconditions: CommitPreconditions,
-    pub(crate) semantic_effects: PlanEffects,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct UntrackedWriteExecution {
-    pub(crate) intended_post_state: Vec<crate::sql::logical_plan::public_ir::PlannedStateRow>,
-    pub(crate) semantic_effects: PlanEffects,
-    pub(crate) persist_filesystem_payloads_before_write: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -388,45 +354,6 @@ pub(crate) async fn statement_references_public_surface_with_backend(
     statement_references_public_surface(&registry, statement)
 }
 
-fn rewrite_public_read_statement_to_lowered_sql_with_registry(
-    statement: &mut Statement,
-    dialect: crate::SqlDialect,
-    registry: &SurfaceRegistry,
-) -> Result<Statement, LixError> {
-    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id(
-        statement, registry, dialect, None,
-    )?;
-    lower_statement(statement.clone(), dialect)
-}
-
-fn rewrite_public_read_query_to_lowered_sql_with_registry(
-    query: Query,
-    dialect: crate::SqlDialect,
-    registry: &SurfaceRegistry,
-) -> Result<Query, LixError> {
-    let mut statement = Statement::Query(Box::new(query));
-    match rewrite_public_read_statement_to_lowered_sql_with_registry(
-        &mut statement,
-        dialect,
-        registry,
-    )? {
-        Statement::Query(query) => Ok(*query),
-        _ => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "expected lowered read query to remain a SELECT query",
-        )),
-    }
-}
-
-#[cfg(test)]
-pub(crate) async fn lower_public_read_query_with_backend(
-    backend: &dyn LixBackend,
-    query: Query,
-    params: &[Value],
-) -> Result<read::LoweredPublicReadQuery, LixError> {
-    read::lower_public_read_query_with_backend(backend, query, params).await
-}
-
 pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
     backend: &dyn LixBackend,
     registry: &SurfaceRegistry,
@@ -556,14 +483,6 @@ pub(crate) async fn prepare_public_read_strict(
         writer_key,
     )
     .await
-}
-
-pub(crate) async fn execute_public_read_query_strict(
-    backend: &dyn LixBackend,
-    query: Query,
-    params: &[Value],
-) -> Result<QueryResult, LixError> {
-    read::execute_public_read_query_strict(backend, query, params).await
 }
 
 fn statements_reference_public_surface(
@@ -1062,12 +981,6 @@ impl Visitor for PublicRelationCollectorVisitor<'_> {
     }
 }
 
-async fn load_active_version_id_for_public_read(
-    backend: &dyn LixBackend,
-) -> Result<String, LixError> {
-    crate::workspace::require_workspace_active_version_id(backend).await
-}
-
 fn requested_history_root_commit_ids_from_selection(selection: Option<&Expr>) -> Vec<String> {
     let mut roots = std::collections::BTreeSet::new();
     if let Some(selection) = selection {
@@ -1134,7 +1047,6 @@ fn expr_string_literal(expr: &Expr) -> Option<&str> {
     }
 }
 
-
 fn explain_query_statement(statement: &Statement) -> Option<(Statement, Option<ExplainOptions>)> {
     match statement {
         Statement::Query(_) => Some((statement.clone(), None)),
@@ -1169,29 +1081,39 @@ fn explain_query_statement(statement: &Statement) -> Option<(Statement, Option<E
 fn wrap_lowered_read_for_explain(
     program: LoweredReadProgram,
     envelope: Option<&ExplainOptions>,
-) -> LoweredReadProgram {
+    dialect: crate::SqlDialect,
+) -> Result<LoweredReadProgram, LixError> {
     let Some(envelope) = envelope else {
-        return program;
+        return Ok(program);
     };
 
-    LoweredReadProgram {
-        statements: program
-            .statements
-            .into_iter()
-            .map(|statement| Statement::Explain {
-                describe_alias: envelope.describe_alias,
-                analyze: envelope.analyze,
-                verbose: envelope.verbose,
-                query_plan: envelope.query_plan,
-                estimate: envelope.estimate,
-                statement: Box::new(statement),
-                format: envelope.format.clone(),
-                options: envelope.options.clone(),
-            })
-            .collect(),
+    let statements = program
+        .statements
+        .into_iter()
+        .map(|statement| {
+            compile_lowered_read_statement(
+                dialect,
+                statement.bindings.minimum_param_count,
+                Statement::Explain {
+                    describe_alias: envelope.describe_alias,
+                    analyze: envelope.analyze,
+                    verbose: envelope.verbose,
+                    query_plan: envelope.query_plan,
+                    estimate: envelope.estimate,
+                    statement: Box::new(statement.shell_statement),
+                    format: envelope.format.clone(),
+                    options: envelope.options.clone(),
+                },
+                statement.relation_render_nodes,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(LoweredReadProgram {
+        statements,
         pushdown_decision: program.pushdown_decision,
         result_columns: program.result_columns,
-    }
+    })
 }
 
 pub(crate) async fn try_prepare_public_write_with_functions<P>(
@@ -1359,6 +1281,8 @@ where
         debug_trace: PublicExecutionDebugTrace {
             semantic_statement: Some(write_analysis.semantics.semantic_statement()),
             bound_statements: vec![bound_statement],
+            optimizer_passes: Vec::new(),
+            physical_plan: Some(PhysicalPlan::PublicWrite(execution.clone())),
             surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
             bound_public_leaves: vec![BoundPublicLeaf::from_surface_binding(
                 &canonicalized.surface_binding,
@@ -1961,7 +1885,8 @@ fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWri
         .as_ref()
         .map(|plan| {
             plan.partitions.iter().any(|partition| {
-                partition.execution_mode != crate::sql::logical_plan::public_ir::WriteMode::Untracked
+                partition.execution_mode
+                    != crate::sql::logical_plan::public_ir::WriteMode::Untracked
             })
         })
         .unwrap_or(true)
@@ -1979,9 +1904,8 @@ fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWri
 #[cfg(test)]
 mod tests {
     use super::{
-        lower_public_read_query_with_backend, prepare_public_execution, prepare_public_read,
-        prepare_public_read_strict, DirectPublicReadPlan, PreparedPublicExecution,
-        PreparedPublicReadExecution,
+        prepare_public_execution, prepare_public_read, prepare_public_read_strict,
+        DirectPublicReadPlan, PreparedPublicExecution, PreparedPublicReadExecution,
     };
     use crate::read::models::StateHistoryRootScope;
     use crate::sql::logical_plan::DependencyPrecision;
@@ -2193,6 +2117,15 @@ mod tests {
         assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_key_value"]);
         assert_eq!(
             prepared
+                .debug_trace
+                .optimizer_passes
+                .iter()
+                .map(|pass| pass.name)
+                .collect::<Vec<_>>(),
+            vec!["public-read.choose-direct-history-strategy"]
+        );
+        assert_eq!(
+            prepared
                 .dependency_spec()
                 .expect("dependency spec should be derived")
                 .schema_keys
@@ -2222,7 +2155,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .residual_predicates,
+                .residual_predicate_sql(),
             vec!["key = 'hello'".to_string()]
         );
         let lowered_sql = prepared
@@ -2319,19 +2252,31 @@ mod tests {
                         )
                         .await
                         .expect("schema registration write should succeed");
-                    let mut statements = parse_one("SELECT body FROM message WHERE id = 'm1'");
-                    let Statement::Query(query) = statements.remove(0) else {
-                        panic!("expected SELECT query");
-                    };
-
-                    let lowered = lower_public_read_query_with_backend(&backend, *query, &[])
-                        .await
-                        .expect("registered-schema derived public query should lower through backend registry");
-                    let lowered_sql = lowered.query.to_string();
+                    let prepared = prepare_public_read_strict(
+                        &backend,
+                        &parse_one("SELECT body FROM message WHERE id = 'm1'"),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("registered-schema derived public query should prepare through backend registry")
+                    .expect("registered-schema derived public query should lower through backend registry");
+                    let lowered_sql = prepared
+                        .debug_trace
+                        .lowered_sql
+                        .first()
+                        .expect("registered-schema derived public query should lower");
 
                     assert_eq!(
-                        lowered.required_schema_keys,
-                        ["message".to_string()].into_iter().collect()
+                        prepared
+                            .dependency_spec()
+                            .expect("dependency spec should be recorded")
+                            .schema_keys
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        vec!["message".to_string()]
                     );
                     assert!(lowered_sql.contains("lix_internal_live_v1_message"));
                     assert!(!lowered_sql.contains("FROM message"));
@@ -2366,7 +2311,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .residual_predicates,
+                .residual_predicate_sql(),
             vec![
                 "key = 'hello'".to_string(),
                 "lixcol_version_id = 'version-a'".to_string()
@@ -2413,10 +2358,19 @@ mod tests {
                     assert_eq!(
                         prepared
                             .debug_trace
+                            .optimizer_passes
+                            .iter()
+                            .map(|pass| pass.name)
+                            .collect::<Vec<_>>(),
+                        vec!["public-read.choose-direct-history-strategy"]
+                    );
+                    assert_eq!(
+                        prepared
+                            .debug_trace
                             .pushdown_decision
                             .as_ref()
                             .expect("pushdown decision should be recorded")
-                            .residual_predicates,
+                            .residual_predicate_sql(),
                         vec!["key = 'hello'".to_string()]
                     );
                     match &prepared.execution {
@@ -2470,7 +2424,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .residual_predicates,
+                .residual_predicate_sql(),
             vec!["entity_id = 'entity-1'".to_string()]
         );
         let lowered_sql = prepared
@@ -2518,7 +2472,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .residual_predicates,
+                .residual_predicate_sql(),
             vec!["schema_key = 'lix_key_value'".to_string()]
         );
         let lowered_sql = prepared
@@ -2573,7 +2527,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .residual_predicates,
+                .residual_predicate_sql(),
             vec!["id = 'file-1'".to_string()]
         );
         let lowered_sql = prepared
@@ -2615,7 +2569,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .residual_predicates,
+                .residual_predicate_sql(),
             vec![
                 "id = 'dir-1'".to_string(),
                 "lixcol_version_id = 'version-a'".to_string()
@@ -2660,7 +2614,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .accepted_predicates,
+                .accepted_predicate_sql(),
             vec!["root_commit_id = 'commit-1'".to_string()]
         );
         match &prepared.execution {
@@ -2717,7 +2671,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .accepted_predicates,
+                .accepted_predicate_sql(),
             vec![
                 "root_commit_id = 'commit-1'".to_string(),
                 "version_id = 'version-a'".to_string()
@@ -2781,7 +2735,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .accepted_predicates,
+                .accepted_predicate_sql(),
             vec![
                 "root_commit_id = 'commit-1'".to_string(),
                 "id = 'dir-1'".to_string()
@@ -2963,7 +2917,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .accepted_predicates,
+                .accepted_predicate_sql(),
             vec!["schema_key = 'lix_key_value'".to_string()]
         );
         let lowered_sql = prepared
@@ -3228,7 +3182,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .accepted_predicates,
+                .accepted_predicate_sql(),
             vec!["schema_key = 'lix_key_value'".to_string()]
         );
         assert_eq!(
@@ -3237,7 +3191,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .residual_predicates,
+                .residual_predicate_sql(),
             Vec::<String>::new()
         );
         let lowered_sql = prepared
@@ -3270,7 +3224,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .accepted_predicates,
+                .accepted_predicate_sql(),
             vec![
                 "version_id = 'v1'".to_string(),
                 "schema_key = 'lix_key_value'".to_string()
@@ -3309,7 +3263,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .accepted_predicates,
+                .accepted_predicate_sql(),
             vec!["root_commit_id = 'commit-1'".to_string()]
         );
         match &prepared.execution {
@@ -3361,7 +3315,7 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .accepted_predicates,
+                .accepted_predicate_sql(),
             vec!["root_commit_id = 'commit-1'".to_string()]
         );
         match &prepared.execution {

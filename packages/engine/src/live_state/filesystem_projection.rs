@@ -1,7 +1,7 @@
 use crate::filesystem::path::ParsedFilePath;
 use crate::live_state::schema_access::{payload_column_name_for_schema, tracked_relation_name};
-use crate::sql::semantic_ir::semantics::filesystem_queries::lookup_file_id_by_path;
 use crate::sql::common::text::escape_sql_string;
+use crate::sql::semantic_ir::semantics::filesystem_queries::lookup_file_id_by_path;
 use crate::version::{version_descriptor_schema_key, GLOBAL_VERSION_ID};
 use crate::{LixBackend, LixError, SqlDialect};
 

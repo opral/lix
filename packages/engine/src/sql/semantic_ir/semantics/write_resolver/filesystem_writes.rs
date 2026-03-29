@@ -7,6 +7,7 @@ use crate::filesystem::path::{
 use crate::filesystem::runtime::{
     FilesystemDescriptorState, FilesystemTransactionFileState, FilesystemTransactionState,
 };
+use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::semantic_ir::semantics::filesystem_assignments::{
     parse_directory_insert_assignments, parse_directory_update_assignments,
     parse_file_insert_assignments, parse_file_update_assignments, DirectoryInsertAssignments,
@@ -25,7 +26,6 @@ use crate::sql::semantic_ir::semantics::filesystem_queries::{
     lookup_directory_path_by_id, lookup_file_id_by_path_with_pending_transaction_view,
     DirectoryFilesystemRow, FileFilesystemRow,
 };
-use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::transaction::PendingTransactionView;
 use serde_json::json;
 use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue, ValueWithSpan};

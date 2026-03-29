@@ -29,9 +29,7 @@ use crate::sql::executor::intent::{
 };
 use crate::sql::executor::preprocess::preprocess_with_surfaces_to_logical_plan;
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;
-use crate::sql::logical_plan::{
-    result_contract_for_statements, ResultContract,
-};
+use crate::sql::logical_plan::{result_contract_for_statements, ResultContract};
 use crate::transaction::PendingTransactionView;
 use sqlparser::ast::Statement;
 
@@ -210,7 +208,8 @@ async fn compile_execution_with_backend(
                 error.description
             ),
         })?;
-        let preprocess: PlannedStatementSet = internal_logical_plan.normalized_statements.clone().into();
+        let preprocess: PlannedStatementSet =
+            internal_logical_plan.normalized_statements.clone().into();
         validate_compiled_internal_execution(&preprocess, internal_logical_plan.result_contract)?;
 
         if !preprocess.mutations.is_empty() {

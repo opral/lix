@@ -7,8 +7,8 @@ use sqlparser::ast::{
 };
 
 use crate::sql::parser::parse_sql_statements;
-use crate::sql::parser::placeholders::{parse_placeholder_ref, resolve_placeholder_ref};
 pub(crate) use crate::sql::parser::placeholders::PlaceholderState;
+use crate::sql::parser::placeholders::{parse_placeholder_ref, resolve_placeholder_ref};
 use crate::{LixError, SqlDialect, Value};
 
 #[derive(Debug, Clone)]
@@ -18,13 +18,13 @@ pub(crate) struct BoundSql {
     pub(crate) state: PlaceholderState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundStatementAst {
     pub(crate) statement: Statement,
     pub(crate) params: Vec<Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StatementBindingTemplate {
     pub(crate) statement: Statement,
     pub(crate) used_bindings: Vec<StatementBindingSource>,

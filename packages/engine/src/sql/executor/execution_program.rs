@@ -3,19 +3,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::engine::{Engine, ExecuteOptions};
-use crate::sql::executor::contracts::requirements::PlanRequirements;
-use crate::sql::executor::runtime_state::ExecutionRuntimeEffects;
-use crate::sql::executor::runtime_state::ExecutionRuntimeState;
-use crate::sql::internal::script::coalesce_state_surface_inserts_in_transactions;
 use crate::sql::binder::{
     bind_statement_binding_template, compile_statement_binding_template_with_state,
     RuntimeBindingValues, StatementBindingTemplate,
 };
-use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::catalog::SurfaceRegistry;
+use crate::sql::executor::contracts::requirements::PlanRequirements;
 use crate::sql::executor::public_runtime::{
     classify_public_execution_route_with_registry, PublicExecutionRoute,
 };
+use crate::sql::executor::runtime_state::ExecutionRuntimeEffects;
+use crate::sql::executor::runtime_state::ExecutionRuntimeState;
+use crate::sql::internal::script::coalesce_state_surface_inserts_in_transactions;
+use crate::sql::parser::placeholders::PlaceholderState;
 use crate::transaction::{
     execute_bound_statement_template_instance_in_borrowed_write_transaction,
     execute_bound_statement_template_instance_in_write_transaction, BorrowedWriteTransaction,

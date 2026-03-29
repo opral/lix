@@ -10,88 +10,42 @@ use crate::read::models::{
     StateHistoryRequest, StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
 };
 use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
-use crate::sql::binder::{bind_public_query, bind_public_statement_sql, bind_statement};
-use crate::sql::catalog::SurfaceBinding;
+use crate::sql::binder::{bind_statement, RuntimeBindingValues};
+use crate::sql::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
 use crate::sql::logical_plan::{
-    DirectDirectoryHistoryField, DirectEntityHistoryField, DirectFileHistoryField,
-    DirectPublicReadPlan, DirectStateHistoryField, DirectoryHistoryAggregate,
-    DirectoryHistoryDirectReadPlan, DirectoryHistoryPredicate, DirectoryHistoryProjection,
-    DirectoryHistorySortKey, EntityHistoryDirectReadPlan, EntityHistoryPredicate,
-    EntityHistoryProjection, EntityHistorySortKey, FileHistoryAggregate,
+    verify_logical_plan, DirectDirectoryHistoryField, DirectEntityHistoryField,
+    DirectFileHistoryField, DirectPublicReadPlan, DirectStateHistoryField,
+    DirectoryHistoryAggregate, DirectoryHistoryDirectReadPlan, DirectoryHistoryPredicate,
+    DirectoryHistoryProjection, DirectoryHistorySortKey, EntityHistoryDirectReadPlan,
+    EntityHistoryPredicate, EntityHistoryProjection, EntityHistorySortKey, FileHistoryAggregate,
     FileHistoryDirectReadPlan, FileHistoryPredicate, FileHistoryProjection, FileHistorySortKey,
-    LogicalPlan, PublicReadLogicalPlan, StateHistoryAggregate,
-    StateHistoryAggregatePredicate, StateHistoryDirectReadPlan, StateHistoryPredicate,
-    StateHistoryProjection, StateHistoryProjectionValue, StateHistorySortKey,
-    StateHistorySortValue, verify_logical_plan,
+    LogicalPlan, PublicReadLogicalPlan, StateHistoryAggregate, StateHistoryAggregatePredicate,
+    StateHistoryDirectReadPlan, StateHistoryPredicate, StateHistoryProjection,
+    StateHistoryProjectionValue, StateHistorySortKey, StateHistorySortValue,
 };
-use crate::sql::physical_plan::lowerer::{
-    lower_read_for_execution_with_layouts,
-    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id,
-    LoweredReadProgram, LoweredResultColumn, LoweredResultColumns,
+use crate::sql::optimizer::{
+    choose_specialized_public_read_strategy,
+    optimize_broad_public_read_statement_with_known_live_layouts,
+};
+use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::sql::physical_plan::lowerer::lower_read_for_execution_with_layouts;
+use crate::sql::physical_plan::{
+    compile_lowered_read_statement, LoweredReadProgram, LoweredResultColumn, LoweredResultColumns,
+    PhysicalPlan, PreparedPublicReadExecution,
 };
 use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_bound_public_surface_bindings;
 use crate::sql::semantic_ir::{
     augment_dependency_spec_for_broad_public_read, prepare_structured_public_read_analysis,
     unknown_public_state_schema_error, BoundPublicLeaf, PublicReadSemantics,
+    StructuredPublicReadPreparation,
 };
-use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::SqlDialect;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    JoinConstraint, JoinOperator, LimitClause, OrderBy, OrderByExpr, OrderByKind, Query, Select,
-    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value as SqlValue,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
+    LimitClause, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Value as SqlValue,
 };
 use std::collections::{BTreeMap, BTreeSet};
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct LoweredPublicReadQuery {
-    pub(crate) query: Query,
-    pub(crate) required_schema_keys: BTreeSet<String>,
-    pub(crate) result_columns: Option<LoweredResultColumns>,
-    pub(crate) public_output_columns: Option<Vec<String>>,
-}
-
-pub(crate) async fn execute_public_read_query_strict(
-    backend: &dyn LixBackend,
-    mut query: Query,
-    params: &[Value],
-) -> Result<QueryResult, LixError> {
-    let original_public_output_columns = public_output_columns_from_query(&query);
-    let mut nested_required_schema_keys = BTreeSet::new();
-    lower_nested_public_read_subqueries_in_query(
-        backend,
-        &mut query,
-        params,
-        &mut nested_required_schema_keys,
-    )
-    .await?;
-    let lowered = lower_public_read_query_with_details(backend, query, params).await?;
-    let mut required_schema_keys = lowered.required_schema_keys;
-    required_schema_keys.extend(nested_required_schema_keys);
-    let bound = bind_public_query(lowered.query, params, backend.dialect())?;
-    let result = backend
-        .execute(&bound.sql, &bound.params)
-        .await
-        .map_err(|error| translate_lowered_public_read_error(error, &[]))?;
-    let public_output_columns = lowered
-        .public_output_columns
-        .as_deref()
-        .or(original_public_output_columns.as_deref());
-    let Some(result_columns) = lowered.result_columns.as_ref() else {
-        return Ok(apply_public_output_columns(result, public_output_columns));
-    };
-    Ok(apply_public_output_columns(
-        decode_public_read_result(
-            result,
-            &LoweredReadProgram {
-                statements: Vec::new(),
-                pushdown_decision: PushdownDecision::default(),
-                result_columns: result_columns.clone(),
-            },
-        ),
-        public_output_columns,
-    ))
-}
 
 pub(crate) fn decode_public_read_result(
     result: QueryResult,
@@ -163,18 +117,13 @@ pub(crate) async fn execute_prepared_public_read(
 ) -> Result<QueryResult, LixError> {
     let result = match &prepared.execution {
         PreparedPublicReadExecution::LoweredSql(lowered) => {
-            let bound_params = prepared
-                .debug_trace
-                .bound_statements
-                .first()
-                .map(|statement| statement.bound_parameters.as_slice())
-                .unwrap_or(&[]);
             execute_lowered_public_read(
                 backend,
                 lowered,
                 prepared.dependency_spec(),
                 &prepared.debug_trace.surface_bindings,
-                bound_params,
+                &prepared.bound_parameters,
+                &prepared.runtime_bindings,
             )
             .await
         }
@@ -191,16 +140,17 @@ async fn execute_lowered_public_read(
     _dependency_spec: Option<&DependencySpec>,
     public_surfaces: &[String],
     params: &[Value],
+    runtime_bindings: &RuntimeBindingValues,
 ) -> Result<QueryResult, LixError> {
     let mut result = QueryResult {
         rows: Vec::new(),
         columns: Vec::new(),
     };
-    for statement in lowered.statements.iter().cloned() {
-        let statement = lower_statement(statement, backend.dialect())?;
-        let bound = bind_public_statement_sql(statement, params, backend.dialect())?;
+    for statement in &lowered.statements {
+        let (sql, bound_params) =
+            statement.bind_and_render_sql(params, runtime_bindings, backend.dialect())?;
         result = backend
-            .execute(&bound.sql, &bound.params)
+            .execute(&sql, &bound_params)
             .await
             .map_err(|error| translate_lowered_public_read_error(error, public_surfaces))?;
     }
@@ -227,6 +177,42 @@ fn translate_lowered_public_read_error(error: LixError, public_surfaces: &[Strin
     let description =
         sanitize_lowered_public_sql_error_description(&error.description, public_surfaces);
     LixError::new(&error.code, description)
+}
+
+fn runtime_binding_values_from_execution_context(
+    execution_context: &ExecutionContext,
+) -> Result<RuntimeBindingValues, LixError> {
+    Ok(RuntimeBindingValues {
+        active_version_id: execution_context
+            .requested_version_id
+            .clone()
+            .unwrap_or_default(),
+        active_account_ids_json: serde_json::to_string(&execution_context.active_account_ids)
+            .map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("active account ids serialization failed: {error}"),
+                )
+            })?,
+    })
+}
+
+fn render_lowered_read_sql(
+    lowered: &LoweredReadProgram,
+    params: &[Value],
+    execution_context: &ExecutionContext,
+    dialect: SqlDialect,
+) -> Result<Vec<String>, LixError> {
+    let runtime_bindings = runtime_binding_values_from_execution_context(execution_context)?;
+    lowered
+        .statements
+        .iter()
+        .map(|statement| {
+            statement
+                .bind_and_render_sql(params, &runtime_bindings, dialect)
+                .map(|(sql, _)| sql)
+        })
+        .collect()
 }
 
 async fn execute_direct_public_read(
@@ -262,902 +248,6 @@ fn decode_boolean_value(value: &Value) -> Option<Value> {
         },
         Value::Real(_) | Value::Json(_) | Value::Blob(_) => None,
         Value::Integer(_) => None,
-    }
-}
-
-async fn lower_nested_public_read_subqueries_in_query(
-    backend: &dyn LixBackend,
-    query: &mut Query,
-    params: &[Value],
-    required_schema_keys: &mut BTreeSet<String>,
-) -> Result<(), LixError> {
-    if let Some(with) = &mut query.with {
-        for cte in &mut with.cte_tables {
-            Box::pin(lower_nested_public_read_subqueries_in_query(
-                backend,
-                &mut cte.query,
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-        }
-    }
-    Box::pin(lower_nested_public_read_subqueries_in_set_expr(
-        backend,
-        query.body.as_mut(),
-        params,
-        required_schema_keys,
-    ))
-    .await?;
-    if let Some(order_by) = &mut query.order_by {
-        lower_nested_public_read_subqueries_in_order_by(
-            backend,
-            order_by,
-            params,
-            required_schema_keys,
-        )
-        .await?;
-    }
-    if let Some(limit_clause) = &mut query.limit_clause {
-        Box::pin(lower_nested_public_read_subqueries_in_limit_clause(
-            backend,
-            limit_clause,
-            params,
-            required_schema_keys,
-        ))
-        .await?;
-    }
-    if let Some(quantity) = query
-        .fetch
-        .as_mut()
-        .and_then(|fetch| fetch.quantity.as_mut())
-    {
-        Box::pin(lower_nested_public_read_subqueries_in_expr(
-            backend,
-            quantity,
-            params,
-            required_schema_keys,
-        ))
-        .await?;
-    }
-    Ok(())
-}
-
-async fn lower_nested_public_read_subqueries_in_set_expr(
-    backend: &dyn LixBackend,
-    expr: &mut SetExpr,
-    params: &[Value],
-    required_schema_keys: &mut BTreeSet<String>,
-) -> Result<(), LixError> {
-    match expr {
-        SetExpr::Select(select) => {
-            Box::pin(lower_nested_public_read_subqueries_in_select(
-                backend,
-                select,
-                params,
-                required_schema_keys,
-            ))
-            .await
-        }
-        SetExpr::Query(query) => {
-            Box::pin(lower_nested_public_read_subqueries_in_query(
-                backend,
-                query,
-                params,
-                required_schema_keys,
-            ))
-            .await
-        }
-        SetExpr::SetOperation { left, right, .. } => {
-            Box::pin(lower_nested_public_read_subqueries_in_set_expr(
-                backend,
-                left.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-            Box::pin(lower_nested_public_read_subqueries_in_set_expr(
-                backend,
-                right.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await
-        }
-        SetExpr::Values(values) => {
-            for row in &mut values.rows {
-                for expr in row {
-                    Box::pin(lower_nested_public_read_subqueries_in_expr(
-                        backend,
-                        expr,
-                        params,
-                        required_schema_keys,
-                    ))
-                    .await?;
-                }
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-async fn lower_nested_public_read_subqueries_in_select(
-    backend: &dyn LixBackend,
-    select: &mut Select,
-    params: &[Value],
-    required_schema_keys: &mut BTreeSet<String>,
-) -> Result<(), LixError> {
-    for table in &mut select.from {
-        Box::pin(lower_nested_public_read_subqueries_in_table_with_joins(
-            backend,
-            table,
-            params,
-            required_schema_keys,
-        ))
-        .await?;
-    }
-    if let Some(prewhere) = &mut select.prewhere {
-        Box::pin(lower_nested_public_read_subqueries_in_expr(
-            backend,
-            prewhere,
-            params,
-            required_schema_keys,
-        ))
-        .await?;
-    }
-    if let Some(selection) = &mut select.selection {
-        Box::pin(lower_nested_public_read_subqueries_in_expr(
-            backend,
-            selection,
-            params,
-            required_schema_keys,
-        ))
-        .await?;
-    }
-    for item in &mut select.projection {
-        match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                Box::pin(lower_nested_public_read_subqueries_in_expr(
-                    backend,
-                    expr,
-                    params,
-                    required_schema_keys,
-                ))
-                .await?;
-            }
-            SelectItem::QualifiedWildcard(
-                sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr),
-                _,
-            ) => {
-                Box::pin(lower_nested_public_read_subqueries_in_expr(
-                    backend,
-                    expr,
-                    params,
-                    required_schema_keys,
-                ))
-                .await?;
-            }
-            _ => {}
-        }
-    }
-    match &mut select.group_by {
-        GroupByExpr::All(_) => {}
-        GroupByExpr::Expressions(expressions, _) => {
-            for expr in expressions {
-                Box::pin(lower_nested_public_read_subqueries_in_expr(
-                    backend,
-                    expr,
-                    params,
-                    required_schema_keys,
-                ))
-                .await?;
-            }
-        }
-    }
-    for expr in &mut select.cluster_by {
-        Box::pin(lower_nested_public_read_subqueries_in_expr(
-            backend,
-            expr,
-            params,
-            required_schema_keys,
-        ))
-        .await?;
-    }
-    for expr in &mut select.distribute_by {
-        Box::pin(lower_nested_public_read_subqueries_in_expr(
-            backend,
-            expr,
-            params,
-            required_schema_keys,
-        ))
-        .await?;
-    }
-    for expr in &mut select.sort_by {
-        lower_nested_public_read_subqueries_in_order_by_expr(
-            backend,
-            expr,
-            params,
-            required_schema_keys,
-        )
-        .await?;
-    }
-    if let Some(having) = &mut select.having {
-        Box::pin(lower_nested_public_read_subqueries_in_expr(
-            backend,
-            having,
-            params,
-            required_schema_keys,
-        ))
-        .await?;
-    }
-    if let Some(qualify) = &mut select.qualify {
-        Box::pin(lower_nested_public_read_subqueries_in_expr(
-            backend,
-            qualify,
-            params,
-            required_schema_keys,
-        ))
-        .await?;
-    }
-    if let Some(connect_by) = &mut select.connect_by {
-        Box::pin(lower_nested_public_read_subqueries_in_expr(
-            backend,
-            &mut connect_by.condition,
-            params,
-            required_schema_keys,
-        ))
-        .await?;
-        for expr in &mut connect_by.relationships {
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                expr,
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-async fn lower_nested_public_read_subqueries_in_table_with_joins(
-    backend: &dyn LixBackend,
-    table: &mut TableWithJoins,
-    params: &[Value],
-    required_schema_keys: &mut BTreeSet<String>,
-) -> Result<(), LixError> {
-    Box::pin(lower_nested_public_read_subqueries_in_table_factor(
-        backend,
-        &mut table.relation,
-        params,
-        required_schema_keys,
-    ))
-    .await?;
-    for join in &mut table.joins {
-        Box::pin(lower_nested_public_read_subqueries_in_table_factor(
-            backend,
-            &mut join.relation,
-            params,
-            required_schema_keys,
-        ))
-        .await?;
-        lower_nested_public_read_subqueries_in_join_operator(
-            backend,
-            &mut join.join_operator,
-            params,
-            required_schema_keys,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-async fn lower_nested_public_read_subqueries_in_table_factor(
-    backend: &dyn LixBackend,
-    relation: &mut TableFactor,
-    params: &[Value],
-    required_schema_keys: &mut BTreeSet<String>,
-) -> Result<(), LixError> {
-    match relation {
-        TableFactor::Derived { subquery, .. } => {
-            Box::pin(lower_nested_public_read_subqueries_in_query(
-                backend,
-                subquery,
-                params,
-                required_schema_keys,
-            ))
-            .await
-        }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            Box::pin(lower_nested_public_read_subqueries_in_table_with_joins(
-                backend,
-                table_with_joins,
-                params,
-                required_schema_keys,
-            ))
-            .await
-        }
-        _ => Ok(()),
-    }
-}
-
-async fn lower_nested_public_read_subqueries_in_order_by(
-    backend: &dyn LixBackend,
-    order_by: &mut OrderBy,
-    params: &[Value],
-    required_schema_keys: &mut BTreeSet<String>,
-) -> Result<(), LixError> {
-    let OrderByKind::Expressions(expressions) = &mut order_by.kind else {
-        return Ok(());
-    };
-    for item in expressions {
-        lower_nested_public_read_subqueries_in_order_by_expr(
-            backend,
-            item,
-            params,
-            required_schema_keys,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-async fn lower_nested_public_read_subqueries_in_order_by_expr(
-    backend: &dyn LixBackend,
-    order_by_expr: &mut OrderByExpr,
-    params: &[Value],
-    required_schema_keys: &mut BTreeSet<String>,
-) -> Result<(), LixError> {
-    Box::pin(lower_nested_public_read_subqueries_in_expr(
-        backend,
-        &mut order_by_expr.expr,
-        params,
-        required_schema_keys,
-    ))
-    .await?;
-    if let Some(with_fill) = &mut order_by_expr.with_fill {
-        if let Some(from) = &mut with_fill.from {
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                from,
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-        }
-        if let Some(to) = &mut with_fill.to {
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                to,
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-        }
-        if let Some(step) = &mut with_fill.step {
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                step,
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-async fn lower_nested_public_read_subqueries_in_limit_clause(
-    backend: &dyn LixBackend,
-    limit_clause: &mut LimitClause,
-    params: &[Value],
-    required_schema_keys: &mut BTreeSet<String>,
-) -> Result<(), LixError> {
-    match limit_clause {
-        LimitClause::LimitOffset {
-            limit,
-            offset,
-            limit_by,
-        } => {
-            if let Some(limit) = limit {
-                Box::pin(lower_nested_public_read_subqueries_in_expr(
-                    backend,
-                    limit,
-                    params,
-                    required_schema_keys,
-                ))
-                .await?;
-            }
-            if let Some(offset) = offset {
-                Box::pin(lower_nested_public_read_subqueries_in_expr(
-                    backend,
-                    &mut offset.value,
-                    params,
-                    required_schema_keys,
-                ))
-                .await?;
-            }
-            for expr in limit_by {
-                Box::pin(lower_nested_public_read_subqueries_in_expr(
-                    backend,
-                    expr,
-                    params,
-                    required_schema_keys,
-                ))
-                .await?;
-            }
-            Ok(())
-        }
-        LimitClause::OffsetCommaLimit { offset, limit } => {
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                offset,
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                limit,
-                params,
-                required_schema_keys,
-            ))
-            .await
-        }
-    }
-}
-
-async fn lower_nested_public_read_subqueries_in_join_operator(
-    backend: &dyn LixBackend,
-    join_operator: &mut JoinOperator,
-    params: &[Value],
-    required_schema_keys: &mut BTreeSet<String>,
-) -> Result<(), LixError> {
-    let (match_condition, constraint) = match join_operator {
-        JoinOperator::AsOf {
-            match_condition,
-            constraint,
-        } => (Some(match_condition), Some(constraint)),
-        JoinOperator::Join(constraint)
-        | JoinOperator::Inner(constraint)
-        | JoinOperator::Left(constraint)
-        | JoinOperator::LeftOuter(constraint)
-        | JoinOperator::Right(constraint)
-        | JoinOperator::RightOuter(constraint)
-        | JoinOperator::FullOuter(constraint)
-        | JoinOperator::CrossJoin(constraint)
-        | JoinOperator::Semi(constraint)
-        | JoinOperator::LeftSemi(constraint)
-        | JoinOperator::RightSemi(constraint)
-        | JoinOperator::Anti(constraint)
-        | JoinOperator::LeftAnti(constraint)
-        | JoinOperator::RightAnti(constraint)
-        | JoinOperator::StraightJoin(constraint) => (None, Some(constraint)),
-        JoinOperator::CrossApply | JoinOperator::OuterApply => (None, None),
-    };
-    if let Some(expr) = match_condition {
-        Box::pin(lower_nested_public_read_subqueries_in_expr(
-            backend,
-            expr,
-            params,
-            required_schema_keys,
-        ))
-        .await?;
-    }
-    if let Some(JoinConstraint::On(expr)) = constraint {
-        Box::pin(lower_nested_public_read_subqueries_in_expr(
-            backend,
-            expr,
-            params,
-            required_schema_keys,
-        ))
-        .await?;
-    }
-    Ok(())
-}
-
-async fn lower_nested_public_read_subqueries_in_expr(
-    backend: &dyn LixBackend,
-    expr: &mut Expr,
-    params: &[Value],
-    required_schema_keys: &mut BTreeSet<String>,
-) -> Result<(), LixError> {
-    match expr {
-        Expr::BinaryOp { left, right, .. } => {
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                left.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                right.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::Nested(expr)
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::Cast { expr, .. } => {
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                expr.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await
-        }
-        Expr::InList { expr, list, .. } => {
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                expr.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-            for item in list {
-                Box::pin(lower_nested_public_read_subqueries_in_expr(
-                    backend,
-                    item,
-                    params,
-                    required_schema_keys,
-                ))
-                .await?;
-            }
-            Ok(())
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                expr.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                low.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                high.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                expr.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                pattern.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await
-        }
-        Expr::Subquery(query) => {
-            Box::pin(lower_nested_public_read_subqueries_in_query(
-                backend,
-                query,
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-            let lowered =
-                lower_public_read_query_with_details(backend, (**query).clone(), params).await?;
-            required_schema_keys.extend(lowered.required_schema_keys);
-            *query = Box::new(lowered.query);
-            Ok(())
-        }
-        Expr::Exists { subquery, .. } => {
-            Box::pin(lower_nested_public_read_subqueries_in_query(
-                backend,
-                subquery,
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-            let lowered =
-                lower_public_read_query_with_details(backend, (**subquery).clone(), params).await?;
-            required_schema_keys.extend(lowered.required_schema_keys);
-            *subquery = Box::new(lowered.query);
-            Ok(())
-        }
-        Expr::InSubquery { expr, subquery, .. } => {
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                expr.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-            Box::pin(lower_nested_public_read_subqueries_in_query(
-                backend,
-                subquery,
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-            let lowered =
-                lower_public_read_query_with_details(backend, (**subquery).clone(), params).await?;
-            required_schema_keys.extend(lowered.required_schema_keys);
-            *subquery = Box::new(lowered.query);
-            Ok(())
-        }
-        Expr::InUnnest {
-            expr, array_expr, ..
-        } => {
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                expr.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                array_expr.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await
-        }
-        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                left.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await?;
-            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                backend,
-                right.as_mut(),
-                params,
-                required_schema_keys,
-            ))
-            .await
-        }
-        Expr::Function(function) => match &mut function.args {
-            FunctionArguments::List(list) => {
-                for arg in &mut list.args {
-                    match arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
-                            Box::pin(lower_nested_public_read_subqueries_in_expr(
-                                backend,
-                                expr,
-                                params,
-                                required_schema_keys,
-                            ))
-                            .await?;
-                        }
-                        FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
-                            if let FunctionArgExpr::Expr(expr) = arg {
-                                Box::pin(lower_nested_public_read_subqueries_in_expr(
-                                    backend,
-                                    expr,
-                                    params,
-                                    required_schema_keys,
-                                ))
-                                .await?;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        },
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(operand) = operand {
-                Box::pin(lower_nested_public_read_subqueries_in_expr(
-                    backend,
-                    operand,
-                    params,
-                    required_schema_keys,
-                ))
-                .await?;
-            }
-            for condition in conditions {
-                Box::pin(lower_nested_public_read_subqueries_in_expr(
-                    backend,
-                    &mut condition.condition,
-                    params,
-                    required_schema_keys,
-                ))
-                .await?;
-                Box::pin(lower_nested_public_read_subqueries_in_expr(
-                    backend,
-                    &mut condition.result,
-                    params,
-                    required_schema_keys,
-                ))
-                .await?;
-            }
-            if let Some(else_result) = else_result {
-                Box::pin(lower_nested_public_read_subqueries_in_expr(
-                    backend,
-                    else_result,
-                    params,
-                    required_schema_keys,
-                ))
-                .await?;
-            }
-            Ok(())
-        }
-        Expr::Tuple(items) => {
-            for item in items {
-                Box::pin(lower_nested_public_read_subqueries_in_expr(
-                    backend,
-                    item,
-                    params,
-                    required_schema_keys,
-                ))
-                .await?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-#[cfg(test)]
-pub(super) async fn lower_public_read_query_with_backend(
-    backend: &dyn LixBackend,
-    query: Query,
-    params: &[Value],
-) -> Result<LoweredPublicReadQuery, LixError> {
-    lower_public_read_query_with_details(backend, query, params).await
-}
-
-async fn lower_public_read_query_with_details(
-    backend: &dyn LixBackend,
-    query: Query,
-    params: &[Value],
-) -> Result<LoweredPublicReadQuery, LixError> {
-    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
-        .await
-        .map_err(|error| LixError::new(error.code, error.description))?;
-    if !statement_references_public_surface(&registry, &Statement::Query(Box::new(query.clone()))) {
-        return Ok(LoweredPublicReadQuery {
-            query,
-            required_schema_keys: BTreeSet::new(),
-            result_columns: None,
-            public_output_columns: None,
-        });
-    }
-    let active_version_id = load_active_version_id_for_public_read(backend).await?;
-    let parsed = vec![Statement::Query(Box::new(query.clone()))];
-    let prepared = try_prepare_public_read_with_registry_and_internal_access(
-        backend,
-        &registry,
-        &parsed,
-        params,
-        &active_version_id,
-        None,
-        true,
-    )
-    .await?;
-    let prepared_public_output_columns = prepared
-        .as_ref()
-        .and_then(|prepared| prepared.public_output_columns.clone());
-    let maybe_lowered_from_prepared = prepared
-        .as_ref()
-        .and_then(|prepared| prepared.lowered_read().cloned());
-    let (lowered, required_schema_keys) = if let Some(lowered) = maybe_lowered_from_prepared {
-        let required_schema_keys = prepared
-            .as_ref()
-            .map(|prepared| {
-                required_schema_keys_from_dependency_spec(prepared.dependency_spec())
-            })
-            .unwrap_or_default();
-        (lowered, required_schema_keys)
-    } else {
-        let rewritten = rewrite_public_read_query_to_lowered_sql_with_registry(
-            query.clone(),
-            backend.dialect(),
-            &registry,
-        )?;
-        if rewritten != query {
-            return Ok(LoweredPublicReadQuery {
-                query: rewritten,
-                required_schema_keys: BTreeSet::new(),
-                result_columns: None,
-                public_output_columns: None,
-            });
-        }
-        let analysis = prepare_structured_public_read_analysis(
-            backend,
-            bind_statement(
-                Statement::Query(Box::new(query)),
-                params.to_vec(),
-                ExecutionContext {
-                    dialect: Some(backend.dialect()),
-                    writer_key: None,
-                    requested_version_id: Some(active_version_id.clone()),
-                    active_account_ids: Vec::new(),
-                },
-            ),
-            &active_version_id,
-            &registry,
-        )
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "public read subquery canonicalization failed",
-            )
-        })?;
-        let structured_read = analysis.structured_read();
-        let known_live_layouts = load_known_live_layouts_for_public_read(
-            backend,
-            structured_read,
-            analysis.dependency_spec.as_ref(),
-            analysis.semantics.effective_state_request.as_ref(),
-        )
-        .await?;
-        let lowered = lower_read_for_execution_with_layouts(
-            backend.dialect(),
-            structured_read,
-            analysis.semantics.effective_state_request.as_ref(),
-            analysis.semantics.effective_state_plan.as_ref(),
-            &known_live_layouts,
-        )?
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "public read lowering could not prepare read subquery",
-            )
-        })?;
-        (
-            lowered,
-            required_schema_keys_from_dependency_spec(analysis.dependency_spec.as_ref()),
-        )
-    };
-    let statement = lowered.statements.into_iter().next().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "public read subquery lowered to no statements",
-        )
-    })?;
-    let statement = lower_statement(statement, backend.dialect())?;
-    match statement {
-        Statement::Query(query) => Ok(LoweredPublicReadQuery {
-            query: *query,
-            required_schema_keys,
-            result_columns: Some(lowered.result_columns),
-            public_output_columns: prepared_public_output_columns,
-        }),
-        _ => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "expected lowered subquery to remain a SELECT query",
-        )),
     }
 }
 
@@ -1245,6 +335,38 @@ async fn load_known_live_layouts_for_public_read(
     Ok(schemas)
 }
 
+async fn load_known_live_layouts_for_broad_public_read(
+    backend: &dyn LixBackend,
+    registry: &SurfaceRegistry,
+    surface_bindings: &[SurfaceBinding],
+) -> Result<BTreeMap<String, JsonValue>, LixError> {
+    let mut provider = SqlRegisteredSchemaProvider::new(backend);
+    let mut schemas = BTreeMap::new();
+    let mut required_schema_keys = surface_bindings
+        .iter()
+        .filter(|binding| {
+            matches!(
+                binding.descriptor.surface_family,
+                SurfaceFamily::State | SurfaceFamily::Entity
+            )
+        })
+        .filter_map(|binding| binding.implicit_overrides.fixed_schema_key.clone())
+        .collect::<BTreeSet<_>>();
+    if surface_bindings
+        .iter()
+        .any(|binding| binding.descriptor.surface_family == SurfaceFamily::State)
+    {
+        required_schema_keys.extend(registry.registered_state_surface_schema_keys());
+    }
+    for schema_key in required_schema_keys {
+        schemas.insert(
+            schema_key.clone(),
+            provider.load_latest_schema(&schema_key).await?,
+        );
+    }
+    Ok(schemas)
+}
+
 fn build_direct_state_history_plan(
     structured_read: &StructuredPublicRead,
 ) -> Result<Option<StateHistoryDirectReadPlan>, LixError> {
@@ -1275,7 +397,7 @@ fn build_direct_state_history_plan(
     let sort_keys = build_state_history_sort_keys(structured_read, &projection_aliases)?;
     let (limit, offset) = direct_limit_values(
         structured_read.query.limit_clause.as_ref(),
-        &structured_read.bound_statement.bound_parameters,
+        &structured_read.bound_parameters,
     )?;
     let result_columns = direct_state_history_result_columns(
         &structured_read.surface_binding,
@@ -1337,7 +459,7 @@ fn build_direct_entity_history_plan(
     let sort_keys = build_entity_history_sort_keys(structured_read, &projection_aliases)?;
     let (limit, offset) = direct_limit_values(
         structured_read.query.limit_clause.as_ref(),
-        &structured_read.bound_statement.bound_parameters,
+        &structured_read.bound_parameters,
     )?;
     let result_columns = direct_entity_history_result_columns(
         &structured_read.surface_binding,
@@ -1398,7 +520,7 @@ fn build_state_history_having(
     };
     parse_state_history_aggregate_predicate(
         having,
-        &structured_read.bound_statement.bound_parameters,
+        &structured_read.bound_parameters,
         &mut PlaceholderState::new(),
     )?
     .ok_or_else(|| {
@@ -1412,8 +534,6 @@ fn build_state_history_having(
 
 fn required_requested_version_id(structured_read: &StructuredPublicRead) -> Result<&str, LixError> {
     structured_read
-        .bound_statement
-        .execution_context
         .requested_version_id
         .as_deref()
         .ok_or_else(|| {
@@ -1445,7 +565,7 @@ fn build_entity_history_predicates_and_request(
         let predicate = parse_entity_history_predicate(
             predicate_expr,
             &structured_read.surface_binding,
-            &structured_read.bound_statement.bound_parameters,
+            &structured_read.bound_parameters,
             &mut placeholder_state,
         )?
         .ok_or_else(|| {
@@ -1771,7 +891,7 @@ fn build_direct_file_history_plan(
     let sort_keys = build_file_history_sort_keys(structured_read, &projection_aliases)?;
     let (limit, offset) = direct_limit_values(
         structured_read.query.limit_clause.as_ref(),
-        &structured_read.bound_statement.bound_parameters,
+        &structured_read.bound_parameters,
     )?;
     let result_columns = direct_file_history_result_columns(
         &structured_read.surface_binding,
@@ -1831,7 +951,7 @@ fn build_direct_directory_history_plan(
     let sort_keys = build_directory_history_sort_keys(structured_read, &projection_aliases)?;
     let (limit, offset) = direct_limit_values(
         structured_read.query.limit_clause.as_ref(),
-        &structured_read.bound_statement.bound_parameters,
+        &structured_read.bound_parameters,
     )?;
     let result_columns = direct_directory_history_result_columns(
         &structured_read.surface_binding,
@@ -1916,7 +1036,7 @@ fn build_directory_history_predicates_and_request(
         let predicate = parse_directory_history_predicate(
             predicate_expr,
             &structured_read.surface_binding,
-            &structured_read.bound_statement.bound_parameters,
+            &structured_read.bound_parameters,
             &mut placeholder_state,
         )?
         .ok_or_else(|| {
@@ -2392,7 +1512,7 @@ fn build_file_history_predicates_and_request(
         let predicate = parse_file_history_predicate(
             predicate_expr,
             &structured_read.surface_binding,
-            &structured_read.bound_statement.bound_parameters,
+            &structured_read.bound_parameters,
             &mut placeholder_state,
         )?
         .ok_or_else(|| {
@@ -2840,7 +1960,7 @@ fn build_state_history_predicates_and_request(
         let predicate = parse_state_history_predicate(
             predicate_expr,
             &structured_read.surface_binding,
-            &structured_read.bound_statement.bound_parameters,
+            &structured_read.bound_parameters,
             &mut placeholder_state,
         )?
         .ok_or_else(|| {
@@ -3159,10 +2279,7 @@ fn direct_state_history_result_columns(
                 .column_types
                 .iter()
                 .map(
-                    |(name, column_type): (
-                        &String,
-                        &crate::sql::catalog::SurfaceColumnType,
-                    )| {
+                    |(name, column_type): (&String, &crate::sql::catalog::SurfaceColumnType)| {
                         (
                             name.clone(),
                             direct_lowered_result_column_from_surface_type(*column_type),
@@ -4943,77 +4060,83 @@ fn direct_entity_history_field_name(field: &DirectEntityHistoryField) -> &str {
     }
 }
 
-fn entity_history_predicate_debug_sql(predicate: &EntityHistoryPredicate) -> String {
-    match predicate {
-        EntityHistoryPredicate::Eq(field, value) => {
-            format!(
-                "{} = {}",
-                direct_entity_history_field_name(field),
-                debug_value_sql(value)
-            )
-        }
-        EntityHistoryPredicate::NotEq(field, value) => {
-            format!(
-                "{} != {}",
-                direct_entity_history_field_name(field),
-                debug_value_sql(value)
-            )
-        }
-        EntityHistoryPredicate::Gt(field, value) => {
-            format!(
-                "{} > {}",
-                direct_entity_history_field_name(field),
-                debug_value_sql(value)
-            )
-        }
-        EntityHistoryPredicate::GtEq(field, value) => {
-            format!(
-                "{} >= {}",
-                direct_entity_history_field_name(field),
-                debug_value_sql(value)
-            )
-        }
-        EntityHistoryPredicate::Lt(field, value) => {
-            format!(
-                "{} < {}",
-                direct_entity_history_field_name(field),
-                debug_value_sql(value)
-            )
-        }
-        EntityHistoryPredicate::LtEq(field, value) => {
-            format!(
-                "{} <= {}",
-                direct_entity_history_field_name(field),
-                debug_value_sql(value)
-            )
-        }
-        EntityHistoryPredicate::In(field, values) => format!(
-            "{} IN ({})",
-            direct_entity_history_field_name(field),
-            values
-                .iter()
-                .map(debug_value_sql)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        EntityHistoryPredicate::IsNull(field) => {
-            format!("{} IS NULL", direct_entity_history_field_name(field))
-        }
-        EntityHistoryPredicate::IsNotNull(field) => {
-            format!("{} IS NOT NULL", direct_entity_history_field_name(field))
-        }
+fn identifier_expr(name: &str) -> Expr {
+    Expr::Identifier(Ident::new(name))
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn sql_value_expr(value: &Value) -> Expr {
+    match value {
+        Value::Null => Expr::Value(SqlValue::Null.into()),
+        Value::Boolean(value) => Expr::Value(SqlValue::Boolean(*value).into()),
+        Value::Integer(value) => Expr::Value(SqlValue::Number(value.to_string(), false).into()),
+        Value::Real(value) => Expr::Value(SqlValue::Number(value.to_string(), false).into()),
+        Value::Text(value) => Expr::Value(SqlValue::SingleQuotedString(value.clone()).into()),
+        Value::Json(value) => Expr::Value(SqlValue::SingleQuotedString(value.to_string()).into()),
+        Value::Blob(value) => Expr::Value(SqlValue::HexStringLiteral(hex_string(value)).into()),
     }
 }
 
-fn debug_value_sql(value: &Value) -> String {
-    match value {
-        Value::Null => "NULL".to_string(),
-        Value::Boolean(value) => value.to_string(),
-        Value::Integer(value) => value.to_string(),
-        Value::Real(value) => value.to_string(),
-        Value::Text(value) => format!("'{}'", value.replace('\'', "''")),
-        Value::Json(value) => format!("'{}'", value.to_string().replace('\'', "''")),
-        Value::Blob(_) => "<blob>".to_string(),
+fn binary_predicate_expr(field_name: &str, op: BinaryOperator, value: &Value) -> Expr {
+    Expr::BinaryOp {
+        left: Box::new(identifier_expr(field_name)),
+        op,
+        right: Box::new(sql_value_expr(value)),
+    }
+}
+
+fn in_list_predicate_expr(field_name: &str, values: &[Value]) -> Expr {
+    Expr::InList {
+        expr: Box::new(identifier_expr(field_name)),
+        list: values.iter().map(sql_value_expr).collect(),
+        negated: false,
+    }
+}
+
+fn entity_history_predicate_expr(predicate: &EntityHistoryPredicate) -> Expr {
+    match predicate {
+        EntityHistoryPredicate::Eq(field, value) => binary_predicate_expr(
+            direct_entity_history_field_name(field),
+            BinaryOperator::Eq,
+            value,
+        ),
+        EntityHistoryPredicate::NotEq(field, value) => binary_predicate_expr(
+            direct_entity_history_field_name(field),
+            BinaryOperator::NotEq,
+            value,
+        ),
+        EntityHistoryPredicate::Gt(field, value) => binary_predicate_expr(
+            direct_entity_history_field_name(field),
+            BinaryOperator::Gt,
+            value,
+        ),
+        EntityHistoryPredicate::GtEq(field, value) => binary_predicate_expr(
+            direct_entity_history_field_name(field),
+            BinaryOperator::GtEq,
+            value,
+        ),
+        EntityHistoryPredicate::Lt(field, value) => binary_predicate_expr(
+            direct_entity_history_field_name(field),
+            BinaryOperator::Lt,
+            value,
+        ),
+        EntityHistoryPredicate::LtEq(field, value) => binary_predicate_expr(
+            direct_entity_history_field_name(field),
+            BinaryOperator::LtEq,
+            value,
+        ),
+        EntityHistoryPredicate::In(field, values) => {
+            in_list_predicate_expr(direct_entity_history_field_name(field), values)
+        }
+        EntityHistoryPredicate::IsNull(field) => Expr::IsNull(Box::new(identifier_expr(
+            direct_entity_history_field_name(field),
+        ))),
+        EntityHistoryPredicate::IsNotNull(field) => Expr::IsNotNull(Box::new(identifier_expr(
+            direct_entity_history_field_name(field),
+        ))),
     }
 }
 
@@ -5046,7 +4169,10 @@ fn value_as_i64(value: &Value) -> Option<i64> {
 
 enum SpecializedPublicReadPreparation {
     Prepared(PreparedPublicRead),
-    Declined { reason: String },
+    Declined {
+        reason: String,
+        bound_statement: BoundStatement,
+    },
 }
 
 fn parse_public_read_unknown_column_name(message: &str) -> Option<String> {
@@ -5089,17 +4215,24 @@ async fn try_prepare_public_read_via_specialized_optimization(
     registry: &SurfaceRegistry,
     public_output_columns: Option<Vec<String>>,
 ) -> Result<SpecializedPublicReadPreparation, LixError> {
-    let Some(analysis) = prepare_structured_public_read_analysis(
+    let runtime_bindings =
+        runtime_binding_values_from_execution_context(&bound_statement.execution_context)?;
+    let bound_parameters = bound_statement.bound_parameters.clone();
+    let analysis = match prepare_structured_public_read_analysis(
         backend,
-        bound_statement.clone(),
+        bound_statement,
         active_version_id,
         registry,
     )
     .await?
-    else {
-        return Ok(SpecializedPublicReadPreparation::Declined {
-            reason: "specialized read optimization declined canonicalization".to_string(),
-        });
+    {
+        StructuredPublicReadPreparation::Prepared(analysis) => analysis,
+        StructuredPublicReadPreparation::Declined(bound_statement) => {
+            return Ok(SpecializedPublicReadPreparation::Declined {
+                reason: "specialized read optimization declined canonicalization".to_string(),
+                bound_statement,
+            });
+        }
     };
     let structured_read = analysis.structured_read().clone();
     if explain_envelope.is_some()
@@ -5123,9 +4256,11 @@ async fn try_prepare_public_read_via_specialized_optimization(
     let surface_binding = structured_read.surface_binding.clone();
     let effective_state_request = analysis.semantics.effective_state_request.clone();
     let effective_state_plan = analysis.semantics.effective_state_plan.clone();
-    let dependency_spec = analysis.dependency_spec.clone();
-    let direct_execution =
-        explain_envelope.is_none() && is_direct_only_history_surface(&surface_binding);
+    let dependency_spec: Option<DependencySpec> = analysis.dependency_spec.clone();
+    let strategy_decision =
+        choose_specialized_public_read_strategy(&surface_binding, explain_envelope.is_some());
+    let direct_execution = strategy_decision.direct_execution;
+    let optimizer_passes = strategy_decision.pass_traces;
 
     let (execution, pushdown_decision, lowered_sql, dependency_spec) = if direct_execution {
         match (
@@ -5151,6 +4286,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                                 "specialized read optimization declined '{}'",
                                 structured_read.surface_binding.descriptor.public_name
                             ),
+                            bound_statement: analysis.bound_statement,
                         })
                     }
                     Err(error) if specialized_public_read_error_is_semantic(&error) => {
@@ -5159,6 +4295,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                     Err(error) => {
                         return Ok(SpecializedPublicReadPreparation::Declined {
                             reason: error.description,
+                            bound_statement: analysis.bound_statement,
                         })
                     }
                 }
@@ -5182,6 +4319,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                                 "specialized read optimization declined '{}'",
                                 structured_read.surface_binding.descriptor.public_name
                             ),
+                            bound_statement: analysis.bound_statement,
                         })
                     }
                     Err(error) if specialized_public_read_error_is_semantic(&error) => {
@@ -5190,6 +4328,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                     Err(error) => {
                         return Ok(SpecializedPublicReadPreparation::Declined {
                             reason: error.description,
+                            bound_statement: analysis.bound_statement,
                         })
                     }
                 }
@@ -5213,6 +4352,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                                 "specialized read optimization declined '{}'",
                                 structured_read.surface_binding.descriptor.public_name
                             ),
+                            bound_statement: analysis.bound_statement,
                         })
                     }
                     Err(error) if specialized_public_read_error_is_semantic(&error) => {
@@ -5221,6 +4361,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                     Err(error) => {
                         return Ok(SpecializedPublicReadPreparation::Declined {
                             reason: error.description,
+                            bound_statement: analysis.bound_statement,
                         })
                     }
                 }
@@ -5244,6 +4385,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                                 "specialized read optimization declined '{}'",
                                 structured_read.surface_binding.descriptor.public_name
                             ),
+                            bound_statement: analysis.bound_statement,
                         })
                     }
                     Err(error) if specialized_public_read_error_is_semantic(&error) => {
@@ -5252,6 +4394,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                     Err(error) => {
                         return Ok(SpecializedPublicReadPreparation::Declined {
                             reason: error.description,
+                            bound_statement: analysis.bound_statement,
                         })
                     }
                 }
@@ -5268,27 +4411,32 @@ async fn try_prepare_public_read_via_specialized_optimization(
             analysis.semantics.effective_state_plan.as_ref(),
             &known_live_layouts,
         ) {
-            Ok(Some(program)) => wrap_lowered_read_for_explain(program, explain_envelope),
+            Ok(Some(program)) => {
+                wrap_lowered_read_for_explain(program, explain_envelope, backend.dialect())
+            }
             Ok(None) => {
                 return Ok(SpecializedPublicReadPreparation::Declined {
                     reason: format!(
                         "specialized read optimization declined '{}'",
                         structured_read.surface_binding.descriptor.public_name
                     ),
+                    bound_statement: analysis.bound_statement,
                 })
             }
             Err(error) if specialized_public_read_error_is_semantic(&error) => return Err(error),
             Err(error) => {
                 return Ok(SpecializedPublicReadPreparation::Declined {
                     reason: error.description,
+                    bound_statement: analysis.bound_statement,
                 })
             }
-        };
-        let lowered_sql = lowered_read
-            .statements
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
+        }?;
+        let lowered_sql = render_lowered_read_sql(
+            &lowered_read,
+            &analysis.bound_statement.bound_parameters,
+            &analysis.bound_statement.execution_context,
+            backend.dialect(),
+        )?;
         let pushdown_decision = Some(lowered_read.pushdown_decision.clone());
         (
             PreparedPublicReadExecution::LoweredSql(lowered_read),
@@ -5307,19 +4455,28 @@ async fn try_prepare_public_read_via_specialized_optimization(
     verify_logical_plan(&LogicalPlan::PublicRead(logical_plan.clone())).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("public read logical plan verification failed: {}", error.message),
+            format!(
+                "public read logical plan verification failed: {}",
+                error.message
+            ),
         )
     })?;
 
     Ok(SpecializedPublicReadPreparation::Prepared(
         PreparedPublicRead {
             logical_plan,
+            bound_parameters,
+            runtime_bindings,
             public_output_columns,
             debug_trace: PublicExecutionDebugTrace {
                 semantic_statement: Some(
-                    analysis.semantics.semantic_statement(explain_envelope.cloned()),
+                    analysis
+                        .semantics
+                        .semantic_statement(explain_envelope.cloned()),
                 ),
-                bound_statements: vec![bound_statement],
+                bound_statements: Vec::new(),
+                optimizer_passes,
+                physical_plan: Some(PhysicalPlan::PublicRead(execution.clone())),
                 surface_bindings: vec![surface_binding.descriptor.public_name.clone()],
                 bound_public_leaves: vec![BoundPublicLeaf::from_surface_binding(&surface_binding)],
                 dependency_spec: dependency_spec.clone(),
@@ -5348,7 +4505,11 @@ fn direct_state_history_pushdown_decision(
     let mut accepted_predicates = Vec::new();
     if let StateHistoryRootScope::RequestedRoots(root_commit_ids) = &plan.request.root_scope {
         for root_commit_id in root_commit_ids {
-            accepted_predicates.push(format!("root_commit_id = '{root_commit_id}'"));
+            accepted_predicates.push(binary_predicate_expr(
+                "root_commit_id",
+                BinaryOperator::Eq,
+                &Value::Text(root_commit_id.clone()),
+            ));
         }
     }
 
@@ -5367,33 +4528,65 @@ fn direct_entity_history_pushdown_decision(
 
     if let StateHistoryRootScope::RequestedRoots(root_commit_ids) = &plan.request.root_scope {
         for root_commit_id in root_commit_ids {
-            accepted_predicates.push(format!("root_commit_id = '{root_commit_id}'"));
+            accepted_predicates.push(binary_predicate_expr(
+                "root_commit_id",
+                BinaryOperator::Eq,
+                &Value::Text(root_commit_id.clone()),
+            ));
         }
     }
     if let StateHistoryVersionScope::RequestedVersions(version_ids) = &plan.request.version_scope {
         for version_id in version_ids {
-            accepted_predicates.push(format!("version_id = '{version_id}'"));
+            accepted_predicates.push(binary_predicate_expr(
+                "version_id",
+                BinaryOperator::Eq,
+                &Value::Text(version_id.clone()),
+            ));
         }
     }
     for entity_id in &plan.request.entity_ids {
-        accepted_predicates.push(format!("entity_id = '{entity_id}'"));
+        accepted_predicates.push(binary_predicate_expr(
+            "entity_id",
+            BinaryOperator::Eq,
+            &Value::Text(entity_id.clone()),
+        ));
     }
     for file_id in &plan.request.file_ids {
-        accepted_predicates.push(format!("file_id = '{file_id}'"));
+        accepted_predicates.push(binary_predicate_expr(
+            "file_id",
+            BinaryOperator::Eq,
+            &Value::Text(file_id.clone()),
+        ));
     }
     for plugin_key in &plan.request.plugin_keys {
-        accepted_predicates.push(format!("plugin_key = '{plugin_key}'"));
+        accepted_predicates.push(binary_predicate_expr(
+            "plugin_key",
+            BinaryOperator::Eq,
+            &Value::Text(plugin_key.clone()),
+        ));
     }
     if let Some(min_depth) = plan.request.min_depth {
         if plan.request.max_depth == Some(min_depth) {
-            accepted_predicates.push(format!("depth = {min_depth}"));
+            accepted_predicates.push(binary_predicate_expr(
+                "depth",
+                BinaryOperator::Eq,
+                &Value::Integer(min_depth),
+            ));
         } else {
-            accepted_predicates.push(format!("depth >= {min_depth}"));
+            accepted_predicates.push(binary_predicate_expr(
+                "depth",
+                BinaryOperator::GtEq,
+                &Value::Integer(min_depth),
+            ));
         }
     }
     if let Some(max_depth) = plan.request.max_depth {
         if plan.request.min_depth != Some(max_depth) {
-            accepted_predicates.push(format!("depth <= {max_depth}"));
+            accepted_predicates.push(binary_predicate_expr(
+                "depth",
+                BinaryOperator::LtEq,
+                &Value::Integer(max_depth),
+            ));
         }
     }
 
@@ -5410,7 +4603,7 @@ fn direct_entity_history_pushdown_decision(
             | EntityHistoryPredicate::IsNotNull(field) => field,
         };
         if matches!(field, DirectEntityHistoryField::Property(_)) {
-            residual_predicates.push(entity_history_predicate_debug_sql(predicate));
+            residual_predicates.push(entity_history_predicate_expr(predicate));
         }
     }
 
@@ -5427,12 +4620,20 @@ fn direct_file_history_pushdown_decision(
     let mut accepted_predicates = Vec::new();
     if let FileHistoryRootScope::RequestedRoots(root_commit_ids) = &plan.request.root_scope {
         for root_commit_id in root_commit_ids {
-            accepted_predicates.push(format!("root_commit_id = '{root_commit_id}'"));
+            accepted_predicates.push(binary_predicate_expr(
+                "root_commit_id",
+                BinaryOperator::Eq,
+                &Value::Text(root_commit_id.clone()),
+            ));
         }
     }
     if let FileHistoryVersionScope::RequestedVersions(version_ids) = &plan.request.version_scope {
         for version_id in version_ids {
-            accepted_predicates.push(format!("version_id = '{version_id}'"));
+            accepted_predicates.push(binary_predicate_expr(
+                "version_id",
+                BinaryOperator::Eq,
+                &Value::Text(version_id.clone()),
+            ));
         }
     }
 
@@ -5449,16 +4650,28 @@ fn direct_directory_history_pushdown_decision(
     let mut accepted_predicates = Vec::new();
     if let FileHistoryRootScope::RequestedRoots(root_commit_ids) = &plan.request.root_scope {
         for root_commit_id in root_commit_ids {
-            accepted_predicates.push(format!("root_commit_id = '{root_commit_id}'"));
+            accepted_predicates.push(binary_predicate_expr(
+                "root_commit_id",
+                BinaryOperator::Eq,
+                &Value::Text(root_commit_id.clone()),
+            ));
         }
     }
     if let FileHistoryVersionScope::RequestedVersions(version_ids) = &plan.request.version_scope {
         for version_id in version_ids {
-            accepted_predicates.push(format!("version_id = '{version_id}'"));
+            accepted_predicates.push(binary_predicate_expr(
+                "version_id",
+                BinaryOperator::Eq,
+                &Value::Text(version_id.clone()),
+            ));
         }
     }
     for directory_id in &plan.request.directory_ids {
-        accepted_predicates.push(format!("id = '{directory_id}'"));
+        accepted_predicates.push(binary_predicate_expr(
+            "id",
+            BinaryOperator::Eq,
+            &Value::Text(directory_id.clone()),
+        ));
     }
 
     Some(PushdownDecision {
@@ -5543,6 +4756,20 @@ async fn try_prepare_public_read_with_internal_access(
         None
     };
     let read_summary = summarize_bound_public_read_statement(&registry, &statement);
+    if let Some(binding) = explain_envelope.as_ref().and_then(|_| {
+        read_summary
+            .bound_surface_bindings
+            .iter()
+            .find(|binding| is_direct_only_history_surface(binding))
+    }) {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "EXPLAIN is not supported for direct-only surface '{}'",
+                binding.descriptor.public_name
+            ),
+        ));
+    }
     if read_summary.bound_surface_bindings.len() > 1
         && bound_summary_contains_direct_only_history_surface(&read_summary)
     {
@@ -5584,7 +4811,7 @@ async fn try_prepare_public_read_with_internal_access(
     }
     let specialized = try_prepare_public_read_via_specialized_optimization(
         backend,
-        bound_statement.clone(),
+        bound_statement,
         active_version_id,
         explain_envelope.as_ref(),
         &registry,
@@ -5593,7 +4820,10 @@ async fn try_prepare_public_read_with_internal_access(
     .await?;
     match specialized {
         SpecializedPublicReadPreparation::Prepared(prepared) => return Ok(Some(prepared)),
-        SpecializedPublicReadPreparation::Declined { reason } => {
+        SpecializedPublicReadPreparation::Declined {
+            reason,
+            bound_statement,
+        } => {
             if !attempted_broad_lowering {
                 if let Some(prepared) = prepare_public_read_via_surface_lowering(
                     backend,
@@ -5645,41 +4875,58 @@ async fn prepare_public_read_via_surface_lowering(
         ));
     }
 
-    let mut rewritten_statement = bound_statement.statement.clone();
     let active_version_id = bound_statement
         .execution_context
         .requested_version_id
         .as_deref();
-    if let Err(error) =
-        rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id(
-            &mut rewritten_statement,
-            registry,
-            backend.dialect(),
-            active_version_id,
-        )
-    {
-        if let Some(mapped) =
-            public_read_preparation_error(&read_summary.bound_surface_bindings, &error.description)
-        {
-            return Err(mapped);
+    let known_live_layouts = load_known_live_layouts_for_broad_public_read(
+        backend,
+        registry,
+        &read_summary.bound_surface_bindings,
+    )
+    .await?;
+    let optimized_statement = match optimize_broad_public_read_statement_with_known_live_layouts(
+        &bound_statement.statement,
+        registry,
+        backend.dialect(),
+        active_version_id,
+        &known_live_layouts,
+    ) {
+        Ok(optimized) => optimized,
+        Err(error) => {
+            if let Some(mapped) = public_read_preparation_error(
+                &read_summary.bound_surface_bindings,
+                &error.description,
+            ) {
+                return Err(mapped);
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
+    let rewritten_statement = optimized_statement.shell_statement;
     if statement_references_public_surface(registry, &rewritten_statement) {
         return Ok(None);
     }
-    if rewritten_statement == bound_statement.statement {
+    if rewritten_statement == bound_statement.statement
+        && optimized_statement.relation_render_nodes.is_empty()
+    {
         return Ok(None);
     }
 
     let lowered_read = wrap_lowered_read_for_explain(
         LoweredReadProgram {
-            statements: vec![rewritten_statement.clone()],
+            statements: vec![compile_lowered_read_statement(
+                backend.dialect(),
+                bound_statement.bound_parameters.len(),
+                rewritten_statement,
+                optimized_statement.relation_render_nodes,
+            )?],
             pushdown_decision: PushdownDecision::default(),
             result_columns: LoweredResultColumns::Static(Vec::new()),
         },
         explain_envelope,
-    );
+        backend.dialect(),
+    )?;
     let dependency_spec = augment_dependency_spec_for_broad_public_read(
         registry,
         derive_dependency_spec_from_bound_public_surface_bindings(
@@ -5696,7 +4943,6 @@ async fn prepare_public_read_via_surface_lowering(
         .collect::<Vec<_>>();
 
     let semantic_read = PublicReadSemantics {
-        bound_statement: bound_statement.clone(),
         surface_bindings: read_summary.bound_surface_bindings.clone(),
         structured_read: None,
         effective_state_request: None,
@@ -5710,16 +4956,27 @@ async fn prepare_public_read_via_surface_lowering(
     verify_logical_plan(&LogicalPlan::PublicRead(logical_plan.clone())).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("public read logical plan verification failed: {}", error.message),
+            format!(
+                "public read logical plan verification failed: {}",
+                error.message
+            ),
         )
     })?;
 
     Ok(Some(PreparedPublicRead {
         logical_plan,
+        bound_parameters: bound_statement.bound_parameters.clone(),
+        runtime_bindings: runtime_binding_values_from_execution_context(
+            &bound_statement.execution_context,
+        )?,
         public_output_columns,
         debug_trace: PublicExecutionDebugTrace {
             semantic_statement: Some(semantic_read.semantic_statement(explain_envelope.cloned())),
-            bound_statements: vec![bound_statement.clone()],
+            bound_statements: Vec::new(),
+            optimizer_passes: optimized_statement.pass_traces,
+            physical_plan: Some(PhysicalPlan::PublicRead(
+                PreparedPublicReadExecution::LoweredSql(lowered_read.clone()),
+            )),
             surface_bindings: read_summary
                 .bound_surface_bindings
                 .iter()
@@ -5739,11 +4996,12 @@ async fn prepare_public_read_via_surface_lowering(
             commit_preconditions: Vec::new(),
             invariant_trace: None,
             write_phase_trace: Vec::new(),
-            lowered_sql: lowered_read
-                .statements
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
+            lowered_sql: render_lowered_read_sql(
+                &lowered_read,
+                &bound_statement.bound_parameters,
+                &bound_statement.execution_context,
+                backend.dialect(),
+            )?,
         },
         execution: PreparedPublicReadExecution::LoweredSql(lowered_read),
     }))

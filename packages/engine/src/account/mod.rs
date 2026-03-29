@@ -4,7 +4,9 @@ use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
 use crate::schema::builtin::types::LixAccount;
-use crate::schema::builtin::{builtin_schema_definition, builtin_schema_json, decode_lixcol_literal};
+use crate::schema::builtin::{
+    builtin_schema_definition, builtin_schema_json, decode_lixcol_literal,
+};
 use crate::version::GLOBAL_VERSION_ID;
 pub(crate) use init::{init, seed_bootstrap};
 pub(crate) const ACCOUNT_STORAGE_VERSION_ID: &str = "global";

@@ -153,9 +153,9 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
                     .as_ref()
                     .map(|batch| batch.write_lane.clone())
                     .unwrap_or_else(|| match &unit.execution.create_preconditions.write_lane {
-                        crate::sql::logical_plan::public_ir::WriteLane::SingleVersion(version_id) => {
-                            WriteLane::SingleVersion(version_id.clone())
-                        }
+                        crate::sql::logical_plan::public_ir::WriteLane::SingleVersion(
+                            version_id,
+                        ) => WriteLane::SingleVersion(version_id.clone()),
                         crate::sql::logical_plan::public_ir::WriteLane::ActiveVersion => {
                             WriteLane::ActiveVersion
                         }

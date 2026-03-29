@@ -3,10 +3,10 @@ use crate::engine::{Engine, ExecuteOptions, TransactionBackendAdapter};
 use crate::live_state::schema_access::{
     normalized_values_for_schema, payload_column_name_for_schema, tracked_relation_name,
 };
-use crate::sql::executor::execution_program::{ExecutionContext, SessionExecutionRuntime};
-use crate::sql::parser::parse_sql;
-use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::sql::common::text::escape_sql_string;
+use crate::sql::executor::execution_program::{ExecutionContext, SessionExecutionRuntime};
+use crate::sql::executor::runtime_state::ExecutionRuntimeState;
+use crate::sql::parser::parse_sql;
 use crate::transaction::{
     execute_parsed_statements_in_borrowed_write_transaction, BorrowedWriteTransaction,
 };

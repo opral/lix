@@ -49,7 +49,9 @@ pub(crate) fn verify_public_read_logical_plan(
             }
             verify_direct_public_read_plan(direct_plan)?;
         }
-        PublicReadLogicalPlan::Broad { surface_bindings, .. } => {
+        PublicReadLogicalPlan::Broad {
+            surface_bindings, ..
+        } => {
             if surface_bindings.is_empty() {
                 return Err(LogicalPlanVerificationError::new(
                     "broad public read logical plan must record at least one bound surface",
@@ -111,9 +113,7 @@ fn verify_direct_public_read_plan(
             }
         }
         DirectPublicReadPlan::FileHistory(plan) => verify_file_history_direct_plan(plan),
-        DirectPublicReadPlan::DirectoryHistory(plan) => {
-            verify_directory_history_direct_plan(plan)
-        }
+        DirectPublicReadPlan::DirectoryHistory(plan) => verify_directory_history_direct_plan(plan),
     }
 }
 

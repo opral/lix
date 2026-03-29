@@ -4,22 +4,20 @@
 //! parameter/caller-specific AST binding concerns.
 
 pub(crate) mod classifier;
-pub(crate) mod public_bind;
 pub(crate) mod runtime;
 
 use crate::sql::semantic_ir::{BoundStatement, ExecutionContext};
 use crate::Value;
 use sqlparser::ast::Statement;
 
-pub(crate) use public_bind::{bind_public_query, bind_public_statement_sql};
+#[cfg(test)]
+pub(crate) use runtime::{
+    advance_placeholder_state_for_statement_ast, is_transaction_control_statement,
+};
 pub(crate) use runtime::{
     bind_sql, bind_sql_with_state, bind_sql_with_state_and_appended_params,
     bind_statement_binding_template, compile_statement_binding_template_with_state,
     insert_values_rows_mut, RuntimeBindingValues, StatementBindingTemplate,
-};
-#[cfg(test)]
-pub(crate) use runtime::{
-    advance_placeholder_state_for_statement_ast, is_transaction_control_statement,
 };
 
 pub(crate) fn bind_statement(
