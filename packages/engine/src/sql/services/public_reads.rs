@@ -1,5 +1,5 @@
 use crate::sql::catalog::SurfaceRegistry;
-use crate::sql::executor::public_runtime::{
+use crate::sql::executor::{
     execute_prepared_public_read, try_prepare_public_read_with_registry_and_internal_access,
 };
 use crate::sql::services::pending_reads::{

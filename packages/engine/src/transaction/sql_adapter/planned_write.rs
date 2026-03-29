@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::live_state::{
     coalesce_live_table_requirements, SchemaRegistration, SchemaRegistrationSet,
 };
-use crate::sql::executor::compiled::{CompiledExecution, CompiledInternalExecution};
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;
+use crate::sql::executor::{CompiledExecution, CompiledInternalExecution};
+use crate::sql::physical_plan::{PhysicalPlan, PreparedPublicWriteExecution};
 use crate::LixError;
 
 use super::{
@@ -355,8 +356,11 @@ pub(crate) fn build_planned_write_plan(
     let mut units = Vec::new();
 
     if let Some(public_write) = prepared.public_write() {
-        if let Some(execution) = public_write.materialization() {
-            for partition in &execution.partitions {
+        let Some(PhysicalPlan::PublicWrite(execution)) = prepared.physical_plan() else {
+            return None;
+        };
+        if let PreparedPublicWriteExecution::Materialize(materialization) = execution {
+            for partition in &materialization.partitions {
                 match partition {
                     PublicWriteExecutionPartition::Tracked(tracked) => {
                         let tracked_plan =

@@ -1,8 +1,8 @@
 use crate::filesystem::runtime::FilesystemTransactionState;
-use crate::sql::executor::compiled::CompiledExecution;
-use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::sql::physical_plan::TrackedWriteExecution;
 
+use super::super::compiled::CompiledExecution;
+use super::super::runtime_state::ExecutionRuntimeState;
 use super::PreparedPublicWrite;
 
 #[derive(Clone)]

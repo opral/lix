@@ -291,10 +291,10 @@ fn execution_program_is_a_thin_client_for_adapter_runtime() {
 
 #[test]
 fn pending_transaction_view_is_transaction_owned() {
-    let shared_path_source = read_engine_source("sql/executor/shared_path.rs");
+    let executor_compile_source = read_engine_source("sql/executor/compile.rs");
     assert!(
-        !shared_path_source.contains("struct PendingTransactionView"),
-        "shared_path.rs should not define PendingTransactionView once transaction owns pending visibility"
+        !executor_compile_source.contains("struct PendingTransactionView"),
+        "executor compile ownership should not define PendingTransactionView once transaction owns pending visibility"
     );
 
     let transaction_mod_source = read_engine_source("transaction/mod.rs");

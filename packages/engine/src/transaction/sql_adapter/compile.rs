@@ -4,7 +4,10 @@ use crate::engine::{
 use crate::sql::executor::execution_program::{
     BoundStatementTemplateInstance, ExecutionContext, StatementTemplate, StatementTemplateCacheKey,
 };
-use crate::sql::executor::shared_path::{self, prepared_execution_mutates_public_surface_registry};
+use crate::sql::executor::{
+    compile_execution_from_template_instance_with_backend,
+    prepared_execution_mutates_public_surface_registry, PreparationPolicy,
+};
 use crate::sql::parser::parse_sql;
 use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, Value};
@@ -38,34 +41,33 @@ pub(super) async fn compile_sql_buffered_write_command(
             .await?;
     }
     let backend = TransactionBackendAdapter::new(transaction);
-    let compiled_execution =
-        match shared_path::compile_execution_from_template_instance_with_backend(
-            engine,
-            &backend,
-            pending_transaction_view,
-            bound_statement_template,
-            context.active_version_id.as_str(),
-            &context.active_account_ids,
-            writer_key.as_deref(),
-            allow_internal_tables,
-            Some(&context.public_surface_registry),
-            Some(runtime_state),
-            shared_path::PreparationPolicy {
-                skip_side_effect_collection,
-            },
-        )
-        .await
-        {
-            Ok(compiled_execution) => compiled_execution,
-            Err(error) => {
-                return Err(normalize_sql_execution_error_with_backend(
-                    &backend,
-                    error,
-                    parsed_statements,
-                )
-                .await);
-            }
-        };
+    let compiled_execution = match compile_execution_from_template_instance_with_backend(
+        engine,
+        &backend,
+        pending_transaction_view,
+        bound_statement_template,
+        context.active_version_id.as_str(),
+        &context.active_account_ids,
+        writer_key.as_deref(),
+        allow_internal_tables,
+        Some(&context.public_surface_registry),
+        Some(runtime_state),
+        PreparationPolicy {
+            skip_side_effect_collection,
+        },
+    )
+    .await
+    {
+        Ok(compiled_execution) => compiled_execution,
+        Err(error) => {
+            return Err(normalize_sql_execution_error_with_backend(
+                &backend,
+                error,
+                parsed_statements,
+            )
+            .await);
+        }
+    };
     let compiled = CompiledExecutionStep::compile(compiled_execution, writer_key.as_deref())?;
     let registry_mutated_during_planning =
         prepared_execution_mutates_public_surface_registry(compiled.execution())?;

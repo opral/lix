@@ -1,6 +1,25 @@
 use crate::engine::Engine;
 use crate::functions::SharedFunctionProvider;
-use crate::sql::executor::public_runtime::{
+use crate::sql::physical_plan::PhysicalPlan;
+use crate::sql::semantic_ir::validation::{
+    validate_batch_local_write, validate_inserts, validate_updates,
+};
+use crate::transaction::PendingTransactionView;
+use crate::{LixBackend, LixError, Value};
+use sqlparser::ast::Statement;
+
+use super::compiled::{CompiledExecution, CompiledExecutionBody, CompiledInternalExecution};
+use super::contracts::effects::PlanEffects;
+use super::contracts::planned_statement::PlannedStatementSet;
+use super::contracts::requirements::PlanRequirements;
+use super::derive_effects::derive_plan_effects;
+use super::derive_requirements::derive_plan_requirements;
+use super::execution_program::{BoundStatementTemplateInstance, StatementTemplateOwnership};
+use super::intent::{
+    collect_execution_intent_with_backend, ExecutionIntent, IntentCollectionPolicy,
+};
+use super::preprocess::preprocess_with_surfaces_to_logical_plan;
+use super::public_runtime::{
     finalize_public_write_execution, prepare_public_execution_with_internal_access_and_functions,
     prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions,
     prepared_public_write_mutates_public_surface_registry,
@@ -8,30 +27,8 @@ use crate::sql::executor::public_runtime::{
     try_prepare_public_write_with_functions, try_prepare_public_write_with_registry_and_functions,
     PreparedPublicExecution, PreparedPublicWrite,
 };
-use crate::sql::semantic_ir::validation::{
-    validate_batch_local_write, validate_inserts, validate_updates,
-};
-use crate::{LixBackend, LixError, Value};
-
-use crate::sql::executor::compiled::{
-    CompiledExecution, CompiledExecutionBody, CompiledInternalExecution,
-};
-use crate::sql::executor::contracts::effects::PlanEffects;
-use crate::sql::executor::contracts::planned_statement::PlannedStatementSet;
-use crate::sql::executor::contracts::requirements::PlanRequirements;
-use crate::sql::executor::derive_effects::derive_plan_effects;
-use crate::sql::executor::derive_requirements::derive_plan_requirements;
-use crate::sql::executor::execution_program::{
-    BoundStatementTemplateInstance, StatementTemplateOwnership,
-};
-use crate::sql::executor::intent::{
-    collect_execution_intent_with_backend, ExecutionIntent, IntentCollectionPolicy,
-};
-use crate::sql::executor::preprocess::preprocess_with_surfaces_to_logical_plan;
-use crate::sql::executor::runtime_state::ExecutionRuntimeState;
+use super::runtime_state::ExecutionRuntimeState;
 use crate::sql::logical_plan::{result_contract_for_statements, ResultContract};
-use crate::transaction::PendingTransactionView;
-use sqlparser::ast::Statement;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const GLOBAL_VERSION_ID: &str = "global";
@@ -281,10 +278,20 @@ async fn compile_execution_with_backend(
             ));
         }
     };
+    let physical_plan = match &body {
+        CompiledExecutionBody::PublicRead(read) => {
+            Some(PhysicalPlan::PublicRead(read.execution.clone()))
+        }
+        CompiledExecutionBody::PublicWrite(write) => {
+            Some(PhysicalPlan::PublicWrite(write.execution.clone()))
+        }
+        CompiledExecutionBody::Internal(_) => None,
+    };
 
     Ok(CompiledExecution {
         intent,
         runtime_state: runtime_state.clone(),
+        physical_plan,
         result_contract,
         effects,
         read_only_query: requirements.read_only_query,

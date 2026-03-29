@@ -2,12 +2,11 @@ use crate::engine::{DeferredTransactionSideEffects, Engine, TransactionBackendAd
 use crate::filesystem::runtime::merge_filesystem_transaction_state;
 use crate::read::contracts::PublicReadExecutionMode;
 use crate::sql::catalog::SurfaceRegistry;
-use crate::sql::executor::compiled::CompiledExecution;
 use crate::sql::executor::execution_program::ExecutionContext;
-use crate::sql::executor::public_runtime::{
-    apply_public_surface_registry_mutations, public_surface_registry_mutations,
+use crate::sql::executor::{
+    apply_public_surface_registry_mutations, prepared_execution_mutates_public_surface_registry,
+    public_surface_registry_mutations, CompiledExecution, PreparedPublicWrite,
 };
-use crate::sql::executor::shared_path::prepared_execution_mutates_public_surface_registry;
 use crate::sql::physical_plan::PublicWriteExecutionPartition;
 use crate::sql::services::pending_reads::{
     bootstrap_public_surface_registry_with_pending_transaction_view, public_read_execution_mode,
@@ -355,7 +354,7 @@ fn apply_execution_planning_effects(
 }
 
 fn public_write_execution_next_active_version_id(
-    public_write: &crate::sql::executor::public_runtime::PreparedPublicWrite,
+    public_write: &PreparedPublicWrite,
 ) -> Option<String> {
     public_write.materialization().and_then(|execution| {
         execution

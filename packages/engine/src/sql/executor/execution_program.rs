@@ -8,12 +8,6 @@ use crate::sql::binder::{
     RuntimeBindingValues, StatementBindingTemplate,
 };
 use crate::sql::catalog::SurfaceRegistry;
-use crate::sql::executor::contracts::requirements::PlanRequirements;
-use crate::sql::executor::public_runtime::{
-    classify_public_execution_route_with_registry, PublicExecutionRoute,
-};
-use crate::sql::executor::runtime_state::ExecutionRuntimeEffects;
-use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::sql::internal::script::coalesce_state_surface_inserts_in_transactions;
 use crate::sql::parser::placeholders::PlaceholderState;
 use crate::transaction::{
@@ -23,6 +17,10 @@ use crate::transaction::{
 };
 use crate::{ExecuteResult, LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
+
+use super::contracts::requirements::PlanRequirements;
+use super::runtime_state::{ExecutionRuntimeEffects, ExecutionRuntimeState};
+use super::{classify_public_execution_route_with_registry, PublicExecutionRoute};
 
 pub(crate) struct ExecutionProgram {
     source_statements: Vec<Statement>,
