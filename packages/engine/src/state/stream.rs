@@ -59,6 +59,8 @@ pub struct StateCommitStreamChange {
     pub plugin_key: String,
     pub snapshot_content: Option<JsonValue>,
     pub untracked: bool,
+    /// Runtime notification metadata used for listener filtering and echo
+    /// suppression. This is not canonical committed state.
     pub writer_key: Option<String>,
 }
 
@@ -66,6 +68,19 @@ pub struct StateCommitStreamChange {
 pub struct StateCommitStreamBatch {
     pub sequence: u64,
     pub changes: Vec<StateCommitStreamChange>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StateCommitStreamRuntimeMetadata {
+    pub(crate) writer_key: Option<String>,
+}
+
+impl StateCommitStreamRuntimeMetadata {
+    pub(crate) fn from_runtime_writer_key(writer_key: Option<&str>) -> Self {
+        Self {
+            writer_key: writer_key.map(str::to_string),
+        }
+    }
 }
 
 pub struct StateCommitStream {
@@ -460,13 +475,11 @@ fn enqueue_batch(queue: &ListenerQueue, batch: StateCommitStreamBatch) {
 
 pub(crate) fn state_commit_stream_changes_from_mutations(
     mutations: &[MutationRow],
-    writer_key: Option<&str>,
+    runtime_metadata: StateCommitStreamRuntimeMetadata,
 ) -> Vec<StateCommitStreamChange> {
     if mutations.is_empty() {
         return Vec::new();
     }
-
-    let writer_key = writer_key.map(str::to_string);
 
     mutations
         .iter()
@@ -480,7 +493,7 @@ pub(crate) fn state_commit_stream_changes_from_mutations(
             plugin_key: mutation.plugin_key.clone(),
             snapshot_content: mutation.snapshot_content.clone(),
             untracked: mutation.untracked,
-            writer_key: writer_key.clone(),
+            writer_key: runtime_metadata.writer_key.clone(),
         })
         .collect()
 }
@@ -488,6 +501,7 @@ pub(crate) fn state_commit_stream_changes_from_mutations(
 pub(crate) fn state_commit_stream_changes_from_domain_changes<Change: TrackedDomainChangeView>(
     changes: &[Change],
     operation: StateCommitStreamOperation,
+    runtime_metadata: StateCommitStreamRuntimeMetadata,
 ) -> Result<Vec<StateCommitStreamChange>, LixError> {
     if changes.is_empty() {
         return Ok(Vec::new());
@@ -495,6 +509,10 @@ pub(crate) fn state_commit_stream_changes_from_domain_changes<Change: TrackedDom
 
     let mut resolved = Vec::with_capacity(changes.len());
     for change in changes {
+        // State-commit-stream is a runtime notification surface rather than a
+        // canonical replay surface. When a tracked change has no row-level
+        // writer annotation, the event may still carry the runtime writer
+        // metadata for listener-side echo suppression.
         let snapshot_content = match change.snapshot_content() {
             Some(snapshot_content) => Some(
                 serde_json::from_str(snapshot_content).map_err(|error| LixError {
@@ -536,7 +554,7 @@ pub(crate) fn state_commit_stream_changes_from_domain_changes<Change: TrackedDom
                 .to_string(),
             snapshot_content,
             untracked: false,
-            writer_key: change.writer_key().map(str::to_string),
+            writer_key: state_commit_stream_writer_key(change.writer_key(), &runtime_metadata),
         });
     }
 
@@ -547,13 +565,11 @@ pub(crate) fn state_commit_stream_changes_from_planned_rows(
     rows: &[crate::sql::logical_plan::public_ir::PlannedStateRow],
     operation: StateCommitStreamOperation,
     untracked: bool,
-    writer_key: Option<&str>,
+    runtime_metadata: StateCommitStreamRuntimeMetadata,
 ) -> Result<Vec<StateCommitStreamChange>, LixError> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-
-    let writer_key = writer_key.map(str::to_string);
     let mut resolved = Vec::with_capacity(rows.len());
     for row in rows {
         let file_id = planned_row_required_text(row, "file_id")?;
@@ -578,11 +594,20 @@ pub(crate) fn state_commit_stream_changes_from_planned_rows(
             plugin_key,
             snapshot_content,
             untracked,
-            writer_key: writer_key.clone(),
+            writer_key: runtime_metadata.writer_key.clone(),
         });
     }
 
     Ok(resolved)
+}
+
+fn state_commit_stream_writer_key(
+    row_writer_key: Option<&str>,
+    runtime_metadata: &StateCommitStreamRuntimeMetadata,
+) -> Option<String> {
+    row_writer_key
+        .map(str::to_string)
+        .or_else(|| runtime_metadata.writer_key.clone())
 }
 
 fn planned_row_required_text(
@@ -641,6 +666,7 @@ mod tests {
     use super::{
         state_commit_stream_changes_from_domain_changes,
         state_commit_stream_changes_from_planned_rows, StateCommitStreamOperation,
+        StateCommitStreamRuntimeMetadata,
     };
     use crate::canonical::ProposedDomainChange;
     use crate::sql::logical_plan::public_ir::PlannedStateRow;
@@ -662,6 +688,7 @@ mod tests {
                 writer_key: Some("writer-a".to_string()),
             }],
             StateCommitStreamOperation::Update,
+            StateCommitStreamRuntimeMetadata::default(),
         )
         .expect("domain changes should map");
 
@@ -670,6 +697,52 @@ mod tests {
         assert_eq!(changes[0].entity_id, "entity-1");
         assert_eq!(changes[0].schema_key, "lix_key_value");
         assert_eq!(changes[0].writer_key.as_deref(), Some("writer-a"));
+    }
+
+    #[test]
+    fn state_commit_stream_uses_runtime_writer_metadata_when_change_omits_it() {
+        let changes = state_commit_stream_changes_from_domain_changes(
+            &[ProposedDomainChange {
+                entity_id: "entity-1".try_into().unwrap(),
+                schema_key: "lix_key_value".try_into().unwrap(),
+                schema_version: Some("1".try_into().unwrap()),
+                file_id: Some("file-1".try_into().unwrap()),
+                plugin_key: Some("lix".try_into().unwrap()),
+                snapshot_content: Some("{\"value\":\"after\"}".to_string()),
+                metadata: None,
+                version_id: "version-a".try_into().unwrap(),
+                writer_key: None,
+            }],
+            StateCommitStreamOperation::Update,
+            StateCommitStreamRuntimeMetadata::from_runtime_writer_key(Some("writer-runtime")),
+        )
+        .expect("domain changes should map");
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].writer_key.as_deref(), Some("writer-runtime"));
+    }
+
+    #[test]
+    fn state_commit_stream_prefers_change_writer_key_over_runtime_metadata() {
+        let changes = state_commit_stream_changes_from_domain_changes(
+            &[ProposedDomainChange {
+                entity_id: "entity-1".try_into().unwrap(),
+                schema_key: "lix_key_value".try_into().unwrap(),
+                schema_version: Some("1".try_into().unwrap()),
+                file_id: Some("file-1".try_into().unwrap()),
+                plugin_key: Some("lix".try_into().unwrap()),
+                snapshot_content: Some("{\"value\":\"after\"}".to_string()),
+                metadata: None,
+                version_id: "version-a".try_into().unwrap(),
+                writer_key: Some("writer-change".to_string()),
+            }],
+            StateCommitStreamOperation::Update,
+            StateCommitStreamRuntimeMetadata::from_runtime_writer_key(Some("writer-runtime")),
+        )
+        .expect("domain changes should map");
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].writer_key.as_deref(), Some("writer-change"));
     }
 
     #[test]
@@ -692,11 +765,12 @@ mod tests {
                 schema_key: "lix_key_value".to_string(),
                 version_id: Some("global".to_string()),
                 values,
+                writer_key: None,
                 tombstone: false,
             }],
             StateCommitStreamOperation::Insert,
             true,
-            None,
+            StateCommitStreamRuntimeMetadata::default(),
         )
         .expect("planned rows should accept structured JSON snapshot_content");
 

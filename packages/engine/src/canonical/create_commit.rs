@@ -286,12 +286,8 @@ pub(crate) async fn create_commit(
         invariant_checker.recheck_invariants(transaction).await?;
     }
 
-    let (applied_domain_changes, mut compiled_filesystem_state) = resolve_proposed_domain_changes(
-        &args.changes,
-        &preflight,
-        &args.filesystem_state,
-        args.writer_key.as_deref(),
-    )?;
+    let (applied_domain_changes, mut compiled_filesystem_state) =
+        resolve_proposed_domain_changes(&args.changes, &preflight, &args.filesystem_state)?;
     let applied_domain_changes = {
         let mut executor = TransactionCommitExecutor { transaction };
         normalize_proposed_domain_changes(&mut executor, &applied_domain_changes).await?
@@ -578,15 +574,11 @@ fn resolve_proposed_domain_changes(
     changes: &[ProposedDomainChange],
     preflight: &CreateCommitPreflightState,
     filesystem_state: &FilesystemTransactionState,
-    writer_key: Option<&str>,
 ) -> Result<(Vec<ProposedDomainChange>, CompiledTrackedFilesystemState), CreateCommitError> {
     let hydrated = with_exact_filesystem_descriptors(filesystem_state, &preflight.file_descriptors);
-    let compiled_filesystem = compile_filesystem_transaction_state_from_state(
-        &hydrated,
-        writer_key,
-        &[] as &[MutationRow],
-    )
-    .map_err(backend_error)?;
+    let compiled_filesystem =
+        compile_filesystem_transaction_state_from_state(&hydrated, None, &[] as &[MutationRow])
+            .map_err(backend_error)?;
 
     let mut resolved = changes.to_vec();
     let mut index_by_identity = resolved
@@ -708,7 +700,6 @@ async fn proposed_domain_change_is_noop(
                 .get("snapshot_content")
                 .and_then(value_as_text);
             let current_metadata = current.values.get("metadata").and_then(value_as_text);
-            let current_writer_key = current.writer_key.as_deref();
             Ok(canonicalize_change_payload(
                 change.snapshot_content.as_deref(),
                 &change.schema_key,
@@ -725,7 +716,7 @@ async fn proposed_domain_change_is_noop(
                 current_metadata.as_deref(),
                 &change.schema_key,
                 "metadata",
-            )? && change.writer_key.as_deref() == current_writer_key)
+            )?)
         }
     }
 }

@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::receipt::UpdatedVersionRef;
-use crate::canonical::ProposedDomainChange;
 use crate::canonical::{CanonicalCommitReceipt, CanonicalWatermark};
 use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::untracked::{
@@ -101,15 +100,11 @@ pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
     receipt: &CanonicalCommitReceipt,
     tracked_writer_key_hints: &BTreeMap<RowIdentity, Option<String>>,
 ) -> Result<(), LixError> {
-    if let Err(_mirror_error) = apply_committed_version_ref_mirrors_in_transaction(
+    apply_legacy_version_ref_compat_mirrors_best_effort_in_transaction(
         transaction,
         &receipt.updated_version_refs,
     )
-    .await
-    {
-        // Compatibility mirrors are disposable derived state. They must not
-        // block canonical commit durability or affect projection readiness.
-    }
+    .await;
 
     if receipt.affected_versions.is_empty() {
         return Ok(());
@@ -150,25 +145,19 @@ pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
     Ok(())
 }
 
-pub(crate) fn tracked_writer_key_hints_from_domain_changes(
-    changes: &[ProposedDomainChange],
-) -> BTreeMap<RowIdentity, Option<String>> {
-    let mut hints = BTreeMap::new();
-    for change in changes {
-        let Some(file_id) = change.file_id.as_ref() else {
-            continue;
-        };
-        hints.insert(
-            RowIdentity {
-                schema_key: change.schema_key.to_string(),
-                version_id: change.version_id.to_string(),
-                entity_id: change.entity_id.to_string(),
-                file_id: file_id.to_string(),
-            },
-            change.writer_key.clone(),
-        );
+async fn apply_legacy_version_ref_compat_mirrors_best_effort_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    version_ref_updates: &[UpdatedVersionRef],
+) {
+    if let Err(_mirror_error) =
+        apply_legacy_version_ref_compat_mirrors_in_transaction(transaction, version_ref_updates)
+            .await
+    {
+        // Legacy compatibility mirrors are disposable derived state kept only
+        // for older read paths. They must not block canonical commit
+        // durability, live-state projection readiness, or semantic rebuild
+        // correctness.
     }
-    hints
 }
 
 pub(crate) async fn mark_live_state_projection_ready_in_transaction(
@@ -364,7 +353,7 @@ async fn apply_live_state_replay_scope_to_watermark(
     transaction.commit().await
 }
 
-async fn apply_committed_version_ref_mirrors_in_transaction(
+async fn apply_legacy_version_ref_compat_mirrors_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     version_ref_updates: &[UpdatedVersionRef],
 ) -> Result<(), LixError> {
@@ -373,12 +362,16 @@ async fn apply_committed_version_ref_mirrors_in_transaction(
     }
     let batch: UntrackedWriteBatch = version_ref_updates
         .iter()
-        .map(committed_version_ref_mirror_write_row_from_update)
+        .map(legacy_compat_version_ref_mirror_write_row_from_update)
         .collect();
     UntrackedWriteParticipant::apply_write_batch(transaction, &batch).await
 }
 
-pub(crate) fn committed_version_ref_mirror_write_row(
+/// Legacy compatibility mirror row for older live-table readers.
+///
+/// Canonical committed version refs are read from canonical change history, not
+/// from this untracked derived row shape.
+pub(crate) fn legacy_compat_version_ref_mirror_write_row(
     version_id: &str,
     commit_id: &str,
     timestamp: &str,
@@ -400,10 +393,10 @@ pub(crate) fn committed_version_ref_mirror_write_row(
     }
 }
 
-fn committed_version_ref_mirror_write_row_from_update(
+fn legacy_compat_version_ref_mirror_write_row_from_update(
     update: &UpdatedVersionRef,
 ) -> UntrackedWriteRow {
-    committed_version_ref_mirror_write_row(
+    legacy_compat_version_ref_mirror_write_row(
         update.version_id.as_str(),
         &update.commit_id,
         &update.created_at,
@@ -413,15 +406,18 @@ fn committed_version_ref_mirror_write_row_from_update(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_canonical_receipt_in_transaction, catch_up_live_state_to_watermark,
+        apply_canonical_receipt_in_transaction,
+        apply_commit_projections_best_effort_in_transaction, catch_up_live_state_to_watermark,
         projection_status, DerivedProjectionId, ProjectionCatchUpOutcome, ProjectionReplayMode,
+        UpdatedVersionRef,
     };
     use crate::canonical::{CanonicalCommitReceipt, CanonicalWatermark};
     use crate::live_state::{LiveStateMode, LIVE_STATE_SCHEMA_EPOCH};
     use crate::test_support::boot_test_engine;
-    use crate::CreateVersionOptions;
+    use crate::{CreateVersionOptions, VersionId};
     use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, TransactionMode, Value};
     use async_trait::async_trait;
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -544,6 +540,7 @@ mod tests {
         status_row: Option<Vec<Value>>,
         latest_watermark: Option<(i64, String, String)>,
         executed_sql: Vec<String>,
+        fail_legacy_version_ref_compat_mirror: bool,
     }
 
     #[async_trait(?Send)]
@@ -558,6 +555,15 @@ mod tests {
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             self.executed_sql.push(sql.to_string());
+            if self.fail_legacy_version_ref_compat_mirror
+                && sql.contains("lix_version_ref")
+                && sql.contains("INSERT INTO")
+            {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "legacy version-ref compat mirror failed",
+                ));
+            }
             if sql.contains("WITH status AS")
                 && sql.contains("lix_internal_live_state_status")
                 && sql.contains("lix_internal_change")
@@ -706,6 +712,7 @@ mod tests {
                 "2026-03-15T01:02:02Z".to_string(),
             )),
             executed_sql: Vec::new(),
+            fail_legacy_version_ref_compat_mirror: false,
         };
         let receipt = CanonicalCommitReceipt {
             commit_id: "commit-2".to_string(),
@@ -727,6 +734,43 @@ mod tests {
                 && sql.contains("'ready'")
                 && sql.contains("'change-2'")
         }));
+    }
+
+    #[tokio::test]
+    async fn legacy_version_ref_compat_mirror_failures_do_not_block_projection_application() {
+        let mut transaction = FakeTransaction {
+            status_row: None,
+            latest_watermark: None,
+            executed_sql: Vec::new(),
+            fail_legacy_version_ref_compat_mirror: true,
+        };
+        let receipt = CanonicalCommitReceipt {
+            commit_id: "commit-2".to_string(),
+            canonical_watermark: CanonicalWatermark {
+                change_ordinal: 2,
+                change_id: "change-2".to_string(),
+                created_at: "2026-03-15T01:02:03Z".to_string(),
+            },
+            updated_version_refs: vec![UpdatedVersionRef {
+                version_id: VersionId::new("main").expect("valid version id"),
+                commit_id: "commit-2".to_string(),
+                created_at: "2026-03-15T01:02:03Z".to_string(),
+            }],
+            affected_versions: Vec::new(),
+        };
+
+        apply_commit_projections_best_effort_in_transaction(
+            &mut transaction,
+            &receipt,
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("legacy compat mirror failures should not block projection application");
+
+        assert!(transaction
+            .executed_sql
+            .iter()
+            .any(|sql| sql.contains("lix_version_ref")));
     }
 
     #[tokio::test]

@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::live_state::effective::contracts::{
     EffectiveRow, EffectiveRowIdentity, EffectiveRowRequest, EffectiveRowSet, EffectiveRowState,
     EffectiveRowsRequest, LaneResult, OverlayLane, ReadContext,
 };
+use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::tracked::{
     BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedRow, TrackedScanRequest,
     TrackedTombstoneMarker,
@@ -12,6 +13,7 @@ use crate::live_state::untracked::{
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedRow, UntrackedScanRequest,
 };
 use crate::version::GLOBAL_VERSION_ID;
+use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
 use crate::{LixError, Value};
 
 pub fn overlay_lanes(include_global: bool, include_untracked: bool) -> Vec<OverlayLane> {
@@ -61,10 +63,14 @@ pub async fn resolve_effective_row(
                     file_id: request.file_id.clone(),
                 };
                 if let Some(row) = context.tracked.load_exact_row(&exact_request).await? {
+                    let writer_key =
+                        tracked_row_workspace_writer_key(context.workspace_writer_keys, &row)
+                            .await?;
                     return Ok(Some(effective_row_from_tracked(
                         row,
                         &request.version_id,
                         lane,
+                        writer_key,
                     )));
                 }
                 if let Some(tombstone_view) = context.tracked_tombstones {
@@ -176,8 +182,11 @@ async fn scan_tracked_lane(
         })
         .await?;
 
+    let rows = tracked_rows_with_workspace_writer_keys(context.workspace_writer_keys, rows).await?;
+
     for row in rows {
-        let effective = effective_row_from_tracked(row, &request.version_id, lane);
+        let writer_key = row.writer_key.clone();
+        let effective = effective_row_from_tracked(row, &request.version_id, lane, writer_key);
         rows_by_identity.insert(effective.identity(), LaneResult::Found(effective));
     }
 
@@ -227,10 +236,12 @@ async fn scan_untracked_lane(
 }
 
 fn effective_row_from_tracked(
-    row: TrackedRow,
+    mut row: TrackedRow,
     requested_version_id: &str,
     lane: OverlayLane,
+    writer_key: Option<String>,
 ) -> EffectiveRow {
+    row.writer_key = writer_key;
     let source_version_id = row.version_id.clone();
     let version_id = projected_version_id(requested_version_id, lane, &source_version_id);
     EffectiveRow {
@@ -370,23 +381,28 @@ async fn load_effective_rows_exact_batch(
         .collect::<Vec<_>>();
     let storage_version_id = storage_version_id(&request.version_id, lane);
     match lane {
-        OverlayLane::LocalTracked | OverlayLane::GlobalTracked => context
-            .tracked
-            .load_exact_rows(&BatchTrackedRowRequest {
-                schema_key: request.schema_key.clone(),
-                version_id: storage_version_id,
-                entity_ids,
-                file_id: None,
-            })
-            .await
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|row| {
-                        let effective = effective_row_from_tracked(row, &request.version_id, lane);
-                        (effective.identity(), effective)
-                    })
-                    .collect()
-            }),
+        OverlayLane::LocalTracked | OverlayLane::GlobalTracked => {
+            let rows = context
+                .tracked
+                .load_exact_rows(&BatchTrackedRowRequest {
+                    schema_key: request.schema_key.clone(),
+                    version_id: storage_version_id,
+                    entity_ids,
+                    file_id: None,
+                })
+                .await?;
+            let rows = tracked_rows_with_workspace_writer_keys(context.workspace_writer_keys, rows)
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|row| {
+                    let writer_key = row.writer_key.clone();
+                    let effective =
+                        effective_row_from_tracked(row, &request.version_id, lane, writer_key);
+                    (effective.identity(), effective)
+                })
+                .collect())
+        }
         OverlayLane::LocalUntracked | OverlayLane::GlobalUntracked => context
             .untracked
             .load_exact_rows(&BatchUntrackedRowRequest {
@@ -410,3 +426,38 @@ async fn load_effective_rows_exact_batch(
 
 #[allow(dead_code)]
 fn _preserve_value_type(_value: &Value) {}
+
+async fn tracked_row_workspace_writer_key(
+    workspace_writer_keys: &dyn WorkspaceWriterKeyReadView,
+    row: &TrackedRow,
+) -> Result<Option<String>, LixError> {
+    workspace_writer_keys
+        .load_annotation(&RowIdentity::from_tracked_row(row))
+        .await
+}
+
+async fn tracked_rows_with_workspace_writer_keys(
+    workspace_writer_keys: &dyn WorkspaceWriterKeyReadView,
+    mut rows: Vec<TrackedRow>,
+) -> Result<Vec<TrackedRow>, LixError> {
+    if rows.is_empty() {
+        return Ok(rows);
+    }
+
+    let row_identities = rows
+        .iter()
+        .map(RowIdentity::from_tracked_row)
+        .collect::<BTreeSet<_>>();
+    let annotations = workspace_writer_keys
+        .load_annotations(&row_identities)
+        .await?;
+
+    for row in &mut rows {
+        row.writer_key = annotations
+            .get(&RowIdentity::from_tracked_row(row))
+            .cloned()
+            .unwrap_or(None);
+    }
+
+    Ok(rows)
+}

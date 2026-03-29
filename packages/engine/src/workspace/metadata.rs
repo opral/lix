@@ -2,7 +2,7 @@ use crate::canonical::version_state::find_version_id_by_name_with_backend;
 use crate::version::DEFAULT_ACTIVE_VERSION_NAME;
 use crate::{LixBackend, LixError, Value};
 
-const WORKSPACE_METADATA_TABLE: &str = "lix_internal_workspace_metadata";
+pub(crate) const WORKSPACE_METADATA_TABLE: &str = "lix_internal_workspace_metadata";
 const WORKSPACE_ACTIVE_VERSION_ID_KEY: &str = "active_version_id";
 const WORKSPACE_ACTIVE_ACCOUNT_IDS_KEY: &str = "active_account_ids";
 
@@ -55,26 +55,10 @@ pub(crate) async fn persist_workspace_active_account_ids(
     persist_workspace_metadata_value(backend, WORKSPACE_ACTIVE_ACCOUNT_IDS_KEY, &encoded).await
 }
 
-async fn ensure_workspace_metadata_table(backend: &dyn LixBackend) -> Result<(), LixError> {
-    backend
-        .execute(
-            &format!(
-                "CREATE TABLE IF NOT EXISTS {WORKSPACE_METADATA_TABLE} (\
-                 key TEXT PRIMARY KEY, \
-                 value TEXT NOT NULL\
-                 )"
-            ),
-            &[],
-        )
-        .await?;
-    Ok(())
-}
-
 async fn load_workspace_metadata_value(
     backend: &dyn LixBackend,
     key: &str,
 ) -> Result<Option<String>, LixError> {
-    ensure_workspace_metadata_table(backend).await?;
     let result = backend
         .execute(
             &format!("SELECT value FROM {WORKSPACE_METADATA_TABLE} WHERE key = $1 LIMIT 1"),
@@ -99,7 +83,6 @@ async fn persist_workspace_metadata_value(
     key: &str,
     value: &str,
 ) -> Result<(), LixError> {
-    ensure_workspace_metadata_table(backend).await?;
     backend
         .execute(
             &format!(

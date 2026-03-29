@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::init as init_live_state;
-use crate::live_state::projection::committed_version_ref_mirror_write_row;
+use crate::live_state::projection::legacy_compat_version_ref_mirror_write_row;
 use crate::live_state::untracked::{
     load_exact_row_with_backend, load_exact_rows_with_backend, scan_rows_with_backend,
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedScanRequest,
@@ -179,7 +179,7 @@ async fn commit_untracked_rows(
     backend: &SqliteBackend,
     rows: Vec<UntrackedWriteRow>,
 ) -> Result<(), LixError> {
-    let read_context = ReadContext::new(backend, backend);
+    let read_context = ReadContext::new(backend, backend, backend);
     let backend_txn = backend.begin_transaction(TransactionMode::Write).await?;
     let mut write_tx = WriteTransaction::new(backend_txn, read_context);
     let schema_keys = rows
@@ -230,8 +230,8 @@ async fn live_untracked_state_roundtrips_helper_rows() {
         &backend,
         vec![
             active_version_helper_write_row("active-row", "main", timestamp),
-            committed_version_ref_mirror_write_row("main", "commit-1", timestamp),
-            committed_version_ref_mirror_write_row("other", "commit-2", timestamp),
+            legacy_compat_version_ref_mirror_write_row("main", "commit-1", timestamp),
+            legacy_compat_version_ref_mirror_write_row("other", "commit-2", timestamp),
         ],
     )
     .await
@@ -340,7 +340,7 @@ async fn live_untracked_state_delete_removes_rows() {
         .expect("live_state init should succeed");
     commit_untracked_rows(
         &backend,
-        vec![committed_version_ref_mirror_write_row(
+        vec![legacy_compat_version_ref_mirror_write_row(
             "main", "commit-1", timestamp,
         )],
     )

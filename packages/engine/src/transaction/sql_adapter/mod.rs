@@ -42,8 +42,9 @@ pub(crate) use execute::{
 };
 pub(crate) use planned_write::{
     BufferedWriteJournal, PendingFilesystemOverlay, PendingRegisteredSchemaOverlay,
-    PendingSemanticOverlay, PendingSemanticRow, PendingSemanticStorage, PlannedInternalWriteUnit,
-    PlannedPublicUntrackedWriteUnit, PlannedWriteDelta, PlannedWriteUnit,
+    PendingSemanticOverlay, PendingSemanticRow, PendingSemanticStorage,
+    PendingWorkspaceWriterKeyOverlay, PlannedInternalWriteUnit, PlannedPublicUntrackedWriteUnit,
+    PlannedWriteDelta, PlannedWriteUnit,
 };
 pub(crate) use planned_write_runner::execute_planned_write_delta;
 pub(crate) use runtime::{
