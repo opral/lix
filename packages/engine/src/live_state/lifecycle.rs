@@ -72,6 +72,13 @@ pub(crate) struct LiveStateSnapshot {
     pub(crate) latest_canonical_watermark: Option<CanonicalWatermark>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveStateProjectionStatus {
+    pub(crate) mode: LiveStateMode,
+    pub(crate) applied_watermark: Option<CanonicalWatermark>,
+    pub(crate) latest_canonical_watermark: Option<CanonicalWatermark>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveStateReadiness {
     Uninitialized,
@@ -153,6 +160,14 @@ pub(crate) async fn load_live_state_snapshot(
     load_live_state_snapshot_with_backend(backend).await
 }
 
+pub(crate) async fn load_projection_status_with_backend(
+    backend: &dyn LixBackend,
+) -> Result<LiveStateProjectionStatus, LixError> {
+    Ok(projection_status_from_snapshot(
+        load_live_state_snapshot_with_backend(backend).await?,
+    ))
+}
+
 pub async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
     backend
         .execute(LIVE_STATE_STATUS_CREATE_TABLE_SQL, &[])
@@ -209,6 +224,16 @@ pub(crate) async fn finalize_commit_in_transaction(
         .execute(&build_mark_live_state_ready_sql(&watermark), &[])
         .await?;
     Ok(watermark)
+}
+
+pub(crate) async fn mark_live_state_ready_at_canonical_watermark_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    watermark: &CanonicalWatermark,
+) -> Result<(), LixError> {
+    transaction
+        .execute(&build_mark_live_state_ready_sql(watermark), &[])
+        .await?;
+    Ok(())
 }
 
 pub(crate) async fn advance_commit_replay_boundary_in_transaction(
@@ -485,6 +510,23 @@ fn parse_live_state_snapshot_result(
         status,
         latest_canonical_watermark,
     })
+}
+
+fn projection_status_from_snapshot(snapshot: LiveStateSnapshot) -> LiveStateProjectionStatus {
+    let LiveStateSnapshot {
+        status,
+        latest_canonical_watermark,
+    } = snapshot;
+    let (mode, applied_watermark) = match status {
+        Some(status) => (status.mode, status.watermark),
+        None if latest_canonical_watermark.is_some() => (LiveStateMode::NeedsRebuild, None),
+        None => (LiveStateMode::Uninitialized, None),
+    };
+    LiveStateProjectionStatus {
+        mode,
+        applied_watermark,
+        latest_canonical_watermark,
+    }
 }
 
 fn live_state_status_row_from_values(row: &[Value]) -> Result<LiveStateStatusRow, LixError> {

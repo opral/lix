@@ -104,34 +104,12 @@ pub struct ChangeRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MaterializedStateRow {
-    pub id: String,
-    pub entity_id: EntityId,
-    pub schema_key: CanonicalSchemaKey,
-    pub schema_version: CanonicalSchemaVersion,
-    pub file_id: FileId,
-    pub plugin_key: CanonicalPluginKey,
-    pub snapshot_content: Option<CanonicalJson>,
-    pub metadata: Option<CanonicalJson>,
-    pub created_at: String,
-    pub lixcol_version_id: VersionId,
-    pub lixcol_commit_id: String,
-    pub writer_key: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalCommitOutput {
     pub changes: Vec<ChangeRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DerivedCommitApplyInput {
-    pub live_state_rows: Vec<MaterializedStateRow>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateCommitResult {
     pub canonical_output: CanonicalCommitOutput,
-    pub derived_apply_input: DerivedCommitApplyInput,
     pub updated_version_refs: Vec<UpdatedVersionRef>,
 }

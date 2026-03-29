@@ -86,12 +86,12 @@ impl<'a> WriteTransaction<'a> {
     }
 
     pub(crate) async fn finalize_live_state_for_commit(&mut self) -> Result<(), LixError> {
-        let canonical_watermark = self
+        let receipt = self
             .buffered_write_state
             .as_ref()
-            .and_then(BufferedWriteState::latest_canonical_watermark);
+            .and_then(BufferedWriteState::latest_canonical_commit_receipt);
         self.coordinator
-            .advance_live_state_replay_boundary_for_commit(canonical_watermark)
+            .advance_live_state_replay_boundary_for_commit(receipt)
             .await
     }
 

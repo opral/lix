@@ -4,7 +4,6 @@ use serde_json::Value as JsonValue;
 
 use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::sql_support::binding::bind_sql;
-use crate::version::GLOBAL_VERSION_ID;
 use crate::Value as EngineValue;
 use crate::{LixError, SqlDialect};
 
@@ -13,7 +12,7 @@ use super::graph_sql::{
     build_exact_commit_depth_cte_sql as build_exact_commit_depth_cte_sql_impl,
 };
 use super::state_source::CommitQueryExecutor;
-use super::types::MaterializedStateRow;
+use super::types::CanonicalCommitOutput;
 
 pub(crate) const COMMIT_GRAPH_NODE_TABLE: &str = "lix_internal_commit_graph_node";
 
@@ -25,9 +24,9 @@ pub(crate) struct CommitGraphNodeWriteRow {
 
 pub(crate) async fn resolve_commit_graph_node_write_rows_with_executor(
     executor: &mut dyn CommitQueryExecutor,
-    live_state_rows: &[MaterializedStateRow],
+    canonical_output: &CanonicalCommitOutput,
 ) -> Result<Vec<CommitGraphNodeWriteRow>, LixError> {
-    let parent_map = collect_commit_parent_map(live_state_rows)?;
+    let parent_map = collect_commit_parent_map(canonical_output)?;
     if parent_map.is_empty() {
         return Ok(Vec::new());
     }
@@ -108,28 +107,42 @@ pub(crate) fn build_exact_commit_depth_cte_sql(
 }
 
 fn collect_commit_parent_map(
-    live_state_rows: &[MaterializedStateRow],
+    canonical_output: &CanonicalCommitOutput,
 ) -> Result<BTreeMap<String, BTreeSet<String>>, LixError> {
     let mut out = BTreeMap::<String, BTreeSet<String>>::new();
-    for row in live_state_rows {
-        if row.schema_key == "lix_commit" && row.lixcol_version_id == GLOBAL_VERSION_ID {
-            out.entry(row.entity_id.to_string()).or_default();
-        }
-    }
-
-    for row in live_state_rows {
-        if row.schema_key != "lix_commit_edge" || row.lixcol_version_id != GLOBAL_VERSION_ID {
+    for row in &canonical_output.changes {
+        if row.schema_key != "lix_commit" {
             continue;
         }
         let Some(raw) = row.snapshot_content.as_deref() else {
             continue;
         };
-        let Some((parent_id, child_id)) = parse_commit_edge_snapshot(raw)? else {
+        out.entry(row.entity_id.to_string())
+            .or_default()
+            .extend(parse_commit_snapshot_parent_ids(raw)?);
+    }
+    Ok(out)
+}
+
+fn parse_commit_snapshot_parent_ids(raw: &str) -> Result<BTreeSet<String>, LixError> {
+    let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!("commit snapshot invalid JSON: {error}"),
+    })?;
+    let Some(parent_commit_ids) = parsed
+        .get("parent_commit_ids")
+        .and_then(JsonValue::as_array)
+    else {
+        return Ok(BTreeSet::new());
+    };
+
+    let mut out = BTreeSet::new();
+    for parent_commit_id in parent_commit_ids {
+        let Some(parent_commit_id) = parent_commit_id.as_str().filter(|value| !value.is_empty())
+        else {
             continue;
         };
-        if let Some(parents) = out.get_mut(&child_id) {
-            parents.insert(parent_id);
-        }
+        out.insert(parent_commit_id.to_string());
     }
     Ok(out)
 }
@@ -208,27 +221,6 @@ fn resolve_commit_generation(
     let generation = max_parent_generation + 1;
     resolved.insert(commit_id.to_string(), generation);
     Ok(generation)
-}
-
-fn parse_commit_edge_snapshot(raw: &str) -> Result<Option<(String, String)>, LixError> {
-    let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("commit_edge snapshot invalid JSON: {error}"),
-    })?;
-    let parent_id = parsed
-        .get("parent_id")
-        .and_then(JsonValue::as_str)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    let child_id = parsed
-        .get("child_id")
-        .and_then(JsonValue::as_str)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    match (parent_id, child_id) {
-        (Some(parent_id), Some(child_id)) => Ok(Some((parent_id, child_id))),
-        _ => Ok(None),
-    }
 }
 
 pub(crate) fn build_commit_generation_seed_sql() -> String {

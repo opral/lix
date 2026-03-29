@@ -23,6 +23,7 @@ pub(crate) struct ExactCommittedStateRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitLineageEntry {
     pub(crate) id: String,
+    pub(crate) change_set_id: Option<String>,
     pub(crate) change_ids: Vec<String>,
     pub(crate) parent_commit_ids: Vec<String>,
 }
@@ -281,6 +282,7 @@ pub(crate) async fn load_commit_lineage_entry_by_id(
     })?;
     Ok(Some(CommitLineageEntry {
         id: parsed.id,
+        change_set_id: parsed.change_set_id,
         change_ids: parsed.change_ids,
         parent_commit_ids: parsed.parent_commit_ids,
     }))

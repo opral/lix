@@ -1,30 +1,22 @@
 use std::collections::BTreeMap;
 
-use crate::backend::QueryExecutor;
 use crate::live_state::storage::{json_value_from_live_row_cell, LiveRowAccess};
-use crate::live_state::tracked::{
-    load_exact_row_with_executor as load_exact_tracked_row_with_executor, ExactTrackedRowRequest,
-    TrackedRow,
-};
-use crate::live_state::untracked::{
-    load_exact_row_with_executor as load_exact_untracked_row_with_executor,
-    ExactUntrackedRowRequest, UntrackedRow,
-};
-use crate::{LixBackend, LixError, Value};
+use crate::{LixError, Value};
 use serde_json::Value as JsonValue;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum RawStorage {
-    Tracked,
-    Untracked,
-}
+#[cfg(test)]
+use crate::live_state::tracked::TrackedRow;
+#[cfg(test)]
+use crate::live_state::untracked::UntrackedRow;
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum RawRow {
     Tracked(TrackedRow),
     Untracked(UntrackedRow),
 }
 
+#[cfg(test)]
 impl RawRow {
     #[cfg(test)]
     pub(crate) fn schema_key(&self) -> &str {
@@ -34,73 +26,12 @@ impl RawRow {
         }
     }
 
-    pub(crate) fn plugin_key(&self) -> &str {
-        match self {
-            Self::Tracked(row) => &row.plugin_key,
-            Self::Untracked(row) => &row.plugin_key,
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn values(&self) -> &BTreeMap<String, Value> {
         match self {
             Self::Tracked(row) => &row.values,
             Self::Untracked(row) => &row.values,
         }
-    }
-}
-
-pub(crate) async fn load_exact_row_with_backend(
-    backend: &dyn LixBackend,
-    storage: RawStorage,
-    schema_key: &str,
-    version_id: &str,
-    entity_id: &str,
-    file_id: Option<&str>,
-) -> Result<Option<RawRow>, LixError> {
-    let mut executor = backend;
-    load_exact_row_with_executor(
-        &mut executor,
-        storage,
-        schema_key,
-        version_id,
-        entity_id,
-        file_id,
-    )
-    .await
-}
-
-pub(crate) async fn load_exact_row_with_executor(
-    executor: &mut dyn QueryExecutor,
-    storage: RawStorage,
-    schema_key: &str,
-    version_id: &str,
-    entity_id: &str,
-    file_id: Option<&str>,
-) -> Result<Option<RawRow>, LixError> {
-    match storage {
-        RawStorage::Tracked => load_exact_tracked_row_with_executor(
-            executor,
-            &ExactTrackedRowRequest {
-                schema_key: schema_key.to_string(),
-                version_id: version_id.to_string(),
-                entity_id: entity_id.to_string(),
-                file_id: file_id.map(ToOwned::to_owned),
-            },
-        )
-        .await
-        .map(|row| row.map(RawRow::Tracked)),
-        RawStorage::Untracked => load_exact_untracked_row_with_executor(
-            executor,
-            &ExactUntrackedRowRequest {
-                schema_key: schema_key.to_string(),
-                version_id: version_id.to_string(),
-                entity_id: entity_id.to_string(),
-                file_id: file_id.map(ToOwned::to_owned),
-            },
-        )
-        .await
-        .map(|row| row.map(RawRow::Untracked)),
     }
 }
 

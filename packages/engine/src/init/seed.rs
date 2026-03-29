@@ -1,8 +1,6 @@
 use crate::canonical::readers::load_committed_version_head_commit_id;
 use crate::engine::{Engine, ExecuteOptions, TransactionBackendAdapter};
-use crate::live_state::schema_access::{
-    normalized_values_for_schema, payload_column_name_for_schema, tracked_relation_name,
-};
+use crate::live_state::schema_access::{normalized_values_for_schema, tracked_relation_name};
 use crate::sql::execution::execution_program::{ExecutionContext, SessionExecutionRuntime};
 use crate::sql::execution::parse::parse_sql;
 use crate::sql::execution::runtime_state::ExecutionRuntimeState;
@@ -167,35 +165,17 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     }
 
     pub(crate) async fn load_global_version_commit_id(&mut self) -> Result<String, LixError> {
-        let rows = self
-            .execute_internal(
-                "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_version_ref' \
-                   AND entity_id = 'global' \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global' \
-                   AND snapshot_content IS NOT NULL \
-                 ORDER BY updated_at DESC, created_at DESC, change_id DESC \
-                 LIMIT 1",
-                &[],
-            )
-            .await?;
-        let [statement] = rows.statements.as_slice() else {
-            return Err(crate::errors::unexpected_statement_count_error(
-                "hidden global version commit_id query",
-                1,
-                rows.statements.len(),
-            ));
-        };
-        let Some(first) = statement.rows.first() else {
+        let mut backend = self.backend_adapter();
+        let Some(commit_id) =
+            load_committed_version_head_commit_id(&mut backend, GLOBAL_VERSION_ID).await?
+        else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "init invariant violation: hidden global version ref is missing"
                     .to_string(),
             });
         };
-        text_value(first.first(), "lix_version_ref.commit_id")
+        Ok(commit_id)
     }
 
     pub(crate) async fn add_change_id_to_commit(
@@ -552,15 +532,6 @@ pub(crate) fn sql_literal(value: &Value) -> String {
 
 pub(crate) fn quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
-}
-
-pub(crate) fn live_payload_column_name(schema_key: &str, property_name: &str) -> String {
-    payload_column_name_for_schema(schema_key, None, property_name).unwrap_or_else(|error| {
-        panic!(
-            "builtin live schema '{schema_key}' must include '{property_name}': {}",
-            error.description
-        )
-    })
 }
 
 pub(crate) fn system_directory_name(path: &str) -> String {

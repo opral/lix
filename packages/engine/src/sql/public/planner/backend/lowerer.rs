@@ -1018,58 +1018,10 @@ fn build_state_source_query(
 }
 
 fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError> {
-    let version_descriptor_table = tracked_relation_name("lix_version_descriptor");
-    let version_ref_table = tracked_relation_name("lix_version_ref");
-    let version_descriptor_name_column = quote_ident(&builtin_payload_column_name(
-        version_descriptor_schema_key(),
-        "name",
-    ));
-    let version_descriptor_hidden_column = quote_ident(&builtin_payload_column_name(
-        version_descriptor_schema_key(),
-        "hidden",
-    ));
-    let version_ref_commit_id_column = quote_ident(&builtin_payload_column_name(
-        version_ref_schema_key(),
-        "commit_id",
-    ));
     let sql = match kind {
-        CanonicalAdminKind::Version => format!(
-            "SELECT \
-                d.entity_id AS id, \
-                d.{version_descriptor_name_column} AS name, \
-                COALESCE(d.{version_descriptor_hidden_column}, false) AS hidden, \
-                t.commit_id AS commit_id \
-             FROM {version_descriptor_table} d \
-             LEFT JOIN ( \
-               SELECT entity_id, {version_ref_commit_id_column} AS commit_id \
-               FROM ( \
-                 SELECT \
-                   entity_id, \
-                   {version_ref_commit_id_column}, \
-                   ROW_NUMBER() OVER ( \
-                     PARTITION BY entity_id \
-                     ORDER BY updated_at DESC, \
-                              created_at DESC \
-                   ) AS rn \
-                 FROM {version_ref_table} \
-                 WHERE schema_key = 'lix_version_ref' \
-                   AND untracked = true \
-                   AND {version_ref_commit_id_column} IS NOT NULL \
-               ) ranked_version_refs \
-               WHERE rn = 1 \
-             ) t \
-               ON t.entity_id = d.entity_id \
-             WHERE d.schema_key = '{descriptor_schema_key}' \
-               AND d.version_id = '{global_version}' \
-               AND d.is_tombstone = 0",
-            version_descriptor_table = quote_ident(&version_descriptor_table),
-            version_ref_table = quote_ident(&version_ref_table),
-            version_descriptor_name_column = version_descriptor_name_column,
-            version_descriptor_hidden_column = version_descriptor_hidden_column,
-            version_ref_commit_id_column = version_ref_commit_id_column,
-            descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
-            global_version = escape_sql_string(GLOBAL_VERSION_ID),
-        ),
+        CanonicalAdminKind::Version => {
+            crate::canonical::version_state::build_admin_version_source_sql()
+        }
     };
 
     parse_single_query(&sql)
@@ -2898,7 +2850,7 @@ mod tests {
     }
 
     #[test]
-    fn lowers_version_reads_through_internal_descriptor_and_pointer_sources() {
+    fn lowers_version_reads_through_canonical_descriptor_and_pointer_sources() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
         let lowered = lowered_program(
             &registry,
@@ -2907,9 +2859,9 @@ mod tests {
         .expect("version read should lower");
         let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
-        assert!(lowered_sql.contains("untracked = true"));
+        assert!(lowered_sql.contains("FROM lix_internal_change c"));
+        assert!(lowered_sql.contains("lix_version_descriptor"));
+        assert!(lowered_sql.contains("lix_version_ref"));
         assert!(!lowered_sql.contains("FROM lix_version"));
         assert_eq!(
             lowered.pushdown_decision.accepted_predicates,

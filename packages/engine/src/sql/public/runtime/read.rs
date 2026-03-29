@@ -11,7 +11,7 @@ use crate::read::models::{
     StateHistoryRequest, StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
 };
 use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
-use crate::sql::public::catalog::SurfaceBinding;
+use crate::sql::public::catalog::{SurfaceBinding, SurfaceReadFreshness};
 use crate::sql::public::planner::backend::lowerer::{
     lower_read_for_execution_with_layouts,
     rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id,
@@ -40,6 +40,26 @@ pub(crate) async fn execute_public_read_query_strict(
     mut query: Query,
     params: &[Value],
 ) -> Result<QueryResult, LixError> {
+    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
+        .await
+        .map_err(|error| LixError::new(error.code, error.description))?;
+    let statement = Statement::Query(Box::new(query.clone()));
+    let read_summary = super::summarize_bound_public_read_statement(&registry, &statement);
+    if let Some(freshness_contract) =
+        super::bound_surface_freshness_contract(&read_summary.bound_surface_bindings)
+    {
+        ensure_surface_read_freshness(
+            backend,
+            freshness_contract,
+            &read_summary
+                .bound_surface_bindings
+                .iter()
+                .map(|binding| binding.descriptor.public_name.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+    }
+
     let original_public_output_columns = public_output_columns_from_query(&query);
     let mut nested_required_schema_keys = BTreeSet::new();
     lower_nested_public_read_subqueries_in_query(
@@ -145,6 +165,13 @@ pub(crate) async fn execute_prepared_public_read(
     backend: &dyn LixBackend,
     prepared: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
+    ensure_surface_read_freshness(
+        backend,
+        prepared.freshness_contract,
+        &prepared.debug_trace.surface_bindings,
+    )
+    .await?;
+
     let result = match &prepared.execution {
         PreparedPublicReadExecution::LoweredSql(lowered) => {
             let bound_params = prepared
@@ -167,6 +194,52 @@ pub(crate) async fn execute_prepared_public_read(
         }
     }?;
     Ok(finalize_prepared_public_read_result(result, prepared))
+}
+
+async fn ensure_surface_read_freshness(
+    backend: &dyn LixBackend,
+    freshness_contract: SurfaceReadFreshness,
+    surface_names: &[String],
+) -> Result<(), LixError> {
+    if freshness_contract == SurfaceReadFreshness::AllowsStaleProjection {
+        return Ok(());
+    }
+
+    let status = crate::live_state::load_projection_status_with_backend(backend).await?;
+    if matches!(
+        status.mode,
+        crate::live_state::LiveStateMode::Ready | crate::live_state::LiveStateMode::Bootstrapping
+    ) {
+        return Ok(());
+    }
+
+    Err(public_read_projection_stale_error(surface_names, &status))
+}
+
+fn public_read_projection_stale_error(
+    surface_names: &[String],
+    status: &crate::live_state::LiveStateProjectionStatus,
+) -> LixError {
+    let surfaces = if surface_names.is_empty() {
+        "this public read".to_string()
+    } else {
+        format!("surface(s) {}", surface_names.join(", "))
+    };
+    let applied = format_optional_watermark(status.applied_watermark.as_ref());
+    let latest = format_optional_watermark(status.latest_canonical_watermark.as_ref());
+    LixError::new(
+        crate::errors::ErrorCode::LiveStateNotReady.as_str(),
+        format!(
+            "Public read for {surfaces} requires fresh live-state projections, but live_state is {:?}. Applied watermark: {applied}. Latest canonical watermark: {latest}. Canonical history/change reads may proceed while stale, but current-state projection reads must wait for replay or rebuild.",
+            status.mode
+        ),
+    )
+}
+
+fn format_optional_watermark(watermark: Option<&crate::canonical::CanonicalWatermark>) -> String {
+    watermark
+        .map(|watermark| format!("{}@{}", watermark.change_id, watermark.created_at))
+        .unwrap_or_else(|| "(none)".to_string())
 }
 
 async fn execute_lowered_public_read(
@@ -5279,6 +5352,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
     )
     .await?;
     let surface_binding = structured_read.surface_binding.clone();
+    let freshness_contract = surface_binding.read_freshness;
     let effective_state_request = effective_state.as_ref().map(|(request, _)| request.clone());
     let effective_state_plan = effective_state.as_ref().map(|(_, plan)| plan.clone());
     let direct_execution =
@@ -5462,6 +5536,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                 effective_state_request: effective_state_request.clone(),
                 effective_state_plan: effective_state_plan.clone(),
             }),
+            freshness_contract,
             public_output_columns,
             debug_trace: PublicExecutionDebugTrace {
                 bound_statements: vec![bound_statement],
@@ -5839,9 +5914,13 @@ async fn prepare_public_read_via_surface_lowering(
         .iter()
         .map(bound_public_leaf)
         .collect::<Vec<_>>();
+    let freshness_contract =
+        super::bound_surface_freshness_contract(&read_summary.bound_surface_bindings)
+            .expect("broad public read should bind at least one surface");
 
     Ok(Some(PreparedPublicRead {
         optimization: None,
+        freshness_contract,
         public_output_columns,
         debug_trace: PublicExecutionDebugTrace {
             bound_statements: vec![bound_statement.clone()],

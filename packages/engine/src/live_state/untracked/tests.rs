@@ -1,19 +1,19 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use crate::canonical::refs::{
-    committed_version_ref_mirror_write_row, load_committed_version_ref_with_backend,
-};
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::init as init_live_state;
+use crate::live_state::projection::committed_version_ref_mirror_write_row;
 use crate::live_state::untracked::{
     load_exact_row_with_backend, load_exact_rows_with_backend, scan_rows_with_backend,
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedScanRequest,
     UntrackedWriteOperation, UntrackedWriteRow,
 };
 use crate::transaction::{ReadContext, TransactionDelta, WriteTransaction};
-use crate::workspace::{
-    load_workspace_active_version_row_with_backend, workspace_active_version_write_row,
+use crate::version::{
+    active_version_file_id, active_version_plugin_key, active_version_schema_key,
+    active_version_schema_version, active_version_snapshot_content,
+    active_version_storage_version_id,
 };
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
@@ -197,6 +197,28 @@ async fn commit_untracked_rows(
     Ok(())
 }
 
+fn active_version_helper_write_row(
+    entity_id: &str,
+    version_id: &str,
+    timestamp: &str,
+) -> UntrackedWriteRow {
+    UntrackedWriteRow {
+        entity_id: entity_id.to_string(),
+        schema_key: active_version_schema_key().to_string(),
+        schema_version: active_version_schema_version().to_string(),
+        file_id: active_version_file_id().to_string(),
+        version_id: active_version_storage_version_id().to_string(),
+        global: true,
+        plugin_key: active_version_plugin_key().to_string(),
+        metadata: None,
+        writer_key: None,
+        snapshot_content: Some(active_version_snapshot_content(entity_id, version_id)),
+        created_at: Some(timestamp.to_string()),
+        updated_at: timestamp.to_string(),
+        operation: UntrackedWriteOperation::Upsert,
+    }
+}
+
 #[tokio::test]
 async fn live_untracked_state_roundtrips_helper_rows() {
     let backend = SqliteBackend::new();
@@ -207,7 +229,7 @@ async fn live_untracked_state_roundtrips_helper_rows() {
     commit_untracked_rows(
         &backend,
         vec![
-            workspace_active_version_write_row("active-row", "main", timestamp),
+            active_version_helper_write_row("active-row", "main", timestamp),
             committed_version_ref_mirror_write_row("main", "commit-1", timestamp),
             committed_version_ref_mirror_write_row("other", "commit-2", timestamp),
         ],
@@ -215,19 +237,23 @@ async fn live_untracked_state_roundtrips_helper_rows() {
     .await
     .expect("helper row transaction should succeed");
 
-    let active_version = load_workspace_active_version_row_with_backend(&backend)
-        .await
-        .expect("active version lookup should succeed")
-        .expect("active version row should exist");
+    let active_version = load_exact_row_with_backend(
+        &backend,
+        &ExactUntrackedRowRequest {
+            schema_key: active_version_schema_key().to_string(),
+            version_id: active_version_storage_version_id().to_string(),
+            entity_id: "active-row".to_string(),
+            file_id: Some(active_version_file_id().to_string()),
+        },
+    )
+    .await
+    .expect("active version lookup should succeed")
+    .expect("active version row should exist");
     assert_eq!(active_version.entity_id, "active-row");
-    assert_eq!(active_version.version_id, "main");
-
-    let version_ref = load_committed_version_ref_with_backend(&backend, "main")
-        .await
-        .expect("version ref lookup should succeed")
-        .expect("version ref row should exist");
-    assert_eq!(version_ref.version_id, "main");
-    assert_eq!(version_ref.commit_id, "commit-1");
+    assert_eq!(
+        active_version.property_text("version_id").as_deref(),
+        Some("main")
+    );
 
     let exact = load_exact_row_with_backend(
         &backend,
@@ -342,8 +368,16 @@ async fn live_untracked_state_delete_removes_rows() {
     .await
     .expect("delete transaction should succeed");
 
-    let version_ref = load_committed_version_ref_with_backend(&backend, "main")
-        .await
-        .expect("version ref lookup should succeed");
+    let version_ref = load_exact_row_with_backend(
+        &backend,
+        &ExactUntrackedRowRequest {
+            schema_key: "lix_version_ref".to_string(),
+            version_id: "global".to_string(),
+            entity_id: "main".to_string(),
+            file_id: Some("lix".to_string()),
+        },
+    )
+    .await
+    .expect("version ref lookup should succeed");
     assert!(version_ref.is_none());
 }

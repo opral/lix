@@ -5,14 +5,12 @@ use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::canonical_json::CanonicalJson;
 use crate::filesystem::runtime::{build_binary_blob_fastcdc_write_program, BinaryBlobWrite};
 use crate::functions::LixFunctionProvider;
-use crate::version::GLOBAL_VERSION_ID;
 use crate::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
     LixBackendTransaction, LixError, QueryResult, Value, VersionId,
 };
 use serde_json::{json, Value as JsonValue};
 
-use super::apply::apply_projected_live_state_rows_best_effort_in_transaction;
 use super::change_log::build_prepared_batch_from_canonical_output;
 use super::create_commit::{
     CreateCommitAppliedOutput, CreateCommitError, CreateCommitExpectedHead,
@@ -25,24 +23,16 @@ use super::graph_index::{
 use super::receipt::{
     latest_canonical_watermark_from_change_rows, CanonicalCommitReceipt, UpdatedVersionRef,
 };
-use super::refs::apply_committed_version_ref_updates_in_transaction;
 use super::state_source::{load_version_info_for_versions, CommitQueryExecutor};
 use super::types::{
-    DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow,
-    ProposedDomainChange, VersionInfo,
+    DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange, VersionInfo,
 };
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingPublicCommitSession {
     pub(crate) lane: CreateCommitWriteLane,
     pub(crate) commit_id: String,
-    pub(crate) change_set_id: String,
-    pub(crate) commit_change_id: String,
     pub(crate) commit_change_snapshot_id: String,
-    pub(crate) commit_materialized_change_id: String,
-    pub(crate) commit_schema_version: String,
-    pub(crate) commit_file_id: String,
-    pub(crate) commit_plugin_key: String,
     pub(crate) commit_snapshot: JsonValue,
 }
 
@@ -94,17 +84,6 @@ pub(crate) async fn build_pending_public_commit_session(
                 format!("public commit session commit snapshot is invalid JSON: {error}"),
             )
         })?;
-    let change_set_id = commit_snapshot
-        .get("change_set_id")
-        .and_then(JsonValue::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "public commit session commit snapshot is missing change_set_id",
-            )
-        })?
-        .to_string();
     let snapshot_id_result = transaction
         .execute(
             "SELECT snapshot_id \
@@ -137,13 +116,7 @@ pub(crate) async fn build_pending_public_commit_session(
     Ok(PendingPublicCommitSession {
         lane,
         commit_id: seed.commit_id.clone(),
-        change_set_id,
-        commit_change_id: seed.commit_change_id.clone(),
         commit_change_snapshot_id,
-        commit_materialized_change_id: seed.commit_materialized_change_id.clone(),
-        commit_schema_version: seed.commit_schema_version.clone(),
-        commit_file_id: seed.commit_file_id.clone(),
-        commit_plugin_key: seed.commit_plugin_key.clone(),
         commit_snapshot,
     })
 }
@@ -311,72 +284,6 @@ fn rewrite_generated_commit_result_for_pending_session(
     domain_change_count: usize,
     timestamp: &str,
 ) -> Result<GenerateCommitResult, LixError> {
-    let temporary_commit_id = generated
-        .derived_apply_input
-        .live_state_rows
-        .iter()
-        .find(|row| row.schema_key == "lix_commit")
-        .map(|row| row.entity_id.clone())
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "public merge rewrite requires a generated lix_commit row",
-            )
-        })?;
-    let temporary_change_set_id = generated
-        .derived_apply_input
-        .live_state_rows
-        .iter()
-        .find(|row| row.schema_key == "lix_change_set")
-        .map(|row| row.entity_id.clone())
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "public merge rewrite requires a generated lix_change_set row",
-            )
-        })?;
-    let mut live_state_rows = Vec::new();
-    for mut row in generated.derived_apply_input.live_state_rows {
-        if is_pending_commit_meta_row(&row, &temporary_commit_id, &temporary_change_set_id)? {
-            continue;
-        }
-
-        match row.schema_key.as_str() {
-            "lix_change_set_element" => {
-                let (entity_id, snapshot_content) = rewrite_change_set_element_snapshot(
-                    row.snapshot_content.as_deref(),
-                    &session.change_set_id,
-                )?;
-                row.entity_id = EntityId::new(entity_id)?;
-                row.snapshot_content = Some(snapshot_content);
-                row.lixcol_commit_id = session.commit_id.clone();
-            }
-            "lix_change_author" => {
-                row.id = session.commit_change_id.clone();
-                row.lixcol_commit_id = session.commit_id.clone();
-            }
-            _ => {
-                row.lixcol_commit_id = session.commit_id.clone();
-            }
-        }
-        live_state_rows.push(row);
-    }
-
-    live_state_rows.push(MaterializedStateRow {
-        id: session.commit_materialized_change_id.clone(),
-        entity_id: EntityId::new(session.commit_id.clone())?,
-        schema_key: CanonicalSchemaKey::new("lix_commit".to_string())?,
-        schema_version: CanonicalSchemaVersion::new(session.commit_schema_version.clone())?,
-        file_id: FileId::new(session.commit_file_id.clone())?,
-        plugin_key: CanonicalPluginKey::new(session.commit_plugin_key.clone())?,
-        snapshot_content: Some(CanonicalJson::from_value(session.commit_snapshot.clone())?),
-        metadata: None,
-        created_at: timestamp.to_string(),
-        lixcol_version_id: VersionId::new(GLOBAL_VERSION_ID.to_string())?,
-        lixcol_commit_id: session.commit_id.clone(),
-        writer_key: None,
-    });
-
     let updated_version_refs = generated
         .updated_version_refs
         .into_iter()
@@ -396,56 +303,8 @@ fn rewrite_generated_commit_result_for_pending_session(
                 .take(domain_change_count)
                 .collect(),
         },
-        derived_apply_input: super::types::DerivedCommitApplyInput { live_state_rows },
         updated_version_refs,
     })
-}
-
-fn is_pending_commit_meta_row(
-    row: &MaterializedStateRow,
-    temporary_commit_id: &str,
-    temporary_change_set_id: &str,
-) -> Result<bool, LixError> {
-    match row.schema_key.as_str() {
-        "lix_change_set" => Ok(row.entity_id == temporary_change_set_id),
-        "lix_commit" => Ok(row.entity_id == temporary_commit_id),
-        "lix_commit_edge" => Ok(row.entity_id.ends_with(&format!("~{temporary_commit_id}"))),
-        _ => Ok(false),
-    }
-}
-
-fn rewrite_change_set_element_snapshot(
-    snapshot: Option<&str>,
-    change_set_id: &str,
-) -> Result<(String, CanonicalJson), LixError> {
-    let snapshot = snapshot.ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "public merge rewrite requires change_set_element snapshot_content",
-        )
-    })?;
-    let mut parsed: JsonValue = serde_json::from_str(snapshot).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("public merge rewrite saw invalid change_set_element JSON: {error}"),
-        )
-    })?;
-    let change_id = parsed
-        .get("change_id")
-        .and_then(JsonValue::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "public merge rewrite requires change_set_element change_id",
-            )
-        })?
-        .to_string();
-    parsed["change_set_id"] = JsonValue::String(change_set_id.to_string());
-    Ok((
-        format!("{change_set_id}~{change_id}"),
-        CanonicalJson::from_value(parsed)?,
-    ))
 }
 
 fn extend_json_array_strings<I>(snapshot: &mut JsonValue, key: &str, values: I)
@@ -485,11 +344,9 @@ async fn execute_generated_commit_result(
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<CanonicalCommitReceipt, LixError> {
     let mut executor = &mut *transaction;
-    let commit_graph_rows = resolve_commit_graph_node_write_rows_with_executor(
-        &mut executor,
-        &result.derived_apply_input.live_state_rows,
-    )
-    .await?;
+    let commit_graph_rows =
+        resolve_commit_graph_node_write_rows_with_executor(&mut executor, &result.canonical_output)
+            .await?;
     let mut prepared = build_prepared_batch_from_canonical_output(
         &result.canonical_output,
         functions,
@@ -513,12 +370,9 @@ async fn execute_generated_commit_result(
     program.push_batch(prepared);
     execute_write_program_with_transaction(transaction, program).await?;
     let receipt = canonical_commit_receipt_from_generated_result(&result)?;
-    apply_committed_version_ref_updates_in_transaction(transaction, &receipt.updated_version_refs)
-        .await?;
-    apply_projected_live_state_rows_best_effort_in_transaction(
+    crate::live_state::projection::apply_commit_projections_best_effort_in_transaction(
         transaction,
-        &result.derived_apply_input,
-        &receipt.canonical_watermark,
+        &receipt,
     )
     .await?;
     Ok(receipt)

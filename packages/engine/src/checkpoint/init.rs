@@ -174,20 +174,12 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     }
 
     pub(crate) async fn rebuild_internal_last_checkpoint(&mut self) -> Result<(), LixError> {
-        let versions = self
-            .execute_internal(
-                "SELECT id, commit_id \
-                 FROM lix_version \
-                 ORDER BY id",
-                &[],
+        let version_descriptors = {
+            let mut backend = self.backend_adapter();
+            crate::canonical::version_state::load_all_version_descriptors_with_executor(
+                &mut backend,
             )
-            .await?;
-        let [statement] = versions.statements.as_slice() else {
-            return Err(crate::errors::unexpected_statement_count_error(
-                "rebuild_internal_last_checkpoint query",
-                1,
-                versions.statements.len(),
-            ));
+            .await?
         };
 
         // `lix_internal_last_checkpoint` is derived convenience state. Rebuild it
@@ -206,12 +198,25 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         )
         .await?;
 
-        for row in &statement.rows {
-            let version_id = text_value(row.get(0), "lix_version.id")?;
+        for descriptor in &version_descriptors {
+            let version_id = descriptor.version_id.clone();
             if version_id == crate::version::GLOBAL_VERSION_ID {
                 continue;
             }
-            let commit_id = text_value(row.get(1), "lix_version.commit_id")?;
+            let commit_id = {
+                let mut backend = self.backend_adapter();
+                crate::canonical::refs::load_committed_version_head_commit_id(
+                    &mut backend,
+                    &version_id,
+                )
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!("version '{version_id}' is missing a committed head"),
+                    )
+                })?
+            };
             let checkpoint_commit_id = self
                 .resolve_last_checkpoint_commit_id_for_tip(&commit_id)
                 .await?
