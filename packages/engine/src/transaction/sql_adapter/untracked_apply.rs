@@ -126,7 +126,9 @@ fn untracked_write_row_from_planned_row(
         global,
         plugin_key: plugin_key.to_string(),
         metadata: planned_row_optional_text_value(row, "metadata").map(ToString::to_string),
-        writer_key: planned_row_optional_text_value(row, "writer_key")
+        writer_key: row
+            .writer_key
+            .as_deref()
             .or(execution_writer_key)
             .map(ToString::to_string),
         snapshot_content: (!row.tombstone)

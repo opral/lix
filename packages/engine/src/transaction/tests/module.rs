@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use crate::live_state::projection::committed_version_ref_mirror_write_row;
+use crate::live_state::projection::legacy_compat_version_ref_mirror_write_row;
 use crate::live_state::tracked::{
     load_exact_row_with_backend, ExactTrackedRowRequest, TrackedWriteOperation, TrackedWriteRow,
 };
@@ -9,6 +9,7 @@ use crate::live_state::untracked::{
     UntrackedWriteRow,
 };
 use crate::transaction::{ReadContext, TransactionDelta, WriteTransaction};
+use crate::workspace::init as init_workspace;
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
 };
@@ -199,7 +200,10 @@ fn tracked_row(
 async fn isolated_transaction_commits_tracked_and_untracked_batches() {
     let backend = SqliteBackend::new();
     let timestamp = "2026-03-24T00:00:00Z";
-    let read_context = ReadContext::new(&backend, &backend);
+    init_workspace(&backend)
+        .await
+        .expect("workspace init should succeed");
+    let read_context = ReadContext::new(&backend, &backend, &backend);
     let backend_txn = backend
         .begin_transaction(TransactionMode::Write)
         .await
@@ -215,7 +219,7 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
     write_tx
         .stage(TransactionDelta {
             tracked_writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
-            untracked_writes: vec![committed_version_ref_mirror_write_row(
+            untracked_writes: vec![legacy_compat_version_ref_mirror_write_row(
                 "main", "commit-1", timestamp,
             )],
         })
@@ -268,7 +272,10 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
 async fn isolated_transaction_rejects_staging_after_execute() {
     let backend = SqliteBackend::new();
     let timestamp = "2026-03-24T00:00:00Z";
-    let read_context = ReadContext::new(&backend, &backend);
+    init_workspace(&backend)
+        .await
+        .expect("workspace init should succeed");
+    let read_context = ReadContext::new(&backend, &backend, &backend);
     let backend_txn = backend
         .begin_transaction(TransactionMode::Write)
         .await
@@ -302,7 +309,10 @@ async fn isolated_transaction_rejects_staging_after_execute() {
 async fn isolated_transaction_rollback_discards_staged_writes() {
     let backend = SqliteBackend::new();
     let timestamp = "2026-03-24T00:00:00Z";
-    let read_context = ReadContext::new(&backend, &backend);
+    init_workspace(&backend)
+        .await
+        .expect("workspace init should succeed");
+    let read_context = ReadContext::new(&backend, &backend, &backend);
     let backend_txn = backend
         .begin_transaction(TransactionMode::Write)
         .await
@@ -318,7 +328,7 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
     write_tx
         .stage(TransactionDelta {
             tracked_writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
-            untracked_writes: vec![committed_version_ref_mirror_write_row(
+            untracked_writes: vec![legacy_compat_version_ref_mirror_write_row(
                 "main", "commit-1", timestamp,
             )],
         })

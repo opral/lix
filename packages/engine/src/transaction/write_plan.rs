@@ -208,5 +208,6 @@ where
 
 pub(crate) use super::sql_adapter::{
     BufferedWriteJournal, PendingFilesystemOverlay, PendingRegisteredSchemaOverlay,
-    PendingSemanticOverlay, PendingSemanticRow, PendingSemanticStorage, PlannedWriteDelta,
+    PendingSemanticOverlay, PendingSemanticRow, PendingSemanticStorage,
+    PendingWorkspaceWriterKeyOverlay, PlannedWriteDelta,
 };

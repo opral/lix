@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::{
     coalesce_live_table_requirements, SchemaRegistration, SchemaRegistrationSet,
 };
@@ -36,11 +37,17 @@ pub(crate) struct PlannedInternalWriteUnit {
     pub(crate) writer_key: Option<String>,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct PlannedWorkspaceWriterKeyUnit {
+    pub(crate) annotations: BTreeMap<RowIdentity, Option<String>>,
+}
+
 #[derive(Clone)]
 pub(crate) enum PlannedWriteUnit {
     PublicTracked(TrackedTxnUnit),
     PublicUntracked(PlannedPublicUntrackedWriteUnit),
     Internal(PlannedInternalWriteUnit),
+    WorkspaceWriterKey(PlannedWorkspaceWriterKeyUnit),
 }
 
 #[derive(Clone, Default)]
@@ -82,6 +89,7 @@ pub(crate) struct PlannedWriteDelta {
     registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
     semantic_overlay: Option<PendingSemanticOverlay>,
     filesystem_overlay: Option<PendingFilesystemOverlay>,
+    workspace_writer_key_overlay: Option<PendingWorkspaceWriterKeyOverlay>,
 }
 
 impl PlannedWriteDelta {
@@ -94,6 +102,8 @@ impl PlannedWriteDelta {
             pending_semantic_overlay_for_planned_write_plan(&materialization_plan)?;
         let filesystem_overlay =
             pending_filesystem_overlay_for_planned_write_plan(&materialization_plan);
+        let workspace_writer_key_overlay =
+            pending_workspace_writer_key_overlay_for_planned_write_plan(&materialization_plan);
         let registered_schema_overlay = semantic_overlay
             .as_ref()
             .and_then(PendingSemanticOverlay::registered_schema_overlay);
@@ -103,6 +113,7 @@ impl PlannedWriteDelta {
             registered_schema_overlay,
             semantic_overlay,
             filesystem_overlay,
+            workspace_writer_key_overlay,
         })
     }
 
@@ -126,11 +137,16 @@ impl PlannedWriteDelta {
         self.filesystem_overlay.clone()
     }
 
+    pub(crate) fn workspace_writer_key_overlay(&self) -> Option<PendingWorkspaceWriterKeyOverlay> {
+        self.workspace_writer_key_overlay.clone()
+    }
+
     pub(crate) fn pending_transaction_view(&self) -> Option<PendingTransactionView> {
         PendingTransactionView::new(
             self.registered_schema_overlay(),
             self.semantic_overlay(),
             self.filesystem_overlay(),
+            self.workspace_writer_key_overlay(),
         )
     }
 
@@ -162,6 +178,18 @@ impl PlannedWriteDelta {
                 (None, Some(incoming)) => Some(incoming),
                 (None, None) => None,
             };
+        self.workspace_writer_key_overlay = match (
+            self.workspace_writer_key_overlay.take(),
+            incoming.workspace_writer_key_overlay,
+        ) {
+            (Some(mut current), Some(incoming)) => {
+                merge_pending_workspace_writer_key_overlay(&mut current, incoming);
+                Some(current)
+            }
+            (Some(current), None) => Some(current),
+            (None, Some(incoming)) => Some(incoming),
+            (None, None) => None,
+        };
         self.registered_schema_overlay = self
             .semantic_overlay
             .as_ref()
@@ -302,6 +330,11 @@ pub(crate) struct PendingFilesystemOverlay {
     files: BTreeMap<(String, String), FilesystemTransactionFileState>,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct PendingWorkspaceWriterKeyOverlay {
+    annotations: BTreeMap<RowIdentity, Option<String>>,
+}
+
 impl PendingFilesystemOverlay {
     pub(crate) fn visible_directory_rows<'a>(
         &'a self,
@@ -315,6 +348,12 @@ impl PendingFilesystemOverlay {
 
     pub(crate) fn visible_files(&self) -> impl Iterator<Item = &FilesystemTransactionFileState> {
         self.files.values()
+    }
+}
+
+impl PendingWorkspaceWriterKeyOverlay {
+    pub(crate) fn annotation(&self, identity: &RowIdentity) -> Option<&Option<String>> {
+        self.annotations.get(identity)
     }
 }
 
@@ -376,6 +415,13 @@ pub(crate) fn build_planned_write_plan(
                 }
             }
         }
+        if let Some(workspace_writer_key_unit) =
+            planned_workspace_writer_key_unit_from_public_write(public_write)
+        {
+            units.push(PlannedWriteUnit::WorkspaceWriterKey(
+                workspace_writer_key_unit,
+            ));
+        }
     } else if !prepared.read_only_query {
         let Some(internal_execution) = prepared.internal_execution().cloned() else {
             return None;
@@ -406,6 +452,17 @@ pub(crate) fn build_planned_write_delta(
     build_planned_write_plan(prepared, writer_key)
         .map(PlannedWriteDelta::from_materialization_plan)
         .transpose()
+}
+
+fn planned_workspace_writer_key_unit_from_public_write(
+    public_write: &PreparedPublicWrite,
+) -> Option<PlannedWorkspaceWriterKeyUnit> {
+    let resolved = public_write.planned_write.resolved_write_plan.as_ref()?;
+    let mut annotations = BTreeMap::new();
+    for partition in &resolved.partitions {
+        annotations.extend(partition.workspace_writer_key_updates.clone());
+    }
+    (!annotations.is_empty()).then_some(PlannedWorkspaceWriterKeyUnit { annotations })
 }
 
 fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> SchemaRegistrationSet {
@@ -447,6 +504,7 @@ fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> Schem
                     }
                 }
             }
+            PlannedWriteUnit::WorkspaceWriterKey(_) => {}
         }
     }
     registrations
@@ -472,13 +530,65 @@ pub(crate) fn pending_filesystem_overlay_for_planned_write_plan(
     (!overlay.directory_rows.is_empty() || !overlay.files.is_empty()).then_some(overlay)
 }
 
+pub(crate) fn pending_workspace_writer_key_overlay_for_planned_write_plan(
+    plan: &PlannedWritePlan,
+) -> Option<PendingWorkspaceWriterKeyOverlay> {
+    let mut overlay = PendingWorkspaceWriterKeyOverlay::default();
+    for unit in &plan.units {
+        match unit {
+            PlannedWriteUnit::PublicTracked(tracked) => {
+                for public_write in &tracked.public_writes {
+                    let Some(resolved) = public_write.planned_write.resolved_write_plan.as_ref()
+                    else {
+                        continue;
+                    };
+                    for partition in &resolved.partitions {
+                        if partition.execution_mode != WriteMode::Tracked {
+                            continue;
+                        }
+                        for row in &partition.intended_post_state {
+                            let Some(version_id) = row.version_id.as_ref() else {
+                                continue;
+                            };
+                            let Some(file_id) =
+                                row.values.get("file_id").and_then(|value| match value {
+                                    crate::Value::Text(value) => Some(value.clone()),
+                                    _ => None,
+                                })
+                            else {
+                                continue;
+                            };
+                            overlay.annotations.insert(
+                                RowIdentity {
+                                    schema_key: row.schema_key.clone(),
+                                    version_id: version_id.clone(),
+                                    entity_id: row.entity_id.clone(),
+                                    file_id,
+                                },
+                                row.writer_key.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+            PlannedWriteUnit::WorkspaceWriterKey(unit) => {
+                overlay.annotations.extend(unit.annotations.clone());
+            }
+            PlannedWriteUnit::PublicUntracked(_) | PlannedWriteUnit::Internal(_) => {}
+        }
+    }
+    (!overlay.annotations.is_empty()).then_some(overlay)
+}
+
 pub(crate) fn planned_write_plan_is_independent_filesystem(plan: &PlannedWritePlan) -> bool {
     !plan.units.is_empty()
         && plan.units.iter().all(|unit| match unit {
             PlannedWriteUnit::PublicTracked(tracked) => {
                 tracked_plan_is_coalescible_filesystem(tracked)
             }
-            PlannedWriteUnit::PublicUntracked(_) | PlannedWriteUnit::Internal(_) => false,
+            PlannedWriteUnit::PublicUntracked(_)
+            | PlannedWriteUnit::Internal(_)
+            | PlannedWriteUnit::WorkspaceWriterKey(_) => false,
         })
 }
 
@@ -520,6 +630,13 @@ fn merge_pending_filesystem_overlay(
     current.files.extend(incoming.files);
 }
 
+fn merge_pending_workspace_writer_key_overlay(
+    current: &mut PendingWorkspaceWriterKeyOverlay,
+    incoming: PendingWorkspaceWriterKeyOverlay,
+) {
+    current.annotations.extend(incoming.annotations);
+}
+
 fn collect_semantic_overlay_from_planned_write_plan(
     plan: &PlannedWritePlan,
     overlay: &mut PendingSemanticOverlay,
@@ -558,6 +675,7 @@ fn collect_semantic_overlay_from_planned_write_plan(
                     )?
                     && internal.execution.update_validations.is_empty()
             }
+            PlannedWriteUnit::WorkspaceWriterKey(_) => true,
         };
 
         if !unit_supported {
@@ -582,7 +700,9 @@ fn collect_filesystem_overlay_from_planned_write_plan(
             PlannedWriteUnit::PublicTracked(tracked) => {
                 collect_filesystem_overlay_from_tracked_plan(tracked, overlay, &mut saw_entry)
             }
-            PlannedWriteUnit::PublicUntracked(_) | PlannedWriteUnit::Internal(_) => false,
+            PlannedWriteUnit::PublicUntracked(_)
+            | PlannedWriteUnit::Internal(_)
+            | PlannedWriteUnit::WorkspaceWriterKey(_) => false,
         };
         if !unit_supported {
             return false;

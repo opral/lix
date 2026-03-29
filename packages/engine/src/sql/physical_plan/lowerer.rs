@@ -23,6 +23,7 @@ use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     EffectiveStatePlan, EffectiveStateRequest,
 };
 use crate::version::{version_descriptor_schema_key, version_ref_schema_key, GLOBAL_VERSION_ID};
+use crate::workspace::writer_key::WORKSPACE_WRITER_KEY_TABLE;
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
@@ -1315,6 +1316,7 @@ fn effective_state_schema_winner_rows_sql(
         .map(|schema_key| {
             let table_name = quote_ident(&tracked_relation_name(schema_key));
             let untracked_table = quote_ident(&tracked_relation_name(schema_key));
+            let workspace_writer_key_table = quote_ident(WORKSPACE_WRITER_KEY_TABLE);
             let tracked_full_projection = normalized_projection_sql_for_schema(
                 schema_key,
                 known_live_layouts.get(schema_key),
@@ -1364,8 +1366,10 @@ fn effective_state_schema_winner_rows_sql(
             } else {
                 String::new()
             };
-            let tracked_predicates = render_where_clause_sql(source_predicates, " AND ");
-            let untracked_predicates = render_where_clause_sql(source_predicates, " AND ");
+            let tracked_predicates =
+                render_qualified_where_clause_sql(source_predicates, " AND ", "t");
+            let untracked_predicates =
+                render_qualified_where_clause_sql(source_predicates, " AND ", "u");
             format!(
                 "SELECT \
                    ranked.effective_entity_id AS entity_id, \
@@ -1422,7 +1426,7 @@ fn effective_state_schema_winner_rows_sql(
                        t.change_id AS effective_change_id, \
                        cc.commit_id AS effective_commit_id, \
                        false AS effective_untracked, \
-                       t.writer_key AS effective_writer_key, \
+                       wk.writer_key AS effective_writer_key, \
                        t.metadata AS effective_metadata, \
                        t.is_tombstone AS is_tombstone{tracked_full_projection}, \
                        2 AS precedence \
@@ -1431,6 +1435,11 @@ fn effective_state_schema_winner_rows_sql(
                        ON tv.version_id = t.version_id \
                      LEFT JOIN change_commit_by_change_id cc \
                        ON cc.change_id = t.change_id \
+                     LEFT JOIN {workspace_writer_key_table} wk \
+                       ON wk.version_id = t.version_id \
+                      AND wk.schema_key = t.schema_key \
+                      AND wk.entity_id = t.entity_id \
+                      AND wk.file_id = t.file_id \
                      WHERE t.untracked = false{tracked_predicates} \
                      UNION ALL \
                      SELECT \
@@ -1446,7 +1455,7 @@ fn effective_state_schema_winner_rows_sql(
                        t.change_id AS effective_change_id, \
                        cc.commit_id AS effective_commit_id, \
                        false AS effective_untracked, \
-                       t.writer_key AS effective_writer_key, \
+                       gwk.writer_key AS effective_writer_key, \
                        t.metadata AS effective_metadata, \
                        t.is_tombstone AS is_tombstone{tracked_full_projection}, \
                        4 AS precedence \
@@ -1456,6 +1465,11 @@ fn effective_state_schema_winner_rows_sql(
                       AND t.version_id = '{global_version}' \
                      LEFT JOIN change_commit_by_change_id cc \
                        ON cc.change_id = t.change_id \
+                     LEFT JOIN {workspace_writer_key_table} gwk \
+                       ON gwk.version_id = t.version_id \
+                      AND gwk.schema_key = t.schema_key \
+                      AND gwk.entity_id = t.entity_id \
+                      AND gwk.file_id = t.file_id \
                      WHERE t.version_id = '{global_version}' \
                        AND t.untracked = false{tracked_predicates} \
                      UNION ALL \
@@ -1528,6 +1542,7 @@ fn effective_state_schema_winner_rows_sql(
                 untracked_predicates = untracked_predicates,
                 table_name = table_name,
                 untracked_table = untracked_table,
+                workspace_writer_key_table = workspace_writer_key_table,
             )
         })
         .collect::<Vec<_>>()
@@ -1563,6 +1578,67 @@ fn render_where_clause_sql(predicates: &[Expr], prefix: &str) -> String {
                 .collect::<Vec<_>>()
                 .join(" AND ")
         )
+    }
+}
+
+fn render_qualified_where_clause_sql(
+    predicates: &[Expr],
+    prefix: &str,
+    table_alias: &str,
+) -> String {
+    if predicates.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{prefix}{}",
+            predicates
+                .iter()
+                .map(|predicate| render_qualified_predicate_sql(predicate, table_alias))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        )
+    }
+}
+
+fn render_qualified_predicate_sql(expr: &Expr, table_alias: &str) -> String {
+    match expr {
+        Expr::BinaryOp { left, op, right } => format!(
+            "{} {op} {}",
+            render_qualified_predicate_sql(left, table_alias),
+            render_qualified_predicate_sql(right, table_alias),
+        ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let not = if *negated { " NOT" } else { "" };
+            format!(
+                "{}{not} IN ({})",
+                render_qualified_predicate_sql(expr, table_alias),
+                list.iter()
+                    .map(|item| render_qualified_predicate_sql(item, table_alias))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        Expr::Nested(inner) => format!("({})", render_qualified_predicate_sql(inner, table_alias)),
+        Expr::Identifier(identifier) => format!(
+            "{}.{}",
+            quote_ident(table_alias),
+            quote_ident(&identifier.value)
+        ),
+        Expr::CompoundIdentifier(identifiers) => identifiers
+            .last()
+            .map(|identifier| {
+                format!(
+                    "{}.{}",
+                    quote_ident(table_alias),
+                    quote_ident(&identifier.value)
+                )
+            })
+            .unwrap_or_else(|| expr.to_string()),
+        _ => expr.to_string(),
     }
 }
 
@@ -1766,6 +1842,8 @@ fn build_change_source_sql() -> String {
 }
 
 fn build_working_changes_source_sql(active_version_id: &str) -> String {
+    // This still reads the legacy compatibility mirror for version refs until
+    // all working-change paths are fully canonicalized.
     let version_ref_table = tracked_relation_name("lix_version_ref");
     let commit_tracked_table = tracked_relation_name("lix_commit");
     let cse_tracked_table = tracked_relation_name("lix_change_set_element");

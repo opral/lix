@@ -3,8 +3,8 @@ use crate::support;
 use std::collections::BTreeSet;
 
 use lix_engine::{
-    CanonicalJson, LiveStateRebuildDebugMode, LiveStateRebuildPlan, LiveStateRebuildRequest,
-    LiveStateRebuildScope, LiveStateWrite, LiveStateWriteOp, Value,
+    CanonicalJson, ExecuteOptions, LiveStateRebuildDebugMode, LiveStateRebuildPlan,
+    LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateWrite, LiveStateWriteOp, Value,
 };
 
 fn scrub_timestamp_fields(value: &mut serde_json::Value) {
@@ -318,5 +318,309 @@ simulation_test!(
             Value::Text("{\"value\":\"new\"}".to_string())
         );
         sim.assert_deterministic(rows.statements[0].rows.clone());
+    }
+);
+
+simulation_test!(
+    full_rebuild_keeps_semantic_state_without_preserving_writer_key,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.initialize().await.unwrap();
+
+        register_test_schema(&engine).await;
+        let main_version_id = main_version_id(&engine).await;
+
+        engine
+            .execute_with_options(
+                &format!(
+                    "INSERT INTO lix_state_by_version (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                     ) VALUES (\
+                     'entity-writer', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"seed\"}}', '1'\
+                     )",
+                    main_version_id
+                ),
+                &[],
+                ExecuteOptions {
+                    writer_key: Some("editor:seed".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let before = engine
+            .execute(
+                &format!(
+                    "SELECT snapshot_content, writer_key \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'materialization_test_schema' \
+                       AND entity_id = 'entity-writer' \
+                       AND version_id = '{}'",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(before.statements[0].rows.len(), 1);
+        assert_eq!(
+            before.statements[0].rows[0][0],
+            Value::Text("{\"value\":\"seed\"}".to_string())
+        );
+        assert_eq!(
+            before.statements[0].rows[0][1],
+            Value::Text("editor:seed".to_string())
+        );
+
+        engine
+            .rebuild_live_state(&LiveStateRebuildRequest {
+                scope: LiveStateRebuildScope::Full,
+                debug: LiveStateRebuildDebugMode::Off,
+                debug_row_limit: 1,
+            })
+            .await
+            .expect("full rebuild should succeed without annotation hints");
+
+        let raw_after = engine
+            .execute(
+                &format!(
+                    "SELECT writer_key, change_id \
+                     FROM lix_internal_live_v1_materialization_test_schema \
+                     WHERE schema_key = 'materialization_test_schema' \
+                       AND entity_id = 'entity-writer' \
+                       AND version_id = '{}' \
+                       AND is_tombstone = 0 \
+                       AND untracked = false",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw_after.statements[0].rows.len(), 1);
+        assert_eq!(raw_after.statements[0].rows[0][0], Value::Null);
+        match &raw_after.statements[0].rows[0][1] {
+            Value::Text(change_id) => assert!(!change_id.is_empty()),
+            other => panic!("expected text change_id after rebuild, got {other:?}"),
+        }
+
+        let after = engine
+            .execute(
+                &format!(
+                    "SELECT snapshot_content, writer_key, change_id \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'materialization_test_schema' \
+                       AND entity_id = 'entity-writer' \
+                       AND version_id = '{}'",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(after.statements[0].rows.len(), 1);
+        assert_eq!(
+            after.statements[0].rows[0][0],
+            Value::Text("{\"value\":\"seed\"}".to_string())
+        );
+        assert_eq!(
+            after.statements[0].rows[0][1],
+            Value::Text("editor:seed".to_string())
+        );
+        match &after.statements[0].rows[0][2] {
+            Value::Text(change_id) => assert!(!change_id.is_empty()),
+            other => panic!("expected text change_id after rebuild, got {other:?}"),
+        }
+
+        let filtered = engine
+            .execute(
+                &format!(
+                    "SELECT entity_id \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'materialization_test_schema' \
+                       AND version_id = '{}' \
+                       AND writer_key = 'editor:seed'",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered.statements[0].rows.len(), 1);
+        assert_eq!(
+            filtered.statements[0].rows[0][0],
+            Value::Text("entity-writer".to_string())
+        );
+    }
+);
+
+simulation_test!(
+    full_rebuild_keeps_semantic_state_when_workspace_writer_key_annotation_is_missing,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        register_test_schema(&engine).await;
+        let main_version_id = main_version_id(&engine).await;
+
+        engine
+            .execute_with_options(
+                &format!(
+                    "INSERT INTO lix_state_by_version (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                     ) VALUES (\
+                     'entity-writer-missing', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"seed\"}}', '1'\
+                     )",
+                    main_version_id
+                ),
+                &[],
+                ExecuteOptions {
+                    writer_key: Some("editor:seed".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let raw_before = engine
+            .execute(
+                &format!(
+                    "SELECT writer_key \
+                     FROM lix_internal_live_v1_materialization_test_schema \
+                     WHERE schema_key = 'materialization_test_schema' \
+                       AND entity_id = 'entity-writer-missing' \
+                       AND version_id = '{}' \
+                       AND is_tombstone = 0 \
+                       AND untracked = false",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw_before.statements[0].rows.len(), 1);
+        assert_eq!(
+            raw_before.statements[0].rows[0][0],
+            Value::Text("editor:seed".to_string())
+        );
+
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_workspace_writer_key \
+                     WHERE version_id = '{}' \
+                       AND schema_key = 'materialization_test_schema' \
+                       AND entity_id = 'entity-writer-missing' \
+                       AND file_id = 'file-1'",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let before_rebuild = engine
+            .execute(
+                &format!(
+                    "SELECT snapshot_content, writer_key \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'materialization_test_schema' \
+                       AND entity_id = 'entity-writer-missing' \
+                       AND version_id = '{}'",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(before_rebuild.statements[0].rows.len(), 1);
+        assert_eq!(
+            before_rebuild.statements[0].rows[0][0],
+            Value::Text("{\"value\":\"seed\"}".to_string())
+        );
+        assert_eq!(before_rebuild.statements[0].rows[0][1], Value::Null);
+
+        engine
+            .rebuild_live_state(&LiveStateRebuildRequest {
+                scope: LiveStateRebuildScope::Full,
+                debug: LiveStateRebuildDebugMode::Off,
+                debug_row_limit: 1,
+            })
+            .await
+            .expect("full rebuild should succeed without workspace writer annotation");
+
+        let raw_after = engine
+            .execute(
+                &format!(
+                    "SELECT writer_key, change_id \
+                     FROM lix_internal_live_v1_materialization_test_schema \
+                     WHERE schema_key = 'materialization_test_schema' \
+                       AND entity_id = 'entity-writer-missing' \
+                       AND version_id = '{}' \
+                       AND is_tombstone = 0 \
+                       AND untracked = false",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw_after.statements[0].rows.len(), 1);
+        assert_eq!(raw_after.statements[0].rows[0][0], Value::Null);
+        match &raw_after.statements[0].rows[0][1] {
+            Value::Text(change_id) => assert!(!change_id.is_empty()),
+            other => panic!("expected text change_id after rebuild, got {other:?}"),
+        }
+
+        let after = engine
+            .execute(
+                &format!(
+                    "SELECT snapshot_content, writer_key, change_id \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'materialization_test_schema' \
+                       AND entity_id = 'entity-writer-missing' \
+                       AND version_id = '{}'",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(after.statements[0].rows.len(), 1);
+        assert_eq!(
+            after.statements[0].rows[0][0],
+            Value::Text("{\"value\":\"seed\"}".to_string())
+        );
+        assert_eq!(after.statements[0].rows[0][1], Value::Null);
+        match &after.statements[0].rows[0][2] {
+            Value::Text(change_id) => assert!(!change_id.is_empty()),
+            other => panic!("expected text change_id after rebuild, got {other:?}"),
+        }
+
+        let filtered = engine
+            .execute(
+                &format!(
+                    "SELECT entity_id \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'materialization_test_schema' \
+                       AND version_id = '{}' \
+                       AND writer_key = 'editor:seed'",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            filtered.statements[0].rows.is_empty(),
+            "writer_key filtering should reflect missing workspace annotation state"
+        );
     }
 );

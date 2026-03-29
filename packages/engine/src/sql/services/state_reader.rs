@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::readers::{
     load_committed_version_head_commit_id as load_canonical_committed_version_head_commit_id,
@@ -14,20 +14,20 @@ use crate::live_state::schema_access::{
     load_schema_read_contract_with_backend, logical_snapshot_from_projected_row_with_contract,
     LiveReadContract,
 };
+use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::tracked::{
     load_exact_tombstone_with_executor, scan_tombstones_with_executor,
 };
 use crate::live_state::tracked::{
-    scan_rows_with_backend as scan_tracked_rows_with_backend,
     scan_rows_with_executor as scan_tracked_rows_with_executor, TrackedRow,
 };
 pub(crate) use crate::live_state::tracked::{
     ExactTrackedRowRequest, TrackedScanRequest, TrackedTombstoneMarker,
 };
 use crate::live_state::untracked::{
-    scan_rows_with_backend as scan_untracked_rows_with_backend,
     scan_rows_with_executor as scan_untracked_rows_with_executor, UntrackedRow,
 };
+use crate::workspace::writer_key::load_workspace_writer_key_annotations_for_versions_with_executor;
 use crate::{LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,30 +149,16 @@ pub(crate) async fn scan_live_rows(
     constraints: &[crate::live_state::constraints::ScanConstraint],
     required_columns: &[String],
 ) -> Result<Vec<LiveReadRow>, LixError> {
-    match storage {
-        LiveStorageLane::Tracked => scan_tracked_rows_with_backend(
-            backend,
-            &TrackedScanRequest {
-                schema_key: schema_key.to_string(),
-                version_id: version_id.to_string(),
-                constraints: constraints.to_vec(),
-                required_columns: required_columns.to_vec(),
-            },
-        )
-        .await
-        .map(|rows| rows.into_iter().map(LiveReadRow::from).collect()),
-        LiveStorageLane::Untracked => scan_untracked_rows_with_backend(
-            backend,
-            &crate::live_state::untracked::UntrackedScanRequest {
-                schema_key: schema_key.to_string(),
-                version_id: version_id.to_string(),
-                constraints: constraints.to_vec(),
-                required_columns: required_columns.to_vec(),
-            },
-        )
-        .await
-        .map(|rows| rows.into_iter().map(LiveReadRow::from).collect()),
-    }
+    let mut executor = backend;
+    scan_live_rows_with_executor_ref(
+        &mut executor,
+        storage,
+        schema_key,
+        version_id,
+        constraints,
+        required_columns,
+    )
+    .await
 }
 
 pub(crate) async fn scan_live_rows_with_executor_ref(
@@ -184,17 +170,21 @@ pub(crate) async fn scan_live_rows_with_executor_ref(
     required_columns: &[String],
 ) -> Result<Vec<LiveReadRow>, LixError> {
     match storage {
-        LiveStorageLane::Tracked => scan_tracked_rows_with_executor(
-            executor,
-            &TrackedScanRequest {
-                schema_key: schema_key.to_string(),
-                version_id: version_id.to_string(),
-                constraints: constraints.to_vec(),
-                required_columns: required_columns.to_vec(),
-            },
-        )
-        .await
-        .map(|rows| rows.into_iter().map(LiveReadRow::from).collect()),
+        LiveStorageLane::Tracked => {
+            let rows = scan_tracked_rows_with_executor(
+                executor,
+                &TrackedScanRequest {
+                    schema_key: schema_key.to_string(),
+                    version_id: version_id.to_string(),
+                    constraints: constraints.to_vec(),
+                    required_columns: required_columns.to_vec(),
+                },
+            )
+            .await?;
+            overlay_workspace_writer_key_annotations_on_tracked_rows_with_executor(executor, rows)
+                .await
+                .map(|rows| rows.into_iter().map(LiveReadRow::from).collect())
+        }
         LiveStorageLane::Untracked => scan_untracked_rows_with_executor(
             executor,
             &crate::live_state::untracked::UntrackedScanRequest {
@@ -207,6 +197,31 @@ pub(crate) async fn scan_live_rows_with_executor_ref(
         .await
         .map(|rows| rows.into_iter().map(LiveReadRow::from).collect()),
     }
+}
+
+async fn overlay_workspace_writer_key_annotations_on_tracked_rows_with_executor(
+    executor: &mut dyn CommitQueryExecutor,
+    mut rows: Vec<TrackedRow>,
+) -> Result<Vec<TrackedRow>, LixError> {
+    if rows.is_empty() {
+        return Ok(rows);
+    }
+
+    let version_ids = rows
+        .iter()
+        .map(|row| row.version_id.clone())
+        .collect::<BTreeSet<_>>();
+    let annotations =
+        load_workspace_writer_key_annotations_for_versions_with_executor(executor, &version_ids)
+            .await?;
+
+    for row in &mut rows {
+        row.writer_key = annotations
+            .get(&RowIdentity::from_tracked_row(row))
+            .cloned();
+    }
+
+    Ok(rows)
 }
 
 pub(crate) async fn load_version_ref(
