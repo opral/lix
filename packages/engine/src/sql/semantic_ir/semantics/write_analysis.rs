@@ -560,7 +560,8 @@ fn selector_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<
 mod tests {
     use super::analyze_write;
     use crate::sql::catalog::SurfaceRegistry;
-    use crate::sql::binder::contracts::{BoundStatement, ExecutionContext};
+    use crate::sql::binder::bind_statement;
+    use crate::sql::semantic_ir::ExecutionContext;
     use crate::sql::semantic_ir::canonicalize::canonicalize_write;
     use crate::sql::logical_plan::public_ir::{SchemaProof, ScopeProof, TargetSetProof};
     use std::collections::BTreeSet;
@@ -572,7 +573,7 @@ mod tests {
         let registry = SurfaceRegistry::with_builtin_surfaces();
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
-        let bound = BoundStatement::from_statement(
+        let bound = bind_statement(
             statement,
             Vec::new(),
             ExecutionContext {

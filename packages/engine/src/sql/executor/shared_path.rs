@@ -19,7 +19,6 @@ use crate::sql::executor::compiled::{
 use crate::sql::executor::contracts::effects::PlanEffects;
 use crate::sql::executor::contracts::planned_statement::PlannedStatementSet;
 use crate::sql::executor::contracts::requirements::PlanRequirements;
-use crate::sql::executor::contracts::result_contract::ResultContract;
 use crate::sql::executor::derive_effects::derive_plan_effects;
 use crate::sql::executor::derive_requirements::derive_plan_requirements;
 use crate::sql::executor::execution_program::{
@@ -28,8 +27,11 @@ use crate::sql::executor::execution_program::{
 use crate::sql::executor::intent::{
     collect_execution_intent_with_backend, ExecutionIntent, IntentCollectionPolicy,
 };
-use crate::sql::executor::preprocess::preprocess_with_surfaces_to_plan;
+use crate::sql::executor::preprocess::preprocess_with_surfaces_to_logical_plan;
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;
+use crate::sql::logical_plan::{
+    result_contract_for_statements, ResultContract,
+};
 use crate::transaction::PendingTransactionView;
 use sqlparser::ast::Statement;
 
@@ -186,12 +188,12 @@ async fn compile_execution_with_backend(
         }
     }
 
-    let result_contract = derive_result_contract_for_statements(&statements);
+    let result_contract = result_contract_for_statements(&statements);
     let (effects, internal_execution) = if public_write_owns_execution || public_read_owns_execution
     {
         (PlanEffects::default(), None)
     } else {
-        let preprocess = preprocess_with_surfaces_to_plan(
+        let internal_logical_plan = preprocess_with_surfaces_to_logical_plan(
             backend,
             &engine.cel_evaluator,
             statements.clone(),
@@ -208,7 +210,8 @@ async fn compile_execution_with_backend(
                 error.description
             ),
         })?;
-        validate_compiled_internal_execution(&preprocess, result_contract)?;
+        let preprocess: PlannedStatementSet = internal_logical_plan.normalized_statements.clone().into();
+        validate_compiled_internal_execution(&preprocess, internal_logical_plan.result_contract)?;
 
         if !preprocess.mutations.is_empty() {
             validate_inserts(backend, &engine.schema_cache, &preprocess.mutations)
@@ -464,34 +467,6 @@ fn validate_compiled_internal_execution(
         ));
     }
     Ok(())
-}
-
-fn derive_result_contract_for_statements(statements: &[Statement]) -> ResultContract {
-    match statements.last() {
-        Some(Statement::Query(_) | Statement::Explain { .. }) => ResultContract::Select,
-        Some(Statement::Insert(insert)) => {
-            if insert.returning.is_some() {
-                ResultContract::DmlReturning
-            } else {
-                ResultContract::DmlNoReturning
-            }
-        }
-        Some(Statement::Update(update)) => {
-            if update.returning.is_some() {
-                ResultContract::DmlReturning
-            } else {
-                ResultContract::DmlNoReturning
-            }
-        }
-        Some(Statement::Delete(delete)) => {
-            if delete.returning.is_some() {
-                ResultContract::DmlReturning
-            } else {
-                ResultContract::DmlNoReturning
-            }
-        }
-        Some(_) | None => ResultContract::Other,
-    }
 }
 
 #[cfg(test)]

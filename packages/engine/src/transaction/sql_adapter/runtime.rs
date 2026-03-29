@@ -13,9 +13,9 @@ use crate::sql::executor::compiled::{
 };
 use crate::sql::executor::contracts::effects::PlanEffects;
 use crate::sql::executor::contracts::executor_error::ExecutorError;
-use crate::sql::executor::contracts::result_contract::ResultContract;
 use crate::sql::executor::execute_prepared::execute_prepared_with_transaction;
 use crate::sql::executor::public_runtime::PreparedPublicRead;
+use crate::sql::logical_plan::ResultContract;
 use crate::sql::services::pending_reads::execute_prepared_public_read_with_pending_transaction_view;
 use crate::state::stream::StateCommitStreamChange;
 use crate::transaction::PendingTransactionView;

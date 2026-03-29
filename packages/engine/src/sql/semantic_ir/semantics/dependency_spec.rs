@@ -1,5 +1,5 @@
 use crate::session::contracts::SessionDependency;
-use crate::sql::common::dependency_spec::{DependencyPrecision, DependencySpec};
+use crate::sql::logical_plan::{DependencyPrecision, DependencySpec};
 use crate::sql::catalog::{SurfaceBinding, SurfaceFamily};
 use crate::sql::logical_plan::public_ir::{
     CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan,
@@ -584,9 +584,10 @@ fn add_filter_literal(column: FilterColumn, value: String, spec: &mut Dependency
 mod tests {
     use super::derive_dependency_spec_from_structured_public_read;
     use crate::session::contracts::SessionDependency;
-    use crate::sql::common::dependency_spec::DependencyPrecision;
+    use crate::sql::logical_plan::DependencyPrecision;
     use crate::sql::catalog::SurfaceRegistry;
-    use crate::sql::binder::contracts::{BoundStatement, ExecutionContext};
+    use crate::sql::binder::bind_statement;
+    use crate::sql::semantic_ir::ExecutionContext;
     use crate::sql::semantic_ir::canonicalize::canonicalize_read;
     use crate::sql::logical_plan::public_ir::StructuredPublicRead;
     use crate::{SqlDialect, Value};
@@ -598,14 +599,14 @@ mod tests {
     ) -> StructuredPublicRead {
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
-        let bound = BoundStatement::from_statement(
+        let bound = bind_statement(
             statement,
             params,
             ExecutionContext::with_dialect(SqlDialect::Sqlite),
         );
         canonicalize_read(bound, registry)
             .expect("query should canonicalize")
-            .into_structured_read()
+            .structured_read()
     }
 
     #[test]

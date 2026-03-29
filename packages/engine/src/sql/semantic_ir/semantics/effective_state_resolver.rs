@@ -1,5 +1,5 @@
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::sql::common::dependency_spec::DependencySpec;
+use crate::sql::logical_plan::DependencySpec;
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
 };
@@ -725,7 +725,8 @@ async fn exact_effective_state_row_from_pending(
 mod tests {
     use super::{build_effective_state, OverlayLane, StateSourceAuthority};
     use crate::sql::catalog::SurfaceRegistry;
-    use crate::sql::binder::contracts::{BoundStatement, ExecutionContext};
+    use crate::sql::binder::bind_statement;
+    use crate::sql::semantic_ir::ExecutionContext;
     use crate::sql::semantic_ir::canonicalize::canonicalize_read;
     use crate::sql::logical_plan::public_ir::StructuredPublicRead;
     use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
@@ -738,14 +739,14 @@ mod tests {
     ) -> StructuredPublicRead {
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
-        let bound = BoundStatement::from_statement(
+        let bound = bind_statement(
             statement,
             params,
             ExecutionContext::with_dialect(SqlDialect::Sqlite),
         );
         canonicalize_read(bound, registry)
             .expect("query should canonicalize")
-            .into_structured_read()
+            .structured_read()
     }
 
     #[test]

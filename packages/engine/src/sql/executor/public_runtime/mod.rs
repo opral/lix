@@ -1,6 +1,5 @@
 //! Executor-owned implementation of the public SQL runtime surface.
 
-use crate::errors::schema_not_registered_error;
 use crate::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
 };
@@ -11,44 +10,40 @@ use crate::filesystem::runtime::{
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
-use crate::read::models::{
-    DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest, TrackedDomainChangeView,
-};
+use crate::read::models::TrackedDomainChangeView;
 use crate::schema::builtin::builtin_schema_definition;
 use crate::session::contracts::SessionStateDelta;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::ast::lowering::lower_statement;
-use crate::sql::common::dependency_spec::DependencySpec;
 use crate::sql::executor::contracts::effects::PlanEffects;
 use crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::sql::executor::intent::authoritative_binary_blob_write_targets;
 use crate::sql::backend::PushdownDecision;
-use crate::sql::catalog::{
-    SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
-};
-use crate::sql::binder::contracts::{BoundStatement, ExecutionContext};
+use crate::sql::catalog::{SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
+use crate::sql::binder::bind_statement;
 use crate::sql::physical_plan::lowerer::{
     rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id,
-    summarize_bound_public_read_statement_with_registry, LoweredReadProgram, LoweredResultColumns,
+    summarize_bound_public_read_statement_with_registry, LoweredReadProgram,
 };
-use crate::sql::semantic_ir::canonicalize::{canonicalize_write, CanonicalizedWrite};
+use crate::sql::semantic_ir::canonicalize::CanonicalizedWrite;
+use crate::sql::semantic_ir::{
+    analyze_public_write_semantics, BoundPublicLeaf, BoundStatement, ExecutionContext,
+    ExplainOptions, PublicExecutionDebugTrace, PublicWriteInvariantTrace, PublicWriteSemantics,
+};
+use crate::sql::logical_plan::{
+    verify_logical_plan, DependencySpec, DirectPublicReadPlan, LogicalPlan,
+    PublicReadLogicalPlan,
+};
 use crate::sql::logical_plan::public_ir::{
-    CommitPreconditions, PlannedWrite, ResolvedWritePlan, SchemaProof, ScopeProof,
-    StructuredPublicRead, TargetSetProof, WriteCommand, WriteOperationKind,
-};
-use crate::sql::semantic_ir::semantics::dependency_spec::{
-    derive_dependency_spec_from_bound_public_surface_bindings,
-    derive_dependency_spec_from_structured_public_read,
+    CommitPreconditions, PlannedWrite, StructuredPublicRead, WriteOperationKind,
 };
 use crate::sql::semantic_ir::semantics::domain_changes::{
     build_domain_change_batch, derive_commit_preconditions, DomainChangeBatch,
 };
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
-    build_effective_state, EffectiveStatePlan, EffectiveStateRequest,
+    EffectiveStatePlan, EffectiveStateRequest,
 };
-use crate::sql::semantic_ir::semantics::write_analysis::analyze_write;
 use crate::sql::semantic_ir::semantics::write_resolver::resolve_write_plan_with_functions;
-use crate::sql::services::state_reader::load_committed_version_head_commit_id;
 use crate::state::stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamOperation,
@@ -61,331 +56,12 @@ use crate::version::{
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     JoinConstraint, JoinOperator, LimitClause, ObjectNamePart, OrderBy, OrderByExpr, Query, Select,
     SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value as SqlValue, Visit, Visitor,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
-
-#[derive(Debug, Clone, PartialEq)]
-struct ExplainEnvelope {
-    describe_alias: sqlparser::ast::DescribeAlias,
-    analyze: bool,
-    verbose: bool,
-    query_plan: bool,
-    estimate: bool,
-    format: Option<sqlparser::ast::AnalyzeFormatKind>,
-    options: Option<Vec<sqlparser::ast::UtilityOption>>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct PublicExecutionDebugTrace {
-    pub(crate) bound_statements: Vec<BoundStatement>,
-    pub(crate) surface_bindings: Vec<String>,
-    pub(crate) bound_public_leaves: Vec<BoundPublicLeaf>,
-    pub(crate) dependency_spec: Option<DependencySpec>,
-    pub(crate) effective_state_request: Option<EffectiveStateRequest>,
-    pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
-    pub(crate) pushdown_decision: Option<PushdownDecision>,
-    pub(crate) write_command: Option<WriteCommand>,
-    pub(crate) scope_proof: Option<ScopeProof>,
-    pub(crate) schema_proof: Option<SchemaProof>,
-    pub(crate) target_set_proof: Option<TargetSetProof>,
-    pub(crate) resolved_write_plan: Option<ResolvedWritePlan>,
-    pub(crate) domain_change_batches: Vec<DomainChangeBatch>,
-    pub(crate) commit_preconditions: Vec<CommitPreconditions>,
-    pub(crate) invariant_trace: Option<PublicWriteInvariantTrace>,
-    pub(crate) write_phase_trace: Vec<String>,
-    pub(crate) lowered_sql: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct PublicWriteInvariantTrace {
-    pub(crate) batch_local_checks: Vec<String>,
-    pub(crate) commit_time_checks: Vec<String>,
-    pub(crate) physical_checks: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PublicReadOptimization {
-    pub(crate) structured_read: StructuredPublicRead,
-    pub(crate) effective_state_request: Option<EffectiveStateRequest>,
-    pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DirectStateHistoryField {
-    EntityId,
-    SchemaKey,
-    FileId,
-    PluginKey,
-    SnapshotContent,
-    Metadata,
-    SchemaVersion,
-    ChangeId,
-    CommitId,
-    CommitCreatedAt,
-    RootCommitId,
-    Depth,
-    VersionId,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum StateHistoryAggregate {
-    Count,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum StateHistoryProjectionValue {
-    Field(DirectStateHistoryField),
-    Aggregate(StateHistoryAggregate),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct StateHistoryProjection {
-    pub(crate) output_name: String,
-    pub(crate) value: StateHistoryProjectionValue,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum StateHistorySortValue {
-    Field(DirectStateHistoryField),
-    Aggregate(StateHistoryAggregate),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct StateHistorySortKey {
-    pub(crate) output_name: String,
-    pub(crate) value: Option<StateHistorySortValue>,
-    pub(crate) descending: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum StateHistoryPredicate {
-    Eq(DirectStateHistoryField, Value),
-    NotEq(DirectStateHistoryField, Value),
-    Gt(DirectStateHistoryField, Value),
-    GtEq(DirectStateHistoryField, Value),
-    Lt(DirectStateHistoryField, Value),
-    LtEq(DirectStateHistoryField, Value),
-    In(DirectStateHistoryField, Vec<Value>),
-    IsNull(DirectStateHistoryField),
-    IsNotNull(DirectStateHistoryField),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct StateHistoryDirectReadPlan {
-    pub(crate) request: StateHistoryRequest,
-    pub(crate) predicates: Vec<StateHistoryPredicate>,
-    pub(crate) projections: Vec<StateHistoryProjection>,
-    pub(crate) wildcard_projection: bool,
-    pub(crate) wildcard_columns: Vec<String>,
-    pub(crate) group_by_fields: Vec<DirectStateHistoryField>,
-    pub(crate) having: Option<StateHistoryAggregatePredicate>,
-    pub(crate) sort_keys: Vec<StateHistorySortKey>,
-    pub(crate) limit: Option<u64>,
-    pub(crate) offset: u64,
-    pub(crate) result_columns: LoweredResultColumns,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum StateHistoryAggregatePredicate {
-    Eq(StateHistoryAggregate, i64),
-    NotEq(StateHistoryAggregate, i64),
-    Gt(StateHistoryAggregate, i64),
-    GtEq(StateHistoryAggregate, i64),
-    Lt(StateHistoryAggregate, i64),
-    LtEq(StateHistoryAggregate, i64),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DirectEntityHistoryField {
-    Property(String),
-    State(DirectStateHistoryField),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct EntityHistoryProjection {
-    pub(crate) output_name: String,
-    pub(crate) field: DirectEntityHistoryField,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct EntityHistorySortKey {
-    pub(crate) output_name: String,
-    pub(crate) field: Option<DirectEntityHistoryField>,
-    pub(crate) descending: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum EntityHistoryPredicate {
-    Eq(DirectEntityHistoryField, Value),
-    NotEq(DirectEntityHistoryField, Value),
-    Gt(DirectEntityHistoryField, Value),
-    GtEq(DirectEntityHistoryField, Value),
-    Lt(DirectEntityHistoryField, Value),
-    LtEq(DirectEntityHistoryField, Value),
-    In(DirectEntityHistoryField, Vec<Value>),
-    IsNull(DirectEntityHistoryField),
-    IsNotNull(DirectEntityHistoryField),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct EntityHistoryDirectReadPlan {
-    pub(crate) surface_binding: SurfaceBinding,
-    pub(crate) request: StateHistoryRequest,
-    pub(crate) predicates: Vec<EntityHistoryPredicate>,
-    pub(crate) projections: Vec<EntityHistoryProjection>,
-    pub(crate) wildcard_projection: bool,
-    pub(crate) wildcard_columns: Vec<String>,
-    pub(crate) sort_keys: Vec<EntityHistorySortKey>,
-    pub(crate) limit: Option<u64>,
-    pub(crate) offset: u64,
-    pub(crate) result_columns: LoweredResultColumns,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DirectFileHistoryField {
-    Id,
-    Path,
-    Data,
-    Metadata,
-    Hidden,
-    EntityId,
-    SchemaKey,
-    FileId,
-    VersionId,
-    PluginKey,
-    SchemaVersion,
-    ChangeId,
-    LixcolMetadata,
-    CommitId,
-    CommitCreatedAt,
-    RootCommitId,
-    Depth,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct FileHistoryProjection {
-    pub(crate) output_name: String,
-    pub(crate) field: DirectFileHistoryField,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct FileHistorySortKey {
-    pub(crate) output_name: String,
-    pub(crate) field: Option<DirectFileHistoryField>,
-    pub(crate) descending: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum FileHistoryPredicate {
-    Eq(DirectFileHistoryField, Value),
-    NotEq(DirectFileHistoryField, Value),
-    Gt(DirectFileHistoryField, Value),
-    GtEq(DirectFileHistoryField, Value),
-    Lt(DirectFileHistoryField, Value),
-    LtEq(DirectFileHistoryField, Value),
-    In(DirectFileHistoryField, Vec<Value>),
-    IsNull(DirectFileHistoryField),
-    IsNotNull(DirectFileHistoryField),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum FileHistoryAggregate {
-    Count,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct FileHistoryDirectReadPlan {
-    pub(crate) request: FileHistoryRequest,
-    pub(crate) predicates: Vec<FileHistoryPredicate>,
-    pub(crate) projections: Vec<FileHistoryProjection>,
-    pub(crate) wildcard_projection: bool,
-    pub(crate) wildcard_columns: Vec<String>,
-    pub(crate) sort_keys: Vec<FileHistorySortKey>,
-    pub(crate) limit: Option<u64>,
-    pub(crate) offset: u64,
-    pub(crate) aggregate: Option<FileHistoryAggregate>,
-    pub(crate) aggregate_output_name: Option<String>,
-    pub(crate) result_columns: LoweredResultColumns,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DirectDirectoryHistoryField {
-    Id,
-    ParentId,
-    Name,
-    Path,
-    Hidden,
-    EntityId,
-    SchemaKey,
-    FileId,
-    VersionId,
-    PluginKey,
-    SchemaVersion,
-    ChangeId,
-    LixcolMetadata,
-    CommitId,
-    CommitCreatedAt,
-    RootCommitId,
-    Depth,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct DirectoryHistoryProjection {
-    pub(crate) output_name: String,
-    pub(crate) field: DirectDirectoryHistoryField,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct DirectoryHistorySortKey {
-    pub(crate) output_name: String,
-    pub(crate) field: Option<DirectDirectoryHistoryField>,
-    pub(crate) descending: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DirectoryHistoryPredicate {
-    Eq(DirectDirectoryHistoryField, Value),
-    NotEq(DirectDirectoryHistoryField, Value),
-    Gt(DirectDirectoryHistoryField, Value),
-    GtEq(DirectDirectoryHistoryField, Value),
-    Lt(DirectDirectoryHistoryField, Value),
-    LtEq(DirectDirectoryHistoryField, Value),
-    In(DirectDirectoryHistoryField, Vec<Value>),
-    IsNull(DirectDirectoryHistoryField),
-    IsNotNull(DirectDirectoryHistoryField),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DirectoryHistoryAggregate {
-    Count,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct DirectoryHistoryDirectReadPlan {
-    pub(crate) request: DirectoryHistoryRequest,
-    pub(crate) predicates: Vec<DirectoryHistoryPredicate>,
-    pub(crate) projections: Vec<DirectoryHistoryProjection>,
-    pub(crate) wildcard_projection: bool,
-    pub(crate) wildcard_columns: Vec<String>,
-    pub(crate) sort_keys: Vec<DirectoryHistorySortKey>,
-    pub(crate) limit: Option<u64>,
-    pub(crate) offset: u64,
-    pub(crate) aggregate: Option<DirectoryHistoryAggregate>,
-    pub(crate) aggregate_output_name: Option<String>,
-    pub(crate) result_columns: LoweredResultColumns,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DirectPublicReadPlan {
-    StateHistory(StateHistoryDirectReadPlan),
-    EntityHistory(EntityHistoryDirectReadPlan),
-    FileHistory(FileHistoryDirectReadPlan),
-    DirectoryHistory(DirectoryHistoryDirectReadPlan),
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PreparedPublicReadExecution {
@@ -395,8 +71,7 @@ pub(crate) enum PreparedPublicReadExecution {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PreparedPublicRead {
-    pub(crate) optimization: Option<PublicReadOptimization>,
-    pub(crate) dependency_spec: Option<DependencySpec>,
+    pub(crate) logical_plan: PublicReadLogicalPlan,
     pub(crate) execution: PreparedPublicReadExecution,
     pub(crate) public_output_columns: Option<Vec<String>>,
     pub(crate) debug_trace: PublicExecutionDebugTrace,
@@ -406,21 +81,19 @@ pub(crate) use read::{decode_public_read_result, execute_prepared_public_read};
 
 impl PreparedPublicRead {
     pub(crate) fn structured_read(&self) -> Option<&StructuredPublicRead> {
-        self.optimization
-            .as_ref()
-            .map(|optimization| &optimization.structured_read)
+        self.logical_plan.structured_read()
     }
 
     pub(crate) fn effective_state_request(&self) -> Option<&EffectiveStateRequest> {
-        self.optimization
-            .as_ref()
-            .and_then(|optimization| optimization.effective_state_request.as_ref())
+        self.logical_plan.effective_state_request()
     }
 
     pub(crate) fn effective_state_plan(&self) -> Option<&EffectiveStatePlan> {
-        self.optimization
-            .as_ref()
-            .and_then(|optimization| optimization.effective_state_plan.as_ref())
+        self.logical_plan.effective_state_plan()
+    }
+
+    pub(crate) fn dependency_spec(&self) -> Option<&DependencySpec> {
+        self.logical_plan.dependency_spec()
     }
 
     pub(crate) fn lowered_read(&self) -> Option<&LoweredReadProgram> {
@@ -430,15 +103,6 @@ impl PreparedPublicRead {
         }
     }
 
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BoundPublicLeaf {
-    pub(crate) public_name: String,
-    pub(crate) surface_family: SurfaceFamily,
-    pub(crate) surface_variant: SurfaceVariant,
-    pub(crate) capability: SurfaceCapability,
-    pub(crate) requires_effective_state: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -978,19 +642,6 @@ fn query_selection(query: &Query) -> Option<&Expr> {
     select.selection.as_ref()
 }
 
-fn bound_public_leaf(binding: &crate::sql::catalog::SurfaceBinding) -> BoundPublicLeaf {
-    BoundPublicLeaf {
-        public_name: binding.descriptor.public_name.clone(),
-        surface_family: binding.descriptor.surface_family,
-        surface_variant: binding.descriptor.surface_variant,
-        capability: binding.capability,
-        requires_effective_state: matches!(
-            binding.descriptor.surface_family,
-            SurfaceFamily::State | SurfaceFamily::Entity
-        ),
-    }
-}
-
 fn collect_public_query_relation_names(query: &Query) -> BTreeSet<String> {
     let mut relation_names = BTreeSet::new();
     collect_public_query_relation_names_scoped(query, &BTreeSet::new(), &mut relation_names);
@@ -1417,79 +1068,6 @@ async fn load_active_version_id_for_public_read(
     crate::workspace::require_workspace_active_version_id(backend).await
 }
 
-async fn maybe_bind_active_history_root(
-    backend: &dyn LixBackend,
-    mut structured_read: StructuredPublicRead,
-    active_version_id: &str,
-) -> Option<StructuredPublicRead> {
-    let descriptor = &structured_read.surface_binding.descriptor;
-    let public_name = descriptor.public_name.as_str();
-    let uses_active_history_root = descriptor.surface_variant == SurfaceVariant::History
-        && matches!(
-            descriptor.surface_family,
-            SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
-        )
-        && !public_name.ends_with("_history_by_version");
-    if !uses_active_history_root {
-        return Some(structured_read);
-    }
-    if structured_read_has_root_commit_predicate(&structured_read) {
-        return Some(structured_read);
-    }
-
-    let root_commit_id = load_committed_version_head_commit_id(backend, active_version_id)
-        .await
-        .ok()??;
-    let root_predicate = Expr::BinaryOp {
-        left: Box::new(Expr::Identifier(Ident::new("lixcol_root_commit_id"))),
-        op: BinaryOperator::Eq,
-        right: Box::new(Expr::Value(
-            SqlValue::SingleQuotedString(root_commit_id).into(),
-        )),
-    };
-
-    structured_read.query.selection = Some(match structured_read.query.selection.take() {
-        Some(existing) => Expr::BinaryOp {
-            left: Box::new(existing),
-            op: BinaryOperator::And,
-            right: Box::new(root_predicate.clone()),
-        },
-        None => root_predicate.clone(),
-    });
-    structured_read
-        .query
-        .selection_predicates
-        .push(root_predicate);
-    Some(structured_read)
-}
-
-fn structured_read_has_root_commit_predicate(structured_read: &StructuredPublicRead) -> bool {
-    structured_read
-        .query
-        .selection_predicates
-        .iter()
-        .any(expr_has_root_commit_predicate)
-}
-
-fn expr_has_root_commit_predicate(expr: &Expr) -> bool {
-    match expr {
-        Expr::BinaryOp { left, right, .. } => {
-            expr_references_root_commit(left)
-                || expr_references_root_commit(right)
-                || expr_has_root_commit_predicate(left)
-                || expr_has_root_commit_predicate(right)
-        }
-        Expr::Nested(inner)
-        | Expr::IsNull(inner)
-        | Expr::IsNotNull(inner)
-        | Expr::UnaryOp { expr: inner, .. } => expr_has_root_commit_predicate(inner),
-        Expr::InList { expr, .. } | Expr::InSubquery { expr, .. } => {
-            expr_references_root_commit(expr) || expr_has_root_commit_predicate(expr)
-        }
-        _ => false,
-    }
-}
-
 fn requested_history_root_commit_ids_from_selection(selection: Option<&Expr>) -> Vec<String> {
     let mut roots = std::collections::BTreeSet::new();
     if let Some(selection) = selection {
@@ -1556,108 +1134,8 @@ fn expr_string_literal(expr: &Expr) -> Option<&str> {
     }
 }
 
-fn expr_references_root_commit(expr: &Expr) -> bool {
-    match expr {
-        Expr::Identifier(identifier) => {
-            matches!(
-                identifier.value.to_ascii_lowercase().as_str(),
-                "lixcol_root_commit_id" | "root_commit_id"
-            )
-        }
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => matches!(
-            parts[1].value.to_ascii_lowercase().as_str(),
-            "lixcol_root_commit_id" | "root_commit_id"
-        ),
-        Expr::Nested(inner) => expr_references_root_commit(inner),
-        _ => false,
-    }
-}
 
-fn dependency_spec_has_unknown_schema_keys(
-    registry: &SurfaceRegistry,
-    dependency_spec: Option<&DependencySpec>,
-) -> bool {
-    let Some(dependency_spec) = dependency_spec else {
-        return false;
-    };
-    if dependency_spec.schema_keys.is_empty() {
-        return false;
-    }
-    let registered = registry
-        .registered_schema_keys()
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    dependency_spec
-        .schema_keys
-        .iter()
-        .any(|schema_key| !registered.contains(schema_key))
-}
-
-fn unknown_public_state_schema_error(
-    registry: &SurfaceRegistry,
-    dependency_spec: Option<&DependencySpec>,
-) -> Option<LixError> {
-    if !dependency_spec_has_unknown_schema_keys(registry, dependency_spec) {
-        return None;
-    }
-    let dependency_spec = dependency_spec?;
-    let registered = registry.registered_state_surface_schema_keys();
-    let available_refs = registered.iter().map(String::as_str).collect::<Vec<_>>();
-    let unknown = dependency_spec.schema_keys.iter().find(|schema_key| {
-        !registered
-            .iter()
-            .any(|registered| registered == *schema_key)
-    })?;
-    Some(schema_not_registered_error(unknown, &available_refs))
-}
-
-fn augment_dependency_spec_for_public_read(
-    registry: &SurfaceRegistry,
-    structured_read: &StructuredPublicRead,
-    dependency_spec: Option<DependencySpec>,
-) -> Option<DependencySpec> {
-    let dependency_spec = dependency_spec?;
-    augment_dependency_spec_for_broad_public_read(registry, Some(dependency_spec)).map(
-        |mut dependency_spec| {
-            let has_state_schema_keys = !dependency_spec.schema_keys.is_empty();
-            if structured_read.surface_binding.descriptor.surface_family == SurfaceFamily::State
-                && !has_state_schema_keys
-            {
-                dependency_spec.schema_keys = registry
-                    .registered_state_surface_schema_keys()
-                    .into_iter()
-                    .collect();
-            }
-            dependency_spec
-        },
-    )
-}
-
-fn augment_dependency_spec_for_broad_public_read(
-    registry: &SurfaceRegistry,
-    dependency_spec: Option<DependencySpec>,
-) -> Option<DependencySpec> {
-    let mut dependency_spec = dependency_spec?;
-    let references_state_like_surface = dependency_spec.relations.iter().any(|relation| {
-        registry
-            .bind_relation_name(relation)
-            .is_some_and(|binding| {
-                matches!(
-                    binding.descriptor.surface_family,
-                    SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
-                )
-            })
-    });
-    let has_state_schema_keys = !dependency_spec.schema_keys.is_empty();
-    if references_state_like_surface && !has_state_schema_keys {
-        dependency_spec
-            .schema_keys
-            .extend(registry.registered_state_surface_schema_keys());
-    }
-    Some(dependency_spec)
-}
-
-fn explain_query_statement(statement: &Statement) -> Option<(Statement, Option<ExplainEnvelope>)> {
+fn explain_query_statement(statement: &Statement) -> Option<(Statement, Option<ExplainOptions>)> {
     match statement {
         Statement::Query(_) => Some((statement.clone(), None)),
         Statement::Explain {
@@ -1672,7 +1150,7 @@ fn explain_query_statement(statement: &Statement) -> Option<(Statement, Option<E
         } => match statement.as_ref() {
             Statement::Query(_) => Some((
                 statement.as_ref().clone(),
-                Some(ExplainEnvelope {
+                Some(ExplainOptions {
                     describe_alias: describe_alias.clone(),
                     analyze: *analyze,
                     verbose: *verbose,
@@ -1690,7 +1168,7 @@ fn explain_query_statement(statement: &Statement) -> Option<(Statement, Option<E
 
 fn wrap_lowered_read_for_explain(
     program: LoweredReadProgram,
-    envelope: Option<&ExplainEnvelope>,
+    envelope: Option<&ExplainOptions>,
 ) -> LoweredReadProgram {
     let Some(envelope) = envelope else {
         return program;
@@ -1768,7 +1246,7 @@ where
     }
 
     let statement = parsed_statements[0].clone();
-    let bound_statement = BoundStatement::from_statement(
+    let bound_statement = bind_statement(
         statement,
         params.to_vec(),
         ExecutionContext {
@@ -1780,8 +1258,8 @@ where
     );
     let filesystem_target_name =
         top_level_filesystem_write_target_name(&bound_statement.statement).map(str::to_string);
-    let canonicalized = match canonicalize_write(bound_statement.clone(), &registry) {
-        Ok(canonicalized) => canonicalized,
+    let semantics = match PublicWriteSemantics::prepare(bound_statement.clone(), &registry) {
+        Ok(semantics) => semantics,
         Err(error) => {
             if let Some(binding) = top_level_write_target_name(&bound_statement.statement)
                 .and_then(|name| registry.bind_relation_name(&name))
@@ -1806,15 +1284,19 @@ where
             }
         }
     };
-    let mut planned_write = match analyze_write(&canonicalized) {
-        Ok(planned_write) => planned_write,
+    let mut write_analysis = match analyze_public_write_semantics(&semantics) {
+        Ok(write_analysis) => write_analysis,
         Err(error) => {
-            if let Some(error) = public_write_preparation_error(&canonicalized, &error.message) {
+            if let Some(error) =
+                public_write_preparation_error(&semantics.canonicalized, &error.message)
+            {
                 return Err(error);
             }
             return Ok(None);
         }
     };
+    let canonicalized = &write_analysis.semantics.canonicalized;
+    let mut planned_write = write_analysis.planned_write.clone();
     let resolved_write_plan = match resolve_write_plan_with_functions(
         backend,
         &planned_write,
@@ -1849,6 +1331,17 @@ where
         }
     };
     planned_write.commit_preconditions = commit_preconditions.clone();
+    write_analysis.planned_write = planned_write.clone();
+    let write_logical_plan = write_analysis.logical_plan();
+    verify_logical_plan(&LogicalPlan::PublicWrite(write_logical_plan)).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "public write logical plan verification failed: {}",
+                error.message
+            ),
+        )
+    })?;
     let invariant_trace = Some(build_public_write_invariant_trace(&planned_write));
     let execution = build_public_write_execution(
         &planned_write,
@@ -1864,9 +1357,12 @@ where
 
     Ok(Some(PreparedPublicWrite {
         debug_trace: PublicExecutionDebugTrace {
+            semantic_statement: Some(write_analysis.semantics.semantic_statement()),
             bound_statements: vec![bound_statement],
             surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
-            bound_public_leaves: vec![bound_public_leaf(&canonicalized.surface_binding)],
+            bound_public_leaves: vec![BoundPublicLeaf::from_surface_binding(
+                &canonicalized.surface_binding,
+            )],
             dependency_spec: None,
             effective_state_request: None,
             effective_state_plan: None,
@@ -1885,7 +1381,7 @@ where
         planned_write,
         domain_change_batches,
         execution,
-        canonicalized,
+        canonicalized: canonicalized.clone(),
     }))
 }
 
@@ -2488,6 +1984,7 @@ mod tests {
         PreparedPublicReadExecution,
     };
     use crate::read::models::StateHistoryRootScope;
+    use crate::sql::logical_plan::DependencyPrecision;
     use crate::{LixBackend, LixError, QueryResult, Session, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::json;
@@ -2696,8 +2193,7 @@ mod tests {
         assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_key_value"]);
         assert_eq!(
             prepared
-                .dependency_spec
-                .as_ref()
+                .dependency_spec()
                 .expect("dependency spec should be derived")
                 .schema_keys
                 .iter()
@@ -2706,8 +2202,7 @@ mod tests {
             vec!["lix_key_value".to_string()]
         );
         assert!(prepared
-            .dependency_spec
-            .as_ref()
+            .dependency_spec()
             .expect("dependency spec should be derived")
             .session_dependencies
             .contains(&crate::session::contracts::SessionDependency::ActiveVersion));
@@ -2787,7 +2282,7 @@ mod tests {
                 .as_deref(),
             Some("message")
         );
-        assert!(prepared.dependency_spec.is_some());
+        assert!(prepared.dependency_spec().is_some());
         assert!(prepared.effective_state_plan().is_some());
         let lowered_sql = prepared
             .debug_trace
@@ -2964,8 +2459,7 @@ mod tests {
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
             prepared
-                .dependency_spec
-                .as_ref()
+                .dependency_spec()
                 .expect("change read should derive dependency spec")
                 .relations,
             ["lix_change".to_string()].into_iter().collect()
@@ -3013,11 +2507,10 @@ mod tests {
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
             prepared
-                .dependency_spec
-                .as_ref()
+                .dependency_spec()
                 .expect("working-changes dependency spec should be recorded")
                 .precision,
-            crate::sql::common::dependency_spec::DependencyPrecision::Conservative
+            DependencyPrecision::Conservative
         );
         assert_eq!(
             prepared
@@ -3057,8 +2550,7 @@ mod tests {
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
             prepared
-                .dependency_spec
-                .as_ref()
+                .dependency_spec()
                 .expect("filesystem dependency spec should be recorded")
                 .schema_keys
                 .iter()
@@ -3071,8 +2563,7 @@ mod tests {
             ]
         );
         assert!(prepared
-            .dependency_spec
-            .as_ref()
+            .dependency_spec()
             .expect("filesystem dependency spec should be recorded")
             .session_dependencies
             .contains(&crate::session::contracts::SessionDependency::ActiveVersion));
@@ -3624,8 +3115,8 @@ mod tests {
         .expect("bindable cte/join/group-by read should not error")
         .expect("bindable cte/join/group-by read should prepare through public lowering");
 
-        assert!(prepared.optimization.is_none());
-        assert!(prepared.dependency_spec.is_some());
+        assert!(prepared.structured_read().is_none());
+        assert!(prepared.dependency_spec().is_some());
         assert_eq!(
             prepared.debug_trace.surface_bindings,
             vec!["lix_state", "lix_state_by_version"]
@@ -3641,11 +3132,10 @@ mod tests {
         );
         assert_eq!(
             prepared
-                .dependency_spec
-                .as_ref()
+                .dependency_spec()
                 .expect("broad read should derive dependency spec")
                 .precision,
-            crate::sql::common::dependency_spec::DependencyPrecision::Conservative
+            DependencyPrecision::Conservative
         );
         let lowered_sql = prepared
             .debug_trace
@@ -3679,7 +3169,7 @@ mod tests {
         .expect("group-by/having public read should not error")
         .expect("group-by/having public read should prepare through public lowering");
 
-        assert!(prepared.optimization.is_none());
+        assert!(prepared.structured_read().is_none());
         assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_state"]);
         let lowered_sql = prepared
             .debug_trace

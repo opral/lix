@@ -2,7 +2,7 @@ use crate::filesystem::runtime::{merge_filesystem_transaction_state, FilesystemT
 use crate::sql::catalog::{
     DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, SurfaceVariant,
 };
-use crate::sql::binder::contracts::{BoundStatement, ExecutionContext};
+use crate::sql::semantic_ir::{BoundStatement, ExecutionContext};
 use crate::Value;
 use sqlparser::ast::{
     Expr, GroupByExpr, Join, LimitClause, OrderBy, Query, Select, SelectItem, SetExpr, Statement,

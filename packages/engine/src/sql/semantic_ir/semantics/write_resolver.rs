@@ -17,11 +17,7 @@ use crate::sql::semantic_ir::semantics::state_assignments::StateAssignmentsError
 use crate::sql::semantic_ir::semantics::surface_semantics::{
     public_selector_column_name, public_selector_version_column, OverlayLane,
 };
-use crate::sql::executor::public_runtime::try_prepare_public_read_with_registry_and_internal_access;
-use crate::sql::services::pending_reads::{
-    bootstrap_public_surface_registry_with_pending_transaction_view,
-    execute_prepared_public_read_with_pending_transaction_view,
-};
+use crate::sql::services::public_reads::execute_public_query_with_optional_pending_transaction_view;
 use crate::sql::services::state_reader::{
     load_exact_live_row, load_version_ref, LiveStorageLane,
 };
@@ -37,7 +33,7 @@ use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     BinaryOperator, Expr, GroupByExpr, Ident, ObjectName, ObjectNamePart, Query, Select,
-    SelectFlavor, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value as SqlValue,
+    SelectFlavor, SelectItem, SetExpr, TableFactor, TableWithJoins, Value as SqlValue,
     ValueWithSpan,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -1214,31 +1210,15 @@ pub(super) async fn execute_public_selector_query_strict(
     pending_transaction_view: Option<&PendingTransactionView>,
     query: Query,
 ) -> Result<QueryResult, LixError> {
-    if pending_transaction_view.is_none() {
-        return crate::sql::executor::public_runtime::execute_public_read_query_strict(
-            backend,
-            query,
-            &planned_write.command.bound_parameters,
-        )
-        .await;
-    }
-
-    let registry = bootstrap_public_surface_registry_with_pending_transaction_view(
-        backend,
-        pending_transaction_view,
-    )
-    .await?;
     let active_version_id = planned_write
         .command
         .execution_context
         .requested_version_id
         .as_deref()
         .unwrap_or(GLOBAL_VERSION_ID);
-    let statement = Statement::Query(Box::new(query));
-    let prepared = try_prepare_public_read_with_registry_and_internal_access(
+    execute_public_query_with_optional_pending_transaction_view(
         backend,
-        &registry,
-        &[statement],
+        query,
         &planned_write.command.bound_parameters,
         active_version_id,
         planned_write
@@ -1246,19 +1226,7 @@ pub(super) async fn execute_public_selector_query_strict(
             .execution_context
             .writer_key
             .as_deref(),
-        false,
-    )
-    .await?;
-    let Some(public_read) = prepared else {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "public write selector resolver expected a public read plan",
-        ));
-    };
-    execute_prepared_public_read_with_pending_transaction_view(
-        backend,
         pending_transaction_view,
-        &public_read,
     )
     .await
 }
