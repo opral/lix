@@ -10,39 +10,39 @@ fn read_engine_source(relative: &str) -> String {
 
 #[test]
 fn sql_execution_uses_transaction_module_for_write_orchestration() {
-    let source = read_engine_source("sql/execution/execution_program.rs");
+    let source = read_engine_source("sql/executor/execution_program.rs");
     assert!(
         source.contains("use crate::transaction::{"),
         "execution_program.rs should import transaction-owned write orchestration"
     );
     assert!(
-        !source.contains("sql::execution::write_txn_plan"),
+        !source.contains("sql::executor::write_txn_plan"),
         "execution_program.rs should not import SQL-owned write txn plan code"
     );
     assert!(
-        !source.contains("sql::execution::write_txn_runner"),
+        !source.contains("sql::executor::write_txn_runner"),
         "execution_program.rs should not import SQL-owned write txn runner code"
     );
 }
 
 #[test]
 fn sql_execution_module_no_longer_owns_write_txn_modules() {
-    let source = read_engine_source("sql/execution/mod.rs");
+    let source = read_engine_source("sql/executor/mod.rs");
     assert!(
         !source.contains("mod write_txn_plan"),
-        "sql/execution/mod.rs should not compile a SQL-owned write txn plan module"
+        "sql/executor/mod.rs should not compile a SQL-owned write txn plan module"
     );
     assert!(
         !source.contains("mod write_txn_runner"),
-        "sql/execution/mod.rs should not compile a SQL-owned write txn runner module"
+        "sql/executor/mod.rs should not compile a SQL-owned write txn runner module"
     );
     assert!(
         !source.contains("mod transaction_exec"),
-        "sql/execution/mod.rs should not compile the removed raw transaction orchestration module"
+        "sql/executor/mod.rs should not compile the removed raw transaction orchestration module"
     );
     assert!(
         !PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src/sql/execution/transaction_exec.rs")
+            .join("src/sql/executor/transaction_exec.rs")
             .exists(),
         "transaction_exec.rs should be deleted once transaction orchestration lives under transaction/"
     );
@@ -183,7 +183,7 @@ fn session_owns_runtime_context_state_and_construction() {
 
 #[test]
 fn sql_execution_program_requires_caller_owned_write_transaction() {
-    let source = read_engine_source("sql/execution/execution_program.rs");
+    let source = read_engine_source("sql/executor/execution_program.rs");
     assert!(
         source.contains("execute_execution_program_with_write_transaction"),
         "execution_program.rs should expose a caller-owned write-transaction entrypoint"
@@ -204,13 +204,13 @@ fn sql_execution_program_requires_caller_owned_write_transaction() {
     let session_source = read_engine_source("session/mod.rs");
     assert!(
         session_source.contains("execute_execution_program_with_write_transaction"),
-        "session/mod.rs should own the runtime execution choreography above sql/execution"
+        "session/mod.rs should own the runtime execution choreography above sql/executor"
     );
 }
 
 #[test]
 fn execution_context_no_longer_owns_buffered_write_state() {
-    let source = read_engine_source("sql/execution/execution_program.rs");
+    let source = read_engine_source("sql/executor/execution_program.rs");
     let context_struct_region = source
         .split("impl ExecutionContext")
         .next()
@@ -243,7 +243,7 @@ fn execution_context_no_longer_owns_buffered_write_state() {
 
 #[test]
 fn execution_program_is_a_thin_client_for_adapter_runtime() {
-    let source = read_engine_source("sql/execution/execution_program.rs");
+    let source = read_engine_source("sql/executor/execution_program.rs");
     for needle in [
         "struct CompiledExecution",
         "enum CompiledExecutionBody",
@@ -258,18 +258,18 @@ fn execution_program_is_a_thin_client_for_adapter_runtime() {
         );
     }
 
-    let compiled_source = read_engine_source("sql/execution/compiled.rs");
+    let compiled_source = read_engine_source("sql/executor/compiled.rs");
     assert!(
         compiled_source.contains("struct CompiledExecution"),
-        "sql/execution/compiled.rs should own neutral compiled execution types"
+        "sql/executor/compiled.rs should own neutral compiled execution types"
     );
     assert!(
         compiled_source.contains("enum CompiledExecutionBody"),
-        "sql/execution/compiled.rs should own the compiled execution body split"
+        "sql/executor/compiled.rs should own the compiled execution body split"
     );
     assert!(
         !compiled_source.contains("crate::transaction::"),
-        "sql/execution/compiled.rs should not depend on transaction-owned contracts"
+        "sql/executor/compiled.rs should not depend on transaction-owned contracts"
     );
 
     let adapter_source = read_engine_source("transaction/sql_adapter/runtime.rs");
@@ -284,14 +284,14 @@ fn execution_program_is_a_thin_client_for_adapter_runtime() {
 
     let adapter_mod_source = read_engine_source("transaction/sql_adapter/mod.rs");
     assert!(
-        !adapter_mod_source.contains("pub(crate) use crate::sql::execution::compiled::"),
+        !adapter_mod_source.contains("pub(crate) use crate::sql::executor::compiled::"),
         "transaction/sql_adapter/mod.rs should not re-export the neutral compiled execution model"
     );
 }
 
 #[test]
 fn pending_transaction_view_is_transaction_owned() {
-    let shared_path_source = read_engine_source("sql/execution/shared_path.rs");
+    let shared_path_source = read_engine_source("sql/executor/shared_path.rs");
     assert!(
         !shared_path_source.contains("struct PendingTransactionView"),
         "shared_path.rs should not define PendingTransactionView once transaction owns pending visibility"
@@ -372,7 +372,7 @@ fn init_and_plugin_paths_use_transaction_owned_write_entrypoints() {
 #[test]
 fn internal_vtable_runtime_no_longer_uses_legacy_parallel_contracts() {
     let planned_statement_source =
-        read_engine_source("sql/execution/contracts/planned_statement.rs");
+        read_engine_source("sql/executor/contracts/planned_statement.rs");
     assert!(
         !planned_statement_source.contains("InternalStatePlan"),
         "planned_statement.rs should not carry InternalStatePlan"

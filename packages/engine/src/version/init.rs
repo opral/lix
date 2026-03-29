@@ -3,7 +3,7 @@ use crate::init::seed::{
     normalized_seed_values, quote_ident,
 };
 use crate::init::InitExecutor;
-use crate::sql_support::text::escape_sql_string;
+use crate::sql::common::text::escape_sql_string;
 use crate::Value;
 use crate::{LixBackend, LixError};
 

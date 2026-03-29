@@ -14,17 +14,17 @@ pub(crate) use crate::filesystem::runtime::{
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
     FilesystemTransactionFileState, FilesystemTransactionState,
 };
-pub(crate) use crate::sql::execution::contracts::effects::{
+pub(crate) use crate::sql::executor::contracts::effects::{
     FilesystemPayloadDomainChange, PlanEffects,
 };
-pub(crate) use crate::sql::execution::contracts::planned_statement::MutationRow;
-pub(crate) use crate::sql::execution::contracts::result_contract::ResultContract;
-pub(crate) use crate::sql::execution::execution_program::ExecutionContext;
-pub(crate) use crate::sql::public::planner::ir::{
+pub(crate) use crate::sql::executor::contracts::planned_statement::MutationRow;
+pub(crate) use crate::sql::executor::contracts::result_contract::ResultContract;
+pub(crate) use crate::sql::executor::execution_program::ExecutionContext;
+pub(crate) use crate::sql::logical_plan::public_ir::{
     OptionalTextPatch, PlannedStateRow, WriteLane, WriteMode,
 };
-pub(crate) use crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch;
-pub(crate) use crate::sql::public::runtime::{
+pub(crate) use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
+pub(crate) use crate::sql::executor::public_runtime::{
     build_tracked_txn_unit, semantic_plan_effects_from_domain_changes,
     state_commit_stream_operation, PreparedPublicWrite, PublicWriteExecutionPartition,
     TrackedTxnUnit, UntrackedWriteExecution,

@@ -1,11 +1,11 @@
 use crate::engine::{
     normalize_sql_execution_error_with_backend, Engine, TransactionBackendAdapter,
 };
-use crate::sql::execution::execution_program::{
+use crate::sql::executor::execution_program::{
     BoundStatementTemplateInstance, ExecutionContext, StatementTemplate, StatementTemplateCacheKey,
 };
-use crate::sql::execution::parse::parse_sql;
-use crate::sql::execution::shared_path::{
+use crate::sql::parser::parse_sql;
+use crate::sql::executor::shared_path::{
     self, prepared_execution_mutates_public_surface_registry,
 };
 use crate::transaction::PendingTransactionView;

@@ -4,7 +4,7 @@ use crate::init::seed::{
 };
 use crate::init::InitExecutor;
 use crate::live_state::schema_access::tracked_relation_name;
-use crate::sql_support::text::escape_sql_string;
+use crate::sql::common::text::escape_sql_string;
 use crate::{LixBackend, LixError};
 
 pub(crate) async fn init(_backend: &dyn LixBackend) -> Result<(), LixError> {

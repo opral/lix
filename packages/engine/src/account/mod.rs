@@ -3,16 +3,13 @@ mod init;
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
-use crate::schema::builtin::types::{LixAccount, LixActiveAccount};
-use crate::schema::builtin::{
-    builtin_schema_definition, builtin_schema_json, decode_lixcol_literal,
-};
+use crate::schema::builtin::types::LixAccount;
+use crate::schema::builtin::{builtin_schema_definition, builtin_schema_json, decode_lixcol_literal};
 use crate::version::GLOBAL_VERSION_ID;
 pub(crate) use init::{init, seed_bootstrap};
 pub(crate) const ACCOUNT_STORAGE_VERSION_ID: &str = "global";
 
 static ACCOUNT_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
-static ACTIVE_ACCOUNT_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
 
 struct SchemaMetadata {
     schema_key: String,
@@ -60,51 +57,8 @@ pub(crate) fn account_snapshot_content(id: &str, name: &str) -> String {
     .expect("lix_account snapshot serialization must succeed")
 }
 
-#[allow(dead_code)]
-pub(crate) fn active_account_schema_definition() -> &'static JsonValue {
-    builtin_schema_definition("lix_active_account")
-        .expect("builtin schema 'lix_active_account' must exist")
-}
-
-#[allow(dead_code)]
-pub(crate) fn active_account_schema_definition_json() -> &'static str {
-    builtin_schema_json("lix_active_account")
-        .expect("builtin schema 'lix_active_account' must exist")
-}
-
-pub(crate) fn active_account_schema_key() -> &'static str {
-    &active_account_schema_metadata().schema_key
-}
-
-pub(crate) fn active_account_schema_version() -> &'static str {
-    &active_account_schema_metadata().schema_version
-}
-
-pub(crate) fn active_account_file_id() -> &'static str {
-    &active_account_schema_metadata().file_id
-}
-
-pub(crate) fn active_account_plugin_key() -> &'static str {
-    &active_account_schema_metadata().plugin_key
-}
-
-pub(crate) fn active_account_storage_version_id() -> &'static str {
-    &active_account_schema_metadata().storage_version_id
-}
-
-pub(crate) fn active_account_snapshot_content(account_id: &str) -> String {
-    serde_json::to_string(&LixActiveAccount {
-        account_id: account_id.to_string(),
-    })
-    .expect("lix_active_account snapshot serialization must succeed")
-}
-
 fn account_schema_metadata() -> &'static SchemaMetadata {
     ACCOUNT_SCHEMA_METADATA.get_or_init(|| parse_schema_metadata("lix_account"))
-}
-
-fn active_account_schema_metadata() -> &'static SchemaMetadata {
-    ACTIVE_ACCOUNT_SCHEMA_METADATA.get_or_init(|| parse_schema_metadata("lix_active_account"))
 }
 
 fn parse_schema_metadata(schema_key: &str) -> SchemaMetadata {

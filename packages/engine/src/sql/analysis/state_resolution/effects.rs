@@ -2,9 +2,9 @@ use crate::engine::direct_state_file_cache_refresh_targets;
 use crate::session::contracts::SessionStateDelta;
 use crate::state::stream::state_commit_stream_changes_from_mutations;
 
-use crate::sql::execution::contracts::effects::PlanEffects;
-use crate::sql::execution::contracts::planned_statement::PlannedStatementSet;
-use crate::sql::execution::contracts::planner_error::PlannerError;
+use crate::sql::executor::contracts::effects::PlanEffects;
+use crate::sql::executor::contracts::planned_statement::PlannedStatementSet;
+use crate::sql::executor::contracts::planner_error::PlannerError;
 
 pub(crate) fn derive_effects_from_state_resolution(
     preprocess: &PlannedStatementSet,
@@ -29,7 +29,7 @@ pub(crate) fn derive_effects_from_state_resolution(
 mod tests {
     use super::derive_effects_from_state_resolution;
     use crate::backend::prepared::PreparedStatement;
-    use crate::sql::execution::contracts::planned_statement::{
+    use crate::sql::executor::contracts::planned_statement::{
         MutationOperation, MutationRow, PlannedStatementSet, UpdateValidationPlan,
     };
     use serde_json::json;

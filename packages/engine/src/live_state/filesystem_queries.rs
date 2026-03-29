@@ -6,7 +6,7 @@ use crate::filesystem::path::{compose_directory_path, NormalizedDirectoryPath, P
 use crate::filesystem::runtime::FilesystemTransactionFileState;
 use crate::live_state::schema_access::tracked_relation_name;
 use crate::sql::common::ast::{lower_statement, parse_sql_statements};
-use crate::sql_support::text::escape_sql_string;
+use crate::sql::common::text::escape_sql_string;
 use crate::transaction::PendingTransactionView;
 use crate::transaction::{PendingSemanticRow, PendingSemanticStorage};
 use crate::version::GLOBAL_VERSION_ID;

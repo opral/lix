@@ -10,7 +10,7 @@ use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
 use crate::plugin::types::PluginManifest;
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
-use crate::sql::execution::execution_program::ExecutionContext;
+use crate::sql::executor::execution_program::ExecutionContext;
 use crate::transaction::{execute_with_options_in_write_transaction, WriteTransaction};
 use crate::{ExecuteOptions, LixError, Session, Value};
 

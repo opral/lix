@@ -1,5 +1,5 @@
-use crate::sql::execution::contracts::requirements::PlanRequirements;
-use crate::sql::execution::runtime_state::derive_execution_runtime_effects;
+use crate::sql::executor::contracts::requirements::PlanRequirements;
+use crate::sql::executor::runtime_state::derive_execution_runtime_effects;
 use sqlparser::ast::Statement;
 
 use super::canonical::canonicalize_state_resolution;

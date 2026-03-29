@@ -3,15 +3,15 @@ use crate::engine::{
 };
 use crate::read::contracts::committed_read_mode_from_prepared_public_read;
 use crate::session::contracts::SessionExecutionMode;
-use crate::sql::execution::compiled::{CompiledExecution, CompiledExecutionBody};
-use crate::sql::execution::contracts::result_contract::ResultContract;
-use crate::sql::execution::execute_prepared::execute_prepared_with_transaction;
-use crate::sql::execution::execution_program::{
+use crate::sql::executor::compiled::{CompiledExecution, CompiledExecutionBody};
+use crate::sql::executor::contracts::result_contract::ResultContract;
+use crate::sql::executor::execute_prepared::execute_prepared_with_transaction;
+use crate::sql::executor::execution_program::{
     BoundStatementTemplateInstance, ExecutionContext, ExecutionProgram,
 };
-use crate::sql::execution::runtime_state::ExecutionRuntimeState;
-use crate::sql::execution::shared_path::{self, PreparationPolicy};
-use crate::sql::public::runtime::execute_prepared_public_read;
+use crate::sql::executor::runtime_state::ExecutionRuntimeState;
+use crate::sql::executor::shared_path::{self, PreparationPolicy};
+use crate::sql::executor::public_runtime::execute_prepared_public_read;
 use crate::{
     ExecuteResult, LixBackend, LixBackendTransaction, LixError, QueryResult, TransactionMode,
 };

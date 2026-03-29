@@ -5,7 +5,7 @@ pub(crate) mod script;
 use crate::cel::CelEvaluator;
 use crate::functions::LixFunctionProvider;
 use crate::functions::SharedFunctionProvider;
-use crate::sql::execution::contracts::planned_statement::PlannedStatementSet;
+use crate::sql::executor::contracts::planned_statement::PlannedStatementSet;
 use crate::sql::internal::inline_functions::inline_lix_functions_with_provider;
 use crate::sql::internal::param_context::normalize_statement_placeholders_in_batch;
 use crate::{LixBackend, LixError, SqlDialect, Value};
@@ -14,13 +14,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::sql::ast::lowering::lower_statement;
-pub(crate) use crate::sql_support::binding::PlaceholderState;
+pub(crate) use crate::sql::parser::placeholders::PlaceholderState;
 use serde_json::Value as JsonValue;
 pub(crate) type SchemaLiveTableRequirement =
-    crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
-pub(crate) type MutationRow = crate::sql::execution::contracts::planned_statement::MutationRow;
+    crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
+pub(crate) type MutationRow = crate::sql::executor::contracts::planned_statement::MutationRow;
 pub(crate) type UpdateValidationPlan =
-    crate::sql::execution::contracts::planned_statement::UpdateValidationPlan;
+    crate::sql::executor::contracts::planned_statement::UpdateValidationPlan;
 pub(crate) type PreparedStatement = crate::backend::prepared::PreparedStatement;
 
 #[derive(Debug, Clone)]
@@ -271,7 +271,7 @@ fn render_statements_with_params(
                 statement,
                 appended_params,
             } => {
-                let bound = crate::sql_support::binding::bind_sql_with_state_and_appended_params(
+                let bound = crate::sql::binder::bind_sql_with_state_and_appended_params(
                     &statement.to_string(),
                     base_params,
                     appended_params.as_slice(),

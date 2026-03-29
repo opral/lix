@@ -4,7 +4,7 @@ use crate::canonical::readers::load_commit_lineage_entry_by_id;
 use crate::init::seed::text_value;
 use crate::init::tables::execute_init_statements;
 use crate::init::InitExecutor;
-use crate::sql_support::text::escape_sql_string;
+use crate::sql::common::text::escape_sql_string;
 use crate::Value;
 use crate::{LixBackend, LixError};
 

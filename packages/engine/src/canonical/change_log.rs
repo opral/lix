@@ -1,6 +1,6 @@
 use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::functions::LixFunctionProvider;
-use crate::sql_support::binding::bind_sql;
+use crate::sql::binder::bind_sql;
 use crate::{LixError, SqlDialect, Value};
 
 use super::types::CanonicalCommitOutput;

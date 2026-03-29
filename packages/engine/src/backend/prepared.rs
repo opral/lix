@@ -1,6 +1,6 @@
-use crate::sql_support::binding::{
-    bind_sql, parse_sql_statements, resolve_placeholder_index, PlaceholderState,
-};
+use crate::sql::binder::bind_sql;
+use crate::sql::parser::parse_sql_statements;
+use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::{Expr, Value as SqlValue, VisitMut, VisitorMut};
 use sqlparser::dialect::GenericDialect;

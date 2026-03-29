@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value as JsonValue;
 
 use crate::backend::prepared::{PreparedBatch, PreparedStatement};
-use crate::sql_support::binding::bind_sql;
+use crate::sql::binder::bind_sql;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::Value as EngineValue;
 use crate::{LixError, SqlDialect};

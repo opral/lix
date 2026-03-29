@@ -1,5 +1,5 @@
 use crate::change_view::TrackedDomainChangeView;
-use crate::sql::execution::contracts::planned_statement::{MutationOperation, MutationRow};
+use crate::sql::executor::contracts::planned_statement::{MutationOperation, MutationRow};
 use crate::{LixError, Value};
 use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
@@ -544,7 +544,7 @@ pub(crate) fn state_commit_stream_changes_from_domain_changes<Change: TrackedDom
 }
 
 pub(crate) fn state_commit_stream_changes_from_planned_rows(
-    rows: &[crate::sql::public::planner::ir::PlannedStateRow],
+    rows: &[crate::sql::logical_plan::public_ir::PlannedStateRow],
     operation: StateCommitStreamOperation,
     untracked: bool,
     writer_key: Option<&str>,
@@ -586,7 +586,7 @@ pub(crate) fn state_commit_stream_changes_from_planned_rows(
 }
 
 fn planned_row_required_text(
-    row: &crate::sql::public::planner::ir::PlannedStateRow,
+    row: &crate::sql::logical_plan::public_ir::PlannedStateRow,
     key: &str,
 ) -> Result<String, LixError> {
     planned_row_optional_text(row, key).ok_or_else(|| LixError {
@@ -596,7 +596,7 @@ fn planned_row_required_text(
 }
 
 fn planned_row_optional_text(
-    row: &crate::sql::public::planner::ir::PlannedStateRow,
+    row: &crate::sql::logical_plan::public_ir::PlannedStateRow,
     key: &str,
 ) -> Option<String> {
     match row.values.get(key) {
@@ -607,7 +607,7 @@ fn planned_row_optional_text(
 }
 
 fn planned_row_snapshot_content(
-    row: &crate::sql::public::planner::ir::PlannedStateRow,
+    row: &crate::sql::logical_plan::public_ir::PlannedStateRow,
 ) -> Result<Option<JsonValue>, LixError> {
     match row.values.get("snapshot_content") {
         None | Some(Value::Null) => Ok(None),
@@ -643,7 +643,7 @@ mod tests {
         state_commit_stream_changes_from_planned_rows, StateCommitStreamOperation,
     };
     use crate::canonical::ProposedDomainChange;
-    use crate::sql::public::planner::ir::PlannedStateRow;
+    use crate::sql::logical_plan::public_ir::PlannedStateRow;
     use crate::Value;
     use std::collections::BTreeMap;
 

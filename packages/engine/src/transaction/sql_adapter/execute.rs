@@ -3,12 +3,12 @@ use sqlparser::ast::Statement;
 
 use crate::canonical::pending_session::PendingPublicCommitSession;
 use crate::engine::{DeferredTransactionSideEffects, Engine};
-use crate::sql::execution::execution_program::{
+use crate::sql::executor::execution_program::{
     execute_execution_program_with_borrowed_write_transaction,
     execute_execution_program_with_write_transaction, BoundStatementTemplateInstance,
     ExecutionContext, ExecutionProgram,
 };
-use crate::sql::execution::runtime_state::ExecutionRuntimeState;
+use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::transaction::PendingTransactionView;
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 

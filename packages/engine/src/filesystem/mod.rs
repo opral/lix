@@ -1,5 +1,5 @@
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::sql_support::binding::insert_values_rows_mut;
+use crate::sql::binder::insert_values_rows_mut;
 use crate::LixError;
 use sqlparser::ast::{
     Expr, ObjectName, ObjectNamePart, Statement, TableObject, Value as AstValue, ValueWithSpan,
