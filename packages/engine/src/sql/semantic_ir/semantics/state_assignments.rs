@@ -60,12 +60,14 @@ pub(crate) fn build_state_insert_row(
     schema_key: String,
     version_id: Option<String>,
     values: BTreeMap<String, Value>,
+    writer_key: Option<String>,
 ) -> PlannedStateRow {
     PlannedStateRow {
         entity_id,
         schema_key,
         version_id,
         values,
+        writer_key,
         tombstone: false,
     }
 }
@@ -154,6 +156,7 @@ where
             semantics.schema_key.to_string(),
             version_id,
             values,
+            None,
         ));
     }
     Ok(rows)

@@ -32,5 +32,6 @@ pub(crate) use sql_adapter::{
 };
 pub(crate) use write_plan::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
-    PendingSemanticRow, PendingSemanticStorage, PlannedWriteDelta,
+    PendingSemanticRow, PendingSemanticStorage, PendingWorkspaceWriterKeyOverlay,
+    PlannedWriteDelta,
 };

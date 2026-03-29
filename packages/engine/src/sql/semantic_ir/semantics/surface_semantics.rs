@@ -33,6 +33,7 @@ pub(crate) fn public_selector_column_name(
             "global" => Some("global".to_string()),
             "untracked" => Some("untracked".to_string()),
             "metadata" => Some("metadata".to_string()),
+            "writer_key" => Some("writer_key".to_string()),
             _ => None,
         },
         SurfaceFamily::Entity => match canonical_column {
@@ -45,6 +46,7 @@ pub(crate) fn public_selector_column_name(
             "global" => Some("lixcol_global".to_string()),
             "untracked" => Some("lixcol_untracked".to_string()),
             "metadata" => Some("lixcol_metadata".to_string()),
+            "writer_key" => Some("lixcol_writer_key".to_string()),
             _ => Some(canonical_column.to_string()),
         },
         SurfaceFamily::Filesystem => match canonical_column {
@@ -61,6 +63,7 @@ pub(crate) fn public_selector_column_name(
             "global" => Some("lixcol_global".to_string()),
             "untracked" => Some("lixcol_untracked".to_string()),
             "metadata" => Some("lixcol_metadata".to_string()),
+            "writer_key" => Some("lixcol_writer_key".to_string()),
             _ => None,
         },
         SurfaceFamily::Admin => match canonical_column {

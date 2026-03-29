@@ -84,7 +84,10 @@ pub(crate) fn build_domain_change_batch(
     resolved
         .partitions
         .iter()
-        .filter(|partition| partition.execution_mode == WriteMode::Tracked)
+        .filter(|partition| {
+            partition.execution_mode == WriteMode::Tracked
+                && !partition.intended_post_state.is_empty()
+        })
         .map(|partition| build_domain_change_batch_for_partition(planned_write, partition))
         .collect()
 }
@@ -101,11 +104,15 @@ pub(crate) async fn derive_commit_preconditions(
                 .to_string(),
         })?;
     let mut preconditions = Vec::new();
-    for (partition_index, partition) in resolved
-        .partitions
-        .iter()
-        .enumerate()
-        .filter(|(_, partition)| partition.execution_mode == WriteMode::Tracked)
+    for (partition_index, partition) in
+        resolved
+            .partitions
+            .iter()
+            .enumerate()
+            .filter(|(_, partition)| {
+                partition.execution_mode == WriteMode::Tracked
+                    && !partition.intended_post_state.is_empty()
+            })
     {
         let write_lane = partition
             .target_write_lane
@@ -150,14 +157,7 @@ fn build_domain_change_batch_for_partition(
             .version_id
             .clone()
             .unwrap_or_else(|| "active".to_string());
-        let writer_key = resolved_row_writer_key(
-            row,
-            planned_write
-                .command
-                .execution_context
-                .writer_key
-                .as_deref(),
-        );
+        let writer_key = resolved_row_writer_key(row);
         let operation_key = if row.tombstone {
             "state.delete"
         } else {
@@ -242,7 +242,6 @@ fn build_idempotency_key(
         "operation": format!("{:?}", planned_write.command.operation_kind),
         "partition_index": partition_index,
         "lane": format!("{:?}", write_lane),
-        "writer_key": planned_write.command.execution_context.writer_key,
         "payload": summarize_mutation_payload(&planned_write.command.payload),
         "resolved_rows": summarize_partition_rows(partition),
     });
@@ -381,16 +380,8 @@ where
     })
 }
 
-fn resolved_row_writer_key(
-    row: &PlannedStateRow,
-    execution_writer_key: Option<&str>,
-) -> Option<String> {
-    match row.values.get("writer_key") {
-        Some(crate::Value::Text(value)) => Some(value.clone()),
-        Some(crate::Value::Null) => None,
-        Some(_) => None,
-        None => execution_writer_key.map(str::to_string),
-    }
+fn resolved_row_writer_key(row: &PlannedStateRow) -> Option<String> {
+    row.writer_key.clone()
 }
 
 #[cfg(test)]
@@ -494,6 +485,7 @@ mod tests {
                     assert_eq!(batches.changes.len(), 1);
                     assert_eq!(batches.semantic_effects.len(), 1);
                     assert_eq!(batches.writer_key.as_deref(), Some("writer-a"));
+                    assert_eq!(batches.changes[0].writer_key.as_deref(), Some("writer-a"));
                     assert_eq!(batches.changes[0].schema_version.as_deref(), Some("1"));
                     assert_eq!(batches.changes[0].file_id.as_deref(), Some("lix"));
                     assert_eq!(batches.changes[0].plugin_key.as_deref(), Some("lix"));

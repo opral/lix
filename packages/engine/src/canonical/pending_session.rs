@@ -129,11 +129,14 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
     changes: &[ProposedDomainChange],
     binary_blob_writes: &[BinaryBlobWrite],
     active_account_ids: &[String],
+    writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
     timestamp: &str,
 ) -> Result<CanonicalCommitReceipt, LixError> {
-    let projection_writer_key_hints =
-        crate::live_state::projection::tracked_writer_key_hints_from_domain_changes(changes);
+    let tracked_writer_key_annotations =
+        crate::workspace::writer_key::tracked_writer_key_annotations_from_changes(
+            changes, writer_key,
+        );
     let domain_changes = changes
         .iter()
         .map(|change| {
@@ -252,7 +255,7 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
         rewritten,
         binary_blob_writes,
         functions,
-        &projection_writer_key_hints,
+        &tracked_writer_key_annotations,
     )
     .await
 }
@@ -353,7 +356,7 @@ async fn execute_generated_commit_result(
     result: GenerateCommitResult,
     binary_blob_writes: &[BinaryBlobWrite],
     functions: &mut dyn LixFunctionProvider,
-    projection_writer_key_hints: &std::collections::BTreeMap<
+    tracked_writer_key_annotations: &std::collections::BTreeMap<
         crate::live_state::shared::identity::RowIdentity,
         Option<String>,
     >,
@@ -387,10 +390,16 @@ async fn execute_generated_commit_result(
     program.push_batch(prepared);
     execute_write_program_with_transaction(transaction, program).await?;
     let receipt = canonical_commit_receipt_from_generated_result(&result, next_change_ordinal)?;
+    let mut executor = &mut *transaction;
+    crate::workspace::writer_key::apply_workspace_writer_key_annotations_with_executor(
+        &mut executor,
+        tracked_writer_key_annotations,
+    )
+    .await?;
     crate::live_state::projection::apply_commit_projections_best_effort_in_transaction(
         transaction,
         &receipt,
-        projection_writer_key_hints,
+        tracked_writer_key_annotations,
     )
     .await?;
     Ok(receipt)

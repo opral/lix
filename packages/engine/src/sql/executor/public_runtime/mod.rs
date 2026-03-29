@@ -48,7 +48,7 @@ use crate::sql::semantic_ir::{
 };
 use crate::state::stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
-    StateCommitStreamOperation,
+    StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
 };
 use crate::transaction::PendingTransactionView;
 use crate::version::{
@@ -1360,6 +1360,9 @@ fn build_public_write_execution(
     let mut filesystem_payloads_persisted = false;
 
     for partition in &resolved.partitions {
+        if partition.intended_post_state.is_empty() {
+            continue;
+        }
         let persist_filesystem_payloads_before_write = !filesystem_payloads_persisted
             && public_write_persists_filesystem_payloads(planned_write, partition);
         filesystem_payloads_persisted |= persist_filesystem_payloads_before_write;
@@ -1385,6 +1388,7 @@ fn build_public_write_execution(
                         semantic_effects: semantic_plan_effects_from_domain_changes(
                             &domain_change_batch.changes,
                             state_commit_stream_operation(planned_write.command.operation_kind),
+                            domain_change_batch.writer_key.as_deref(),
                         )?,
                         domain_change_batch: Some(domain_change_batch),
                     },
@@ -1602,11 +1606,13 @@ fn semantic_plan_effects_from_untracked_public_write(
             intended_post_state,
             state_commit_stream_operation(planned_write.command.operation_kind),
             true,
-            planned_write
-                .command
-                .execution_context
-                .writer_key
-                .as_deref(),
+            StateCommitStreamRuntimeMetadata::from_runtime_writer_key(
+                planned_write
+                    .command
+                    .execution_context
+                    .writer_key
+                    .as_deref(),
+            ),
         )?,
         ..PlanEffects::default()
     };
@@ -1628,11 +1634,13 @@ fn semantic_plan_effects_from_untracked_public_write(
 pub(crate) fn semantic_plan_effects_from_domain_changes<Change: TrackedDomainChangeView>(
     changes: &[Change],
     stream_operation: StateCommitStreamOperation,
+    writer_key: Option<&str>,
 ) -> Result<PlanEffects, LixError> {
     Ok(PlanEffects {
         state_commit_stream_changes: state_commit_stream_changes_from_domain_changes(
             changes,
             stream_operation,
+            StateCommitStreamRuntimeMetadata::from_runtime_writer_key(writer_key),
         )?,
         session_delta: SessionStateDelta {
             next_active_version_id: next_active_version_id_from_domain_changes(changes)?,

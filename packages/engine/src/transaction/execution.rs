@@ -359,7 +359,9 @@ impl<'tx> BorrowedWriteTransaction<'tx> {
 mod tests {
     use async_trait::async_trait;
     use std::cell::Cell;
+    use std::collections::{BTreeMap, BTreeSet};
 
+    use crate::live_state::shared::identity::RowIdentity;
     use crate::live_state::tracked::{
         BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedReadView, TrackedRow,
         TrackedScanRequest, TrackedTombstoneMarker, TrackedTombstoneView, TrackedWriteOperation,
@@ -370,6 +372,7 @@ mod tests {
         UntrackedScanRequest, UntrackedWriteOperation, UntrackedWriteRow,
     };
     use crate::transaction::live_state_write_state::prepare_materialization_plan;
+    use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
 
     use super::*;
 
@@ -384,6 +387,7 @@ mod tests {
     }
 
     struct EmptyTombstones;
+    struct EmptyWorkspaceWriterKeys;
 
     #[async_trait(?Send)]
     impl TrackedReadView for CountingTrackedView {
@@ -452,13 +456,35 @@ mod tests {
         }
     }
 
+    #[async_trait(?Send)]
+    impl WorkspaceWriterKeyReadView for EmptyWorkspaceWriterKeys {
+        async fn load_annotation(
+            &self,
+            _row_identity: &RowIdentity,
+        ) -> Result<Option<String>, LixError> {
+            Ok(None)
+        }
+
+        async fn load_annotations(
+            &self,
+            row_identities: &BTreeSet<RowIdentity>,
+        ) -> Result<BTreeMap<RowIdentity, Option<String>>, LixError> {
+            Ok(row_identities
+                .iter()
+                .cloned()
+                .map(|row_identity| (row_identity, None))
+                .collect())
+        }
+    }
+
     #[tokio::test]
     async fn prepare_materialization_plan_scans_each_partition_once() {
         let tracked = CountingTrackedView::default();
         let untracked = CountingUntrackedView::default();
         let tombstones = EmptyTombstones;
-        let read_context =
-            ReadContext::new(&tracked, &untracked).with_tracked_tombstones(&tombstones);
+        let writer_keys = EmptyWorkspaceWriterKeys;
+        let read_context = ReadContext::new(&tracked, &untracked, &writer_keys)
+            .with_tracked_tombstones(&tombstones);
         let mut journal = TransactionJournal::default();
         journal
             .stage(TransactionDelta {

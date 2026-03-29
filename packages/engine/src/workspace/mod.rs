@@ -3,20 +3,31 @@
 //! `workspace` owns mutable selectors that are distinct from canonical
 //! committed refs.
 //!
+//! Workspace annotation data such as `writer_key` also belongs here. It may be
+//! session-local or locally durable, but it is not a canonical change fact and
+//! semantic replay must not require it.
+//!
 //! Durable workspace state:
 //! - the persisted active workspace version id
 //! - the persisted active workspace account ids
+//! - workspace writer annotations keyed by `(version_id, schema_key, entity_id, file_id)`
 //!
 //! Session-local state:
 //! - in-memory `Session` overrides
 //! - transaction-local pending overlays that may be discarded without changing
 //!   committed truth
+//! - workspace annotation projected onto state-shaped reads
 //!
 //! None of these APIs own committed head semantics. Canonical refs remain the
-//! durable source for committed heads and roots.
+//! durable source for committed heads and roots. If a read surface exposes
+//! `writer_key`, it does so as workspace annotation data rather than
+//! canonical committed meaning.
 
+mod init;
 mod metadata;
+pub(crate) mod writer_key;
 
+pub(crate) use init::init;
 pub(crate) use metadata::{
     load_workspace_active_account_ids, persist_workspace_active_account_ids,
     persist_workspace_active_version_id, require_workspace_active_version_id,

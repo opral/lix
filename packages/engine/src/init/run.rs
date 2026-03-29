@@ -16,6 +16,7 @@ use crate::observe;
 use crate::schema;
 use crate::undo_redo;
 use crate::version;
+use crate::workspace;
 use crate::{LixError, TransactionMode};
 
 use super::tables::prepare_backend_for_init;
@@ -70,6 +71,9 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             account::init(&backend)
                 .await
                 .map_err(|error| init_step_error("account::init", error))?;
+            workspace::init(&backend)
+                .await
+                .map_err(|error| init_step_error("workspace::init", error))?;
         }
         {
             let backend = TransactionBackendAdapter::new(transaction.as_mut());

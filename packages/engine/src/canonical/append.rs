@@ -53,19 +53,27 @@ async fn append_tracked_unchecked(
     functions: &mut dyn LixFunctionProvider,
     invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
 ) -> Result<CreateCommitResult, LixError> {
-    let projection_writer_key_hints =
-        crate::live_state::projection::tracked_writer_key_hints_from_domain_changes(&args.changes);
+    let execution_writer_key = args.writer_key.clone();
     let result = create_commit(transaction, args, functions, invariant_checker)
         .await
         .map_err(create_commit_error_to_lix_error)?;
 
-    if let (Some(receipt), Some(_applied_output)) =
-        (result.receipt.as_ref(), result.applied_output.as_ref())
-    {
+    if let Some(receipt) = result.receipt.as_ref() {
+        let tracked_writer_key_annotations =
+            crate::workspace::writer_key::tracked_writer_key_annotations_from_changes(
+                &result.applied_domain_changes,
+                execution_writer_key.as_deref(),
+            );
+        let mut executor = &mut *transaction;
+        crate::workspace::writer_key::apply_workspace_writer_key_annotations_with_executor(
+            &mut executor,
+            &tracked_writer_key_annotations,
+        )
+        .await?;
         crate::live_state::projection::apply_commit_projections_best_effort_in_transaction(
             transaction,
             receipt,
-            &projection_writer_key_hints,
+            &tracked_writer_key_annotations,
         )
         .await?;
     }
@@ -108,6 +116,7 @@ pub(crate) async fn append_tracked_with_pending_public_session(
                 &args.changes,
                 &binary_blob_writes,
                 &args.active_account_ids,
+                args.writer_key.as_deref(),
                 functions,
                 &timestamp,
             )

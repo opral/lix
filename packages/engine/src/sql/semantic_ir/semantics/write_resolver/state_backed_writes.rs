@@ -220,7 +220,7 @@ fn authoritative_pre_state_row_for_effective_row(
     current_row: &ExactEffectiveStateRow,
     authoritative_version_id: &str,
 ) -> PlannedStateRow {
-    let mut values = current_row.values.clone();
+    let mut values = state_values_without_writer_key(&current_row.values);
     values.insert(
         "version_id".to_string(),
         Value::Text(authoritative_version_id.to_string()),
@@ -230,6 +230,10 @@ fn authoritative_pre_state_row_for_effective_row(
         schema_key: current_row.schema_key.clone(),
         version_id: Some(authoritative_version_id.to_string()),
         values,
+        writer_key: current_row
+            .values
+            .get("writer_key")
+            .and_then(text_from_value),
         tombstone: false,
     }
 }
@@ -326,20 +330,26 @@ impl StateBackedSurface<'_> {
                 schema,
                 functions,
             ),
-            Self::Entity(entity_schema) => build_entity_insert_rows_with_functions(
-                payload_maps(planned_write)?,
-                row_version_ids.to_vec(),
-                EntityInsertSemantics {
-                    schema: &entity_schema.annotations.schema,
-                    schema_key: &entity_schema.annotations.schema_key,
-                    schema_version: &entity_schema.annotations.schema_version,
-                    property_columns: &entity_schema.property_columns,
-                    primary_key_paths: &entity_schema.primary_key_paths,
-                    state_defaults: &entity_schema.annotations.state_defaults,
-                },
-                functions,
-            )
-            .map_err(write_resolve_state_assignments_error),
+            Self::Entity(entity_schema) => {
+                let mut rows = build_entity_insert_rows_with_functions(
+                    payload_maps(planned_write)?,
+                    row_version_ids.to_vec(),
+                    EntityInsertSemantics {
+                        schema: &entity_schema.annotations.schema,
+                        schema_key: &entity_schema.annotations.schema_key,
+                        schema_version: &entity_schema.annotations.schema_version,
+                        property_columns: &entity_schema.property_columns,
+                        primary_key_paths: &entity_schema.primary_key_paths,
+                        state_defaults: &entity_schema.annotations.state_defaults,
+                    },
+                    functions,
+                )
+                .map_err(write_resolve_state_assignments_error)?;
+                for row in &mut rows {
+                    row.writer_key = planned_write.command.execution_context.writer_key.clone();
+                }
+                Ok(rows)
+            }
         }
     }
 
@@ -353,12 +363,16 @@ impl StateBackedSurface<'_> {
 
     fn apply_update_assignments(
         self,
+        planned_write: &PlannedWrite,
         assignments: &CanonicalStateAssignments,
         current_row: &ExactEffectiveStateRow,
-    ) -> Result<BTreeMap<String, Value>, WriteResolveError> {
+    ) -> Result<(BTreeMap<String, Value>, Option<String>), WriteResolveError> {
         match self {
             Self::State(_) => {
-                let values = apply_state_assignments(&current_row.values, assignments);
+                let values = apply_state_assignments(
+                    &state_values_without_writer_key(&current_row.values),
+                    &state_assignments_without_writer_key(assignments),
+                );
                 ensure_identity_columns_preserved(
                     &current_row.entity_id,
                     &current_row.schema_key,
@@ -367,7 +381,18 @@ impl StateBackedSurface<'_> {
                     &values,
                 )
                 .map_err(write_resolve_state_assignments_error)?;
-                Ok(values)
+                Ok((
+                    values,
+                    state_writer_key_from_assignments(
+                        assignments,
+                        planned_write
+                            .command
+                            .execution_context
+                            .writer_key
+                            .as_deref(),
+                        self.update_context(),
+                    )?,
+                ))
             }
             Self::Entity(entity_schema) => apply_entity_state_assignments(
                 current_row,
@@ -377,6 +402,12 @@ impl StateBackedSurface<'_> {
                     primary_key_paths: &entity_schema.primary_key_paths,
                 },
             )
+            .map(|values| {
+                (
+                    values,
+                    planned_write.command.execution_context.writer_key.clone(),
+                )
+            })
             .map_err(write_resolve_state_assignments_error),
         }
     }
@@ -626,7 +657,8 @@ fn resolve_state_backed_existing_write_from_rows(
                     source_change_id: current_row.source_change_id.clone(),
                     source_commit_id: None,
                 };
-                let mut values = surface.apply_update_assignments(assignments, &current_row)?;
+                let (mut values, writer_key) =
+                    surface.apply_update_assignments(planned_write, assignments, &current_row)?;
                 values.insert(
                     "version_id".to_string(),
                     Value::Text(target_version_id.clone()),
@@ -649,6 +681,7 @@ fn resolve_state_backed_existing_write_from_rows(
                     schema_key: current_row.schema_key.clone(),
                     version_id: Some(target_version_id),
                     values,
+                    writer_key,
                     tombstone: false,
                 });
                 partition.lineage.push(RowLineage {
@@ -686,7 +719,8 @@ fn resolve_state_backed_existing_write_from_rows(
                     entity_id: current_row.entity_id.clone(),
                     schema_key: current_row.schema_key.clone(),
                     version_id: Some(target_version_id),
-                    values: current_row.values,
+                    values: state_values_without_writer_key(&current_row.values),
+                    writer_key: planned_write.command.execution_context.writer_key.clone(),
                     tombstone: true,
                 });
                 partition.tombstones.push(row_ref.clone());
@@ -725,7 +759,7 @@ where
     let schema_key = resolved_schema_key(planned_write)?;
     let mut rows = Vec::with_capacity(payloads.len());
 
-    for (payload, version_id) in payloads.into_iter().zip(row_version_ids.iter()) {
+    for (mut payload, version_id) in payloads.into_iter().zip(row_version_ids.iter()) {
         let entity_id = payload
             .get("entity_id")
             .and_then(text_from_value)
@@ -739,15 +773,83 @@ where
             .ok_or_else(|| WriteResolveError {
                 message: "public write resolver requires an exact entity target".to_string(),
             })?;
+        let writer_key = state_writer_key_from_values(
+            &mut payload,
+            planned_write
+                .command
+                .execution_context
+                .writer_key
+                .as_deref(),
+            "public state insert resolver",
+        )?;
         rows.push(build_state_insert_row(
             entity_id,
             schema_key.clone(),
             version_id.clone(),
             payload,
+            writer_key,
         ));
     }
 
     Ok(rows)
+}
+
+fn state_values_without_writer_key(values: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    values
+        .iter()
+        .filter(|(key, _)| key.as_str() != "writer_key")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn state_assignments_without_writer_key(
+    assignments: &CanonicalStateAssignments,
+) -> CanonicalStateAssignments {
+    CanonicalStateAssignments {
+        columns: assignments
+            .columns
+            .iter()
+            .filter(|(key, _)| key.as_str() != "writer_key")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    }
+}
+
+fn state_writer_key_from_assignments(
+    assignments: &CanonicalStateAssignments,
+    default_writer_key: Option<&str>,
+    context: &str,
+) -> Result<Option<String>, WriteResolveError> {
+    match assignments.columns.get("writer_key") {
+        Some(value) => state_writer_key_value(value, context),
+        None => Ok(default_writer_key.map(str::to_string)),
+    }
+}
+
+fn state_writer_key_from_values(
+    values: &mut BTreeMap<String, Value>,
+    default_writer_key: Option<&str>,
+    context: &str,
+) -> Result<Option<String>, WriteResolveError> {
+    match values.remove("writer_key") {
+        Some(value) => state_writer_key_value(&value, context),
+        None => Ok(default_writer_key.map(str::to_string)),
+    }
+}
+
+fn state_writer_key_value(
+    value: &Value,
+    context: &str,
+) -> Result<Option<String>, WriteResolveError> {
+    match value {
+        Value::Text(text) => Ok(Some(text.clone())),
+        Value::Null => Ok(None),
+        other => Err(WriteResolveError {
+            message: format!(
+                "{context} treats 'writer_key' as workspace annotation text or null, got {other:?}"
+            ),
+        }),
+    }
 }
 
 fn apply_state_insert_schema_annotations<P>(
@@ -889,7 +991,7 @@ fn state_insert_row_key(row: &PlannedStateRow) -> CanonicalStateRowKey {
         version_id: row.version_id.clone(),
         global: row.values.get("global").and_then(bool_from_value),
         untracked: row.values.get("untracked").and_then(bool_from_value),
-        writer_key: row.values.get("writer_key").and_then(text_from_value),
+        writer_key: None,
     }
 }
 

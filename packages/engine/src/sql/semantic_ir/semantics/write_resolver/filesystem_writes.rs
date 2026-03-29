@@ -1743,6 +1743,7 @@ fn directory_descriptor_row(
         schema_key: FILESYSTEM_DIRECTORY_SCHEMA_KEY.to_string(),
         version_id: Some(version_id.to_string()),
         values,
+        writer_key: None,
         tombstone: false,
     }
 }
@@ -1799,6 +1800,7 @@ fn file_descriptor_row(
         schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
         version_id: Some(version_id.to_string()),
         values,
+        writer_key: None,
         tombstone: false,
     }
 }
@@ -1886,6 +1888,7 @@ fn binary_blob_ref_row(
         schema_key: FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
         version_id: Some(version_id.to_string()),
         values,
+        writer_key: None,
         tombstone: false,
     })
 }
@@ -1915,6 +1918,7 @@ fn binary_blob_ref_tombstone_row(file_id: &str, version_id: &str) -> PlannedStat
         schema_key: FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
         version_id: Some(version_id.to_string()),
         values,
+        writer_key: None,
         tombstone: true,
     }
 }

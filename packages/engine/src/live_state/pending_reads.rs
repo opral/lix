@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::schema_access::{live_read_contract_from_layout, LiveReadContract};
+use crate::live_state::shared::identity::RowIdentity;
 use crate::read::contracts::{
     committed_read_mode_from_prepared_public_read, CommittedReadMode, PublicReadExecutionMode,
 };
@@ -17,6 +18,7 @@ use crate::sql::services::state_reader::{
 use crate::transaction::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
     PendingSemanticRow, PendingSemanticStorage, PendingTransactionView,
+    PendingWorkspaceWriterKeyOverlay,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
@@ -34,6 +36,7 @@ struct TransactionReadModel<'a> {
     registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
     semantic_overlay: Option<PendingSemanticOverlay>,
     filesystem_overlay: Option<PendingFilesystemOverlay>,
+    workspace_writer_key_overlay: Option<PendingWorkspaceWriterKeyOverlay>,
 }
 
 impl<'a> TransactionReadModel<'a> {
@@ -49,6 +52,9 @@ impl<'a> TransactionReadModel<'a> {
                 .cloned(),
             semantic_overlay: pending_transaction_view.semantic_overlay().cloned(),
             filesystem_overlay: pending_transaction_view.filesystem_overlay().cloned(),
+            workspace_writer_key_overlay: pending_transaction_view
+                .workspace_writer_key_overlay()
+                .cloned(),
         }
     }
 
@@ -56,6 +62,7 @@ impl<'a> TransactionReadModel<'a> {
         self.registered_schema_overlay.is_some()
             || self.semantic_overlay.is_some()
             || self.filesystem_overlay.is_some()
+            || self.workspace_writer_key_overlay.is_some()
     }
 
     async fn bootstrap_public_surface_registry(
@@ -216,6 +223,7 @@ impl<'a> TransactionReadModel<'a> {
             }
         }
         self.apply_filesystem_overlay_to_rows(query, &access, &mut by_identity);
+        self.apply_workspace_writer_key_overlay_to_rows(query, &mut by_identity);
         let mut rows = by_identity
             .into_values()
             .filter(|row| {
@@ -347,6 +355,35 @@ impl<'a> TransactionReadModel<'a> {
                     row.metadata = pending.metadata_patch.apply(row.metadata.clone());
                 }
             }
+        }
+    }
+
+    fn apply_workspace_writer_key_overlay_to_rows(
+        &self,
+        query: &LiveTableOverlayQuery,
+        rows: &mut BTreeMap<OverlayVisibleLiveRowIdentity, OverlayVisibleLiveRow>,
+    ) {
+        if query.storage != PendingSemanticStorage::Tracked {
+            return;
+        }
+        let Some(overlay) = self.workspace_writer_key_overlay.as_ref() else {
+            return;
+        };
+
+        for row in rows.values_mut() {
+            let identity = RowIdentity {
+                schema_key: row.schema_key.clone(),
+                version_id: row.version_id.clone(),
+                entity_id: row.entity_id.clone(),
+                file_id: row.file_id.clone(),
+            };
+            let Some(writer_key) = overlay.annotation(&identity) else {
+                continue;
+            };
+            row.normalized_values.insert(
+                "writer_key".to_string(),
+                writer_key.clone().map(Value::Text).unwrap_or(Value::Null),
+            );
         }
     }
 }

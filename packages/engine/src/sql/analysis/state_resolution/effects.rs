@@ -1,6 +1,8 @@
 use crate::engine::direct_state_file_cache_refresh_targets;
 use crate::session::contracts::SessionStateDelta;
-use crate::state::stream::state_commit_stream_changes_from_mutations;
+use crate::state::stream::{
+    state_commit_stream_changes_from_mutations, StateCommitStreamRuntimeMetadata,
+};
 
 use crate::sql::executor::contracts::effects::PlanEffects;
 use crate::sql::executor::contracts::planned_statement::PlannedStatementSet;
@@ -10,8 +12,10 @@ pub(crate) fn derive_effects_from_state_resolution(
     preprocess: &PlannedStatementSet,
     writer_key: Option<&str>,
 ) -> Result<PlanEffects, PlannerError> {
-    let state_commit_stream_changes =
-        state_commit_stream_changes_from_mutations(&preprocess.mutations, writer_key);
+    let state_commit_stream_changes = state_commit_stream_changes_from_mutations(
+        &preprocess.mutations,
+        StateCommitStreamRuntimeMetadata::from_runtime_writer_key(writer_key),
+    );
     let file_cache_refresh_targets = direct_state_file_cache_refresh_targets(&preprocess.mutations);
 
     Ok(PlanEffects {

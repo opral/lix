@@ -321,6 +321,8 @@ pub(crate) async fn rebuild_scope_with_writer_key_hints_in_transaction(
     request: &LiveStateRebuildRequest,
     writer_key_hints: &BTreeMap<RowIdentity, Option<String>>,
 ) -> Result<LiveStateApplyReport, LixError> {
+    // Rebuild semantic live state first, then optionally reapply workspace
+    // annotation hints for read surfaces that still expose them.
     let plan = materialize::rebuild_plan_with_transaction(transaction, request).await?;
     let (rows_deleted, tables_touched) =
         materialize::apply_rebuild_scope_with_writer_key_hints_in_transaction(

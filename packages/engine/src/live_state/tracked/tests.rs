@@ -9,6 +9,7 @@ use crate::live_state::tracked::{
     TrackedWriteRow,
 };
 use crate::transaction::{ReadContext, TransactionDelta, WriteTransaction};
+use crate::workspace::init as init_workspace;
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
 };
@@ -199,7 +200,7 @@ async fn commit_tracked_rows(
     backend: &SqliteBackend,
     rows: Vec<TrackedWriteRow>,
 ) -> Result<(), LixError> {
-    let read_context = ReadContext::new(backend, backend);
+    let read_context = ReadContext::new(backend, backend, backend);
     let backend_txn = backend.begin_transaction(TransactionMode::Write).await?;
     let mut write_tx = WriteTransaction::new(backend_txn, read_context);
     let schema_keys = rows
@@ -224,6 +225,9 @@ async fn live_tracked_state_roundtrips_rows() {
     init_live_state(&backend)
         .await
         .expect("live_state init should succeed");
+    init_workspace(&backend)
+        .await
+        .expect("workspace init should succeed");
     commit_tracked_rows(
         &backend,
         vec![
@@ -317,6 +321,9 @@ async fn live_tracked_state_tombstones_hide_rows() {
     init_live_state(&backend)
         .await
         .expect("live_state init should succeed");
+    init_workspace(&backend)
+        .await
+        .expect("workspace init should succeed");
     commit_tracked_rows(
         &backend,
         vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],

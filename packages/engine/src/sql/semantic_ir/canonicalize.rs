@@ -1249,6 +1249,7 @@ fn selector_column_is_supported(surface_binding: &SurfaceBinding, column: &str) 
                 | "schema_version"
                 | "global"
                 | "untracked"
+                | "writer_key"
         ),
         SurfaceFamily::Entity => surface_binding
             .exposed_columns
