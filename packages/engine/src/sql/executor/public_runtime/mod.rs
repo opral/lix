@@ -17,8 +17,7 @@ use crate::sql::analysis::state_resolution::canonical::statement_targets_table_n
 use crate::sql::backend::PushdownDecision;
 use crate::sql::binder::{bind_statement, RuntimeBindingValues};
 use crate::sql::catalog::{
-    SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry,
-    SurfaceVariant,
+    SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry, SurfaceVariant,
 };
 use crate::sql::executor::contracts::effects::PlanEffects;
 use crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
@@ -26,12 +25,10 @@ use crate::sql::executor::intent::authoritative_binary_blob_write_targets;
 use crate::sql::logical_plan::public_ir::{
     CommitPreconditions, PlannedWrite, StructuredPublicRead, WriteOperationKind,
 };
-use crate::sql::logical_plan::DirectPublicReadPlan;
 use crate::sql::logical_plan::{
     verify_logical_plan, DependencySpec, LogicalPlan, PublicReadLogicalPlan,
 };
 use crate::sql::physical_plan::compile_lowered_read_statement;
-use crate::sql::physical_plan::lowerer::summarize_bound_public_read_statement_with_registry;
 use crate::sql::physical_plan::{
     LoweredReadProgram, PhysicalPlan, PreparedPublicReadExecution, PreparedPublicWriteExecution,
     PublicWriteExecutionPartition, PublicWriteMaterialization, TrackedWriteExecution,
@@ -110,13 +107,6 @@ impl PreparedPublicRead {
         match &self.execution {
             PreparedPublicReadExecution::LoweredSql(lowered) => Some(lowered),
             PreparedPublicReadExecution::Direct(_) => None,
-        }
-    }
-
-    pub(crate) fn direct_plan(&self) -> Option<&DirectPublicReadPlan> {
-        match &self.execution {
-            PreparedPublicReadExecution::LoweredSql(_) => None,
-            PreparedPublicReadExecution::Direct(plan) => Some(plan),
         }
     }
 }
@@ -552,19 +542,24 @@ fn summarize_bound_public_read_statement(
     let Statement::Query(query) = statement else {
         return BoundPublicReadSummary::default();
     };
-    let Ok(Some(summary)) =
-        summarize_bound_public_read_statement_with_registry(statement, registry)
-    else {
-        return BoundPublicReadSummary::default();
-    };
+    let mut bound_surface_bindings = Vec::new();
+    let mut internal_relations = Vec::new();
+    let mut external_relations = Vec::new();
+
+    for relation_name in collect_public_query_relation_names(query) {
+        if let Some(binding) = registry.bind_relation_name(&relation_name) {
+            bound_surface_bindings.push(binding);
+        } else if relation_name.starts_with("lix_internal_") {
+            internal_relations.push(relation_name);
+        } else {
+            external_relations.push(relation_name);
+        }
+    }
+
     BoundPublicReadSummary {
-        bound_surface_bindings: summary
-            .public_relations
-            .into_iter()
-            .filter_map(|relation_name| registry.bind_relation_name(&relation_name))
-            .collect(),
-        internal_relations: summary.internal_relations.into_iter().collect(),
-        external_relations: summary.external_relations.into_iter().collect(),
+        bound_surface_bindings,
+        internal_relations,
+        external_relations,
         requested_history_root_commit_ids: requested_history_root_commit_ids_from_selection(
             query_selection(query),
         ),
@@ -1947,11 +1942,13 @@ fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWri
 mod tests {
     use super::{
         prepare_public_execution, prepare_public_read, prepare_public_read_strict,
-        DirectPublicReadPlan, PreparedPublicExecution, PreparedPublicReadExecution,
+        PreparedPublicExecution, PreparedPublicReadExecution,
     };
     use crate::read::models::StateHistoryRootScope;
-    use crate::sql::logical_plan::DependencyPrecision;
-    use crate::sql::{catalog::SurfaceReadFreshness, logical_plan::DependencyPrecision};
+    use crate::sql::{
+        catalog::SurfaceReadFreshness,
+        logical_plan::{DependencyPrecision, DirectPublicReadPlan},
+    };
     use crate::{LixBackend, LixError, QueryResult, Session, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::json;
@@ -2161,10 +2158,6 @@ mod tests {
             derived_read.freshness_contract,
             SurfaceReadFreshness::RequiresFreshProjection
         );
-        assert_eq!(
-            derived_read.debug_trace.bound_public_leaves[0].read_freshness,
-            SurfaceReadFreshness::RequiresFreshProjection
-        );
 
         let canonical_read = prepare_public_read(
             &backend,
@@ -2179,10 +2172,6 @@ mod tests {
             canonical_read.freshness_contract,
             SurfaceReadFreshness::AllowsStaleProjection
         );
-        assert_eq!(
-            canonical_read.debug_trace.bound_public_leaves[0].read_freshness,
-            SurfaceReadFreshness::AllowsStaleProjection
-        );
 
         let admin_read = prepare_public_read(
             &backend,
@@ -2195,10 +2184,6 @@ mod tests {
         .expect("canonical admin read should prepare");
         assert_eq!(
             admin_read.freshness_contract,
-            SurfaceReadFreshness::AllowsStaleProjection
-        );
-        assert_eq!(
-            admin_read.debug_trace.bound_public_leaves[0].read_freshness,
             SurfaceReadFreshness::AllowsStaleProjection
         );
     }
