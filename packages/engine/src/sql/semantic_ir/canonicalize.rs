@@ -1,5 +1,4 @@
 use crate::sql::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
-use crate::sql::binder::contracts::{BoundStatement, ExecutionContext, StatementKind};
 use crate::sql::logical_plan::public_ir::{
     CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan,
     CanonicalWorkingChangesScan, InsertOnConflict, InsertOnConflictAction, MutationPayload,
@@ -8,6 +7,7 @@ use crate::sql::logical_plan::public_ir::{
     WriteSelector,
 };
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::sql::semantic_ir::{BoundStatement, ExecutionContext, StatementKind};
 use crate::Value;
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, ConflictTarget, Delete, Expr, FromTable, FunctionArg,
@@ -45,15 +45,6 @@ impl CanonicalizedRead {
             surface_binding: self.surface_binding.clone(),
             read_command: self.read_command.clone(),
             query: self.query.clone(),
-        }
-    }
-
-    pub(crate) fn into_structured_read(self) -> StructuredPublicRead {
-        StructuredPublicRead {
-            bound_statement: self.bound_statement,
-            surface_binding: self.surface_binding,
-            read_command: self.read_command,
-            query: self.query,
         }
     }
 }
@@ -1855,7 +1846,8 @@ fn expr_to_u64(expr: &Expr) -> Result<u64, CanonicalizeError> {
 mod tests {
     use super::{canonicalize_read, canonicalize_write};
     use crate::sql::catalog::{DynamicEntitySurfaceSpec, SurfaceRegistry};
-    use crate::sql::binder::contracts::{BoundStatement, ExecutionContext};
+    use crate::sql::binder::bind_statement;
+    use crate::sql::semantic_ir::{BoundStatement, ExecutionContext};
     use crate::sql::logical_plan::public_ir::{
         MutationPayload, ReadContract, ReadPlan, VersionScope, WriteModeRequest, WriteOperationKind,
     };
@@ -1866,13 +1858,13 @@ mod tests {
     fn bound_statement(sql: &str) -> BoundStatement {
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
-        BoundStatement::from_statement(statement, Vec::new(), ExecutionContext::default())
+        bind_statement(statement, Vec::new(), ExecutionContext::default())
     }
 
     fn bound_statement_with_params(sql: &str, params: Vec<Value>) -> BoundStatement {
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
-        BoundStatement::from_statement(statement, params, ExecutionContext::default())
+        bind_statement(statement, params, ExecutionContext::default())
     }
 
     fn bound_statement_with_context(
@@ -1881,7 +1873,7 @@ mod tests {
     ) -> BoundStatement {
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
-        BoundStatement::from_statement(statement, Vec::new(), execution_context)
+        bind_statement(statement, Vec::new(), execution_context)
     }
 
     #[test]

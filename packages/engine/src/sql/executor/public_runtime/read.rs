@@ -10,14 +10,30 @@ use crate::read::models::{
     StateHistoryRequest, StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
 };
 use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
-use crate::sql::binder::{bind_public_query, bind_public_statement_sql};
+use crate::sql::binder::{bind_public_query, bind_public_statement_sql, bind_statement};
 use crate::sql::catalog::SurfaceBinding;
+use crate::sql::logical_plan::{
+    DirectDirectoryHistoryField, DirectEntityHistoryField, DirectFileHistoryField,
+    DirectPublicReadPlan, DirectStateHistoryField, DirectoryHistoryAggregate,
+    DirectoryHistoryDirectReadPlan, DirectoryHistoryPredicate, DirectoryHistoryProjection,
+    DirectoryHistorySortKey, EntityHistoryDirectReadPlan, EntityHistoryPredicate,
+    EntityHistoryProjection, EntityHistorySortKey, FileHistoryAggregate,
+    FileHistoryDirectReadPlan, FileHistoryPredicate, FileHistoryProjection, FileHistorySortKey,
+    LogicalPlan, PublicReadLogicalPlan, StateHistoryAggregate,
+    StateHistoryAggregatePredicate, StateHistoryDirectReadPlan, StateHistoryPredicate,
+    StateHistoryProjection, StateHistoryProjectionValue, StateHistorySortKey,
+    StateHistorySortValue, verify_logical_plan,
+};
 use crate::sql::physical_plan::lowerer::{
     lower_read_for_execution_with_layouts,
     rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id,
     LoweredReadProgram, LoweredResultColumn, LoweredResultColumns,
 };
-use crate::sql::semantic_ir::canonicalize::canonicalize_read;
+use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_bound_public_surface_bindings;
+use crate::sql::semantic_ir::{
+    augment_dependency_spec_for_broad_public_read, prepare_structured_public_read_analysis,
+    unknown_public_state_schema_error, BoundPublicLeaf, PublicReadSemantics,
+};
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
@@ -156,7 +172,7 @@ pub(crate) async fn execute_prepared_public_read(
             execute_lowered_public_read(
                 backend,
                 lowered,
-                prepared.dependency_spec.as_ref(),
+                prepared.dependency_spec(),
                 &prepared.debug_trace.surface_bindings,
                 bound_params,
             )
@@ -1058,7 +1074,7 @@ async fn lower_public_read_query_with_details(
         let required_schema_keys = prepared
             .as_ref()
             .map(|prepared| {
-                required_schema_keys_from_dependency_spec(prepared.dependency_spec.as_ref())
+                required_schema_keys_from_dependency_spec(prepared.dependency_spec())
             })
             .unwrap_or_default();
         (lowered, required_schema_keys)
@@ -1076,45 +1092,41 @@ async fn lower_public_read_query_with_details(
                 public_output_columns: None,
             });
         }
-        let bound_statement = BoundStatement::from_statement(
-            Statement::Query(Box::new(query)),
-            params.to_vec(),
-            ExecutionContext {
-                dialect: Some(backend.dialect()),
-                writer_key: None,
-                requested_version_id: Some(active_version_id),
-                active_account_ids: Vec::new(),
-            },
-        );
-        let structured_read = canonicalize_read(bound_statement, &registry)
-            .map(|canonicalized| canonicalized.into_structured_read())
-            .map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "public read subquery canonicalization failed: {}",
-                        error.message
-                    ),
-                )
-            })?;
-        let dependency_spec = augment_dependency_spec_for_public_read(
+        let analysis = prepare_structured_public_read_analysis(
+            backend,
+            bind_statement(
+                Statement::Query(Box::new(query)),
+                params.to_vec(),
+                ExecutionContext {
+                    dialect: Some(backend.dialect()),
+                    writer_key: None,
+                    requested_version_id: Some(active_version_id.clone()),
+                    active_account_ids: Vec::new(),
+                },
+            ),
+            &active_version_id,
             &registry,
-            &structured_read,
-            derive_dependency_spec_from_structured_public_read(&structured_read),
-        );
-        let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
+        )
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "public read subquery canonicalization failed",
+            )
+        })?;
+        let structured_read = analysis.structured_read();
         let known_live_layouts = load_known_live_layouts_for_public_read(
             backend,
-            &structured_read,
-            dependency_spec.as_ref(),
-            effective_state.as_ref().map(|(request, _)| request),
+            structured_read,
+            analysis.dependency_spec.as_ref(),
+            analysis.semantics.effective_state_request.as_ref(),
         )
         .await?;
         let lowered = lower_read_for_execution_with_layouts(
             backend.dialect(),
-            &structured_read,
-            effective_state.as_ref().map(|(request, _)| request),
-            effective_state.as_ref().map(|(_, plan)| plan),
+            structured_read,
+            analysis.semantics.effective_state_request.as_ref(),
+            analysis.semantics.effective_state_plan.as_ref(),
             &known_live_layouts,
         )?
         .ok_or_else(|| {
@@ -1125,7 +1137,7 @@ async fn lower_public_read_query_with_details(
         })?;
         (
             lowered,
-            required_schema_keys_from_dependency_spec(dependency_spec.as_ref()),
+            required_schema_keys_from_dependency_spec(analysis.dependency_spec.as_ref()),
         )
     };
     let statement = lowered.statements.into_iter().next().ok_or_else(|| {
@@ -5032,119 +5044,6 @@ fn value_as_i64(value: &Value) -> Option<i64> {
     }
 }
 
-fn try_build_direct_state_history_structured_read(
-    bound_statement: BoundStatement,
-    registry: &SurfaceRegistry,
-) -> Result<Option<StructuredPublicRead>, LixError> {
-    let Statement::Query(query) = &bound_statement.statement else {
-        return Ok(None);
-    };
-    if query.with.is_some()
-        || query.fetch.is_some()
-        || !query.locks.is_empty()
-        || query.for_clause.is_some()
-        || query.settings.is_some()
-        || query.format_clause.is_some()
-    {
-        return Ok(None);
-    }
-
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(None);
-    };
-    if select.distinct.is_some()
-        || select.top.is_some()
-        || select.exclude.is_some()
-        || select.into.is_some()
-        || !select.lateral_views.is_empty()
-        || select.prewhere.is_some()
-        || !select.named_window.is_empty()
-        || select.qualify.is_some()
-        || select.value_table_mode.is_some()
-        || select.connect_by.is_some()
-        || !select.cluster_by.is_empty()
-        || !select.distribute_by.is_empty()
-        || !select.sort_by.is_empty()
-        || select.from.len() != 1
-        || !select.from[0].joins.is_empty()
-    {
-        return Ok(None);
-    }
-
-    let TableFactor::Table { name, alias, .. } = &select.from[0].relation else {
-        return Ok(None);
-    };
-    let alias = alias.clone();
-    let projection = select.projection.clone();
-    let selection = select.selection.clone();
-    let selection_predicates = select
-        .selection
-        .as_ref()
-        .map(split_read_conjunctive_predicates)
-        .unwrap_or_default();
-    let group_by = select.group_by.clone();
-    let having = select.having.clone();
-    let order_by = query.order_by.clone();
-    let limit_clause = query.limit_clause.clone();
-    let Some(surface_binding) = registry.bind_object_name(name) else {
-        return Ok(None);
-    };
-    if surface_binding.descriptor.public_name != "lix_state_history" {
-        return Ok(None);
-    }
-
-    let scan = crate::sql::logical_plan::public_ir::CanonicalStateScan::from_surface_binding(
-        surface_binding.clone(),
-    )
-    .ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "state-history direct preparation could not derive a canonical state scan",
-        )
-    })?;
-
-    Ok(Some(StructuredPublicRead {
-        bound_statement,
-        surface_binding,
-        read_command: crate::sql::logical_plan::public_ir::ReadCommand {
-            root: crate::sql::logical_plan::public_ir::ReadPlan::scan(scan),
-            contract: crate::sql::logical_plan::public_ir::ReadContract::CommittedAtStart,
-            requested_commit_mapping: None,
-        },
-        query: crate::sql::logical_plan::public_ir::NormalizedPublicReadQuery {
-            source_alias: alias,
-            projection,
-            selection,
-            selection_predicates,
-            group_by,
-            having,
-            order_by,
-            limit_clause,
-        },
-    }))
-}
-
-fn split_read_conjunctive_predicates(expr: &Expr) -> Vec<Expr> {
-    let mut predicates = Vec::new();
-    collect_read_conjunctive_predicates(expr, &mut predicates);
-    predicates
-}
-
-fn collect_read_conjunctive_predicates(expr: &Expr, predicates: &mut Vec<Expr>) {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            collect_read_conjunctive_predicates(left, predicates);
-            collect_read_conjunctive_predicates(right, predicates);
-        }
-        Expr::Nested(inner) => collect_read_conjunctive_predicates(inner, predicates),
-        _ => predicates.push(expr.clone()),
-    }
-}
-
 enum SpecializedPublicReadPreparation {
     Prepared(PreparedPublicRead),
     Declined { reason: String },
@@ -5186,24 +5085,23 @@ async fn try_prepare_public_read_via_specialized_optimization(
     backend: &dyn LixBackend,
     bound_statement: BoundStatement,
     active_version_id: &str,
-    explain_envelope: Option<&ExplainEnvelope>,
+    explain_envelope: Option<&ExplainOptions>,
     registry: &SurfaceRegistry,
     public_output_columns: Option<Vec<String>>,
 ) -> Result<SpecializedPublicReadPreparation, LixError> {
-    let structured_read = match canonicalize_read(bound_statement.clone(), registry) {
-        Ok(canonicalized) => canonicalized.structured_read(),
-        Err(error) => {
-            match try_build_direct_state_history_structured_read(bound_statement.clone(), registry)?
-            {
-                Some(structured_read) => structured_read,
-                None => {
-                    return Ok(SpecializedPublicReadPreparation::Declined {
-                        reason: error.message,
-                    })
-                }
-            }
-        }
+    let Some(analysis) = prepare_structured_public_read_analysis(
+        backend,
+        bound_statement.clone(),
+        active_version_id,
+        registry,
+    )
+    .await?
+    else {
+        return Ok(SpecializedPublicReadPreparation::Declined {
+            reason: "specialized read optimization declined canonicalization".to_string(),
+        });
     };
+    let structured_read = analysis.structured_read().clone();
     if explain_envelope.is_some()
         && is_direct_only_history_surface(&structured_read.surface_binding)
     {
@@ -5215,36 +5113,17 @@ async fn try_prepare_public_read_via_specialized_optimization(
             ),
         ));
     }
-    let structured_read =
-        maybe_bind_active_history_root(backend, structured_read, active_version_id)
-            .await
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "public read preparation could not bind active history root",
-                )
-            })?;
-    let dependency_spec = augment_dependency_spec_for_public_read(
-        registry,
-        &structured_read,
-        derive_dependency_spec_from_structured_public_read(&structured_read),
-    );
-    if structured_read.surface_binding.descriptor.surface_family == SurfaceFamily::State {
-        if let Some(error) = unknown_public_state_schema_error(registry, dependency_spec.as_ref()) {
-            return Err(error);
-        }
-    }
-    let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
     let known_live_layouts = load_known_live_layouts_for_public_read(
         backend,
         &structured_read,
-        dependency_spec.as_ref(),
-        effective_state.as_ref().map(|(request, _)| request),
+        analysis.dependency_spec.as_ref(),
+        analysis.semantics.effective_state_request.as_ref(),
     )
     .await?;
     let surface_binding = structured_read.surface_binding.clone();
-    let effective_state_request = effective_state.as_ref().map(|(request, _)| request.clone());
-    let effective_state_plan = effective_state.as_ref().map(|(_, plan)| plan.clone());
+    let effective_state_request = analysis.semantics.effective_state_request.clone();
+    let effective_state_plan = analysis.semantics.effective_state_plan.clone();
+    let dependency_spec = analysis.dependency_spec.clone();
     let direct_execution =
         explain_envelope.is_none() && is_direct_only_history_surface(&surface_binding);
 
@@ -5385,8 +5264,8 @@ async fn try_prepare_public_read_via_specialized_optimization(
         let lowered_read = match lower_read_for_execution_with_layouts(
             backend.dialect(),
             &structured_read,
-            effective_state.as_ref().map(|(request, _)| request),
-            effective_state.as_ref().map(|(_, plan)| plan),
+            analysis.semantics.effective_state_request.as_ref(),
+            analysis.semantics.effective_state_plan.as_ref(),
             &known_live_layouts,
         ) {
             Ok(Some(program)) => wrap_lowered_read_for_explain(program, explain_envelope),
@@ -5419,18 +5298,30 @@ async fn try_prepare_public_read_via_specialized_optimization(
         )
     };
 
+    let logical_plan = match &execution {
+        PreparedPublicReadExecution::LoweredSql(_) => analysis.logical_plan(),
+        PreparedPublicReadExecution::Direct(direct_plan) => {
+            analysis.logical_plan_with_direct_execution(direct_plan.clone())
+        }
+    };
+    verify_logical_plan(&LogicalPlan::PublicRead(logical_plan.clone())).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("public read logical plan verification failed: {}", error.message),
+        )
+    })?;
+
     Ok(SpecializedPublicReadPreparation::Prepared(
         PreparedPublicRead {
-            optimization: Some(PublicReadOptimization {
-                structured_read,
-                effective_state_request: effective_state_request.clone(),
-                effective_state_plan: effective_state_plan.clone(),
-            }),
+            logical_plan,
             public_output_columns,
             debug_trace: PublicExecutionDebugTrace {
+                semantic_statement: Some(
+                    analysis.semantics.semantic_statement(explain_envelope.cloned()),
+                ),
                 bound_statements: vec![bound_statement],
                 surface_bindings: vec![surface_binding.descriptor.public_name.clone()],
-                bound_public_leaves: vec![bound_public_leaf(&surface_binding)],
+                bound_public_leaves: vec![BoundPublicLeaf::from_surface_binding(&surface_binding)],
                 dependency_spec: dependency_spec.clone(),
                 effective_state_request,
                 effective_state_plan,
@@ -5446,7 +5337,6 @@ async fn try_prepare_public_read_via_specialized_optimization(
                 write_phase_trace: Vec::new(),
                 lowered_sql,
             },
-            dependency_spec,
             execution,
         },
     ))
@@ -5666,7 +5556,7 @@ async fn try_prepare_public_read_with_internal_access(
             &read_summary.internal_relations,
         ));
     }
-    let bound_statement = BoundStatement::from_statement(
+    let bound_statement = bind_statement(
         statement,
         params.to_vec(),
         ExecutionContext {
@@ -5734,7 +5624,7 @@ async fn try_prepare_public_read_with_internal_access(
 async fn prepare_public_read_via_surface_lowering(
     backend: &dyn LixBackend,
     bound_statement: BoundStatement,
-    explain_envelope: Option<&ExplainEnvelope>,
+    explain_envelope: Option<&ExplainOptions>,
     registry: &SurfaceRegistry,
     allow_internal_tables: bool,
     public_output_columns: Option<Vec<String>>,
@@ -5802,13 +5692,33 @@ async fn prepare_public_read_via_surface_lowering(
     let bound_public_leaves = read_summary
         .bound_surface_bindings
         .iter()
-        .map(bound_public_leaf)
+        .map(BoundPublicLeaf::from_surface_binding)
         .collect::<Vec<_>>();
 
+    let semantic_read = PublicReadSemantics {
+        bound_statement: bound_statement.clone(),
+        surface_bindings: read_summary.bound_surface_bindings.clone(),
+        structured_read: None,
+        effective_state_request: None,
+        effective_state_plan: None,
+    };
+
+    let logical_plan = PublicReadLogicalPlan::Broad {
+        surface_bindings: read_summary.bound_surface_bindings.clone(),
+        dependency_spec: dependency_spec.clone(),
+    };
+    verify_logical_plan(&LogicalPlan::PublicRead(logical_plan.clone())).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("public read logical plan verification failed: {}", error.message),
+        )
+    })?;
+
     Ok(Some(PreparedPublicRead {
-        optimization: None,
+        logical_plan,
         public_output_columns,
         debug_trace: PublicExecutionDebugTrace {
+            semantic_statement: Some(semantic_read.semantic_statement(explain_envelope.cloned())),
             bound_statements: vec![bound_statement.clone()],
             surface_bindings: read_summary
                 .bound_surface_bindings
@@ -5835,7 +5745,6 @@ async fn prepare_public_read_via_surface_lowering(
                 .map(ToString::to_string)
                 .collect(),
         },
-        dependency_spec,
         execution: PreparedPublicReadExecution::LoweredSql(lowered_read),
     }))
 }

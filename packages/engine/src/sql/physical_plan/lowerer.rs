@@ -991,6 +991,10 @@ fn build_effective_state_source_sql(
     pushdown_predicates: &[String],
     known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<String, LixError> {
+    let include_snapshot_content = effective_state_request
+        .required_columns
+        .iter()
+        .any(|column| column.eq_ignore_ascii_case("snapshot_content"));
     build_effective_live_source_sql(
         dialect,
         active_version_id,
@@ -998,7 +1002,7 @@ fn build_effective_state_source_sql(
         surface_binding,
         pushdown_predicates,
         known_live_layouts,
-        true,
+        include_snapshot_content,
     )
 }
 
@@ -2416,7 +2420,8 @@ mod tests {
         LoweredReadProgram,
     };
     use crate::sql::catalog::SurfaceRegistry;
-    use crate::sql::binder::contracts::{BoundStatement, ExecutionContext};
+    use crate::sql::binder::bind_statement;
+    use crate::sql::semantic_ir::ExecutionContext;
     use crate::sql::semantic_ir::canonicalize::canonicalize_read;
     use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
     use crate::sql::semantic_ir::semantics::effective_state_resolver::build_effective_state;
@@ -2438,11 +2443,10 @@ mod tests {
         let statement = statements.pop().expect("single statement");
         let mut execution_context = ExecutionContext::with_dialect(SqlDialect::Sqlite);
         execution_context.requested_version_id = Some("main".to_string());
-        let bound =
-            BoundStatement::from_statement(statement, Vec::<Value>::new(), execution_context);
+        let bound = bind_statement(statement, Vec::<Value>::new(), execution_context);
         let structured_read = canonicalize_read(bound, registry)
             .expect("query should canonicalize")
-            .into_structured_read();
+            .structured_read();
         let dependency_spec = derive_dependency_spec_from_structured_public_read(&structured_read);
         let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
         lower_read_for_execution_with_layouts(

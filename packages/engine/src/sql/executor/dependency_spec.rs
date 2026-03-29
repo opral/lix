@@ -10,7 +10,7 @@ use sqlparser::ast::{Visit, Visitor};
 use crate::live_state::is_untracked_live_table;
 use crate::session::contracts::SessionDependency;
 use crate::sql::binder::bind_sql_with_state;
-use crate::sql::executor::contracts::dependency_spec::{DependencyPrecision, DependencySpec};
+use crate::sql::logical_plan::{DependencyPrecision, DependencySpec};
 use crate::sql::parser::parse_sql_statements;
 use crate::sql::parser::placeholders::PlaceholderState;
 use crate::state::stream::StateCommitStreamFilter;
@@ -509,7 +509,7 @@ mod tests {
         parse_sql_statements,
     };
     use crate::session::contracts::SessionDependency;
-    use crate::sql::executor::contracts::dependency_spec::DependencyPrecision;
+    use crate::sql::logical_plan::DependencyPrecision;
     use crate::Value;
 
     #[test]
