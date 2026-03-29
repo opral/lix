@@ -11,7 +11,9 @@ use crate::{
 };
 use serde_json::{json, Value as JsonValue};
 
-use super::change_log::build_prepared_batch_from_canonical_output;
+use super::change_log::{
+    build_prepared_batch_from_canonical_output, load_next_change_ordinal_with_executor,
+};
 use super::create_commit::{
     CreateCommitAppliedOutput, CreateCommitError, CreateCommitExpectedHead,
     CreateCommitPreconditions, CreateCommitWriteLane,
@@ -130,6 +132,8 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
     functions: &mut dyn LixFunctionProvider,
     timestamp: &str,
 ) -> Result<CanonicalCommitReceipt, LixError> {
+    let projection_writer_key_hints =
+        crate::live_state::projection::tracked_writer_key_hints_from_domain_changes(changes);
     let domain_changes = changes
         .iter()
         .map(|change| {
@@ -243,7 +247,14 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
         domain_changes.len(),
         timestamp,
     )?;
-    execute_generated_commit_result(transaction, rewritten, binary_blob_writes, functions).await
+    execute_generated_commit_result(
+        transaction,
+        rewritten,
+        binary_blob_writes,
+        functions,
+        &projection_writer_key_hints,
+    )
+    .await
 }
 
 fn canonicalize_optional_json_text(
@@ -342,15 +353,21 @@ async fn execute_generated_commit_result(
     result: GenerateCommitResult,
     binary_blob_writes: &[BinaryBlobWrite],
     functions: &mut dyn LixFunctionProvider,
+    projection_writer_key_hints: &std::collections::BTreeMap<
+        crate::live_state::shared::identity::RowIdentity,
+        Option<String>,
+    >,
 ) -> Result<CanonicalCommitReceipt, LixError> {
     let mut executor = &mut *transaction;
     let commit_graph_rows =
         resolve_commit_graph_node_write_rows_with_executor(&mut executor, &result.canonical_output)
             .await?;
+    let next_change_ordinal = load_next_change_ordinal_with_executor(&mut executor).await?;
     let mut prepared = build_prepared_batch_from_canonical_output(
         &result.canonical_output,
         functions,
         transaction.dialect(),
+        next_change_ordinal,
     )?;
     prepared.extend(build_commit_graph_node_prepared_batch(
         &commit_graph_rows,
@@ -369,10 +386,11 @@ async fn execute_generated_commit_result(
     }
     program.push_batch(prepared);
     execute_write_program_with_transaction(transaction, program).await?;
-    let receipt = canonical_commit_receipt_from_generated_result(&result)?;
+    let receipt = canonical_commit_receipt_from_generated_result(&result, next_change_ordinal)?;
     crate::live_state::projection::apply_commit_projections_best_effort_in_transaction(
         transaction,
         &receipt,
+        projection_writer_key_hints,
     )
     .await?;
     Ok(receipt)
@@ -380,9 +398,11 @@ async fn execute_generated_commit_result(
 
 fn canonical_commit_receipt_from_generated_result(
     result: &GenerateCommitResult,
+    starting_change_ordinal: i64,
 ) -> Result<CanonicalCommitReceipt, LixError> {
     let canonical_watermark = latest_canonical_watermark_from_change_rows(
         &result.canonical_output.changes,
+        starting_change_ordinal,
     )
     .ok_or_else(|| {
         LixError::new(

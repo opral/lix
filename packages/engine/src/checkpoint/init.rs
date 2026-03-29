@@ -290,12 +290,11 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             .execute_internal(
                 &format!(
                     "SELECT entity_id \
-                     FROM lix_state_by_version \
+                     FROM lix_internal_change \
                      WHERE entity_id IN ({label_in_list}) \
                        AND schema_key = 'lix_entity_label' \
                        AND file_id = 'lix' \
-                       AND version_id = 'global' \
-                       AND snapshot_content IS NOT NULL"
+                       AND plugin_key = 'lix'"
                 ),
                 &[],
             )
@@ -310,7 +309,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let labeled_entity_ids = label_statement
             .rows
             .iter()
-            .map(|row| text_value(row.first(), "lix_state_by_version.entity_id"))
+            .map(|row| text_value(row.first(), "lix_internal_change.entity_id"))
             .collect::<Result<BTreeSet<_>, _>>()?;
         let labeled_commit_ids = commit_ids
             .iter()

@@ -1,3 +1,4 @@
+use crate::canonical::load_next_change_ordinal_with_executor;
 use crate::canonical::readers::load_committed_version_head_commit_id;
 use crate::engine::{Engine, ExecuteOptions, TransactionBackendAdapter};
 use crate::live_state::schema_access::{normalized_values_for_schema, tracked_relation_name};
@@ -191,7 +192,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                  WHERE c.entity_id = $1 \
                    AND c.schema_key = 'lix_commit' \
                    AND c.file_id = 'lix' \
-                 ORDER BY c.created_at DESC \
+                 ORDER BY c.change_ordinal DESC \
                  LIMIT 1",
                 &[Value::Text(commit_id.to_string())],
             )
@@ -246,7 +247,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                  WHERE c.entity_id = $1 \
                    AND c.schema_key = 'lix_commit' \
                    AND c.file_id = 'lix' \
-                 ORDER BY c.created_at DESC \
+                 ORDER BY c.change_ordinal DESC \
                  LIMIT 1",
                 &[Value::Text(commit_id.to_string())],
             )
@@ -408,6 +409,10 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         created_at: &str,
     ) -> Result<(), LixError> {
         let snapshot_id = format!("{change_id}~snapshot");
+        let next_change_ordinal = {
+            let mut backend = self.backend_adapter();
+            load_next_change_ordinal_with_executor(&mut backend).await?
+        };
         self.execute_backend(
             "INSERT INTO lix_internal_snapshot (id, content) \
              SELECT $1, $2 \
@@ -420,12 +425,13 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         .await?;
         self.execute_backend(
             "INSERT INTO lix_internal_change (\
-             id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
+             id, change_ordinal, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
              ) \
-             SELECT $1, $2, $3, $4, $5, $6, $7, NULL, $8 \
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, NULL, $9 \
              WHERE NOT EXISTS (SELECT 1 FROM lix_internal_change WHERE id = $1)",
             &[
                 Value::Text(change_id.to_string()),
+                Value::Integer(next_change_ordinal),
                 Value::Text(entity_id.to_string()),
                 Value::Text(schema_key.to_string()),
                 Value::Text(schema_version.to_string()),

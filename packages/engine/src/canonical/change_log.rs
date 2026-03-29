@@ -1,4 +1,5 @@
 use crate::backend::prepared::{PreparedBatch, PreparedStatement};
+use crate::backend::QueryExecutor;
 use crate::functions::LixFunctionProvider;
 use crate::sql_support::binding::bind_sql;
 use crate::{LixError, SqlDialect, Value};
@@ -10,7 +11,7 @@ const CHANGE_TABLE: &str = "lix_internal_change";
 const SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 32_766;
 const POSTGRES_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 65_535;
 const SNAPSHOT_INSERT_PARAM_COLUMNS: usize = 2;
-const CHANGE_INSERT_PARAM_COLUMNS: usize = 9;
+const CHANGE_INSERT_PARAM_COLUMNS: usize = 10;
 
 #[derive(Debug, Clone)]
 struct SnapshotInsertRow {
@@ -21,6 +22,7 @@ struct SnapshotInsertRow {
 #[derive(Debug, Clone)]
 struct CanonicalChangeInsertRow {
     id: String,
+    change_ordinal: i64,
     entity_id: String,
     schema_key: String,
     schema_version: String,
@@ -35,12 +37,13 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
     canonical_output: &CanonicalCommitOutput,
     functions: &mut dyn LixFunctionProvider,
     dialect: SqlDialect,
+    starting_change_ordinal: i64,
 ) -> Result<PreparedBatch, LixError> {
     let mut ensure_no_content = false;
     let mut snapshot_rows = Vec::new();
     let mut change_rows = Vec::new();
 
-    for change in &canonical_output.changes {
+    for (index, change) in canonical_output.changes.iter().enumerate() {
         let snapshot_id = match &change.snapshot_content {
             Some(content) => {
                 let id = functions.uuid_v7();
@@ -58,6 +61,7 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
 
         change_rows.push(CanonicalChangeInsertRow {
             id: change.id.clone(),
+            change_ordinal: starting_change_ordinal + index as i64,
             entity_id: change.entity_id.to_string(),
             schema_key: change.schema_key.to_string(),
             schema_version: change.schema_version.to_string(),
@@ -105,6 +109,7 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
         CHANGE_TABLE,
         &[
             "id",
+            "change_ordinal",
             "entity_id",
             "schema_key",
             "schema_version",
@@ -121,6 +126,7 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
         |row, next_placeholder, params| {
             vec![
                 text_param_value(&row.id, next_placeholder, params),
+                bigint_param_value(row.change_ordinal, next_placeholder, params),
                 text_param_value(&row.entity_id, next_placeholder, params),
                 text_param_value(&row.schema_key, next_placeholder, params),
                 text_param_value(&row.schema_version, next_placeholder, params),
@@ -134,6 +140,34 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
     )?;
 
     Ok(prepared)
+}
+
+pub(crate) async fn load_next_change_ordinal_with_executor(
+    executor: &mut dyn QueryExecutor,
+) -> Result<i64, LixError> {
+    let result = executor
+        .execute(
+            "SELECT COALESCE(MAX(change_ordinal), -1) + 1 FROM lix_internal_change",
+            &[],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(0);
+    };
+    match row.first() {
+        Some(Value::Integer(value)) => Ok(*value),
+        Some(Value::Text(value)) => value.parse::<i64>().map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("next canonical change ordinal is invalid text: {error}"),
+        }),
+        Some(other) => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "next canonical change ordinal returned non-integer value: {other:?}"
+            ),
+        }),
+        None => Ok(0),
+    }
 }
 
 fn max_bind_parameters_for_dialect(dialect: SqlDialect) -> usize {
@@ -211,6 +245,13 @@ fn text_param_value(value: &str, next_placeholder: &mut usize, params: &mut Vec<
     let index = *next_placeholder;
     *next_placeholder += 1;
     params.push(Value::Text(value.to_string()));
+    format!("?{index}")
+}
+
+fn bigint_param_value(value: i64, next_placeholder: &mut usize, params: &mut Vec<Value>) -> String {
+    let index = *next_placeholder;
+    *next_placeholder += 1;
+    params.push(Value::Integer(value));
     format!("?{index}")
 }
 

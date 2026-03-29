@@ -35,7 +35,7 @@ pub(crate) async fn load_version_descriptor_with_executor(
            AND c.entity_id = '{entity_id}' \
            AND c.file_id = '{file_id}' \
            AND c.plugin_key = '{plugin_key}' \
-         ORDER BY c.created_at DESC, c.id DESC \
+         ORDER BY c.change_ordinal DESC \
          LIMIT 1",
         schema_key = escape_sql_string(version_descriptor_schema_key()),
         schema_version = escape_sql_string(version_descriptor_schema_version()),
@@ -66,7 +66,7 @@ pub(crate) async fn load_all_version_descriptors_with_executor(
              SELECT c.entity_id, \
                     c.id AS change_id, \
                     s.content AS snapshot_content, \
-                    ROW_NUMBER() OVER (PARTITION BY c.entity_id ORDER BY c.created_at DESC, c.id DESC) AS rn \
+                    ROW_NUMBER() OVER (PARTITION BY c.entity_id ORDER BY c.change_ordinal DESC) AS rn \
              FROM lix_internal_change c \
              LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
              WHERE c.schema_key = '{schema_key}' \
@@ -145,7 +145,7 @@ pub(crate) fn build_admin_version_source_sql() -> String {
         "WITH descriptor_ranked AS (\
              SELECT c.entity_id, \
                     s.content AS snapshot_content, \
-                    ROW_NUMBER() OVER (PARTITION BY c.entity_id ORDER BY c.created_at DESC, c.id DESC) AS rn \
+                    ROW_NUMBER() OVER (PARTITION BY c.entity_id ORDER BY c.change_ordinal DESC) AS rn \
              FROM lix_internal_change c \
              LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
              WHERE c.schema_key = '{descriptor_schema_key}' \
@@ -156,7 +156,7 @@ pub(crate) fn build_admin_version_source_sql() -> String {
          ref_ranked AS (\
              SELECT c.entity_id, \
                     s.content AS snapshot_content, \
-                    ROW_NUMBER() OVER (PARTITION BY c.entity_id ORDER BY c.created_at DESC, c.id DESC) AS rn \
+                    ROW_NUMBER() OVER (PARTITION BY c.entity_id ORDER BY c.change_ordinal DESC) AS rn \
              FROM lix_internal_change c \
              LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
              WHERE c.schema_key = '{ref_schema_key}' \

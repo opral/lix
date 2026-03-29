@@ -8,6 +8,7 @@ use crate::{CanonicalJson, LixError, Value};
 #[derive(Debug, Clone)]
 pub(crate) struct ChangeRecord {
     pub id: String,
+    pub change_ordinal: i64,
     pub entity_id: String,
     pub schema_key: String,
     pub schema_version: String,
@@ -23,12 +24,12 @@ pub(crate) struct CommitRecord {
     pub id: String,
     pub entity_id: String,
     pub snapshot: LixCommit,
-    pub created_at: String,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct VersionDescriptorRecord {
     pub id: String,
+    pub change_ordinal: i64,
     pub entity_id: String,
     pub schema_version: String,
     pub file_id: String,
@@ -42,7 +43,6 @@ pub(crate) struct VersionDescriptorRecord {
 pub(crate) struct CommitEdgeRecord {
     pub id: String,
     pub snapshot: LixCommitEdge,
-    pub created_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +56,7 @@ pub(crate) struct LoadedData {
 pub(crate) async fn load_data_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<LoadedData, LixError> {
-    let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at \
+    let sql = "SELECT c.id, c.change_ordinal, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at \
                FROM lix_internal_change c \
                LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id";
     let result = executor.execute(sql, &[]).await?;
@@ -68,13 +68,14 @@ pub(crate) async fn load_data_with_executor(
 
     for row in result.rows {
         let id = text_required(&row, 0, "id")?;
-        let entity_id = text_required(&row, 1, "entity_id")?;
-        let schema_key = text_required(&row, 2, "schema_key")?;
-        let schema_version = text_required(&row, 3, "schema_version")?;
-        let file_id = text_required(&row, 4, "file_id")?;
-        let plugin_key = text_required(&row, 5, "plugin_key")?;
-        let snapshot_content_raw = json_text_optional(&row, 6, "snapshot_content")?;
-        let metadata_raw = json_text_optional(&row, 7, "metadata")?;
+        let change_ordinal = integer_required(&row, 1, "change_ordinal")?;
+        let entity_id = text_required(&row, 2, "entity_id")?;
+        let schema_key = text_required(&row, 3, "schema_key")?;
+        let schema_version = text_required(&row, 4, "schema_version")?;
+        let file_id = text_required(&row, 5, "file_id")?;
+        let plugin_key = text_required(&row, 6, "plugin_key")?;
+        let snapshot_content_raw = json_text_optional(&row, 7, "snapshot_content")?;
+        let metadata_raw = json_text_optional(&row, 8, "metadata")?;
         let snapshot_content = snapshot_content_raw
             .as_ref()
             .map(|s| CanonicalJson::from_text(s))
@@ -83,10 +84,11 @@ pub(crate) async fn load_data_with_executor(
             .as_ref()
             .map(|s| CanonicalJson::from_text(s))
             .transpose()?;
-        let created_at = text_required(&row, 8, "created_at")?;
+        let created_at = text_required(&row, 9, "created_at")?;
 
         let change = ChangeRecord {
             id: id.clone(),
+            change_ordinal,
             entity_id: entity_id.clone(),
             schema_key: schema_key.clone(),
             schema_version: schema_version.clone(),
@@ -106,7 +108,6 @@ pub(crate) async fn load_data_with_executor(
                         id: id.clone(),
                         entity_id: entity_id.clone(),
                         snapshot,
-                        created_at,
                     };
                     upsert_latest_by_entity(&mut commits, candidate, |record| {
                         record.entity_id.clone()
@@ -131,6 +132,7 @@ pub(crate) async fn load_data_with_executor(
             };
             let candidate = VersionDescriptorRecord {
                 id: id.clone(),
+                change_ordinal,
                 entity_id: entity_id.clone(),
                 schema_version: schema_version.clone(),
                 file_id: file_id.clone(),
@@ -148,11 +150,7 @@ pub(crate) async fn load_data_with_executor(
         if schema_key == "lix_commit_edge" {
             if let Some(ref snapshot_canonical) = snapshot_content {
                 if let Some(snapshot) = parse_commit_edge_snapshot(snapshot_canonical)? {
-                    commit_edges.push(CommitEdgeRecord {
-                        id,
-                        snapshot,
-                        created_at,
-                    });
+                    commit_edges.push(CommitEdgeRecord { id, snapshot });
                 }
             }
         }
@@ -163,7 +161,6 @@ pub(crate) async fn load_data_with_executor(
             .parent_id
             .cmp(&b.snapshot.parent_id)
             .then_with(|| a.snapshot.child_id.cmp(&b.snapshot.child_id))
-            .then_with(|| b.created_at.cmp(&a.created_at))
             .then_with(|| b.id.cmp(&a.id))
     });
 
@@ -190,33 +187,22 @@ where
 }
 
 trait HasOrder {
-    fn created_at_value(&self) -> &str;
-    fn id_value(&self) -> &str;
+    fn ordinal_value(&self) -> i64;
 
     fn is_newer_than(&self, other: &Self) -> bool {
-        self.created_at_value() > other.created_at_value()
-            || (self.created_at_value() == other.created_at_value()
-                && self.id_value() > other.id_value())
+        self.ordinal_value() > other.ordinal_value()
     }
 }
 
 impl HasOrder for CommitRecord {
-    fn created_at_value(&self) -> &str {
-        &self.created_at
-    }
-
-    fn id_value(&self) -> &str {
-        &self.id
+    fn ordinal_value(&self) -> i64 {
+        i64::MAX
     }
 }
 
 impl HasOrder for VersionDescriptorRecord {
-    fn created_at_value(&self) -> &str {
-        &self.created_at
-    }
-
-    fn id_value(&self) -> &str {
-        &self.id
+    fn ordinal_value(&self) -> i64 {
+        self.change_ordinal
     }
 }
 
@@ -285,6 +271,26 @@ fn text_required(row: &[Value], index: usize, label: &str) -> Result<String, Lix
             description: format!(
                 "materialization: expected text for column '{label}' at index {index}"
             ),
+        }),
+    }
+}
+
+fn integer_required(row: &[Value], index: usize, label: &str) -> Result<i64, LixError> {
+    let Some(value) = row.get(index) else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("materialization: missing required column '{label}'"),
+        });
+    };
+    match value {
+        Value::Integer(value) => Ok(*value),
+        Value::Text(value) => value.parse::<i64>().map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("materialization: invalid integer for '{label}': {error}"),
+        }),
+        other => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("materialization: expected integer for '{label}', got {other:?}"),
         }),
     }
 }

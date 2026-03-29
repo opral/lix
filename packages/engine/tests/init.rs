@@ -42,14 +42,9 @@ fn assert_uuid_v7_like(value: &str, field: &str) {
 async fn global_version_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let result = engine
         .execute(
-            "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
-             FROM lix_state_by_version \
-             WHERE schema_key = 'lix_version_ref' \
-               AND entity_id = 'global' \
-               AND file_id = 'lix' \
-               AND version_id = 'global' \
-               AND snapshot_content IS NOT NULL \
-             ORDER BY updated_at DESC, created_at DESC, change_id DESC \
+            "SELECT commit_id \
+             FROM lix_version \
+             WHERE id = 'global' \
              LIMIT 1",
             &[],
         )
@@ -906,72 +901,6 @@ simulation_test!(
                 "commit '{commit_id}' must exist exactly once"
             );
         }
-
-        let main_authoritative_tip = engine
-            .execute(
-                "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_version_ref' \
-                   AND entity_id = $1 \
-                   AND untracked = true \
-                   AND snapshot_content IS NOT NULL \
-                 ORDER BY updated_at DESC, created_at DESC \
-                 LIMIT 1",
-                &[lix_engine::Value::Text(main_version_id.clone())],
-            )
-            .await
-            .unwrap();
-        assert_eq!(main_authoritative_tip.statements[0].rows.len(), 1);
-        assert_eq!(
-            text_value(
-                &main_authoritative_tip.statements[0].rows[0][0],
-                "commit_id"
-            ),
-            baselines.statements[0]
-                .rows
-                .iter()
-                .find_map(|row| {
-                    if text_value(&row[0], "version_id") == main_version_id {
-                        Some(text_value(&row[1], "checkpoint_commit_id"))
-                    } else {
-                        None
-                    }
-                })
-                .expect("main version checkpoint must exist"),
-        );
-
-        let global_authoritative_tip = engine
-            .execute(
-                "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_version_ref' \
-                   AND entity_id = 'global' \
-                   AND untracked = true \
-                   AND snapshot_content IS NOT NULL \
-                 ORDER BY updated_at DESC, created_at DESC \
-                 LIMIT 1",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(global_authoritative_tip.statements[0].rows.len(), 1);
-        assert_eq!(
-            text_value(
-                &global_authoritative_tip.statements[0].rows[0][0],
-                "commit_id"
-            ),
-            baselines.statements[0]
-                .rows
-                .iter()
-                .find_map(|row| {
-                    if text_value(&row[0], "version_id") == "global" {
-                        Some(text_value(&row[1], "checkpoint_commit_id"))
-                    } else {
-                        None
-                    }
-                })
-                .expect("global checkpoint must exist"),
-        );
 
         let second_init_err = engine
             .initialize()

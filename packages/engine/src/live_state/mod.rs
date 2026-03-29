@@ -41,6 +41,7 @@ pub mod untracked;
 
 use crate::backend::QueryExecutor;
 pub use crate::canonical::CanonicalWatermark;
+use crate::live_state::shared::identity::RowIdentity;
 use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 use serde_json::Value as JsonValue;
@@ -312,9 +313,22 @@ pub(crate) async fn rebuild_scope_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     request: &LiveStateRebuildRequest,
 ) -> Result<LiveStateApplyReport, LixError> {
+    rebuild_scope_with_writer_key_hints_in_transaction(transaction, request, &BTreeMap::new()).await
+}
+
+pub(crate) async fn rebuild_scope_with_writer_key_hints_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    request: &LiveStateRebuildRequest,
+    writer_key_hints: &BTreeMap<RowIdentity, Option<String>>,
+) -> Result<LiveStateApplyReport, LixError> {
     let plan = materialize::rebuild_plan_with_transaction(transaction, request).await?;
     let (rows_deleted, tables_touched) =
-        materialize::apply_rebuild_scope_in_transaction(transaction, &plan).await?;
+        materialize::apply_rebuild_scope_with_writer_key_hints_in_transaction(
+            transaction,
+            &plan,
+            writer_key_hints,
+        )
+        .await?;
     Ok(LiveStateApplyReport {
         run_id: plan.run_id.clone(),
         rows_written: plan.writes.len(),
