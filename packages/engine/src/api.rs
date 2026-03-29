@@ -6,7 +6,7 @@ use crate::live_state::{
     mark_mode_with_backend, LiveStateApplyReport, LiveStateMode, LiveStateRebuildPlan,
     LiveStateRebuildReport, LiveStateRebuildRequest, ProjectionStatus,
 };
-use crate::sql_support::text::escape_sql_string;
+use crate::sql::common::text::escape_sql_string;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
 impl Engine {

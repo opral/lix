@@ -16,14 +16,14 @@ use crate::errors;
 use crate::read::runtime::{
     execute_execution_program_in_committed_read_transaction, prepare_committed_read_program,
 };
-use crate::sql::execution::execution_program::{
+use crate::sql::catalog::SurfaceRegistry;
+use crate::sql::executor::execution_program::{
     execute_execution_program_with_write_transaction, ExecutionContext, ExecutionProgram,
     SessionExecutionRuntime, SessionExecutionRuntimeHandle,
 };
-use crate::sql::execution::parse::parse_sql;
-use crate::sql::execution::runtime_state::ExecutionRuntimeState;
+use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
-use crate::sql::public::catalog::SurfaceRegistry;
+use crate::sql::parser::parse_sql;
 use crate::transaction::{TransactionCommitOutcome, WriteTransaction};
 use crate::workspace::{
     load_workspace_active_account_ids, persist_workspace_active_account_ids,

@@ -1,4 +1,4 @@
-use crate::sql_support::text::escape_sql_string;
+use crate::sql::common::text::escape_sql_string;
 use crate::{LixBackendTransaction, LixError, Value};
 
 use super::types::{UndoRedoOperationKind, UndoRedoOperationRecord};

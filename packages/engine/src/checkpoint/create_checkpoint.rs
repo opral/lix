@@ -7,7 +7,7 @@ use crate::init::seed::{
     quote_ident,
 };
 use crate::live_state::schema_access::tracked_relation_name;
-use crate::sql::execution::runtime_state::ExecutionRuntimeState;
+use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

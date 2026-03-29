@@ -166,16 +166,16 @@ mod tests {
                 include_str!("../plugin/runtime.rs"),
             ),
             (
-                "packages/engine/src/sql/public/catalog/mod.rs",
-                include_str!("../sql/public/catalog/mod.rs"),
+                "packages/engine/src/sql/catalog/mod.rs",
+                include_str!("../sql/catalog/mod.rs"),
             ),
             (
-                "packages/engine/src/sql/public/planner/semantics/state_assignments.rs",
-                include_str!("../sql/public/planner/semantics/state_assignments.rs"),
+                "packages/engine/src/sql/semantic_ir/semantics/state_assignments.rs",
+                include_str!("../sql/semantic_ir/semantics/state_assignments.rs"),
             ),
             (
-                "packages/engine/src/sql/public/planner/semantics/write_resolver/state_backed_writes.rs",
-                include_str!("../sql/public/planner/semantics/write_resolver/state_backed_writes.rs"),
+                "packages/engine/src/sql/semantic_ir/semantics/write_resolver/state_backed_writes.rs",
+                include_str!("../sql/semantic_ir/semantics/write_resolver/state_backed_writes.rs"),
             ),
         ] {
             assert!(

@@ -1,15 +1,15 @@
 use crate::engine::{DeferredTransactionSideEffects, Engine, TransactionBackendAdapter};
 use crate::filesystem::runtime::merge_filesystem_transaction_state;
 use crate::read::contracts::PublicReadExecutionMode;
-use crate::sql::execution::compiled::CompiledExecution;
-use crate::sql::execution::execution_program::ExecutionContext;
-use crate::sql::execution::shared_path::prepared_execution_mutates_public_surface_registry;
-use crate::sql::public::catalog::SurfaceRegistry;
-use crate::sql::public::runtime::{
+use crate::sql::catalog::SurfaceRegistry;
+use crate::sql::executor::compiled::CompiledExecution;
+use crate::sql::executor::execution_program::ExecutionContext;
+use crate::sql::executor::public_runtime::{
     apply_public_surface_registry_mutations, public_surface_registry_mutations,
-    PublicWriteExecutionPartition,
 };
-use crate::sql::public::services::pending_reads::{
+use crate::sql::executor::shared_path::prepared_execution_mutates_public_surface_registry;
+use crate::sql::physical_plan::PublicWriteExecutionPartition;
+use crate::sql::services::pending_reads::{
     bootstrap_public_surface_registry_with_pending_transaction_view, public_read_execution_mode,
 };
 use crate::transaction::PendingTransactionView;
@@ -91,12 +91,12 @@ pub(crate) async fn mirror_public_registered_schema_bootstrap_rows(
         let snapshot_sql = row
             .snapshot_content
             .as_ref()
-            .map(|value| format!("'{}'", crate::sql_support::text::escape_sql_string(value)))
+            .map(|value| format!("'{}'", crate::sql::common::text::escape_sql_string(value)))
             .unwrap_or_else(|| "NULL".to_string());
         let metadata_sql = row
             .metadata
             .as_ref()
-            .map(|value| format!("'{}'", crate::sql_support::text::escape_sql_string(value)))
+            .map(|value| format!("'{}'", crate::sql::common::text::escape_sql_string(value)))
             .unwrap_or_else(|| "NULL".to_string());
         let writer_key_sql = "NULL".to_string();
         let is_tombstone = if row.snapshot_content.is_some() { 0 } else { 1 };
@@ -116,21 +116,21 @@ pub(crate) async fn mirror_public_registered_schema_bootstrap_rows(
              metadata = excluded.metadata, \
              writer_key = excluded.writer_key, \
              is_tombstone = excluded.is_tombstone, \
-             updated_at = excluded.updated_at",
+            updated_at = excluded.updated_at",
             table = REGISTERED_SCHEMA_BOOTSTRAP_TABLE,
-            entity_id = crate::sql_support::text::escape_sql_string(&row.entity_id),
-            schema_key = crate::sql_support::text::escape_sql_string(&row.schema_key),
-            schema_version = crate::sql_support::text::escape_sql_string(&row.schema_version),
-            file_id = crate::sql_support::text::escape_sql_string(&row.file_id),
-            version_id = crate::sql_support::text::escape_sql_string(GLOBAL_VERSION_ID),
-            plugin_key = crate::sql_support::text::escape_sql_string(&row.plugin_key),
+            entity_id = crate::sql::common::text::escape_sql_string(&row.entity_id),
+            schema_key = crate::sql::common::text::escape_sql_string(&row.schema_key),
+            schema_version = crate::sql::common::text::escape_sql_string(&row.schema_version),
+            file_id = crate::sql::common::text::escape_sql_string(&row.file_id),
+            version_id = crate::sql::common::text::escape_sql_string(GLOBAL_VERSION_ID),
+            plugin_key = crate::sql::common::text::escape_sql_string(&row.plugin_key),
             snapshot_content = snapshot_sql,
-            change_id = crate::sql_support::text::escape_sql_string(&row.id),
+            change_id = crate::sql::common::text::escape_sql_string(&row.id),
             metadata = metadata_sql,
             writer_key = writer_key_sql,
             is_tombstone = is_tombstone,
-            created_at = crate::sql_support::text::escape_sql_string(&row.created_at),
-            updated_at = crate::sql_support::text::escape_sql_string(&row.created_at),
+            created_at = crate::sql::common::text::escape_sql_string(&row.created_at),
+            updated_at = crate::sql::common::text::escape_sql_string(&row.created_at),
         );
 
         transaction.execute(&sql, &[]).await?;
@@ -355,7 +355,7 @@ fn apply_execution_planning_effects(
 }
 
 fn public_write_execution_next_active_version_id(
-    public_write: &crate::sql::public::runtime::PreparedPublicWrite,
+    public_write: &crate::sql::executor::public_runtime::PreparedPublicWrite,
 ) -> Option<String> {
     public_write.materialization().and_then(|execution| {
         execution

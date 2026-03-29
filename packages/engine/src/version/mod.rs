@@ -50,6 +50,7 @@ pub(crate) fn active_version_schema_key() -> &'static str {
     &active_version_schema_metadata().schema_key
 }
 
+#[cfg(test)]
 pub(crate) fn active_version_schema_version() -> &'static str {
     &active_version_schema_metadata().schema_version
 }
@@ -58,6 +59,7 @@ pub(crate) fn active_version_file_id() -> &'static str {
     &active_version_schema_metadata().file_id
 }
 
+#[cfg(test)]
 pub(crate) fn active_version_plugin_key() -> &'static str {
     &active_version_schema_metadata().plugin_key
 }
@@ -66,6 +68,7 @@ pub(crate) fn active_version_storage_version_id() -> &'static str {
     &active_version_schema_metadata().storage_version_id
 }
 
+#[cfg(test)]
 pub(crate) fn active_version_snapshot_content(entity_id: &str, version_id: &str) -> String {
     serde_json::to_string(&LixActiveVersion {
         id: entity_id.to_string(),
