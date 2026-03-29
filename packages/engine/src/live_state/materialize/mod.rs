@@ -1,3 +1,9 @@
+//! Live-state materialization rebuilds semantic state from canonical changes.
+//!
+//! Workspace annotation data such as `writer_key` may be supplied as optional
+//! overlay hints for current read surfaces, but it is not a required input for
+//! semantic replay correctness.
+
 mod apply;
 mod loader;
 mod plan;

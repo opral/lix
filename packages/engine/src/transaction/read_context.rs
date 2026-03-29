@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 
@@ -14,6 +14,7 @@ use crate::live_state::untracked::{
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedReadView, UntrackedRow,
     UntrackedScanRequest,
 };
+use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
 use crate::LixError;
 
 use super::overlay::PendingWriteOverlay;
@@ -23,9 +24,13 @@ pub struct ReadContext<'a> {
 }
 
 impl<'a> ReadContext<'a> {
-    pub fn new(tracked: &'a dyn TrackedReadView, untracked: &'a dyn UntrackedReadView) -> Self {
+    pub(crate) fn new(
+        tracked: &'a dyn TrackedReadView,
+        untracked: &'a dyn UntrackedReadView,
+        workspace_writer_keys: &'a dyn WorkspaceWriterKeyReadView,
+    ) -> Self {
         Self {
-            base: ReadViews::new(tracked, untracked),
+            base: ReadViews::new(tracked, untracked, workspace_writer_keys),
         }
     }
 
@@ -54,6 +59,10 @@ impl<'a> ReadContext<'a> {
                 base: self.base.tracked_tombstones,
                 pending,
             },
+            workspace_writer_keys: PendingWorkspaceWriterKeyReadView {
+                base: self.base.workspace_writer_keys,
+                pending,
+            },
         }
     }
 }
@@ -62,11 +71,16 @@ pub(crate) struct PendingReadContext<'a> {
     tracked: PendingTrackedReadView<'a>,
     untracked: PendingUntrackedReadView<'a>,
     tracked_tombstones: PendingTrackedTombstoneView<'a>,
+    workspace_writer_keys: PendingWorkspaceWriterKeyReadView<'a>,
 }
 
 impl<'a> PendingReadContext<'a> {
     pub(crate) fn effective_state_context(&'a self) -> effective::ReadContext<'a> {
-        let context = effective::ReadContext::new(&self.tracked, &self.untracked);
+        let context = effective::ReadContext::new(
+            &self.tracked,
+            &self.untracked,
+            &self.workspace_writer_keys,
+        );
         if self.tracked_tombstones.has_source() {
             context.with_tracked_tombstones(&self.tracked_tombstones)
         } else {
@@ -90,9 +104,44 @@ struct PendingTrackedTombstoneView<'a> {
     pending: &'a PendingWriteOverlay,
 }
 
+struct PendingWorkspaceWriterKeyReadView<'a> {
+    base: &'a dyn WorkspaceWriterKeyReadView,
+    pending: &'a PendingWriteOverlay,
+}
+
 impl PendingTrackedTombstoneView<'_> {
     fn has_source(&self) -> bool {
         self.base.is_some() || self.pending.has_tombstones()
+    }
+}
+
+#[async_trait(?Send)]
+impl WorkspaceWriterKeyReadView for PendingWorkspaceWriterKeyReadView<'_> {
+    async fn load_annotation(
+        &self,
+        row_identity: &RowIdentity,
+    ) -> Result<Option<String>, LixError> {
+        if let Some(annotation) =
+            pending_workspace_writer_key_annotation(self.pending, row_identity)
+        {
+            return Ok(annotation);
+        }
+        self.base.load_annotation(row_identity).await
+    }
+
+    async fn load_annotations(
+        &self,
+        row_identities: &BTreeSet<RowIdentity>,
+    ) -> Result<BTreeMap<RowIdentity, Option<String>>, LixError> {
+        let mut annotations = self.base.load_annotations(row_identities).await?;
+        for row_identity in row_identities {
+            if let Some(annotation) =
+                pending_workspace_writer_key_annotation(self.pending, row_identity)
+            {
+                annotations.insert(row_identity.clone(), annotation);
+            }
+        }
+        Ok(annotations)
     }
 }
 
@@ -380,6 +429,19 @@ fn pending_tracked_tombstone<'a>(
         .iter()
         .find(|(identity, _)| identity.matches_exact(request))
         .map(|(_, row)| row)
+}
+
+fn pending_workspace_writer_key_annotation(
+    pending: &PendingWriteOverlay,
+    row_identity: &RowIdentity,
+) -> Option<Option<String>> {
+    if let Some(row) = pending.tracked_rows().get(row_identity) {
+        return Some(row.writer_key.clone());
+    }
+    pending
+        .tracked_tombstones()
+        .get(row_identity)
+        .map(|row| row.writer_key.clone())
 }
 
 fn pending_untracked_row<'a>(

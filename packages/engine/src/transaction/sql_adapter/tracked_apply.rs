@@ -207,6 +207,7 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
                 state_commit_stream_operation(
                     unit.public_write.planned_write.command.operation_kind,
                 ),
+                unit.writer_key.as_deref(),
             )?
         } else {
             unit.execution.semantic_effects.clone()

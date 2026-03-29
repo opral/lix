@@ -1,4 +1,5 @@
 use crate::filesystem::runtime::{merge_filesystem_transaction_state, FilesystemTransactionState};
+use crate::live_state::shared::identity::RowIdentity;
 use crate::sql::catalog::{DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, SurfaceVariant};
 use crate::sql::semantic_ir::ExecutionContext;
 use crate::Value;
@@ -450,9 +451,6 @@ impl CanonicalStateRowKey {
                 Value::Text(schema_version.clone()),
             );
         }
-        if let Some(writer_key) = self.writer_key.as_ref() {
-            filters.insert("writer_key".to_string(), Value::Text(writer_key.clone()));
-        }
         filters
     }
 }
@@ -539,6 +537,7 @@ pub(crate) struct PlannedStateRow {
     pub(crate) schema_key: String,
     pub(crate) version_id: Option<String>,
     pub(crate) values: BTreeMap<String, Value>,
+    pub(crate) writer_key: Option<String>,
     pub(crate) tombstone: bool,
 }
 
@@ -566,6 +565,7 @@ pub(crate) struct ResolvedWritePartition {
     pub(crate) authoritative_pre_state: Vec<ResolvedRowRef>,
     pub(crate) authoritative_pre_state_rows: Vec<PlannedStateRow>,
     pub(crate) intended_post_state: Vec<PlannedStateRow>,
+    pub(crate) workspace_writer_key_updates: BTreeMap<RowIdentity, Option<String>>,
     pub(crate) tombstones: Vec<ResolvedRowRef>,
     pub(crate) lineage: Vec<RowLineage>,
     pub(crate) target_write_lane: Option<WriteLane>,

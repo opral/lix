@@ -1,4 +1,5 @@
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
+use crate::live_state::shared::identity::RowIdentity;
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
 };
@@ -17,6 +18,7 @@ use crate::sql::services::state_reader::{
 use crate::transaction::PendingTransactionView;
 use crate::transaction::{PendingSemanticRow, PendingSemanticStorage};
 use crate::version::GLOBAL_VERSION_ID;
+use crate::workspace::writer_key::load_workspace_writer_key_annotation;
 use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::{Expr, OrderBy, OrderByKind, SelectItem, Visit, Visitor};
 use std::collections::{BTreeMap, BTreeSet};
@@ -64,6 +66,12 @@ pub(crate) struct ExactEffectiveStateRow {
     pub(crate) values: BTreeMap<String, Value>,
     pub(crate) source_change_id: Option<String>,
     pub(crate) overlay_lane: OverlayLane,
+}
+
+enum TrackedExactEffectiveRowLookup {
+    Matched(ExactEffectiveStateRow),
+    Shadowed,
+    Missing,
 }
 
 pub(crate) fn build_effective_state(
@@ -300,26 +308,30 @@ pub(crate) async fn resolve_exact_effective_state_row_with_pending_transaction_v
             return Ok(row);
         }
 
-        let row = match lane {
+        match lane {
             OverlayLane::LocalTracked | OverlayLane::GlobalTracked => {
-                load_exact_tracked_effective_row(backend, request, &internal_version_id, lane)
-                    .await?
+                match load_exact_tracked_effective_row(
+                    backend,
+                    pending_transaction_view,
+                    request,
+                    &internal_version_id,
+                    lane,
+                )
+                .await?
+                {
+                    TrackedExactEffectiveRowLookup::Matched(row) => return Ok(Some(row)),
+                    TrackedExactEffectiveRowLookup::Shadowed => return Ok(None),
+                    TrackedExactEffectiveRowLookup::Missing => {}
+                }
             }
             OverlayLane::LocalUntracked | OverlayLane::GlobalUntracked => {
-                load_exact_untracked_effective_row(backend, request, &internal_version_id, lane)
-                    .await?
+                if let Some(row) =
+                    load_exact_untracked_effective_row(backend, request, &internal_version_id, lane)
+                        .await?
+                {
+                    return Ok(Some(row));
+                }
             }
-        };
-
-        if row.is_some() {
-            return Ok(row);
-        }
-
-        if matches!(lane, OverlayLane::LocalTracked | OverlayLane::GlobalTracked)
-            && tracked_exact_row_exists_including_tombstones(backend, request, &internal_version_id)
-                .await?
-        {
-            return Ok(None);
         }
     }
 
@@ -359,10 +371,11 @@ async fn tracked_exact_row_exists_including_tombstones(
 
 async fn load_exact_tracked_effective_row(
     backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
     request: &ExactEffectiveStateRowRequest,
     internal_version_id: &str,
     overlay_lane: OverlayLane,
-) -> Result<Option<ExactEffectiveStateRow>, LixError> {
+) -> Result<TrackedExactEffectiveRowLookup, LixError> {
     let row = load_exact_committed_state_row(
         backend,
         &ExactCommittedStateRowRequest {
@@ -374,8 +387,23 @@ async fn load_exact_tracked_effective_row(
     )
     .await?;
 
-    Ok(row
-        .map(|row| exact_effective_state_row_from_tracked(row, &request.version_id, overlay_lane)))
+    if let Some(row) = row {
+        let row =
+            tracked_exact_row_with_workspace_writer_key(backend, pending_transaction_view, row)
+                .await?;
+        if tracked_exact_row_matches_row_key(&row, &request.row_key) {
+            return Ok(TrackedExactEffectiveRowLookup::Matched(
+                exact_effective_state_row_from_tracked(row, &request.version_id, overlay_lane),
+            ));
+        }
+        return Ok(TrackedExactEffectiveRowLookup::Shadowed);
+    }
+
+    if tracked_exact_row_exists_including_tombstones(backend, request, internal_version_id).await? {
+        return Ok(TrackedExactEffectiveRowLookup::Shadowed);
+    }
+
+    Ok(TrackedExactEffectiveRowLookup::Missing)
 }
 
 async fn load_exact_untracked_effective_row(
@@ -401,7 +429,7 @@ async fn load_exact_untracked_effective_row(
 }
 
 fn exact_effective_state_row_from_tracked(
-    row: ExactCommittedStateRow,
+    mut row: ExactCommittedStateRow,
     requested_version_id: &str,
     overlay_lane: OverlayLane,
 ) -> ExactEffectiveStateRow {
@@ -412,10 +440,15 @@ fn exact_effective_state_row_from_tracked(
     } else {
         row.version_id.clone()
     };
+    let writer_key = row.writer_key.take();
     let mut values = row.values;
     values.insert(
         "version_id".to_string(),
         Value::Text(projected_version_id.clone()),
+    );
+    values.insert(
+        "writer_key".to_string(),
+        writer_key.clone().map(Value::Text).unwrap_or(Value::Null),
     );
     ExactEffectiveStateRow {
         entity_id: row.entity_id.clone(),
@@ -557,17 +590,58 @@ fn row_key_constraints(row_key: &CanonicalStateRowKey) -> Vec<ScanConstraint> {
 
 fn tombstone_matches_row_key(row: &TrackedTombstoneMarker, row_key: &CanonicalStateRowKey) -> bool {
     row_key
-        .writer_key
+        .plugin_key
         .as_deref()
-        .is_none_or(|writer_key| row.writer_key.as_deref() == Some(writer_key))
-        && row_key
-            .plugin_key
-            .as_deref()
-            .is_none_or(|plugin_key| row.plugin_key.as_deref() == Some(plugin_key))
+        .is_none_or(|plugin_key| row.plugin_key.as_deref() == Some(plugin_key))
         && row_key
             .schema_version
             .as_deref()
             .is_none_or(|schema_version| row.schema_version.as_deref() == Some(schema_version))
+}
+
+async fn tracked_exact_row_with_workspace_writer_key(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    mut row: ExactCommittedStateRow,
+) -> Result<ExactCommittedStateRow, LixError> {
+    let identity = RowIdentity {
+        schema_key: row.schema_key.clone(),
+        version_id: row.version_id.clone(),
+        entity_id: row.entity_id.clone(),
+        file_id: row.file_id.clone(),
+    };
+    let writer_key = if let Some(writer_key) =
+        pending_workspace_writer_key_annotation(pending_transaction_view, &identity)
+    {
+        writer_key
+    } else {
+        load_workspace_writer_key_annotation(backend, &identity).await?
+    };
+    row.writer_key = writer_key.clone();
+    row.values.insert(
+        "writer_key".to_string(),
+        writer_key.map(Value::Text).unwrap_or(Value::Null),
+    );
+    Ok(row)
+}
+
+fn pending_workspace_writer_key_annotation(
+    pending_transaction_view: Option<&PendingTransactionView>,
+    identity: &RowIdentity,
+) -> Option<Option<String>> {
+    pending_transaction_view
+        .and_then(PendingTransactionView::workspace_writer_key_overlay)
+        .and_then(|overlay| overlay.annotation(identity).cloned())
+}
+
+fn tracked_exact_row_matches_row_key(
+    row: &ExactCommittedStateRow,
+    row_key: &CanonicalStateRowKey,
+) -> bool {
+    row_key
+        .writer_key
+        .as_deref()
+        .is_none_or(|writer_key| row.writer_key.as_deref() == Some(writer_key))
 }
 
 fn untracked_row_matches_row_key(row: &LiveReadRow, row_key: &CanonicalStateRowKey) -> bool {
@@ -650,10 +724,19 @@ async fn load_exact_pending_effective_row(
         return Ok(Some(None));
     }
 
-    Ok(Some(Some(
-        exact_effective_state_row_from_pending(backend, pending, &request.version_id, overlay_lane)
-            .await?,
-    )))
+    let row = exact_effective_state_row_from_pending(
+        backend,
+        pending_transaction_view,
+        pending,
+        &request.version_id,
+        overlay_lane,
+    )
+    .await?;
+    if !pending_effective_row_matches_row_key(&row, &request.row_key) {
+        return Ok(Some(None));
+    }
+
+    Ok(Some(Some(row)))
 }
 
 fn pending_row_matches_exact_request(
@@ -672,6 +755,7 @@ fn pending_row_matches_exact_request(
 
 async fn exact_effective_state_row_from_pending(
     backend: &dyn LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
     row: &PendingSemanticRow,
     requested_version_id: &str,
     overlay_lane: OverlayLane,
@@ -709,6 +793,20 @@ async fn exact_effective_state_row_from_pending(
         "metadata".to_string(),
         row.metadata.clone().map(Value::Text).unwrap_or(Value::Null),
     );
+    let writer_key = pending_workspace_writer_key_annotation(
+        pending_transaction_view,
+        &RowIdentity {
+            schema_key: row.schema_key.clone(),
+            version_id: row.version_id.clone(),
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+        },
+    )
+    .flatten();
+    values.insert(
+        "writer_key".to_string(),
+        writer_key.map(Value::Text).unwrap_or(Value::Null),
+    );
 
     Ok(ExactEffectiveStateRow {
         entity_id: row.entity_id.clone(),
@@ -718,6 +816,18 @@ async fn exact_effective_state_row_from_pending(
         values,
         source_change_id: Some("pending".to_string()),
         overlay_lane,
+    })
+}
+
+fn pending_effective_row_matches_row_key(
+    row: &ExactEffectiveStateRow,
+    row_key: &CanonicalStateRowKey,
+) -> bool {
+    row_key.writer_key.as_deref().is_none_or(|writer_key| {
+        matches!(
+            row.values.get("writer_key"),
+            Some(Value::Text(actual)) if actual == writer_key
+        )
     })
 }
 

@@ -30,3 +30,5 @@ mod system_tables;
 mod version_view;
 #[path = "sql_surfaces/working_changes.rs"]
 mod working_changes;
+#[path = "sql_surfaces/writer_key.rs"]
+mod writer_key;

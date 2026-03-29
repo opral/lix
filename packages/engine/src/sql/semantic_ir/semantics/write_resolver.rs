@@ -2,6 +2,7 @@ use crate::canonical::version_state::load_version_descriptor_with_backend;
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::live_state::shared::identity::RowIdentity;
 use crate::sql::catalog::SurfaceFamily;
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateSelector, MutationPayload, PlannedStateRow, PlannedWrite, ResolvedRowRef,
@@ -60,6 +61,7 @@ struct ResolvedWritePartitionBuilder {
     authoritative_pre_state: Vec<ResolvedRowRef>,
     authoritative_pre_state_rows: Vec<PlannedStateRow>,
     intended_post_state: Vec<PlannedStateRow>,
+    workspace_writer_key_updates: BTreeMap<RowIdentity, Option<String>>,
     tombstones: Vec<ResolvedRowRef>,
     lineage: Vec<RowLineage>,
     filesystem_state: crate::filesystem::runtime::FilesystemTransactionState,
@@ -69,6 +71,7 @@ impl ResolvedWritePartitionBuilder {
     fn is_empty(&self) -> bool {
         self.authoritative_pre_state.is_empty()
             && self.intended_post_state.is_empty()
+            && self.workspace_writer_key_updates.is_empty()
             && self.tombstones.is_empty()
             && self.lineage.is_empty()
     }
@@ -80,6 +83,7 @@ impl ResolvedWritePartitionBuilder {
             authoritative_pre_state: self.authoritative_pre_state,
             authoritative_pre_state_rows: self.authoritative_pre_state_rows,
             intended_post_state: self.intended_post_state,
+            workspace_writer_key_updates: self.workspace_writer_key_updates,
             tombstones: self.tombstones,
             lineage: self.lineage,
             target_write_lane: None,
@@ -106,6 +110,12 @@ impl ResolvedWritePartitionBuilder {
                 return true;
             };
             let unchanged = !row.tombstone && planned_state_rows_equivalent(authoritative, row);
+            if unchanged && authoritative.writer_key != row.writer_key {
+                if let Some(identity) = planned_state_row_workspace_identity(row) {
+                    self.workspace_writer_key_updates
+                        .insert(identity, row.writer_key.clone());
+                }
+            }
             if unchanged && row.schema_key == "lix_binary_blob_ref" && row.version_id.is_some() {
                 dropped_blob_rows.insert((
                     row.entity_id.clone(),
@@ -608,6 +618,7 @@ fn version_descriptor_row(id: &str, name: &str, hidden: bool) -> PlannedStateRow
         schema_key: version_descriptor_schema_key().to_string(),
         version_id: Some(GLOBAL_VERSION_ID.to_string()),
         values,
+        writer_key: None,
         tombstone: false,
     }
 }
@@ -644,6 +655,7 @@ fn version_ref_row(id: &str, commit_id: &str) -> PlannedStateRow {
         schema_key: version_ref_schema_key().to_string(),
         version_id: Some(GLOBAL_VERSION_ID.to_string()),
         values,
+        writer_key: None,
         tombstone: false,
     }
 }
@@ -681,6 +693,7 @@ fn single_partition_write_plan(
         authoritative_pre_state,
         authoritative_pre_state_rows,
         intended_post_state,
+        workspace_writer_key_updates: BTreeMap::new(),
         tombstones,
         lineage,
         filesystem_state: Default::default(),
@@ -705,6 +718,18 @@ fn planned_state_rows_equivalent(left: &PlannedStateRow, right: &PlannedStateRow
         && left.version_id == right.version_id
         && left.tombstone == right.tombstone
         && left.values == right.values
+}
+
+fn planned_state_row_workspace_identity(row: &PlannedStateRow) -> Option<RowIdentity> {
+    Some(RowIdentity {
+        schema_key: row.schema_key.clone(),
+        version_id: row.version_id.clone()?,
+        entity_id: row.entity_id.clone(),
+        file_id: row.values.get("file_id").and_then(|value| match value {
+            Value::Text(value) => Some(value.clone()),
+            _ => None,
+        })?,
+    })
 }
 
 fn execution_mode_for_overlay_lane(overlay_lane: OverlayLane) -> WriteMode {
@@ -1030,7 +1055,9 @@ fn finalize_resolved_write_plan(
     mut resolved: ResolvedWritePlan,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     resolved.partitions.retain(|partition| {
-        !partition.intended_post_state.is_empty() || !partition.filesystem_state.files.is_empty()
+        !partition.intended_post_state.is_empty()
+            || !partition.filesystem_state.files.is_empty()
+            || !partition.workspace_writer_key_updates.is_empty()
     });
     for partition in &mut resolved.partitions {
         if partition.execution_mode == WriteMode::Untracked {
