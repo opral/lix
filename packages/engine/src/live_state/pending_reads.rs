@@ -6,7 +6,7 @@ use crate::read::contracts::{
     committed_read_mode_from_prepared_public_read, CommittedReadMode, PublicReadExecutionMode,
 };
 use crate::sql::catalog::{SurfaceFamily, SurfaceVariant};
-use crate::sql::executor::public_runtime::{
+use crate::sql::executor::{
     decode_public_read_result, execute_prepared_public_read, PreparedPublicRead,
 };
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::sql::common::text::escape_sql_string;
-use crate::sql::executor::public_runtime::PreparedPublicWrite;
+use crate::sql::executor::PreparedPublicWrite;
 use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
 use crate::{LixBackendTransaction, LixError, Value};
 

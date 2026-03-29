@@ -1,4 +1,4 @@
-use crate::sql::executor::public_runtime::PreparedPublicRead;
+use crate::sql::executor::PreparedPublicRead;
 use crate::TransactionMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

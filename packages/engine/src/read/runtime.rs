@@ -3,14 +3,15 @@ use crate::engine::{
 };
 use crate::read::contracts::committed_read_mode_from_prepared_public_read;
 use crate::session::contracts::SessionExecutionMode;
-use crate::sql::executor::compiled::{CompiledExecution, CompiledExecutionBody};
 use crate::sql::executor::execute_prepared::execute_prepared_with_transaction;
 use crate::sql::executor::execution_program::{
     BoundStatementTemplateInstance, ExecutionContext, ExecutionProgram,
 };
-use crate::sql::executor::public_runtime::execute_prepared_public_read;
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;
-use crate::sql::executor::shared_path::{self, PreparationPolicy};
+use crate::sql::executor::{
+    compile_execution_from_template_instance_with_backend, execute_prepared_public_read,
+    CompiledExecution, PreparationPolicy,
+};
 use crate::sql::logical_plan::ResultContract;
 use crate::{
     ExecuteResult, LixBackend, LixBackendTransaction, LixError, QueryResult, TransactionMode,
@@ -88,7 +89,7 @@ async fn compile_bound_statement_template_instance_for_committed_read(
     runtime_state: &ExecutionRuntimeState,
 ) -> Result<CompiledExecution, LixError> {
     let parsed_statements = std::slice::from_ref(bound_statement_template.statement());
-    match shared_path::compile_execution_from_template_instance_with_backend(
+    match compile_execution_from_template_instance_with_backend(
         engine,
         backend,
         None,
@@ -145,20 +146,23 @@ fn merge_committed_read_transaction_mode(
 fn transaction_mode_for_committed_read_execution(
     compiled: &CompiledExecution,
 ) -> Result<TransactionMode, LixError> {
-    match &compiled.body {
-        CompiledExecutionBody::PublicRead(public_read) => {
-            Ok(committed_read_mode_from_prepared_public_read(public_read).transaction_mode())
-        }
-        CompiledExecutionBody::Internal(_) if compiled.read_only_query => Ok(TransactionMode::Read),
-        CompiledExecutionBody::Internal(_) => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "committed read routing compiled a non-read internal step unexpectedly",
-        )),
-        CompiledExecutionBody::PublicWrite(_) => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "committed read routing compiled a public write unexpectedly",
-        )),
+    if let Some(public_read) = compiled.public_read() {
+        return Ok(committed_read_mode_from_prepared_public_read(public_read).transaction_mode());
     }
+    if compiled.internal_execution().is_some() {
+        return if compiled.read_only_query {
+            Ok(TransactionMode::Read)
+        } else {
+            Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "committed read routing compiled a non-read internal step unexpectedly",
+            ))
+        };
+    }
+    Err(LixError::new(
+        "LIX_ERROR_UNKNOWN",
+        "committed read routing compiled a public write unexpectedly",
+    ))
 }
 
 fn public_result_from_contract(
@@ -245,44 +249,42 @@ async fn execute_compiled_committed_read_in_transaction(
     source_statement: &Statement,
 ) -> Result<QueryResult, LixError> {
     let parsed_statements = std::slice::from_ref(source_statement);
-    match &compiled.body {
-        CompiledExecutionBody::PublicRead(public_read) => {
-            let backend = TransactionBackendAdapter::new(transaction);
-            match execute_prepared_public_read(&backend, public_read).await {
-                Ok(result) => Ok(result),
-                Err(error) => Err(normalize_sql_execution_error_with_backend(
+    if let Some(public_read) = compiled.public_read() {
+        let backend = TransactionBackendAdapter::new(transaction);
+        return match execute_prepared_public_read(&backend, public_read).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                Err(
+                    normalize_sql_execution_error_with_backend(&backend, error, parsed_statements)
+                        .await,
+                )
+            }
+        };
+    }
+    if let Some(internal) = compiled.internal_execution() {
+        let internal_result =
+            execute_prepared_with_transaction(transaction, &internal.prepared_statements)
+                .await
+                .map_err(LixError::from);
+        let internal_result = match internal_result {
+            Ok(result) => result,
+            Err(error) => {
+                let backend = TransactionBackendAdapter::new(transaction);
+                return Err(normalize_sql_execution_error_with_backend(
                     &backend,
                     error,
                     parsed_statements,
                 )
-                .await),
+                .await);
             }
-        }
-        CompiledExecutionBody::Internal(internal) => {
-            let internal_result =
-                execute_prepared_with_transaction(transaction, &internal.prepared_statements)
-                    .await
-                    .map_err(LixError::from);
-            let internal_result = match internal_result {
-                Ok(result) => result,
-                Err(error) => {
-                    let backend = TransactionBackendAdapter::new(transaction);
-                    return Err(normalize_sql_execution_error_with_backend(
-                        &backend,
-                        error,
-                        parsed_statements,
-                    )
-                    .await);
-                }
-            };
-            Ok(public_result_from_contract(
-                compiled.result_contract,
-                &internal_result,
-            ))
-        }
-        CompiledExecutionBody::PublicWrite(_) => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "committed read execution compiled a write-routed step unexpectedly",
-        )),
+        };
+        return Ok(public_result_from_contract(
+            compiled.result_contract,
+            &internal_result,
+        ));
     }
+    Err(LixError::new(
+        "LIX_ERROR_UNKNOWN",
+        "committed read execution compiled a write-routed step unexpectedly",
+    ))
 }

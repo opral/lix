@@ -19,7 +19,7 @@ pub(crate) use crate::sql::executor::contracts::effects::{
 };
 pub(crate) use crate::sql::executor::contracts::planned_statement::MutationRow;
 pub(crate) use crate::sql::executor::execution_program::ExecutionContext;
-pub(crate) use crate::sql::executor::public_runtime::{
+pub(crate) use crate::sql::executor::{
     build_tracked_txn_unit, semantic_plan_effects_from_domain_changes,
     state_commit_stream_operation, PreparedPublicWrite, TrackedTxnUnit,
 };

@@ -1,7 +1,5 @@
 use crate::cel::CelEvaluator;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
-use crate::sql::executor::contracts::planned_statement::PlannedStatementSet;
-use crate::sql::executor::public_runtime::statement_references_public_surface_with_backend;
 use crate::sql::logical_plan::{
     result_contract_for_statements, verify_logical_plan, InternalLogicalPlan, LogicalPlan,
 };
@@ -9,6 +7,9 @@ use crate::sql::parser::parse_sql_statements;
 use crate::sql::semantic_ir::prepare_internal_statements_with_backend_to_plan;
 use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::Statement;
+
+use super::contracts::planned_statement::PlannedStatementSet;
+use super::statement_references_public_surface_with_backend;
 
 pub(crate) async fn preprocess_sql_to_plan(
     backend: &dyn LixBackend,
