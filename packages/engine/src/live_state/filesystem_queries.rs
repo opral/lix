@@ -5,8 +5,7 @@ use crate::filesystem::live_projection::{
 use crate::filesystem::path::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
 use crate::filesystem::runtime::FilesystemTransactionFileState;
 use crate::live_state::schema_access::tracked_relation_name;
-use crate::sql::common::ast::{lower_statement, parse_sql_statements};
-use crate::sql_support::text::escape_sql_string;
+use crate::sql::common::text::escape_sql_string;
 use crate::transaction::PendingTransactionView;
 use crate::transaction::{PendingSemanticRow, PendingSemanticStorage};
 use crate::version::GLOBAL_VERSION_ID;
@@ -868,19 +867,10 @@ async fn load_file_rows_from_sql(
 }
 
 fn lower_internal_sql_for_backend(
-    backend: &dyn LixBackend,
+    _backend: &dyn LixBackend,
     sql: &str,
 ) -> Result<String, FilesystemQueryError> {
-    let mut statements = parse_sql_statements(sql).map_err(filesystem_query_backend_error)?;
-    if statements.len() != 1 {
-        return Err(FilesystemQueryError {
-            message: "public filesystem resolver expected a single helper statement".to_string(),
-        });
-    }
-    let statement = statements.remove(0);
-    let lowered =
-        lower_statement(statement, backend.dialect()).map_err(filesystem_query_backend_error)?;
-    Ok(lowered.to_string())
+    Ok(sql.to_string())
 }
 
 #[derive(Debug, Clone)]

@@ -23,7 +23,6 @@ mod read;
 mod schema;
 pub mod session;
 pub(crate) mod sql;
-mod sql_support;
 pub(crate) mod state;
 #[cfg(test)]
 mod test_support;

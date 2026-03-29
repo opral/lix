@@ -7,7 +7,7 @@ use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::matching::select_best_glob_match;
 use crate::plugin::storage::plugin_key_from_archive_path;
 use crate::plugin::types::{InstalledPlugin, PluginContentType};
-use crate::sql::execution::preprocess::preprocess_sql_to_plan as preprocess_sql;
+use crate::sql::executor::preprocess::preprocess_sql_to_plan as preprocess_sql;
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

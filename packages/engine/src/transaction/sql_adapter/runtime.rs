@@ -8,15 +8,15 @@ use crate::engine::{
 };
 use crate::functions::SharedFunctionProvider;
 use crate::live_state::SchemaRegistrationSet;
-use crate::sql::execution::compiled::{
+use crate::sql::executor::compiled::{
     schema_registrations_for_compiled_execution, CompiledExecution, CompiledInternalExecution,
 };
-use crate::sql::execution::contracts::effects::PlanEffects;
-use crate::sql::execution::contracts::executor_error::ExecutorError;
-use crate::sql::execution::contracts::result_contract::ResultContract;
-use crate::sql::execution::execute_prepared::execute_prepared_with_transaction;
-use crate::sql::public::runtime::PreparedPublicRead;
-use crate::sql::public::services::pending_reads::execute_prepared_public_read_with_pending_transaction_view;
+use crate::sql::executor::contracts::effects::PlanEffects;
+use crate::sql::executor::contracts::executor_error::ExecutorError;
+use crate::sql::executor::execute_prepared::execute_prepared_with_transaction;
+use crate::sql::executor::public_runtime::PreparedPublicRead;
+use crate::sql::logical_plan::ResultContract;
+use crate::sql::services::pending_reads::execute_prepared_public_read_with_pending_transaction_view;
 use crate::state::stream::StateCommitStreamChange;
 use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, QueryResult};

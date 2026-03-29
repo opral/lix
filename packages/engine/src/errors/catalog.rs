@@ -1,4 +1,4 @@
-use crate::sql::public::catalog::builtin_public_surface_names;
+use crate::sql::catalog::builtin_public_surface_names;
 use crate::LixError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -332,10 +332,10 @@ mod tests {
         assert!(classification_src.contains("errors::sql_unknown_column_error("));
         assert!(classification_src.contains("errors::table_not_found_read_error()"));
 
-        let state_history_write_src = include_str!("../sql/public/runtime/mod.rs");
+        let state_history_write_src = include_str!("../sql/executor/public_runtime/mod.rs");
         assert!(state_history_write_src.contains("read_only_view_write_error("));
 
-        let change_write_src = include_str!("../sql/public/runtime/mod.rs");
+        let change_write_src = include_str!("../sql/executor/public_runtime/mod.rs");
         assert!(change_write_src.contains("read_only_view_write_error("));
 
         let session_src = include_str!("../session/mod.rs");

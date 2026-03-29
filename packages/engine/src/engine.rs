@@ -2,8 +2,8 @@ use crate::cel::CelEvaluator;
 use crate::deterministic_mode::{deterministic_mode_key, DeterministicSettings};
 use crate::key_value::key_value_schema_key;
 use crate::plugin::types::InstalledPlugin;
-use crate::sql::public::catalog::SurfaceRegistry;
-use crate::sql::public::validation::SchemaCache;
+use crate::sql::catalog::SurfaceRegistry;
+use crate::sql::semantic_ir::validation::SchemaCache;
 use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
-use crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange;
-use crate::sql::execution::contracts::planned_statement::MutationRow;
+use crate::sql::executor::contracts::effects::FilesystemPayloadDomainChange;
+use crate::sql::executor::contracts::planned_statement::MutationRow;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
@@ -325,7 +325,7 @@ fn object_name_is_protected_lix_ddl_target(name: &sqlparser::ast::ObjectName) ->
     };
 
     relation.starts_with("lix_internal_")
-        || crate::sql::public::catalog::builtin_public_surface_names()
+        || crate::sql::catalog::builtin_public_surface_names()
             .iter()
             .any(|surface| surface.eq_ignore_ascii_case(&relation))
 }
@@ -341,7 +341,7 @@ pub(crate) async fn normalize_sql_execution_error_with_backend(
 
 #[cfg(test)]
 fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
-    let Ok(statements) = crate::sql::execution::parse::parse_sql(sql) else {
+    let Ok(statements) = crate::sql::parser::parse_sql(sql) else {
         return false;
     };
     crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements(&statements)
@@ -536,12 +536,11 @@ mod tests {
     };
     use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect, TransactionMode};
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
-    use crate::sql::analysis::state_resolution::optimize::should_refresh_file_cache_for_statements;
+    use crate::sql::binder::{advance_placeholder_state_for_statement_ast, bind_sql_with_state};
     use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
-    use crate::sql_support::binding::{
-        advance_placeholder_state_for_statement_ast, bind_sql_with_state, parse_sql_statements,
-        PlaceholderState,
-    };
+    use crate::sql::optimizer::optimize_state_resolution;
+    use crate::sql::parser::parse_sql_statements;
+    use crate::sql::parser::placeholders::PlaceholderState;
     use crate::{LixError, NoopWasmRuntime, QueryResult, Session, Value};
     use async_trait::async_trait;
     use sqlparser::ast::Statement;
@@ -871,7 +870,16 @@ mod tests {
 
     fn should_refresh_file_cache_for_sql(sql: &str) -> bool {
         parse_sql_statements(sql)
-            .map(|statements| should_refresh_file_cache_for_statements(&statements))
+            .map(|statements| {
+                optimize_state_resolution(
+                    &statements,
+                    crate::sql::analysis::state_resolution::canonical::canonicalize_state_resolution(
+                        &statements,
+                    ),
+                )
+                .optimized
+                .should_refresh_file_cache
+            })
             .unwrap_or(false)
     }
 

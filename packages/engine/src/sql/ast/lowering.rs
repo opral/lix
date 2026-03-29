@@ -20,11 +20,19 @@ pub(crate) fn lower_statement(
     dialect: SqlDialect,
 ) -> Result<Statement, LixError> {
     let mut statement = statement;
+    apply_logical_function_lowering(&mut statement, dialect)?;
+    Ok(statement)
+}
+
+fn apply_logical_function_lowering<T>(node: &mut T, dialect: SqlDialect) -> Result<(), LixError>
+where
+    T: VisitMut,
+{
     let mut lowerer = LogicalFunctionLowerer { dialect };
-    if let ControlFlow::Break(error) = statement.visit(&mut lowerer) {
+    if let ControlFlow::Break(error) = node.visit(&mut lowerer) {
         return Err(error);
     }
-    Ok(statement)
+    Ok(())
 }
 
 struct LogicalFunctionLowerer {

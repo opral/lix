@@ -1,0 +1,1410 @@
+#[cfg(test)]
+use crate::functions::SystemFunctionProvider;
+use crate::canonical::version_state::load_version_descriptor_with_backend;
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::sql::catalog::SurfaceFamily;
+use crate::sql::logical_plan::public_ir::{
+    CanonicalStateSelector, MutationPayload, PlannedStateRow, PlannedWrite, ResolvedRowRef,
+    ResolvedWritePartition, ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, TargetSetProof,
+    WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
+};
+use crate::sql::semantic_ir::semantics::effective_state_resolver::{
+    ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
+};
+use crate::sql::semantic_ir::semantics::filesystem_assignments::FilesystemAssignmentsError;
+use crate::sql::semantic_ir::semantics::filesystem_planning::FilesystemPlanningError;
+use crate::sql::semantic_ir::semantics::filesystem_queries::FilesystemQueryError;
+use crate::sql::semantic_ir::semantics::state_assignments::StateAssignmentsError;
+use crate::sql::semantic_ir::semantics::surface_semantics::{
+    public_selector_column_name, public_selector_version_column, OverlayLane,
+};
+use crate::sql::services::public_reads::execute_public_query_with_optional_pending_transaction_view;
+use crate::sql::services::state_reader::{load_version_ref, LiveStorageLane};
+use crate::transaction::PendingTransactionView;
+use crate::version::{
+    version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
+    version_descriptor_schema_version, version_descriptor_snapshot_content, version_ref_file_id,
+    version_ref_plugin_key,
+    version_ref_schema_key, version_ref_schema_version, version_ref_snapshot_content,
+    GLOBAL_VERSION_ID,
+};
+use crate::{LixBackend, LixError, QueryResult, Value};
+use sqlparser::ast::helpers::attached_token::AttachedToken;
+use sqlparser::ast::{
+    BinaryOperator, Expr, GroupByExpr, Ident, ObjectName, ObjectNamePart, Query, Select,
+    SelectFlavor, SelectItem, SetExpr, TableFactor, TableWithJoins, Value as SqlValue,
+    ValueWithSpan,
+};
+use std::collections::{BTreeMap, BTreeSet};
+
+mod filesystem_writes;
+mod state_backed_writes;
+
+use filesystem_writes::resolve_filesystem_write;
+use state_backed_writes::{resolve_entity_write, resolve_state_write};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriteResolveError {
+    pub(crate) message: String,
+}
+
+impl From<FilesystemQueryError> for WriteResolveError {
+    fn from(error: FilesystemQueryError) -> Self {
+        Self {
+            message: error.message,
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+struct ResolvedWritePartitionBuilder {
+    authoritative_pre_state: Vec<ResolvedRowRef>,
+    authoritative_pre_state_rows: Vec<PlannedStateRow>,
+    intended_post_state: Vec<PlannedStateRow>,
+    tombstones: Vec<ResolvedRowRef>,
+    lineage: Vec<RowLineage>,
+    filesystem_state: crate::filesystem::runtime::FilesystemTransactionState,
+}
+
+impl ResolvedWritePartitionBuilder {
+    fn is_empty(&self) -> bool {
+        self.authoritative_pre_state.is_empty()
+            && self.intended_post_state.is_empty()
+            && self.tombstones.is_empty()
+            && self.lineage.is_empty()
+    }
+
+    fn into_partition(mut self, execution_mode: WriteMode) -> Option<ResolvedWritePartition> {
+        self.normalize_semantic_noops();
+        (!self.is_empty()).then_some(ResolvedWritePartition {
+            execution_mode,
+            authoritative_pre_state: self.authoritative_pre_state,
+            authoritative_pre_state_rows: self.authoritative_pre_state_rows,
+            intended_post_state: self.intended_post_state,
+            tombstones: self.tombstones,
+            lineage: self.lineage,
+            target_write_lane: None,
+            filesystem_state: self.filesystem_state,
+        })
+    }
+
+    fn normalize_semantic_noops(&mut self) {
+        if self.authoritative_pre_state_rows.is_empty() || self.intended_post_state.is_empty() {
+            return;
+        }
+
+        let authoritative_by_identity = self
+            .authoritative_pre_state_rows
+            .iter()
+            .map(|row| (planned_state_row_identity(row), row))
+            .collect::<BTreeMap<_, _>>();
+        let mut dropped_blob_rows = std::collections::BTreeSet::new();
+
+        self.intended_post_state.retain(|row| {
+            let Some(authoritative) =
+                authoritative_by_identity.get(&planned_state_row_identity(row))
+            else {
+                return true;
+            };
+            let unchanged = !row.tombstone && planned_state_rows_equivalent(authoritative, row);
+            if unchanged && row.schema_key == "lix_binary_blob_ref" && row.version_id.is_some() {
+                dropped_blob_rows.insert((
+                    row.entity_id.clone(),
+                    row.version_id
+                        .clone()
+                        .expect("checked version_id presence above"),
+                ));
+            }
+            !unchanged
+        });
+
+        if !dropped_blob_rows.is_empty() {
+            for file in self.filesystem_state.files.values_mut() {
+                if dropped_blob_rows.contains(&(file.file_id.clone(), file.version_id.clone())) {
+                    file.data = None;
+                }
+            }
+            self.filesystem_state.files.retain(|_, file| {
+                file.deleted
+                    || file.descriptor.is_some()
+                    || file.data.is_some()
+                    || !matches!(
+                        file.metadata_patch,
+                        crate::sql::logical_plan::public_ir::OptionalTextPatch::Unchanged
+                    )
+            });
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+struct ResolvedWritePlanBuilder {
+    partitions: Vec<ResolvedWritePlanEntry>,
+}
+
+#[derive(Clone)]
+struct ResolvedWritePlanEntry {
+    execution_mode: WriteMode,
+    target_write_lane: Option<WriteLane>,
+    partition: ResolvedWritePartitionBuilder,
+}
+
+impl ResolvedWritePlanBuilder {
+    fn partition_mut(
+        &mut self,
+        execution_mode: WriteMode,
+        target_write_lane: Option<WriteLane>,
+    ) -> &mut ResolvedWritePartitionBuilder {
+        if let Some(index) = self.partitions.iter().position(|entry| {
+            entry.execution_mode == execution_mode && entry.target_write_lane == target_write_lane
+        }) {
+            return &mut self.partitions[index].partition;
+        }
+        self.partitions.push(ResolvedWritePlanEntry {
+            execution_mode,
+            target_write_lane,
+            partition: ResolvedWritePartitionBuilder::default(),
+        });
+        &mut self
+            .partitions
+            .last_mut()
+            .expect("partition entry was just pushed")
+            .partition
+    }
+
+    fn into_resolved_write_plan(self, requested_mode: WriteModeRequest) -> ResolvedWritePlan {
+        let mut partitions = Vec::new();
+        for entry in self.partitions {
+            if let Some(mut partition) = entry.partition.into_partition(entry.execution_mode) {
+                partition.target_write_lane = entry.target_write_lane;
+                partitions.push(partition);
+            }
+        }
+        if partitions.is_empty() {
+            return noop_resolved_write_plan(default_execution_mode_for_request(requested_mode));
+        }
+        ResolvedWritePlan::from_partitions(partitions)
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn resolve_write_plan(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    resolve_write_plan_with_functions(
+        backend,
+        planned_write,
+        pending_transaction_view,
+        SharedFunctionProvider::new(SystemFunctionProvider),
+    )
+    .await
+}
+
+pub(crate) async fn resolve_write_plan_with_functions<P>(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    functions: SharedFunctionProvider<P>,
+) -> Result<ResolvedWritePlan, WriteResolveError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
+    let resolved = match planned_write.command.target.descriptor.surface_family {
+        SurfaceFamily::State => {
+            resolve_state_write(
+                backend,
+                planned_write,
+                pending_transaction_view,
+                functions.clone(),
+            )
+            .await
+        }
+        SurfaceFamily::Entity => {
+            resolve_entity_write(
+                backend,
+                planned_write,
+                pending_transaction_view,
+                functions.clone(),
+            )
+            .await
+        }
+        SurfaceFamily::Admin => resolve_admin_write(backend, planned_write).await,
+        SurfaceFamily::Filesystem => {
+            resolve_filesystem_write(backend, planned_write, pending_transaction_view).await
+        }
+        SurfaceFamily::Change => Err(WriteResolveError {
+            message: format!(
+                "public write resolver does not support '{}' writes",
+                planned_write.command.target.descriptor.public_name
+            ),
+        }),
+    }?;
+
+    finalize_resolved_write_plan(planned_write, resolved)
+}
+
+#[derive(Debug, Clone)]
+struct VersionAdminRow {
+    id: String,
+    name: String,
+    hidden: bool,
+    commit_id: String,
+    descriptor_change_id: Option<String>,
+}
+
+async fn resolve_admin_write(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    match planned_write.command.target.descriptor.public_name.as_str() {
+        "lix_version" => match planned_write.command.operation_kind {
+            WriteOperationKind::Insert => {
+                resolve_version_insert_write_plan(backend, planned_write).await
+            }
+            WriteOperationKind::Update | WriteOperationKind::Delete => {
+                resolve_existing_version_write(backend, planned_write).await
+            }
+        },
+        other => Err(WriteResolveError {
+            message: format!(
+                "public write resolver does not yet support '{}' writes",
+                other
+            ),
+        }),
+    }
+}
+
+async fn resolve_version_insert_write_plan(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    let rows = payload_maps(planned_write)?;
+    let mut partitions = ResolvedWritePlanBuilder::default();
+
+    for row in rows {
+        let version_id = version_admin_id_from_payload_map(&row)?;
+        let name = version_admin_required_text_from_payload_map(&row, "name")?;
+        let commit_id = version_admin_required_text_from_payload_map(&row, "commit_id")?;
+        let hidden = version_admin_hidden_from_payload_map(&row)?;
+        let existing = load_version_admin_row(backend, &version_id)
+            .await
+            .map_err(write_resolve_backend_error)?;
+
+        if let Some(existing) = existing.as_ref() {
+            partitions
+                .partition_mut(WriteMode::Tracked, None)
+                .authoritative_pre_state
+                .extend(version_descriptor_pre_state_refs(existing));
+            partitions
+                .partition_mut(WriteMode::Tracked, None)
+                .authoritative_pre_state
+                .extend(version_ref_pre_state_refs(existing));
+        }
+        partitions
+            .partition_mut(WriteMode::Tracked, None)
+            .intended_post_state
+            .push(version_descriptor_row(&version_id, &name, hidden));
+        partitions
+            .partition_mut(WriteMode::Tracked, None)
+            .lineage
+            .push(RowLineage {
+                entity_id: version_id.clone(),
+                source_change_id: existing.and_then(|row| row.descriptor_change_id),
+                source_commit_id: None,
+            });
+        partitions
+            .partition_mut(WriteMode::Tracked, None)
+            .intended_post_state
+            .push(version_ref_row(&version_id, &commit_id));
+        partitions
+            .partition_mut(WriteMode::Tracked, None)
+            .lineage
+            .push(RowLineage {
+                entity_id: version_id,
+                source_change_id: None,
+                source_commit_id: None,
+            });
+    }
+
+    Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
+}
+
+async fn resolve_existing_version_write(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    let version_ids = query_text_selector_values_for_write_selector(
+        backend,
+        planned_write,
+        None,
+        "id",
+        "public version selector resolver expected id text rows",
+    )
+    .await?;
+    if version_ids.is_empty() {
+        return Ok(noop_resolved_write_plan(
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+        ));
+    }
+
+    let mut current_rows = Vec::new();
+    for version_id in version_ids {
+        let Some(current_row) = load_version_admin_row(backend, &version_id)
+            .await
+            .map_err(write_resolve_backend_error)?
+        else {
+            continue;
+        };
+        current_rows.push(current_row);
+    }
+    if current_rows.is_empty() {
+        return Ok(noop_resolved_write_plan(
+            default_execution_mode_for_request(planned_write.command.requested_mode),
+        ));
+    }
+
+    match planned_write.command.operation_kind {
+        WriteOperationKind::Update => {
+            let MutationPayload::UpdatePatch(payload) = &planned_write.command.payload else {
+                return Err(WriteResolveError {
+                    message: "public version update resolver requires a patch payload".to_string(),
+                });
+            };
+            if payload.contains_key("id") {
+                return Err(WriteResolveError {
+                    message: "public version update cannot modify id".to_string(),
+                });
+            }
+            let mut partitions = ResolvedWritePlanBuilder::default();
+
+            for current_row in current_rows {
+                let next_name = payload
+                    .get("name")
+                    .and_then(text_from_value)
+                    .unwrap_or_else(|| current_row.name.clone());
+                if next_name.is_empty() {
+                    return Err(WriteResolveError {
+                        message: "public version update cannot set empty name".to_string(),
+                    });
+                }
+                let next_hidden = payload
+                    .get("hidden")
+                    .and_then(value_as_bool)
+                    .unwrap_or(current_row.hidden);
+                let next_commit_id = payload
+                    .get("commit_id")
+                    .and_then(text_from_value)
+                    .unwrap_or_else(|| current_row.commit_id.clone());
+                if next_commit_id.is_empty() {
+                    return Err(WriteResolveError {
+                        message: "public version update cannot set empty commit_id".to_string(),
+                    });
+                }
+
+                if payload.contains_key("name") || payload.contains_key("hidden") {
+                    let tracked = partitions.partition_mut(WriteMode::Tracked, None);
+                    tracked
+                        .authoritative_pre_state
+                        .extend(version_descriptor_pre_state_refs(&current_row));
+                    tracked
+                        .authoritative_pre_state_rows
+                        .push(version_descriptor_row(
+                            &current_row.id,
+                            &current_row.name,
+                            current_row.hidden,
+                        ));
+                    tracked.lineage.push(RowLineage {
+                        entity_id: current_row.id.clone(),
+                        source_change_id: current_row.descriptor_change_id.clone(),
+                        source_commit_id: None,
+                    });
+                    tracked.intended_post_state.push(version_descriptor_row(
+                        &current_row.id,
+                        &next_name,
+                        next_hidden,
+                    ));
+                }
+                if payload.contains_key("commit_id") {
+                    let tracked = partitions.partition_mut(WriteMode::Tracked, None);
+                    tracked
+                        .authoritative_pre_state
+                        .extend(version_ref_pre_state_refs(&current_row));
+                    tracked
+                        .authoritative_pre_state_rows
+                        .push(version_ref_row(&current_row.id, &current_row.commit_id));
+                    tracked.lineage.push(RowLineage {
+                        entity_id: current_row.id.clone(),
+                        source_change_id: None,
+                        source_commit_id: None,
+                    });
+                    tracked
+                        .intended_post_state
+                        .push(version_ref_row(&current_row.id, &next_commit_id));
+                }
+            }
+
+            Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
+        }
+        WriteOperationKind::Delete => {
+            let mut partitions = ResolvedWritePlanBuilder::default();
+            for current_row in current_rows {
+                let tracked = partitions.partition_mut(WriteMode::Tracked, None);
+                tracked
+                    .authoritative_pre_state
+                    .extend(version_descriptor_pre_state_refs(&current_row));
+                tracked
+                    .intended_post_state
+                    .push(version_descriptor_tombstone_row(&current_row.id));
+                tracked
+                    .tombstones
+                    .extend(version_descriptor_tombstone_refs(&current_row));
+                tracked.lineage.push(RowLineage {
+                    entity_id: current_row.id.clone(),
+                    source_change_id: current_row.descriptor_change_id.clone(),
+                    source_commit_id: None,
+                });
+
+                let tracked = partitions.partition_mut(WriteMode::Tracked, None);
+                tracked
+                    .authoritative_pre_state
+                    .extend(version_ref_pre_state_refs(&current_row));
+                tracked
+                    .intended_post_state
+                    .push(version_ref_tombstone_row(&current_row.id));
+                tracked
+                    .tombstones
+                    .extend(version_ref_tombstone_refs(&current_row));
+                tracked.lineage.push(RowLineage {
+                    entity_id: current_row.id.clone(),
+                    source_change_id: None,
+                    source_commit_id: None,
+                });
+            }
+            Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
+        }
+        WriteOperationKind::Insert => Err(WriteResolveError {
+            message: "public version existing-row resolver does not handle inserts".to_string(),
+        }),
+    }
+}
+
+async fn load_version_admin_row(
+    backend: &dyn LixBackend,
+    version_id: &str,
+) -> Result<Option<VersionAdminRow>, crate::LixError> {
+    let Some(descriptor_row) = load_version_descriptor_with_backend(backend, version_id).await?
+    else {
+        return Ok(None);
+    };
+    let pointer_row = load_version_ref(backend, version_id).await?;
+    Ok(Some(VersionAdminRow {
+        id: version_id.to_string(),
+        name: descriptor_row.name,
+        hidden: descriptor_row.hidden,
+        commit_id: pointer_row
+            .as_ref()
+            .map(|row| row.commit_id.clone())
+            .unwrap_or_default(),
+        descriptor_change_id: descriptor_row.change_id,
+    }))
+}
+
+fn version_descriptor_pre_state_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
+    vec![ResolvedRowRef {
+        entity_id: row.id.clone(),
+        schema_key: version_descriptor_schema_key().to_string(),
+        version_id: Some(GLOBAL_VERSION_ID.to_string()),
+        source_change_id: row.descriptor_change_id.clone(),
+        source_commit_id: None,
+    }]
+}
+
+fn version_ref_pre_state_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
+    vec![ResolvedRowRef {
+        entity_id: row.id.clone(),
+        schema_key: version_ref_schema_key().to_string(),
+        version_id: Some(GLOBAL_VERSION_ID.to_string()),
+        source_change_id: None,
+        source_commit_id: None,
+    }]
+}
+
+fn version_descriptor_tombstone_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
+    version_descriptor_pre_state_refs(row)
+}
+
+fn version_ref_tombstone_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
+    version_ref_pre_state_refs(row)
+}
+
+fn version_admin_id_from_payload_map(
+    payload: &BTreeMap<String, Value>,
+) -> Result<String, WriteResolveError> {
+    payload
+        .get("id")
+        .and_then(text_from_value)
+        .ok_or_else(|| WriteResolveError {
+            message: "public version insert requires column 'id'".to_string(),
+        })
+}
+
+fn version_admin_required_text_from_payload_map(
+    payload: &BTreeMap<String, Value>,
+    key: &str,
+) -> Result<String, WriteResolveError> {
+    let value = payload
+        .get(key)
+        .and_then(text_from_value)
+        .ok_or_else(|| WriteResolveError {
+            message: format!("public version insert requires column '{key}'"),
+        })?;
+    if value.is_empty() {
+        return Err(WriteResolveError {
+            message: format!("public version insert cannot set empty {key}"),
+        });
+    }
+    Ok(value)
+}
+
+fn version_admin_hidden_from_payload_map(
+    payload: &BTreeMap<String, Value>,
+) -> Result<bool, WriteResolveError> {
+    Ok(payload
+        .get("hidden")
+        .and_then(value_as_bool)
+        .unwrap_or(false))
+}
+
+fn version_descriptor_row(id: &str, name: &str, hidden: bool) -> PlannedStateRow {
+    let mut values = BTreeMap::new();
+    values.insert("entity_id".to_string(), Value::Text(id.to_string()));
+    values.insert(
+        "schema_key".to_string(),
+        Value::Text(version_descriptor_schema_key().to_string()),
+    );
+    values.insert(
+        "file_id".to_string(),
+        Value::Text(version_descriptor_file_id().to_string()),
+    );
+    values.insert(
+        "plugin_key".to_string(),
+        Value::Text(version_descriptor_plugin_key().to_string()),
+    );
+    values.insert(
+        "schema_version".to_string(),
+        Value::Text(version_descriptor_schema_version().to_string()),
+    );
+    values.insert(
+        "snapshot_content".to_string(),
+        Value::Text(version_descriptor_snapshot_content(id, name, hidden)),
+    );
+    values.insert(
+        "version_id".to_string(),
+        Value::Text(GLOBAL_VERSION_ID.to_string()),
+    );
+    PlannedStateRow {
+        entity_id: id.to_string(),
+        schema_key: version_descriptor_schema_key().to_string(),
+        version_id: Some(GLOBAL_VERSION_ID.to_string()),
+        values,
+        tombstone: false,
+    }
+}
+
+fn version_ref_row(id: &str, commit_id: &str) -> PlannedStateRow {
+    let mut values = BTreeMap::new();
+    values.insert("entity_id".to_string(), Value::Text(id.to_string()));
+    values.insert(
+        "schema_key".to_string(),
+        Value::Text(version_ref_schema_key().to_string()),
+    );
+    values.insert(
+        "file_id".to_string(),
+        Value::Text(version_ref_file_id().to_string()),
+    );
+    values.insert(
+        "plugin_key".to_string(),
+        Value::Text(version_ref_plugin_key().to_string()),
+    );
+    values.insert(
+        "schema_version".to_string(),
+        Value::Text(version_ref_schema_version().to_string()),
+    );
+    values.insert(
+        "snapshot_content".to_string(),
+        Value::Text(version_ref_snapshot_content(id, commit_id)),
+    );
+    values.insert(
+        "version_id".to_string(),
+        Value::Text(GLOBAL_VERSION_ID.to_string()),
+    );
+    PlannedStateRow {
+        entity_id: id.to_string(),
+        schema_key: version_ref_schema_key().to_string(),
+        version_id: Some(GLOBAL_VERSION_ID.to_string()),
+        values,
+        tombstone: false,
+    }
+}
+
+fn version_descriptor_tombstone_row(id: &str) -> PlannedStateRow {
+    let mut row = version_descriptor_row(id, id, false);
+    row.values.remove("snapshot_content");
+    row.tombstone = true;
+    row
+}
+
+fn version_ref_tombstone_row(id: &str) -> PlannedStateRow {
+    let mut row = version_ref_row(id, "deleted");
+    row.values.remove("snapshot_content");
+    row.tombstone = true;
+    row
+}
+
+fn default_execution_mode_for_request(requested_mode: WriteModeRequest) -> WriteMode {
+    match requested_mode {
+        WriteModeRequest::Auto | WriteModeRequest::ForceTracked => WriteMode::Tracked,
+        WriteModeRequest::ForceUntracked => WriteMode::Untracked,
+    }
+}
+
+fn single_partition_write_plan(
+    execution_mode: WriteMode,
+    authoritative_pre_state: Vec<ResolvedRowRef>,
+    authoritative_pre_state_rows: Vec<PlannedStateRow>,
+    intended_post_state: Vec<PlannedStateRow>,
+    tombstones: Vec<ResolvedRowRef>,
+    lineage: Vec<RowLineage>,
+) -> ResolvedWritePlan {
+    let builder = ResolvedWritePartitionBuilder {
+        authoritative_pre_state,
+        authoritative_pre_state_rows,
+        intended_post_state,
+        tombstones,
+        lineage,
+        filesystem_state: Default::default(),
+    };
+    builder
+        .into_partition(execution_mode)
+        .map(ResolvedWritePlan::from_partition)
+        .unwrap_or_else(|| ResolvedWritePlan::from_partitions(Vec::new()))
+}
+
+fn planned_state_row_identity(row: &PlannedStateRow) -> (String, String, Option<String>) {
+    (
+        row.entity_id.clone(),
+        row.schema_key.clone(),
+        row.version_id.clone(),
+    )
+}
+
+fn planned_state_rows_equivalent(left: &PlannedStateRow, right: &PlannedStateRow) -> bool {
+    left.entity_id == right.entity_id
+        && left.schema_key == right.schema_key
+        && left.version_id == right.version_id
+        && left.tombstone == right.tombstone
+        && left.values == right.values
+}
+
+fn execution_mode_for_overlay_lane(overlay_lane: OverlayLane) -> WriteMode {
+    match overlay_lane {
+        OverlayLane::LocalTracked | OverlayLane::GlobalTracked => WriteMode::Tracked,
+        OverlayLane::LocalUntracked | OverlayLane::GlobalUntracked => WriteMode::Untracked,
+    }
+}
+
+fn resolve_execution_mode_for_untracked_flag(
+    requested_mode: WriteModeRequest,
+    untracked: bool,
+    tracked_error: &str,
+    untracked_error: &str,
+) -> Result<WriteMode, WriteResolveError> {
+    let execution_mode = if untracked {
+        WriteMode::Untracked
+    } else {
+        WriteMode::Tracked
+    };
+    match (requested_mode, execution_mode) {
+        (WriteModeRequest::ForceTracked, WriteMode::Untracked) => Err(WriteResolveError {
+            message: tracked_error.to_string(),
+        }),
+        (WriteModeRequest::ForceUntracked, WriteMode::Tracked) => Err(WriteResolveError {
+            message: untracked_error.to_string(),
+        }),
+        _ => Ok(execution_mode),
+    }
+}
+
+fn resolve_execution_mode_for_effective_row(
+    requested_mode: WriteModeRequest,
+    current_row: &ExactEffectiveStateRow,
+) -> Result<WriteMode, WriteResolveError> {
+    let execution_mode = execution_mode_for_overlay_lane(current_row.overlay_lane);
+    match (requested_mode, execution_mode) {
+        (WriteModeRequest::ForceTracked, WriteMode::Untracked) => Err(WriteResolveError {
+            message: format!(
+                "public tracked write requires a tracked effective-state winner, found {:?}",
+                current_row.overlay_lane
+            ),
+        }),
+        (WriteModeRequest::ForceUntracked, WriteMode::Tracked) => Err(WriteResolveError {
+            message: format!(
+                "public untracked write requires an untracked effective-state winner, found {:?}",
+                current_row.overlay_lane
+            ),
+        }),
+        _ => Ok(execution_mode),
+    }
+}
+
+fn target_write_lane_for_effective_row(
+    planned_write: &PlannedWrite,
+    execution_mode: WriteMode,
+    current_row: &ExactEffectiveStateRow,
+) -> Result<Option<WriteLane>, WriteResolveError> {
+    target_write_lane_for_version(
+        planned_write,
+        execution_mode,
+        Some(current_row.version_id.as_str()),
+    )
+}
+
+fn target_write_lane_for_planned_row(
+    planned_write: &PlannedWrite,
+    execution_mode: WriteMode,
+    version_id: Option<&str>,
+) -> Result<Option<WriteLane>, WriteResolveError> {
+    target_write_lane_for_version(planned_write, execution_mode, version_id)
+}
+
+fn target_write_lane_for_version(
+    planned_write: &PlannedWrite,
+    _execution_mode: WriteMode,
+    version_id: Option<&str>,
+) -> Result<Option<WriteLane>, WriteResolveError> {
+    match &planned_write.scope_proof {
+        ScopeProof::ActiveVersion => Ok(Some(WriteLane::ActiveVersion)),
+        ScopeProof::SingleVersion(version_id) => Ok(Some(WriteLane::SingleVersion(
+            version_id.clone(),
+        ))),
+        ScopeProof::FiniteVersionSet(_) => version_id
+            .map(|version_id| Some(WriteLane::SingleVersion(version_id.to_string())))
+            .ok_or_else(|| WriteResolveError {
+                message:
+                    "public tracked write could not determine a concrete version lane for a selected row"
+                        .to_string(),
+            }),
+        ScopeProof::GlobalAdmin => Ok(Some(WriteLane::GlobalAdmin)),
+        ScopeProof::Unknown | ScopeProof::Unbounded => version_id
+            .map(|version_id| Some(WriteLane::SingleVersion(version_id.to_string())))
+            .ok_or_else(|| WriteResolveError {
+                message: "public tracked write requires a bounded version lane".to_string(),
+            }),
+    }
+}
+
+fn resolved_entity_id(planned_write: &PlannedWrite) -> Result<String, WriteResolveError> {
+    if let Some(TargetSetProof::Exact(entity_ids)) = &planned_write.target_set_proof {
+        if entity_ids.len() == 1 {
+            return Ok(entity_ids
+                .iter()
+                .next()
+                .expect("singleton exact target-set proof")
+                .clone());
+        }
+    }
+
+    payload_text_value(planned_write, "entity_id").ok_or_else(|| WriteResolveError {
+        message: "public write resolver requires an exact entity target".to_string(),
+    })
+}
+
+fn resolved_schema_key(planned_write: &PlannedWrite) -> Result<String, WriteResolveError> {
+    match &planned_write.schema_proof {
+        SchemaProof::Exact(schema_keys) if schema_keys.len() == 1 => Ok(schema_keys
+            .iter()
+            .next()
+            .expect("singleton exact schema proof")
+            .clone()),
+        _ => payload_text_value(planned_write, "schema_key").ok_or_else(|| WriteResolveError {
+            message: "public write resolver requires an exact schema proof or schema_key literal"
+                .to_string(),
+        }),
+    }
+}
+
+fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, WriteResolveError> {
+    match &planned_write.scope_proof {
+        ScopeProof::ActiveVersion => planned_write
+            .command
+            .execution_context
+            .requested_version_id
+            .clone()
+            .map(Some)
+            .ok_or_else(|| WriteResolveError {
+                message:
+                    "public write resolver requires requested_version_id for ActiveVersion writes"
+                        .to_string(),
+            }),
+        ScopeProof::SingleVersion(version_id) => Ok(Some(version_id.clone())),
+        ScopeProof::FiniteVersionSet(version_ids) if version_ids.len() == 1 => {
+            Ok(version_ids.iter().next().cloned())
+        }
+        ScopeProof::FiniteVersionSet(version_ids) if version_ids.is_empty() => {
+            Err(WriteResolveError {
+                message: "public write resolver requires a concrete version_id".to_string(),
+            })
+        }
+        ScopeProof::FiniteVersionSet(_) => Err(WriteResolveError {
+            message: "public write resolver cannot resolve multi-version writes".to_string(),
+        }),
+        ScopeProof::GlobalAdmin => Ok(Some(GLOBAL_VERSION_ID.to_string())),
+        ScopeProof::Unknown | ScopeProof::Unbounded => Err(WriteResolveError {
+            message: "public write resolver requires a bounded scope proof".to_string(),
+        }),
+    }
+}
+
+fn resolved_version_ids(planned_write: &PlannedWrite) -> Result<Vec<String>, WriteResolveError> {
+    match &planned_write.scope_proof {
+        ScopeProof::ActiveVersion => planned_write
+            .command
+            .execution_context
+            .requested_version_id
+            .clone()
+            .map(|version_id| vec![version_id])
+            .ok_or_else(|| WriteResolveError {
+                message:
+                    "public write resolver requires requested_version_id for ActiveVersion writes"
+                        .to_string(),
+            }),
+        ScopeProof::SingleVersion(version_id) => Ok(vec![version_id.clone()]),
+        ScopeProof::FiniteVersionSet(version_ids) if version_ids.is_empty() => {
+            Err(WriteResolveError {
+                message: "public write resolver requires a concrete version_id".to_string(),
+            })
+        }
+        ScopeProof::FiniteVersionSet(version_ids) => Ok(version_ids.iter().cloned().collect()),
+        ScopeProof::GlobalAdmin => Ok(vec![GLOBAL_VERSION_ID.to_string()]),
+        ScopeProof::Unknown | ScopeProof::Unbounded => Err(WriteResolveError {
+            message: "public write resolver requires a bounded scope proof".to_string(),
+        }),
+    }
+}
+
+pub(super) fn write_mode_request_for_insert_payload(
+    planned_write: &PlannedWrite,
+    payload: &BTreeMap<String, Value>,
+) -> WriteModeRequest {
+    match payload.get("untracked").and_then(bool_from_value) {
+        Some(true) => WriteModeRequest::ForceUntracked,
+        Some(false) => WriteModeRequest::ForceTracked,
+        None => planned_write.command.requested_mode,
+    }
+}
+
+fn surface_forces_global_write_scope(planned_write: &PlannedWrite) -> bool {
+    planned_write
+        .command
+        .target
+        .implicit_overrides
+        .predicate_overrides
+        .iter()
+        .any(|predicate| {
+            predicate.column == "global"
+                && predicate.value == crate::sql::catalog::SurfaceOverrideValue::Boolean(true)
+        })
+}
+
+pub(super) fn resolved_version_id_for_insert_payload(
+    planned_write: &PlannedWrite,
+    payload: &BTreeMap<String, Value>,
+) -> Result<Option<String>, WriteResolveError> {
+    if surface_forces_global_write_scope(planned_write)
+        || payload.get("global").and_then(bool_from_value) == Some(true)
+    {
+        return Ok(Some(GLOBAL_VERSION_ID.to_string()));
+    }
+
+    match planned_write.command.target.default_scope {
+        crate::sql::catalog::DefaultScopeSemantics::ActiveVersion => planned_write
+            .command
+            .execution_context
+            .requested_version_id
+            .clone()
+            .map(Some)
+            .ok_or_else(|| WriteResolveError {
+                message:
+                    "public write resolver requires requested_version_id for ActiveVersion writes"
+                        .to_string(),
+            }),
+        crate::sql::catalog::DefaultScopeSemantics::ExplicitVersion => payload
+            .get("version_id")
+            .and_then(text_from_value)
+            .map(Some)
+            .ok_or_else(|| WriteResolveError {
+                message: "public write resolver requires a concrete version_id".to_string(),
+            }),
+        crate::sql::catalog::DefaultScopeSemantics::GlobalAdmin => {
+            Ok(Some(GLOBAL_VERSION_ID.to_string()))
+        }
+        crate::sql::catalog::DefaultScopeSemantics::History
+        | crate::sql::catalog::DefaultScopeSemantics::WorkingChanges => Err(WriteResolveError {
+            message: "public write resolver requires a bounded scope proof".to_string(),
+        }),
+    }
+}
+
+async fn resolved_existing_version_ids(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+) -> Result<Vec<String>, WriteResolveError> {
+    let version_ids = resolved_version_ids(planned_write)?;
+    let mut validated = BTreeSet::new();
+
+    for version_id in &version_ids {
+        if validated.insert(version_id.clone()) {
+            validate_public_write_version_target(backend, version_id).await?;
+        }
+    }
+
+    Ok(version_ids)
+}
+
+pub(super) async fn resolved_insert_version_ids(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+) -> Result<Vec<Option<String>>, WriteResolveError> {
+    let payloads = payload_maps(planned_write)?;
+    let mut validated = BTreeSet::new();
+    let mut version_ids = Vec::with_capacity(payloads.len());
+
+    for payload in &payloads {
+        let version_id = resolved_version_id_for_insert_payload(planned_write, payload)?;
+        if let Some(version_id_ref) = version_id.as_deref() {
+            if validated.insert(version_id_ref.to_string()) {
+                validate_public_write_version_target(backend, version_id_ref).await?;
+            }
+        }
+        version_ids.push(version_id);
+    }
+
+    Ok(version_ids)
+}
+
+async fn validate_public_write_version_target(
+    backend: &dyn LixBackend,
+    version_id: &str,
+) -> Result<(), WriteResolveError> {
+    if version_id == GLOBAL_VERSION_ID {
+        return Ok(());
+    }
+
+    let descriptor_exists = load_version_descriptor_with_backend(backend, version_id)
+        .await
+        .map_err(write_resolve_backend_error)?
+        .is_some();
+    if !descriptor_exists {
+        return Err(WriteResolveError {
+            message: format!("version with id '{version_id}' does not exist"),
+        });
+    }
+
+    let version_ref = load_version_ref(backend, version_id)
+        .await
+        .map_err(write_resolve_backend_error)?;
+    if version_ref.is_none() {
+        return Err(WriteResolveError {
+            message: format!(
+                "public write invariant violation: version with id '{version_id}' exists but its version ref is missing"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn finalize_resolved_write_plan(
+    planned_write: &PlannedWrite,
+    mut resolved: ResolvedWritePlan,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    resolved.partitions.retain(|partition| {
+        !partition.intended_post_state.is_empty() || !partition.filesystem_state.files.is_empty()
+    });
+    for partition in &mut resolved.partitions {
+        if partition.execution_mode == WriteMode::Untracked {
+            partition.target_write_lane = None;
+            continue;
+        }
+        if partition.target_write_lane.is_none() {
+            partition.target_write_lane = Some(write_lane_from_scope(&planned_write.scope_proof)?);
+        }
+    }
+    Ok(resolved)
+}
+
+fn noop_resolved_write_plan(execution_mode: WriteMode) -> ResolvedWritePlan {
+    single_partition_write_plan(
+        execution_mode,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+fn write_lane_from_scope(scope_proof: &ScopeProof) -> Result<WriteLane, WriteResolveError> {
+    match scope_proof {
+        ScopeProof::ActiveVersion => Ok(WriteLane::ActiveVersion),
+        ScopeProof::SingleVersion(version_id) => Ok(WriteLane::SingleVersion(version_id.clone())),
+        ScopeProof::FiniteVersionSet(version_ids) if version_ids.len() == 1 => {
+            Ok(WriteLane::SingleVersion(
+                version_ids
+                    .iter()
+                    .next()
+                    .expect("singleton version set")
+                    .clone(),
+            ))
+        }
+        ScopeProof::FiniteVersionSet(_) => Err(WriteResolveError {
+            message: "public tracked writes require exactly one write lane".to_string(),
+        }),
+        ScopeProof::GlobalAdmin => Ok(WriteLane::GlobalAdmin),
+        ScopeProof::Unknown | ScopeProof::Unbounded => Err(WriteResolveError {
+            message: "public tracked writes require a bounded write lane".to_string(),
+        }),
+    }
+}
+
+fn value_as_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Boolean(value) => Some(*value),
+        Value::Integer(value) => Some(*value != 0),
+        Value::Text(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" => Some(true),
+            "0" | "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn required_text_value_index(
+    row: &[Value],
+    index: usize,
+    label: &str,
+) -> Result<String, WriteResolveError> {
+    row.get(index)
+        .and_then(text_from_value)
+        .ok_or_else(|| WriteResolveError {
+            message: format!("public filesystem resolver expected text {}", label),
+        })
+}
+
+fn required_bool_value_index(
+    row: &[Value],
+    index: usize,
+    label: &str,
+) -> Result<bool, WriteResolveError> {
+    row.get(index)
+        .and_then(value_as_bool)
+        .ok_or_else(|| WriteResolveError {
+            message: format!("public selector resolver expected bool {}", label),
+        })
+}
+
+fn write_resolve_to_lix_error(error: WriteResolveError) -> crate::LixError {
+    crate::LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: error.message,
+    }
+}
+
+pub(super) async fn query_text_selector_values_for_write_selector(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    selector_column: &str,
+    error_message: &str,
+) -> Result<Vec<String>, WriteResolveError> {
+    let selector = canonical_state_selector(planned_write);
+    let query_result = execute_public_selector_query_strict(
+        backend,
+        planned_write,
+        pending_transaction_view,
+        build_public_selector_query(
+            &planned_write.command.target.descriptor.public_name,
+            &selector,
+            &[selector_column],
+        ),
+    )
+    .await
+    .map_err(write_resolve_backend_error)?;
+
+    let mut values = Vec::new();
+    for row in query_result.rows {
+        let Some(value) = row.first().and_then(text_from_value) else {
+            return Err(WriteResolveError {
+                message: error_message.to_string(),
+            });
+        };
+        if !values.iter().any(|existing| existing == &value) {
+            values.push(value);
+        }
+    }
+    Ok(values)
+}
+
+pub(super) fn canonical_state_selector(planned_write: &PlannedWrite) -> CanonicalStateSelector {
+    let predicates = if planned_write.command.selector.exact_only {
+        exact_selector_predicates(planned_write)
+            .unwrap_or_else(|| planned_write.command.selector.residual_predicates.clone())
+    } else {
+        planned_write.command.selector.residual_predicates.clone()
+    };
+    let version_column = planned_write
+        .command
+        .target
+        .implicit_overrides
+        .expose_version_id
+        .then(|| {
+            public_selector_version_column(planned_write.command.target.descriptor.surface_family)
+                .to_string()
+        });
+    CanonicalStateSelector {
+        predicates,
+        version_column,
+    }
+}
+
+pub(super) async fn execute_public_selector_query_strict(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    query: Query,
+) -> Result<QueryResult, LixError> {
+    let active_version_id = planned_write
+        .command
+        .execution_context
+        .requested_version_id
+        .as_deref()
+        .unwrap_or(GLOBAL_VERSION_ID);
+    execute_public_query_with_optional_pending_transaction_view(
+        backend,
+        query,
+        &planned_write.command.bound_parameters,
+        active_version_id,
+        planned_write
+            .command
+            .execution_context
+            .writer_key
+            .as_deref(),
+        pending_transaction_view,
+    )
+    .await
+}
+
+fn exact_selector_predicates(planned_write: &PlannedWrite) -> Option<Vec<Expr>> {
+    let mut predicates = Vec::with_capacity(planned_write.command.selector.exact_filters.len());
+    for (column, value) in &planned_write.command.selector.exact_filters {
+        let public_column = public_selector_column_name(
+            planned_write.command.target.descriptor.surface_family,
+            column,
+        )?;
+        predicates.push(Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new(public_column))),
+            op: BinaryOperator::Eq,
+            right: Box::new(engine_value_to_sql_expr(value)),
+        });
+    }
+    Some(predicates)
+}
+
+fn engine_value_to_sql_expr(value: &Value) -> Expr {
+    match value {
+        Value::Null => Expr::Value(ValueWithSpan::from(SqlValue::Null)),
+        Value::Boolean(value) => Expr::Value(ValueWithSpan::from(SqlValue::Boolean(*value))),
+        Value::Text(value) => Expr::Value(ValueWithSpan::from(SqlValue::SingleQuotedString(
+            value.clone(),
+        ))),
+        Value::Json(value) => Expr::Value(ValueWithSpan::from(SqlValue::SingleQuotedString(
+            value.to_string(),
+        ))),
+        Value::Integer(value) => Expr::Value(ValueWithSpan::from(SqlValue::Number(
+            value.to_string(),
+            false,
+        ))),
+        Value::Real(value) => Expr::Value(ValueWithSpan::from(SqlValue::Number(
+            value.to_string(),
+            false,
+        ))),
+        Value::Blob(value) => Expr::Value(ValueWithSpan::from(
+            SqlValue::SingleQuotedByteStringLiteral(String::from_utf8_lossy(value).to_string()),
+        )),
+    }
+}
+
+fn build_public_selector_query(
+    surface_name: &str,
+    selector: &CanonicalStateSelector,
+    selector_columns: &[&str],
+) -> Query {
+    let selection = selector
+        .predicates
+        .iter()
+        .cloned()
+        .reduce(|left, right| Expr::BinaryOp {
+            left: Box::new(left),
+            op: BinaryOperator::And,
+            right: Box::new(right),
+        });
+
+    Query {
+        with: None,
+        body: Box::new(SetExpr::Select(Box::new(Select {
+            select_token: AttachedToken::empty(),
+            distinct: None,
+            top: None,
+            top_before_distinct: false,
+            projection: selector_columns
+                .iter()
+                .map(|column| SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(*column))))
+                .collect(),
+            exclude: None,
+            into: None,
+            from: vec![TableWithJoins {
+                relation: TableFactor::Table {
+                    name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(surface_name))]),
+                    alias: None,
+                    args: None,
+                    with_hints: vec![],
+                    version: None,
+                    with_ordinality: false,
+                    partitions: vec![],
+                    json_path: None,
+                    sample: None,
+                    index_hints: vec![],
+                },
+                joins: Vec::new(),
+            }],
+            lateral_views: Vec::new(),
+            prewhere: None,
+            selection,
+            group_by: GroupByExpr::Expressions(Vec::new(), Vec::new()),
+            cluster_by: Vec::new(),
+            distribute_by: Vec::new(),
+            sort_by: Vec::new(),
+            having: None,
+            named_window: Vec::new(),
+            qualify: None,
+            window_before_qualify: false,
+            value_table_mode: None,
+            connect_by: None,
+            flavor: SelectFlavor::Standard,
+        }))),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    }
+}
+
+fn payload_map(planned_write: &PlannedWrite) -> Result<BTreeMap<String, Value>, WriteResolveError> {
+    match &planned_write.command.payload {
+        MutationPayload::InsertRows(payloads) => match payloads.as_slice() {
+            [payload] => Ok(payload.clone()),
+            _ => Err(WriteResolveError {
+                message: "public resolver expected a single-row payload".to_string(),
+            }),
+        },
+        MutationPayload::UpdatePatch(payload) => Ok(payload.clone()),
+        MutationPayload::Tombstone => Ok(Default::default()),
+    }
+}
+
+fn payload_text_value(planned_write: &PlannedWrite, key: &str) -> Option<String> {
+    match &planned_write.command.payload {
+        MutationPayload::InsertRows(payloads) => {
+            let mut values = payloads
+                .iter()
+                .filter_map(|payload| match payload.get(key) {
+                    Some(Value::Text(value)) => Some(value.clone()),
+                    _ => None,
+                });
+            let first = values.next()?;
+            values.all(|candidate| candidate == first).then_some(first)
+        }
+        MutationPayload::UpdatePatch(payload) => match payload.get(key) {
+            Some(Value::Text(value)) => Some(value.clone()),
+            _ => None,
+        },
+        MutationPayload::Tombstone => None,
+    }
+}
+
+fn payload_maps(
+    planned_write: &PlannedWrite,
+) -> Result<Vec<BTreeMap<String, Value>>, WriteResolveError> {
+    match &planned_write.command.payload {
+        MutationPayload::InsertRows(payloads) => Ok(payloads.clone()),
+        MutationPayload::UpdatePatch(_) | MutationPayload::Tombstone => Err(WriteResolveError {
+            message: "public resolver expected insert payload rows".to_string(),
+        }),
+    }
+}
+
+fn text_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Text(value) => Some(value.clone()),
+        Value::Integer(value) => Some(value.to_string()),
+        Value::Boolean(value) => Some(value.to_string()),
+        Value::Real(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn bool_from_value(value: &Value) -> Option<bool> {
+    match value {
+        Value::Boolean(value) => Some(*value),
+        Value::Integer(value) => Some(*value != 0),
+        Value::Text(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" => Some(true),
+            "0" | "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn write_resolve_backend_error(error: crate::LixError) -> WriteResolveError {
+    WriteResolveError {
+        message: error.description,
+    }
+}
+
+fn write_resolve_state_assignments_error(error: StateAssignmentsError) -> WriteResolveError {
+    WriteResolveError {
+        message: error.message,
+    }
+}
+
+fn write_resolve_filesystem_assignments_error(
+    error: FilesystemAssignmentsError,
+) -> WriteResolveError {
+    WriteResolveError {
+        message: error.message,
+    }
+}
+
+fn write_resolve_filesystem_planning_error(error: FilesystemPlanningError) -> WriteResolveError {
+    WriteResolveError {
+        message: error.message,
+    }
+}

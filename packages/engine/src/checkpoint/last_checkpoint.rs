@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
-use crate::sql::public::planner::semantics::domain_changes::DomainChangeBatch;
-use crate::sql::public::runtime::PreparedPublicWrite;
-use crate::sql_support::text::escape_sql_string;
+use crate::sql::common::text::escape_sql_string;
+use crate::sql::executor::public_runtime::PreparedPublicWrite;
+use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
 use crate::{LixBackendTransaction, LixError, Value};
 
 pub(crate) async fn apply_public_version_last_checkpoint_side_effects(
@@ -25,7 +25,7 @@ pub(crate) async fn apply_public_version_last_checkpoint_side_effects(
     }
 
     match public_write.planned_write.command.operation_kind {
-        crate::sql::public::planner::ir::WriteOperationKind::Insert => {
+        crate::sql::logical_plan::public_ir::WriteOperationKind::Insert => {
             upsert_last_checkpoint_rows(
                 transaction,
                 &version_checkpoint_rows_from_resolved_write(public_write, batch),
@@ -33,7 +33,7 @@ pub(crate) async fn apply_public_version_last_checkpoint_side_effects(
             )
             .await
         }
-        crate::sql::public::planner::ir::WriteOperationKind::Update => {
+        crate::sql::logical_plan::public_ir::WriteOperationKind::Update => {
             upsert_last_checkpoint_rows(
                 transaction,
                 &version_checkpoint_rows_from_resolved_write(public_write, batch),
@@ -41,7 +41,7 @@ pub(crate) async fn apply_public_version_last_checkpoint_side_effects(
             )
             .await
         }
-        crate::sql::public::planner::ir::WriteOperationKind::Delete => {
+        crate::sql::logical_plan::public_ir::WriteOperationKind::Delete => {
             let version_ids = version_ids_from_resolved_write(public_write, batch);
             delete_last_checkpoint_rows(transaction, &version_ids).await
         }

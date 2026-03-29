@@ -42,7 +42,7 @@ pub mod untracked;
 use crate::backend::QueryExecutor;
 pub use crate::canonical::CanonicalWatermark;
 use crate::live_state::shared::identity::RowIdentity;
-use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirement;
+use crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
