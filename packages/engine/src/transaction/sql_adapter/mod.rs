@@ -19,16 +19,18 @@ pub(crate) use crate::sql::executor::contracts::effects::{
 };
 pub(crate) use crate::sql::executor::contracts::planned_statement::MutationRow;
 pub(crate) use crate::sql::executor::execution_program::ExecutionContext;
+pub(crate) use crate::sql::executor::public_runtime::{
+    build_tracked_txn_unit, semantic_plan_effects_from_domain_changes,
+    state_commit_stream_operation, PreparedPublicWrite, TrackedTxnUnit,
+};
 pub(crate) use crate::sql::logical_plan::public_ir::{
     OptionalTextPatch, PlannedStateRow, WriteLane, WriteMode,
 };
 pub(crate) use crate::sql::logical_plan::ResultContract;
-pub(crate) use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
-pub(crate) use crate::sql::executor::public_runtime::{
-    build_tracked_txn_unit, semantic_plan_effects_from_domain_changes,
-    state_commit_stream_operation, PreparedPublicWrite, PublicWriteExecutionPartition,
-    TrackedTxnUnit, UntrackedWriteExecution,
+pub(crate) use crate::sql::physical_plan::{
+    PublicWriteExecutionPartition, UntrackedWriteExecution,
 };
+pub(crate) use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
 pub(crate) use crate::transaction::PendingTransactionView;
 
 pub(crate) use effects::mirror_public_registered_schema_bootstrap_rows;

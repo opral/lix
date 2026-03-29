@@ -536,9 +536,9 @@ mod tests {
     };
     use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect, TransactionMode};
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
-    use crate::sql::analysis::state_resolution::optimize::should_refresh_file_cache_for_statements;
-    use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
     use crate::sql::binder::{advance_placeholder_state_for_statement_ast, bind_sql_with_state};
+    use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
+    use crate::sql::optimizer::optimize_state_resolution;
     use crate::sql::parser::parse_sql_statements;
     use crate::sql::parser::placeholders::PlaceholderState;
     use crate::{LixError, NoopWasmRuntime, QueryResult, Session, Value};
@@ -870,7 +870,16 @@ mod tests {
 
     fn should_refresh_file_cache_for_sql(sql: &str) -> bool {
         parse_sql_statements(sql)
-            .map(|statements| should_refresh_file_cache_for_statements(&statements))
+            .map(|statements| {
+                optimize_state_resolution(
+                    &statements,
+                    crate::sql::analysis::state_resolution::canonical::canonicalize_state_resolution(
+                        &statements,
+                    ),
+                )
+                .optimized
+                .should_refresh_file_cache
+            })
             .unwrap_or(false)
     }
 

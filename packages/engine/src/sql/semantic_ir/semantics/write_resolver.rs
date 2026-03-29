@@ -1,11 +1,11 @@
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::catalog::SurfaceFamily;
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateSelector, MutationPayload, PlannedStateRow, PlannedWrite, ResolvedRowRef,
-    ResolvedWritePartition, ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof,
-    TargetSetProof, WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
+    ResolvedWritePartition, ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, TargetSetProof,
+    WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
 };
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
@@ -18,9 +18,7 @@ use crate::sql::semantic_ir::semantics::surface_semantics::{
     public_selector_column_name, public_selector_version_column, OverlayLane,
 };
 use crate::sql::services::public_reads::execute_public_query_with_optional_pending_transaction_view;
-use crate::sql::services::state_reader::{
-    load_exact_live_row, load_version_ref, LiveStorageLane,
-};
+use crate::sql::services::state_reader::{load_exact_live_row, load_version_ref, LiveStorageLane};
 use crate::transaction::PendingTransactionView;
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
@@ -927,8 +925,7 @@ fn surface_forces_global_write_scope(planned_write: &PlannedWrite) -> bool {
         .iter()
         .any(|predicate| {
             predicate.column == "global"
-                && predicate.value
-                    == crate::sql::catalog::SurfaceOverrideValue::Boolean(true)
+                && predicate.value == crate::sql::catalog::SurfaceOverrideValue::Boolean(true)
         })
 }
 
@@ -965,11 +962,9 @@ pub(super) fn resolved_version_id_for_insert_payload(
             Ok(Some(GLOBAL_VERSION_ID.to_string()))
         }
         crate::sql::catalog::DefaultScopeSemantics::History
-        | crate::sql::catalog::DefaultScopeSemantics::WorkingChanges => {
-            Err(WriteResolveError {
-                message: "public write resolver requires a bounded scope proof".to_string(),
-            })
-        }
+        | crate::sql::catalog::DefaultScopeSemantics::WorkingChanges => Err(WriteResolveError {
+            message: "public write resolver requires a bounded scope proof".to_string(),
+        }),
     }
 }
 

@@ -1,7 +1,6 @@
 use crate::errors::sql_unknown_column_error;
 use crate::filesystem::live_projection::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
-    FilesystemProjectionScope,
 };
 use crate::live_state::schema_access::{
     normalized_projection_sql_for_schema, payload_column_name_for_schema,
@@ -12,10 +11,13 @@ use crate::sql::catalog::{
     SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
     SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
 };
-use crate::sql::parser::parse_sql_script;
 use crate::sql::logical_plan::public_ir::{
     CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan, CanonicalStateScan,
     CanonicalWorkingChangesScan, FilesystemKind, ReadPlan, StructuredPublicRead, VersionScope,
+};
+use crate::sql::physical_plan::plan::{
+    compile_lowered_read_statement, FilesystemPublicSurface, LoweredReadProgram,
+    LoweredResultColumn, LoweredResultColumns, TerminalRelationRenderNode,
 };
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     EffectiveStatePlan, EffectiveStateRequest,
@@ -29,26 +31,10 @@ use sqlparser::ast::{
     JoinConstraint, JoinOperator, LimitClause, OrderBy, OrderByExpr, OrderByKind, Query, Select,
     SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins,
 };
+use sqlparser::ast::{ObjectName, ObjectNamePart};
+use sqlparser::ast::{Value as SqlValue, Visit, Visitor};
 use std::collections::{BTreeMap, BTreeSet};
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct LoweredReadProgram {
-    pub(crate) statements: Vec<Statement>,
-    pub(crate) pushdown_decision: PushdownDecision,
-    pub(crate) result_columns: LoweredResultColumns,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LoweredResultColumn {
-    Untyped,
-    Boolean,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LoweredResultColumns {
-    Static(Vec<LoweredResultColumn>),
-    ByColumnName(BTreeMap<String, LoweredResultColumn>),
-}
+use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BroadPublicRelationSummary {
@@ -57,7 +43,58 @@ pub(crate) struct BroadPublicRelationSummary {
     pub(crate) external_relations: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RenderRelationSubstitutionCollector {
+    next_relation_id: usize,
+    substitutions: Vec<TerminalRelationRenderNode>,
+}
+
+impl RenderRelationSubstitutionCollector {
+    fn into_substitutions(self) -> Vec<TerminalRelationRenderNode> {
+        self.substitutions
+    }
+
+    fn replacement_table_factor(
+        &mut self,
+        relation_name: &str,
+        alias: Option<TableAlias>,
+        replacement_sql: String,
+    ) -> TableFactor {
+        let alias = alias.unwrap_or_else(|| TableAlias {
+            explicit: true,
+            name: Ident::new(relation_name),
+            columns: Vec::new(),
+        });
+        let placeholder_name = format!("__lix_lowered_relation_{}", self.next_relation_id);
+        self.next_relation_id += 1;
+
+        let placeholder_factor = TableFactor::Table {
+            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+                &placeholder_name,
+            ))]),
+            alias: Some(alias.clone()),
+            args: None,
+            with_hints: vec![],
+            version: None,
+            with_ordinality: false,
+            partitions: vec![],
+            json_path: None,
+            sample: None,
+            index_hints: vec![],
+        };
+
+        self.substitutions.push(TerminalRelationRenderNode {
+            placeholder_relation_name: placeholder_name,
+            alias: alias.clone(),
+            rendered_factor_sql: format!("({replacement_sql}) {}", alias),
+        });
+
+        placeholder_factor
+    }
+}
+
 mod broad;
+pub(crate) use broad::RenderedBroadPublicReadStatement;
 
 #[cfg(test)]
 pub(crate) fn rewrite_supported_public_read_surfaces_in_statement(
@@ -66,17 +103,19 @@ pub(crate) fn rewrite_supported_public_read_surfaces_in_statement(
     broad::rewrite_supported_public_read_surfaces_in_statement(statement, SqlDialect::Sqlite)
 }
 
-pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id(
-    statement: &mut Statement,
+pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id_and_layouts(
+    statement: &Statement,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
-) -> Result<(), LixError> {
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<RenderedBroadPublicReadStatement, LixError> {
     broad::rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id(
         statement,
         registry,
         dialect,
         active_version_id,
+        known_live_layouts,
     )
 }
 
@@ -110,11 +149,11 @@ pub(crate) fn lower_read_for_execution_with_layouts(
                 effective_state_plan,
                 known_live_layouts,
             )
-            .map(|statement| {
-                statement.map(|statement| LoweredReadProgram {
-                    statements: vec![statement],
-                    pushdown_decision: build_pushdown_decision(effective_state_plan),
-                    result_columns: result_columns.clone(),
+            .map(|program| {
+                program.map(|mut program| {
+                    program.pushdown_decision = build_pushdown_decision(effective_state_plan);
+                    program.result_columns = result_columns.clone();
+                    program
                 })
             })
         }
@@ -132,16 +171,16 @@ pub(crate) fn lower_read_for_execution_with_layouts(
                 effective_state_plan,
                 known_live_layouts,
             )
-            .map(|statement| {
-                statement.map(|statement| LoweredReadProgram {
-                    statements: vec![statement],
-                    pushdown_decision: build_pushdown_decision(effective_state_plan),
-                    result_columns: result_columns.clone(),
+            .map(|program| {
+                program.map(|mut program| {
+                    program.pushdown_decision = build_pushdown_decision(effective_state_plan);
+                    program.result_columns = result_columns.clone();
+                    program
                 })
             })
         }
         SurfaceFamily::Change => {
-            lower_change_read_for_execution(dialect, structured_read).map(|statement| {
+            lower_change_read_for_execution(dialect, structured_read).map(|program| {
                 let pushdown_decision =
                     if canonical_working_changes_scan(&structured_read.read_command.root).is_some()
                     {
@@ -149,28 +188,28 @@ pub(crate) fn lower_read_for_execution_with_layouts(
                     } else {
                         change_pushdown_decision(structured_read)
                     };
-                statement.map(|statement| LoweredReadProgram {
-                    statements: vec![statement],
-                    pushdown_decision,
-                    result_columns: result_columns.clone(),
+                program.map(|mut program| {
+                    program.pushdown_decision = pushdown_decision;
+                    program.result_columns = result_columns.clone();
+                    program
                 })
             })
         }
         SurfaceFamily::Admin => {
-            lower_admin_read_for_execution(dialect, structured_read).map(|statement| {
-                statement.map(|statement| LoweredReadProgram {
-                    statements: vec![statement],
-                    pushdown_decision: admin_pushdown_decision(structured_read),
-                    result_columns: result_columns.clone(),
+            lower_admin_read_for_execution(dialect, structured_read).map(|program| {
+                program.map(|mut program| {
+                    program.pushdown_decision = admin_pushdown_decision(structured_read);
+                    program.result_columns = result_columns.clone();
+                    program
                 })
             })
         }
         SurfaceFamily::Filesystem => lower_filesystem_read_for_execution(dialect, structured_read)
-            .map(|statement| {
-                statement.map(|statement| LoweredReadProgram {
-                    statements: vec![statement],
-                    pushdown_decision: filesystem_pushdown_decision(structured_read),
-                    result_columns: result_columns.clone(),
+            .map(|program| {
+                program.map(|mut program| {
+                    program.pushdown_decision = filesystem_pushdown_decision(structured_read);
+                    program.result_columns = result_columns.clone();
+                    program
                 })
             }),
     }
@@ -182,7 +221,7 @@ fn lower_state_read_for_execution(
     effective_state_request: &EffectiveStateRequest,
     effective_state_plan: &EffectiveStatePlan,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-) -> Result<Option<Statement>, LixError> {
+) -> Result<Option<LoweredReadProgram>, LixError> {
     if let Some(error) =
         state_read_exposed_column_error(&canonicalized.surface_binding, effective_state_request)
     {
@@ -198,13 +237,9 @@ fn lower_state_read_for_execution(
                 effective_state_plan,
             )
         };
-    let Some(derived_query) = build_state_source_query(
+    let Some(source_sql) = build_state_source_sql(
         dialect,
-        canonicalized
-            .bound_statement
-            .execution_context
-            .requested_version_id
-            .as_deref(),
+        canonicalized.requested_version_id.as_deref(),
         &canonicalized.surface_binding,
         effective_state_request,
         &pushdown_predicates,
@@ -213,46 +248,58 @@ fn lower_state_read_for_execution(
     else {
         return Ok(None);
     };
-    let query =
-        build_lowered_read_query(dialect, canonicalized, derived_query, residual_selection)?;
-    Ok(Some(Statement::Query(Box::new(query))))
+    build_lowered_read_program(dialect, canonicalized, source_sql, residual_selection).map(Some)
 }
 
-fn build_lowered_read_query(
+fn build_lowered_read_program(
     dialect: SqlDialect,
     structured_read: &StructuredPublicRead,
-    source_query: Query,
+    source_sql: String,
     selection: Option<Expr>,
-) -> Result<Query, LixError> {
+) -> Result<LoweredReadProgram, LixError> {
     let mut projection = structured_read.query.projection.clone();
-    let active_version_id = structured_read
-        .bound_statement
-        .execution_context
-        .requested_version_id
-        .as_deref();
+    let active_version_id = structured_read.requested_version_id.as_deref();
+    let mut substitutions = RenderRelationSubstitutionCollector::default();
     rewrite_nested_filesystem_surfaces_in_select_items(
         dialect,
         active_version_id,
         &mut projection,
+        &mut substitutions,
     )?;
 
     let mut selection = selection;
     if let Some(selection) = &mut selection {
-        rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, selection)?;
+        rewrite_nested_filesystem_surfaces_in_expr(
+            dialect,
+            active_version_id,
+            selection,
+            &mut substitutions,
+        )?;
     }
 
     let mut order_by = structured_read.query.order_by.clone();
-    rewrite_nested_filesystem_surfaces_in_order_by(dialect, active_version_id, order_by.as_mut())?;
+    rewrite_nested_filesystem_surfaces_in_order_by(
+        dialect,
+        active_version_id,
+        order_by.as_mut(),
+        &mut substitutions,
+    )?;
 
     let derived_alias = structured_read.query.source_alias.clone().or_else(|| {
         Some(TableAlias {
-            explicit: false,
+            explicit: true,
             name: Ident::new(&structured_read.surface_binding.descriptor.public_name),
             columns: Vec::new(),
         })
     });
 
-    Ok(Query {
+    let relation = substitutions.replacement_table_factor(
+        &structured_read.surface_binding.descriptor.public_name,
+        derived_alias,
+        source_sql,
+    );
+
+    let statement = Statement::Query(Box::new(Query {
         with: None,
         body: Box::new(SetExpr::Select(Box::new(Select {
             select_token: AttachedToken::empty(),
@@ -263,11 +310,7 @@ fn build_lowered_read_query(
             exclude: None,
             into: None,
             from: vec![TableWithJoins {
-                relation: TableFactor::Derived {
-                    lateral: false,
-                    subquery: Box::new(source_query),
-                    alias: derived_alias,
-                },
+                relation,
                 joins: Vec::new(),
             }],
             lateral_views: Vec::new(),
@@ -293,6 +336,16 @@ fn build_lowered_read_query(
         settings: None,
         format_clause: None,
         pipe_operators: Vec::new(),
+    }));
+    Ok(LoweredReadProgram {
+        statements: vec![compile_lowered_read_statement(
+            dialect,
+            structured_read.bound_parameters.len(),
+            statement,
+            substitutions.into_substitutions(),
+        )?],
+        pushdown_decision: PushdownDecision::default(),
+        result_columns: LoweredResultColumns::Static(Vec::new()),
     })
 }
 
@@ -419,7 +472,7 @@ fn lower_entity_read_for_execution(
     effective_state_request: &EffectiveStateRequest,
     effective_state_plan: &EffectiveStatePlan,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-) -> Result<Option<Statement>, LixError> {
+) -> Result<Option<LoweredReadProgram>, LixError> {
     if canonicalized.query.uses_wildcard_projection() {
         return Ok(None);
     }
@@ -428,13 +481,9 @@ fn lower_entity_read_for_execution(
         canonicalized.query.selection.as_ref(),
         effective_state_plan,
     );
-    let Some(derived_query) = build_entity_source_query(
+    let Some(source_sql) = build_entity_source_sql(
         dialect,
-        canonicalized
-            .bound_statement
-            .execution_context
-            .requested_version_id
-            .as_deref(),
+        canonicalized.requested_version_id.as_deref(),
         &canonicalized.surface_binding,
         effective_state_request,
         &pushdown_predicates,
@@ -443,36 +492,31 @@ fn lower_entity_read_for_execution(
     else {
         return Ok(None);
     };
-    let query =
-        build_lowered_read_query(dialect, canonicalized, derived_query, residual_selection)?;
-    Ok(Some(Statement::Query(Box::new(query))))
+    build_lowered_read_program(dialect, canonicalized, source_sql, residual_selection).map(Some)
 }
 
 fn lower_change_read_for_execution(
     dialect: SqlDialect,
     canonicalized: &StructuredPublicRead,
-) -> Result<Option<Statement>, LixError> {
+) -> Result<Option<LoweredReadProgram>, LixError> {
     if canonical_working_changes_scan(&canonicalized.read_command.root).is_some() {
         return lower_working_changes_read_for_execution(dialect, canonicalized);
     }
 
-    let derived_query = build_change_source_query()?;
-    let query = build_lowered_read_query(
+    build_lowered_read_program(
         dialect,
         canonicalized,
-        derived_query,
+        build_change_source_sql(),
         canonicalized.query.selection.clone(),
-    )?;
-    Ok(Some(Statement::Query(Box::new(query))))
+    )
+    .map(Some)
 }
 
 fn lower_working_changes_read_for_execution(
     dialect: SqlDialect,
     canonicalized: &StructuredPublicRead,
-) -> Result<Option<Statement>, LixError> {
+) -> Result<Option<LoweredReadProgram>, LixError> {
     let active_version_id = canonicalized
-        .bound_statement
-        .execution_context
         .requested_version_id
         .as_deref()
         .ok_or_else(|| {
@@ -484,14 +528,13 @@ fn lower_working_changes_read_for_execution(
                 ),
             )
         })?;
-    let derived_query = build_working_changes_source_query(active_version_id)?;
-    let query = build_lowered_read_query(
+    build_lowered_read_program(
         dialect,
         canonicalized,
-        derived_query,
+        build_working_changes_source_sql(active_version_id),
         canonicalized.query.selection.clone(),
-    )?;
-    Ok(Some(Statement::Query(Box::new(query))))
+    )
+    .map(Some)
 }
 
 fn rewrite_nested_filesystem_surfaces_in_query(
@@ -499,12 +542,14 @@ fn rewrite_nested_filesystem_surfaces_in_query(
     active_version_id: Option<&str>,
     query: &mut Query,
     top_level: bool,
+    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<(), LixError> {
     rewrite_nested_filesystem_surfaces_in_set_expr(
         dialect,
         active_version_id,
         query.body.as_mut(),
         top_level,
+        substitutions,
     )?;
     Ok(())
 }
@@ -514,6 +559,7 @@ fn rewrite_nested_filesystem_surfaces_in_set_expr(
     active_version_id: Option<&str>,
     expr: &mut SetExpr,
     top_level: bool,
+    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<(), LixError> {
     match expr {
         SetExpr::Select(select) => rewrite_nested_filesystem_surfaces_in_select(
@@ -521,22 +567,29 @@ fn rewrite_nested_filesystem_surfaces_in_set_expr(
             active_version_id,
             select,
             top_level,
+            substitutions,
         ),
-        SetExpr::Query(query) => {
-            rewrite_nested_filesystem_surfaces_in_query(dialect, active_version_id, query, false)
-        }
+        SetExpr::Query(query) => rewrite_nested_filesystem_surfaces_in_query(
+            dialect,
+            active_version_id,
+            query,
+            false,
+            substitutions,
+        ),
         SetExpr::SetOperation { left, right, .. } => {
             rewrite_nested_filesystem_surfaces_in_set_expr(
                 dialect,
                 active_version_id,
                 left.as_mut(),
                 top_level,
+                substitutions,
             )?;
             rewrite_nested_filesystem_surfaces_in_set_expr(
                 dialect,
                 active_version_id,
                 right.as_mut(),
                 top_level,
+                substitutions,
             )
         }
         _ => Ok(()),
@@ -548,6 +601,7 @@ fn rewrite_nested_filesystem_surfaces_in_select(
     active_version_id: Option<&str>,
     select: &mut Select,
     top_level: bool,
+    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<(), LixError> {
     for table in &mut select.from {
         rewrite_nested_filesystem_surfaces_in_table_with_joins(
@@ -555,15 +609,26 @@ fn rewrite_nested_filesystem_surfaces_in_select(
             active_version_id,
             table,
             top_level,
+            substitutions,
         )?;
     }
     if let Some(selection) = &mut select.selection {
-        rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, selection)?;
+        rewrite_nested_filesystem_surfaces_in_expr(
+            dialect,
+            active_version_id,
+            selection,
+            substitutions,
+        )?;
     }
     for item in &mut select.projection {
         match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, expr)?;
+                rewrite_nested_filesystem_surfaces_in_expr(
+                    dialect,
+                    active_version_id,
+                    expr,
+                    substitutions,
+                )?;
             }
             _ => {}
         }
@@ -575,11 +640,17 @@ fn rewrite_nested_filesystem_surfaces_in_select_items(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     projection: &mut [SelectItem],
+    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<(), LixError> {
     for item in projection {
         match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, expr)?;
+                rewrite_nested_filesystem_surfaces_in_expr(
+                    dialect,
+                    active_version_id,
+                    expr,
+                    substitutions,
+                )?;
             }
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {}
         }
@@ -591,6 +662,7 @@ fn rewrite_nested_filesystem_surfaces_in_order_by(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     order_by: Option<&mut OrderBy>,
+    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<(), LixError> {
     let Some(order_by) = order_by else {
         return Ok(());
@@ -599,7 +671,12 @@ fn rewrite_nested_filesystem_surfaces_in_order_by(
         return Ok(());
     };
     for item in ordering {
-        rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, &mut item.expr)?;
+        rewrite_nested_filesystem_surfaces_in_expr(
+            dialect,
+            active_version_id,
+            &mut item.expr,
+            substitutions,
+        )?;
     }
     Ok(())
 }
@@ -609,12 +686,14 @@ fn rewrite_nested_filesystem_surfaces_in_table_with_joins(
     active_version_id: Option<&str>,
     table: &mut TableWithJoins,
     top_level: bool,
+    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<(), LixError> {
     rewrite_nested_filesystem_surfaces_in_table_factor(
         dialect,
         active_version_id,
         &mut table.relation,
         top_level,
+        substitutions,
     )?;
     for join in &mut table.joins {
         rewrite_nested_filesystem_surfaces_in_table_factor(
@@ -622,6 +701,7 @@ fn rewrite_nested_filesystem_surfaces_in_table_with_joins(
             active_version_id,
             &mut join.relation,
             top_level,
+            substitutions,
         )?;
     }
     Ok(())
@@ -632,6 +712,7 @@ fn rewrite_nested_filesystem_surfaces_in_table_factor(
     active_version_id: Option<&str>,
     relation: &mut TableFactor,
     top_level: bool,
+    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<(), LixError> {
     match relation {
         TableFactor::Table { name, alias, .. } => {
@@ -641,28 +722,31 @@ fn rewrite_nested_filesystem_surfaces_in_table_factor(
             if top_level || !is_rewriteable_filesystem_public_surface_name(surface_name) {
                 return Ok(());
             }
-            let Some(derived_query) =
-                build_nested_filesystem_surface_query(dialect, active_version_id, surface_name)?
+            let Some(source_sql) =
+                build_nested_filesystem_surface_sql(dialect, active_version_id, surface_name)?
             else {
                 return Ok(());
             };
-            let derived_alias = alias.clone().or_else(|| {
-                Some(TableAlias {
-                    explicit: false,
-                    name: Ident::new(surface_name),
-                    columns: Vec::new(),
-                })
-            });
-            *relation = TableFactor::Derived {
-                lateral: false,
-                subquery: Box::new(derived_query),
-                alias: derived_alias,
-            };
+            *relation = substitutions.replacement_table_factor(
+                surface_name,
+                alias.clone().or_else(|| {
+                    Some(TableAlias {
+                        explicit: true,
+                        name: Ident::new(surface_name),
+                        columns: Vec::new(),
+                    })
+                }),
+                source_sql,
+            );
             Ok(())
         }
-        TableFactor::Derived { subquery, .. } => {
-            rewrite_nested_filesystem_surfaces_in_query(dialect, active_version_id, subquery, false)
-        }
+        TableFactor::Derived { subquery, .. } => rewrite_nested_filesystem_surfaces_in_query(
+            dialect,
+            active_version_id,
+            subquery,
+            false,
+            substitutions,
+        ),
         TableFactor::NestedJoin {
             table_with_joins, ..
         } => rewrite_nested_filesystem_surfaces_in_table_with_joins(
@@ -670,6 +754,7 @@ fn rewrite_nested_filesystem_surfaces_in_table_factor(
             active_version_id,
             table_with_joins,
             false,
+            substitutions,
         ),
         _ => Ok(()),
     }
@@ -679,85 +764,132 @@ fn rewrite_nested_filesystem_surfaces_in_expr(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     expr: &mut Expr,
+    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<(), LixError> {
     match expr {
         Expr::BinaryOp { left, right, .. } => {
-            rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, left)?;
-            rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, right)
+            rewrite_nested_filesystem_surfaces_in_expr(
+                dialect,
+                active_version_id,
+                left,
+                substitutions,
+            )?;
+            rewrite_nested_filesystem_surfaces_in_expr(
+                dialect,
+                active_version_id,
+                right,
+                substitutions,
+            )
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
-        | Expr::Cast { expr, .. } => {
-            rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, expr)
-        }
+        | Expr::Cast { expr, .. } => rewrite_nested_filesystem_surfaces_in_expr(
+            dialect,
+            active_version_id,
+            expr,
+            substitutions,
+        ),
         Expr::InList { expr, list, .. } => {
-            rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, expr)?;
+            rewrite_nested_filesystem_surfaces_in_expr(
+                dialect,
+                active_version_id,
+                expr,
+                substitutions,
+            )?;
             for item in list {
-                rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, item)?;
+                rewrite_nested_filesystem_surfaces_in_expr(
+                    dialect,
+                    active_version_id,
+                    item,
+                    substitutions,
+                )?;
             }
             Ok(())
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, expr)?;
-            rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, low)?;
-            rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, high)
+            rewrite_nested_filesystem_surfaces_in_expr(
+                dialect,
+                active_version_id,
+                expr,
+                substitutions,
+            )?;
+            rewrite_nested_filesystem_surfaces_in_expr(
+                dialect,
+                active_version_id,
+                low,
+                substitutions,
+            )?;
+            rewrite_nested_filesystem_surfaces_in_expr(
+                dialect,
+                active_version_id,
+                high,
+                substitutions,
+            )
         }
         Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, expr)?;
-            rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, pattern)
+            rewrite_nested_filesystem_surfaces_in_expr(
+                dialect,
+                active_version_id,
+                expr,
+                substitutions,
+            )?;
+            rewrite_nested_filesystem_surfaces_in_expr(
+                dialect,
+                active_version_id,
+                pattern,
+                substitutions,
+            )
         }
-        Expr::Subquery(query) => {
-            rewrite_nested_filesystem_surfaces_in_query(dialect, active_version_id, query, false)
-        }
-        Expr::Exists { subquery, .. } => {
-            rewrite_nested_filesystem_surfaces_in_query(dialect, active_version_id, subquery, false)
-        }
+        Expr::Subquery(query) => rewrite_nested_filesystem_surfaces_in_query(
+            dialect,
+            active_version_id,
+            query,
+            false,
+            substitutions,
+        ),
+        Expr::Exists { subquery, .. } => rewrite_nested_filesystem_surfaces_in_query(
+            dialect,
+            active_version_id,
+            subquery,
+            false,
+            substitutions,
+        ),
         Expr::InSubquery { expr, subquery, .. } => {
-            rewrite_nested_filesystem_surfaces_in_expr(dialect, active_version_id, expr)?;
-            rewrite_nested_filesystem_surfaces_in_query(dialect, active_version_id, subquery, false)
+            rewrite_nested_filesystem_surfaces_in_expr(
+                dialect,
+                active_version_id,
+                expr,
+                substitutions,
+            )?;
+            rewrite_nested_filesystem_surfaces_in_query(
+                dialect,
+                active_version_id,
+                subquery,
+                false,
+                substitutions,
+            )
         }
         _ => Ok(()),
     }
 }
 
-fn build_nested_filesystem_surface_query(
+fn build_nested_filesystem_surface_sql(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     surface_name: &str,
-) -> Result<Option<Query>, LixError> {
-    let normalized = surface_name.to_ascii_lowercase();
-    let query = match normalized.as_str() {
-        "lix_file" => parse_single_query(&build_filesystem_file_projection_sql(
-            FilesystemProjectionScope::ActiveVersion,
-            active_version_id,
-            false,
-            dialect,
-        )?)?,
-        "lix_file_by_version" => parse_single_query(&build_filesystem_file_projection_sql(
-            FilesystemProjectionScope::ExplicitVersion,
-            None,
-            false,
-            dialect,
-        )?)?,
-        "lix_directory" => parse_single_query(&build_filesystem_directory_projection_sql(
-            FilesystemProjectionScope::ActiveVersion,
-            active_version_id,
-            dialect,
-        )?)?,
-        "lix_directory_by_version" => {
-            parse_single_query(&build_filesystem_directory_projection_sql(
-                FilesystemProjectionScope::ExplicitVersion,
-                None,
-                dialect,
-            )?)?
-        }
-        _ => return Ok(None),
+) -> Result<Option<String>, LixError> {
+    let Some(surface) = FilesystemPublicSurface::from_public_name(surface_name) else {
+        return Ok(None);
     };
-    Ok(Some(query))
+    Ok(Some(build_filesystem_surface_sql(
+        dialect,
+        active_version_id,
+        surface,
+    )?))
 }
 
 fn table_name_terminal(name: &sqlparser::ast::ObjectName) -> Option<&str> {
@@ -768,98 +900,84 @@ fn table_name_terminal(name: &sqlparser::ast::ObjectName) -> Option<&str> {
 }
 
 fn is_rewriteable_filesystem_public_surface_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "lix_file" | "lix_file_by_version" | "lix_directory" | "lix_directory_by_version"
-    )
+    FilesystemPublicSurface::from_public_name(name).is_some()
 }
 
 fn lower_admin_read_for_execution(
     dialect: SqlDialect,
     canonicalized: &StructuredPublicRead,
-) -> Result<Option<Statement>, LixError> {
+) -> Result<Option<LoweredReadProgram>, LixError> {
     let Some(admin_scan) = canonical_admin_scan(&canonicalized.read_command.root) else {
         return Ok(None);
     };
 
-    let derived_query = build_admin_source_query(admin_scan.kind)?;
-    let query = build_lowered_read_query(
+    build_lowered_read_program(
         dialect,
         canonicalized,
-        derived_query,
+        build_admin_source_sql(admin_scan.kind)?,
         canonicalized.query.selection.clone(),
-    )?;
-    Ok(Some(Statement::Query(Box::new(query))))
+    )
+    .map(Some)
 }
 
 fn lower_filesystem_read_for_execution(
     dialect: SqlDialect,
     canonicalized: &StructuredPublicRead,
-) -> Result<Option<Statement>, LixError> {
+) -> Result<Option<LoweredReadProgram>, LixError> {
     let Some(filesystem_scan) = canonical_filesystem_scan(&canonicalized.read_command.root) else {
         return Ok(None);
     };
-    let active_version_id = canonicalized
-        .bound_statement
-        .execution_context
-        .requested_version_id
-        .as_deref();
-
-    let derived_query = match (filesystem_scan.kind, filesystem_scan.version_scope) {
-        (FilesystemKind::File, VersionScope::ActiveVersion) => {
-            parse_single_query(&build_filesystem_file_projection_sql(
-                FilesystemProjectionScope::ActiveVersion,
-                active_version_id,
-                false,
-                dialect,
-            )?)?
-        }
-        (FilesystemKind::File, VersionScope::ExplicitVersion)
-            if canonicalized.surface_binding.descriptor.public_name == "lix_file_by_version" =>
-        {
-            parse_single_query(&build_filesystem_file_projection_sql(
-                FilesystemProjectionScope::ExplicitVersion,
-                None,
-                false,
-                dialect,
-            )?)?
-        }
-        (FilesystemKind::Directory, VersionScope::ActiveVersion) => {
-            parse_single_query(&build_filesystem_directory_projection_sql(
-                FilesystemProjectionScope::ActiveVersion,
-                active_version_id,
-                dialect,
-            )?)?
-        }
-        (FilesystemKind::Directory, VersionScope::ExplicitVersion)
-            if canonicalized.surface_binding.descriptor.public_name
-                == "lix_directory_by_version" =>
-        {
-            parse_single_query(&build_filesystem_directory_projection_sql(
-                FilesystemProjectionScope::ExplicitVersion,
-                None,
-                dialect,
-            )?)?
-        }
-        _ => return Ok(None),
+    let active_version_id = canonicalized.requested_version_id.as_deref();
+    let Some(surface) = FilesystemPublicSurface::from_filesystem_read(
+        &canonicalized.surface_binding,
+        filesystem_scan.kind,
+        filesystem_scan.version_scope,
+    ) else {
+        return Ok(None);
     };
-    let query = build_lowered_read_query(
+
+    build_lowered_read_program(
         dialect,
         canonicalized,
-        derived_query,
+        build_filesystem_surface_sql(dialect, active_version_id, surface)?,
         canonicalized.query.selection.clone(),
-    )?;
-    Ok(Some(Statement::Query(Box::new(query))))
+    )
+    .map(Some)
 }
 
-fn build_state_source_query(
+fn build_filesystem_surface_sql(
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    surface: FilesystemPublicSurface,
+) -> Result<String, LixError> {
+    let scoped_active_version_id = if surface.needs_active_version_id() {
+        active_version_id
+    } else {
+        None
+    };
+    match surface.kind() {
+        FilesystemKind::File => build_filesystem_file_projection_sql(
+            surface.projection_scope(),
+            scoped_active_version_id,
+            false,
+            dialect,
+        ),
+        FilesystemKind::Directory => build_filesystem_directory_projection_sql(
+            surface.projection_scope(),
+            scoped_active_version_id,
+            dialect,
+        ),
+    }
+}
+
+fn build_state_source_sql(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     surface_binding: &SurfaceBinding,
     effective_state_request: &EffectiveStateRequest,
-    pushdown_predicates: &[String],
+    pushdown_predicates: &[Expr],
     known_live_layouts: &BTreeMap<String, JsonValue>,
-) -> Result<Option<Query>, LixError> {
+) -> Result<Option<String>, LixError> {
     let sql = match surface_binding.descriptor.surface_variant {
         SurfaceVariant::Default | SurfaceVariant::ByVersion => build_effective_state_source_sql(
             dialect,
@@ -872,10 +990,10 @@ fn build_state_source_query(
         SurfaceVariant::History => return Ok(None),
         SurfaceVariant::WorkingChanges => return Ok(None),
     };
-    parse_single_query(&sql).map(Some)
+    Ok(Some(sql))
 }
 
-fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError> {
+fn build_admin_source_sql(kind: CanonicalAdminKind) -> Result<String, LixError> {
     let version_descriptor_table = tracked_relation_name("lix_version_descriptor");
     let version_ref_table = tracked_relation_name("lix_version_ref");
     let version_descriptor_name_column = quote_ident(&builtin_payload_column_name(
@@ -930,17 +1048,17 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
         ),
     };
 
-    parse_single_query(&sql)
+    Ok(sql)
 }
 
-fn build_entity_source_query(
+fn build_entity_source_sql(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     surface_binding: &SurfaceBinding,
     effective_state_request: &EffectiveStateRequest,
-    pushdown_predicates: &[String],
+    pushdown_predicates: &[Expr],
     known_live_layouts: &BTreeMap<String, JsonValue>,
-) -> Result<Option<Query>, LixError> {
+) -> Result<Option<String>, LixError> {
     let projection = entity_projection_sql(surface_binding, effective_state_request);
     let projection = if projection.is_empty() {
         "entity_id AS lixcol_entity_id".to_string()
@@ -948,9 +1066,9 @@ fn build_entity_source_query(
         projection.join(", ")
     };
 
-    let state_source_query = match surface_binding.descriptor.surface_variant {
+    let state_source_sql = match surface_binding.descriptor.surface_variant {
         SurfaceVariant::Default | SurfaceVariant::ByVersion => {
-            Some(parse_single_query(&build_effective_live_source_sql(
+            Some(build_effective_live_source_sql(
                 dialect,
                 active_version_id,
                 effective_state_request,
@@ -958,12 +1076,12 @@ fn build_entity_source_query(
                 pushdown_predicates,
                 known_live_layouts,
                 false,
-            )?)?)
+            )?)
         }
         SurfaceVariant::History => None,
         SurfaceVariant::WorkingChanges => None,
     };
-    let Some(state_source_query) = state_source_query else {
+    let Some(state_source_sql) = state_source_sql else {
         return Ok(None);
     };
     let mut predicates = Vec::new();
@@ -971,16 +1089,15 @@ fn build_entity_source_query(
         predicates.push(render_override_predicate(predicate));
     }
 
-    let source_sql = state_source_query.to_string();
     let sql = if predicates.is_empty() {
-        format!("SELECT {projection} FROM ({source_sql}) AS state_source")
+        format!("SELECT {projection} FROM ({state_source_sql}) AS state_source")
     } else {
         format!(
-            "SELECT {projection} FROM ({source_sql}) AS state_source WHERE {}",
+            "SELECT {projection} FROM ({state_source_sql}) AS state_source WHERE {}",
             predicates.join(" AND ")
         )
     };
-    parse_single_query(&sql).map(Some)
+    Ok(Some(sql))
 }
 
 fn build_effective_state_source_sql(
@@ -988,7 +1105,7 @@ fn build_effective_state_source_sql(
     active_version_id: Option<&str>,
     effective_state_request: &EffectiveStateRequest,
     surface_binding: &SurfaceBinding,
-    pushdown_predicates: &[String],
+    pushdown_predicates: &[Expr],
     known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<String, LixError> {
     let include_snapshot_content = effective_state_request
@@ -1011,7 +1128,7 @@ fn build_effective_live_source_sql(
     active_version_id: Option<&str>,
     effective_state_request: &EffectiveStateRequest,
     surface_binding: &SurfaceBinding,
-    pushdown_predicates: &[String],
+    pushdown_predicates: &[Expr],
     known_live_layouts: &BTreeMap<String, JsonValue>,
     include_snapshot_content: bool,
 ) -> Result<String, LixError> {
@@ -1129,7 +1246,7 @@ fn active_target_versions_cte_sql(active_version_id: &str) -> String {
 
 fn explicit_target_versions_cte_sql(
     schema_keys: &[String],
-    target_version_predicates: &[String],
+    target_version_predicates: &[Expr],
 ) -> String {
     let version_descriptor_table = tracked_relation_name("lix_version_descriptor");
     let version_descriptor_hidden_column = quote_ident(&builtin_payload_column_name(
@@ -1138,7 +1255,7 @@ fn explicit_target_versions_cte_sql(
     ));
     let hidden_global_requested = target_version_predicates
         .iter()
-        .any(|predicate| predicate.contains(&format!("'{}'", GLOBAL_VERSION_ID)));
+        .any(|predicate| expr_contains_string_literal(predicate, GLOBAL_VERSION_ID));
     let version_descriptor_predicates = vec![
         format!(
             "schema_key = '{}'",
@@ -1218,7 +1335,7 @@ fn effective_state_schema_winner_rows_sql(
     dialect: SqlDialect,
     surface_binding: &SurfaceBinding,
     schema_keys: &[String],
-    source_predicates: &[String],
+    source_predicates: &[Expr],
     effective_state_request: &EffectiveStateRequest,
     known_live_layouts: &BTreeMap<String, JsonValue>,
     include_snapshot_content: bool,
@@ -1449,12 +1566,14 @@ fn effective_state_schema_winner_rows_sql(
 }
 
 fn split_effective_state_pushdown_predicates(
-    pushdown_predicates: &[String],
-) -> (Vec<String>, Vec<String>) {
+    pushdown_predicates: &[Expr],
+) -> (Vec<Expr>, Vec<Expr>) {
     let mut target_version_predicates = Vec::new();
     let mut source_predicates = Vec::new();
     for predicate in pushdown_predicates {
-        if predicate.contains("version_id") && !predicate.contains("root_commit_id") {
+        if expr_references_identifier(predicate, &["version_id", "lixcol_version_id"])
+            && !expr_references_identifier(predicate, &["root_commit_id", "lixcol_root_commit_id"])
+        {
             target_version_predicates.push(predicate.clone());
         } else {
             source_predicates.push(predicate.clone());
@@ -1463,11 +1582,18 @@ fn split_effective_state_pushdown_predicates(
     (target_version_predicates, source_predicates)
 }
 
-fn render_where_clause_sql(predicates: &[String], prefix: &str) -> String {
+fn render_where_clause_sql(predicates: &[Expr], prefix: &str) -> String {
     if predicates.is_empty() {
         String::new()
     } else {
-        format!("{prefix}{}", predicates.join(" AND "))
+        format!(
+            "{prefix}{}",
+            predicates
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        )
     }
 }
 
@@ -1650,28 +1776,27 @@ fn render_live_payload_column_expr(
     }
 }
 
-fn build_change_source_query() -> Result<Query, LixError> {
-    parse_single_query(
-        "SELECT \
-            ch.id AS id, \
-            ch.entity_id AS entity_id, \
-            ch.schema_key AS schema_key, \
-            ch.schema_version AS schema_version, \
-            ch.file_id AS file_id, \
-            ch.plugin_key AS plugin_key, \
-            ch.metadata AS metadata, \
-            ch.created_at AS created_at, \
-            CASE \
-                WHEN ch.snapshot_id = 'no-content' THEN NULL \
-                ELSE s.content \
-            END AS snapshot_content \
-         FROM lix_internal_change ch \
-         LEFT JOIN lix_internal_snapshot s \
-            ON s.id = ch.snapshot_id",
-    )
+fn build_change_source_sql() -> String {
+    "SELECT \
+        ch.id AS id, \
+        ch.entity_id AS entity_id, \
+        ch.schema_key AS schema_key, \
+        ch.schema_version AS schema_version, \
+        ch.file_id AS file_id, \
+        ch.plugin_key AS plugin_key, \
+        ch.metadata AS metadata, \
+        ch.created_at AS created_at, \
+        CASE \
+            WHEN ch.snapshot_id = 'no-content' THEN NULL \
+            ELSE s.content \
+        END AS snapshot_content \
+     FROM lix_internal_change ch \
+     LEFT JOIN lix_internal_snapshot s \
+        ON s.id = ch.snapshot_id"
+        .to_string()
 }
 
-fn build_working_changes_source_query(active_version_id: &str) -> Result<Query, LixError> {
+fn build_working_changes_source_sql(active_version_id: &str) -> String {
     let version_ref_table = tracked_relation_name("lix_version_ref");
     let commit_tracked_table = tracked_relation_name("lix_commit");
     let cse_tracked_table = tracked_relation_name("lix_change_set_element");
@@ -1713,7 +1838,7 @@ fn build_working_changes_source_query(active_version_id: &str) -> Result<Query, 
         active_version_id = escape_sql_string(active_version_id),
     );
 
-    parse_single_query(&format!(
+    format!(
         "WITH RECURSIVE \
             {active_version_cte}, \
             scope_heads AS ( \
@@ -2088,7 +2213,7 @@ fn build_working_changes_source_query(active_version_id: &str) -> Result<Query, 
         commit_edge_table = commit_edge_table,
         commit_edge_parent_id_column = commit_edge_parent_id_column,
         commit_edge_child_id_column = commit_edge_child_id_column,
-    ))
+    )
 }
 
 fn canonical_admin_scan(
@@ -2226,27 +2351,19 @@ fn render_override_value(value: &SurfaceOverrideValue) -> String {
 
 fn build_pushdown_decision(effective_state_plan: &EffectiveStatePlan) -> PushdownDecision {
     PushdownDecision {
-        accepted_predicates: effective_state_plan
-            .pushdown_safe_predicates
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
+        accepted_predicates: effective_state_plan.pushdown_safe_predicates.clone(),
         rejected_predicates: effective_state_plan
             .residual_predicates
             .iter()
             .map(|predicate| RejectedPredicate {
-                predicate: predicate.to_string(),
+                predicate: predicate.clone(),
                 reason:
                     "day-1 public read lowering keeps this predicate above effective-state resolution"
                         .to_string(),
                 support: PushdownSupport::Unsupported,
             })
             .collect(),
-        residual_predicates: effective_state_plan
-            .residual_predicates
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
+        residual_predicates: effective_state_plan.residual_predicates.clone(),
     }
 }
 
@@ -2321,7 +2438,7 @@ fn filesystem_pushdown_decision(canonicalized: &StructuredPublicRead) -> Pushdow
 fn split_state_selection_for_pushdown(
     selection: Option<&Expr>,
     effective_state_plan: &EffectiveStatePlan,
-) -> (Vec<String>, Option<Expr>) {
+) -> (Vec<Expr>, Option<Expr>) {
     let Some(selection) = selection else {
         return (Vec::new(), None);
     };
@@ -2333,14 +2450,37 @@ fn split_state_selection_for_pushdown(
             .pushdown_safe_predicates
             .iter()
             .any(|accepted| accepted == &predicate)
+            && !expr_contains_placeholder(&predicate)
         {
-            pushdown.push(predicate.to_string());
+            pushdown.push(predicate);
         } else {
             residual.push(predicate);
         }
     }
 
     (pushdown, combine_conjunctive_predicates(residual))
+}
+
+fn expr_contains_placeholder(expr: &Expr) -> bool {
+    struct PlaceholderVisitor {
+        found: bool,
+    }
+
+    impl Visitor for PlaceholderVisitor {
+        type Break = ();
+
+        fn pre_visit_value(&mut self, value: &SqlValue) -> ControlFlow<Self::Break> {
+            if matches!(value, SqlValue::Placeholder(_)) {
+                self.found = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = PlaceholderVisitor { found: false };
+    let _ = expr.visit(&mut visitor);
+    visitor.found
 }
 
 fn split_conjunctive_predicates(expr: &Expr) -> Vec<Expr> {
@@ -2374,35 +2514,84 @@ fn combine_conjunctive_predicates(predicates: Vec<Expr>) -> Option<Expr> {
     }))
 }
 
-fn read_predicates_from_query(canonicalized: &StructuredPublicRead) -> Vec<String> {
-    canonicalized
-        .query
-        .selection_predicates
-        .iter()
-        .cloned()
-        .into_iter()
-        .map(|predicate| predicate.to_string())
-        .collect()
+fn read_predicates_from_query(canonicalized: &StructuredPublicRead) -> Vec<Expr> {
+    canonicalized.query.selection_predicates.clone()
 }
 
-fn parse_single_query(sql: &str) -> Result<Query, LixError> {
-    let mut statements = parse_sql_script(sql).map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: error.to_string(),
-    })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "expected a single lowered public read statement".to_string(),
-        });
+fn expr_references_identifier(expr: &Expr, accepted_names: &[&str]) -> bool {
+    struct IdentifierVisitor<'a> {
+        accepted_names: &'a [&'a str],
+        matched: bool,
     }
-    let Statement::Query(query) = statements.remove(0) else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "expected lowered public read to parse as a query".to_string(),
-        });
+
+    impl Visitor for IdentifierVisitor<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            let matched_name = match expr {
+                Expr::Identifier(identifier) => Some(identifier.value.as_str()),
+                Expr::CompoundIdentifier(identifiers) => identifiers
+                    .last()
+                    .map(|identifier| identifier.value.as_str()),
+                _ => None,
+            };
+
+            if matched_name.is_some_and(|name| {
+                self.accepted_names
+                    .iter()
+                    .any(|accepted| name.eq_ignore_ascii_case(accepted))
+            }) {
+                self.matched = true;
+                return ControlFlow::Break(());
+            }
+
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = IdentifierVisitor {
+        accepted_names,
+        matched: false,
     };
-    Ok(*query)
+    let _ = expr.visit(&mut visitor);
+    visitor.matched
+}
+
+fn expr_contains_string_literal(expr: &Expr, expected: &str) -> bool {
+    struct LiteralVisitor<'a> {
+        expected: &'a str,
+        matched: bool,
+    }
+
+    impl Visitor for LiteralVisitor<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            let matches = match expr {
+                Expr::Value(value) => match &value.value {
+                    SqlValue::SingleQuotedString(text) | SqlValue::DoubleQuotedString(text) => {
+                        text == self.expected
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+
+            if matches {
+                self.matched = true;
+                return ControlFlow::Break(());
+            }
+
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = LiteralVisitor {
+        expected,
+        matched: false,
+    };
+    let _ = expr.visit(&mut visitor);
+    visitor.matched
 }
 
 fn render_identifier(value: &str) -> String {
@@ -2419,12 +2608,12 @@ mod tests {
         lower_read_for_execution_with_layouts, rewrite_supported_public_read_surfaces_in_statement,
         LoweredReadProgram,
     };
-    use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::binder::bind_statement;
-    use crate::sql::semantic_ir::ExecutionContext;
+    use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::semantic_ir::canonicalize::canonicalize_read;
     use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
     use crate::sql::semantic_ir::semantics::effective_state_resolver::build_effective_state;
+    use crate::sql::semantic_ir::ExecutionContext;
     use crate::{SqlDialect, Value};
     use serde_json::{json, Value as JsonValue};
     use std::collections::BTreeMap;
@@ -2438,8 +2627,7 @@ mod tests {
         sql: &str,
         known_live_layouts: &BTreeMap<String, JsonValue>,
     ) -> Option<LoweredReadProgram> {
-        let mut statements =
-            crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
+        let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
         let mut execution_context = ExecutionContext::with_dialect(SqlDialect::Sqlite);
         execution_context.requested_version_id = Some("main".to_string());
@@ -2467,7 +2655,9 @@ mod tests {
             "SELECT key, value FROM lix_key_value WHERE key = 'hello'",
         )
         .expect("builtin entity read should lower");
-        let lowered_sql = lowered.statements[0].to_string();
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
 
         assert!(lowered_sql.contains("FROM (SELECT"));
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
@@ -2476,11 +2666,11 @@ mod tests {
         assert!(lowered_sql.contains("file_id = 'lix'"));
         assert!(lowered_sql.contains("plugin_key = 'lix'"));
         assert_eq!(
-            lowered.pushdown_decision.residual_predicates,
+            lowered.pushdown_decision.residual_predicate_sql(),
             vec!["key = 'hello'".to_string()]
         );
         assert_eq!(
-            lowered.pushdown_decision.accepted_predicates,
+            lowered.pushdown_decision.accepted_predicate_sql(),
             Vec::<String>::new()
         );
     }
@@ -2560,31 +2750,27 @@ mod tests {
     #[test]
     fn lowers_dynamic_entity_reads_with_scalar_override_predicates() {
         let mut registry = SurfaceRegistry::with_builtin_surfaces();
-        registry.register_dynamic_entity_surfaces(
-            crate::sql::catalog::DynamicEntitySurfaceSpec {
-                schema_key: "message".to_string(),
-                visible_columns: vec!["body".to_string(), "id".to_string()],
-                column_types: BTreeMap::new(),
-                predicate_overrides: vec![
-                    crate::sql::catalog::SurfaceOverridePredicate {
-                        column: "file_id".to_string(),
-                        value: crate::sql::catalog::SurfaceOverrideValue::String(
-                            "inlang".to_string(),
-                        ),
-                    },
-                    crate::sql::catalog::SurfaceOverridePredicate {
-                        column: "plugin_key".to_string(),
-                        value: crate::sql::catalog::SurfaceOverrideValue::String(
-                            "inlang_sdk".to_string(),
-                        ),
-                    },
-                    crate::sql::catalog::SurfaceOverridePredicate {
-                        column: "global".to_string(),
-                        value: crate::sql::catalog::SurfaceOverrideValue::Boolean(true),
-                    },
-                ],
-            },
-        );
+        registry.register_dynamic_entity_surfaces(crate::sql::catalog::DynamicEntitySurfaceSpec {
+            schema_key: "message".to_string(),
+            visible_columns: vec!["body".to_string(), "id".to_string()],
+            column_types: BTreeMap::new(),
+            predicate_overrides: vec![
+                crate::sql::catalog::SurfaceOverridePredicate {
+                    column: "file_id".to_string(),
+                    value: crate::sql::catalog::SurfaceOverrideValue::String("inlang".to_string()),
+                },
+                crate::sql::catalog::SurfaceOverridePredicate {
+                    column: "plugin_key".to_string(),
+                    value: crate::sql::catalog::SurfaceOverrideValue::String(
+                        "inlang_sdk".to_string(),
+                    ),
+                },
+                crate::sql::catalog::SurfaceOverridePredicate {
+                    column: "global".to_string(),
+                    value: crate::sql::catalog::SurfaceOverrideValue::Boolean(true),
+                },
+            ],
+        });
 
         let mut known_live_layouts = BTreeMap::new();
         known_live_layouts.insert(
@@ -2607,7 +2793,9 @@ mod tests {
             &known_live_layouts,
         )
         .expect("dynamic entity read should lower");
-        let lowered_sql = lowered.statements[0].to_string();
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
 
         assert!(lowered_sql.contains("lix_internal_live_v1_message"));
         assert!(lowered_sql.contains("file_id = 'inlang'"));
@@ -2632,17 +2820,19 @@ mod tests {
             "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'",
         )
         .expect("state read should lower");
-        let lowered_sql = lowered.statements[0].to_string();
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
 
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
         assert!(!lowered_sql.contains("FROM lix_state"));
         assert!(!lowered_sql.contains(") WHERE schema_key = 'lix_key_value'"));
         assert_eq!(
-            lowered.pushdown_decision.accepted_predicates,
+            lowered.pushdown_decision.accepted_predicate_sql(),
             vec!["schema_key = 'lix_key_value'".to_string()]
         );
         assert_eq!(
-            lowered.pushdown_decision.residual_predicates,
+            lowered.pushdown_decision.residual_predicate_sql(),
             Vec::<String>::new()
         );
     }
@@ -2655,13 +2845,15 @@ mod tests {
             "SELECT id, schema_key, snapshot_content FROM lix_change WHERE entity_id = 'entity-1'",
         )
         .expect("change read should lower");
-        let lowered_sql = lowered.statements[0].to_string();
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
 
         assert!(lowered_sql.contains("FROM (SELECT ch.id AS id"));
         assert!(lowered_sql.contains("FROM lix_internal_change ch"));
         assert!(lowered_sql.contains("LEFT JOIN lix_internal_snapshot s"));
         assert_eq!(
-            lowered.pushdown_decision.residual_predicates,
+            lowered.pushdown_decision.residual_predicate_sql(),
             vec!["entity_id = 'entity-1'".to_string()]
         );
     }
@@ -2675,7 +2867,9 @@ mod tests {
              WHERE entity_id = 'entity-1' AND schema_key = 'lix_file_descriptor'",
         )
         .expect("change-set element read should lower");
-        let lowered_sql = lowered.statements[0].to_string();
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
 
         assert!(
             !lowered_sql.contains("json_extract(\"ranked\".\"change_id\""),
@@ -2697,7 +2891,9 @@ mod tests {
              WHERE wc.file_id IN (SELECT f.id FROM lix_file f WHERE f.path = '/hello.txt')",
         )
         .expect("working changes read with nested filesystem subquery should lower");
-        let lowered_sql = lowered.statements[0].to_string();
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
 
         assert!(
             !lowered_sql.contains("FROM lix_file"),
@@ -2716,14 +2912,16 @@ mod tests {
             "SELECT id, path, data FROM lix_file WHERE id = 'file-1'",
         )
         .expect("filesystem current read should lower");
-        let current_sql = current.statements[0].to_string();
+        let current_sql = current.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
 
         assert!(current_sql.contains("lix_internal_live_v1_lix_file_descriptor"));
         assert!(current_sql.contains("lix_internal_live_v1_lix_directory_descriptor"));
         assert!(current_sql.contains("lix_internal_binary_blob_store"));
         assert!(!current_sql.contains("FROM lix_file_by_version"));
         assert_eq!(
-            current.pushdown_decision.residual_predicates,
+            current.pushdown_decision.residual_predicate_sql(),
             vec!["id = 'file-1'".to_string()]
         );
 
@@ -2733,13 +2931,15 @@ mod tests {
              WHERE id = 'dir-1' AND lixcol_version_id = 'version-a'",
         )
         .expect("filesystem by-version read should lower");
-        let by_version_sql = by_version.statements[0].to_string();
+        let by_version_sql = by_version.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
 
         assert!(by_version_sql.contains("lix_internal_live_v1_lix_directory_descriptor"));
         assert!(by_version_sql.contains("all_target_versions AS"));
         assert!(!by_version_sql.contains("FROM lix_directory_by_version"));
         assert_eq!(
-            by_version.pushdown_decision.residual_predicates,
+            by_version.pushdown_decision.residual_predicate_sql(),
             vec![
                 "id = 'dir-1'".to_string(),
                 "lixcol_version_id = 'version-a'".to_string()
@@ -2767,18 +2967,20 @@ mod tests {
             "SELECT id, name, hidden, commit_id FROM lix_version WHERE name = 'main'",
         )
         .expect("version read should lower");
-        let lowered_sql = lowered.statements[0].to_string();
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
 
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
         assert!(lowered_sql.contains("untracked = true"));
         assert!(!lowered_sql.contains("FROM lix_version"));
         assert_eq!(
-            lowered.pushdown_decision.accepted_predicates,
+            lowered.pushdown_decision.accepted_predicate_sql(),
             Vec::<String>::new()
         );
         assert_eq!(
-            lowered.pushdown_decision.residual_predicates,
+            lowered.pushdown_decision.residual_predicate_sql(),
             vec!["name = 'main'".to_string()]
         );
     }
@@ -2791,7 +2993,9 @@ mod tests {
             "SELECT value, lixcol_entity_id FROM lix_registered_schema WHERE lixcol_entity_id = 'x~1'",
         )
         .expect("registered schema read should lower");
-        let lowered_sql = lowered.statements[0].to_string();
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
 
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_registered_schema"));
         assert!(lowered_sql.contains("file_id = 'lix'"));
@@ -2799,7 +3003,7 @@ mod tests {
         assert!(lowered_sql.contains("global = true"));
         assert!(!lowered_sql.contains("FROM lix_registered_schema"));
         assert_eq!(
-            lowered.pushdown_decision.residual_predicates,
+            lowered.pushdown_decision.residual_predicate_sql(),
             vec!["lixcol_entity_id = 'x~1'".to_string()]
         );
     }

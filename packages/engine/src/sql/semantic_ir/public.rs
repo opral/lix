@@ -1,5 +1,5 @@
 use super::canonicalize::{
-    canonicalize_read, canonicalize_write, CanonicalizeError, CanonicalizedWrite,
+    canonicalize_read_parts, canonicalize_write, CanonicalizeError, CanonicalizedWrite,
 };
 use super::internal::NormalizedInternalStatements;
 use super::statement::BoundStatement;
@@ -8,12 +8,15 @@ use crate::sql::backend::PushdownDecision;
 use crate::sql::catalog::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
-use crate::sql::logical_plan::{DependencySpec, DirectPublicReadPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan};
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateScan, CommitPreconditions, PlannedWrite, ReadCommand, ReadContract, ReadPlan,
-    ResolvedWritePlan, SchemaProof, ScopeProof, StructuredPublicRead, TargetSetProof,
-    WriteCommand,
+    ResolvedWritePlan, SchemaProof, ScopeProof, StructuredPublicRead, TargetSetProof, WriteCommand,
 };
+use crate::sql::logical_plan::{
+    DependencySpec, DirectPublicReadPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan,
+};
+use crate::sql::optimizer::OptimizerPassTrace;
+use crate::sql::physical_plan::PhysicalPlan;
 use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
 use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
@@ -23,8 +26,8 @@ use crate::sql::semantic_ir::semantics::write_analysis::{analyze_write, WriteAna
 use crate::sql::services::state_reader::load_committed_version_head_commit_id;
 use crate::{LixBackend, LixError};
 use sqlparser::ast::{
-    AnalyzeFormatKind, BinaryOperator, DescribeAlias, Expr, Ident, SetExpr, Statement,
-    TableFactor, UtilityOption, Value as SqlValue,
+    AnalyzeFormatKind, BinaryOperator, DescribeAlias, Expr, Ident, SetExpr, Statement, TableFactor,
+    UtilityOption, Value as SqlValue,
 };
 use std::collections::BTreeSet;
 
@@ -56,7 +59,6 @@ pub(crate) struct ExplainedStatement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PublicReadSemantics {
-    pub(crate) bound_statement: BoundStatement,
     pub(crate) surface_bindings: Vec<SurfaceBinding>,
     pub(crate) structured_read: Option<StructuredPublicRead>,
     pub(crate) effective_state_request: Option<EffectiveStateRequest>,
@@ -75,8 +77,14 @@ impl PublicReadSemantics {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StructuredPublicReadAnalysis {
+    pub(crate) bound_statement: BoundStatement,
     pub(crate) semantics: PublicReadSemantics,
     pub(crate) dependency_spec: Option<DependencySpec>,
+}
+
+pub(crate) enum StructuredPublicReadPreparation {
+    Prepared(StructuredPublicReadAnalysis),
+    Declined(BoundStatement),
 }
 
 impl StructuredPublicReadAnalysis {
@@ -115,14 +123,24 @@ pub(crate) async fn prepare_structured_public_read_analysis(
     bound_statement: BoundStatement,
     active_version_id: &str,
     registry: &SurfaceRegistry,
-) -> Result<Option<StructuredPublicReadAnalysis>, LixError> {
-    let structured_read = match canonicalize_read(bound_statement.clone(), registry) {
-        Ok(canonicalized) => canonicalized.structured_read(),
-        Err(_error) => match try_build_direct_state_history_structured_read(bound_statement, registry)?
-        {
-            Some(structured_read) => structured_read,
-            None => return Ok(None),
+) -> Result<StructuredPublicReadPreparation, LixError> {
+    let structured_read = match canonicalize_read_parts(&bound_statement, registry) {
+        Ok(parts) => StructuredPublicRead {
+            bound_parameters: bound_statement.bound_parameters.clone(),
+            requested_version_id: bound_statement
+                .execution_context
+                .requested_version_id
+                .clone(),
+            surface_binding: parts.surface_binding,
+            read_command: parts.read_command,
+            query: parts.query,
         },
+        Err(_error) => {
+            match try_build_direct_state_history_structured_read(&bound_statement, registry)? {
+                Some(structured_read) => structured_read,
+                None => return Ok(StructuredPublicReadPreparation::Declined(bound_statement)),
+            }
+        }
     };
 
     let structured_read =
@@ -146,16 +164,20 @@ pub(crate) async fn prepare_structured_public_read_analysis(
     }
     let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
 
-    Ok(Some(StructuredPublicReadAnalysis {
-        semantics: PublicReadSemantics {
-            bound_statement: structured_read.bound_statement.clone(),
-            surface_bindings: vec![structured_read.surface_binding.clone()],
-            structured_read: Some(structured_read),
-            effective_state_request: effective_state.as_ref().map(|(request, _)| request.clone()),
-            effective_state_plan: effective_state.as_ref().map(|(_, plan)| plan.clone()),
+    Ok(StructuredPublicReadPreparation::Prepared(
+        StructuredPublicReadAnalysis {
+            bound_statement,
+            semantics: PublicReadSemantics {
+                surface_bindings: vec![structured_read.surface_binding.clone()],
+                structured_read: Some(structured_read),
+                effective_state_request: effective_state
+                    .as_ref()
+                    .map(|(request, _)| request.clone()),
+                effective_state_plan: effective_state.as_ref().map(|(_, plan)| plan.clone()),
+            },
+            dependency_spec,
         },
-        dependency_spec,
-    }))
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -242,6 +264,8 @@ pub(crate) struct PublicWriteInvariantTrace {
 pub(crate) struct PublicExecutionDebugTrace {
     pub(crate) semantic_statement: Option<SemanticStatement>,
     pub(crate) bound_statements: Vec<BoundStatement>,
+    pub(crate) optimizer_passes: Vec<OptimizerPassTrace>,
+    pub(crate) physical_plan: Option<PhysicalPlan>,
     pub(crate) surface_bindings: Vec<String>,
     pub(crate) bound_public_leaves: Vec<BoundPublicLeaf>,
     pub(crate) dependency_spec: Option<DependencySpec>,
@@ -261,7 +285,7 @@ pub(crate) struct PublicExecutionDebugTrace {
 }
 
 fn try_build_direct_state_history_structured_read(
-    bound_statement: BoundStatement,
+    bound_statement: &BoundStatement,
     registry: &SurfaceRegistry,
 ) -> Result<Option<StructuredPublicRead>, LixError> {
     let Statement::Query(query) = &bound_statement.statement else {
@@ -321,15 +345,20 @@ fn try_build_direct_state_history_structured_read(
         return Ok(None);
     }
 
-    let scan = CanonicalStateScan::from_surface_binding(surface_binding.clone()).ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "state-history direct preparation could not derive a canonical state scan",
-        )
-    })?;
+    let scan =
+        CanonicalStateScan::from_surface_binding(surface_binding.clone()).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "state-history direct preparation could not derive a canonical state scan",
+            )
+        })?;
 
     Ok(Some(StructuredPublicRead {
-        bound_statement,
+        bound_parameters: bound_statement.bound_parameters.clone(),
+        requested_version_id: bound_statement
+            .execution_context
+            .requested_version_id
+            .clone(),
         surface_binding,
         read_command: ReadCommand {
             root: ReadPlan::scan(scan),
@@ -512,12 +541,14 @@ pub(crate) fn augment_dependency_spec_for_broad_public_read(
 ) -> Option<DependencySpec> {
     let mut dependency_spec = dependency_spec?;
     let references_state_like_surface = dependency_spec.relations.iter().any(|relation| {
-        registry.bind_relation_name(relation).is_some_and(|binding| {
-            matches!(
-                binding.descriptor.surface_family,
-                SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
-            )
-        })
+        registry
+            .bind_relation_name(relation)
+            .is_some_and(|binding| {
+                matches!(
+                    binding.descriptor.surface_family,
+                    SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
+                )
+            })
     });
     let has_state_schema_keys = !dependency_spec.schema_keys.is_empty();
     if references_state_like_surface && !has_state_schema_keys {

@@ -17,6 +17,6 @@ pub(crate) mod logical_plan;
 pub(crate) mod optimizer;
 pub(crate) mod parser;
 pub(crate) mod physical_plan;
-pub(crate) mod services;
 pub(crate) mod semantic_ir;
+pub(crate) mod services;
 pub(crate) mod storage;

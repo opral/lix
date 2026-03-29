@@ -1,8 +1,6 @@
 use crate::filesystem::runtime::{merge_filesystem_transaction_state, FilesystemTransactionState};
-use crate::sql::catalog::{
-    DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, SurfaceVariant,
-};
-use crate::sql::semantic_ir::{BoundStatement, ExecutionContext};
+use crate::sql::catalog::{DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, SurfaceVariant};
+use crate::sql::semantic_ir::ExecutionContext;
 use crate::Value;
 use sqlparser::ast::{
     Expr, GroupByExpr, Join, LimitClause, OrderBy, Query, Select, SelectItem, SetExpr, Statement,
@@ -274,7 +272,8 @@ impl NormalizedPublicReadQuery {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StructuredPublicRead {
-    pub(crate) bound_statement: BoundStatement,
+    pub(crate) bound_parameters: Vec<Value>,
+    pub(crate) requested_version_id: Option<String>,
     pub(crate) surface_binding: SurfaceBinding,
     pub(crate) read_command: ReadCommand,
     pub(crate) query: NormalizedPublicReadQuery,
@@ -591,8 +590,7 @@ pub(crate) struct PlannedWrite {
     pub(crate) backend_rejections: Vec<String>,
 }
 
-impl PlannedWrite {
-}
+impl PlannedWrite {}
 
 impl ResolvedWritePlan {
     pub(crate) fn from_partition(partition: ResolvedWritePartition) -> Self {

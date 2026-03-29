@@ -4,10 +4,8 @@ use crate::engine::{
 use crate::sql::executor::execution_program::{
     BoundStatementTemplateInstance, ExecutionContext, StatementTemplate, StatementTemplateCacheKey,
 };
+use crate::sql::executor::shared_path::{self, prepared_execution_mutates_public_surface_registry};
 use crate::sql::parser::parse_sql;
-use crate::sql::executor::shared_path::{
-    self, prepared_execution_mutates_public_surface_registry,
-};
 use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, Value};
 use sqlparser::ast::Statement;

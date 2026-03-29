@@ -9,11 +9,11 @@ use crate::sql::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::sql::executor::public_runtime::{
     decode_public_read_result, execute_prepared_public_read, PreparedPublicRead,
 };
+use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::services::state_reader::{
     normalized_values_from_snapshot, scan_live_rows, snapshot_text_from_row, LiveReadRow,
     LiveStorageLane,
 };
-use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::transaction::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
     PendingSemanticRow, PendingSemanticStorage, PendingTransactionView,
@@ -62,8 +62,7 @@ impl<'a> TransactionReadModel<'a> {
         &self,
     ) -> Result<crate::sql::catalog::SurfaceRegistry, LixError> {
         if !self.has_pending_visibility() {
-            return crate::sql::catalog::SurfaceRegistry::bootstrap_with_backend(self.base)
-                .await;
+            return crate::sql::catalog::SurfaceRegistry::bootstrap_with_backend(self.base).await;
         }
 
         let mut registry = crate::sql::catalog::SurfaceRegistry::with_builtin_surfaces();
@@ -492,7 +491,7 @@ fn live_table_query_from_prepared_public_read(
         .as_ref()
         .map(|alias| alias.name.value.as_str());
     let mut placeholder_state = PlaceholderState::new();
-    let bound_parameters = &structured_read.bound_statement.bound_parameters;
+    let bound_parameters = &structured_read.bound_parameters;
 
     Some(LiveTableOverlayQuery {
         storage: PendingSemanticStorage::Tracked,
@@ -507,11 +506,7 @@ fn live_table_query_from_prepared_public_read(
                     .then(|| request.schema_set.iter().next().cloned())
                     .flatten()
             })?,
-        version_id: structured_read
-            .bound_statement
-            .execution_context
-            .requested_version_id
-            .clone()?,
+        version_id: structured_read.requested_version_id.clone()?,
         projections: structured_read
             .query
             .projection

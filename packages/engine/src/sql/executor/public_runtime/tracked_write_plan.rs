@@ -1,8 +1,9 @@
 use crate::filesystem::runtime::FilesystemTransactionState;
 use crate::sql::executor::compiled::CompiledExecution;
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;
+use crate::sql::physical_plan::TrackedWriteExecution;
 
-use super::{PreparedPublicWrite, TrackedWriteExecution};
+use super::PreparedPublicWrite;
 
 #[derive(Clone)]
 pub(crate) struct TrackedTxnUnit {

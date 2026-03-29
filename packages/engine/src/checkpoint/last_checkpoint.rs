@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
-use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
-use crate::sql::executor::public_runtime::PreparedPublicWrite;
 use crate::sql::common::text::escape_sql_string;
+use crate::sql::executor::public_runtime::PreparedPublicWrite;
+use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
 use crate::{LixBackendTransaction, LixError, Value};
 
 pub(crate) async fn apply_public_version_last_checkpoint_side_effects(
