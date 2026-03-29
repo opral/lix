@@ -1,6 +1,6 @@
+use crate::canonical::version_state::load_version_descriptor_with_backend;
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
-use crate::canonical::version_state::load_version_descriptor_with_backend;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::catalog::SurfaceFamily;
 use crate::sql::logical_plan::public_ir::{
@@ -19,14 +19,13 @@ use crate::sql::semantic_ir::semantics::surface_semantics::{
     public_selector_column_name, public_selector_version_column, OverlayLane,
 };
 use crate::sql::services::public_reads::execute_public_query_with_optional_pending_transaction_view;
-use crate::sql::services::state_reader::{load_version_ref, LiveStorageLane};
+use crate::sql::services::state_reader::load_version_ref;
 use crate::transaction::PendingTransactionView;
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content, version_ref_file_id,
-    version_ref_plugin_key,
-    version_ref_schema_key, version_ref_schema_version, version_ref_snapshot_content,
-    GLOBAL_VERSION_ID,
+    version_ref_plugin_key, version_ref_schema_key, version_ref_schema_version,
+    version_ref_snapshot_content, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::helpers::attached_token::AttachedToken;

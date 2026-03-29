@@ -1970,7 +1970,7 @@ fn build_supported_public_read_surface_sql(
             active_version_id,
             &surface_binding.descriptor.public_name,
         ),
-        SurfaceFamily::Admin => build_public_admin_surface_sql(&surface_binding),
+        SurfaceFamily::Admin => build_public_admin_surface_sql(dialect, &surface_binding),
         SurfaceFamily::Change => {
             build_public_change_surface_sql(&surface_binding, active_version_id)
         }
@@ -2020,12 +2020,13 @@ fn build_public_state_surface_sql(
 }
 
 fn build_public_admin_surface_sql(
+    dialect: SqlDialect,
     surface_binding: &SurfaceBinding,
 ) -> Result<Option<String>, LixError> {
     let Some(admin_scan) = CanonicalAdminScan::from_surface_binding(surface_binding.clone()) else {
         return Ok(None);
     };
-    build_admin_source_sql(admin_scan.kind).map(Some)
+    build_admin_source_sql(admin_scan.kind, dialect).map(Some)
 }
 
 fn build_public_change_surface_sql(

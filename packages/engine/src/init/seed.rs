@@ -1,9 +1,7 @@
 use crate::canonical::load_next_change_ordinal_with_executor;
 use crate::canonical::readers::load_committed_version_head_commit_id;
 use crate::engine::{Engine, ExecuteOptions, TransactionBackendAdapter};
-use crate::live_state::schema_access::{
-    normalized_values_for_schema, tracked_relation_name,
-};
+use crate::live_state::schema_access::{normalized_values_for_schema, tracked_relation_name};
 use crate::sql::common::text::escape_sql_string;
 use crate::sql::executor::execution_program::{ExecutionContext, SessionExecutionRuntime};
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;

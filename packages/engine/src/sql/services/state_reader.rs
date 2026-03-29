@@ -15,18 +15,16 @@ use crate::live_state::schema_access::{
     LiveReadContract,
 };
 use crate::live_state::tracked::{
-    load_exact_row_with_backend as load_exact_tracked_row_with_backend,
-    scan_rows_with_backend as scan_tracked_rows_with_backend,
-    scan_rows_with_executor as scan_tracked_rows_with_executor, TrackedRow,
+    load_exact_tombstone_with_executor, scan_tombstones_with_executor,
 };
 use crate::live_state::tracked::{
-    load_exact_tombstone_with_executor, scan_tombstones_with_executor,
+    scan_rows_with_backend as scan_tracked_rows_with_backend,
+    scan_rows_with_executor as scan_tracked_rows_with_executor, TrackedRow,
 };
 pub(crate) use crate::live_state::tracked::{
     ExactTrackedRowRequest, TrackedScanRequest, TrackedTombstoneMarker,
 };
 use crate::live_state::untracked::{
-    load_exact_row_with_backend as load_exact_untracked_row_with_backend,
     scan_rows_with_backend as scan_untracked_rows_with_backend,
     scan_rows_with_executor as scan_untracked_rows_with_executor, UntrackedRow,
 };
@@ -91,14 +89,6 @@ impl LiveReadRow {
 
     pub(crate) fn values(&self) -> &BTreeMap<String, Value> {
         &self.values
-    }
-
-    pub(crate) fn property_text(&self, property_name: &str) -> Option<String> {
-        match self.values.get(property_name) {
-            Some(Value::Text(value)) => Some(value.clone()),
-            Some(Value::Integer(value)) => Some(value.to_string()),
-            _ => None,
-        }
     }
 }
 
@@ -216,40 +206,6 @@ pub(crate) async fn scan_live_rows_with_executor_ref(
         )
         .await
         .map(|rows| rows.into_iter().map(LiveReadRow::from).collect()),
-    }
-}
-
-pub(crate) async fn load_exact_live_row(
-    backend: &dyn LixBackend,
-    storage: LiveStorageLane,
-    schema_key: &str,
-    version_id: &str,
-    entity_id: &str,
-    file_id: Option<&str>,
-) -> Result<Option<LiveReadRow>, LixError> {
-    match storage {
-        LiveStorageLane::Tracked => load_exact_tracked_row_with_backend(
-            backend,
-            &ExactTrackedRowRequest {
-                schema_key: schema_key.to_string(),
-                version_id: version_id.to_string(),
-                entity_id: entity_id.to_string(),
-                file_id: file_id.map(ToOwned::to_owned),
-            },
-        )
-        .await
-        .map(|row| row.map(LiveReadRow::from)),
-        LiveStorageLane::Untracked => load_exact_untracked_row_with_backend(
-            backend,
-            &crate::live_state::untracked::ExactUntrackedRowRequest {
-                schema_key: schema_key.to_string(),
-                version_id: version_id.to_string(),
-                entity_id: entity_id.to_string(),
-                file_id: file_id.map(ToOwned::to_owned),
-            },
-        )
-        .await
-        .map(|row| row.map(LiveReadRow::from)),
     }
 }
 

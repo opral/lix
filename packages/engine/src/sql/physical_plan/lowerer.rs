@@ -914,7 +914,7 @@ fn lower_admin_read_for_execution(
     build_lowered_read_program(
         dialect,
         canonicalized,
-        build_admin_source_sql(admin_scan.kind)?,
+        build_admin_source_sql(admin_scan.kind, dialect)?,
         canonicalized.query.selection.clone(),
     )
     .map(Some)
@@ -993,14 +993,31 @@ fn build_state_source_sql(
     Ok(Some(sql))
 }
 
-fn build_admin_source_sql(kind: CanonicalAdminKind) -> Result<String, LixError> {
+fn build_admin_source_sql(
+    kind: CanonicalAdminKind,
+    dialect: SqlDialect,
+) -> Result<String, LixError> {
     let sql = match kind {
         CanonicalAdminKind::Version => {
             crate::canonical::version_state::build_admin_version_source_sql()
         }
     };
 
-    Ok(sql)
+    lower_embedded_query_sql(&sql, dialect)
+}
+
+fn lower_embedded_query_sql(sql: &str, dialect: SqlDialect) -> Result<String, LixError> {
+    let mut statements = crate::sql::parser::parse_sql_statements(sql)?;
+    let statement = statements
+        .pop()
+        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "expected embedded query SQL"))?;
+    if !statements.is_empty() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "embedded query SQL must contain exactly one statement",
+        ));
+    }
+    Ok(crate::sql::ast::lowering::lower_statement(statement, dialect)?.to_string())
 }
 
 fn build_entity_source_sql(
@@ -2927,6 +2944,8 @@ mod tests {
         assert!(lowered_sql.contains("lix_version_descriptor"));
         assert!(lowered_sql.contains("lix_version_ref"));
         assert!(!lowered_sql.contains("FROM lix_version"));
+        assert!(!lowered_sql.contains("lix_json_extract("));
+        assert!(!lowered_sql.contains("lix_json_extract_boolean("));
         assert_eq!(
             lowered.pushdown_decision.accepted_predicate_sql(),
             Vec::<String>::new()
