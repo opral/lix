@@ -185,7 +185,7 @@ pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
          ) \
          SELECT entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, metadata, change_id \
          FROM ranked_changes \
-         ORDER BY depth ASC, created_at DESC, change_id DESC \
+         ORDER BY depth ASC, change_id DESC \
          LIMIT 1",
         head_commit_id = escape_sql_string(head_commit_id),
         parent_value_expr = parent_value_expr,
@@ -257,7 +257,7 @@ pub(crate) async fn load_commit_lineage_entry_by_id(
            AND c.file_id = 'lix' \
            AND c.plugin_key = 'lix' \
            AND s.content IS NOT NULL \
-         ORDER BY c.created_at DESC, c.id DESC \
+         ORDER BY c.change_ordinal DESC \
          LIMIT 1",
         commit_id = escape_sql_string(commit_id),
     );

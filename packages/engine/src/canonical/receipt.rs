@@ -4,14 +4,14 @@ use super::types::ChangeRow;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalWatermark {
+    pub change_ordinal: i64,
     pub change_id: String,
     pub created_at: String,
 }
 
 impl CanonicalWatermark {
     pub(crate) fn is_newer_than(&self, other: &Self) -> bool {
-        (self.created_at.as_str(), self.change_id.as_str())
-            > (other.created_at.as_str(), other.change_id.as_str())
+        self.change_ordinal > other.change_ordinal
     }
 }
 
@@ -32,15 +32,11 @@ pub struct CanonicalCommitReceipt {
 
 pub(crate) fn latest_canonical_watermark_from_change_rows(
     changes: &[ChangeRow],
+    starting_change_ordinal: i64,
 ) -> Option<CanonicalWatermark> {
-    changes
-        .iter()
-        .max_by(|left, right| {
-            (left.created_at.as_str(), left.id.as_str())
-                .cmp(&(right.created_at.as_str(), right.id.as_str()))
-        })
-        .map(|change| CanonicalWatermark {
-            change_id: change.id.clone(),
-            created_at: change.created_at.clone(),
-        })
+    changes.last().map(|change| CanonicalWatermark {
+        change_ordinal: starting_change_ordinal + (changes.len() as i64) - 1,
+        change_id: change.id.clone(),
+        created_at: change.created_at.clone(),
+    })
 }

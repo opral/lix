@@ -35,6 +35,7 @@ pub(crate) mod roots;
 pub(crate) mod state_source;
 mod types;
 pub(crate) mod version_state;
+pub(crate) use change_log::load_next_change_ordinal_with_executor;
 pub(crate) use init::{init, seed_bootstrap};
 pub(crate) use receipt::CanonicalCommitReceipt;
 pub use receipt::CanonicalWatermark;

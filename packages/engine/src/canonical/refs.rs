@@ -81,22 +81,14 @@ pub(crate) async fn load_committed_version_ids_updated_between_watermarks_with_e
            AND c.schema_version = '{schema_version}' \
            AND c.file_id = '{file_id}' \
            AND c.plugin_key = '{plugin_key}' \
-           AND (\
-             c.created_at > '{older_created_at}' \
-             OR (c.created_at = '{older_created_at}' AND c.id > '{older_change_id}')\
-           ) \
-           AND (\
-             c.created_at < '{newer_created_at}' \
-             OR (c.created_at = '{newer_created_at}' AND c.id <= '{newer_change_id}')\
-           ) \
+           AND c.id > '{older_change_id}' \
+           AND c.id <= '{newer_change_id}' \
          ORDER BY c.entity_id ASC",
         schema_key = escape_sql_string(version_ref_schema_key()),
         schema_version = escape_sql_string(version_ref_schema_version()),
         file_id = escape_sql_string(version_ref_file_id()),
         plugin_key = escape_sql_string(version_ref_plugin_key()),
-        older_created_at = escape_sql_string(&older_exclusive.created_at),
         older_change_id = escape_sql_string(&older_exclusive.change_id),
-        newer_created_at = escape_sql_string(&newer_inclusive.created_at),
         newer_change_id = escape_sql_string(&newer_inclusive.change_id),
     );
 
@@ -138,7 +130,7 @@ async fn load_committed_version_ref_from_canonical(
            AND c.entity_id = '{entity_id}' \
            AND c.file_id = '{file_id}' \
            AND c.plugin_key = '{plugin_key}' \
-         ORDER BY c.created_at DESC, c.id DESC \
+         ORDER BY c.change_ordinal DESC \
          LIMIT 1",
         schema_key = escape_sql_string(version_ref_schema_key()),
         schema_version = escape_sql_string(version_ref_schema_version()),
@@ -168,7 +160,7 @@ async fn load_all_committed_version_refs_from_canonical(
         "WITH ranked AS (\
              SELECT c.entity_id, \
                     s.content AS snapshot_content, \
-                    ROW_NUMBER() OVER (PARTITION BY c.entity_id ORDER BY c.created_at DESC, c.id DESC) AS rn \
+                    ROW_NUMBER() OVER (PARTITION BY c.entity_id ORDER BY c.change_ordinal DESC) AS rn \
              FROM lix_internal_change c \
              LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
              WHERE c.schema_key = '{schema_key}' \
@@ -326,10 +318,12 @@ mod tests {
         let version_ids = load_committed_version_ids_updated_between_watermarks_with_executor(
             &mut executor,
             &CanonicalWatermark {
+                change_ordinal: 1,
                 change_id: "change-1".to_string(),
                 created_at: "2026-03-28T10:00:00Z".to_string(),
             },
             &CanonicalWatermark {
+                change_ordinal: 2,
                 change_id: "change-2".to_string(),
                 created_at: "2026-03-28T10:00:01Z".to_string(),
             },

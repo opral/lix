@@ -1,13 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::types::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildScope, LiveStateWriteOp,
 };
 use crate::live_state::lifecycle::{build_set_live_state_mode_sql, LiveStateMode};
+use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::storage::{
     load_live_table_layout_in_transaction, normalized_insert_columns_sql,
     normalized_insert_values_sql, normalized_live_column_values, normalized_update_assignments_sql,
-    quoted_live_table_name,
+    quoted_live_table_name, text_from_value,
 };
 use crate::live_state::{finalize_commit_in_transaction, register_schema_in_transaction};
 use crate::{LixBackend, LixBackendTransaction, LixError, TransactionMode, Value};
@@ -51,6 +52,15 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     plan: &LiveStateRebuildPlan,
 ) -> Result<(usize, BTreeSet<String>), LixError> {
+    apply_live_state_scope_with_writer_key_hints_in_transaction(transaction, plan, &BTreeMap::new())
+        .await
+}
+
+pub(crate) async fn apply_live_state_scope_with_writer_key_hints_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    plan: &LiveStateRebuildPlan,
+    writer_key_hints: &BTreeMap<RowIdentity, Option<String>>,
+) -> Result<(usize, BTreeSet<String>), LixError> {
     let mut tables_touched = BTreeSet::new();
 
     let mut schema_keys = BTreeSet::new();
@@ -58,6 +68,11 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
         schema_keys.insert(write.schema_key.to_string());
     }
 
+    let mut writer_keys =
+        load_preserved_tracked_writer_keys_in_scope(transaction, &schema_keys, &plan.scope).await?;
+    for (identity, writer_key) in writer_key_hints {
+        writer_keys.insert(identity.clone(), writer_key.clone());
+    }
     let rows_deleted =
         clear_scope_rows(transaction, &schema_keys, &plan.scope, &mut tables_touched).await?;
 
@@ -80,6 +95,15 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
                 )
             })
             .unwrap_or_else(|| "NULL".to_string());
+        let writer_key_sql = match writer_keys.get(&RowIdentity {
+            schema_key: write.schema_key.to_string(),
+            version_id: write.version_id.to_string(),
+            entity_id: write.entity_id.to_string(),
+            file_id: write.file_id.to_string(),
+        }) {
+            Some(Some(writer_key)) => crate::live_state::constraints::sql_literal_text(writer_key),
+            _ => "NULL".to_string(),
+        };
         let layout = load_live_table_layout_in_transaction(transaction, &write.schema_key).await?;
         let normalized_values =
             normalized_live_column_values(&layout, write.snapshot_content.as_deref())?
@@ -88,9 +112,9 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
 
         let sql = format!(
             "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, is_tombstone, created_at, updated_at{normalized_columns}\
+             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, writer_key, is_tombstone, created_at, updated_at{normalized_columns}\
              ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{change_id}', {metadata}, {is_tombstone}, '{created_at}', '{updated_at}'{normalized_values}\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{change_id}', {metadata}, {writer_key}, {is_tombstone}, '{created_at}', '{updated_at}'{normalized_values}\
              ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
              schema_key = excluded.schema_key, \
              schema_version = excluded.schema_version, \
@@ -98,6 +122,7 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
              plugin_key = excluded.plugin_key, \
              change_id = excluded.change_id, \
              metadata = excluded.metadata, \
+             writer_key = excluded.writer_key, \
              is_tombstone = excluded.is_tombstone, \
              created_at = excluded.created_at, \
              updated_at = excluded.updated_at{normalized_updates}",
@@ -111,6 +136,7 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
             plugin_key = crate::live_state::constraints::escape_sql_string(&write.plugin_key),
             change_id = crate::live_state::constraints::escape_sql_string(&write.change_id),
             metadata = metadata_sql,
+            writer_key = writer_key_sql,
             is_tombstone = is_tombstone,
             created_at = crate::live_state::constraints::escape_sql_string(&write.created_at),
             updated_at = crate::live_state::constraints::escape_sql_string(&write.updated_at),
@@ -123,6 +149,62 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
     }
 
     Ok((rows_deleted, tables_touched))
+}
+
+async fn load_preserved_tracked_writer_keys_in_scope(
+    transaction: &mut dyn LixBackendTransaction,
+    schema_keys: &BTreeSet<String>,
+    scope: &LiveStateRebuildScope,
+) -> Result<BTreeMap<RowIdentity, Option<String>>, LixError> {
+    if schema_keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let version_filter = match scope {
+        LiveStateRebuildScope::Full => None,
+        LiveStateRebuildScope::Versions(versions) if versions.is_empty() => {
+            return Ok(BTreeMap::new())
+        }
+        LiveStateRebuildScope::Versions(versions) => Some(in_clause_values(versions)),
+    };
+
+    let mut preserved = BTreeMap::new();
+    for schema_key in schema_keys {
+        register_schema_in_transaction(transaction, schema_key.as_str()).await?;
+        let table_name = quoted_live_table_name(schema_key);
+        let sql = if let Some(in_list) = version_filter.as_ref() {
+            format!(
+                "SELECT entity_id, file_id, version_id, writer_key \
+                 FROM {table_name} \
+                 WHERE version_id IN ({in_list}) \
+                   AND untracked = false",
+                table_name = table_name,
+                in_list = in_list,
+            )
+        } else {
+            format!(
+                "SELECT entity_id, file_id, version_id, writer_key \
+                 FROM {table_name} \
+                 WHERE untracked = false",
+                table_name = table_name,
+            )
+        };
+
+        let result = transaction.execute(&sql, &[]).await?;
+        for row in result.rows {
+            preserved.insert(
+                RowIdentity {
+                    schema_key: schema_key.clone(),
+                    entity_id: required_text_value(&row, 0, "entity_id")?,
+                    file_id: required_text_value(&row, 1, "file_id")?,
+                    version_id: required_text_value(&row, 2, "version_id")?,
+                },
+                row.get(3).and_then(text_from_value),
+            );
+        }
+    }
+
+    Ok(preserved)
 }
 
 async fn clear_scope_rows(
@@ -209,6 +291,18 @@ fn parse_count_result(rows: &[Vec<Value>]) -> Result<usize, LixError> {
                 .to_string(),
         }),
     }
+}
+
+fn required_text_value(row: &[Value], index: usize, column: &str) -> Result<String, LixError> {
+    row.get(index).and_then(text_from_value).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            &format!(
+                "materialization apply: expected non-null text column '{}'",
+                column
+            ),
+        )
+    })
 }
 
 fn in_clause_values(values: &BTreeSet<String>) -> String {

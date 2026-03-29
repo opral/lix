@@ -20,7 +20,9 @@ use crate::SqlDialect;
 use crate::{CanonicalSchemaKey, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
 
-use super::change_log::build_prepared_batch_from_canonical_output;
+use super::change_log::{
+    build_prepared_batch_from_canonical_output, load_next_change_ordinal_with_executor,
+};
 use super::create_commit_preflight::{
     load_create_commit_deterministic_sequence_start as load_create_commit_deterministic_sequence_start_impl,
     load_untracked_file_descriptor as load_untracked_file_descriptor_impl,
@@ -385,10 +387,17 @@ pub(crate) async fn create_commit(
     let committed_head = extract_committed_head_id(&generated_commit, &concrete_lane)?;
     let canonical_output = generated_commit.canonical_output;
     let updated_version_refs = generated_commit.updated_version_refs;
+    let next_change_ordinal = {
+        let mut executor = TransactionCommitExecutor { transaction };
+        load_next_change_ordinal_with_executor(&mut executor)
+            .await
+            .map_err(backend_error)?
+    };
     let receipt = build_canonical_commit_receipt(
         committed_head.clone(),
         &canonical_output,
         &updated_version_refs,
+        next_change_ordinal,
     )?;
     let mut executor = &mut *transaction;
     let commit_graph_rows =
@@ -412,6 +421,7 @@ pub(crate) async fn create_commit(
         &canonical_output,
         functions,
         transaction.dialect(),
+        next_change_ordinal,
     )
     .map_err(backend_error)?;
     let deterministic_sequence_highest_seen =
@@ -1286,9 +1296,11 @@ fn build_canonical_commit_receipt(
     commit_id: String,
     canonical_output: &CanonicalCommitOutput,
     updated_version_refs: &[UpdatedVersionRef],
+    starting_change_ordinal: i64,
 ) -> Result<CanonicalCommitReceipt, CreateCommitError> {
     let canonical_watermark = latest_canonical_watermark_from_change_rows(
         &canonical_output.changes,
+        starting_change_ordinal,
     )
     .ok_or_else(|| CreateCommitError {
         kind: CreateCommitErrorKind::Internal,
@@ -1485,7 +1497,7 @@ mod tests {
         idempotency_rows: HashMap<(String, String, String, String), String>,
         executed_sql: Vec<String>,
         live_state_mode: Option<String>,
-        latest_watermark: Option<(String, String)>,
+        latest_watermark: Option<(i64, String, String)>,
         fail_projected_live_state_writes: bool,
     }
 
@@ -1512,10 +1524,12 @@ mod tests {
                         ),
                         Value::Null,
                         Value::Null,
+                        Value::Null,
                         Value::Text(crate::live_state::LIVE_STATE_SCHEMA_EPOCH.to_string()),
                     ]],
                     columns: vec![
                         "mode".to_string(),
+                        "latest_change_ordinal".to_string(),
                         "latest_change_id".to_string(),
                         "latest_change_created_at".to_string(),
                         "schema_epoch".to_string(),
@@ -1523,16 +1537,26 @@ mod tests {
                 });
             }
             if sql.contains("FROM lix_internal_change")
-                && sql.contains("ORDER BY created_at DESC, id DESC")
+                && sql.contains("ORDER BY change_ordinal DESC")
             {
                 return Ok(QueryResult {
                     rows: self
                         .latest_watermark
                         .clone()
                         .into_iter()
-                        .map(|(id, created_at)| vec![Value::Text(id), Value::Text(created_at)])
+                        .map(|(ordinal, id, created_at)| {
+                            vec![
+                                Value::Integer(ordinal),
+                                Value::Text(id),
+                                Value::Text(created_at),
+                            ]
+                        })
                         .collect(),
-                    columns: vec!["id".to_string(), "created_at".to_string()],
+                    columns: vec![
+                        "change_ordinal".to_string(),
+                        "id".to_string(),
+                        "created_at".to_string(),
+                    ],
                 });
             }
 
@@ -1672,6 +1696,7 @@ mod tests {
             }
             if extract_statement_from_batch(sql, "INSERT INTO lix_internal_change ").is_some() {
                 self.latest_watermark = Some((
+                    0,
                     "change-watermark".to_string(),
                     "2026-03-06T14:22:00.000Z".to_string(),
                 ));
@@ -1841,6 +1866,7 @@ mod tests {
         let mut transaction = FakeTransaction {
             version_heads: HashMap::from([("version-a".to_string(), "commit-123".to_string())]),
             latest_watermark: Some((
+                0,
                 "change-watermark".to_string(),
                 "2026-03-06T14:22:00.000Z".to_string(),
             )),
@@ -2464,10 +2490,12 @@ mod tests {
             "commit-123".to_string(),
             &canonical_output,
             &updated_version_refs,
+            0,
         )
         .expect("receipt should build");
 
         assert_eq!(receipt.commit_id, "commit-123");
+        assert_eq!(receipt.canonical_watermark.change_ordinal, 1);
         assert_eq!(receipt.canonical_watermark.change_id, "change-2");
         assert_eq!(
             receipt.canonical_watermark.created_at,

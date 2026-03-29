@@ -15,6 +15,7 @@ const INIT_STATEMENTS: &[&str] = &[
      )",
     "CREATE TABLE lix_internal_change (\
      id TEXT PRIMARY KEY,\
+     change_ordinal BIGINT NOT NULL,\
      entity_id TEXT NOT NULL,\
      schema_key TEXT NOT NULL,\
      schema_version TEXT NOT NULL,\
@@ -24,6 +25,8 @@ const INIT_STATEMENTS: &[&str] = &[
      metadata TEXT,\
      created_at TEXT NOT NULL\
      )",
+    "CREATE INDEX idx_lix_internal_change_ordinal \
+     ON lix_internal_change (change_ordinal)",
     "CREATE TABLE lix_internal_commit_idempotency (\
      write_lane TEXT NOT NULL,\
      idempotency_key TEXT NOT NULL,\

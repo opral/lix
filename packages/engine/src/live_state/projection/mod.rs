@@ -1,7 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::receipt::UpdatedVersionRef;
+use crate::canonical::ProposedDomainChange;
 use crate::canonical::{CanonicalCommitReceipt, CanonicalWatermark};
+use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::untracked::{
     UntrackedWriteBatch, UntrackedWriteOperation, UntrackedWriteParticipant, UntrackedWriteRow,
 };
@@ -97,6 +99,7 @@ pub(crate) async fn apply_canonical_receipt_in_transaction(
 pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     receipt: &CanonicalCommitReceipt,
+    tracked_writer_key_hints: &BTreeMap<RowIdentity, Option<String>>,
 ) -> Result<(), LixError> {
     if let Err(_mirror_error) = apply_committed_version_ref_mirrors_in_transaction(
         transaction,
@@ -130,7 +133,12 @@ pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
         debug_row_limit: 0,
     };
     if let Err(_projection_error) =
-        crate::live_state::rebuild_scope_in_transaction(transaction, &rebuild_request).await
+        crate::live_state::rebuild_scope_with_writer_key_hints_in_transaction(
+            transaction,
+            &rebuild_request,
+            tracked_writer_key_hints,
+        )
+        .await
     {
         crate::live_state::mark_needs_rebuild_at_canonical_watermark_in_transaction(
             transaction,
@@ -140,6 +148,27 @@ pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
     }
 
     Ok(())
+}
+
+pub(crate) fn tracked_writer_key_hints_from_domain_changes(
+    changes: &[ProposedDomainChange],
+) -> BTreeMap<RowIdentity, Option<String>> {
+    let mut hints = BTreeMap::new();
+    for change in changes {
+        let Some(file_id) = change.file_id.as_ref() else {
+            continue;
+        };
+        hints.insert(
+            RowIdentity {
+                schema_key: change.schema_key.to_string(),
+                version_id: change.version_id.to_string(),
+                entity_id: change.entity_id.to_string(),
+                file_id: file_id.to_string(),
+            },
+            change.writer_key.clone(),
+        );
+    }
+    hints
 }
 
 pub(crate) async fn mark_live_state_projection_ready_in_transaction(
@@ -398,7 +427,7 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         status_row: Option<Vec<Value>>,
-        latest_watermark: Option<(String, String)>,
+        latest_watermark: Option<(i64, String, String)>,
         executed_sql: Mutex<Vec<String>>,
     }
 
@@ -414,16 +443,23 @@ mod tests {
                 && sql.contains("lix_internal_live_state_status")
                 && sql.contains("lix_internal_change")
             {
-                let mut row = self
-                    .status_row
-                    .clone()
-                    .unwrap_or_else(|| vec![Value::Null, Value::Null, Value::Null, Value::Null]);
+                let mut row = self.status_row.clone().unwrap_or_else(|| {
+                    vec![
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                    ]
+                });
                 match &self.latest_watermark {
-                    Some((id, created_at)) => {
+                    Some((ordinal, id, created_at)) => {
+                        row.push(Value::Integer(*ordinal));
                         row.push(Value::Text(id.clone()));
                         row.push(Value::Text(created_at.clone()));
                     }
                     None => {
+                        row.push(Value::Null);
                         row.push(Value::Null);
                         row.push(Value::Null);
                     }
@@ -432,9 +468,11 @@ mod tests {
                     rows: vec![row],
                     columns: vec![
                         "mode".to_string(),
+                        "latest_change_ordinal".to_string(),
                         "latest_change_id".to_string(),
                         "latest_change_created_at".to_string(),
                         "schema_epoch".to_string(),
+                        "change_ordinal".to_string(),
                         "id".to_string(),
                         "created_at".to_string(),
                     ],
@@ -445,6 +483,7 @@ mod tests {
                     rows: self.status_row.clone().into_iter().collect(),
                     columns: vec![
                         "mode".to_string(),
+                        "latest_change_ordinal".to_string(),
                         "latest_change_id".to_string(),
                         "latest_change_created_at".to_string(),
                         "schema_epoch".to_string(),
@@ -452,16 +491,26 @@ mod tests {
                 });
             }
             if sql.contains("FROM lix_internal_change")
-                && sql.contains("ORDER BY created_at DESC, id DESC")
+                && sql.contains("ORDER BY change_ordinal DESC")
             {
                 return Ok(QueryResult {
                     rows: self
                         .latest_watermark
                         .clone()
                         .into_iter()
-                        .map(|(id, created_at)| vec![Value::Text(id), Value::Text(created_at)])
+                        .map(|(ordinal, id, created_at)| {
+                            vec![
+                                Value::Integer(ordinal),
+                                Value::Text(id),
+                                Value::Text(created_at),
+                            ]
+                        })
                         .collect(),
-                    columns: vec!["id".to_string(), "created_at".to_string()],
+                    columns: vec![
+                        "change_ordinal".to_string(),
+                        "id".to_string(),
+                        "created_at".to_string(),
+                    ],
                 });
             }
             Ok(QueryResult {
@@ -493,7 +542,7 @@ mod tests {
 
     struct FakeTransaction {
         status_row: Option<Vec<Value>>,
-        latest_watermark: Option<(String, String)>,
+        latest_watermark: Option<(i64, String, String)>,
         executed_sql: Vec<String>,
     }
 
@@ -513,16 +562,23 @@ mod tests {
                 && sql.contains("lix_internal_live_state_status")
                 && sql.contains("lix_internal_change")
             {
-                let mut row = self
-                    .status_row
-                    .clone()
-                    .unwrap_or_else(|| vec![Value::Null, Value::Null, Value::Null, Value::Null]);
+                let mut row = self.status_row.clone().unwrap_or_else(|| {
+                    vec![
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                    ]
+                });
                 match &self.latest_watermark {
-                    Some((id, created_at)) => {
+                    Some((ordinal, id, created_at)) => {
+                        row.push(Value::Integer(*ordinal));
                         row.push(Value::Text(id.clone()));
                         row.push(Value::Text(created_at.clone()));
                     }
                     None => {
+                        row.push(Value::Null);
                         row.push(Value::Null);
                         row.push(Value::Null);
                     }
@@ -531,9 +587,11 @@ mod tests {
                     rows: vec![row],
                     columns: vec![
                         "mode".to_string(),
+                        "latest_change_ordinal".to_string(),
                         "latest_change_id".to_string(),
                         "latest_change_created_at".to_string(),
                         "schema_epoch".to_string(),
+                        "change_ordinal".to_string(),
                         "id".to_string(),
                         "created_at".to_string(),
                     ],
@@ -544,6 +602,7 @@ mod tests {
                     rows: self.status_row.clone().into_iter().collect(),
                     columns: vec![
                         "mode".to_string(),
+                        "latest_change_ordinal".to_string(),
                         "latest_change_id".to_string(),
                         "latest_change_created_at".to_string(),
                         "schema_epoch".to_string(),
@@ -551,16 +610,26 @@ mod tests {
                 });
             }
             if sql.contains("FROM lix_internal_change")
-                && sql.contains("ORDER BY created_at DESC, id DESC")
+                && sql.contains("ORDER BY change_ordinal DESC")
             {
                 return Ok(QueryResult {
                     rows: self
                         .latest_watermark
                         .clone()
                         .into_iter()
-                        .map(|(id, created_at)| vec![Value::Text(id), Value::Text(created_at)])
+                        .map(|(ordinal, id, created_at)| {
+                            vec![
+                                Value::Integer(ordinal),
+                                Value::Text(id),
+                                Value::Text(created_at),
+                            ]
+                        })
                         .collect(),
-                    columns: vec!["id".to_string(), "created_at".to_string()],
+                    columns: vec![
+                        "change_ordinal".to_string(),
+                        "id".to_string(),
+                        "created_at".to_string(),
+                    ],
                 });
             }
             Ok(QueryResult {
@@ -583,11 +652,16 @@ mod tests {
         let backend = FakeBackend {
             status_row: Some(vec![
                 Value::Text("ready".to_string()),
+                Value::Integer(1),
                 Value::Text("change-1".to_string()),
                 Value::Text("2026-03-15T01:02:02Z".to_string()),
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
             ]),
-            latest_watermark: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            latest_watermark: Some((
+                2,
+                "change-2".to_string(),
+                "2026-03-15T01:02:03Z".to_string(),
+            )),
             executed_sql: Mutex::new(Vec::new()),
         };
 
@@ -601,6 +675,7 @@ mod tests {
         assert_eq!(
             live_state.applied_watermark,
             Some(CanonicalWatermark {
+                change_ordinal: 1,
                 change_id: "change-1".to_string(),
                 created_at: "2026-03-15T01:02:02Z".to_string(),
             })
@@ -608,6 +683,7 @@ mod tests {
         assert_eq!(
             live_state.latest_canonical_watermark,
             Some(CanonicalWatermark {
+                change_ordinal: 2,
                 change_id: "change-2".to_string(),
                 created_at: "2026-03-15T01:02:03Z".to_string(),
             })
@@ -619,16 +695,22 @@ mod tests {
         let mut transaction = FakeTransaction {
             status_row: Some(vec![
                 Value::Text("ready".to_string()),
+                Value::Integer(1),
                 Value::Text("change-1".to_string()),
                 Value::Text("2026-03-15T01:02:02Z".to_string()),
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
             ]),
-            latest_watermark: Some(("change-1".to_string(), "2026-03-15T01:02:02Z".to_string())),
+            latest_watermark: Some((
+                1,
+                "change-1".to_string(),
+                "2026-03-15T01:02:02Z".to_string(),
+            )),
             executed_sql: Vec::new(),
         };
         let receipt = CanonicalCommitReceipt {
             commit_id: "commit-2".to_string(),
             canonical_watermark: CanonicalWatermark {
+                change_ordinal: 2,
                 change_id: "change-2".to_string(),
                 created_at: "2026-03-15T01:02:03Z".to_string(),
             },
@@ -652,14 +734,20 @@ mod tests {
         let backend = FakeBackend {
             status_row: Some(vec![
                 Value::Text("ready".to_string()),
+                Value::Integer(2),
                 Value::Text("change-2".to_string()),
                 Value::Text("2026-03-15T01:02:03Z".to_string()),
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
             ]),
-            latest_watermark: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            latest_watermark: Some((
+                2,
+                "change-2".to_string(),
+                "2026-03-15T01:02:03Z".to_string(),
+            )),
             executed_sql: Mutex::new(Vec::new()),
         };
         let target = CanonicalWatermark {
+            change_ordinal: 2,
             change_id: "change-2".to_string(),
             created_at: "2026-03-15T01:02:03Z".to_string(),
         };

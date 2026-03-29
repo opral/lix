@@ -1,4 +1,5 @@
 use super::{checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot};
+use crate::canonical::load_next_change_ordinal_with_executor;
 use crate::canonical::readers::load_commit_lineage_entry_by_id;
 use crate::engine::TransactionBackendAdapter;
 use crate::init::seed::{
@@ -6,6 +7,7 @@ use crate::init::seed::{
     quote_ident,
 };
 use crate::live_state::schema_access::tracked_relation_name;
+use crate::sql::execution::runtime_state::ExecutionRuntimeState;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -140,24 +142,17 @@ async fn ensure_checkpoint_label_on_commit(
     commit_id: &str,
 ) -> Result<(), LixError> {
     let state_entity_id = checkpoint_commit_label_entity_id(commit_id);
-    let tracked_table = quote_ident(&tracked_relation_name("lix_entity_label"));
     let exists = tx
         .backend_transaction_mut()?
         .execute(
-            &format!(
-                "SELECT 1 \
-                 FROM {tracked_table} \
+            "SELECT 1 \
+             FROM lix_internal_change \
              WHERE entity_id = $1 \
                AND schema_key = 'lix_entity_label' \
                AND file_id = 'lix' \
-               AND version_id = $2 \
-               AND is_tombstone = 0 \
-             LIMIT 1"
-            ),
-            &[
-                Value::Text(state_entity_id.clone()),
-                Value::Text(crate::version::GLOBAL_VERSION_ID.to_string()),
-            ],
+               AND plugin_key = 'lix' \
+             LIMIT 1",
+            &[Value::Text(state_entity_id.clone())],
         )
         .await?;
     if !exists.rows.is_empty() {
@@ -165,14 +160,26 @@ async fn ensure_checkpoint_label_on_commit(
     }
 
     let snapshot_content = checkpoint_commit_label_snapshot(commit_id);
+    let change_id = generate_runtime_uuid(tx).await?;
+    let timestamp = generate_runtime_timestamp(tx).await?;
+    insert_canonical_checkpoint_label_change(
+        tx,
+        &state_entity_id,
+        &snapshot_content,
+        &change_id,
+        &timestamp,
+    )
+    .await?;
+
     let normalized_values = normalized_seed_values("lix_entity_label", Some(&snapshot_content))?;
+    let tracked_table = quote_ident(&tracked_relation_name("lix_entity_label"));
     tx.backend_transaction_mut()?
         .execute(
             &format!(
                 "INSERT INTO {tracked_table} (\
                  entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, writer_key, is_tombstone, created_at, updated_at{normalized_columns}\
                  ) VALUES (\
-                 $1, 'lix_entity_label', '1', 'lix', $2, true, 'lix', lix_uuid_v7(), NULL, NULL, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP{normalized_literals}\
+                 $1, 'lix_entity_label', '1', 'lix', $2, true, 'lix', $3, NULL, NULL, 0, $4, $4{normalized_literals}\
                  )",
                 normalized_columns = normalized_insert_columns_sql(&normalized_values),
                 normalized_literals = normalized_insert_literals_sql(&normalized_values),
@@ -180,8 +187,84 @@ async fn ensure_checkpoint_label_on_commit(
             &[
                 Value::Text(state_entity_id),
                 Value::Text(crate::version::GLOBAL_VERSION_ID.to_string()),
+                Value::Text(change_id),
+                Value::Text(timestamp),
             ],
         )
         .await?;
     Ok(())
+}
+
+async fn insert_canonical_checkpoint_label_change(
+    tx: &mut SessionTransaction<'_>,
+    entity_id: &str,
+    snapshot_content: &str,
+    change_id: &str,
+    created_at: &str,
+) -> Result<(), LixError> {
+    let snapshot_id = format!("{change_id}~snapshot");
+    let next_change_ordinal = {
+        let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
+        load_next_change_ordinal_with_executor(&mut executor).await?
+    };
+    tx.backend_transaction_mut()?
+        .execute(
+            "INSERT INTO lix_internal_snapshot (id, content) \
+             SELECT $1, $2 \
+             WHERE NOT EXISTS (SELECT 1 FROM lix_internal_snapshot WHERE id = $1)",
+            &[
+                Value::Text(snapshot_id.clone()),
+                Value::Text(snapshot_content.to_string()),
+            ],
+        )
+        .await?;
+    tx.backend_transaction_mut()?
+        .execute(
+            "INSERT INTO lix_internal_change (\
+             id, change_ordinal, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
+             ) \
+             SELECT $1, $2, $3, 'lix_entity_label', '1', 'lix', 'lix', $4, NULL, $5 \
+             WHERE NOT EXISTS (SELECT 1 FROM lix_internal_change WHERE id = $1)",
+            &[
+                Value::Text(change_id.to_string()),
+                Value::Integer(next_change_ordinal),
+                Value::Text(entity_id.to_string()),
+                Value::Text(snapshot_id),
+                Value::Text(created_at.to_string()),
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn checkpoint_runtime_state(
+    tx: &mut SessionTransaction<'_>,
+) -> Result<ExecutionRuntimeState, LixError> {
+    if let Some(runtime_state) = tx.context.execution_runtime_state().cloned() {
+        return Ok(runtime_state);
+    }
+
+    let engine = tx.engine;
+    let backend = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
+    let runtime_state = ExecutionRuntimeState::prepare(engine, &backend).await?;
+    runtime_state
+        .ensure_sequence_initialized_in_transaction(engine, tx.backend_transaction_mut()?)
+        .await?;
+    tx.context
+        .set_execution_runtime_state(runtime_state.clone());
+    Ok(runtime_state)
+}
+
+async fn generate_runtime_uuid(tx: &mut SessionTransaction<'_>) -> Result<String, LixError> {
+    Ok(checkpoint_runtime_state(tx)
+        .await?
+        .provider()
+        .call_uuid_v7())
+}
+
+async fn generate_runtime_timestamp(tx: &mut SessionTransaction<'_>) -> Result<String, LixError> {
+    Ok(checkpoint_runtime_state(tx)
+        .await?
+        .provider()
+        .call_timestamp())
 }

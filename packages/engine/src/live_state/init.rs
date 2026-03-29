@@ -16,6 +16,7 @@ const LIVE_STATE_INIT_STATEMENTS: &[&str] = &[
      )",
     "CREATE TABLE IF NOT EXISTS lix_internal_change (\
      id TEXT PRIMARY KEY,\
+     change_ordinal BIGINT NOT NULL,\
      entity_id TEXT NOT NULL,\
      schema_key TEXT NOT NULL,\
      schema_version TEXT NOT NULL,\
@@ -25,6 +26,8 @@ const LIVE_STATE_INIT_STATEMENTS: &[&str] = &[
      metadata TEXT,\
      created_at TEXT NOT NULL\
      )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_change_ordinal \
+     ON lix_internal_change (change_ordinal)",
     "CREATE TABLE IF NOT EXISTS lix_internal_commit_idempotency (\
      write_lane TEXT NOT NULL,\
      idempotency_key TEXT NOT NULL,\

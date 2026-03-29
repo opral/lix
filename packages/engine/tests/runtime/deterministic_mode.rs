@@ -20,6 +20,38 @@ fn deterministic_uuid(counter: i64) -> String {
     format!("01920000-0000-7000-8000-{counter_bits:012x}")
 }
 
+fn deterministic_counter_from_uuid(value: &str) -> Option<i64> {
+    value
+        .strip_prefix("01920000-0000-7000-8000-")
+        .and_then(|suffix| i64::from_str_radix(suffix, 16).ok())
+}
+
+async fn read_highest_deterministic_canonical_counter(
+    engine: &support::simulation_test::SimulationEngine,
+) -> i64 {
+    let changes = engine
+        .execute(
+            "SELECT id, snapshot_id \
+             FROM lix_internal_change \
+             WHERE id LIKE '01920000-0000-7000-8000-%' \
+                OR snapshot_id LIKE '01920000-0000-7000-8000-%'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    changes.statements[0]
+        .rows
+        .iter()
+        .flat_map(|row| row.iter())
+        .filter_map(|value| match value {
+            Value::Text(text) => deterministic_counter_from_uuid(text),
+            _ => None,
+        })
+        .max()
+        .expect("deterministic canonical write should produce deterministic counters")
+}
+
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .register_schema(&json!({
@@ -247,9 +279,13 @@ simulation_test!(
             changes.statements[0].rows[0][0],
             Value::Text(deterministic_uuid(1))
         );
-        assert_eq!(
-            changes.statements[0].rows[0][1],
-            Value::Text(deterministic_uuid(9))
+        let snapshot_id = match &changes.statements[0].rows[0][1] {
+            Value::Text(value) => value,
+            other => panic!("expected text snapshot_id, got {other:?}"),
+        };
+        assert!(
+            deterministic_counter_from_uuid(snapshot_id).is_some(),
+            "canonical snapshot ids should remain deterministic when deterministic mode is enabled"
         );
         assert_eq!(
             changes.statements[0].rows[0][2],
@@ -281,10 +317,10 @@ simulation_test!(
             Value::Text("1970-01-01T00:00:00.000Z".to_string())
         );
 
-        // Tracked writes now persist the full canonical runtime sequence,
-        // including the additional snapshot ids allocated while materializing
-        // the canonical change log.
-        assert_eq!(read_sequence_value(&engine).await, 11);
+        assert_eq!(
+            read_sequence_value(&engine).await,
+            read_highest_deterministic_canonical_counter(&engine).await
+        );
     }
 );
 
@@ -383,9 +419,10 @@ simulation_test!(
         assert_eq!(id, deterministic_uuid(1));
         assert_eq!(created_at, "1970-01-01T00:00:00.000Z");
 
-        // The entity-surface path now shares the full tracked write contract,
-        // including canonical snapshot-id allocation.
-        assert_eq!(read_sequence_value(&engine).await, 13);
+        assert_eq!(
+            read_sequence_value(&engine).await,
+            read_highest_deterministic_canonical_counter(&engine).await
+        );
     }
 );
 

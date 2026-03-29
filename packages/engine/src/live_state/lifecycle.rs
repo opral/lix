@@ -12,6 +12,7 @@ pub(crate) const LIVE_STATE_STATUS_CREATE_TABLE_SQL: &str =
     "CREATE TABLE IF NOT EXISTS lix_internal_live_state_status (\
      singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),\
      mode TEXT NOT NULL,\
+     latest_change_ordinal BIGINT,\
      latest_change_id TEXT,\
      latest_change_created_at TEXT,\
      schema_epoch TEXT NOT NULL,\
@@ -20,9 +21,9 @@ pub(crate) const LIVE_STATE_STATUS_CREATE_TABLE_SQL: &str =
 
 pub(crate) const LIVE_STATE_STATUS_SEED_ROW_SQL: &str =
     "INSERT INTO lix_internal_live_state_status (\
-     singleton_id, mode, latest_change_id, latest_change_created_at, schema_epoch, updated_at\
+     singleton_id, mode, latest_change_ordinal, latest_change_id, latest_change_created_at, schema_epoch, updated_at\
      ) \
-     SELECT 1, 'uninitialized', NULL, NULL, '1', '1970-01-01T00:00:00Z' \
+     SELECT 1, 'uninitialized', NULL, NULL, NULL, '1', '1970-01-01T00:00:00Z' \
      WHERE NOT EXISTS (\
        SELECT 1 FROM lix_internal_live_state_status WHERE singleton_id = 1\
      )";
@@ -333,6 +334,7 @@ pub(crate) async fn try_claim_live_state_bootstrap_with_backend(
         .execute(
             "UPDATE lix_internal_live_state_status \
              SET mode = 'bootstrapping', \
+                 latest_change_ordinal = NULL, \
                  latest_change_id = NULL, \
                  latest_change_created_at = NULL, \
                  schema_epoch = $1, \
@@ -351,9 +353,9 @@ pub(crate) async fn load_latest_canonical_watermark(
 ) -> Result<Option<CanonicalWatermark>, LixError> {
     let result = backend
         .execute(
-            "SELECT id, created_at \
+            "SELECT change_ordinal, id, created_at \
              FROM lix_internal_change \
-             ORDER BY created_at DESC, id DESC \
+             ORDER BY change_ordinal DESC \
              LIMIT 1",
             &[],
         )
@@ -366,9 +368,9 @@ pub(crate) async fn load_latest_canonical_watermark_in_transaction(
 ) -> Result<Option<CanonicalWatermark>, LixError> {
     let result = transaction
         .execute(
-            "SELECT id, created_at \
+            "SELECT change_ordinal, id, created_at \
              FROM lix_internal_change \
-             ORDER BY created_at DESC, id DESC \
+             ORDER BY change_ordinal DESC \
              LIMIT 1",
             &[],
         )
@@ -395,8 +397,9 @@ fn parse_latest_canonical_watermark(
         return Ok(None);
     };
     Ok(Some(CanonicalWatermark {
-        change_id: text_value(row.first(), "lix_internal_change.id")?,
-        created_at: text_value(row.get(1), "lix_internal_change.created_at")?,
+        change_ordinal: integer_value(row.first(), "lix_internal_change.change_ordinal")?,
+        change_id: text_value(row.get(1), "lix_internal_change.id")?,
+        created_at: text_value(row.get(2), "lix_internal_change.created_at")?,
     }))
 }
 
@@ -419,6 +422,9 @@ fn build_upsert_live_state_status_sql(
     mode: LiveStateMode,
     watermark: Option<&CanonicalWatermark>,
 ) -> String {
+    let latest_change_ordinal_sql = watermark
+        .map(|value| value.change_ordinal.to_string())
+        .unwrap_or_else(|| "NULL".to_string());
     let latest_change_id_sql = watermark
         .map(|value| format!("'{}'", escape_sql_string(&value.change_id)))
         .unwrap_or_else(|| "NULL".to_string());
@@ -427,11 +433,12 @@ fn build_upsert_live_state_status_sql(
         .unwrap_or_else(|| "NULL".to_string());
     format!(
         "INSERT INTO {table} (\
-         singleton_id, mode, latest_change_id, latest_change_created_at, schema_epoch, updated_at\
+         singleton_id, mode, latest_change_ordinal, latest_change_id, latest_change_created_at, schema_epoch, updated_at\
          ) VALUES (\
-         {singleton_id}, '{mode}', {change_id}, {created_at}, '{schema_epoch}', CURRENT_TIMESTAMP\
+         {singleton_id}, '{mode}', {change_ordinal}, {change_id}, {created_at}, '{schema_epoch}', CURRENT_TIMESTAMP\
          ) ON CONFLICT (singleton_id) DO UPDATE SET \
          mode = excluded.mode, \
+         latest_change_ordinal = excluded.latest_change_ordinal, \
          latest_change_id = excluded.latest_change_id, \
          latest_change_created_at = excluded.latest_change_created_at, \
          schema_epoch = excluded.schema_epoch, \
@@ -439,6 +446,7 @@ fn build_upsert_live_state_status_sql(
         table = LIVE_STATE_STATUS_TABLE,
         singleton_id = LIVE_STATE_STATUS_SINGLETON_ID,
         mode = mode.as_str(),
+        change_ordinal = latest_change_ordinal_sql,
         change_id = latest_change_id_sql,
         created_at = latest_change_created_at_sql,
         schema_epoch = LIVE_STATE_SCHEMA_EPOCH,
@@ -450,7 +458,7 @@ async fn load_live_state_status_row_with_backend(
 ) -> Result<LiveStateStatusRow, LixError> {
     let result = backend
         .execute(
-            "SELECT mode, latest_change_id, latest_change_created_at, schema_epoch \
+            "SELECT mode, latest_change_ordinal, latest_change_id, latest_change_created_at, schema_epoch \
              FROM lix_internal_live_state_status \
              WHERE singleton_id = 1 \
              LIMIT 1",
@@ -505,7 +513,8 @@ fn parse_live_state_snapshot_result(
     };
 
     let status = parse_nullable_live_state_status(row)?;
-    let latest_canonical_watermark = parse_nullable_canonical_watermark(row.get(4), row.get(5))?;
+    let latest_canonical_watermark =
+        parse_nullable_canonical_watermark(row.get(5), row.get(6), row.get(7))?;
     Ok(LiveStateSnapshot {
         status,
         latest_canonical_watermark,
@@ -537,14 +546,20 @@ fn live_state_status_row_from_values(row: &[Value]) -> Result<LiveStateStatusRow
             &format!("invalid live state mode '{mode_text}'"),
         ));
     };
-    let latest_change_id = optional_text_value(row.get(1))?;
-    let latest_change_created_at = optional_text_value(row.get(2))?;
-    let watermark = match (latest_change_id, latest_change_created_at) {
-        (Some(change_id), Some(created_at)) => Some(CanonicalWatermark {
+    let latest_change_ordinal = optional_integer_value(row.get(1))?;
+    let latest_change_id = optional_text_value(row.get(2))?;
+    let latest_change_created_at = optional_text_value(row.get(3))?;
+    let watermark = match (
+        latest_change_ordinal,
+        latest_change_id,
+        latest_change_created_at,
+    ) {
+        (Some(change_ordinal), Some(change_id), Some(created_at)) => Some(CanonicalWatermark {
+            change_ordinal,
             change_id,
             created_at,
         }),
-        (None, None) => None,
+        (None, None, None) => None,
         _ => {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -555,7 +570,7 @@ fn live_state_status_row_from_values(row: &[Value]) -> Result<LiveStateStatusRow
 
     Ok(LiveStateStatusRow {
         mode,
-        schema_epoch: text_value(row.get(3), "lix_internal_live_state_status.schema_epoch")?,
+        schema_epoch: text_value(row.get(4), "lix_internal_live_state_status.schema_epoch")?,
         watermark,
     })
 }
@@ -581,10 +596,12 @@ fn parse_nullable_live_state_status(row: &[Value]) -> Result<Option<LiveStateSta
     }
     match optional_text_value(row.first())? {
         None => {
-            let latest_change_id = optional_text_value(row.get(1))?;
-            let latest_change_created_at = optional_text_value(row.get(2))?;
-            let schema_epoch = optional_text_value(row.get(3))?;
-            if latest_change_id.is_some()
+            let latest_change_ordinal = optional_integer_value(row.get(1))?;
+            let latest_change_id = optional_text_value(row.get(2))?;
+            let latest_change_created_at = optional_text_value(row.get(3))?;
+            let schema_epoch = optional_text_value(row.get(4))?;
+            if latest_change_ordinal.is_some()
+                || latest_change_id.is_some()
                 || latest_change_created_at.is_some()
                 || schema_epoch.is_some()
             {
@@ -602,14 +619,22 @@ fn parse_nullable_live_state_status(row: &[Value]) -> Result<Option<LiveStateSta
                     &format!("invalid live state mode '{mode_text}'"),
                 ));
             };
-            let latest_change_id = optional_text_value(row.get(1))?;
-            let latest_change_created_at = optional_text_value(row.get(2))?;
-            let watermark = match (latest_change_id, latest_change_created_at) {
-                (Some(change_id), Some(created_at)) => Some(CanonicalWatermark {
-                    change_id,
-                    created_at,
-                }),
-                (None, None) => None,
+            let latest_change_ordinal = optional_integer_value(row.get(1))?;
+            let latest_change_id = optional_text_value(row.get(2))?;
+            let latest_change_created_at = optional_text_value(row.get(3))?;
+            let watermark = match (
+                latest_change_ordinal,
+                latest_change_id,
+                latest_change_created_at,
+            ) {
+                (Some(change_ordinal), Some(change_id), Some(created_at)) => {
+                    Some(CanonicalWatermark {
+                        change_ordinal,
+                        change_id,
+                        created_at,
+                    })
+                }
+                (None, None, None) => None,
                 _ => {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
@@ -621,7 +646,7 @@ fn parse_nullable_live_state_status(row: &[Value]) -> Result<Option<LiveStateSta
             Ok(Some(LiveStateStatusRow {
                 mode,
                 schema_epoch: text_value(
-                    row.get(3),
+                    row.get(4),
                     "lix_internal_live_state_status.schema_epoch",
                 )?,
                 watermark,
@@ -631,18 +656,21 @@ fn parse_nullable_live_state_status(row: &[Value]) -> Result<Option<LiveStateSta
 }
 
 fn parse_nullable_canonical_watermark(
+    change_ordinal: Option<&Value>,
     change_id: Option<&Value>,
     created_at: Option<&Value>,
 ) -> Result<Option<CanonicalWatermark>, LixError> {
     match (
+        optional_integer_value(change_ordinal)?,
         optional_text_value(change_id)?,
         optional_text_value(created_at)?,
     ) {
-        (Some(change_id), Some(created_at)) => Ok(Some(CanonicalWatermark {
+        (Some(change_ordinal), Some(change_id), Some(created_at)) => Ok(Some(CanonicalWatermark {
+            change_ordinal,
             change_id,
             created_at,
         })),
-        (None, None) => Ok(None),
+        (None, None, None) => Ok(None),
         _ => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "canonical live-state watermark is partially populated",
@@ -669,6 +697,26 @@ fn text_value(value: Option<&Value>, field: &str) -> Result<String, LixError> {
     }
 }
 
+fn integer_value(value: Option<&Value>, field: &str) -> Result<i64, LixError> {
+    match value {
+        Some(Value::Integer(number)) => Ok(*number),
+        Some(Value::Text(text)) => text.parse::<i64>().map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                &format!("{field} is invalid integer text: {error}"),
+            )
+        }),
+        Some(other) => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            &format!("{field} is not an integer: {other:?}"),
+        )),
+        None => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            &format!("{field} is missing"),
+        )),
+    }
+}
+
 fn optional_text_value(value: Option<&Value>) -> Result<Option<String>, LixError> {
     match value {
         None | Some(Value::Null) => Ok(None),
@@ -681,27 +729,46 @@ fn optional_text_value(value: Option<&Value>) -> Result<Option<String>, LixError
     }
 }
 
+fn optional_integer_value(value: Option<&Value>) -> Result<Option<i64>, LixError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Integer(number)) => Ok(Some(*number)),
+        Some(Value::Text(text)) => text.parse::<i64>().map(Some).map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                &format!("invalid nullable integer text: {error}"),
+            )
+        }),
+        Some(other) => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            &format!("expected nullable integer-like value, got {other:?}"),
+        )),
+    }
+}
+
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
 fn build_load_live_state_snapshot_sql() -> String {
     "WITH status AS (\
-       SELECT mode, latest_change_id, latest_change_created_at, schema_epoch \
+       SELECT mode, latest_change_ordinal, latest_change_id, latest_change_created_at, schema_epoch \
        FROM lix_internal_live_state_status \
        WHERE singleton_id = 1 \
        LIMIT 1\
      ), canonical AS (\
-       SELECT id, created_at \
+       SELECT change_ordinal, id, created_at \
        FROM lix_internal_change \
-       ORDER BY created_at DESC, id DESC \
+       ORDER BY change_ordinal DESC \
        LIMIT 1\
      ) \
      SELECT \
        (SELECT mode FROM status), \
+       (SELECT latest_change_ordinal FROM status), \
        (SELECT latest_change_id FROM status), \
        (SELECT latest_change_created_at FROM status), \
        (SELECT schema_epoch FROM status), \
+       (SELECT change_ordinal FROM canonical), \
        (SELECT id FROM canonical), \
        (SELECT created_at FROM canonical)"
         .to_string()
@@ -716,7 +783,7 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         status_row: Option<Vec<Value>>,
-        latest_watermark: Option<(String, String)>,
+        latest_watermark: Option<(i64, String, String)>,
         executed_sql: std::sync::Mutex<Vec<String>>,
     }
 
@@ -732,16 +799,23 @@ mod tests {
                 && sql.contains("lix_internal_live_state_status")
                 && sql.contains("lix_internal_change")
             {
-                let mut row = self
-                    .status_row
-                    .clone()
-                    .unwrap_or_else(|| vec![Value::Null, Value::Null, Value::Null, Value::Null]);
+                let mut row = self.status_row.clone().unwrap_or_else(|| {
+                    vec![
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                    ]
+                });
                 match &self.latest_watermark {
-                    Some((id, created_at)) => {
+                    Some((ordinal, id, created_at)) => {
+                        row.push(Value::Integer(*ordinal));
                         row.push(Value::Text(id.clone()));
                         row.push(Value::Text(created_at.clone()));
                     }
                     None => {
+                        row.push(Value::Null);
                         row.push(Value::Null);
                         row.push(Value::Null);
                     }
@@ -750,9 +824,11 @@ mod tests {
                     rows: vec![row],
                     columns: vec![
                         "mode".to_string(),
+                        "latest_change_ordinal".to_string(),
                         "latest_change_id".to_string(),
                         "latest_change_created_at".to_string(),
                         "schema_epoch".to_string(),
+                        "change_ordinal".to_string(),
                         "id".to_string(),
                         "created_at".to_string(),
                     ],
@@ -763,6 +839,7 @@ mod tests {
                     rows: self.status_row.clone().into_iter().collect(),
                     columns: vec![
                         "mode".to_string(),
+                        "latest_change_ordinal".to_string(),
                         "latest_change_id".to_string(),
                         "latest_change_created_at".to_string(),
                         "schema_epoch".to_string(),
@@ -770,16 +847,26 @@ mod tests {
                 });
             }
             if sql.contains("FROM lix_internal_change")
-                && sql.contains("ORDER BY created_at DESC, id DESC")
+                && sql.contains("ORDER BY change_ordinal DESC")
             {
                 return Ok(QueryResult {
                     rows: self
                         .latest_watermark
                         .clone()
                         .into_iter()
-                        .map(|(id, created_at)| vec![Value::Text(id), Value::Text(created_at)])
+                        .map(|(ordinal, id, created_at)| {
+                            vec![
+                                Value::Integer(ordinal),
+                                Value::Text(id),
+                                Value::Text(created_at),
+                            ]
+                        })
                         .collect(),
-                    columns: vec!["id".to_string(), "created_at".to_string()],
+                    columns: vec![
+                        "change_ordinal".to_string(),
+                        "id".to_string(),
+                        "created_at".to_string(),
+                    ],
                 });
             }
             Ok(QueryResult {
@@ -811,7 +898,7 @@ mod tests {
 
     struct FakeTransaction {
         status_row: Option<Vec<Value>>,
-        latest_watermark: Option<(String, String)>,
+        latest_watermark: Option<(i64, String, String)>,
         executed_sql: Vec<String>,
     }
 
@@ -831,16 +918,23 @@ mod tests {
                 && sql.contains("lix_internal_live_state_status")
                 && sql.contains("lix_internal_change")
             {
-                let mut row = self
-                    .status_row
-                    .clone()
-                    .unwrap_or_else(|| vec![Value::Null, Value::Null, Value::Null, Value::Null]);
+                let mut row = self.status_row.clone().unwrap_or_else(|| {
+                    vec![
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                    ]
+                });
                 match &self.latest_watermark {
-                    Some((id, created_at)) => {
+                    Some((ordinal, id, created_at)) => {
+                        row.push(Value::Integer(*ordinal));
                         row.push(Value::Text(id.clone()));
                         row.push(Value::Text(created_at.clone()));
                     }
                     None => {
+                        row.push(Value::Null);
                         row.push(Value::Null);
                         row.push(Value::Null);
                     }
@@ -849,9 +943,11 @@ mod tests {
                     rows: vec![row],
                     columns: vec![
                         "mode".to_string(),
+                        "latest_change_ordinal".to_string(),
                         "latest_change_id".to_string(),
                         "latest_change_created_at".to_string(),
                         "schema_epoch".to_string(),
+                        "change_ordinal".to_string(),
                         "id".to_string(),
                         "created_at".to_string(),
                     ],
@@ -862,6 +958,7 @@ mod tests {
                     rows: self.status_row.clone().into_iter().collect(),
                     columns: vec![
                         "mode".to_string(),
+                        "latest_change_ordinal".to_string(),
                         "latest_change_id".to_string(),
                         "latest_change_created_at".to_string(),
                         "schema_epoch".to_string(),
@@ -869,16 +966,26 @@ mod tests {
                 });
             }
             if sql.contains("FROM lix_internal_change")
-                && sql.contains("ORDER BY created_at DESC, id DESC")
+                && sql.contains("ORDER BY change_ordinal DESC")
             {
                 return Ok(QueryResult {
                     rows: self
                         .latest_watermark
                         .clone()
                         .into_iter()
-                        .map(|(id, created_at)| vec![Value::Text(id), Value::Text(created_at)])
+                        .map(|(ordinal, id, created_at)| {
+                            vec![
+                                Value::Integer(ordinal),
+                                Value::Text(id),
+                                Value::Text(created_at),
+                            ]
+                        })
                         .collect(),
-                    columns: vec!["id".to_string(), "created_at".to_string()],
+                    columns: vec![
+                        "change_ordinal".to_string(),
+                        "id".to_string(),
+                        "created_at".to_string(),
+                    ],
                 });
             }
             Ok(QueryResult {
@@ -910,11 +1017,16 @@ mod tests {
         let backend = FakeBackend {
             status_row: Some(vec![
                 Value::Text("ready".to_string()),
+                Value::Integer(2),
                 Value::Text("change-2".to_string()),
                 Value::Text("2026-03-15T01:02:03Z".to_string()),
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
             ]),
-            latest_watermark: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            latest_watermark: Some((
+                2,
+                "change-2".to_string(),
+                "2026-03-15T01:02:03Z".to_string(),
+            )),
             executed_sql: std::sync::Mutex::new(Vec::new()),
         };
 
@@ -929,11 +1041,16 @@ mod tests {
         let backend = FakeBackend {
             status_row: Some(vec![
                 Value::Text("ready".to_string()),
+                Value::Integer(1),
                 Value::Text("change-1".to_string()),
                 Value::Text("2026-03-15T01:02:02Z".to_string()),
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
             ]),
-            latest_watermark: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            latest_watermark: Some((
+                2,
+                "change-2".to_string(),
+                "2026-03-15T01:02:03Z".to_string(),
+            )),
             executed_sql: std::sync::Mutex::new(Vec::new()),
         };
 
@@ -966,6 +1083,7 @@ mod tests {
                 Value::Text("needs_rebuild".to_string()),
                 Value::Null,
                 Value::Null,
+                Value::Null,
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
             ]),
             latest_watermark: None,
@@ -985,7 +1103,11 @@ mod tests {
     async fn readiness_without_status_but_with_canonical_state_requires_rebuild() {
         let backend = FakeBackend {
             status_row: None,
-            latest_watermark: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            latest_watermark: Some((
+                2,
+                "change-2".to_string(),
+                "2026-03-15T01:02:03Z".to_string(),
+            )),
             executed_sql: std::sync::Mutex::new(Vec::new()),
         };
 
@@ -1001,11 +1123,16 @@ mod tests {
         let mut transaction = FakeTransaction {
             status_row: Some(vec![
                 Value::Text("ready".to_string()),
+                Value::Integer(1),
                 Value::Text("change-1".to_string()),
                 Value::Text("2026-03-15T01:02:02Z".to_string()),
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
             ]),
-            latest_watermark: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            latest_watermark: Some((
+                2,
+                "change-2".to_string(),
+                "2026-03-15T01:02:03Z".to_string(),
+            )),
             executed_sql: Vec::new(),
         };
 
@@ -1019,11 +1146,16 @@ mod tests {
         let mut transaction = FakeTransaction {
             status_row: Some(vec![
                 Value::Text("ready".to_string()),
+                Value::Integer(1),
                 Value::Text("change-1".to_string()),
                 Value::Text("2026-03-15T01:02:02Z".to_string()),
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
             ]),
-            latest_watermark: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            latest_watermark: Some((
+                2,
+                "change-2".to_string(),
+                "2026-03-15T01:02:03Z".to_string(),
+            )),
             executed_sql: Vec::new(),
         };
 
@@ -1044,11 +1176,16 @@ mod tests {
         let mut transaction = FakeTransaction {
             status_row: Some(vec![
                 Value::Text("needs_rebuild".to_string()),
+                Value::Integer(1),
                 Value::Text("change-1".to_string()),
                 Value::Text("2026-03-15T01:02:02Z".to_string()),
                 Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
             ]),
-            latest_watermark: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
+            latest_watermark: Some((
+                2,
+                "change-2".to_string(),
+                "2026-03-15T01:02:03Z".to_string(),
+            )),
             executed_sql: Vec::new(),
         };
 

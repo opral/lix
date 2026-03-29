@@ -53,6 +53,8 @@ async fn append_tracked_unchecked(
     functions: &mut dyn LixFunctionProvider,
     invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
 ) -> Result<CreateCommitResult, LixError> {
+    let projection_writer_key_hints =
+        crate::live_state::projection::tracked_writer_key_hints_from_domain_changes(&args.changes);
     let result = create_commit(transaction, args, functions, invariant_checker)
         .await
         .map_err(create_commit_error_to_lix_error)?;
@@ -63,6 +65,7 @@ async fn append_tracked_unchecked(
         crate::live_state::projection::apply_commit_projections_best_effort_in_transaction(
             transaction,
             receipt,
+            &projection_writer_key_hints,
         )
         .await?;
     }

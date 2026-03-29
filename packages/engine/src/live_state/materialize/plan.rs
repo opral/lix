@@ -23,6 +23,7 @@ use crate::{CanonicalJson, LixBackend, LixError};
 struct VisibleRow {
     version_id: String,
     commit_id: String,
+    change_ordinal: i64,
     change_id: String,
     entity_id: String,
     schema_key: String,
@@ -221,8 +222,7 @@ fn build_latest_visible_state(
         rows.sort_by(|a, b| {
             a.depth
                 .cmp(&b.depth)
-                .then_with(|| b.change.created_at.cmp(&a.change.created_at))
-                .then_with(|| b.change.id.cmp(&a.change.id))
+                .then_with(|| b.change.change_ordinal.cmp(&a.change.change_ordinal))
         });
 
         let Some(winner) = rows.first() else {
@@ -233,8 +233,7 @@ fn build_latest_visible_state(
         created_candidates.sort_by(|a, b| {
             b.depth
                 .cmp(&a.depth)
-                .then_with(|| a.change.created_at.cmp(&b.change.created_at))
-                .then_with(|| a.change.id.cmp(&b.change.id))
+                .then_with(|| a.change.change_ordinal.cmp(&b.change.change_ordinal))
         });
         let created_at = created_candidates
             .first()
@@ -244,6 +243,7 @@ fn build_latest_visible_state(
         winners.push(VisibleRow {
             version_id: winner.source_version_id.clone(),
             commit_id: winner.commit_id.clone(),
+            change_ordinal: winner.change.change_ordinal,
             change_id: winner.change.id.clone(),
             entity_id: winner.change.entity_id.clone(),
             schema_key: winner.change.schema_key.clone(),
@@ -270,7 +270,7 @@ fn build_latest_visible_state(
             .then_with(|| a.schema_key.cmp(&b.schema_key))
             .then_with(|| a.file_id.cmp(&b.file_id))
             .then_with(|| a.entity_id.cmp(&b.entity_id))
-            .then_with(|| a.change_id.cmp(&b.change_id))
+            .then_with(|| a.change_ordinal.cmp(&b.change_ordinal))
     });
 
     stats.push(StageStat {
@@ -289,6 +289,7 @@ fn build_global_projection_rows(
     warnings: &mut Vec<LiveStateRebuildWarning>,
 ) -> Vec<VisibleRow> {
     let version_descriptor_schema = builtin_projection_schema_meta("lix_version_descriptor");
+    let version_ref_schema = builtin_projection_schema_meta("lix_version_ref");
     let commit_schema = builtin_projection_schema_meta("lix_commit");
     let change_set_element_schema = builtin_projection_schema_meta("lix_change_set_element");
     let commit_edge_schema = builtin_projection_schema_meta("lix_commit_edge");
@@ -312,6 +313,7 @@ fn build_global_projection_rows(
         let row = VisibleRow {
             version_id: GLOBAL_VERSION_ID.to_string(),
             commit_id: effective_commit_id,
+            change_ordinal: descriptor.change_ordinal,
             change_id: descriptor.id.clone(),
             entity_id: descriptor.entity_id.clone(),
             schema_key: version_descriptor_schema.schema_key.clone(),
@@ -322,6 +324,57 @@ fn build_global_projection_rows(
             metadata: descriptor.metadata.clone(),
             created_at: descriptor.created_at.clone(),
             updated_at: descriptor.created_at.clone(),
+        };
+        let key = (
+            row.version_id.clone(),
+            row.entity_id.clone(),
+            row.schema_key.clone(),
+            row.file_id.clone(),
+        );
+        candidates
+            .entry(key)
+            .or_default()
+            .push(ProjectionCandidate { depth, row });
+    }
+
+    let mut latest_version_ref_changes: BTreeMap<String, &ChangeRecord> = BTreeMap::new();
+    for change in data.changes.values() {
+        if change.schema_key != "lix_version_ref" {
+            continue;
+        }
+        match latest_version_ref_changes.get(&change.entity_id) {
+            Some(existing) if existing.change_ordinal >= change.change_ordinal => {}
+            _ => {
+                latest_version_ref_changes.insert(change.entity_id.clone(), change);
+            }
+        }
+    }
+
+    for change in latest_version_ref_changes.into_values() {
+        let effective_commit_id = version_refs
+            .get(&change.entity_id)
+            .and_then(|tips| tips.first())
+            .cloned()
+            .unwrap_or_default();
+        let depth = commit_depths
+            .get(&effective_commit_id)
+            .copied()
+            .unwrap_or(usize::MAX / 4);
+
+        let row = VisibleRow {
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            commit_id: effective_commit_id,
+            change_ordinal: change.change_ordinal,
+            change_id: change.id.clone(),
+            entity_id: change.entity_id.clone(),
+            schema_key: version_ref_schema.schema_key.clone(),
+            schema_version: change.schema_version.clone(),
+            file_id: change.file_id.clone(),
+            plugin_key: change.plugin_key.clone(),
+            snapshot_content: change.snapshot_content.clone(),
+            metadata: change.metadata.clone(),
+            created_at: change.created_at.clone(),
+            updated_at: change.created_at.clone(),
         };
         let key = (
             row.version_id.clone(),
@@ -351,6 +404,7 @@ fn build_global_projection_rows(
         let row = VisibleRow {
             version_id: GLOBAL_VERSION_ID.to_string(),
             commit_id: GLOBAL_VERSION_ID.to_string(),
+            change_ordinal: change.change_ordinal,
             change_id: change.id.clone(),
             entity_id: change.entity_id.clone(),
             schema_key: version_descriptor_schema.schema_key.clone(),
@@ -393,6 +447,7 @@ fn build_global_projection_rows(
         let commit_row = VisibleRow {
             version_id: GLOBAL_VERSION_ID.to_string(),
             commit_id: commit.entity_id.clone(),
+            change_ordinal: commit_change.change_ordinal,
             change_id: commit_change.id.clone(),
             entity_id: commit.entity_id.clone(),
             schema_key: commit_schema.schema_key.clone(),
@@ -439,6 +494,7 @@ fn build_global_projection_rows(
                 let cse_row = VisibleRow {
                     version_id: GLOBAL_VERSION_ID.to_string(),
                     commit_id: commit.entity_id.clone(),
+                    change_ordinal: change.change_ordinal,
                     change_id: change.id.clone(),
                     entity_id: format!("{}~{}", change_set_id, change.id),
                     schema_key: change_set_element_schema.schema_key.clone(),
@@ -477,6 +533,7 @@ fn build_global_projection_rows(
                     let author_row = VisibleRow {
                         version_id: GLOBAL_VERSION_ID.to_string(),
                         commit_id: commit.entity_id.clone(),
+                        change_ordinal: commit_change.change_ordinal,
                         change_id: commit_change.id.clone(),
                         entity_id: format!("{}~{}", change.id, account_id),
                         schema_key: change_author_schema.schema_key.clone(),
@@ -515,6 +572,7 @@ fn build_global_projection_rows(
             let edge_row = VisibleRow {
                 version_id: GLOBAL_VERSION_ID.to_string(),
                 commit_id: commit.entity_id.clone(),
+                change_ordinal: commit_change.change_ordinal,
                 change_id: commit_change.id.clone(),
                 entity_id: format!("{}~{}", parent_id, commit.entity_id),
                 schema_key: commit_edge_schema.schema_key.clone(),
@@ -572,7 +630,6 @@ fn resolve_projection_candidates(
         items.sort_by(|a, b| {
             a.depth
                 .cmp(&b.depth)
-                .then_with(|| b.row.created_at.cmp(&a.row.created_at))
                 .then_with(|| b.row.change_id.cmp(&a.row.change_id))
         });
         if let Some(winner) = items.into_iter().next() {
@@ -644,7 +701,11 @@ fn resolve_target_versions(
     latest_visible_state: &[VisibleRow],
 ) -> BTreeSet<String> {
     match &req.scope {
-        LiveStateRebuildScope::Versions(versions) => versions.clone(),
+        LiveStateRebuildScope::Versions(versions) => {
+            let mut resolved = versions.clone();
+            resolved.insert(GLOBAL_VERSION_ID.to_string());
+            resolved
+        }
         LiveStateRebuildScope::Full => {
             let mut versions = BTreeSet::new();
             for version_id in version_refs.keys() {
@@ -717,7 +778,7 @@ fn build_final_state(
             .then_with(|| a.source.schema_key.cmp(&b.source.schema_key))
             .then_with(|| a.source.file_id.cmp(&b.source.file_id))
             .then_with(|| a.source.entity_id.cmp(&b.source.entity_id))
-            .then_with(|| a.source.change_id.cmp(&b.source.change_id))
+            .then_with(|| a.source.change_ordinal.cmp(&b.source.change_ordinal))
     });
 
     stats.push(StageStat {
