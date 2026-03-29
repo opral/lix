@@ -1000,7 +1000,7 @@ fn build_admin_source_sql(
 ) -> Result<String, LixError> {
     let sql = match kind {
         CanonicalAdminKind::Version => {
-            crate::canonical::version_state::build_admin_version_source_sql()
+            crate::canonical::version_state::build_admin_version_source_sql(dialect)
         }
     };
 

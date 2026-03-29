@@ -20,6 +20,11 @@
 //! `live_state` does not own DAG, root/head, or commit-addressed state
 //! semantics. New history-semantic work should go through `canonical/*`, while
 //! `sql/*` should keep reading query surfaces served here.
+//!
+//! Any replay cursor, watermark, or readiness state tracked here is local and
+//! rebuildable execution machinery for derived projections. It is not canonical
+//! semantics and must not become the source of truth for committed meaning.
+//! Replay-specific entrypoints should live under `live_state::projection::*`.
 
 pub mod constraints;
 pub mod effective;
@@ -33,6 +38,7 @@ pub(crate) mod pending_reads;
 #[allow(dead_code)]
 pub(crate) mod projection;
 pub(crate) mod raw;
+mod replay_cursor;
 pub(crate) mod schema_access;
 pub(crate) mod shared;
 mod storage;
@@ -40,7 +46,6 @@ pub mod tracked;
 pub mod untracked;
 
 use crate::backend::QueryExecutor;
-pub use crate::canonical::CanonicalWatermark;
 use crate::live_state::shared::identity::RowIdentity;
 use crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::{LixBackend, LixBackendTransaction, LixError};
@@ -60,6 +65,7 @@ pub use materialize::{
 pub use projection::{
     DerivedProjectionId, DerivedProjectionStatus, ProjectionReplayMode, ProjectionStatus,
 };
+pub use replay_cursor::ReplayCursor;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaRegistration {
@@ -180,7 +186,7 @@ pub async fn register_schema(
     storage::register_schema(backend, &registration).await
 }
 
-pub async fn finalize_commit(backend: &dyn LixBackend) -> Result<CanonicalWatermark, LixError> {
+pub async fn finalize_commit(backend: &dyn LixBackend) -> Result<ReplayCursor, LixError> {
     lifecycle::finalize_commit(backend).await
 }
 
@@ -243,7 +249,7 @@ pub(crate) async fn register_schema_in_transaction(
 
 pub(crate) async fn finalize_commit_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-) -> Result<CanonicalWatermark, LixError> {
+) -> Result<ReplayCursor, LixError> {
     lifecycle::finalize_commit_in_transaction(transaction).await
 }
 
@@ -259,54 +265,11 @@ pub(crate) async fn try_claim_bootstrap_with_backend(
     lifecycle::try_claim_live_state_bootstrap_with_backend(backend).await
 }
 
-pub(crate) async fn load_latest_canonical_watermark(
-    backend: &dyn LixBackend,
-) -> Result<Option<CanonicalWatermark>, LixError> {
-    lifecycle::load_latest_canonical_watermark(backend).await
-}
-
-pub(crate) async fn load_projection_status_with_backend(
-    backend: &dyn LixBackend,
-) -> Result<LiveStateProjectionStatus, LixError> {
-    lifecycle::load_projection_status_with_backend(backend).await
-}
-
-pub(crate) async fn mark_needs_rebuild_at_canonical_watermark_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    watermark: &CanonicalWatermark,
-) -> Result<(), LixError> {
-    lifecycle::mark_needs_rebuild_at_canonical_watermark_in_transaction(transaction, watermark)
-        .await
-}
-
-pub(crate) async fn advance_commit_replay_boundary_to_watermark_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    watermark: &CanonicalWatermark,
-) -> Result<(), LixError> {
-    lifecycle::advance_commit_replay_boundary_to_watermark_in_transaction(transaction, watermark)
-        .await
-}
-
 pub(crate) async fn mark_mode_with_backend(
     backend: &dyn LixBackend,
     mode: LiveStateMode,
 ) -> Result<(), LixError> {
     lifecycle::mark_live_state_mode_with_backend(backend, mode).await
-}
-
-pub(crate) async fn mark_ready_with_backend(
-    backend: &dyn LixBackend,
-    watermark: &CanonicalWatermark,
-) -> Result<(), LixError> {
-    lifecycle::mark_live_state_ready_with_backend(backend, watermark).await
-}
-
-pub(crate) async fn mark_ready_at_canonical_watermark_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    watermark: &CanonicalWatermark,
-) -> Result<(), LixError> {
-    lifecycle::mark_live_state_ready_at_canonical_watermark_in_transaction(transaction, watermark)
-        .await
 }
 
 pub(crate) async fn rebuild_scope_in_transaction(

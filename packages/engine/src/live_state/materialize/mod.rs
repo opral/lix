@@ -1,8 +1,12 @@
-//! Live-state materialization rebuilds semantic state from canonical changes.
+//! Rebuildable materialization of query-serving live-state rows.
 //!
-//! Workspace annotation data such as `writer_key` may be supplied as optional
-//! overlay hints for current read surfaces, but it is not a required input for
-//! semantic replay correctness.
+//! `materialize` projects canonical committed meaning into derived live-state
+//! rows for query serving. Workspace annotation data such as `writer_key` may
+//! be supplied as optional overlay hints for current read surfaces, but it is
+//! not required for semantic replay correctness.
+//!
+//! Losing or rebuilding this state may affect performance or readiness, but it
+//! must not change committed semantics.
 
 mod apply;
 mod loader;

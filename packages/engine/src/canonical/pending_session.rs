@@ -11,9 +11,7 @@ use crate::{
 };
 use serde_json::{json, Value as JsonValue};
 
-use super::change_log::{
-    build_prepared_batch_from_canonical_output, load_next_change_ordinal_with_executor,
-};
+use super::change_log::build_prepared_batch_from_canonical_output;
 use super::create_commit::{
     CreateCommitAppliedOutput, CreateCommitError, CreateCommitExpectedHead,
     CreateCommitPreconditions, CreateCommitWriteLane,
@@ -23,7 +21,7 @@ use super::graph_index::{
     build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
 };
 use super::receipt::{
-    latest_canonical_watermark_from_change_rows, CanonicalCommitReceipt, UpdatedVersionRef,
+    latest_replay_cursor_from_change_rows, CanonicalCommitReceipt, UpdatedVersionRef,
 };
 use super::state_source::{load_version_info_for_versions, CommitQueryExecutor};
 use super::types::{
@@ -365,12 +363,10 @@ async fn execute_generated_commit_result(
     let commit_graph_rows =
         resolve_commit_graph_node_write_rows_with_executor(&mut executor, &result.canonical_output)
             .await?;
-    let next_change_ordinal = load_next_change_ordinal_with_executor(&mut executor).await?;
     let mut prepared = build_prepared_batch_from_canonical_output(
         &result.canonical_output,
         functions,
         transaction.dialect(),
-        next_change_ordinal,
     )?;
     prepared.extend(build_commit_graph_node_prepared_batch(
         &commit_graph_rows,
@@ -389,13 +385,13 @@ async fn execute_generated_commit_result(
     }
     program.push_batch(prepared);
     execute_write_program_with_transaction(transaction, program).await?;
-    let receipt = canonical_commit_receipt_from_generated_result(&result, next_change_ordinal)?;
     let mut executor = &mut *transaction;
     crate::workspace::writer_key::apply_workspace_writer_key_annotations_with_executor(
         &mut executor,
         tracked_writer_key_annotations,
     )
     .await?;
+    let receipt = canonical_commit_receipt_from_generated_result(&result)?;
     crate::live_state::projection::apply_commit_projections_best_effort_in_transaction(
         transaction,
         &receipt,
@@ -407,18 +403,14 @@ async fn execute_generated_commit_result(
 
 fn canonical_commit_receipt_from_generated_result(
     result: &GenerateCommitResult,
-    starting_change_ordinal: i64,
 ) -> Result<CanonicalCommitReceipt, LixError> {
-    let canonical_watermark = latest_canonical_watermark_from_change_rows(
-        &result.canonical_output.changes,
-        starting_change_ordinal,
-    )
-    .ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "pending public commit execution requires at least one canonical change row",
-        )
-    })?;
+    let replay_cursor = latest_replay_cursor_from_change_rows(&result.canonical_output.changes)
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "pending public commit execution requires at least one canonical change row",
+            )
+        })?;
     let commit_id = result
         .updated_version_refs
         .first()
@@ -431,7 +423,7 @@ fn canonical_commit_receipt_from_generated_result(
         })?;
     Ok(CanonicalCommitReceipt {
         commit_id,
-        canonical_watermark,
+        replay_cursor,
         updated_version_refs: result.updated_version_refs.clone(),
         affected_versions: result
             .updated_version_refs

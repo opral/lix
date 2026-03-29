@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::backend::QueryExecutor;
+use crate::live_state::ReplayCursor;
 use crate::schema::builtin::types::{LixCommit, LixCommitEdge, LixVersionDescriptor};
 
 use crate::{CanonicalJson, LixError, Value};
@@ -8,7 +9,6 @@ use crate::{CanonicalJson, LixError, Value};
 #[derive(Debug, Clone)]
 pub(crate) struct ChangeRecord {
     pub id: String,
-    pub change_ordinal: i64,
     pub entity_id: String,
     pub schema_key: String,
     pub schema_version: String,
@@ -17,6 +17,7 @@ pub(crate) struct ChangeRecord {
     pub snapshot_content: Option<CanonicalJson>,
     pub metadata: Option<CanonicalJson>,
     pub created_at: String,
+    pub replay_cursor: ReplayCursor,
 }
 
 #[derive(Debug, Clone)]
@@ -24,12 +25,12 @@ pub(crate) struct CommitRecord {
     pub id: String,
     pub entity_id: String,
     pub snapshot: LixCommit,
+    pub replay_cursor: ReplayCursor,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct VersionDescriptorRecord {
     pub id: String,
-    pub change_ordinal: i64,
     pub entity_id: String,
     pub schema_version: String,
     pub file_id: String,
@@ -37,6 +38,7 @@ pub(crate) struct VersionDescriptorRecord {
     pub snapshot_content: CanonicalJson,
     pub metadata: Option<CanonicalJson>,
     pub created_at: String,
+    pub replay_cursor: ReplayCursor,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +58,7 @@ pub(crate) struct LoadedData {
 pub(crate) async fn load_data_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<LoadedData, LixError> {
-    let sql = "SELECT c.id, c.change_ordinal, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at \
+    let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at \
                FROM lix_internal_change c \
                LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id";
     let result = executor.execute(sql, &[]).await?;
@@ -68,14 +70,13 @@ pub(crate) async fn load_data_with_executor(
 
     for row in result.rows {
         let id = text_required(&row, 0, "id")?;
-        let change_ordinal = integer_required(&row, 1, "change_ordinal")?;
-        let entity_id = text_required(&row, 2, "entity_id")?;
-        let schema_key = text_required(&row, 3, "schema_key")?;
-        let schema_version = text_required(&row, 4, "schema_version")?;
-        let file_id = text_required(&row, 5, "file_id")?;
-        let plugin_key = text_required(&row, 6, "plugin_key")?;
-        let snapshot_content_raw = json_text_optional(&row, 7, "snapshot_content")?;
-        let metadata_raw = json_text_optional(&row, 8, "metadata")?;
+        let entity_id = text_required(&row, 1, "entity_id")?;
+        let schema_key = text_required(&row, 2, "schema_key")?;
+        let schema_version = text_required(&row, 3, "schema_version")?;
+        let file_id = text_required(&row, 4, "file_id")?;
+        let plugin_key = text_required(&row, 5, "plugin_key")?;
+        let snapshot_content_raw = json_text_optional(&row, 6, "snapshot_content")?;
+        let metadata_raw = json_text_optional(&row, 7, "metadata")?;
         let snapshot_content = snapshot_content_raw
             .as_ref()
             .map(|s| CanonicalJson::from_text(s))
@@ -84,11 +85,11 @@ pub(crate) async fn load_data_with_executor(
             .as_ref()
             .map(|s| CanonicalJson::from_text(s))
             .transpose()?;
-        let created_at = text_required(&row, 9, "created_at")?;
+        let created_at = text_required(&row, 8, "created_at")?;
+        let replay_cursor = ReplayCursor::new(id.clone(), created_at.clone());
 
         let change = ChangeRecord {
             id: id.clone(),
-            change_ordinal,
             entity_id: entity_id.clone(),
             schema_key: schema_key.clone(),
             schema_version: schema_version.clone(),
@@ -97,6 +98,7 @@ pub(crate) async fn load_data_with_executor(
             snapshot_content: snapshot_content.clone(),
             metadata: metadata.clone(),
             created_at: created_at.clone(),
+            replay_cursor: replay_cursor.clone(),
         };
 
         changes.insert(id.clone(), change.clone());
@@ -108,6 +110,7 @@ pub(crate) async fn load_data_with_executor(
                         id: id.clone(),
                         entity_id: entity_id.clone(),
                         snapshot,
+                        replay_cursor: replay_cursor.clone(),
                     };
                     upsert_latest_by_entity(&mut commits, candidate, |record| {
                         record.entity_id.clone()
@@ -132,7 +135,6 @@ pub(crate) async fn load_data_with_executor(
             };
             let candidate = VersionDescriptorRecord {
                 id: id.clone(),
-                change_ordinal,
                 entity_id: entity_id.clone(),
                 schema_version: schema_version.clone(),
                 file_id: file_id.clone(),
@@ -140,6 +142,7 @@ pub(crate) async fn load_data_with_executor(
                 snapshot_content: snapshot_canonical,
                 metadata: metadata.clone(),
                 created_at,
+                replay_cursor,
             };
             upsert_latest_by_entity(&mut version_descriptors, candidate, |record| {
                 record.entity_id.clone()
@@ -187,22 +190,22 @@ where
 }
 
 trait HasOrder {
-    fn ordinal_value(&self) -> i64;
+    fn replay_cursor(&self) -> &ReplayCursor;
 
     fn is_newer_than(&self, other: &Self) -> bool {
-        self.ordinal_value() > other.ordinal_value()
+        self.replay_cursor().is_newer_than(other.replay_cursor())
     }
 }
 
 impl HasOrder for CommitRecord {
-    fn ordinal_value(&self) -> i64 {
-        i64::MAX
+    fn replay_cursor(&self) -> &ReplayCursor {
+        &self.replay_cursor
     }
 }
 
 impl HasOrder for VersionDescriptorRecord {
-    fn ordinal_value(&self) -> i64 {
-        self.change_ordinal
+    fn replay_cursor(&self) -> &ReplayCursor {
+        &self.replay_cursor
     }
 }
 
@@ -271,26 +274,6 @@ fn text_required(row: &[Value], index: usize, label: &str) -> Result<String, Lix
             description: format!(
                 "materialization: expected text for column '{label}' at index {index}"
             ),
-        }),
-    }
-}
-
-fn integer_required(row: &[Value], index: usize, label: &str) -> Result<i64, LixError> {
-    let Some(value) = row.get(index) else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("materialization: missing required column '{label}'"),
-        });
-    };
-    match value {
-        Value::Integer(value) => Ok(*value),
-        Value::Text(value) => value.parse::<i64>().map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("materialization: invalid integer for '{label}': {error}"),
-        }),
-        other => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("materialization: expected integer for '{label}', got {other:?}"),
         }),
     }
 }

@@ -1,6 +1,6 @@
-use crate::canonical::{CanonicalCommitReceipt, CanonicalWatermark};
+use crate::canonical::CanonicalCommitReceipt;
 use crate::engine::Engine;
-use crate::live_state::SchemaRegistration;
+use crate::live_state::{ReplayCursor, SchemaRegistration};
 use crate::state::stream::StateCommitStreamChange;
 use crate::{LixBackendTransaction, LixError};
 
@@ -81,7 +81,7 @@ impl<'a> WriteTransaction<'a> {
         write_state.execute(coordinator).await
     }
 
-    pub async fn finalize_live_state(&mut self) -> Result<CanonicalWatermark, LixError> {
+    pub async fn finalize_live_state(&mut self) -> Result<ReplayCursor, LixError> {
         self.coordinator.finalize_live_state().await
     }
 

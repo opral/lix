@@ -8,6 +8,10 @@
 //! from canonical facts unless the engine deliberately promotes some checkpoint
 //! state into canonical ownership later.
 //!
+//! This subsystem is distinct from projection replay. Replay cursors and
+//! applied watermarks belong to `live_state/projection/*`, not to
+//! `checkpoint/*`.
+//!
 //! Checkpoint-managed rows currently split into two buckets:
 //!
 //! - The system-managed checkpoint label row plus commit-label links are the

@@ -61,11 +61,7 @@ impl BufferedWriteState {
         let should_replace = self
             .latest_canonical_commit_receipt
             .as_ref()
-            .is_none_or(|current| {
-                receipt
-                    .canonical_watermark
-                    .is_newer_than(&current.canonical_watermark)
-            });
+            .is_none_or(|current| receipt.replay_cursor.is_newer_than(&current.replay_cursor));
         if should_replace {
             self.latest_canonical_commit_receipt = Some(receipt);
         }
