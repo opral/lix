@@ -2902,7 +2902,7 @@ mod tests {
         let registry = SurfaceRegistry::with_builtin_surfaces();
         let lowered = lowered_program(
             &registry,
-            "SELECT id, name, hidden, commit_id FROM lix_version WHERE id = 'main'",
+            "SELECT id, name, hidden, commit_id FROM lix_version WHERE name = 'main'",
         )
         .expect("version read should lower");
         let lowered_sql = lowered.statements[0].to_string();
@@ -2917,7 +2917,7 @@ mod tests {
         );
         assert_eq!(
             lowered.pushdown_decision.residual_predicates,
-            vec!["id = 'main'".to_string()]
+            vec!["name = 'main'".to_string()]
         );
     }
 
