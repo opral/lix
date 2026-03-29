@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::live_state::{
     coalesce_live_table_requirements, SchemaRegistration, SchemaRegistrationSet,
 };
-use crate::sql::execution::compiled::{CompiledExecution, CompiledInternalExecution};
-use crate::sql::execution::runtime_state::ExecutionRuntimeState;
+use crate::sql::executor::compiled::{CompiledExecution, CompiledInternalExecution};
+use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::LixError;
 
 use super::{
@@ -929,24 +929,16 @@ fn tracked_plan_is_coalescible_filesystem(plan: &TrackedTxnUnit) -> bool {
 }
 
 fn create_commit_expected_head_compatible(
-    left: &crate::sql::public::planner::ir::ExpectedHead,
-    right: &crate::sql::public::planner::ir::ExpectedHead,
+    left: &crate::sql::logical_plan::public_ir::ExpectedHead,
+    right: &crate::sql::logical_plan::public_ir::ExpectedHead,
 ) -> bool {
-    match (left, right) {
+    matches!(
+        (left, right),
         (
-            crate::sql::public::planner::ir::ExpectedHead::CurrentHead,
-            crate::sql::public::planner::ir::ExpectedHead::CurrentHead,
-        ) => true,
-        (
-            crate::sql::public::planner::ir::ExpectedHead::CommitId(left),
-            crate::sql::public::planner::ir::ExpectedHead::CommitId(right),
-        ) => left == right,
-        (
-            crate::sql::public::planner::ir::ExpectedHead::CreateIfMissing,
-            crate::sql::public::planner::ir::ExpectedHead::CreateIfMissing,
-        ) => true,
-        _ => false,
-    }
+            crate::sql::logical_plan::public_ir::ExpectedHead::CurrentHead,
+            crate::sql::logical_plan::public_ir::ExpectedHead::CurrentHead,
+        )
+    )
 }
 
 fn tracked_plan_entity_targets_disjoint(left: &TrackedTxnUnit, right: &TrackedTxnUnit) -> bool {

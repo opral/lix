@@ -5,15 +5,15 @@ use crate::live_state::schema_access::{live_read_contract_from_layout, LiveReadC
 use crate::read::contracts::{
     committed_read_mode_from_prepared_public_read, CommittedReadMode, PublicReadExecutionMode,
 };
-use crate::sql::public::catalog::{SurfaceFamily, SurfaceVariant};
-use crate::sql::public::runtime::{
+use crate::sql::catalog::{SurfaceFamily, SurfaceVariant};
+use crate::sql::executor::public_runtime::{
     decode_public_read_result, execute_prepared_public_read, PreparedPublicRead,
 };
-use crate::sql::public::services::state_reader::{
+use crate::sql::services::state_reader::{
     normalized_values_from_snapshot, scan_live_rows, snapshot_text_from_row, LiveReadRow,
     LiveStorageLane,
 };
-use crate::sql_support::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::transaction::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
     PendingSemanticRow, PendingSemanticStorage, PendingTransactionView,
@@ -60,13 +60,13 @@ impl<'a> TransactionReadModel<'a> {
 
     async fn bootstrap_public_surface_registry(
         &self,
-    ) -> Result<crate::sql::public::catalog::SurfaceRegistry, LixError> {
+    ) -> Result<crate::sql::catalog::SurfaceRegistry, LixError> {
         if !self.has_pending_visibility() {
-            return crate::sql::public::catalog::SurfaceRegistry::bootstrap_with_backend(self.base)
+            return crate::sql::catalog::SurfaceRegistry::bootstrap_with_backend(self.base)
                 .await;
         }
 
-        let mut registry = crate::sql::public::catalog::SurfaceRegistry::with_builtin_surfaces();
+        let mut registry = crate::sql::catalog::SurfaceRegistry::with_builtin_surfaces();
         for snapshot_content in self.visible_registered_schema_rows().await?.into_values() {
             let snapshot: JsonValue = serde_json::from_str(&snapshot_content).map_err(|error| {
                 LixError::new(
@@ -355,7 +355,7 @@ impl<'a> TransactionReadModel<'a> {
 pub(crate) async fn bootstrap_public_surface_registry_with_pending_transaction_view(
     base: &dyn LixBackend,
     pending_transaction_view: Option<&PendingTransactionView>,
-) -> Result<crate::sql::public::catalog::SurfaceRegistry, LixError> {
+) -> Result<crate::sql::catalog::SurfaceRegistry, LixError> {
     TransactionReadModel::new(base, pending_transaction_view)
         .bootstrap_public_surface_registry()
         .await

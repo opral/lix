@@ -6,7 +6,7 @@ use crate::canonical::roots::{
     resolve_history_root_facts_with_backend, HistoryRootFacts, HistoryRootTraversal,
     RootCommitResolutionRequest, RootCommitScope, RootLineageScope, RootVersionScope,
 };
-use crate::sql_support::text::escape_sql_string;
+use crate::sql::common::text::escape_sql_string;
 use crate::workspace::require_workspace_active_version_id;
 use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 

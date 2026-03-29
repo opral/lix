@@ -9,7 +9,7 @@ use crate::canonical::ProposedDomainChange;
 use crate::checkpoint::apply_public_version_last_checkpoint_side_effects;
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::LixFunctionProvider;
-use crate::sql::public::validation::{validate_commit_time_write, SchemaCache};
+use crate::sql::semantic_ir::validation::{validate_commit_time_write, SchemaCache};
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
 use super::{
@@ -19,12 +19,12 @@ use super::{
 };
 
 struct PublicCommitInvariantChecker<'a> {
-    planned_write: &'a crate::sql::public::planner::ir::PlannedWrite,
+    planned_write: &'a crate::sql::logical_plan::public_ir::PlannedWrite,
     schema_cache: SchemaCache,
 }
 
 impl<'a> PublicCommitInvariantChecker<'a> {
-    fn new(planned_write: &'a crate::sql::public::planner::ir::PlannedWrite) -> Self {
+    fn new(planned_write: &'a crate::sql::logical_plan::public_ir::PlannedWrite) -> Self {
         Self {
             planned_write,
             schema_cache: SchemaCache::new(),
@@ -153,13 +153,13 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
                     .as_ref()
                     .map(|batch| batch.write_lane.clone())
                     .unwrap_or_else(|| match &unit.execution.create_preconditions.write_lane {
-                        crate::sql::public::planner::ir::WriteLane::SingleVersion(version_id) => {
+                        crate::sql::logical_plan::public_ir::WriteLane::SingleVersion(version_id) => {
                             WriteLane::SingleVersion(version_id.clone())
                         }
-                        crate::sql::public::planner::ir::WriteLane::ActiveVersion => {
+                        crate::sql::logical_plan::public_ir::WriteLane::ActiveVersion => {
                             WriteLane::ActiveVersion
                         }
-                        crate::sql::public::planner::ir::WriteLane::GlobalAdmin => {
+                        crate::sql::logical_plan::public_ir::WriteLane::GlobalAdmin => {
                             WriteLane::GlobalAdmin
                         }
                     }),
@@ -240,15 +240,15 @@ fn canonical_create_commit_preconditions_for_tracked_unit(
 }
 
 fn canonical_create_commit_preconditions_from_public_write(
-    commit_preconditions: &crate::sql::public::planner::ir::CommitPreconditions,
+    commit_preconditions: &crate::sql::logical_plan::public_ir::CommitPreconditions,
     batch: Option<&DomainChangeBatch>,
     public_write: &super::PreparedPublicWrite,
 ) -> Result<CreateCommitPreconditions, LixError> {
     let write_lane = match &commit_preconditions.write_lane {
-        crate::sql::public::planner::ir::WriteLane::SingleVersion(version_id) => {
+        crate::sql::logical_plan::public_ir::WriteLane::SingleVersion(version_id) => {
             CreateCommitWriteLane::Version(version_id.clone())
         }
-        crate::sql::public::planner::ir::WriteLane::ActiveVersion => {
+        crate::sql::logical_plan::public_ir::WriteLane::ActiveVersion => {
             let version_id = batch
                 .into_iter()
                 .flat_map(|batch| batch.changes.first())
@@ -270,19 +270,13 @@ fn canonical_create_commit_preconditions_from_public_write(
                 })?;
             CreateCommitWriteLane::Version(version_id)
         }
-        crate::sql::public::planner::ir::WriteLane::GlobalAdmin => {
+        crate::sql::logical_plan::public_ir::WriteLane::GlobalAdmin => {
             CreateCommitWriteLane::GlobalAdmin
         }
     };
     let expected_head = match &commit_preconditions.expected_head {
-        crate::sql::public::planner::ir::ExpectedHead::CurrentHead => {
+        crate::sql::logical_plan::public_ir::ExpectedHead::CurrentHead => {
             CreateCommitExpectedHead::CurrentHead
-        }
-        crate::sql::public::planner::ir::ExpectedHead::CommitId(commit_id) => {
-            CreateCommitExpectedHead::CommitId(commit_id.clone())
-        }
-        crate::sql::public::planner::ir::ExpectedHead::CreateIfMissing => {
-            CreateCommitExpectedHead::CreateIfMissing
         }
     };
 
@@ -290,18 +284,17 @@ fn canonical_create_commit_preconditions_from_public_write(
         write_lane,
         expected_head,
         idempotency_key: match &commit_preconditions.expected_head {
-            crate::sql::public::planner::ir::ExpectedHead::CurrentHead => {
+            crate::sql::logical_plan::public_ir::ExpectedHead::CurrentHead => {
                 CreateCommitIdempotencyKey::CurrentHeadFingerprint(
                     commit_preconditions.idempotency_key.0.clone(),
                 )
             }
-            _ => CreateCommitIdempotencyKey::Exact(commit_preconditions.idempotency_key.0.clone()),
         },
     })
 }
 
 fn public_domain_changes_to_proposed(
-    changes: &[crate::sql::public::planner::semantics::domain_changes::PublicDomainChange],
+    changes: &[crate::sql::semantic_ir::semantics::domain_changes::PublicDomainChange],
 ) -> Result<Vec<ProposedDomainChange>, LixError> {
     changes
         .iter()
@@ -310,7 +303,7 @@ fn public_domain_changes_to_proposed(
 }
 
 fn public_domain_change_to_proposed(
-    change: &crate::sql::public::planner::semantics::domain_changes::PublicDomainChange,
+    change: &crate::sql::semantic_ir::semantics::domain_changes::PublicDomainChange,
 ) -> Result<ProposedDomainChange, LixError> {
     Ok(ProposedDomainChange {
         entity_id: crate::EntityId::new(change.entity_id.clone())?,
@@ -335,11 +328,11 @@ fn public_domain_change_to_proposed(
 
 fn public_domain_changes_from_proposed(
     changes: &[ProposedDomainChange],
-) -> Vec<crate::sql::public::planner::semantics::domain_changes::PublicDomainChange> {
+) -> Vec<crate::sql::semantic_ir::semantics::domain_changes::PublicDomainChange> {
     changes
         .iter()
         .map(
-            |change| crate::sql::public::planner::semantics::domain_changes::PublicDomainChange {
+            |change| crate::sql::semantic_ir::semantics::domain_changes::PublicDomainChange {
                 entity_id: change.entity_id.to_string(),
                 schema_key: change.schema_key.to_string(),
                 schema_version: change.schema_version.as_ref().map(ToString::to_string),
