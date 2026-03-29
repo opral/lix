@@ -2,6 +2,7 @@ use crate::backend::prepared::PreparedStatement;
 use crate::live_state::{
     coalesce_live_table_requirements, SchemaRegistration, SchemaRegistrationSet,
 };
+use crate::sql::explain::ExplainArtifacts;
 use crate::sql::logical_plan::ResultContract;
 use crate::sql::physical_plan::PhysicalPlan;
 
@@ -25,6 +26,7 @@ pub(crate) struct CompiledExecution {
     pub(crate) intent: crate::sql::executor::intent::ExecutionIntent,
     pub(crate) runtime_state: ExecutionRuntimeState,
     pub(crate) physical_plan: Option<PhysicalPlan>,
+    pub(crate) explain: Option<ExplainArtifacts>,
     pub(crate) result_contract: ResultContract,
     pub(crate) effects: PlanEffects,
     pub(crate) read_only_query: bool,
@@ -61,6 +63,22 @@ impl CompiledExecution {
 
     pub(crate) fn physical_plan(&self) -> Option<&PhysicalPlan> {
         self.physical_plan.as_ref()
+    }
+
+    pub(crate) fn explain(&self) -> Option<&ExplainArtifacts> {
+        self.explain.as_ref()
+    }
+
+    pub(crate) fn plain_explain(&self) -> Option<&ExplainArtifacts> {
+        self.explain
+            .as_ref()
+            .filter(|explain| !explain.requires_execution())
+    }
+
+    pub(crate) fn analyzed_explain(&self) -> Option<&ExplainArtifacts> {
+        self.explain
+            .as_ref()
+            .filter(|explain| explain.requires_execution())
     }
 }
 

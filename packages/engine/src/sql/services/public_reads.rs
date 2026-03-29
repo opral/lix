@@ -37,6 +37,7 @@ pub(crate) async fn execute_public_query_with_optional_pending_transaction_view(
         active_version_id,
         writer_key,
         false,
+        None,
     )
     .await?;
     let Some(public_read) = prepared else {

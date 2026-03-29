@@ -8,7 +8,7 @@ use crate::sql::executor::{
     compile_execution_from_template_instance_with_backend,
     prepared_execution_mutates_public_surface_registry, PreparationPolicy,
 };
-use crate::sql::parser::parse_sql;
+use crate::sql::parser::parse_sql_with_timing;
 use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, Value};
 use sqlparser::ast::Statement;
@@ -86,7 +86,8 @@ pub(super) fn bind_single_statement_template(
     allow_internal_tables: bool,
     context: &mut ExecutionContext,
 ) -> Result<BoundStatementTemplateInstance, LixError> {
-    let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
+    let parsed = parse_sql_with_timing(sql).map_err(LixError::from)?;
+    let parsed_statements = parsed.statements;
     if parsed_statements.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -117,7 +118,7 @@ pub(super) fn bind_single_statement_template(
         }
     };
     let runtime_bindings = context.runtime_binding_values()?;
-    template.bind(params, &runtime_bindings)
+    template.bind(params, &runtime_bindings, Some(parsed.parse_duration))
 }
 
 #[cfg(test)]

@@ -1,5 +1,9 @@
 use crate::engine::Engine;
 use crate::functions::SharedFunctionProvider;
+use crate::sql::explain::{
+    build_internal_explain_artifacts, unsupported_explain_analyze_error, unwrap_explain_statement,
+    ExplainRequest, ExplainStage, ExplainTimingCollector, InternalExplainBuildInput,
+};
 use crate::sql::physical_plan::PhysicalPlan;
 use crate::sql::semantic_ir::validation::{
     validate_batch_local_write, validate_inserts, validate_updates,
@@ -7,6 +11,8 @@ use crate::sql::semantic_ir::validation::{
 use crate::transaction::PendingTransactionView;
 use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::Statement;
+use std::time::Duration;
+use std::time::Instant;
 
 use super::compiled::{CompiledExecution, CompiledExecutionBody, CompiledInternalExecution};
 use super::contracts::effects::PlanEffects;
@@ -39,6 +45,7 @@ pub(crate) struct PreparationPolicy {
 
 #[derive(Clone, Copy)]
 struct StaticCompilationArtifacts<'a> {
+    parse_duration: Option<Duration>,
     ownership_hint: Option<StatementTemplateOwnership>,
     plan_requirements: Option<&'a PlanRequirements>,
 }
@@ -46,6 +53,9 @@ struct StaticCompilationArtifacts<'a> {
 pub(crate) fn prepared_execution_mutates_public_surface_registry(
     prepared: &CompiledExecution,
 ) -> Result<bool, LixError> {
+    if prepared.explain().is_some() {
+        return Ok(false);
+    }
     if prepared.public_write().is_some() {
         return prepared
             .public_write()
@@ -97,6 +107,14 @@ async fn compile_execution_with_backend(
 
     let mut statements = parsed_statements.to_vec();
     crate::filesystem::ensure_generated_filesystem_insert_ids(&mut statements, &functions)?;
+    let explained = if statements.len() == 1 {
+        Some(unwrap_explain_statement(&statements[0])?)
+    } else {
+        None
+    };
+    let explain_request = explained
+        .as_ref()
+        .and_then(|explained| explained.request.clone());
 
     let requirements = static_artifacts
         .plan_requirements
@@ -113,6 +131,7 @@ async fn compile_execution_with_backend(
         writer_key,
         allow_internal_tables,
         public_surface_registry_override,
+        static_artifacts.parse_duration,
         static_artifacts.ownership_hint,
         functions.clone(),
     )
@@ -138,10 +157,16 @@ async fn compile_execution_with_backend(
         });
 
     let public_read_owns_execution = public_read.is_some();
+    let explain_internal_execution =
+        explain_request.is_some() && !public_read_owns_execution && public_write.is_none();
 
     let intent = if let Some(public_write) = public_write.as_ref() {
         derived_public_execution_intent(public_write)
     } else if public_read_owns_execution {
+        ExecutionIntent {
+            filesystem_state: Default::default(),
+        }
+    } else if explain_internal_execution {
         ExecutionIntent {
             filesystem_state: Default::default(),
         }
@@ -184,14 +209,25 @@ async fn compile_execution_with_backend(
     }
 
     let result_contract = result_contract_for_statements(&statements);
+    let mut internal_explain = None;
     let (effects, internal_execution) = if public_write_owns_execution || public_read_owns_execution
     {
         (PlanEffects::default(), None)
     } else {
+        let internal_source_statements = explained
+            .as_ref()
+            .and_then(|explained| {
+                explained
+                    .request
+                    .as_ref()
+                    .map(|_| vec![explained.statement.clone()])
+            })
+            .unwrap_or_else(|| statements.clone());
+        let internal_compile_started = Instant::now();
         let internal_logical_plan = preprocess_with_surfaces_to_logical_plan(
             backend,
             &engine.cel_evaluator,
-            statements.clone(),
+            internal_source_statements,
             params,
             functions.clone(),
             writer_key,
@@ -245,6 +281,20 @@ async fn compile_execution_with_backend(
             update_validations: preprocess.update_validations,
             should_refresh_file_cache: requirements.should_refresh_file_cache,
         };
+        if let Some(request) = explain_request.clone() {
+            let mut stage_timings = ExplainTimingCollector::new(static_artifacts.parse_duration);
+            stage_timings.record(
+                ExplainStage::LogicalPlanning,
+                internal_compile_started.elapsed(),
+            );
+            internal_explain = Some(build_internal_explain_artifacts(
+                InternalExplainBuildInput {
+                    request,
+                    logical_plan: internal_logical_plan.clone(),
+                    stage_timings: stage_timings.finish(),
+                },
+            ));
+        }
         (effects, Some(internal_execution))
     };
 
@@ -278,6 +328,9 @@ async fn compile_execution_with_backend(
             ));
         }
     };
+    if let Some(request) = explain_request.as_ref() {
+        validate_explain_execution_support(request, &body, requirements.read_only_query)?;
+    }
     let physical_plan = match &body {
         CompiledExecutionBody::PublicRead(read) => {
             Some(PhysicalPlan::PublicRead(read.execution.clone()))
@@ -287,11 +340,23 @@ async fn compile_execution_with_backend(
         }
         CompiledExecutionBody::Internal(_) => None,
     };
+    let explain = match &body {
+        CompiledExecutionBody::PublicRead(read) => {
+            read.explain.request.as_ref().map(|_| read.explain.clone())
+        }
+        CompiledExecutionBody::PublicWrite(write) => write
+            .explain
+            .request
+            .as_ref()
+            .map(|_| write.explain.clone()),
+        CompiledExecutionBody::Internal(_) => internal_explain,
+    };
 
     Ok(CompiledExecution {
         intent,
         runtime_state: runtime_state.clone(),
         physical_plan,
+        explain,
         result_contract,
         effects,
         read_only_query: requirements.read_only_query,
@@ -309,6 +374,7 @@ async fn prepare_public_execution_for_compile(
     writer_key: Option<&str>,
     allow_internal_tables: bool,
     public_surface_registry_override: Option<&crate::sql::catalog::SurfaceRegistry>,
+    parse_duration: Option<Duration>,
     ownership_hint: Option<StatementTemplateOwnership>,
     functions: SharedFunctionProvider<crate::deterministic_mode::RuntimeFunctionProvider>,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
@@ -322,6 +388,7 @@ async fn prepare_public_execution_for_compile(
                 active_version_id,
                 writer_key,
                 allow_internal_tables,
+                parse_duration,
             )
             .await?
             .map(PreparedPublicExecution::Read),
@@ -333,6 +400,7 @@ async fn prepare_public_execution_for_compile(
                 active_account_ids,
                 writer_key,
                 allow_internal_tables,
+                parse_duration,
                 functions.clone(),
             )
             .await?,
@@ -347,6 +415,7 @@ async fn prepare_public_execution_for_compile(
                 active_account_ids,
                 writer_key,
                 pending_transaction_view,
+                parse_duration,
                 functions.clone(),
             )
             .await?
@@ -358,6 +427,7 @@ async fn prepare_public_execution_for_compile(
                 active_version_id,
                 active_account_ids,
                 writer_key,
+                parse_duration,
                 functions.clone(),
             )
             .await?
@@ -376,6 +446,7 @@ async fn prepare_public_execution_for_compile(
                     writer_key,
                     allow_internal_tables,
                     pending_transaction_view,
+                    parse_duration,
                     functions.clone(),
                 )
                 .await?
@@ -389,6 +460,7 @@ async fn prepare_public_execution_for_compile(
                     active_account_ids,
                     writer_key,
                     allow_internal_tables,
+                    parse_duration,
                     functions.clone(),
                 )
                 .await?
@@ -437,6 +509,7 @@ pub(crate) async fn compile_execution_from_template_instance_with_backend(
         policy,
         runtime_state,
         StaticCompilationArtifacts {
+            parse_duration: template_instance.parse_duration(),
             ownership_hint: template_instance.ownership_hint(),
             plan_requirements: Some(template_instance.plan_requirements()),
         },
@@ -455,6 +528,27 @@ fn derived_public_execution_intent(
 
     crate::sql::executor::intent::ExecutionIntent {
         filesystem_state: resolved.filesystem_state(),
+    }
+}
+
+fn validate_explain_execution_support(
+    request: &ExplainRequest,
+    body: &CompiledExecutionBody,
+    read_only_query: bool,
+) -> Result<(), LixError> {
+    if !request.requires_execution() {
+        return Ok(());
+    }
+
+    match body {
+        CompiledExecutionBody::PublicRead(_) => Ok(()),
+        CompiledExecutionBody::Internal(_) if read_only_query => Ok(()),
+        CompiledExecutionBody::PublicWrite(_) => {
+            Err(unsupported_explain_analyze_error("public write statements"))
+        }
+        CompiledExecutionBody::Internal(_) => Err(unsupported_explain_analyze_error(
+            "mutating internal statements",
+        )),
     }
 }
 

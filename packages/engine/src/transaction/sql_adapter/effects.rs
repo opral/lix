@@ -29,6 +29,7 @@ pub(super) fn command_metadata(
     command: &SqlBufferedWriteCommand,
 ) -> Result<BufferedWriteCommandMetadata, LixError> {
     let route = match command.compiled.route() {
+        CompiledExecutionRoute::Explain(_) => BufferedWriteExecutionRoute::Other,
         CompiledExecutionRoute::Internal(_) => BufferedWriteExecutionRoute::Internal,
         CompiledExecutionRoute::PublicRead(public_read)
             if matches!(

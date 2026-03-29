@@ -14,8 +14,8 @@ pub(crate) use internal::prepare_internal_statements_with_backend_to_plan;
 pub(crate) use public::{
     analyze_public_write_semantics, augment_dependency_spec_for_broad_public_read,
     prepare_structured_public_read_analysis, unknown_public_state_schema_error, BoundPublicLeaf,
-    ExplainOptions, PublicExecutionDebugTrace, PublicReadSemantics, PublicWriteInvariantTrace,
-    PublicWriteSemantics, StructuredPublicReadPreparation,
+    PublicReadSemantics, PublicWriteInvariantTrace, PublicWriteSemantics, SemanticStatement,
+    StructuredPublicReadPreparation,
 };
 pub(crate) use statement::{
     BoundStatement, BoundStatementMetadata, ExecutionContext, StatementKind,

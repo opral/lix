@@ -17,6 +17,7 @@ use crate::{
     ExecuteResult, LixBackend, LixBackendTransaction, LixError, QueryResult, TransactionMode,
 };
 use sqlparser::ast::Statement;
+use std::time::Instant;
 
 pub(crate) struct PreparedCommittedReadProgram {
     pub(crate) transaction_mode: TransactionMode,
@@ -146,6 +147,9 @@ fn merge_committed_read_transaction_mode(
 fn transaction_mode_for_committed_read_execution(
     compiled: &CompiledExecution,
 ) -> Result<TransactionMode, LixError> {
+    if compiled.plain_explain().is_some() {
+        return Ok(TransactionMode::Read);
+    }
     if let Some(public_read) = compiled.public_read() {
         return Ok(committed_read_mode_from_prepared_public_read(public_read).transaction_mode());
     }
@@ -249,10 +253,20 @@ async fn execute_compiled_committed_read_in_transaction(
     source_statement: &Statement,
 ) -> Result<QueryResult, LixError> {
     let parsed_statements = std::slice::from_ref(source_statement);
+    if let Some(explain) = compiled.plain_explain() {
+        return explain.render_query_result();
+    }
     if let Some(public_read) = compiled.public_read() {
         let backend = TransactionBackendAdapter::new(transaction);
+        let execution_started = Instant::now();
         return match execute_prepared_public_read(&backend, public_read).await {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                if let Some(explain) = compiled.analyzed_explain() {
+                    explain.render_analyzed_query_result(&result, execution_started.elapsed())
+                } else {
+                    Ok(result)
+                }
+            }
             Err(error) => {
                 Err(
                     normalize_sql_execution_error_with_backend(&backend, error, parsed_statements)
@@ -262,6 +276,7 @@ async fn execute_compiled_committed_read_in_transaction(
         };
     }
     if let Some(internal) = compiled.internal_execution() {
+        let execution_started = Instant::now();
         let internal_result =
             execute_prepared_with_transaction(transaction, &internal.prepared_statements)
                 .await
@@ -278,10 +293,12 @@ async fn execute_compiled_committed_read_in_transaction(
                 .await);
             }
         };
-        return Ok(public_result_from_contract(
-            compiled.result_contract,
-            &internal_result,
-        ));
+        let public_result = public_result_from_contract(compiled.result_contract, &internal_result);
+        if let Some(explain) = compiled.analyzed_explain() {
+            return explain
+                .render_analyzed_query_result(&public_result, execution_started.elapsed());
+        }
+        return Ok(public_result);
     }
     Err(LixError::new(
         "LIX_ERROR_UNKNOWN",

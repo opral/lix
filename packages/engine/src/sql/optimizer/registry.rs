@@ -42,7 +42,7 @@ pub(crate) struct OptimizerPassOutcome {
     pub(crate) diagnostics: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct OptimizerPassTrace {
     pub(crate) name: &'static str,
     pub(crate) order: u32,
