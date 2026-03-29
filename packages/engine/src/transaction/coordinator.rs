@@ -1,4 +1,4 @@
-use crate::canonical::CanonicalWatermark;
+use crate::canonical::{CanonicalCommitReceipt, CanonicalWatermark};
 use crate::live_state::{SchemaRegistration, SchemaRegistrationSet};
 use crate::{LixBackendTransaction, LixError};
 
@@ -32,22 +32,20 @@ impl<'a> TransactionCoordinator<'a> {
 
     pub(crate) async fn finalize_live_state(&mut self) -> Result<CanonicalWatermark, LixError> {
         let transaction = self.backend_transaction_mut()?;
-        crate::live_state::finalize_commit_in_transaction(transaction).await
+        crate::live_state::projection::mark_live_state_projection_ready_in_transaction(transaction)
+            .await
     }
 
     pub(crate) async fn advance_live_state_replay_boundary_for_commit(
         &mut self,
-        canonical_watermark: Option<&CanonicalWatermark>,
+        receipt: Option<&CanonicalCommitReceipt>,
     ) -> Result<(), LixError> {
-        let Some(canonical_watermark) = canonical_watermark else {
+        let Some(receipt) = receipt else {
             return Ok(());
         };
         let transaction = self.backend_transaction_mut()?;
-        crate::live_state::advance_commit_replay_boundary_to_watermark_in_transaction(
-            transaction,
-            canonical_watermark,
-        )
-        .await
+        crate::live_state::projection::apply_canonical_receipt_in_transaction(transaction, receipt)
+            .await
     }
 
     pub(crate) async fn commit(&mut self) -> Result<(), LixError> {

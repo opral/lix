@@ -734,8 +734,11 @@ impl Drop for SessionTransaction<'_> {
 }
 
 async fn ensure_version_exists(session: &Session, version_id: &str) -> Result<(), LixError> {
-    if !crate::live_state::version_exists_with_backend(session.engine.backend.as_ref(), version_id)
-        .await?
+    if !crate::canonical::version_state::version_exists_with_backend(
+        session.engine.backend.as_ref(),
+        version_id,
+    )
+    .await?
     {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",

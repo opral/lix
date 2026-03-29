@@ -20,7 +20,6 @@ use crate::SqlDialect;
 use crate::{CanonicalSchemaKey, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
 
-use super::apply::apply_projected_live_state_rows_best_effort_in_transaction;
 use super::change_log::build_prepared_batch_from_canonical_output;
 use super::create_commit_preflight::{
     load_create_commit_deterministic_sequence_start as load_create_commit_deterministic_sequence_start_impl,
@@ -33,15 +32,14 @@ use super::graph_index::{
 use super::receipt::{
     latest_canonical_watermark_from_change_rows, CanonicalCommitReceipt, UpdatedVersionRef,
 };
-use super::refs::apply_committed_version_ref_updates_in_transaction;
 use super::roots::load_committed_version_head_commit_id;
 use super::state_source::{
     load_exact_committed_state_row_at_version_head_with_executor, load_version_info_for_versions,
     CommitQueryExecutor, ExactCommittedStateRowRequest,
 };
 use super::types::{
-    CanonicalCommitOutput, DerivedCommitApplyInput, DomainChangeInput, GenerateCommitArgs,
-    GenerateCommitResult, ProposedDomainChange, VersionInfo, VersionSnapshot,
+    CanonicalCommitOutput, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
+    ProposedDomainChange, VersionInfo, VersionSnapshot,
 };
 
 const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
@@ -132,7 +130,6 @@ pub(crate) struct OperationalCommitApplyInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateCommitAppliedOutput {
     pub(crate) canonical_output: CanonicalCommitOutput,
-    pub(crate) derived_apply_input: DerivedCommitApplyInput,
     pub(crate) operational_apply_input: OperationalCommitApplyInput,
     pub(crate) pending_public_commit_seed: Option<PendingPublicCommitSeed>,
 }
@@ -140,12 +137,7 @@ pub(crate) struct CreateCommitAppliedOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingPublicCommitSeed {
     pub(crate) commit_id: String,
-    pub(crate) change_set_id: String,
     pub(crate) commit_change_id: String,
-    pub(crate) commit_materialized_change_id: String,
-    pub(crate) commit_schema_version: String,
-    pub(crate) commit_file_id: String,
-    pub(crate) commit_plugin_key: String,
     pub(crate) commit_snapshot_content: String,
 }
 
@@ -392,7 +384,6 @@ pub(crate) async fn create_commit(
     .map_err(backend_error)?;
     let committed_head = extract_committed_head_id(&generated_commit, &concrete_lane)?;
     let canonical_output = generated_commit.canonical_output;
-    let derived_apply_input = generated_commit.derived_apply_input;
     let updated_version_refs = generated_commit.updated_version_refs;
     let receipt = build_canonical_commit_receipt(
         committed_head.clone(),
@@ -400,12 +391,10 @@ pub(crate) async fn create_commit(
         &updated_version_refs,
     )?;
     let mut executor = &mut *transaction;
-    let commit_graph_rows = resolve_commit_graph_node_write_rows_with_executor(
-        &mut executor,
-        &derived_apply_input.live_state_rows,
-    )
-    .await
-    .map_err(backend_error)?;
+    let commit_graph_rows =
+        resolve_commit_graph_node_write_rows_with_executor(&mut executor, &canonical_output)
+            .await
+            .map_err(backend_error)?;
     let idempotency_write = CommitIdempotencyWrite {
         write_lane: lane_storage_key(&concrete_lane),
         idempotency_key: resolved_idempotency.legacy_key.clone(),
@@ -418,8 +407,7 @@ pub(crate) async fn create_commit(
     let observe_tick = args.should_emit_observe_tick.then(|| ObserveTickWrite {
         writer_key: args.observe_tick_writer_key.clone(),
     });
-    let pending_public_commit_seed =
-        build_pending_public_commit_seed(&canonical_output, &derived_apply_input)?;
+    let pending_public_commit_seed = build_pending_public_commit_seed(&canonical_output)?;
     let mut prepared_batch = build_prepared_batch_from_canonical_output(
         &canonical_output,
         functions,
@@ -450,7 +438,6 @@ pub(crate) async fn create_commit(
     }
     let applied_output = CreateCommitAppliedOutput {
         canonical_output,
-        derived_apply_input,
         operational_apply_input: OperationalCommitApplyInput {
             idempotency_write,
             deterministic_sequence_highest_seen,
@@ -475,17 +462,6 @@ pub(crate) async fn create_commit(
     execute_write_program_with_transaction(transaction, write_program)
         .await
         .map_err(backend_error)?;
-    apply_committed_version_ref_updates_in_transaction(transaction, &receipt.updated_version_refs)
-        .await
-        .map_err(backend_error)?;
-    apply_projected_live_state_rows_best_effort_in_transaction(
-        transaction,
-        &applied_output.derived_apply_input,
-        &receipt.canonical_watermark,
-    )
-    .await
-    .map_err(backend_error)?;
-
     Ok(CreateCommitResult {
         disposition: CreateCommitDisposition::Applied,
         committed_head,
@@ -497,10 +473,9 @@ pub(crate) async fn create_commit(
 
 fn build_pending_public_commit_seed(
     canonical_output: &CanonicalCommitOutput,
-    derived_apply_input: &DerivedCommitApplyInput,
 ) -> Result<Option<PendingPublicCommitSeed>, CreateCommitError> {
-    let Some(commit_row) = derived_apply_input
-        .live_state_rows
+    let Some(commit_row) = canonical_output
+        .changes
         .iter()
         .find(|row| row.schema_key == "lix_commit")
     else {
@@ -519,15 +494,14 @@ fn build_pending_public_commit_seed(
             kind: CreateCommitErrorKind::Internal,
             message: format!("public commit seed snapshot is invalid JSON: {error}"),
         })?;
-    let change_set_id = commit_snapshot
+    commit_snapshot
         .get("change_set_id")
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| CreateCommitError {
             kind: CreateCommitErrorKind::Internal,
             message: "public commit seed snapshot is missing change_set_id".to_string(),
-        })?
-        .to_string();
+        })?;
     let commit_change_id = canonical_output
         .changes
         .iter()
@@ -540,12 +514,7 @@ fn build_pending_public_commit_seed(
 
     Ok(Some(PendingPublicCommitSeed {
         commit_id: commit_row.entity_id.to_string(),
-        change_set_id,
         commit_change_id,
-        commit_materialized_change_id: commit_row.id.clone(),
-        commit_schema_version: commit_row.schema_version.to_string(),
-        commit_file_id: commit_row.file_id.to_string(),
-        commit_plugin_key: commit_row.plugin_key.to_string(),
         commit_snapshot_content: commit_snapshot_content.to_string(),
     }))
 }
@@ -1848,11 +1817,8 @@ mod tests {
             "canonical commit batch should not inline live-state writes after apply isolation"
         );
         assert!(
-            transaction
-                .executed_sql
-                .iter()
-                .any(|sql| sql.contains("lix_internal_live_v1_")),
-            "create_commit should still apply derived live-state rows as a separate step"
+            result.receipt.is_some(),
+            "create_commit should emit a canonical receipt for projection replay instead of applying derived rows inline"
         );
         assert!(
             transaction
@@ -1907,20 +1873,20 @@ mod tests {
             None,
         )
         .await
-        .expect("canonical commit should succeed even if projected live-state writes fail");
+        .expect("canonical commit should succeed without touching projected live-state writes");
 
         assert_eq!(result.disposition, CreateCommitDisposition::Applied);
+        let receipt = result.receipt.expect("canonical receipt should be present");
         assert!(
-            transaction
-                .executed_sql
+            receipt
+                .updated_version_refs
                 .iter()
-                .any(|sql| sql.contains("lix_internal_live_v1_lix_version_ref")),
-            "committed version refs should still be written on the required path",
+                .any(|update| update.version_id.as_str() == "version-a"),
+            "canonical receipt should carry committed version-ref updates",
         );
         assert_eq!(
-            transaction.live_state_mode.as_deref(),
-            Some("needs_rebuild"),
-            "projection failure should record replay work instead of aborting canonical commit",
+            transaction.live_state_mode, None,
+            "canonical commit should not mutate projection readiness directly",
         );
     }
 

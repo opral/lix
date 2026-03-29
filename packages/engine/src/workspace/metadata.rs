@@ -1,10 +1,5 @@
-use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::tracked::{scan_rows_with_backend, TrackedScanRequest};
+use crate::canonical::version_state::find_version_id_by_name_with_backend;
 use crate::version::DEFAULT_ACTIVE_VERSION_NAME;
-use crate::version::{
-    version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
-    version_descriptor_storage_version_id,
-};
 use crate::{LixBackend, LixError, Value};
 
 const WORKSPACE_METADATA_TABLE: &str = "lix_internal_workspace_metadata";
@@ -120,46 +115,21 @@ async fn persist_workspace_metadata_value(
 async fn load_default_workspace_active_version_id(
     backend: &dyn LixBackend,
 ) -> Result<String, LixError> {
-    let rows = scan_rows_with_backend(
-        backend,
-        &TrackedScanRequest {
-            schema_key: version_descriptor_schema_key().to_string(),
-            version_id: version_descriptor_storage_version_id().to_string(),
-            constraints: vec![
-                ScanConstraint {
-                    field: ScanField::FileId,
-                    operator: ScanOperator::Eq(Value::Text(
-                        version_descriptor_file_id().to_string(),
-                    )),
-                },
-                ScanConstraint {
-                    field: ScanField::PluginKey,
-                    operator: ScanOperator::Eq(Value::Text(
-                        version_descriptor_plugin_key().to_string(),
-                    )),
-                },
-            ],
-            required_columns: vec!["name".to_string()],
-        },
-    )
-    .await?;
-    let Some(row) = rows.into_iter().find(|row| {
-        row.property_text("name")
-            .as_deref()
-            .is_some_and(|name| name == DEFAULT_ACTIVE_VERSION_NAME)
-    }) else {
+    let Some(version_id) =
+        find_version_id_by_name_with_backend(backend, DEFAULT_ACTIVE_VERSION_NAME).await?
+    else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "workspace active version is missing and no default version named 'main' exists",
         ));
     };
-    if row.entity_id.is_empty() {
+    if version_id.is_empty() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "workspace active version lookup returned an empty version id",
         ));
     }
-    Ok(row.entity_id)
+    Ok(version_id)
 }
 
 fn parse_workspace_active_account_ids_json(raw: &str) -> Result<Vec<String>, LixError> {

@@ -1,7 +1,7 @@
 //! Workspace-state boundary.
 //!
-//! `workspace` owns mutable selectors and compatibility surfaces that are
-//! distinct from canonical committed refs.
+//! `workspace` owns mutable selectors that are distinct from canonical
+//! committed refs.
 //!
 //! Durable workspace state:
 //! - the persisted active workspace version id
@@ -12,20 +12,11 @@
 //! - transaction-local pending overlays that may be discarded without changing
 //!   committed truth
 //!
-//! Compatibility surfaces:
-//! - `lix_active_version` helper rows used by public/admin flows
-//!
 //! None of these APIs own committed head semantics. Canonical refs remain the
 //! durable source for committed heads and roots.
 
-#[cfg(test)]
-mod active_version;
 mod metadata;
 
-#[cfg(test)]
-pub(crate) use active_version::{
-    load_workspace_active_version_row_with_backend, workspace_active_version_write_row,
-};
 pub(crate) use metadata::{
     load_workspace_active_account_ids, persist_workspace_active_account_ids,
     persist_workspace_active_version_id, require_workspace_active_version_id,

@@ -53,9 +53,21 @@ async fn append_tracked_unchecked(
     functions: &mut dyn LixFunctionProvider,
     invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
 ) -> Result<CreateCommitResult, LixError> {
-    create_commit(transaction, args, functions, invariant_checker)
+    let result = create_commit(transaction, args, functions, invariant_checker)
         .await
-        .map_err(create_commit_error_to_lix_error)
+        .map_err(create_commit_error_to_lix_error)?;
+
+    if let (Some(receipt), Some(_applied_output)) =
+        (result.receipt.as_ref(), result.applied_output.as_ref())
+    {
+        crate::live_state::projection::apply_commit_projections_best_effort_in_transaction(
+            transaction,
+            receipt,
+        )
+        .await?;
+    }
+
+    Ok(result)
 }
 
 pub(crate) async fn append_tracked_with_pending_public_session(
@@ -298,13 +310,7 @@ mod tests {
         let mut pending_session = Some(PendingPublicCommitSession {
             lane: CreateCommitWriteLane::Version("version-a".to_string()),
             commit_id: "commit-123".to_string(),
-            change_set_id: "change-set-1".to_string(),
-            commit_change_id: "change-1".to_string(),
             commit_change_snapshot_id: "snapshot-1".to_string(),
-            commit_materialized_change_id: "mat-change-1".to_string(),
-            commit_schema_version: "1".to_string(),
-            commit_file_id: "lix".to_string(),
-            commit_plugin_key: "lix".to_string(),
             commit_snapshot: serde_json::json!({ "change_set_id": "change-set-1" }),
         });
 

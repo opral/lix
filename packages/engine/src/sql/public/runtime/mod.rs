@@ -23,7 +23,8 @@ use crate::sql::execution::contracts::planned_statement::SchemaLiveTableRequirem
 use crate::sql::execution::intent::authoritative_binary_blob_write_targets;
 use crate::sql::public::backend::PushdownDecision;
 use crate::sql::public::catalog::{
-    SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
+    SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry,
+    SurfaceVariant,
 };
 use crate::sql::public::core::contracts::{BoundStatement, ExecutionContext};
 use crate::sql::public::planner::backend::lowerer::{
@@ -396,6 +397,7 @@ pub(crate) enum PreparedPublicReadExecution {
 pub(crate) struct PreparedPublicRead {
     pub(crate) optimization: Option<PublicReadOptimization>,
     pub(crate) dependency_spec: Option<DependencySpec>,
+    pub(crate) freshness_contract: SurfaceReadFreshness,
     pub(crate) execution: PreparedPublicReadExecution,
     pub(crate) public_output_columns: Option<Vec<String>>,
     pub(crate) debug_trace: PublicExecutionDebugTrace,
@@ -443,6 +445,7 @@ pub(crate) struct BoundPublicLeaf {
     pub(crate) surface_family: SurfaceFamily,
     pub(crate) surface_variant: SurfaceVariant,
     pub(crate) capability: SurfaceCapability,
+    pub(crate) read_freshness: SurfaceReadFreshness,
     pub(crate) requires_effective_state: bool,
 }
 
@@ -1125,11 +1128,38 @@ fn bound_public_leaf(binding: &crate::sql::public::catalog::SurfaceBinding) -> B
         surface_family: binding.descriptor.surface_family,
         surface_variant: binding.descriptor.surface_variant,
         capability: binding.capability,
+        read_freshness: binding.read_freshness,
         requires_effective_state: matches!(
             binding.descriptor.surface_family,
             SurfaceFamily::State | SurfaceFamily::Entity
         ),
     }
+}
+
+fn merge_surface_read_freshness(
+    left: SurfaceReadFreshness,
+    right: SurfaceReadFreshness,
+) -> SurfaceReadFreshness {
+    match (left, right) {
+        (SurfaceReadFreshness::RequiresFreshProjection, _)
+        | (_, SurfaceReadFreshness::RequiresFreshProjection) => {
+            SurfaceReadFreshness::RequiresFreshProjection
+        }
+        (
+            SurfaceReadFreshness::AllowsStaleProjection,
+            SurfaceReadFreshness::AllowsStaleProjection,
+        ) => SurfaceReadFreshness::AllowsStaleProjection,
+    }
+}
+
+fn bound_surface_freshness_contract(
+    bindings: &[crate::sql::public::catalog::SurfaceBinding],
+) -> Option<SurfaceReadFreshness> {
+    let mut bindings = bindings.iter();
+    let first = bindings.next()?;
+    Some(bindings.fold(first.read_freshness, |merged, binding| {
+        merge_surface_read_freshness(merged, binding.read_freshness)
+    }))
 }
 
 fn collect_public_query_relation_names(query: &Query) -> BTreeSet<String> {
@@ -2727,6 +2757,7 @@ mod tests {
         PreparedPublicReadExecution,
     };
     use crate::read::models::StateHistoryRootScope;
+    use crate::sql::public::catalog::SurfaceReadFreshness;
     use crate::{LixBackend, LixError, QueryResult, Session, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::json;
@@ -2999,6 +3030,127 @@ mod tests {
             .expect("test thread should spawn")
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    #[tokio::test]
+    async fn records_surface_read_freshness_contracts() {
+        let backend = FakeBackend::default();
+
+        let derived_read = prepare_public_read(
+            &backend,
+            &parse_one("SELECT key FROM lix_key_value"),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("derived entity read should prepare");
+        assert_eq!(
+            derived_read.freshness_contract,
+            SurfaceReadFreshness::RequiresFreshProjection
+        );
+        assert_eq!(
+            derived_read.debug_trace.bound_public_leaves[0].read_freshness,
+            SurfaceReadFreshness::RequiresFreshProjection
+        );
+
+        let canonical_read = prepare_public_read(
+            &backend,
+            &parse_one("SELECT COUNT(*) FROM lix_change"),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("canonical change read should prepare");
+        assert_eq!(
+            canonical_read.freshness_contract,
+            SurfaceReadFreshness::AllowsStaleProjection
+        );
+        assert_eq!(
+            canonical_read.debug_trace.bound_public_leaves[0].read_freshness,
+            SurfaceReadFreshness::AllowsStaleProjection
+        );
+
+        let admin_read = prepare_public_read(
+            &backend,
+            &parse_one("SELECT id, commit_id FROM lix_version WHERE name = 'main'"),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("canonical admin read should prepare");
+        assert_eq!(
+            admin_read.freshness_contract,
+            SurfaceReadFreshness::AllowsStaleProjection
+        );
+        assert_eq!(
+            admin_read.debug_trace.bound_public_leaves[0].read_freshness,
+            SurfaceReadFreshness::AllowsStaleProjection
+        );
+    }
+
+    #[test]
+    fn stale_live_state_blocks_projection_reads_but_not_canonical_change_reads() {
+        run_with_large_stack(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime should build");
+            runtime.block_on(async {
+                let (backend, session) = boot_real_backend().await;
+                session
+                    .execute(
+                        "INSERT INTO lix_key_value (key, value) VALUES ('freshness-check', '1')",
+                        &[],
+                    )
+                    .await
+                    .expect("tracked write should succeed before staleness test");
+                crate::live_state::mark_mode_with_backend(
+                    &backend,
+                    crate::live_state::LiveStateMode::NeedsRebuild,
+                )
+                .await
+                .expect("marking live_state stale should succeed");
+
+                let stale_error = session
+                    .execute(
+                        "SELECT key FROM lix_key_value WHERE key = 'freshness-check'",
+                        &[],
+                    )
+                    .await
+                    .expect_err("projection-backed state read should reject stale live_state");
+                assert_eq!(
+                    stale_error.code,
+                    crate::errors::ErrorCode::LiveStateNotReady.as_str()
+                );
+                assert!(
+                    stale_error.description.contains("lix_key_value"),
+                    "stale read error should name the projection-backed surface: {}",
+                    stale_error.description
+                );
+
+                let canonical_result = session
+                    .execute("SELECT COUNT(*) FROM lix_change", &[])
+                    .await
+                    .expect("canonical change read should still succeed while live_state is stale");
+                let count = match &canonical_result.statements[0].rows[0][0] {
+                    Value::Integer(value) => *value,
+                    other => panic!("expected integer row count, got {other:?}"),
+                };
+                assert!(count > 0, "canonical change read should still return rows");
+
+                let admin_result = session
+                    .execute(
+                        "SELECT id, commit_id FROM lix_version WHERE name = 'main'",
+                        &[],
+                    )
+                    .await
+                    .expect("canonical admin read should still succeed while live_state is stale");
+                assert_eq!(admin_result.statements[0].rows.len(), 1);
+            });
+        });
     }
 
     #[tokio::test]
@@ -4260,8 +4412,9 @@ mod tests {
                     assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_version"]);
                     if let Some(lowered_sql) = prepared.debug_trace.lowered_sql.first() {
                         assert!(!lowered_sql.contains("FROM lix_version"));
-                        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_descriptor"));
-                        assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
+                        assert!(lowered_sql.contains("FROM lix_internal_change c"));
+                        assert!(lowered_sql.contains("lix_version_descriptor"));
+                        assert!(lowered_sql.contains("lix_version_ref"));
                     }
                 })
         });

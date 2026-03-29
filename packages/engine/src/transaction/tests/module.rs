@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use crate::canonical::refs::committed_version_ref_mirror_write_row;
+use crate::live_state::projection::committed_version_ref_mirror_write_row;
 use crate::live_state::tracked::{
     load_exact_row_with_backend, ExactTrackedRowRequest, TrackedWriteOperation, TrackedWriteRow,
 };

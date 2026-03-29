@@ -3,6 +3,7 @@ use crate::account::{
     active_account_schema_version, active_account_snapshot_content,
     active_account_storage_version_id,
 };
+use crate::canonical::version_state::load_version_descriptor_with_backend;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::sql::public::catalog::SurfaceFamily;
@@ -27,7 +28,7 @@ use crate::sql::public::services::pending_reads::{
     execute_prepared_public_read_with_pending_transaction_view,
 };
 use crate::sql::public::services::state_reader::{
-    load_exact_live_row, load_version_ref, scan_live_rows, LiveStorageLane,
+    load_version_ref, scan_live_rows, LiveStorageLane,
 };
 use crate::transaction::PendingTransactionView;
 use crate::version::{
@@ -35,9 +36,9 @@ use crate::version::{
     active_version_schema_version, active_version_snapshot_content,
     active_version_storage_version_id, version_descriptor_file_id, version_descriptor_plugin_key,
     version_descriptor_schema_key, version_descriptor_schema_version,
-    version_descriptor_snapshot_content, version_descriptor_storage_version_id,
-    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-    version_ref_schema_version, version_ref_snapshot_content, GLOBAL_VERSION_ID,
+    version_descriptor_snapshot_content, version_ref_file_id, version_ref_plugin_key,
+    version_ref_schema_key, version_ref_schema_version, version_ref_snapshot_content,
+    GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
@@ -723,7 +724,7 @@ async fn resolve_version_insert_write_plan(
                 .authoritative_pre_state
                 .extend(version_descriptor_pre_state_refs(existing));
             partitions
-                .partition_mut(WriteMode::Untracked, None)
+                .partition_mut(WriteMode::Tracked, None)
                 .authoritative_pre_state
                 .extend(version_ref_pre_state_refs(existing));
         }
@@ -740,11 +741,11 @@ async fn resolve_version_insert_write_plan(
                 source_commit_id: None,
             });
         partitions
-            .partition_mut(WriteMode::Untracked, None)
+            .partition_mut(WriteMode::Tracked, None)
             .intended_post_state
             .push(version_ref_row(&version_id, &commit_id));
         partitions
-            .partition_mut(WriteMode::Untracked, None)
+            .partition_mut(WriteMode::Tracked, None)
             .lineage
             .push(RowLineage {
                 entity_id: version_id,
@@ -852,19 +853,19 @@ async fn resolve_existing_version_write(
                     ));
                 }
                 if payload.contains_key("commit_id") {
-                    let untracked = partitions.partition_mut(WriteMode::Untracked, None);
-                    untracked
+                    let tracked = partitions.partition_mut(WriteMode::Tracked, None);
+                    tracked
                         .authoritative_pre_state
                         .extend(version_ref_pre_state_refs(&current_row));
-                    untracked
+                    tracked
                         .authoritative_pre_state_rows
                         .push(version_ref_row(&current_row.id, &current_row.commit_id));
-                    untracked.lineage.push(RowLineage {
+                    tracked.lineage.push(RowLineage {
                         entity_id: current_row.id.clone(),
                         source_change_id: None,
                         source_commit_id: None,
                     });
-                    untracked
+                    tracked
                         .intended_post_state
                         .push(version_ref_row(&current_row.id, &next_commit_id));
                 }
@@ -891,17 +892,17 @@ async fn resolve_existing_version_write(
                     source_commit_id: None,
                 });
 
-                let untracked = partitions.partition_mut(WriteMode::Untracked, None);
-                untracked
+                let tracked = partitions.partition_mut(WriteMode::Tracked, None);
+                tracked
                     .authoritative_pre_state
                     .extend(version_ref_pre_state_refs(&current_row));
-                untracked
+                tracked
                     .intended_post_state
                     .push(version_ref_tombstone_row(&current_row.id));
-                untracked
+                tracked
                     .tombstones
                     .extend(version_ref_tombstone_refs(&current_row));
-                untracked.lineage.push(RowLineage {
+                tracked.lineage.push(RowLineage {
                     entity_id: current_row.id.clone(),
                     source_change_id: None,
                     source_commit_id: None,
@@ -919,32 +920,20 @@ async fn load_version_admin_row(
     backend: &dyn LixBackend,
     version_id: &str,
 ) -> Result<Option<VersionAdminRow>, crate::LixError> {
-    let Some(descriptor_row) = load_exact_live_row(
-        backend,
-        LiveStorageLane::Tracked,
-        version_descriptor_schema_key(),
-        version_descriptor_storage_version_id(),
-        version_id,
-        Some(version_descriptor_file_id()),
-    )
-    .await?
-    .filter(|row| row.plugin_key() == version_descriptor_plugin_key()) else {
+    let Some(descriptor_row) = load_version_descriptor_with_backend(backend, version_id).await?
+    else {
         return Ok(None);
     };
     let pointer_row = load_version_ref(backend, version_id).await?;
     Ok(Some(VersionAdminRow {
         id: version_id.to_string(),
-        name: descriptor_row.property_text("name").unwrap_or_default(),
-        hidden: descriptor_row
-            .values()
-            .get("hidden")
-            .and_then(value_as_bool)
-            .unwrap_or(false),
+        name: descriptor_row.name,
+        hidden: descriptor_row.hidden,
         commit_id: pointer_row
             .as_ref()
             .map(|row| row.commit_id.clone())
             .unwrap_or_default(),
-        descriptor_change_id: descriptor_row.change_id().map(ToOwned::to_owned),
+        descriptor_change_id: descriptor_row.change_id,
         pointer_change_id: None,
     }))
 }
@@ -1486,18 +1475,10 @@ async fn validate_public_write_version_target(
         return Ok(());
     }
 
-    let descriptor_exists = load_exact_live_row(
-        backend,
-        LiveStorageLane::Tracked,
-        version_descriptor_schema_key(),
-        version_descriptor_storage_version_id(),
-        version_id,
-        Some(version_descriptor_file_id()),
-    )
-    .await
-    .map_err(write_resolve_backend_error)?
-    .filter(|row| row.plugin_key() == version_descriptor_plugin_key())
-    .is_some();
+    let descriptor_exists = load_version_descriptor_with_backend(backend, version_id)
+        .await
+        .map_err(write_resolve_backend_error)?
+        .is_some();
     if !descriptor_exists {
         return Err(WriteResolveError {
             message: format!("version with id '{version_id}' does not exist"),

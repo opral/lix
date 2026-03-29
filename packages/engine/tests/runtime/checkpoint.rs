@@ -70,6 +70,49 @@ simulation_test!(
 );
 
 simulation_test!(
+    checkpoint_and_version_admin_reads_ignore_missing_version_projection_tables,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.initialize().await.expect("init should succeed");
+
+        engine
+            .execute(
+                "DROP TABLE IF EXISTS lix_internal_live_v1_lix_version_ref",
+                &[],
+            )
+            .await
+            .expect("dropping version ref projection table should succeed");
+        engine
+            .execute(
+                "DROP TABLE IF EXISTS lix_internal_live_v1_lix_version_descriptor",
+                &[],
+            )
+            .await
+            .expect("dropping version descriptor projection table should succeed");
+
+        let version_rows = engine
+            .execute(
+                "SELECT id, commit_id \
+                 FROM lix_version \
+                 WHERE name = 'main'",
+                &[],
+            )
+            .await
+            .expect("canonical lix_version read should succeed without projection tables");
+        assert_eq!(version_rows.statements[0].rows.len(), 1);
+
+        let checkpoint = engine
+            .create_checkpoint()
+            .await
+            .expect("create_checkpoint should succeed without version projection tables");
+        assert!(!checkpoint.id.is_empty());
+    }
+);
+
+simulation_test!(
     checkpoint_noop_returns_tip_and_updates_last_checkpoint,
     |sim| async move {
         let engine = sim

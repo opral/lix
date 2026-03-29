@@ -1,8 +1,8 @@
 //! Checkpoint subsystem boundary.
 //!
-//! `checkpoint` is a derived subsystem layered on canonical changes. It owns
-//! checkpoint-specific acceleration and policy, such as checkpoint labels and
-//! last-checkpoint helpers.
+//! `checkpoint` is the user-facing commit-checkpoint subsystem. It owns
+//! checkpoint-specific label state plus helper tables that accelerate reads
+//! over checkpoint-labelled commits.
 //!
 //! `checkpoint` is not canonical truth by default. It should remain rebuildable
 //! from canonical facts unless the engine deliberately promotes some checkpoint

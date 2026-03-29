@@ -1,4 +1,4 @@
-use crate::canonical::{CanonicalCommitReceipt, CanonicalWatermark};
+use crate::canonical::CanonicalCommitReceipt;
 use crate::engine::Engine;
 use crate::LixBackendTransaction;
 use crate::LixError;
@@ -71,10 +71,8 @@ impl BufferedWriteState {
         }
     }
 
-    pub(crate) fn latest_canonical_watermark(&self) -> Option<&CanonicalWatermark> {
-        self.latest_canonical_commit_receipt
-            .as_ref()
-            .map(|receipt| &receipt.canonical_watermark)
+    pub(crate) fn latest_canonical_commit_receipt(&self) -> Option<&CanonicalCommitReceipt> {
+        self.latest_canonical_commit_receipt.as_ref()
     }
 
     pub(crate) fn mark_public_surface_registry_refresh_pending(&mut self) {

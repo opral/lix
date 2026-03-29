@@ -83,8 +83,8 @@ pub(crate) async fn mirror_public_registered_schema_bootstrap_rows(
     transaction: &mut dyn LixBackendTransaction,
     applied_output: &crate::canonical::append::CreateCommitAppliedOutput,
 ) -> Result<(), LixError> {
-    for row in &applied_output.derived_apply_input.live_state_rows {
-        if row.schema_key != REGISTERED_SCHEMA_KEY || row.lixcol_version_id != GLOBAL_VERSION_ID {
+    for row in &applied_output.canonical_output.changes {
+        if row.schema_key != REGISTERED_SCHEMA_KEY {
             continue;
         }
 
@@ -98,11 +98,7 @@ pub(crate) async fn mirror_public_registered_schema_bootstrap_rows(
             .as_ref()
             .map(|value| format!("'{}'", crate::sql_support::text::escape_sql_string(value)))
             .unwrap_or_else(|| "NULL".to_string());
-        let writer_key_sql = row
-            .writer_key
-            .as_ref()
-            .map(|value| format!("'{}'", crate::sql_support::text::escape_sql_string(value)))
-            .unwrap_or_else(|| "NULL".to_string());
+        let writer_key_sql = "NULL".to_string();
         let is_tombstone = if row.snapshot_content.is_some() { 0 } else { 1 };
 
         let sql = format!(
@@ -126,7 +122,7 @@ pub(crate) async fn mirror_public_registered_schema_bootstrap_rows(
             schema_key = crate::sql_support::text::escape_sql_string(&row.schema_key),
             schema_version = crate::sql_support::text::escape_sql_string(&row.schema_version),
             file_id = crate::sql_support::text::escape_sql_string(&row.file_id),
-            version_id = crate::sql_support::text::escape_sql_string(&row.lixcol_version_id),
+            version_id = crate::sql_support::text::escape_sql_string(GLOBAL_VERSION_ID),
             plugin_key = crate::sql_support::text::escape_sql_string(&row.plugin_key),
             snapshot_content = snapshot_sql,
             change_id = crate::sql_support::text::escape_sql_string(&row.id),

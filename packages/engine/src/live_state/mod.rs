@@ -6,6 +6,7 @@
 //!
 //! `live_state` owns:
 //! - lifecycle initialization and readiness checks for live-state serving
+//! - projection replay/catch-up orchestration for live-state derived rows
 //! - schema-scoped storage initialization
 //! - raw, tracked, untracked, and effective row access
 //! - rebuild planning and apply for visible-row materialization
@@ -29,6 +30,8 @@ pub(crate) mod key_value_queries;
 mod lifecycle;
 mod materialize;
 pub(crate) mod pending_reads;
+#[allow(dead_code)]
+pub(crate) mod projection;
 pub(crate) mod raw;
 pub(crate) mod schema_access;
 pub(crate) mod shared;
@@ -44,6 +47,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
 pub use init::init;
+pub(crate) use lifecycle::LiveStateProjectionStatus;
 pub use lifecycle::{LiveStateMode, LiveStateReadiness};
 pub use materialize::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
@@ -51,6 +55,9 @@ pub use materialize::{
     LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning, LiveStateWrite,
     LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
     TraversedEdgeDebugRow, VersionHeadDebugRow,
+};
+pub use projection::{
+    DerivedProjectionId, DerivedProjectionStatus, ProjectionReplayMode, ProjectionStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -160,6 +167,10 @@ pub async fn require_ready(backend: &dyn LixBackend) -> Result<(), LixError> {
     lifecycle::require_ready(backend).await
 }
 
+pub async fn projection_status(backend: &dyn LixBackend) -> Result<ProjectionStatus, LixError> {
+    projection::projection_status(backend).await
+}
+
 pub async fn register_schema(
     backend: &dyn LixBackend,
     registration: impl Into<SchemaRegistration>,
@@ -253,6 +264,12 @@ pub(crate) async fn load_latest_canonical_watermark(
     lifecycle::load_latest_canonical_watermark(backend).await
 }
 
+pub(crate) async fn load_projection_status_with_backend(
+    backend: &dyn LixBackend,
+) -> Result<LiveStateProjectionStatus, LixError> {
+    lifecycle::load_projection_status_with_backend(backend).await
+}
+
 pub(crate) async fn mark_needs_rebuild_at_canonical_watermark_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     watermark: &CanonicalWatermark,
@@ -283,6 +300,14 @@ pub(crate) async fn mark_ready_with_backend(
     lifecycle::mark_live_state_ready_with_backend(backend, watermark).await
 }
 
+pub(crate) async fn mark_ready_at_canonical_watermark_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    watermark: &CanonicalWatermark,
+) -> Result<(), LixError> {
+    lifecycle::mark_live_state_ready_at_canonical_watermark_in_transaction(transaction, watermark)
+        .await
+}
+
 pub(crate) async fn rebuild_scope_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     request: &LiveStateRebuildRequest,
@@ -298,42 +323,11 @@ pub(crate) async fn rebuild_scope_in_transaction(
     })
 }
 
-pub(crate) async fn version_exists_with_backend(
-    backend: &dyn LixBackend,
-    version_id: &str,
-) -> Result<bool, LixError> {
-    raw::load_exact_row_with_backend(
-        backend,
-        raw::RawStorage::Tracked,
-        crate::version::version_descriptor_schema_key(),
-        crate::version::version_descriptor_storage_version_id(),
-        version_id,
-        Some(crate::version::version_descriptor_file_id()),
-    )
-    .await
-    .map(|row| {
-        row.as_ref()
-            .is_some_and(|row| row.plugin_key() == crate::version::version_descriptor_plugin_key())
-    })
-}
-
 pub(crate) async fn version_exists_with_executor(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
 ) -> Result<bool, LixError> {
-    raw::load_exact_row_with_executor(
-        executor,
-        raw::RawStorage::Tracked,
-        crate::version::version_descriptor_schema_key(),
-        crate::version::version_descriptor_storage_version_id(),
-        version_id,
-        Some(crate::version::version_descriptor_file_id()),
-    )
-    .await
-    .map(|row| {
-        row.as_ref()
-            .is_some_and(|row| row.plugin_key() == crate::version::version_descriptor_plugin_key())
-    })
+    crate::canonical::version_state::version_exists_with_executor(executor, version_id).await
 }
 
 pub(crate) fn snapshot_json_from_values(

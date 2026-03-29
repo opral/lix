@@ -16,7 +16,6 @@
 //! SQL/public reads, but it does not own the meaning of those facts.
 //!
 pub(crate) mod append;
-pub(crate) mod apply;
 mod change_log;
 #[allow(dead_code)]
 mod create_commit;
@@ -35,6 +34,7 @@ pub(crate) mod refs;
 pub(crate) mod roots;
 pub(crate) mod state_source;
 mod types;
+pub(crate) mod version_state;
 pub(crate) use init::{init, seed_bootstrap};
 pub(crate) use receipt::CanonicalCommitReceipt;
 pub use receipt::CanonicalWatermark;

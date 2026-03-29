@@ -1275,7 +1275,7 @@ mod tests {
             let mut state = build_observe_state(
                 &session,
                 ObserveQuery::new(
-                    "SELECT 'observe-shared-sentinel' AS marker FROM lix_key_value LIMIT 1",
+                    "SELECT 'observe-shared-sentinel' AS marker FROM lix_change LIMIT 1",
                     vec![],
                 ),
             )

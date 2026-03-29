@@ -107,10 +107,6 @@ pub(crate) fn version_descriptor_plugin_key() -> &'static str {
     &version_descriptor_schema_metadata().plugin_key
 }
 
-pub(crate) fn version_descriptor_storage_version_id() -> &'static str {
-    &version_descriptor_schema_metadata().storage_version_id
-}
-
 pub(crate) fn version_descriptor_snapshot_content(id: &str, name: &str, hidden: bool) -> String {
     serde_json::to_string(&LixVersionDescriptor {
         id: id.to_string(),
@@ -118,6 +114,15 @@ pub(crate) fn version_descriptor_snapshot_content(id: &str, name: &str, hidden: 
         hidden,
     })
     .expect("lix_version_descriptor snapshot serialization must succeed")
+}
+
+pub(crate) fn parse_version_descriptor_snapshot(
+    snapshot_content: &str,
+) -> Result<LixVersionDescriptor, LixError> {
+    serde_json::from_str(snapshot_content).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!("version descriptor snapshot_content invalid JSON: {error}"),
+    })
 }
 
 pub(crate) fn version_ref_schema_key() -> &'static str {

@@ -1,30 +1,19 @@
+use std::collections::BTreeSet;
+
 use crate::backend::QueryExecutor;
 use crate::errors::classification::is_missing_relation_error;
-use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::untracked::{
-    load_exact_row_with_executor, scan_rows_with_executor, ExactUntrackedRowRequest,
-    UntrackedScanRequest, UntrackedWriteBatch, UntrackedWriteOperation, UntrackedWriteParticipant,
-    UntrackedWriteRow,
-};
 use crate::schema::builtin::types::LixVersionRef;
 use crate::version::{
-    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-    version_ref_schema_version, version_ref_snapshot_content, version_ref_storage_version_id,
+    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key, version_ref_schema_version,
 };
-use crate::{LixBackend, LixBackendTransaction, LixError, Value};
+use crate::{LixBackend, LixError, Value};
 
-use super::receipt::UpdatedVersionRef;
+use super::receipt::CanonicalWatermark;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct VersionRefRow {
     pub(crate) version_id: String,
     pub(crate) commit_id: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CanonicalVersionRefLookupState {
-    Resolved,
-    Unavailable,
 }
 
 pub(crate) async fn load_committed_version_ref_with_backend(
@@ -39,12 +28,7 @@ pub(crate) async fn load_committed_version_ref_with_executor(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
 ) -> Result<Option<VersionRefRow>, LixError> {
-    match load_committed_version_ref_from_canonical(executor, version_id).await? {
-        (CanonicalVersionRefLookupState::Resolved, version_ref) => Ok(version_ref),
-        (CanonicalVersionRefLookupState::Unavailable, _) => {
-            load_committed_version_ref_mirror_with_executor(executor, version_id).await
-        }
-    }
+    load_committed_version_ref_from_canonical(executor, version_id).await
 }
 
 pub(crate) async fn load_committed_version_head_commit_id(
@@ -64,60 +48,87 @@ pub(crate) async fn load_committed_version_head_commit_id(
 pub(crate) async fn load_all_committed_version_refs_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<Vec<VersionRefRow>, LixError> {
-    let (lookup_state, version_refs) =
-        load_all_committed_version_refs_from_canonical(executor).await?;
-    if lookup_state == CanonicalVersionRefLookupState::Resolved {
-        return Ok(version_refs);
+    load_all_committed_version_refs_from_canonical(executor).await
+}
+
+pub(crate) async fn load_committed_version_ids_updated_between_watermarks_with_backend(
+    backend: &dyn LixBackend,
+    older_exclusive: &CanonicalWatermark,
+    newer_inclusive: &CanonicalWatermark,
+) -> Result<Option<BTreeSet<String>>, LixError> {
+    let mut executor = backend;
+    load_committed_version_ids_updated_between_watermarks_with_executor(
+        &mut executor,
+        older_exclusive,
+        newer_inclusive,
+    )
+    .await
+}
+
+pub(crate) async fn load_committed_version_ids_updated_between_watermarks_with_executor(
+    executor: &mut dyn QueryExecutor,
+    older_exclusive: &CanonicalWatermark,
+    newer_inclusive: &CanonicalWatermark,
+) -> Result<Option<BTreeSet<String>>, LixError> {
+    if !newer_inclusive.is_newer_than(older_exclusive) {
+        return Ok(Some(BTreeSet::new()));
     }
-    load_all_committed_version_ref_mirrors_with_executor(executor).await
-}
 
-pub(crate) async fn apply_committed_version_ref_updates_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    version_ref_updates: &[UpdatedVersionRef],
-) -> Result<(), LixError> {
-    let version_ref_batch =
-        committed_version_ref_mirror_write_batch_from_updates(version_ref_updates);
-    UntrackedWriteParticipant::apply_write_batch(transaction, &version_ref_batch).await
-}
+    let sql = format!(
+        "SELECT DISTINCT c.entity_id \
+         FROM lix_internal_change c \
+         WHERE c.schema_key = '{schema_key}' \
+           AND c.schema_version = '{schema_version}' \
+           AND c.file_id = '{file_id}' \
+           AND c.plugin_key = '{plugin_key}' \
+           AND (\
+             c.created_at > '{older_created_at}' \
+             OR (c.created_at = '{older_created_at}' AND c.id > '{older_change_id}')\
+           ) \
+           AND (\
+             c.created_at < '{newer_created_at}' \
+             OR (c.created_at = '{newer_created_at}' AND c.id <= '{newer_change_id}')\
+           ) \
+         ORDER BY c.entity_id ASC",
+        schema_key = escape_sql_string(version_ref_schema_key()),
+        schema_version = escape_sql_string(version_ref_schema_version()),
+        file_id = escape_sql_string(version_ref_file_id()),
+        plugin_key = escape_sql_string(version_ref_plugin_key()),
+        older_created_at = escape_sql_string(&older_exclusive.created_at),
+        older_change_id = escape_sql_string(&older_exclusive.change_id),
+        newer_created_at = escape_sql_string(&newer_inclusive.created_at),
+        newer_change_id = escape_sql_string(&newer_inclusive.change_id),
+    );
 
-pub(crate) fn committed_version_ref_mirror_write_row(
-    version_id: &str,
-    commit_id: &str,
-    timestamp: &str,
-) -> UntrackedWriteRow {
-    // This persisted untracked row is a SQL-facing mirror for convenience
-    // surfaces. Canonical change rows remain the semantic source of truth.
-    UntrackedWriteRow {
-        entity_id: version_id.to_string(),
-        schema_key: version_ref_schema_key().to_string(),
-        schema_version: version_ref_schema_version().to_string(),
-        file_id: version_ref_file_id().to_string(),
-        version_id: version_ref_storage_version_id().to_string(),
-        global: true,
-        plugin_key: version_ref_plugin_key().to_string(),
-        metadata: None,
-        writer_key: None,
-        snapshot_content: Some(version_ref_snapshot_content(version_id, commit_id)),
-        created_at: Some(timestamp.to_string()),
-        updated_at: timestamp.to_string(),
-        operation: UntrackedWriteOperation::Upsert,
+    let result = match executor.execute(&sql, &[]).await {
+        Ok(result) => result,
+        Err(err) if is_missing_relation_error(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+
+    let mut version_ids = BTreeSet::new();
+    for row in &result.rows {
+        match row.first() {
+            Some(Value::Text(version_id)) if !version_id.is_empty() => {
+                version_ids.insert(version_id.clone());
+            }
+            Some(Value::Null) | None => {}
+            Some(other) => {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("version ref delta query returned non-text entity_id: {other:?}"),
+                ));
+            }
+        }
     }
-}
 
-fn committed_version_ref_mirror_write_batch_from_updates(
-    version_ref_updates: &[UpdatedVersionRef],
-) -> UntrackedWriteBatch {
-    version_ref_updates
-        .iter()
-        .map(committed_version_ref_mirror_write_row_from_update)
-        .collect()
+    Ok(Some(version_ids))
 }
 
 async fn load_committed_version_ref_from_canonical(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
-) -> Result<(CanonicalVersionRefLookupState, Option<VersionRefRow>), LixError> {
+) -> Result<Option<VersionRefRow>, LixError> {
     let sql = format!(
         "SELECT s.content AS snapshot_content \
          FROM lix_internal_change c \
@@ -137,18 +148,8 @@ async fn load_committed_version_ref_from_canonical(
     );
 
     let snapshot_content = match executor.execute(&sql, &[]).await {
-        Ok(result) => {
-            if let Some(value) = result.rows.first().and_then(|row| row.first()).cloned() {
-                Some(value)
-            } else if canonical_version_ref_facts_exist(executor).await? {
-                None
-            } else {
-                return Ok((CanonicalVersionRefLookupState::Unavailable, None));
-            }
-        }
-        Err(err) if is_missing_relation_error(&err) => {
-            return Ok((CanonicalVersionRefLookupState::Unavailable, None));
-        }
+        Ok(result) => result.rows.first().and_then(|row| row.first()).cloned(),
+        Err(err) if is_missing_relation_error(&err) => return Ok(None),
         Err(err) => return Err(err),
     };
 
@@ -157,12 +158,12 @@ async fn load_committed_version_ref_from_canonical(
             version_id: version_ref.id,
             commit_id: version_ref.commit_id,
         });
-    Ok((CanonicalVersionRefLookupState::Resolved, version_ref))
+    Ok(version_ref)
 }
 
 async fn load_all_committed_version_refs_from_canonical(
     executor: &mut dyn QueryExecutor,
-) -> Result<(CanonicalVersionRefLookupState, Vec<VersionRefRow>), LixError> {
+) -> Result<Vec<VersionRefRow>, LixError> {
     let sql = format!(
         "WITH ranked AS (\
              SELECT c.entity_id, \
@@ -186,15 +187,9 @@ async fn load_all_committed_version_refs_from_canonical(
 
     let result = match executor.execute(&sql, &[]).await {
         Ok(result) => result,
-        Err(err) if is_missing_relation_error(&err) => {
-            return Ok((CanonicalVersionRefLookupState::Unavailable, Vec::new()));
-        }
+        Err(err) if is_missing_relation_error(&err) => return Ok(Vec::new()),
         Err(err) => return Err(err),
     };
-
-    if result.rows.is_empty() && !canonical_version_ref_facts_exist(executor).await? {
-        return Ok((CanonicalVersionRefLookupState::Unavailable, Vec::new()));
-    }
 
     let mut version_refs = Vec::new();
     for row in &result.rows {
@@ -210,112 +205,7 @@ async fn load_all_committed_version_refs_from_canonical(
         });
     }
     version_refs.sort_by(|left, right| left.version_id.cmp(&right.version_id));
-    Ok((CanonicalVersionRefLookupState::Resolved, version_refs))
-}
-
-async fn canonical_version_ref_facts_exist(
-    executor: &mut dyn QueryExecutor,
-) -> Result<bool, LixError> {
-    let sql = format!(
-        "SELECT 1 \
-         FROM lix_internal_change \
-         WHERE schema_key = '{schema_key}' \
-           AND schema_version = '{schema_version}' \
-           AND file_id = '{file_id}' \
-           AND plugin_key = '{plugin_key}' \
-         LIMIT 1",
-        schema_key = escape_sql_string(version_ref_schema_key()),
-        schema_version = escape_sql_string(version_ref_schema_version()),
-        file_id = escape_sql_string(version_ref_file_id()),
-        plugin_key = escape_sql_string(version_ref_plugin_key()),
-    );
-    match executor.execute(&sql, &[]).await {
-        Ok(result) => Ok(!result.rows.is_empty()),
-        Err(err) if is_missing_relation_error(&err) => Ok(false),
-        Err(err) => Err(err),
-    }
-}
-
-async fn load_all_committed_version_ref_mirrors_with_executor(
-    executor: &mut dyn QueryExecutor,
-) -> Result<Vec<VersionRefRow>, LixError> {
-    let rows = scan_rows_with_executor(
-        executor,
-        &UntrackedScanRequest {
-            schema_key: version_ref_schema_key().to_string(),
-            version_id: version_ref_storage_version_id().to_string(),
-            constraints: vec![
-                ScanConstraint {
-                    field: ScanField::FileId,
-                    operator: ScanOperator::Eq(Value::Text(version_ref_file_id().to_string())),
-                },
-                ScanConstraint {
-                    field: ScanField::PluginKey,
-                    operator: ScanOperator::Eq(Value::Text(version_ref_plugin_key().to_string())),
-                },
-            ],
-            required_columns: vec!["commit_id".to_string()],
-        },
-    )
-    .await?;
-
-    let mut resolved = Vec::new();
-    for row in rows {
-        let Some(commit_id) = row.property_text("commit_id") else {
-            continue;
-        };
-        if commit_id.is_empty() {
-            continue;
-        }
-        resolved.push(VersionRefRow {
-            version_id: row.entity_id,
-            commit_id,
-        });
-    }
-    resolved.sort_by(|left, right| left.version_id.cmp(&right.version_id));
-    Ok(resolved)
-}
-
-async fn load_committed_version_ref_mirror_with_executor(
-    executor: &mut dyn QueryExecutor,
-    version_id: &str,
-) -> Result<Option<VersionRefRow>, LixError> {
-    let Some(row) = load_exact_row_with_executor(
-        executor,
-        &ExactUntrackedRowRequest {
-            schema_key: version_ref_schema_key().to_string(),
-            version_id: version_ref_storage_version_id().to_string(),
-            entity_id: version_id.to_string(),
-            file_id: Some(version_ref_file_id().to_string()),
-        },
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    if row.plugin_key != version_ref_plugin_key() {
-        return Ok(None);
-    }
-    let commit_id = row.property_text("commit_id").ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("version ref mirror row for '{version_id}' is missing commit_id"),
-        )
-    })?;
-    Ok(Some(VersionRefRow {
-        version_id: row.entity_id,
-        commit_id,
-    }))
-}
-
-fn committed_version_ref_mirror_write_row_from_update(
-    update: &UpdatedVersionRef,
-) -> UntrackedWriteRow {
-    committed_version_ref_mirror_write_row(
-        update.version_id.as_str(),
-        &update.commit_id,
-        &update.created_at,
-    )
+    Ok(version_refs)
 }
 
 fn parse_version_ref_snapshot(value: Option<&Value>) -> Result<Option<LixVersionRef>, LixError> {
@@ -347,15 +237,12 @@ fn escape_sql_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::live_state::live_schema_column_names;
-    use crate::live_state::schema_access::normalized_values_for_schema;
     use crate::{QueryResult, SqlDialect};
     use async_trait::async_trait;
 
     struct FakeQueryExecutor {
         canonical_snapshot: Option<Option<String>>,
-        canonical_facts_exist: bool,
-        mirror_snapshot: Option<String>,
+        updated_version_ids: Option<Vec<String>>,
     }
 
     #[async_trait(?Send)]
@@ -379,32 +266,18 @@ mod tests {
                 });
             }
 
-            if sql.contains("SELECT 1")
-                && sql.contains("FROM lix_internal_change")
+            if sql.contains("SELECT DISTINCT c.entity_id")
                 && sql.contains("schema_key = 'lix_version_ref'")
             {
                 return Ok(QueryResult {
-                    rows: if self.canonical_facts_exist {
-                        vec![vec![Value::Integer(1)]]
-                    } else {
-                        Vec::new()
-                    },
-                    columns: vec!["1".to_string()],
-                });
-            }
-
-            if sql.contains("FROM \"lix_internal_live_v1_lix_version_ref\"")
-                && sql.contains("'main'")
-                && sql.contains("ORDER BY updated_at DESC")
-            {
-                let rows = self
-                    .mirror_snapshot
-                    .as_ref()
-                    .map(|commit_id| vec![fake_version_ref_mirror_row("main", commit_id)])
-                    .unwrap_or_default();
-                return Ok(QueryResult {
-                    rows,
-                    columns: Vec::new(),
+                    rows: self
+                        .updated_version_ids
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|version_id| vec![Value::Text(version_id)])
+                        .collect(),
+                    columns: vec!["entity_id".to_string()],
                 });
             }
 
@@ -418,8 +291,7 @@ mod tests {
             canonical_snapshot: Some(Some(
                 "{\"id\":\"main\",\"commit_id\":\"commit-canonical\"}".to_string(),
             )),
-            canonical_facts_exist: true,
-            mirror_snapshot: Some("commit-mirror".to_string()),
+            updated_version_ids: None,
         };
 
         let version_ref = load_committed_version_ref_with_executor(&mut executor, "main")
@@ -431,44 +303,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_ref_lookup_falls_back_to_mirror_when_canonical_facts_are_absent() {
+    async fn committed_ref_lookup_does_not_fall_back_to_mirror_when_canonical_fact_is_absent() {
         let mut executor = FakeQueryExecutor {
             canonical_snapshot: None,
-            canonical_facts_exist: false,
-            mirror_snapshot: Some("commit-mirror".to_string()),
+            updated_version_ids: None,
         };
 
         let version_ref = load_committed_version_ref_with_executor(&mut executor, "main")
             .await
-            .expect("lookup should succeed")
-            .expect("mirror ref should exist");
+            .expect("lookup should succeed");
 
-        assert_eq!(version_ref.commit_id, "commit-mirror");
+        assert!(version_ref.is_none());
     }
 
-    fn fake_version_ref_mirror_row(version_id: &str, commit_id: &str) -> Vec<Value> {
-        let snapshot = version_ref_snapshot_content(version_id, commit_id);
-        let normalized =
-            normalized_values_for_schema(version_ref_schema_key(), None, Some(&snapshot))
-                .expect("snapshot should normalize");
-        let mut row = vec![
-            Value::Text(version_id.to_string()),
-            Value::Text(version_ref_schema_key().to_string()),
-            Value::Text(version_ref_schema_version().to_string()),
-            Value::Text(version_ref_file_id().to_string()),
-            Value::Text(version_ref_storage_version_id().to_string()),
-            Value::Boolean(true),
-            Value::Text(version_ref_plugin_key().to_string()),
-            Value::Null,
-            Value::Null,
-            Value::Text("2026-03-28T00:00:00Z".to_string()),
-            Value::Text("2026-03-28T00:00:00Z".to_string()),
-        ];
-        for column_name in live_schema_column_names(version_ref_schema_key(), None)
-            .expect("version ref schema should expose column names")
-        {
-            row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
-        }
-        row
+    #[tokio::test]
+    async fn committed_ref_delta_lookup_returns_versions_between_watermarks() {
+        let mut executor = FakeQueryExecutor {
+            canonical_snapshot: None,
+            updated_version_ids: Some(vec!["main".to_string(), "version-b".to_string()]),
+        };
+
+        let version_ids = load_committed_version_ids_updated_between_watermarks_with_executor(
+            &mut executor,
+            &CanonicalWatermark {
+                change_id: "change-1".to_string(),
+                created_at: "2026-03-28T10:00:00Z".to_string(),
+            },
+            &CanonicalWatermark {
+                change_id: "change-2".to_string(),
+                created_at: "2026-03-28T10:00:01Z".to_string(),
+            },
+        )
+        .await
+        .expect("delta lookup should succeed")
+        .expect("canonical ref facts should be available");
+
+        assert_eq!(
+            version_ids,
+            BTreeSet::from(["main".to_string(), "version-b".to_string()])
+        );
     }
 }

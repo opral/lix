@@ -3,8 +3,8 @@ use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::engine::Engine;
 use crate::errors;
 use crate::live_state::{
-    mark_mode_with_backend, require_ready, LiveStateApplyReport, LiveStateMode,
-    LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
+    mark_mode_with_backend, LiveStateApplyReport, LiveStateMode, LiveStateRebuildPlan,
+    LiveStateRebuildReport, LiveStateRebuildRequest, ProjectionStatus,
 };
 use crate::sql_support::text::escape_sql_string;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
@@ -28,7 +28,6 @@ impl Engine {
         if !self.is_initialized().await? {
             return Err(errors::not_initialized_error());
         }
-        require_ready(self.backend.as_ref()).await?;
         self.refresh_public_surface_registry().await?;
         Ok(())
     }
@@ -65,10 +64,13 @@ impl Engine {
         reader: &mut dyn crate::ImageChunkReader,
     ) -> Result<(), LixError> {
         self.backend.restore_from_image(reader).await?;
-        require_ready(self.backend.as_ref()).await?;
         self.refresh_public_surface_registry().await?;
         self.invalidate_installed_plugins_cache()?;
         Ok(())
+    }
+
+    pub async fn live_state_projection_status(&self) -> Result<ProjectionStatus, LixError> {
+        crate::live_state::projection_status(self.backend.as_ref()).await
     }
 
     pub async fn live_state_rebuild_plan(
@@ -105,5 +107,55 @@ impl Engine {
         }
 
         Ok(LiveStateRebuildReport { plan, apply })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_existing_allows_stale_live_state_and_reports_projection_status() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime should build");
+                runtime.block_on(async {
+                    let (backend, engine, _session) = crate::test_support::boot_test_engine()
+                        .await
+                        .expect("test engine should boot");
+                    crate::live_state::mark_mode_with_backend(
+                        &backend,
+                        LiveStateMode::NeedsRebuild,
+                    )
+                    .await
+                    .expect("marking live_state stale should succeed");
+
+                    engine
+                        .open_existing()
+                        .await
+                        .expect("open_existing should not fail just because live_state is stale");
+
+                    let status = engine
+                        .live_state_projection_status()
+                        .await
+                        .expect("projection status should load");
+                    assert_eq!(status.projections.len(), 1);
+                    assert_eq!(
+                        status.projections[0].projection,
+                        crate::live_state::DerivedProjectionId::LiveState
+                    );
+                    assert_eq!(
+                        status.projections[0].mode,
+                        crate::live_state::ProjectionReplayMode::NeedsRebuild
+                    );
+                });
+            })
+            .expect("test thread should spawn")
+            .join()
+            .expect("test thread should not panic");
     }
 }

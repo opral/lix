@@ -53,6 +53,12 @@ pub(crate) enum SurfaceCapability {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SurfaceReadFreshness {
+    RequiresFreshProjection,
+    AllowsStaleProjection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefaultScopeSemantics {
     ActiveVersion,
     ExplicitVersion,
@@ -115,6 +121,7 @@ pub(crate) struct SurfaceDescriptor {
     pub(crate) public_name: String,
     pub(crate) surface_family: SurfaceFamily,
     pub(crate) surface_variant: SurfaceVariant,
+    pub(crate) read_freshness: SurfaceReadFreshness,
     pub(crate) visible_columns: Vec<String>,
     pub(crate) hidden_columns: Vec<String>,
     pub(crate) column_types: BTreeMap<String, SurfaceColumnType>,
@@ -132,6 +139,7 @@ pub(crate) struct SurfaceBinding {
     pub(crate) catalog_epoch: Option<CatalogEpoch>,
     pub(crate) exposed_columns: Vec<String>,
     pub(crate) column_types: BTreeMap<String, SurfaceColumnType>,
+    pub(crate) read_freshness: SurfaceReadFreshness,
     pub(crate) capability: SurfaceCapability,
     pub(crate) default_scope: DefaultScopeSemantics,
     pub(crate) implicit_overrides: SurfaceImplicitOverrides,
@@ -190,6 +198,7 @@ impl SurfaceRegistry {
             },
             exposed_columns: descriptor.visible_columns.clone(),
             column_types: descriptor.column_types.clone(),
+            read_freshness: descriptor.read_freshness,
             capability: descriptor.capability,
             default_scope: descriptor.default_scope,
             implicit_overrides: descriptor.implicit_overrides.clone(),
@@ -368,6 +377,7 @@ fn builtin_surface_descriptors() -> Vec<SurfaceDescriptor> {
             public_name: "lix_change".to_string(),
             surface_family: SurfaceFamily::Change,
             surface_variant: SurfaceVariant::History,
+            read_freshness: SurfaceReadFreshness::AllowsStaleProjection,
             visible_columns: change_columns(),
             hidden_columns: Vec::new(),
             column_types: change_column_types(),
@@ -388,6 +398,7 @@ fn builtin_surface_descriptors() -> Vec<SurfaceDescriptor> {
             public_name: "lix_working_changes".to_string(),
             surface_family: SurfaceFamily::Change,
             surface_variant: SurfaceVariant::WorkingChanges,
+            read_freshness: SurfaceReadFreshness::AllowsStaleProjection,
             visible_columns: working_changes_columns(),
             hidden_columns: Vec::new(),
             column_types: working_changes_column_types(),
@@ -459,6 +470,13 @@ fn state_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescr
         public_name: name.to_string(),
         surface_family: SurfaceFamily::State,
         surface_variant: variant,
+        read_freshness: match variant {
+            SurfaceVariant::History => SurfaceReadFreshness::AllowsStaleProjection,
+            SurfaceVariant::Default
+            | SurfaceVariant::ByVersion
+            | SurfaceVariant::Active
+            | SurfaceVariant::WorkingChanges => SurfaceReadFreshness::RequiresFreshProjection,
+        },
         visible_columns,
         hidden_columns,
         column_types: state_column_types(),
@@ -526,6 +544,13 @@ fn filesystem_surface_descriptor(name: &str, variant: SurfaceVariant) -> Surface
         public_name: name.to_string(),
         surface_family: SurfaceFamily::Filesystem,
         surface_variant: variant,
+        read_freshness: match variant {
+            SurfaceVariant::History => SurfaceReadFreshness::AllowsStaleProjection,
+            SurfaceVariant::Default
+            | SurfaceVariant::ByVersion
+            | SurfaceVariant::Active
+            | SurfaceVariant::WorkingChanges => SurfaceReadFreshness::RequiresFreshProjection,
+        },
         visible_columns,
         hidden_columns: Vec::new(),
         column_types: filesystem_column_types(name),
@@ -559,6 +584,7 @@ fn admin_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescr
         public_name: name.to_string(),
         surface_family: SurfaceFamily::Admin,
         surface_variant: variant,
+        read_freshness: SurfaceReadFreshness::AllowsStaleProjection,
         visible_columns: admin_columns(name),
         hidden_columns: Vec::new(),
         column_types: admin_column_types(name),
@@ -599,6 +625,7 @@ fn entity_descriptors_from_spec(
             public_name: spec.schema_key.clone(),
             surface_family: SurfaceFamily::Entity,
             surface_variant: SurfaceVariant::Default,
+            read_freshness: SurfaceReadFreshness::RequiresFreshProjection,
             visible_columns: default_visible,
             hidden_columns: hidden_columns.clone(),
             column_types: column_types.clone(),
@@ -629,6 +656,7 @@ fn entity_descriptors_from_spec(
             public_name: by_version_name,
             surface_family: SurfaceFamily::Entity,
             surface_variant: SurfaceVariant::ByVersion,
+            read_freshness: SurfaceReadFreshness::RequiresFreshProjection,
             visible_columns: by_version_visible,
             hidden_columns: hidden_columns.clone(),
             column_types: column_types.clone(),
@@ -660,6 +688,7 @@ fn entity_descriptors_from_spec(
             public_name: history_name,
             surface_family: SurfaceFamily::Entity,
             surface_variant: SurfaceVariant::History,
+            read_freshness: SurfaceReadFreshness::AllowsStaleProjection,
             visible_columns: history_visible,
             hidden_columns,
             column_types,
