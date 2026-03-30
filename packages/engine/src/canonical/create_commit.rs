@@ -213,7 +213,7 @@ pub(crate) async fn create_commit(
             return Err(CreateCommitError {
                 kind: CreateCommitErrorKind::MissingWriteLane,
                 message: format!(
-                    "create commit precondition failed for '{}': version ref is missing",
+                    "create commit precondition failed for '{}': local version head is missing",
                     lane_storage_key(&concrete_lane)
                 ),
             });
@@ -242,7 +242,7 @@ pub(crate) async fn create_commit(
             return Err(CreateCommitError {
                 kind: CreateCommitErrorKind::MissingWriteLane,
                 message: format!(
-                    "create commit precondition failed for '{}': version ref is missing",
+                    "create commit precondition failed for '{}': local version head is missing",
                     lane_storage_key(&concrete_lane)
                 ),
             });
@@ -1257,7 +1257,7 @@ fn extract_committed_head_id(
         .ok_or_else(|| CreateCommitError {
             kind: CreateCommitErrorKind::Internal,
             message: format!(
-                "generated commit result did not include a version ref for '{}'",
+                "generated commit result did not include a local version head update for '{}'",
                 version_id
             ),
         })?;
@@ -1265,7 +1265,7 @@ fn extract_committed_head_id(
         return Err(CreateCommitError {
             kind: CreateCommitErrorKind::Internal,
             message: format!(
-                "generated version ref for '{}' contained an empty commit_id",
+                "generated local version head update for '{}' contained an empty commit_id",
                 version_id
             ),
         });

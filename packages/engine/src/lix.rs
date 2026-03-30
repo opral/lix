@@ -94,7 +94,7 @@ impl Lix {
     /// Opens a child session with optional workspace-selector overrides.
     ///
     /// This changes workspace selection for the child session only; it does
-    /// not mutate canonical refs or committed heads.
+    /// not mutate replica-local version heads or committed history.
     pub async fn open_session(&self, options: OpenSessionOptions) -> Result<Self, LixError> {
         let session = self.session.open_session(options).await?;
         Ok(Self {

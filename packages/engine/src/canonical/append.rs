@@ -54,9 +54,9 @@ async fn append_tracked_unchecked(
     invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
 ) -> Result<CreateCommitResult, LixError> {
     // This helper intentionally composes multiple owners atomically:
-    // canonical commit facts, workspace writer-key annotations, and derived
-    // live-state projections. The owners remain distinct even though the write
-    // unit commits them together.
+    // canonical commit facts, replica-local version-head state, workspace
+    // writer-key annotations, and derived live-state projections. The owners
+    // remain distinct even though the write unit commits them together.
     let execution_writer_key = args.writer_key.clone();
     let result = create_commit(transaction, args, functions, invariant_checker)
         .await

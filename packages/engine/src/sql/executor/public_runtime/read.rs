@@ -1,4 +1,5 @@
 use super::*;
+use crate::canonical::refs::load_current_committed_version_frontier_with_backend;
 use crate::errors::classification::sanitize_lowered_public_sql_error_description;
 use crate::read::models::{
     load_directory_history_rows, load_file_history_rows, DirectoryHistoryRequest,
@@ -4490,12 +4491,15 @@ async fn try_prepare_public_read_via_specialized_optimization(
             ExplainStage::CapabilityResolution,
             capability_started.elapsed(),
         );
+        let current_version_heads =
+            load_local_version_heads_for_surface(backend, &surface_binding).await?;
         let lowered_read = match lower_read_for_execution_with_layouts(
             backend.dialect(),
             &structured_read,
             analysis.semantics.effective_state_request.as_ref(),
             analysis.semantics.effective_state_plan.as_ref(),
             &known_live_layouts,
+            &current_version_heads,
         ) {
             Ok(Some(program)) => Ok::<LoweredReadProgram, LixError>(program),
             Ok(None) => {
@@ -4594,6 +4598,23 @@ async fn try_prepare_public_read_via_specialized_optimization(
             execution,
         },
     ))
+}
+
+async fn load_local_version_heads_for_surface(
+    backend: &dyn LixBackend,
+    surface_binding: &SurfaceBinding,
+) -> Result<BTreeMap<String, String>, LixError> {
+    if surface_binding.descriptor.surface_family != SurfaceFamily::Admin
+        || surface_binding.descriptor.public_name != "lix_version"
+    {
+        return Ok(BTreeMap::new());
+    }
+
+    Ok(
+        load_current_committed_version_frontier_with_backend(backend)
+            .await?
+            .version_heads,
+    )
 }
 
 fn direct_state_history_pushdown_decision(

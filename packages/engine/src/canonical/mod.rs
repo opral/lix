@@ -7,9 +7,10 @@
 //! The intended model is:
 //! - canonical changes are the only semantic source of truth
 //! - commit graph facts are a canonical projection derived from those changes
-//! - canonical refs select committed heads/roots in that graph
-//! - committed meaning/state is resolved from commit-graph facts plus
-//!   canonical refs
+//! - replica-local version-head state selects committed heads/roots in that
+//!   graph
+//! - committed meaning/state is resolved from commit-graph facts plus those
+//!   local selectors
 //!
 //! `canonical` owns:
 //! - canonical change facts for canonical-owned entities such as `lix_commit`,

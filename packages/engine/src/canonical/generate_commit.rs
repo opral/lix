@@ -1,14 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::json;
-
 use crate::canonical::receipt::UpdatedVersionRef;
 use crate::canonical::types::{
     CanonicalCommitOutput, ChangeRow, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
 };
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
-use crate::version::version_ref_snapshot_content;
 use crate::{CanonicalJson, LixError};
+use serde_json::json;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const CHANGE_SET_SCHEMA_KEY: &str = "lix_change_set";
@@ -67,8 +65,6 @@ where
 
     let commit_schema = builtin_schema_meta(COMMIT_SCHEMA_KEY)?;
     let change_set_schema = builtin_schema_meta(CHANGE_SET_SCHEMA_KEY)?;
-    let version_ref_schema = builtin_schema_meta(crate::version::version_ref_schema_key())?;
-
     let effective_domain_changes = collapse_domain_changes_last_wins(&args.changes);
     let mut output_changes: Vec<ChangeRow> = effective_domain_changes
         .iter()
@@ -232,29 +228,6 @@ where
         updated_version_refs.push(UpdatedVersionRef {
             version_id: expect_identity(version_id.clone(), "version_ref version_id"),
             commit_id: meta.commit_id.clone(),
-            created_at: args.timestamp.clone(),
-        });
-        output_changes.push(ChangeRow {
-            id: generate_uuid(),
-            entity_id: expect_identity(version_id.clone(), "version_ref entity_id"),
-            schema_key: expect_identity(
-                crate::version::version_ref_schema_key().to_string(),
-                "version_ref schema_key",
-            ),
-            schema_version: expect_identity(
-                version_ref_schema.schema_version.clone(),
-                "version_ref schema_version",
-            ),
-            file_id: expect_identity(version_ref_schema.file_id.clone(), "version_ref file_id"),
-            plugin_key: expect_identity(
-                version_ref_schema.plugin_key.clone(),
-                "version_ref plugin_key",
-            ),
-            snapshot_content: Some(CanonicalJson::from_text(version_ref_snapshot_content(
-                version_id,
-                &meta.commit_id,
-            ))?),
-            metadata: None,
             created_at: args.timestamp.clone(),
         });
     }
@@ -499,7 +472,6 @@ mod tests {
 
         let counts = counts_by_schema(&result);
         assert_eq!(counts.get("lix_key_value"), Some(&1));
-        assert_eq!(counts.get("lix_version_ref"), Some(&1));
         assert_eq!(counts.get("lix_change_set"), Some(&1));
         assert_eq!(counts.get("lix_commit"), Some(&1));
         let commit_row = result
@@ -559,7 +531,6 @@ mod tests {
 
         let counts = counts_by_schema(&result);
         assert_eq!(counts.get("lix_key_value"), Some(&1));
-        assert_eq!(counts.get("lix_version_ref"), Some(&1));
         assert_eq!(counts.get("lix_change_set"), Some(&1));
         assert_eq!(counts.get("lix_commit"), Some(&1));
         assert_eq!(result.updated_version_refs.len(), 1);
@@ -617,7 +588,6 @@ mod tests {
 
         let counts = counts_by_schema(&result);
         assert_eq!(counts.get("lix_key_value"), Some(&2));
-        assert_eq!(counts.get("lix_version_ref"), Some(&2));
         assert_eq!(counts.get("lix_change_set"), Some(&2));
         assert_eq!(counts.get("lix_commit"), Some(&2));
         assert_eq!(result.updated_version_refs.len(), 2);
@@ -761,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn generates_version_ref_changes_for_forced_empty_commit() {
+    fn generates_local_version_head_updates_for_forced_empty_commit() {
         let mut versions = BTreeMap::new();
         versions.insert(
             "version-main".to_string(),
@@ -785,7 +755,6 @@ mod tests {
         .expect("generate_commit should succeed");
 
         let counts = counts_by_schema(&result);
-        assert_eq!(counts.get("lix_version_ref"), Some(&1));
         assert_eq!(counts.get("lix_change_set"), Some(&1));
         assert_eq!(counts.get("lix_commit"), Some(&1));
         assert_eq!(counts.get("lix_key_value"), None);

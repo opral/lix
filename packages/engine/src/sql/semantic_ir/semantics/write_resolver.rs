@@ -307,7 +307,7 @@ async fn resolve_version_insert_write_plan(
                 .authoritative_pre_state
                 .extend(version_descriptor_pre_state_refs(existing));
             partitions
-                .partition_mut(WriteMode::Tracked, None)
+                .partition_mut(WriteMode::Untracked, None)
                 .authoritative_pre_state
                 .extend(version_ref_pre_state_refs(existing));
         }
@@ -324,11 +324,11 @@ async fn resolve_version_insert_write_plan(
                 source_commit_id: None,
             });
         partitions
-            .partition_mut(WriteMode::Tracked, None)
+            .partition_mut(WriteMode::Untracked, None)
             .intended_post_state
             .push(version_ref_row(&version_id, &commit_id));
         partitions
-            .partition_mut(WriteMode::Tracked, None)
+            .partition_mut(WriteMode::Untracked, None)
             .lineage
             .push(RowLineage {
                 entity_id: version_id,
@@ -436,19 +436,19 @@ async fn resolve_existing_version_write(
                     ));
                 }
                 if payload.contains_key("commit_id") {
-                    let tracked = partitions.partition_mut(WriteMode::Tracked, None);
-                    tracked
+                    let untracked = partitions.partition_mut(WriteMode::Untracked, None);
+                    untracked
                         .authoritative_pre_state
                         .extend(version_ref_pre_state_refs(&current_row));
-                    tracked
+                    untracked
                         .authoritative_pre_state_rows
                         .push(version_ref_row(&current_row.id, &current_row.commit_id));
-                    tracked.lineage.push(RowLineage {
+                    untracked.lineage.push(RowLineage {
                         entity_id: current_row.id.clone(),
                         source_change_id: None,
                         source_commit_id: None,
                     });
-                    tracked
+                    untracked
                         .intended_post_state
                         .push(version_ref_row(&current_row.id, &next_commit_id));
                 }
@@ -475,17 +475,17 @@ async fn resolve_existing_version_write(
                     source_commit_id: None,
                 });
 
-                let tracked = partitions.partition_mut(WriteMode::Tracked, None);
-                tracked
+                let untracked = partitions.partition_mut(WriteMode::Untracked, None);
+                untracked
                     .authoritative_pre_state
                     .extend(version_ref_pre_state_refs(&current_row));
-                tracked
+                untracked
                     .intended_post_state
                     .push(version_ref_tombstone_row(&current_row.id));
-                tracked
+                untracked
                     .tombstones
                     .extend(version_ref_tombstone_refs(&current_row));
-                tracked.lineage.push(RowLineage {
+                untracked.lineage.push(RowLineage {
                     entity_id: current_row.id.clone(),
                     source_change_id: None,
                     source_commit_id: None,
@@ -1042,7 +1042,7 @@ async fn validate_public_write_version_target(
     if version_ref.is_none() {
         return Err(WriteResolveError {
             message: format!(
-                "public write invariant violation: version with id '{version_id}' exists but its version ref is missing"
+                "public write invariant violation: version with id '{version_id}' exists but its local version head is missing"
             ),
         });
     }

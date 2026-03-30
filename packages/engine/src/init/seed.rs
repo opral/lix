@@ -81,6 +81,12 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut())
     }
 
+    pub(crate) fn backend_transaction_mut(
+        &mut self,
+    ) -> Result<&mut dyn LixBackendTransaction, LixError> {
+        Ok(self.write_transaction.backend_transaction_mut())
+    }
+
     pub(crate) async fn generate_runtime_uuid(&mut self) -> Result<String, LixError> {
         let runtime_state = self.ensure_runtime_state().await?;
         runtime_state
@@ -157,7 +163,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description:
-                    "init invariant violation: commits exist but hidden global version ref is missing"
+                    "init invariant violation: commits exist but the local global version head is missing"
                         .to_string(),
             });
         }
@@ -172,7 +178,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "init invariant violation: hidden global version ref is missing"
+                description: "init invariant violation: local global version head is missing"
                     .to_string(),
             });
         };

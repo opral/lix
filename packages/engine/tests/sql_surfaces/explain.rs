@@ -423,6 +423,7 @@ fn assert_public_read_json_contract(explain_json: &JsonValue) {
             "hidden_columns",
             "public_name",
             "read_freshness",
+            "read_semantics",
             "surface_family",
             "surface_variant",
             "visible_columns",
@@ -458,6 +459,12 @@ fn assert_public_read_json_contract(explain_json: &JsonValue) {
             .get("read_freshness")
             .and_then(JsonValue::as_str),
         Some("requires_fresh_projection")
+    );
+    assert_eq!(
+        surface_binding
+            .get("read_semantics")
+            .and_then(JsonValue::as_str),
+        Some("workspace_effective")
     );
     assert_eq!(
         surface_binding

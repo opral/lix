@@ -1,17 +1,21 @@
-//! Canonical committed-ref resolution.
+//! Replica-local committed-head resolution.
 //!
-//! Canonical refs are semantic selectors for committed heads and roots. They
-//! must be resolved from canonical change facts, not from live-state mirrors or
-//! replay cursors. Version refs are maintained as their own canonical fact
-//! stream outside commit membership, so current-ref selection is based on the
-//! latest ref fact for each version rather than on commit-member ordering.
+//! `lix_version_ref` is local runtime state that chooses which canonical commit
+//! a version resolves to on this replica. It is intentionally not canonical
+//! history, so head lookup must read the exact local row rather than infer a
+//! winner from canonical change order.
 
 use crate::backend::QueryExecutor;
-use crate::errors::classification::is_missing_relation_error;
+use crate::live_state::schema_access::live_storage_relation_exists_with_executor;
+use crate::live_state::untracked::{
+    load_exact_row_with_executor, scan_rows_with_executor, ExactUntrackedRowRequest,
+    UntrackedScanRequest,
+};
 use crate::version::{
     version_ref_file_id, version_ref_plugin_key, version_ref_schema_key, version_ref_schema_version,
+    version_ref_storage_version_id,
 };
-use crate::{CommittedVersionFrontier, LixBackend, LixError, Value};
+use crate::{CommittedVersionFrontier, LixBackend, LixError};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct VersionRefRow {
@@ -31,7 +35,7 @@ pub(crate) async fn load_committed_version_ref_with_executor(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
 ) -> Result<Option<VersionRefRow>, LixError> {
-    load_committed_version_ref_from_canonical(executor, version_id).await
+    load_committed_version_ref_from_local_state(executor, version_id).await
 }
 
 pub(crate) async fn load_committed_version_head_commit_id(
@@ -51,7 +55,7 @@ pub(crate) async fn load_committed_version_head_commit_id(
 pub(crate) async fn load_all_committed_version_refs_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<Vec<VersionRefRow>, LixError> {
-    load_all_committed_version_refs_from_canonical(executor).await
+    load_all_committed_version_refs_from_local_state(executor).await
 }
 
 pub(crate) async fn load_current_committed_version_frontier_with_backend(
@@ -65,166 +69,109 @@ pub(crate) async fn load_current_committed_version_frontier_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<CommittedVersionFrontier, LixError> {
     Ok(CommittedVersionFrontier::from_version_ref_rows(
-        load_all_committed_version_refs_from_canonical(executor).await?,
+        load_all_committed_version_refs_from_local_state(executor).await?,
     ))
 }
 
-async fn load_committed_version_ref_from_canonical(
+async fn load_committed_version_ref_from_local_state(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
 ) -> Result<Option<VersionRefRow>, LixError> {
-    let sql = build_current_version_ref_rows_sql(executor.dialect(), Some(version_id));
-    let result = match executor.execute(&sql, &[]).await {
-        Ok(result) => result,
-        Err(err) if is_missing_relation_error(&err) => return Ok(None),
-        Err(err) => return Err(err),
-    };
-    parse_unique_version_ref_row(&result.rows, version_id)
-}
-
-async fn load_all_committed_version_refs_from_canonical(
-    executor: &mut dyn QueryExecutor,
-) -> Result<Vec<VersionRefRow>, LixError> {
-    let sql = build_current_version_ref_rows_sql(executor.dialect(), None);
-    let result = match executor.execute(&sql, &[]).await {
-        Ok(result) => result,
-        Err(err) if is_missing_relation_error(&err) => return Ok(Vec::new()),
-        Err(err) => return Err(err),
-    };
-    parse_all_version_ref_rows(&result.rows)
-}
-
-fn build_current_version_ref_rows_sql(
-    dialect: crate::SqlDialect,
-    scoped_version_id: Option<&str>,
-) -> String {
-    let scoped_version_sql = scoped_version_id
-        .map(|value| format!(" AND ref_change.entity_id = '{}'", escape_sql_string(value)))
-        .unwrap_or_default();
-    let commit_id_expr = json_text_extract_sql(dialect, "ref_snapshot.content", "commit_id");
-
-    format!(
-        "WITH ranked_ref_facts AS ( \
-             SELECT \
-               ref_change.entity_id AS version_id, \
-               {commit_id_expr} AS commit_id, \
-               ref_snapshot.content AS snapshot_content, \
-               ROW_NUMBER() OVER ( \
-                 PARTITION BY ref_change.entity_id \
-                 ORDER BY ref_change.created_at DESC, ref_change.id DESC \
-               ) AS rn \
-             FROM lix_internal_change ref_change \
-             LEFT JOIN lix_internal_snapshot ref_snapshot \
-               ON ref_snapshot.id = ref_change.snapshot_id \
-             WHERE ref_change.schema_key = '{schema_key}' \
-               AND ref_change.schema_version = '{schema_version}' \
-               AND ref_change.file_id = '{file_id}' \
-               AND ref_change.plugin_key = '{plugin_key}' \
-               {scoped_version_sql} \
-           ), \
-           current_refs AS ( \
-             SELECT \
-               version_id, \
-               commit_id \
-             FROM ranked_ref_facts \
-             WHERE rn = 1 \
-               AND snapshot_content IS NOT NULL \
-               AND COALESCE(commit_id, '') <> '' \
-           ) \
-         SELECT version_id, commit_id \
-         FROM current_refs \
-         ORDER BY version_id ASC, commit_id ASC",
-        schema_key = escape_sql_string(version_ref_schema_key()),
-        schema_version = escape_sql_string(version_ref_schema_version()),
-        file_id = escape_sql_string(version_ref_file_id()),
-        plugin_key = escape_sql_string(version_ref_plugin_key()),
-        scoped_version_sql = scoped_version_sql,
-        commit_id_expr = commit_id_expr,
+    if !live_storage_relation_exists_with_executor(executor, version_ref_schema_key()).await? {
+        return Ok(None);
+    }
+    let row = load_exact_row_with_executor(
+        executor,
+        &ExactUntrackedRowRequest {
+            schema_key: version_ref_schema_key().to_string(),
+            version_id: version_ref_storage_version_id().to_string(),
+            entity_id: version_id.to_string(),
+            file_id: Some(version_ref_file_id().to_string()),
+        },
     )
-}
-
-fn parse_unique_version_ref_row(
-    rows: &[Vec<Value>],
-    version_id: &str,
-) -> Result<Option<VersionRefRow>, LixError> {
-    let parsed = parse_all_version_ref_rows(rows)?;
-    match parsed.as_slice() {
-        [] => Ok(None),
-        [row] => Ok(Some(row.clone())),
-        _ => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "committed ref resolution for version '{}' found multiple incomparable heads",
-                version_id
-            ),
-        )),
+    .await?;
+    match row {
+        Some(row) => Ok(Some(parse_version_ref_row_from_untracked(
+            row.entity_id.clone(),
+            &row,
+        )?)),
+        None => Ok(None),
     }
 }
 
-fn parse_all_version_ref_rows(rows: &[Vec<Value>]) -> Result<Vec<VersionRefRow>, LixError> {
-    let mut version_refs = Vec::new();
+async fn load_all_committed_version_refs_from_local_state(
+    executor: &mut dyn QueryExecutor,
+) -> Result<Vec<VersionRefRow>, LixError> {
+    if !live_storage_relation_exists_with_executor(executor, version_ref_schema_key()).await? {
+        return Ok(Vec::new());
+    }
+    let rows = scan_rows_with_executor(
+        executor,
+        &UntrackedScanRequest {
+            schema_key: version_ref_schema_key().to_string(),
+            version_id: version_ref_storage_version_id().to_string(),
+            constraints: Vec::new(),
+            required_columns: Vec::new(),
+        },
+    )
+    .await?;
+    let mut version_refs = Vec::with_capacity(rows.len());
     let mut previous_version_id: Option<String> = None;
 
     for row in rows {
-        let version_id = required_text(row.first(), "current_refs.version_id")?;
-        let commit_id = required_text(row.get(1), "current_refs.commit_id")?;
+        if row.file_id != version_ref_file_id()
+            || row.schema_version != version_ref_schema_version()
+            || row.plugin_key != version_ref_plugin_key()
+        {
+            continue;
+        }
         if let Some(previous) = previous_version_id.as_ref() {
-            if previous == &version_id {
+            if previous == &row.entity_id {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
-                        "committed ref resolution for version '{}' found multiple incomparable heads",
-                        version_id
+                        "local version-head resolution for version '{}' found multiple exact rows",
+                        row.entity_id
                     ),
                 ));
             }
         }
-        previous_version_id = Some(version_id.clone());
-        version_refs.push(VersionRefRow {
-            version_id,
-            commit_id,
-        });
+        previous_version_id = Some(row.entity_id.clone());
+        version_refs.push(parse_version_ref_row_from_untracked(row.entity_id.clone(), &row)?);
     }
 
     Ok(version_refs)
 }
 
-fn required_text(value: Option<&Value>, field: &str) -> Result<String, LixError> {
-    match value {
-        Some(Value::Text(text)) if !text.is_empty() => Ok(text.clone()),
-        Some(Value::Integer(number)) => Ok(number.to_string()),
-        Some(Value::Text(_)) => Err(LixError::new(
+fn parse_version_ref_row_from_untracked(
+    version_id: String,
+    row: &crate::live_state::untracked::UntrackedRow,
+) -> Result<VersionRefRow, LixError> {
+    let commit_id = row.property_text("commit_id").ok_or_else(|| {
+        LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("{field} is empty"),
-        )),
-        Some(Value::Null) | None => Err(LixError::new(
+            format!("local version head for '{}' is missing commit_id", version_id),
+        )
+    })?;
+    if commit_id.is_empty() {
+        return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("missing {field}"),
-        )),
-        Some(other) => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("expected text-like {field}, got {other:?}"),
-        )),
+            format!("local version head for '{}' has empty commit_id", version_id),
+        ));
     }
-}
-
-fn json_text_extract_sql(dialect: crate::SqlDialect, json_column: &str, field: &str) -> String {
-    match dialect {
-        crate::SqlDialect::Sqlite => format!("json_extract({json_column}, '$.{field}')"),
-        crate::SqlDialect::Postgres => {
-            format!("CAST({json_column} AS JSONB) ->> '{field}'")
-        }
-    }
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
+    Ok(VersionRefRow {
+        version_id,
+        commit_id,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{QueryResult, SqlDialect};
+    use crate::live_state::live_relation_name;
+    use crate::live_state::schema_access::normalized_values_for_schema;
+    use crate::live_state::live_schema_column_names;
+    use crate::{QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
 
     struct FakeQueryExecutor {
@@ -238,24 +185,34 @@ mod tests {
         }
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("FROM current_refs") && sql.contains("schema_key = 'lix_version_ref'") {
+            if sql.contains(&live_relation_name("lix_version_ref")) && sql.contains("untracked = true")
+            {
                 let rows = self
                     .current_ref_rows
                     .iter()
                     .filter(|(version_id, _)| {
-                        !sql.contains("ref_change.entity_id = '")
-                            || sql.contains(&format!("ref_change.entity_id = '{}'", version_id))
+                        !sql.contains("entity_id = '")
+                            || sql.contains(&format!("entity_id = '{}'", version_id))
                     })
-                    .map(|(version_id, commit_id)| {
-                        vec![
-                            Value::Text(version_id.clone()),
-                            Value::Text(commit_id.clone()),
-                        ]
-                    })
+                    .map(|(version_id, commit_id)| fake_version_ref_live_row(version_id, commit_id))
                     .collect::<Vec<_>>();
                 return Ok(QueryResult {
                     rows,
-                    columns: vec!["version_id".to_string(), "commit_id".to_string()],
+                    columns: vec![
+                        "entity_id".to_string(),
+                        "schema_key".to_string(),
+                        "schema_version".to_string(),
+                        "file_id".to_string(),
+                        "version_id".to_string(),
+                        "global".to_string(),
+                        "plugin_key".to_string(),
+                        "metadata".to_string(),
+                        "writer_key".to_string(),
+                        "created_at".to_string(),
+                        "updated_at".to_string(),
+                        "commit_id".to_string(),
+                        "id".to_string(),
+                    ],
                 });
             }
 
@@ -263,8 +220,37 @@ mod tests {
         }
     }
 
+    fn fake_version_ref_live_row(version_id: &str, commit_id: &str) -> Vec<Value> {
+        let snapshot = crate::version::version_ref_snapshot_content(version_id, commit_id);
+        let normalized = normalized_values_for_schema(
+            crate::version::version_ref_schema_key(),
+            None,
+            Some(&snapshot),
+        )
+        .expect("snapshot should normalize");
+        let mut row = vec![
+            Value::Text(version_id.to_string()),
+            Value::Text(crate::version::version_ref_schema_key().to_string()),
+            Value::Text(crate::version::version_ref_schema_version().to_string()),
+            Value::Text(crate::version::version_ref_file_id().to_string()),
+            Value::Text(crate::version::version_ref_storage_version_id().to_string()),
+            Value::Boolean(true),
+            Value::Text(crate::version::version_ref_plugin_key().to_string()),
+            Value::Null,
+            Value::Null,
+            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
+            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
+        ];
+        for column_name in live_schema_column_names(crate::version::version_ref_schema_key(), None)
+            .expect("version ref schema should expose column names")
+        {
+            row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
+        }
+        row
+    }
+
     #[tokio::test]
-    async fn committed_ref_lookup_resolves_current_head_from_canonical_ref_facts() {
+    async fn committed_ref_lookup_resolves_current_head_from_local_version_head_row() {
         let mut executor = FakeQueryExecutor {
             current_ref_rows: vec![("main".to_string(), "commit-canonical".to_string())],
         };
@@ -278,7 +264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_ref_lookup_does_not_fall_back_to_mirror_when_canonical_fact_is_absent() {
+    async fn committed_ref_lookup_returns_none_when_local_version_head_row_is_absent() {
         let mut executor = FakeQueryExecutor {
             current_ref_rows: Vec::new(),
         };
@@ -291,7 +277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_ref_lookup_rejects_multiple_incomparable_heads_for_one_version() {
+    async fn committed_ref_lookup_rejects_multiple_exact_rows_for_one_version() {
         let mut executor = FakeQueryExecutor {
             current_ref_rows: vec![
                 ("main".to_string(), "commit-a".to_string()),
@@ -303,6 +289,6 @@ mod tests {
             .await
             .expect_err("lookup should reject multiple heads");
 
-        assert!(error.description.contains("multiple incomparable heads"));
+        assert!(error.description.contains("expected at most one untracked row"));
     }
 }

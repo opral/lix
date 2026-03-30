@@ -119,29 +119,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         Ok(change_id)
     }
 
-    pub(crate) async fn seed_canonical_version_ref(
-        &mut self,
-        _bootstrap_commit_id: &str,
-        entity_id: &str,
-        commit_id: &str,
-    ) -> Result<String, LixError> {
-        let snapshot_content = crate::version::version_ref_snapshot_content(entity_id, commit_id);
-        let change_id = self.generate_runtime_uuid().await?;
-        let timestamp = self.generate_runtime_timestamp().await?;
-        self.insert_change_row_for_snapshot(
-            entity_id,
-            crate::version::version_ref_schema_key(),
-            crate::version::version_ref_schema_version(),
-            crate::version::version_ref_file_id(),
-            crate::version::version_ref_plugin_key(),
-            &snapshot_content,
-            &change_id,
-            &timestamp,
-        )
-        .await?;
-        Ok(change_id)
-    }
-
     pub(crate) async fn seed_bootstrap_commit(
         &mut self,
         commit_id: &str,

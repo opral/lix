@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use crate::live_state::projection::legacy_compat_version_ref_mirror_write_row;
+use crate::live_state::projection::local_version_head_write_row;
 use crate::live_state::tracked::{
     load_exact_row_with_backend, ExactTrackedRowRequest, TrackedWriteOperation, TrackedWriteRow,
 };
@@ -219,7 +219,7 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
     write_tx
         .stage(TransactionDelta {
             tracked_writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
-            untracked_writes: vec![legacy_compat_version_ref_mirror_write_row(
+            untracked_writes: vec![local_version_head_write_row(
                 "main", "commit-1", timestamp,
             )],
         })
@@ -328,7 +328,7 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
     write_tx
         .stage(TransactionDelta {
             tracked_writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
-            untracked_writes: vec![legacy_compat_version_ref_mirror_write_row(
+            untracked_writes: vec![local_version_head_write_row(
                 "main", "commit-1", timestamp,
             )],
         })
