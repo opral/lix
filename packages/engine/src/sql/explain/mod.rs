@@ -31,24 +31,30 @@ use crate::sql::logical_plan::direct_reads::{
     StateHistorySortValue,
 };
 use crate::sql::logical_plan::public_ir::{
-    BroadNestedQueryExpr, BroadPublicReadAlias, BroadPublicReadGroupBy, BroadPublicReadJoin,
-    BroadPublicReadLimitClause, BroadPublicReadOrderBy, BroadPublicReadOrderByExpr,
-    BroadPublicReadProjectionItem, BroadPublicReadQuery, BroadPublicReadRelation,
-    BroadPublicReadSelect, BroadPublicReadSetExpr, BroadPublicReadStatement,
-    BroadPublicReadTableFactor, BroadPublicReadTableWithJoins, BroadSqlExpr, CanonicalAdminKind,
-    CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan,
-    CanonicalWorkingChangesScan, CommitPreconditions, ExpectedHead, FilesystemKind,
-    InsertOnConflict, InsertOnConflictAction, MutationPayload, NormalizedPublicReadQuery,
-    OptionalTextPatch, PlannedStateRow, PlannedWrite, ReadCommand, ReadContract, ReadPlan,
-    ResolvedRowRef, ResolvedWritePartition, ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof,
-    StateSourceKind, StructuredPublicRead, TargetSetProof, VersionScope, WriteCommand, WriteLane,
-    WriteMode, WriteModeRequest, WriteOperationKind, WriteSelector,
+    BroadPublicReadAlias, BroadPublicReadDistinct, BroadPublicReadGroupBy,
+    BroadPublicReadGroupByKind, BroadPublicReadJoin, BroadPublicReadJoinConstraint,
+    BroadPublicReadJoinKind, BroadPublicReadLimitClause, BroadPublicReadOffset,
+    BroadPublicReadOrderBy, BroadPublicReadOrderByExpr, BroadPublicReadOrderByKind,
+    BroadPublicReadProjectionItem, BroadPublicReadProjectionItemKind, BroadPublicReadQuery,
+    BroadPublicReadRelation, BroadPublicReadSelect, BroadPublicReadSetExpr,
+    BroadPublicReadStatement, BroadPublicReadTableFactor, BroadPublicReadTableWithJoins,
+    BroadSqlCaseWhen, BroadSqlExpr, BroadSqlExprKind, BroadSqlFunction, BroadSqlFunctionArg,
+    BroadSqlFunctionArgExpr, BroadSqlFunctionArguments, CanonicalAdminKind, CanonicalAdminScan,
+    CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan, CanonicalWorkingChangesScan,
+    CommitPreconditions, ExpectedHead, FilesystemKind, InsertOnConflict, InsertOnConflictAction,
+    MutationPayload, NormalizedPublicReadQuery, OptionalTextPatch, PlannedStateRow, PlannedWrite,
+    ReadCommand, ReadContract, ReadPlan, ResolvedRowRef, ResolvedWritePartition, ResolvedWritePlan,
+    RowLineage, SchemaProof, ScopeProof, StateSourceKind, StructuredPublicRead, TargetSetProof,
+    VersionScope, WriteCommand, WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
+    WriteSelector,
 };
 use crate::sql::logical_plan::{
     DependencyPrecision, DependencySpec, InternalLogicalPlan, LogicalPlan, PublicReadLogicalPlan,
     PublicWriteLogicalPlan, ResultContract,
 };
-use crate::sql::physical_plan::plan::{LoweredReadStatement, LoweredStatementBindings};
+use crate::sql::physical_plan::plan::{
+    LoweredReadStatement, LoweredReadStatementShape, LoweredStatementBindings,
+};
 use crate::sql::physical_plan::{
     LoweredReadProgram, LoweredResultColumn, LoweredResultColumns, PhysicalPlan,
     PreparedPublicReadExecution, PreparedPublicWriteExecution, PublicWriteExecutionPartition,
@@ -859,10 +865,17 @@ pub(crate) struct TerminalRelationRenderNodeSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct LoweredReadStatementSnapshot {
-    pub(crate) shell_statement_sql: String,
-    pub(crate) bindings: LoweredStatementBindingsSnapshot,
-    pub(crate) relation_render_nodes: Vec<TerminalRelationRenderNodeSnapshot>,
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
+pub(crate) enum LoweredReadStatementSnapshot {
+    Final {
+        statement_sql: String,
+        bindings: LoweredStatementBindingsSnapshot,
+    },
+    Template {
+        shell_statement_sql: String,
+        bindings: LoweredStatementBindingsSnapshot,
+        relation_render_nodes: Vec<TerminalRelationRenderNodeSnapshot>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1180,12 +1193,17 @@ pub(crate) struct ExplainBroadPublicReadQuerySnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ExplainBroadPublicReadWithSnapshot {
+    pub(crate) recursive: bool,
     pub(crate) cte_tables: Vec<ExplainBroadPublicReadCteSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ExplainBroadPublicReadCteSnapshot {
-    pub(crate) name: String,
+    pub(crate) alias: ExplainBroadPublicReadAliasSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) materialized: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) from: Option<String>,
     pub(crate) query: Box<ExplainBroadPublicReadQuerySnapshot>,
 }
 
@@ -1230,6 +1248,8 @@ pub(crate) enum ExplainBroadSetQuantifier {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ExplainBroadPublicReadSelectSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) distinct: Option<ExplainBroadPublicReadDistinctSnapshot>,
     pub(crate) projection: Vec<ExplainBroadPublicReadProjectionItemSnapshot>,
     pub(crate) from: Vec<ExplainBroadPublicReadTableWithJoinsSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1240,6 +1260,15 @@ pub(crate) struct ExplainBroadPublicReadSelectSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ExplainBroadPublicReadDistinctSnapshot {
+    Distinct,
+    On {
+        expressions: Vec<ExplainBroadSqlExprSnapshot>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ExplainBroadPublicReadTableWithJoinsSnapshot {
     pub(crate) relation: ExplainBroadPublicReadTableFactorSnapshot,
     pub(crate) joins: Vec<ExplainBroadPublicReadJoinSnapshot>,
@@ -1247,10 +1276,78 @@ pub(crate) struct ExplainBroadPublicReadTableWithJoinsSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ExplainBroadPublicReadJoinSnapshot {
-    pub(crate) operator: String,
+    pub(crate) global: bool,
+    pub(crate) kind: ExplainBroadPublicReadJoinKindSnapshot,
     pub(crate) relation: ExplainBroadPublicReadTableFactorSnapshot,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) constraint_expressions: Vec<ExplainBroadSqlExprSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
+pub(crate) enum ExplainBroadPublicReadJoinKindSnapshot {
+    Join {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    Inner {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    Left {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    LeftOuter {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    Right {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    RightOuter {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    FullOuter {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    CrossJoin {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    Semi {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    LeftSemi {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    RightSemi {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    Anti {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    LeftAnti {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    RightAnti {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    StraightJoin {
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+    CrossApply,
+    OuterApply,
+    AsOf {
+        match_condition: Box<ExplainBroadSqlExprSnapshot>,
+        constraint: ExplainBroadPublicReadJoinConstraintSnapshot,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
+pub(crate) enum ExplainBroadPublicReadJoinConstraintSnapshot {
+    None,
+    Natural,
+    Using {
+        columns: Vec<String>,
+    },
+    On {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1278,6 +1375,7 @@ pub(crate) enum ExplainBroadPublicReadTableFactorSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ExplainBroadPublicReadAliasSnapshot {
+    pub(crate) explicit: bool,
     pub(crate) name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) columns: Vec<String>,
@@ -1293,9 +1391,7 @@ pub(crate) enum ExplainBroadPublicReadProjectionItemSnapshot {
     Expr {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         alias: Option<String>,
-        sql: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        nested_queries: Vec<ExplainBroadNestedQueryExprSnapshot>,
+        expr: Box<ExplainBroadSqlExprSnapshot>,
     },
 }
 
@@ -1333,7 +1429,7 @@ pub(crate) enum ExplainBroadPublicReadLimitClauseSnapshot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<Box<ExplainBroadSqlExprSnapshot>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        offset: Option<Box<ExplainBroadSqlExprSnapshot>>,
+        offset: Option<Box<ExplainBroadPublicReadOffsetSnapshot>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         limit_by: Vec<ExplainBroadSqlExprSnapshot>,
     },
@@ -1344,27 +1440,222 @@ pub(crate) enum ExplainBroadPublicReadLimitClauseSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct ExplainBroadSqlExprSnapshot {
-    pub(crate) sql: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) nested_queries: Vec<ExplainBroadNestedQueryExprSnapshot>,
+pub(crate) struct ExplainBroadPublicReadOffsetSnapshot {
+    pub(crate) value: Box<ExplainBroadSqlExprSnapshot>,
+    pub(crate) rows: ExplainBroadOffsetRows,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
-pub(crate) enum ExplainBroadNestedQueryExprSnapshot {
-    ScalarSubquery {
-        query: Box<ExplainBroadPublicReadQuerySnapshot>,
+pub(crate) enum ExplainBroadOffsetRows {
+    None,
+    Row,
+    Rows,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
+pub(crate) enum ExplainBroadSqlExprSnapshot {
+    Identifier {
+        name: String,
+    },
+    CompoundIdentifier {
+        parts: Vec<String>,
+    },
+    Value {
+        value: String,
+    },
+    TypedString {
+        data_type: String,
+        value: String,
+        uses_odbc_syntax: bool,
+    },
+    BinaryOp {
+        left: Box<ExplainBroadSqlExprSnapshot>,
+        op: String,
+        right: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    AnyOp {
+        left: Box<ExplainBroadSqlExprSnapshot>,
+        compare_op: String,
+        right: Box<ExplainBroadSqlExprSnapshot>,
+        is_some: bool,
+    },
+    AllOp {
+        left: Box<ExplainBroadSqlExprSnapshot>,
+        compare_op: String,
+        right: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    UnaryOp {
+        op: String,
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    Nested {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    IsNull {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    IsNotNull {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    IsTrue {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    IsNotTrue {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    IsFalse {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    IsNotFalse {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    IsUnknown {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    IsNotUnknown {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    IsDistinctFrom {
+        left: Box<ExplainBroadSqlExprSnapshot>,
+        right: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    IsNotDistinctFrom {
+        left: Box<ExplainBroadSqlExprSnapshot>,
+        right: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    Cast {
+        kind: String,
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+        data_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<String>,
+    },
+    InList {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+        list: Vec<ExplainBroadSqlExprSnapshot>,
+        negated: bool,
+    },
+    InSubquery {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+        subquery: Box<ExplainBroadPublicReadQuerySnapshot>,
+        negated: bool,
+    },
+    InUnnest {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+        array_expr: Box<ExplainBroadSqlExprSnapshot>,
+        negated: bool,
+    },
+    Between {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+        negated: bool,
+        low: Box<ExplainBroadSqlExprSnapshot>,
+        high: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    Like {
+        negated: bool,
+        any: bool,
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+        pattern: Box<ExplainBroadSqlExprSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        escape_char: Option<String>,
+    },
+    ILike {
+        negated: bool,
+        any: bool,
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+        pattern: Box<ExplainBroadSqlExprSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        escape_char: Option<String>,
+    },
+    Function {
+        function: Box<ExplainBroadSqlFunctionSnapshot>,
+    },
+    Case {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operand: Option<Box<ExplainBroadSqlExprSnapshot>>,
+        conditions: Vec<ExplainBroadSqlCaseWhenSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        else_result: Option<Box<ExplainBroadSqlExprSnapshot>>,
     },
     Exists {
         negated: bool,
         subquery: Box<ExplainBroadPublicReadQuerySnapshot>,
     },
-    InSubquery {
-        negated: bool,
-        expr: Box<ExplainBroadSqlExprSnapshot>,
-        subquery: Box<ExplainBroadPublicReadQuerySnapshot>,
+    ScalarSubquery {
+        query: Box<ExplainBroadPublicReadQuerySnapshot>,
     },
+    Tuple {
+        items: Vec<ExplainBroadSqlExprSnapshot>,
+    },
+    Unsupported {
+        diagnostics_sql: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExplainBroadSqlCaseWhenSnapshot {
+    pub(crate) condition: ExplainBroadSqlExprSnapshot,
+    pub(crate) result: ExplainBroadSqlExprSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExplainBroadSqlFunctionSnapshot {
+    pub(crate) name: Vec<String>,
+    pub(crate) uses_odbc_syntax: bool,
+    pub(crate) parameters: ExplainBroadSqlFunctionArgumentsSnapshot,
+    pub(crate) args: ExplainBroadSqlFunctionArgumentsSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) filter: Option<Box<ExplainBroadSqlExprSnapshot>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) null_treatment: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) within_group: Vec<ExplainBroadPublicReadOrderByExprSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
+pub(crate) enum ExplainBroadSqlFunctionArgumentsSnapshot {
+    None,
+    Subquery {
+        query: Box<ExplainBroadPublicReadQuerySnapshot>,
+    },
+    List {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duplicate_treatment: Option<String>,
+        args: Vec<ExplainBroadSqlFunctionArgSnapshot>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
+pub(crate) enum ExplainBroadSqlFunctionArgSnapshot {
+    Named {
+        name: String,
+        arg: Box<ExplainBroadSqlFunctionArgExprSnapshot>,
+        operator: String,
+    },
+    ExprNamed {
+        name: Box<ExplainBroadSqlExprSnapshot>,
+        arg: Box<ExplainBroadSqlFunctionArgExprSnapshot>,
+        operator: String,
+    },
+    Unnamed {
+        arg: Box<ExplainBroadSqlFunctionArgExprSnapshot>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
+pub(crate) enum ExplainBroadSqlFunctionArgExprSnapshot {
+    Expr {
+        expr: Box<ExplainBroadSqlExprSnapshot>,
+    },
+    QualifiedWildcard {
+        qualifier: Vec<String>,
+    },
+    Wildcard,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2627,11 +2918,14 @@ fn broad_public_read_with_snapshot(
     with: &crate::sql::logical_plan::public_ir::BroadPublicReadWith,
 ) -> ExplainBroadPublicReadWithSnapshot {
     ExplainBroadPublicReadWithSnapshot {
+        recursive: with.recursive,
         cte_tables: with
             .cte_tables
             .iter()
             .map(|cte| ExplainBroadPublicReadCteSnapshot {
-                name: cte.name.clone(),
+                alias: broad_public_read_alias_snapshot(&cte.alias),
+                materialized: cte.materialized.as_ref().map(ToString::to_string),
+                from: cte.from.clone(),
                 query: Box::new(broad_public_read_query_snapshot(&cte.query)),
             })
             .collect(),
@@ -2708,6 +3002,10 @@ fn broad_public_read_select_snapshot(
     select: &BroadPublicReadSelect,
 ) -> ExplainBroadPublicReadSelectSnapshot {
     ExplainBroadPublicReadSelectSnapshot {
+        distinct: select
+            .distinct
+            .as_ref()
+            .map(broad_public_read_distinct_snapshot),
         projection: select
             .projection
             .iter()
@@ -2732,6 +3030,17 @@ fn broad_public_read_select_snapshot(
     }
 }
 
+fn broad_public_read_distinct_snapshot(
+    distinct: &BroadPublicReadDistinct,
+) -> ExplainBroadPublicReadDistinctSnapshot {
+    match distinct {
+        BroadPublicReadDistinct::Distinct => ExplainBroadPublicReadDistinctSnapshot::Distinct,
+        BroadPublicReadDistinct::On(expressions) => ExplainBroadPublicReadDistinctSnapshot::On {
+            expressions: expressions.iter().map(broad_sql_expr_snapshot).collect(),
+        },
+    }
+}
+
 fn broad_public_read_table_with_joins_snapshot(
     table: &BroadPublicReadTableWithJoins,
 ) -> ExplainBroadPublicReadTableWithJoinsSnapshot {
@@ -2749,13 +3058,9 @@ fn broad_public_read_join_snapshot(
     join: &BroadPublicReadJoin,
 ) -> ExplainBroadPublicReadJoinSnapshot {
     ExplainBroadPublicReadJoinSnapshot {
-        operator: join.operator.clone(),
+        global: join.global,
+        kind: broad_public_read_join_kind_snapshot(&join.kind),
         relation: broad_public_read_table_factor_snapshot(&join.relation),
-        constraint_expressions: join
-            .constraint_expressions
-            .iter()
-            .map(broad_sql_expr_snapshot)
-            .collect(),
     }
 }
 
@@ -2800,6 +3105,7 @@ fn broad_public_read_alias_snapshot(
     alias: &BroadPublicReadAlias,
 ) -> ExplainBroadPublicReadAliasSnapshot {
     ExplainBroadPublicReadAliasSnapshot {
+        explicit: alias.explicit,
         name: alias.name.clone(),
         columns: alias.columns.clone(),
     }
@@ -2815,19 +3121,14 @@ fn broad_public_read_projection_item_snapshot(
         crate::sql::logical_plan::public_ir::BroadPublicReadProjectionItemKind::QualifiedWildcard {
             qualifier,
         } => ExplainBroadPublicReadProjectionItemSnapshot::QualifiedWildcard {
-            qualifier: qualifier.clone(),
+            qualifier: object_name_snapshot(qualifier),
         },
         crate::sql::logical_plan::public_ir::BroadPublicReadProjectionItemKind::Expr {
             alias,
-            sql,
-            nested_queries,
+            expr,
         } => ExplainBroadPublicReadProjectionItemSnapshot::Expr {
             alias: alias.clone(),
-            sql: sql.clone(),
-            nested_queries: nested_queries
-                .iter()
-                .map(broad_nested_query_expr_snapshot)
-                .collect(),
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
         },
     }
 }
@@ -2885,7 +3186,10 @@ fn broad_public_read_limit_clause_snapshot(
             limit_by,
         } => ExplainBroadPublicReadLimitClauseSnapshot::LimitOffset {
             limit: limit.as_ref().map(broad_sql_expr_snapshot).map(Box::new),
-            offset: offset.as_ref().map(broad_sql_expr_snapshot).map(Box::new),
+            offset: offset
+                .as_ref()
+                .map(broad_public_read_offset_snapshot)
+                .map(Box::new),
             limit_by: limit_by.iter().map(broad_sql_expr_snapshot).collect(),
         },
         crate::sql::logical_plan::public_ir::BroadPublicReadLimitClauseKind::OffsetCommaLimit {
@@ -2898,43 +3202,431 @@ fn broad_public_read_limit_clause_snapshot(
     }
 }
 
+fn broad_public_read_offset_snapshot(
+    offset: &BroadPublicReadOffset,
+) -> ExplainBroadPublicReadOffsetSnapshot {
+    ExplainBroadPublicReadOffsetSnapshot {
+        value: Box::new(broad_sql_expr_snapshot(&offset.value)),
+        rows: broad_offset_rows_snapshot(offset.rows),
+    }
+}
+
+fn broad_offset_rows_snapshot(rows: sqlparser::ast::OffsetRows) -> ExplainBroadOffsetRows {
+    match rows {
+        sqlparser::ast::OffsetRows::None => ExplainBroadOffsetRows::None,
+        sqlparser::ast::OffsetRows::Row => ExplainBroadOffsetRows::Row,
+        sqlparser::ast::OffsetRows::Rows => ExplainBroadOffsetRows::Rows,
+    }
+}
+
+fn broad_cast_kind_snapshot(kind: &sqlparser::ast::CastKind) -> &'static str {
+    match kind {
+        sqlparser::ast::CastKind::Cast => "cast",
+        sqlparser::ast::CastKind::TryCast => "try_cast",
+        sqlparser::ast::CastKind::SafeCast => "safe_cast",
+        sqlparser::ast::CastKind::DoubleColon => "double_colon",
+    }
+}
+
+fn broad_public_read_join_kind_snapshot(
+    kind: &BroadPublicReadJoinKind,
+) -> ExplainBroadPublicReadJoinKindSnapshot {
+    match kind {
+        BroadPublicReadJoinKind::Join(constraint) => ExplainBroadPublicReadJoinKindSnapshot::Join {
+            constraint: broad_public_read_join_constraint_snapshot(constraint),
+        },
+        BroadPublicReadJoinKind::Inner(constraint) => {
+            ExplainBroadPublicReadJoinKindSnapshot::Inner {
+                constraint: broad_public_read_join_constraint_snapshot(constraint),
+            }
+        }
+        BroadPublicReadJoinKind::Left(constraint) => ExplainBroadPublicReadJoinKindSnapshot::Left {
+            constraint: broad_public_read_join_constraint_snapshot(constraint),
+        },
+        BroadPublicReadJoinKind::LeftOuter(constraint) => {
+            ExplainBroadPublicReadJoinKindSnapshot::LeftOuter {
+                constraint: broad_public_read_join_constraint_snapshot(constraint),
+            }
+        }
+        BroadPublicReadJoinKind::Right(constraint) => {
+            ExplainBroadPublicReadJoinKindSnapshot::Right {
+                constraint: broad_public_read_join_constraint_snapshot(constraint),
+            }
+        }
+        BroadPublicReadJoinKind::RightOuter(constraint) => {
+            ExplainBroadPublicReadJoinKindSnapshot::RightOuter {
+                constraint: broad_public_read_join_constraint_snapshot(constraint),
+            }
+        }
+        BroadPublicReadJoinKind::FullOuter(constraint) => {
+            ExplainBroadPublicReadJoinKindSnapshot::FullOuter {
+                constraint: broad_public_read_join_constraint_snapshot(constraint),
+            }
+        }
+        BroadPublicReadJoinKind::CrossJoin(constraint) => {
+            ExplainBroadPublicReadJoinKindSnapshot::CrossJoin {
+                constraint: broad_public_read_join_constraint_snapshot(constraint),
+            }
+        }
+        BroadPublicReadJoinKind::Semi(constraint) => ExplainBroadPublicReadJoinKindSnapshot::Semi {
+            constraint: broad_public_read_join_constraint_snapshot(constraint),
+        },
+        BroadPublicReadJoinKind::LeftSemi(constraint) => {
+            ExplainBroadPublicReadJoinKindSnapshot::LeftSemi {
+                constraint: broad_public_read_join_constraint_snapshot(constraint),
+            }
+        }
+        BroadPublicReadJoinKind::RightSemi(constraint) => {
+            ExplainBroadPublicReadJoinKindSnapshot::RightSemi {
+                constraint: broad_public_read_join_constraint_snapshot(constraint),
+            }
+        }
+        BroadPublicReadJoinKind::Anti(constraint) => ExplainBroadPublicReadJoinKindSnapshot::Anti {
+            constraint: broad_public_read_join_constraint_snapshot(constraint),
+        },
+        BroadPublicReadJoinKind::LeftAnti(constraint) => {
+            ExplainBroadPublicReadJoinKindSnapshot::LeftAnti {
+                constraint: broad_public_read_join_constraint_snapshot(constraint),
+            }
+        }
+        BroadPublicReadJoinKind::RightAnti(constraint) => {
+            ExplainBroadPublicReadJoinKindSnapshot::RightAnti {
+                constraint: broad_public_read_join_constraint_snapshot(constraint),
+            }
+        }
+        BroadPublicReadJoinKind::StraightJoin(constraint) => {
+            ExplainBroadPublicReadJoinKindSnapshot::StraightJoin {
+                constraint: broad_public_read_join_constraint_snapshot(constraint),
+            }
+        }
+        BroadPublicReadJoinKind::CrossApply => ExplainBroadPublicReadJoinKindSnapshot::CrossApply,
+        BroadPublicReadJoinKind::OuterApply => ExplainBroadPublicReadJoinKindSnapshot::OuterApply,
+        BroadPublicReadJoinKind::AsOf {
+            match_condition,
+            constraint,
+        } => ExplainBroadPublicReadJoinKindSnapshot::AsOf {
+            match_condition: Box::new(broad_sql_expr_snapshot(match_condition)),
+            constraint: broad_public_read_join_constraint_snapshot(constraint),
+        },
+    }
+}
+
+fn broad_public_read_join_constraint_snapshot(
+    constraint: &BroadPublicReadJoinConstraint,
+) -> ExplainBroadPublicReadJoinConstraintSnapshot {
+    match constraint {
+        BroadPublicReadJoinConstraint::None => ExplainBroadPublicReadJoinConstraintSnapshot::None,
+        BroadPublicReadJoinConstraint::Natural => {
+            ExplainBroadPublicReadJoinConstraintSnapshot::Natural
+        }
+        BroadPublicReadJoinConstraint::Using(columns) => {
+            ExplainBroadPublicReadJoinConstraintSnapshot::Using {
+                columns: columns.clone(),
+            }
+        }
+        BroadPublicReadJoinConstraint::On(expr) => {
+            ExplainBroadPublicReadJoinConstraintSnapshot::On {
+                expr: Box::new(broad_sql_expr_snapshot(expr)),
+            }
+        }
+    }
+}
+
 fn broad_sql_expr_snapshot(expr: &BroadSqlExpr) -> ExplainBroadSqlExprSnapshot {
-    ExplainBroadSqlExprSnapshot {
-        sql: expr.sql.clone(),
-        nested_queries: expr
-            .nested_queries
+    match &expr.kind {
+        BroadSqlExprKind::Identifier(ident) => ExplainBroadSqlExprSnapshot::Identifier {
+            name: ident.value.clone(),
+        },
+        BroadSqlExprKind::CompoundIdentifier(parts) => {
+            ExplainBroadSqlExprSnapshot::CompoundIdentifier {
+                parts: parts.iter().map(|part| part.value.clone()).collect(),
+            }
+        }
+        BroadSqlExprKind::Value(value) => ExplainBroadSqlExprSnapshot::Value {
+            value: value.to_string(),
+        },
+        BroadSqlExprKind::TypedString {
+            data_type,
+            value,
+            uses_odbc_syntax,
+        } => ExplainBroadSqlExprSnapshot::TypedString {
+            data_type: data_type.to_string(),
+            value: value.to_string(),
+            uses_odbc_syntax: *uses_odbc_syntax,
+        },
+        BroadSqlExprKind::BinaryOp { left, op, right } => ExplainBroadSqlExprSnapshot::BinaryOp {
+            left: Box::new(broad_sql_expr_snapshot(left)),
+            op: op.to_string(),
+            right: Box::new(broad_sql_expr_snapshot(right)),
+        },
+        BroadSqlExprKind::AnyOp {
+            left,
+            compare_op,
+            right,
+            is_some,
+        } => ExplainBroadSqlExprSnapshot::AnyOp {
+            left: Box::new(broad_sql_expr_snapshot(left)),
+            compare_op: compare_op.to_string(),
+            right: Box::new(broad_sql_expr_snapshot(right)),
+            is_some: *is_some,
+        },
+        BroadSqlExprKind::AllOp {
+            left,
+            compare_op,
+            right,
+        } => ExplainBroadSqlExprSnapshot::AllOp {
+            left: Box::new(broad_sql_expr_snapshot(left)),
+            compare_op: compare_op.to_string(),
+            right: Box::new(broad_sql_expr_snapshot(right)),
+        },
+        BroadSqlExprKind::UnaryOp { op, expr } => ExplainBroadSqlExprSnapshot::UnaryOp {
+            op: op.to_string(),
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+        },
+        BroadSqlExprKind::Nested(expr) => ExplainBroadSqlExprSnapshot::Nested {
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+        },
+        BroadSqlExprKind::IsNull(expr) => ExplainBroadSqlExprSnapshot::IsNull {
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+        },
+        BroadSqlExprKind::IsNotNull(expr) => ExplainBroadSqlExprSnapshot::IsNotNull {
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+        },
+        BroadSqlExprKind::IsTrue(expr) => ExplainBroadSqlExprSnapshot::IsTrue {
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+        },
+        BroadSqlExprKind::IsNotTrue(expr) => ExplainBroadSqlExprSnapshot::IsNotTrue {
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+        },
+        BroadSqlExprKind::IsFalse(expr) => ExplainBroadSqlExprSnapshot::IsFalse {
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+        },
+        BroadSqlExprKind::IsNotFalse(expr) => ExplainBroadSqlExprSnapshot::IsNotFalse {
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+        },
+        BroadSqlExprKind::IsUnknown(expr) => ExplainBroadSqlExprSnapshot::IsUnknown {
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+        },
+        BroadSqlExprKind::IsNotUnknown(expr) => ExplainBroadSqlExprSnapshot::IsNotUnknown {
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+        },
+        BroadSqlExprKind::IsDistinctFrom { left, right } => {
+            ExplainBroadSqlExprSnapshot::IsDistinctFrom {
+                left: Box::new(broad_sql_expr_snapshot(left)),
+                right: Box::new(broad_sql_expr_snapshot(right)),
+            }
+        }
+        BroadSqlExprKind::IsNotDistinctFrom { left, right } => {
+            ExplainBroadSqlExprSnapshot::IsNotDistinctFrom {
+                left: Box::new(broad_sql_expr_snapshot(left)),
+                right: Box::new(broad_sql_expr_snapshot(right)),
+            }
+        }
+        BroadSqlExprKind::Cast {
+            kind,
+            expr,
+            data_type,
+            format,
+        } => ExplainBroadSqlExprSnapshot::Cast {
+            kind: broad_cast_kind_snapshot(kind).to_string(),
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+            data_type: data_type.to_string(),
+            format: format.as_ref().map(ToString::to_string),
+        },
+        BroadSqlExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => ExplainBroadSqlExprSnapshot::InList {
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+            list: list.iter().map(broad_sql_expr_snapshot).collect(),
+            negated: *negated,
+        },
+        BroadSqlExprKind::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => ExplainBroadSqlExprSnapshot::InSubquery {
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+            subquery: Box::new(broad_public_read_query_snapshot(subquery)),
+            negated: *negated,
+        },
+        BroadSqlExprKind::InUnnest {
+            expr,
+            array_expr,
+            negated,
+        } => ExplainBroadSqlExprSnapshot::InUnnest {
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+            array_expr: Box::new(broad_sql_expr_snapshot(array_expr)),
+            negated: *negated,
+        },
+        BroadSqlExprKind::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => ExplainBroadSqlExprSnapshot::Between {
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+            negated: *negated,
+            low: Box::new(broad_sql_expr_snapshot(low)),
+            high: Box::new(broad_sql_expr_snapshot(high)),
+        },
+        BroadSqlExprKind::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => ExplainBroadSqlExprSnapshot::Like {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+            pattern: Box::new(broad_sql_expr_snapshot(pattern)),
+            escape_char: escape_char.as_ref().map(ToString::to_string),
+        },
+        BroadSqlExprKind::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => ExplainBroadSqlExprSnapshot::ILike {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+            pattern: Box::new(broad_sql_expr_snapshot(pattern)),
+            escape_char: escape_char.as_ref().map(ToString::to_string),
+        },
+        BroadSqlExprKind::Function(function) => ExplainBroadSqlExprSnapshot::Function {
+            function: Box::new(broad_sql_function_snapshot(function)),
+        },
+        BroadSqlExprKind::Case {
+            operand,
+            conditions,
+            else_result,
+        } => ExplainBroadSqlExprSnapshot::Case {
+            operand: operand
+                .as_ref()
+                .map(|expr| Box::new(broad_sql_expr_snapshot(expr))),
+            conditions: conditions
+                .iter()
+                .map(broad_sql_case_when_snapshot)
+                .collect(),
+            else_result: else_result
+                .as_ref()
+                .map(|expr| Box::new(broad_sql_expr_snapshot(expr))),
+        },
+        BroadSqlExprKind::Exists { negated, subquery } => ExplainBroadSqlExprSnapshot::Exists {
+            negated: *negated,
+            subquery: Box::new(broad_public_read_query_snapshot(subquery)),
+        },
+        BroadSqlExprKind::ScalarSubquery(query) => ExplainBroadSqlExprSnapshot::ScalarSubquery {
+            query: Box::new(broad_public_read_query_snapshot(query)),
+        },
+        BroadSqlExprKind::Tuple(items) => ExplainBroadSqlExprSnapshot::Tuple {
+            items: items.iter().map(broad_sql_expr_snapshot).collect(),
+        },
+        BroadSqlExprKind::Unsupported { diagnostics_sql } => {
+            ExplainBroadSqlExprSnapshot::Unsupported {
+                diagnostics_sql: diagnostics_sql.clone(),
+            }
+        }
+    }
+}
+
+fn broad_sql_case_when_snapshot(when: &BroadSqlCaseWhen) -> ExplainBroadSqlCaseWhenSnapshot {
+    ExplainBroadSqlCaseWhenSnapshot {
+        condition: broad_sql_expr_snapshot(&when.condition),
+        result: broad_sql_expr_snapshot(&when.result),
+    }
+}
+
+fn broad_sql_function_snapshot(function: &BroadSqlFunction) -> ExplainBroadSqlFunctionSnapshot {
+    ExplainBroadSqlFunctionSnapshot {
+        name: object_name_snapshot(&function.name),
+        uses_odbc_syntax: function.uses_odbc_syntax,
+        parameters: broad_sql_function_arguments_snapshot(&function.parameters),
+        args: broad_sql_function_arguments_snapshot(&function.args),
+        filter: function
+            .filter
+            .as_ref()
+            .map(|expr| Box::new(broad_sql_expr_snapshot(expr))),
+        null_treatment: function.null_treatment.as_ref().map(ToString::to_string),
+        within_group: function
+            .within_group
             .iter()
-            .map(broad_nested_query_expr_snapshot)
+            .map(broad_public_read_order_by_expr_snapshot)
             .collect(),
     }
 }
 
-fn broad_nested_query_expr_snapshot(
-    expr: &BroadNestedQueryExpr,
-) -> ExplainBroadNestedQueryExprSnapshot {
-    match expr {
-        BroadNestedQueryExpr::ScalarSubquery(query) => {
-            ExplainBroadNestedQueryExprSnapshot::ScalarSubquery {
+fn broad_sql_function_arguments_snapshot(
+    arguments: &BroadSqlFunctionArguments,
+) -> ExplainBroadSqlFunctionArgumentsSnapshot {
+    match arguments {
+        BroadSqlFunctionArguments::None => ExplainBroadSqlFunctionArgumentsSnapshot::None,
+        BroadSqlFunctionArguments::Subquery(query) => {
+            ExplainBroadSqlFunctionArgumentsSnapshot::Subquery {
                 query: Box::new(broad_public_read_query_snapshot(query)),
             }
         }
-        BroadNestedQueryExpr::Exists { negated, subquery } => {
-            ExplainBroadNestedQueryExprSnapshot::Exists {
-                negated: *negated,
-                subquery: Box::new(broad_public_read_query_snapshot(subquery)),
-            }
-        }
-        BroadNestedQueryExpr::InSubquery {
-            negated,
-            expr,
-            subquery,
-            ..
-        } => ExplainBroadNestedQueryExprSnapshot::InSubquery {
-            negated: *negated,
-            expr: Box::new(broad_sql_expr_snapshot(expr)),
-            subquery: Box::new(broad_public_read_query_snapshot(subquery)),
+        BroadSqlFunctionArguments::List(list) => ExplainBroadSqlFunctionArgumentsSnapshot::List {
+            duplicate_treatment: list.duplicate_treatment.as_ref().map(ToString::to_string),
+            args: list
+                .args
+                .iter()
+                .map(broad_sql_function_arg_snapshot)
+                .collect(),
         },
     }
+}
+
+fn broad_sql_function_arg_snapshot(
+    arg: &BroadSqlFunctionArg,
+) -> ExplainBroadSqlFunctionArgSnapshot {
+    match arg {
+        BroadSqlFunctionArg::Named {
+            name,
+            arg,
+            operator,
+        } => ExplainBroadSqlFunctionArgSnapshot::Named {
+            name: name.value.clone(),
+            arg: Box::new(broad_sql_function_arg_expr_snapshot(arg)),
+            operator: operator.to_string(),
+        },
+        BroadSqlFunctionArg::ExprNamed {
+            name,
+            arg,
+            operator,
+        } => ExplainBroadSqlFunctionArgSnapshot::ExprNamed {
+            name: Box::new(broad_sql_expr_snapshot(name)),
+            arg: Box::new(broad_sql_function_arg_expr_snapshot(arg)),
+            operator: operator.to_string(),
+        },
+        BroadSqlFunctionArg::Unnamed(arg) => ExplainBroadSqlFunctionArgSnapshot::Unnamed {
+            arg: Box::new(broad_sql_function_arg_expr_snapshot(arg)),
+        },
+    }
+}
+
+fn broad_sql_function_arg_expr_snapshot(
+    arg: &BroadSqlFunctionArgExpr,
+) -> ExplainBroadSqlFunctionArgExprSnapshot {
+    match arg {
+        BroadSqlFunctionArgExpr::Expr(expr) => ExplainBroadSqlFunctionArgExprSnapshot::Expr {
+            expr: Box::new(broad_sql_expr_snapshot(expr)),
+        },
+        BroadSqlFunctionArgExpr::QualifiedWildcard(object_name) => {
+            ExplainBroadSqlFunctionArgExprSnapshot::QualifiedWildcard {
+                qualifier: object_name_snapshot(object_name),
+            }
+        }
+        BroadSqlFunctionArgExpr::Wildcard => ExplainBroadSqlFunctionArgExprSnapshot::Wildcard,
+    }
+}
+
+fn object_name_snapshot(name: &sqlparser::ast::ObjectName) -> Vec<String> {
+    name.0.iter().map(ToString::to_string).collect()
 }
 
 fn broad_public_read_relation_snapshot(
@@ -2971,29 +3663,49 @@ fn collect_broad_public_read_relation_summary(
     external_relations: &mut BTreeSet<String>,
     cte_relations: &mut BTreeSet<String>,
 ) {
+    collect_broad_public_read_relation_summary_in_statement(
+        statement,
+        public_relations,
+        lowered_public_relations,
+        internal_relations,
+        external_relations,
+        cte_relations,
+    );
+}
+
+fn collect_broad_public_read_relation_summary_in_statement(
+    statement: &BroadPublicReadStatement,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
     match statement {
-        BroadPublicReadStatement::Query(query) => collect_broad_public_read_query_relation_summary(
-            query,
-            public_relations,
-            lowered_public_relations,
-            internal_relations,
-            external_relations,
-            cte_relations,
-        ),
+        BroadPublicReadStatement::Query(query) => {
+            collect_broad_public_read_relation_summary_in_query(
+                query,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
         BroadPublicReadStatement::Explain { statement, .. } => {
-            collect_broad_public_read_relation_summary(
+            collect_broad_public_read_relation_summary_in_statement(
                 statement,
                 public_relations,
                 lowered_public_relations,
                 internal_relations,
                 external_relations,
                 cte_relations,
-            )
+            );
         }
     }
 }
 
-fn collect_broad_public_read_query_relation_summary(
+fn collect_broad_public_read_relation_summary_in_query(
     query: &BroadPublicReadQuery,
     public_relations: &mut BTreeSet<String>,
     lowered_public_relations: &mut BTreeSet<String>,
@@ -3003,7 +3715,7 @@ fn collect_broad_public_read_query_relation_summary(
 ) {
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            collect_broad_public_read_query_relation_summary(
+            collect_broad_public_read_relation_summary_in_query(
                 &cte.query,
                 public_relations,
                 lowered_public_relations,
@@ -3013,7 +3725,7 @@ fn collect_broad_public_read_query_relation_summary(
             );
         }
     }
-    collect_broad_public_read_set_expr_relation_summary(
+    collect_broad_public_read_relation_summary_in_set_expr(
         &query.body,
         public_relations,
         lowered_public_relations,
@@ -3022,7 +3734,7 @@ fn collect_broad_public_read_query_relation_summary(
         cte_relations,
     );
     if let Some(order_by) = &query.order_by {
-        collect_broad_public_read_order_by_relation_summary(
+        collect_broad_public_read_relation_summary_in_order_by(
             order_by,
             public_relations,
             lowered_public_relations,
@@ -3032,7 +3744,7 @@ fn collect_broad_public_read_query_relation_summary(
         );
     }
     if let Some(limit_clause) = &query.limit_clause {
-        collect_broad_public_read_limit_clause_relation_summary(
+        collect_broad_public_read_relation_summary_in_limit_clause(
             limit_clause,
             public_relations,
             lowered_public_relations,
@@ -3043,7 +3755,7 @@ fn collect_broad_public_read_query_relation_summary(
     }
 }
 
-fn collect_broad_public_read_set_expr_relation_summary(
+fn collect_broad_public_read_relation_summary_in_set_expr(
     expr: &BroadPublicReadSetExpr,
     public_relations: &mut BTreeSet<String>,
     lowered_public_relations: &mut BTreeSet<String>,
@@ -3053,7 +3765,7 @@ fn collect_broad_public_read_set_expr_relation_summary(
 ) {
     match expr {
         BroadPublicReadSetExpr::Select(select) => {
-            collect_broad_public_read_select_relation_summary(
+            collect_broad_public_read_relation_summary_in_select(
                 select,
                 public_relations,
                 lowered_public_relations,
@@ -3062,16 +3774,18 @@ fn collect_broad_public_read_set_expr_relation_summary(
                 cte_relations,
             );
         }
-        BroadPublicReadSetExpr::Query(query) => collect_broad_public_read_query_relation_summary(
-            query,
-            public_relations,
-            lowered_public_relations,
-            internal_relations,
-            external_relations,
-            cte_relations,
-        ),
+        BroadPublicReadSetExpr::Query(query) => {
+            collect_broad_public_read_relation_summary_in_query(
+                query,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
         BroadPublicReadSetExpr::SetOperation { left, right, .. } => {
-            collect_broad_public_read_set_expr_relation_summary(
+            collect_broad_public_read_relation_summary_in_set_expr(
                 left,
                 public_relations,
                 lowered_public_relations,
@@ -3079,7 +3793,7 @@ fn collect_broad_public_read_set_expr_relation_summary(
                 external_relations,
                 cte_relations,
             );
-            collect_broad_public_read_set_expr_relation_summary(
+            collect_broad_public_read_relation_summary_in_set_expr(
                 right,
                 public_relations,
                 lowered_public_relations,
@@ -3100,7 +3814,7 @@ fn collect_broad_public_read_set_expr_relation_summary(
     }
 }
 
-fn collect_broad_public_read_select_relation_summary(
+fn collect_broad_public_read_relation_summary_in_select(
     select: &BroadPublicReadSelect,
     public_relations: &mut BTreeSet<String>,
     lowered_public_relations: &mut BTreeSet<String>,
@@ -3108,9 +3822,9 @@ fn collect_broad_public_read_select_relation_summary(
     external_relations: &mut BTreeSet<String>,
     cte_relations: &mut BTreeSet<String>,
 ) {
-    for projection in &select.projection {
-        collect_broad_public_read_projection_item_relation_summary(
-            projection,
+    if let Some(distinct) = &select.distinct {
+        collect_broad_public_read_relation_summary_in_distinct(
+            distinct,
             public_relations,
             lowered_public_relations,
             internal_relations,
@@ -3118,8 +3832,20 @@ fn collect_broad_public_read_select_relation_summary(
             cte_relations,
         );
     }
+    for projection in &select.projection {
+        if let BroadPublicReadProjectionItemKind::Expr { expr, .. } = &projection.kind {
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                expr,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+    }
     for table in &select.from {
-        collect_broad_public_read_table_with_joins_relation_summary(
+        collect_broad_public_read_relation_summary_in_table_with_joins(
             table,
             public_relations,
             lowered_public_relations,
@@ -3129,7 +3855,7 @@ fn collect_broad_public_read_select_relation_summary(
         );
     }
     if let Some(selection) = &select.selection {
-        collect_broad_public_read_sql_expr_relation_summary(
+        collect_broad_public_read_relation_summary_in_sql_expr(
             selection,
             public_relations,
             lowered_public_relations,
@@ -3138,16 +3864,20 @@ fn collect_broad_public_read_select_relation_summary(
             cte_relations,
         );
     }
-    collect_broad_public_read_group_by_relation_summary(
-        &select.group_by,
-        public_relations,
-        lowered_public_relations,
-        internal_relations,
-        external_relations,
-        cte_relations,
-    );
+    if let BroadPublicReadGroupByKind::Expressions(expressions) = &select.group_by.kind {
+        for expr in expressions {
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                expr,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+    }
     if let Some(having) = &select.having {
-        collect_broad_public_read_sql_expr_relation_summary(
+        collect_broad_public_read_relation_summary_in_sql_expr(
             having,
             public_relations,
             lowered_public_relations,
@@ -3158,84 +3888,17 @@ fn collect_broad_public_read_select_relation_summary(
     }
 }
 
-fn collect_broad_public_read_table_with_joins_relation_summary(
-    table: &BroadPublicReadTableWithJoins,
+fn collect_broad_public_read_relation_summary_in_distinct(
+    distinct: &BroadPublicReadDistinct,
     public_relations: &mut BTreeSet<String>,
     lowered_public_relations: &mut BTreeSet<String>,
     internal_relations: &mut BTreeSet<String>,
     external_relations: &mut BTreeSet<String>,
     cte_relations: &mut BTreeSet<String>,
 ) {
-    collect_broad_public_read_table_factor_relation_summary(
-        &table.relation,
-        public_relations,
-        lowered_public_relations,
-        internal_relations,
-        external_relations,
-        cte_relations,
-    );
-    for join in &table.joins {
-        collect_broad_public_read_table_factor_relation_summary(
-            &join.relation,
-            public_relations,
-            lowered_public_relations,
-            internal_relations,
-            external_relations,
-            cte_relations,
-        );
-        for expr in &join.constraint_expressions {
-            collect_broad_public_read_sql_expr_relation_summary(
-                expr,
-                public_relations,
-                lowered_public_relations,
-                internal_relations,
-                external_relations,
-                cte_relations,
-            );
-        }
-    }
-}
-
-fn collect_broad_public_read_projection_item_relation_summary(
-    item: &BroadPublicReadProjectionItem,
-    public_relations: &mut BTreeSet<String>,
-    lowered_public_relations: &mut BTreeSet<String>,
-    internal_relations: &mut BTreeSet<String>,
-    external_relations: &mut BTreeSet<String>,
-    cte_relations: &mut BTreeSet<String>,
-) {
-    if let crate::sql::logical_plan::public_ir::BroadPublicReadProjectionItemKind::Expr {
-        nested_queries,
-        ..
-    } = &item.kind
-    {
-        for query in nested_queries {
-            collect_broad_public_read_nested_query_expr_relation_summary(
-                query,
-                public_relations,
-                lowered_public_relations,
-                internal_relations,
-                external_relations,
-                cte_relations,
-            );
-        }
-    }
-}
-
-fn collect_broad_public_read_group_by_relation_summary(
-    group_by: &BroadPublicReadGroupBy,
-    public_relations: &mut BTreeSet<String>,
-    lowered_public_relations: &mut BTreeSet<String>,
-    internal_relations: &mut BTreeSet<String>,
-    external_relations: &mut BTreeSet<String>,
-    cte_relations: &mut BTreeSet<String>,
-) {
-    if let crate::sql::logical_plan::public_ir::BroadPublicReadGroupByKind::Expressions(
-        expressions,
-    ) = &group_by.kind
-    {
+    if let BroadPublicReadDistinct::On(expressions) = distinct {
         for expr in expressions {
-            collect_broad_public_read_sql_expr_relation_summary(
+            collect_broad_public_read_relation_summary_in_sql_expr(
                 expr,
                 public_relations,
                 lowered_public_relations,
@@ -3247,7 +3910,7 @@ fn collect_broad_public_read_group_by_relation_summary(
     }
 }
 
-fn collect_broad_public_read_order_by_relation_summary(
+fn collect_broad_public_read_relation_summary_in_order_by(
     order_by: &BroadPublicReadOrderBy,
     public_relations: &mut BTreeSet<String>,
     lowered_public_relations: &mut BTreeSet<String>,
@@ -3255,12 +3918,9 @@ fn collect_broad_public_read_order_by_relation_summary(
     external_relations: &mut BTreeSet<String>,
     cte_relations: &mut BTreeSet<String>,
 ) {
-    if let crate::sql::logical_plan::public_ir::BroadPublicReadOrderByKind::Expressions(
-        expressions,
-    ) = &order_by.kind
-    {
+    if let BroadPublicReadOrderByKind::Expressions(expressions) = &order_by.kind {
         for expr in expressions {
-            collect_broad_public_read_sql_expr_relation_summary(
+            collect_broad_public_read_relation_summary_in_sql_expr(
                 &expr.expr,
                 public_relations,
                 lowered_public_relations,
@@ -3272,7 +3932,121 @@ fn collect_broad_public_read_order_by_relation_summary(
     }
 }
 
-fn collect_broad_public_read_limit_clause_relation_summary(
+fn collect_broad_public_read_relation_summary_in_table_with_joins(
+    table: &BroadPublicReadTableWithJoins,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
+    collect_broad_public_read_relation_summary_in_table_factor(
+        &table.relation,
+        public_relations,
+        lowered_public_relations,
+        internal_relations,
+        external_relations,
+        cte_relations,
+    );
+    for join in &table.joins {
+        collect_broad_public_read_relation_summary_in_table_factor(
+            &join.relation,
+            public_relations,
+            lowered_public_relations,
+            internal_relations,
+            external_relations,
+            cte_relations,
+        );
+        collect_broad_public_read_relation_summary_in_join_kind(
+            &join.kind,
+            public_relations,
+            lowered_public_relations,
+            internal_relations,
+            external_relations,
+            cte_relations,
+        );
+    }
+}
+
+fn collect_broad_public_read_relation_summary_in_join_kind(
+    kind: &BroadPublicReadJoinKind,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
+    match kind {
+        BroadPublicReadJoinKind::Join(constraint)
+        | BroadPublicReadJoinKind::Inner(constraint)
+        | BroadPublicReadJoinKind::Left(constraint)
+        | BroadPublicReadJoinKind::LeftOuter(constraint)
+        | BroadPublicReadJoinKind::Right(constraint)
+        | BroadPublicReadJoinKind::RightOuter(constraint)
+        | BroadPublicReadJoinKind::FullOuter(constraint)
+        | BroadPublicReadJoinKind::CrossJoin(constraint)
+        | BroadPublicReadJoinKind::Semi(constraint)
+        | BroadPublicReadJoinKind::LeftSemi(constraint)
+        | BroadPublicReadJoinKind::RightSemi(constraint)
+        | BroadPublicReadJoinKind::Anti(constraint)
+        | BroadPublicReadJoinKind::LeftAnti(constraint)
+        | BroadPublicReadJoinKind::RightAnti(constraint)
+        | BroadPublicReadJoinKind::StraightJoin(constraint) => {
+            collect_broad_public_read_relation_summary_in_join_constraint(
+                constraint,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+        BroadPublicReadJoinKind::CrossApply | BroadPublicReadJoinKind::OuterApply => {}
+        BroadPublicReadJoinKind::AsOf {
+            match_condition,
+            constraint,
+        } => {
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                match_condition,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+            collect_broad_public_read_relation_summary_in_join_constraint(
+                constraint,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+    }
+}
+
+fn collect_broad_public_read_relation_summary_in_join_constraint(
+    constraint: &BroadPublicReadJoinConstraint,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
+    if let BroadPublicReadJoinConstraint::On(expr) = constraint {
+        collect_broad_public_read_relation_summary_in_sql_expr(
+            expr,
+            public_relations,
+            lowered_public_relations,
+            internal_relations,
+            external_relations,
+            cte_relations,
+        );
+    }
+}
+
+fn collect_broad_public_read_relation_summary_in_limit_clause(
     limit_clause: &BroadPublicReadLimitClause,
     public_relations: &mut BTreeSet<String>,
     lowered_public_relations: &mut BTreeSet<String>,
@@ -3287,7 +4061,7 @@ fn collect_broad_public_read_limit_clause_relation_summary(
             limit_by,
         } => {
             if let Some(limit) = limit {
-                collect_broad_public_read_sql_expr_relation_summary(
+                collect_broad_public_read_relation_summary_in_sql_expr(
                     limit,
                     public_relations,
                     lowered_public_relations,
@@ -3297,8 +4071,8 @@ fn collect_broad_public_read_limit_clause_relation_summary(
                 );
             }
             if let Some(offset) = offset {
-                collect_broad_public_read_sql_expr_relation_summary(
-                    offset,
+                collect_broad_public_read_relation_summary_in_sql_expr(
+                    &offset.value,
                     public_relations,
                     lowered_public_relations,
                     internal_relations,
@@ -3307,7 +4081,7 @@ fn collect_broad_public_read_limit_clause_relation_summary(
                 );
             }
             for expr in limit_by {
-                collect_broad_public_read_sql_expr_relation_summary(
+                collect_broad_public_read_relation_summary_in_sql_expr(
                     expr,
                     public_relations,
                     lowered_public_relations,
@@ -3321,7 +4095,7 @@ fn collect_broad_public_read_limit_clause_relation_summary(
             offset,
             limit,
         } => {
-            collect_broad_public_read_sql_expr_relation_summary(
+            collect_broad_public_read_relation_summary_in_sql_expr(
                 offset,
                 public_relations,
                 lowered_public_relations,
@@ -3329,7 +4103,7 @@ fn collect_broad_public_read_limit_clause_relation_summary(
                 external_relations,
                 cte_relations,
             );
-            collect_broad_public_read_sql_expr_relation_summary(
+            collect_broad_public_read_relation_summary_in_sql_expr(
                 limit,
                 public_relations,
                 lowered_public_relations,
@@ -3341,77 +4115,7 @@ fn collect_broad_public_read_limit_clause_relation_summary(
     }
 }
 
-fn collect_broad_public_read_sql_expr_relation_summary(
-    expr: &BroadSqlExpr,
-    public_relations: &mut BTreeSet<String>,
-    lowered_public_relations: &mut BTreeSet<String>,
-    internal_relations: &mut BTreeSet<String>,
-    external_relations: &mut BTreeSet<String>,
-    cte_relations: &mut BTreeSet<String>,
-) {
-    for query in &expr.nested_queries {
-        collect_broad_public_read_nested_query_expr_relation_summary(
-            query,
-            public_relations,
-            lowered_public_relations,
-            internal_relations,
-            external_relations,
-            cte_relations,
-        );
-    }
-}
-
-fn collect_broad_public_read_nested_query_expr_relation_summary(
-    expr: &BroadNestedQueryExpr,
-    public_relations: &mut BTreeSet<String>,
-    lowered_public_relations: &mut BTreeSet<String>,
-    internal_relations: &mut BTreeSet<String>,
-    external_relations: &mut BTreeSet<String>,
-    cte_relations: &mut BTreeSet<String>,
-) {
-    match expr {
-        BroadNestedQueryExpr::ScalarSubquery(query) => {
-            collect_broad_public_read_query_relation_summary(
-                query,
-                public_relations,
-                lowered_public_relations,
-                internal_relations,
-                external_relations,
-                cte_relations,
-            )
-        }
-        BroadNestedQueryExpr::Exists { subquery, .. } => {
-            collect_broad_public_read_query_relation_summary(
-                subquery,
-                public_relations,
-                lowered_public_relations,
-                internal_relations,
-                external_relations,
-                cte_relations,
-            )
-        }
-        BroadNestedQueryExpr::InSubquery { expr, subquery, .. } => {
-            collect_broad_public_read_sql_expr_relation_summary(
-                expr,
-                public_relations,
-                lowered_public_relations,
-                internal_relations,
-                external_relations,
-                cte_relations,
-            );
-            collect_broad_public_read_query_relation_summary(
-                subquery,
-                public_relations,
-                lowered_public_relations,
-                internal_relations,
-                external_relations,
-                cte_relations,
-            );
-        }
-    }
-}
-
-fn collect_broad_public_read_table_factor_relation_summary(
+fn collect_broad_public_read_relation_summary_in_table_factor(
     factor: &BroadPublicReadTableFactor,
     public_relations: &mut BTreeSet<String>,
     lowered_public_relations: &mut BTreeSet<String>,
@@ -3431,7 +4135,7 @@ fn collect_broad_public_read_table_factor_relation_summary(
             )
         }
         BroadPublicReadTableFactor::Derived { subquery, .. } => {
-            collect_broad_public_read_query_relation_summary(
+            collect_broad_public_read_relation_summary_in_query(
                 subquery,
                 public_relations,
                 lowered_public_relations,
@@ -3442,7 +4146,7 @@ fn collect_broad_public_read_table_factor_relation_summary(
         }
         BroadPublicReadTableFactor::NestedJoin {
             table_with_joins, ..
-        } => collect_broad_public_read_table_with_joins_relation_summary(
+        } => collect_broad_public_read_relation_summary_in_table_with_joins(
             table_with_joins,
             public_relations,
             lowered_public_relations,
@@ -3451,6 +4155,400 @@ fn collect_broad_public_read_table_factor_relation_summary(
             cte_relations,
         ),
         BroadPublicReadTableFactor::Other { .. } => {}
+    }
+}
+
+fn collect_broad_public_read_relation_summary_in_sql_expr(
+    expr: &BroadSqlExpr,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
+    match &expr.kind {
+        BroadSqlExprKind::Identifier(_)
+        | BroadSqlExprKind::CompoundIdentifier(_)
+        | BroadSqlExprKind::Value(_)
+        | BroadSqlExprKind::TypedString { .. }
+        | BroadSqlExprKind::Unsupported { .. } => {}
+        BroadSqlExprKind::BinaryOp { left, right, .. }
+        | BroadSqlExprKind::IsDistinctFrom { left, right }
+        | BroadSqlExprKind::IsNotDistinctFrom { left, right } => {
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                left,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                right,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+        BroadSqlExprKind::AnyOp { left, right, .. }
+        | BroadSqlExprKind::AllOp { left, right, .. } => {
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                left,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                right,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+        BroadSqlExprKind::UnaryOp { expr, .. }
+        | BroadSqlExprKind::Nested(expr)
+        | BroadSqlExprKind::IsNull(expr)
+        | BroadSqlExprKind::IsNotNull(expr)
+        | BroadSqlExprKind::IsTrue(expr)
+        | BroadSqlExprKind::IsNotTrue(expr)
+        | BroadSqlExprKind::IsFalse(expr)
+        | BroadSqlExprKind::IsNotFalse(expr)
+        | BroadSqlExprKind::IsUnknown(expr)
+        | BroadSqlExprKind::IsNotUnknown(expr)
+        | BroadSqlExprKind::Cast { expr, .. } => {
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                expr,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+        BroadSqlExprKind::InList { expr, list, .. } => {
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                expr,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+            for item in list {
+                collect_broad_public_read_relation_summary_in_sql_expr(
+                    item,
+                    public_relations,
+                    lowered_public_relations,
+                    internal_relations,
+                    external_relations,
+                    cte_relations,
+                );
+            }
+        }
+        BroadSqlExprKind::InSubquery { expr, subquery, .. } => {
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                expr,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+            collect_broad_public_read_relation_summary_in_query(
+                subquery,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+        BroadSqlExprKind::InUnnest {
+            expr, array_expr, ..
+        } => {
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                expr,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                array_expr,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+        BroadSqlExprKind::Between {
+            expr, low, high, ..
+        } => {
+            for child in [expr.as_ref(), low.as_ref(), high.as_ref()] {
+                collect_broad_public_read_relation_summary_in_sql_expr(
+                    child,
+                    public_relations,
+                    lowered_public_relations,
+                    internal_relations,
+                    external_relations,
+                    cte_relations,
+                );
+            }
+        }
+        BroadSqlExprKind::Like { expr, pattern, .. }
+        | BroadSqlExprKind::ILike { expr, pattern, .. } => {
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                expr,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                pattern,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+        BroadSqlExprKind::Function(function) => {
+            collect_broad_public_read_relation_summary_in_sql_function(
+                function,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+        BroadSqlExprKind::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                collect_broad_public_read_relation_summary_in_sql_expr(
+                    operand,
+                    public_relations,
+                    lowered_public_relations,
+                    internal_relations,
+                    external_relations,
+                    cte_relations,
+                );
+            }
+            for when in conditions {
+                collect_broad_public_read_relation_summary_in_sql_expr(
+                    &when.condition,
+                    public_relations,
+                    lowered_public_relations,
+                    internal_relations,
+                    external_relations,
+                    cte_relations,
+                );
+                collect_broad_public_read_relation_summary_in_sql_expr(
+                    &when.result,
+                    public_relations,
+                    lowered_public_relations,
+                    internal_relations,
+                    external_relations,
+                    cte_relations,
+                );
+            }
+            if let Some(else_result) = else_result {
+                collect_broad_public_read_relation_summary_in_sql_expr(
+                    else_result,
+                    public_relations,
+                    lowered_public_relations,
+                    internal_relations,
+                    external_relations,
+                    cte_relations,
+                );
+            }
+        }
+        BroadSqlExprKind::Exists { subquery, .. } | BroadSqlExprKind::ScalarSubquery(subquery) => {
+            collect_broad_public_read_relation_summary_in_query(
+                subquery,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+        BroadSqlExprKind::Tuple(items) => {
+            for item in items {
+                collect_broad_public_read_relation_summary_in_sql_expr(
+                    item,
+                    public_relations,
+                    lowered_public_relations,
+                    internal_relations,
+                    external_relations,
+                    cte_relations,
+                );
+            }
+        }
+    }
+}
+
+fn collect_broad_public_read_relation_summary_in_sql_function(
+    function: &BroadSqlFunction,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
+    collect_broad_public_read_relation_summary_in_sql_function_arguments(
+        &function.parameters,
+        public_relations,
+        lowered_public_relations,
+        internal_relations,
+        external_relations,
+        cte_relations,
+    );
+    collect_broad_public_read_relation_summary_in_sql_function_arguments(
+        &function.args,
+        public_relations,
+        lowered_public_relations,
+        internal_relations,
+        external_relations,
+        cte_relations,
+    );
+    if let Some(filter) = &function.filter {
+        collect_broad_public_read_relation_summary_in_sql_expr(
+            filter,
+            public_relations,
+            lowered_public_relations,
+            internal_relations,
+            external_relations,
+            cte_relations,
+        );
+    }
+    for expr in &function.within_group {
+        collect_broad_public_read_relation_summary_in_sql_expr(
+            &expr.expr,
+            public_relations,
+            lowered_public_relations,
+            internal_relations,
+            external_relations,
+            cte_relations,
+        );
+    }
+}
+
+fn collect_broad_public_read_relation_summary_in_sql_function_arguments(
+    arguments: &BroadSqlFunctionArguments,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
+    match arguments {
+        BroadSqlFunctionArguments::None => {}
+        BroadSqlFunctionArguments::Subquery(query) => {
+            collect_broad_public_read_relation_summary_in_query(
+                query,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+        BroadSqlFunctionArguments::List(list) => {
+            for arg in &list.args {
+                collect_broad_public_read_relation_summary_in_sql_function_arg(
+                    arg,
+                    public_relations,
+                    lowered_public_relations,
+                    internal_relations,
+                    external_relations,
+                    cte_relations,
+                );
+            }
+        }
+    }
+}
+
+fn collect_broad_public_read_relation_summary_in_sql_function_arg(
+    arg: &BroadSqlFunctionArg,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
+    match arg {
+        BroadSqlFunctionArg::Named { arg, .. } => {
+            collect_broad_public_read_relation_summary_in_sql_function_arg_expr(
+                arg,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+        BroadSqlFunctionArg::ExprNamed { name, arg, .. } => {
+            collect_broad_public_read_relation_summary_in_sql_expr(
+                name,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+            collect_broad_public_read_relation_summary_in_sql_function_arg_expr(
+                arg,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+        BroadSqlFunctionArg::Unnamed(arg) => {
+            collect_broad_public_read_relation_summary_in_sql_function_arg_expr(
+                arg,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+    }
+}
+
+fn collect_broad_public_read_relation_summary_in_sql_function_arg_expr(
+    arg: &BroadSqlFunctionArgExpr,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
+    if let BroadSqlFunctionArgExpr::Expr(expr) = arg {
+        collect_broad_public_read_relation_summary_in_sql_expr(
+            expr,
+            public_relations,
+            lowered_public_relations,
+            internal_relations,
+            external_relations,
+            cte_relations,
+        );
     }
 }
 
@@ -4148,14 +5246,24 @@ fn lowered_read_program_snapshot(program: &LoweredReadProgram) -> LoweredReadPro
 fn lowered_read_statement_snapshot(
     statement: &LoweredReadStatement,
 ) -> LoweredReadStatementSnapshot {
-    LoweredReadStatementSnapshot {
-        shell_statement_sql: statement.shell_statement.to_string(),
-        bindings: lowered_statement_bindings_snapshot(&statement.bindings),
-        relation_render_nodes: statement
-            .relation_render_nodes
-            .iter()
-            .map(terminal_relation_render_node_snapshot)
-            .collect(),
+    let bindings = lowered_statement_bindings_snapshot(&statement.bindings);
+    match &statement.shape {
+        LoweredReadStatementShape::Final { statement_sql } => LoweredReadStatementSnapshot::Final {
+            statement_sql: statement_sql.clone(),
+            bindings,
+        },
+        LoweredReadStatementShape::Template {
+            shell_statement_sql,
+            relation_render_nodes,
+            ..
+        } => LoweredReadStatementSnapshot::Template {
+            shell_statement_sql: shell_statement_sql.clone(),
+            bindings,
+            relation_render_nodes: relation_render_nodes
+                .iter()
+                .map(terminal_relation_render_node_snapshot)
+                .collect(),
+        },
     }
 }
 
