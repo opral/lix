@@ -1,17 +1,19 @@
 use crate::sql::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
+use crate::sql::logical_plan::public_ir::{
+    BroadPublicReadJoin, BroadPublicReadQuery, BroadPublicReadRelation, BroadPublicReadSelect,
+    BroadPublicReadSetExpr, BroadPublicReadStatement, BroadPublicReadTableFactor,
+    BroadPublicReadTableWithJoins, BroadPublicReadWith,
+};
 use crate::sql::optimizer::registry::{
     run_fallible_pass, run_infallible_pass, OptimizerPassMetadata, OptimizerPassOutcome,
     OptimizerPassRegistry, OptimizerPassSettings, OptimizerPassTrace,
 };
-use crate::sql::physical_plan::lowerer::{
-    rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id_and_layouts,
-    summarize_bound_public_read_statement_with_registry, BroadPublicRelationSummary,
-};
-use crate::sql::physical_plan::TerminalRelationRenderNode;
+#[cfg(test)]
+use crate::sql::physical_plan::lowerer::bind_broad_public_read_statement_with_registry;
+use crate::sql::physical_plan::lowerer::broad_public_relation_supports_terminal_render;
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
-use sqlparser::ast::Statement;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DirectExecutionStrategyDecision {
@@ -20,9 +22,8 @@ pub(crate) struct DirectExecutionStrategyDecision {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct OptimizedPublicReadStatement {
-    pub(crate) shell_statement: Statement,
-    pub(crate) relation_render_nodes: Vec<TerminalRelationRenderNode>,
+pub(crate) struct OptimizedBroadPublicRead {
+    pub(crate) broad_statement: BroadPublicReadStatement,
     pub(crate) pass_traces: Vec<OptimizerPassTrace>,
 }
 
@@ -35,7 +36,7 @@ const DIRECT_HISTORY_STRATEGY_PASS: OptimizerPassMetadata = OptimizerPassMetadat
 const BROAD_SURFACE_REWRITE_PASS: OptimizerPassMetadata = OptimizerPassMetadata {
     name: "public-read.rewrite-supported-surfaces",
     order: 20,
-    description: "rewrite broad public surface references into derived lowered relations",
+    description: "rewrite typed broad public surface relations into lowered relations",
 };
 
 const PUBLIC_READ_REGISTRY: OptimizerPassRegistry = OptimizerPassRegistry {
@@ -106,13 +107,20 @@ fn surface_variant_name(variant: SurfaceVariant) -> &'static str {
 
 #[cfg(test)]
 pub(crate) fn optimize_broad_public_read_statement(
-    statement: &Statement,
+    statement: &sqlparser::ast::Statement,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
-) -> Result<OptimizedPublicReadStatement, LixError> {
+) -> Result<OptimizedBroadPublicRead, LixError> {
+    let broad_statement = bind_broad_public_read_statement_with_registry(statement, registry)?
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "broad optimizer requires a typed broad public-read statement",
+            )
+        })?;
     optimize_broad_public_read_statement_with_known_live_layouts(
-        statement,
+        &broad_statement,
         registry,
         dialect,
         active_version_id,
@@ -121,12 +129,12 @@ pub(crate) fn optimize_broad_public_read_statement(
 }
 
 pub(crate) fn optimize_broad_public_read_statement_with_known_live_layouts(
-    statement: &Statement,
+    statement: &BroadPublicReadStatement,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-) -> Result<OptimizedPublicReadStatement, LixError> {
+) -> Result<OptimizedBroadPublicRead, LixError> {
     optimize_broad_public_read_statement_with_settings(
         statement,
         registry,
@@ -138,66 +146,541 @@ pub(crate) fn optimize_broad_public_read_statement_with_known_live_layouts(
 }
 
 fn optimize_broad_public_read_statement_with_settings(
-    statement: &Statement,
+    statement: &BroadPublicReadStatement,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
     settings: &OptimizerPassSettings,
-) -> Result<OptimizedPublicReadStatement, LixError> {
+) -> Result<OptimizedBroadPublicRead, LixError> {
     let metadata = public_read_pass_registry().passes[1];
-    let before_summary = summarize_bound_public_read_statement_with_registry(statement, registry)?;
-    let mut rewritten_statement = statement.clone();
-    let mut relation_render_nodes = Vec::new();
+    let before_summary = summarize_broad_public_read_statement(statement);
+    let mut optimized_broad_statement = statement.clone();
     let trace = run_fallible_pass(metadata, settings, || {
-        let rewritten = rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id_and_layouts(
-            &rewritten_statement,
+        optimized_broad_statement = optimize_broad_public_read_statement_relations(
+            statement,
             registry,
             dialect,
             active_version_id,
             known_live_layouts,
         )?;
-        rewritten_statement = rewritten.shell_statement;
-        relation_render_nodes = rewritten.relation_render_nodes;
-        let changed = rewritten_statement != *statement || !relation_render_nodes.is_empty();
+        let changed = optimized_broad_statement != *statement;
+        let lowered_summary = summarize_lowered_public_relations(&optimized_broad_statement);
         Ok::<OptimizerPassOutcome, LixError>(OptimizerPassOutcome {
             changed,
-            diagnostics: broad_rewrite_diagnostics(before_summary.as_ref(), changed),
+            diagnostics: broad_rewrite_diagnostics(&before_summary, &lowered_summary, changed),
         })
     })?;
 
-    Ok(OptimizedPublicReadStatement {
-        shell_statement: rewritten_statement,
-        relation_render_nodes,
+    Ok(OptimizedBroadPublicRead {
+        broad_statement: optimized_broad_statement,
         pass_traces: vec![trace],
     })
 }
 
 fn broad_rewrite_diagnostics(
-    summary: Option<&BroadPublicRelationSummary>,
+    summary: &BTreeSet<String>,
+    lowered_summary: &BTreeSet<String>,
     changed: bool,
 ) -> Vec<String> {
     let mut diagnostics = Vec::new();
-    match summary {
-        Some(summary) if !summary.public_relations.is_empty() => {
-            diagnostics.push(format!(
-                "public relations: {}",
-                summary
-                    .public_relations
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        _ => diagnostics.push("no public relations matched broad surface rewrite".to_string()),
+    if summary.is_empty() {
+        diagnostics.push("no typed public relations matched broad optimizer".to_string());
+    } else {
+        diagnostics.push(format!(
+            "public relations: {}",
+            summary.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !lowered_summary.is_empty() {
+        diagnostics.push(format!(
+            "lowered public relations: {}",
+            lowered_summary
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     if changed {
-        diagnostics.push("rewrote public relations into lowered derived relations".to_string());
+        diagnostics
+            .push("rewrote typed broad public relations into lowered broad relations".to_string());
     } else {
-        diagnostics.push("statement already lowered or not rewriteable".to_string());
+        diagnostics.push("typed broad statement was already lowered or not renderable".to_string());
     }
     diagnostics
+}
+
+fn optimize_broad_public_read_statement_relations(
+    statement: &BroadPublicReadStatement,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<BroadPublicReadStatement, LixError> {
+    match statement {
+        BroadPublicReadStatement::Query(query) => Ok(BroadPublicReadStatement::Query(
+            optimize_broad_public_read_query(
+                query,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?,
+        )),
+        BroadPublicReadStatement::Explain {
+            original,
+            statement,
+        } => Ok(BroadPublicReadStatement::Explain {
+            original: original.clone(),
+            statement: Box::new(optimize_broad_public_read_statement_relations(
+                statement,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+        }),
+    }
+}
+
+fn optimize_broad_public_read_query(
+    query: &BroadPublicReadQuery,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<BroadPublicReadQuery, LixError> {
+    Ok(BroadPublicReadQuery {
+        original: query.original.clone(),
+        with: query
+            .with
+            .as_ref()
+            .map(|with| {
+                optimize_broad_public_read_with(
+                    with,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .transpose()?,
+        body: optimize_broad_public_read_set_expr(
+            &query.body,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?,
+    })
+}
+
+fn optimize_broad_public_read_with(
+    with: &BroadPublicReadWith,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<BroadPublicReadWith, LixError> {
+    Ok(BroadPublicReadWith {
+        original: with.original.clone(),
+        cte_tables: with
+            .cte_tables
+            .iter()
+            .map(|query| {
+                optimize_broad_public_read_query(
+                    query,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn optimize_broad_public_read_set_expr(
+    expr: &BroadPublicReadSetExpr,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<BroadPublicReadSetExpr, LixError> {
+    match expr {
+        BroadPublicReadSetExpr::Select(select) => Ok(BroadPublicReadSetExpr::Select(
+            optimize_broad_public_read_select(
+                select,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?,
+        )),
+        BroadPublicReadSetExpr::Query(query) => Ok(BroadPublicReadSetExpr::Query(Box::new(
+            optimize_broad_public_read_query(
+                query,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?,
+        ))),
+        BroadPublicReadSetExpr::SetOperation {
+            original,
+            left,
+            right,
+        } => Ok(BroadPublicReadSetExpr::SetOperation {
+            original: original.clone(),
+            left: Box::new(optimize_broad_public_read_set_expr(
+                left,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+            right: Box::new(optimize_broad_public_read_set_expr(
+                right,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+        }),
+        BroadPublicReadSetExpr::Table { original, relation } => Ok(BroadPublicReadSetExpr::Table {
+            original: original.clone(),
+            relation: optimize_broad_public_read_relation(
+                relation,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?,
+        }),
+        BroadPublicReadSetExpr::Other(other) => Ok(BroadPublicReadSetExpr::Other(other.clone())),
+    }
+}
+
+fn optimize_broad_public_read_select(
+    select: &BroadPublicReadSelect,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<BroadPublicReadSelect, LixError> {
+    Ok(BroadPublicReadSelect {
+        original: select.original.clone(),
+        from: select
+            .from
+            .iter()
+            .map(|table| {
+                optimize_broad_public_read_table_with_joins(
+                    table,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn optimize_broad_public_read_table_with_joins(
+    table: &BroadPublicReadTableWithJoins,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<BroadPublicReadTableWithJoins, LixError> {
+    Ok(BroadPublicReadTableWithJoins {
+        original: table.original.clone(),
+        relation: optimize_broad_public_read_table_factor(
+            &table.relation,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?,
+        joins: table
+            .joins
+            .iter()
+            .map(|join| {
+                optimize_broad_public_read_join(
+                    join,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn optimize_broad_public_read_join(
+    join: &BroadPublicReadJoin,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<BroadPublicReadJoin, LixError> {
+    Ok(BroadPublicReadJoin {
+        original: join.original.clone(),
+        relation: optimize_broad_public_read_table_factor(
+            &join.relation,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?,
+    })
+}
+
+fn optimize_broad_public_read_table_factor(
+    factor: &BroadPublicReadTableFactor,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<BroadPublicReadTableFactor, LixError> {
+    match factor {
+        BroadPublicReadTableFactor::Table { original, relation } => {
+            Ok(BroadPublicReadTableFactor::Table {
+                original: original.clone(),
+                relation: optimize_broad_public_read_relation(
+                    relation,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )?,
+            })
+        }
+        BroadPublicReadTableFactor::Derived { original, subquery } => {
+            Ok(BroadPublicReadTableFactor::Derived {
+                original: original.clone(),
+                subquery: Box::new(optimize_broad_public_read_query(
+                    subquery,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )?),
+            })
+        }
+        BroadPublicReadTableFactor::NestedJoin {
+            original,
+            table_with_joins,
+        } => Ok(BroadPublicReadTableFactor::NestedJoin {
+            original: original.clone(),
+            table_with_joins: Box::new(optimize_broad_public_read_table_with_joins(
+                table_with_joins,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+        }),
+        BroadPublicReadTableFactor::Other(other) => {
+            Ok(BroadPublicReadTableFactor::Other(other.clone()))
+        }
+    }
+}
+
+fn optimize_broad_public_read_relation(
+    relation: &BroadPublicReadRelation,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<BroadPublicReadRelation, LixError> {
+    match relation {
+        BroadPublicReadRelation::Public(binding)
+            if broad_public_relation_supports_terminal_render(
+                binding,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )? =>
+        {
+            Ok(BroadPublicReadRelation::LoweredPublic(binding.clone()))
+        }
+        _ => Ok(relation.clone()),
+    }
+}
+
+fn summarize_broad_public_read_statement(statement: &BroadPublicReadStatement) -> BTreeSet<String> {
+    let mut relations = BTreeSet::new();
+    collect_public_relations(statement, &mut relations);
+    relations
+}
+
+fn summarize_lowered_public_relations(statement: &BroadPublicReadStatement) -> BTreeSet<String> {
+    let mut relations = BTreeSet::new();
+    collect_lowered_public_relations(statement, &mut relations);
+    relations
+}
+
+fn collect_public_relations(statement: &BroadPublicReadStatement, out: &mut BTreeSet<String>) {
+    match statement {
+        BroadPublicReadStatement::Query(query) => collect_public_relations_in_query(query, out),
+        BroadPublicReadStatement::Explain { statement, .. } => {
+            collect_public_relations(statement, out)
+        }
+    }
+}
+
+fn collect_public_relations_in_query(query: &BroadPublicReadQuery, out: &mut BTreeSet<String>) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            collect_public_relations_in_query(cte, out);
+        }
+    }
+    collect_public_relations_in_set_expr(&query.body, out);
+}
+
+fn collect_public_relations_in_set_expr(expr: &BroadPublicReadSetExpr, out: &mut BTreeSet<String>) {
+    match expr {
+        BroadPublicReadSetExpr::Select(select) => {
+            for table in &select.from {
+                collect_public_relations_in_table_with_joins(table, out);
+            }
+        }
+        BroadPublicReadSetExpr::Query(query) => collect_public_relations_in_query(query, out),
+        BroadPublicReadSetExpr::SetOperation { left, right, .. } => {
+            collect_public_relations_in_set_expr(left, out);
+            collect_public_relations_in_set_expr(right, out);
+        }
+        BroadPublicReadSetExpr::Table { relation, .. } => {
+            collect_public_relation_name(relation, out);
+        }
+        BroadPublicReadSetExpr::Other(_) => {}
+    }
+}
+
+fn collect_public_relations_in_table_with_joins(
+    table: &BroadPublicReadTableWithJoins,
+    out: &mut BTreeSet<String>,
+) {
+    collect_public_relations_in_table_factor(&table.relation, out);
+    for join in &table.joins {
+        collect_public_relations_in_table_factor(&join.relation, out);
+    }
+}
+
+fn collect_public_relations_in_table_factor(
+    factor: &BroadPublicReadTableFactor,
+    out: &mut BTreeSet<String>,
+) {
+    match factor {
+        BroadPublicReadTableFactor::Table { relation, .. } => {
+            collect_public_relation_name(relation, out);
+        }
+        BroadPublicReadTableFactor::Derived { subquery, .. } => {
+            collect_public_relations_in_query(subquery, out);
+        }
+        BroadPublicReadTableFactor::NestedJoin {
+            table_with_joins, ..
+        } => collect_public_relations_in_table_with_joins(table_with_joins, out),
+        BroadPublicReadTableFactor::Other(_) => {}
+    }
+}
+
+fn collect_public_relation_name(relation: &BroadPublicReadRelation, out: &mut BTreeSet<String>) {
+    match relation {
+        BroadPublicReadRelation::Public(binding)
+        | BroadPublicReadRelation::LoweredPublic(binding) => {
+            out.insert(binding.descriptor.public_name.clone());
+        }
+        BroadPublicReadRelation::Internal(_)
+        | BroadPublicReadRelation::External(_)
+        | BroadPublicReadRelation::Cte(_) => {}
+    }
+}
+
+fn collect_lowered_public_relations(
+    statement: &BroadPublicReadStatement,
+    out: &mut BTreeSet<String>,
+) {
+    match statement {
+        BroadPublicReadStatement::Query(query) => {
+            collect_lowered_public_relations_in_query(query, out)
+        }
+        BroadPublicReadStatement::Explain { statement, .. } => {
+            collect_lowered_public_relations(statement, out)
+        }
+    }
+}
+
+fn collect_lowered_public_relations_in_query(
+    query: &BroadPublicReadQuery,
+    out: &mut BTreeSet<String>,
+) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            collect_lowered_public_relations_in_query(cte, out);
+        }
+    }
+    collect_lowered_public_relations_in_set_expr(&query.body, out);
+}
+
+fn collect_lowered_public_relations_in_set_expr(
+    expr: &BroadPublicReadSetExpr,
+    out: &mut BTreeSet<String>,
+) {
+    match expr {
+        BroadPublicReadSetExpr::Select(select) => {
+            for table in &select.from {
+                collect_lowered_public_relations_in_table_with_joins(table, out);
+            }
+        }
+        BroadPublicReadSetExpr::Query(query) => {
+            collect_lowered_public_relations_in_query(query, out)
+        }
+        BroadPublicReadSetExpr::SetOperation { left, right, .. } => {
+            collect_lowered_public_relations_in_set_expr(left, out);
+            collect_lowered_public_relations_in_set_expr(right, out);
+        }
+        BroadPublicReadSetExpr::Table { relation, .. } => {
+            if let BroadPublicReadRelation::LoweredPublic(binding) = relation {
+                out.insert(binding.descriptor.public_name.clone());
+            }
+        }
+        BroadPublicReadSetExpr::Other(_) => {}
+    }
+}
+
+fn collect_lowered_public_relations_in_table_with_joins(
+    table: &BroadPublicReadTableWithJoins,
+    out: &mut BTreeSet<String>,
+) {
+    collect_lowered_public_relations_in_table_factor(&table.relation, out);
+    for join in &table.joins {
+        collect_lowered_public_relations_in_table_factor(&join.relation, out);
+    }
+}
+
+fn collect_lowered_public_relations_in_table_factor(
+    factor: &BroadPublicReadTableFactor,
+    out: &mut BTreeSet<String>,
+) {
+    match factor {
+        BroadPublicReadTableFactor::Table { relation, .. } => {
+            if let BroadPublicReadRelation::LoweredPublic(binding) = relation {
+                out.insert(binding.descriptor.public_name.clone());
+            }
+        }
+        BroadPublicReadTableFactor::Derived { subquery, .. } => {
+            collect_lowered_public_relations_in_query(subquery, out);
+        }
+        BroadPublicReadTableFactor::NestedJoin {
+            table_with_joins, ..
+        } => collect_lowered_public_relations_in_table_with_joins(table_with_joins, out),
+        BroadPublicReadTableFactor::Other(_) => {}
+    }
 }
 
 fn is_direct_only_history_surface(binding: &SurfaceBinding) -> bool {
@@ -215,6 +698,10 @@ mod tests {
         public_read_pass_registry,
     };
     use crate::sql::catalog::SurfaceRegistry;
+    use crate::sql::logical_plan::public_ir::{
+        BroadPublicReadRelation, BroadPublicReadSetExpr, BroadPublicReadStatement,
+        BroadPublicReadTableFactor,
+    };
     use crate::sql::parser::parse_sql_statements;
 
     #[test]
@@ -245,7 +732,7 @@ mod tests {
             &statement,
             &SurfaceRegistry::with_builtin_surfaces(),
             crate::SqlDialect::Sqlite,
-            None,
+            Some("main"),
         )
         .expect("broad rewrite should succeed");
 
@@ -259,6 +746,50 @@ mod tests {
             .diagnostics
             .iter()
             .any(|line| line.contains("public relations")));
+        let BroadPublicReadStatement::Query(query) = &optimized.broad_statement else {
+            panic!("optimizer should keep a broad query statement");
+        };
+        let BroadPublicReadSetExpr::Select(select) = &query.body else {
+            panic!("optimizer should keep the broad select body");
+        };
+        let BroadPublicReadTableFactor::Table { relation, .. } = &select.from[0].relation else {
+            panic!("expected optimizer to keep the root as a table factor");
+        };
+        let BroadPublicReadRelation::LoweredPublic(binding) = relation else {
+            panic!("optimizer should lower the public surface relation");
+        };
+        assert_eq!(binding.descriptor.public_name, "lix_key_value");
+    }
+
+    #[test]
+    fn broad_rewrite_keeps_active_version_surfaces_unlowered_without_version_input() {
+        let statement = parse_sql_statements("SELECT key FROM lix_key_value")
+            .expect("sql should parse")
+            .into_iter()
+            .next()
+            .expect("statement should exist");
+        let optimized = optimize_broad_public_read_statement(
+            &statement,
+            &SurfaceRegistry::with_builtin_surfaces(),
+            crate::SqlDialect::Sqlite,
+            None,
+        )
+        .expect("broad rewrite should still produce a typed result");
+
+        let BroadPublicReadStatement::Query(query) = &optimized.broad_statement else {
+            panic!("optimizer should keep a broad query statement");
+        };
+        let BroadPublicReadSetExpr::Select(select) = &query.body else {
+            panic!("optimizer should keep the broad select body");
+        };
+        let BroadPublicReadTableFactor::Table { relation, .. } = &select.from[0].relation else {
+            panic!("expected optimizer to keep the root as a table factor");
+        };
+        let BroadPublicReadRelation::Public(binding) = relation else {
+            panic!("optimizer should not lower active-version public surfaces without a version");
+        };
+        assert_eq!(binding.descriptor.public_name, "lix_key_value");
+        assert!(!optimized.pass_traces[0].changed);
     }
 
     #[test]
