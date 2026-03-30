@@ -24,6 +24,7 @@ pub struct ReadContext<'a> {
 }
 
 impl<'a> ReadContext<'a> {
+    #[cfg(test)]
     pub(crate) fn new(
         tracked: &'a dyn TrackedReadView,
         untracked: &'a dyn UntrackedReadView,

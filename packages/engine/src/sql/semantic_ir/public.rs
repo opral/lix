@@ -18,7 +18,7 @@ use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     build_effective_state, EffectiveStatePlan, EffectiveStateRequest,
 };
 use crate::sql::semantic_ir::semantics::write_analysis::{analyze_write, WriteAnalysisError};
-use crate::sql::services::state_reader::load_committed_version_head_commit_id;
+use crate::version::context::load_target_version_context_with_backend;
 use crate::{LixBackend, LixError};
 use sqlparser::ast::{
     BinaryOperator, Expr, Ident, SetExpr, Statement, TableFactor, Value as SqlValue,
@@ -345,9 +345,15 @@ async fn maybe_bind_active_history_root(
         return Some(structured_read);
     }
 
-    let root_commit_id = load_committed_version_head_commit_id(backend, active_version_id)
-        .await
-        .ok()??;
+    let root_commit_id = load_target_version_context_with_backend(
+        backend,
+        Some(active_version_id),
+        "active_version_id",
+    )
+    .await
+    .ok()??
+    .history_root_commit_id()
+    .to_string();
     let root_predicate = Expr::BinaryOp {
         left: Box::new(Expr::Identifier(Ident::new("lixcol_root_commit_id"))),
         op: BinaryOperator::Eq,

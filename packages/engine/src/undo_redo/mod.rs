@@ -8,13 +8,15 @@ use std::collections::BTreeMap;
 
 use crate::canonical::readers::{
     load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,
-    load_committed_version_head_commit_id,
     load_exact_committed_state_row_from_commit_with_executor, CommitLineageEntry,
     CommitQueryExecutor, CommittedCanonicalChangeRow, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
 use crate::canonical::ProposedDomainChange;
 use crate::state::stream::StateCommitStreamOperation;
+use crate::version::context::{
+    load_version_context_with_executor, ResolvedVersionTarget, VersionContextSource,
+};
 use crate::{LixBackendTransaction, LixError, SessionTransaction};
 
 pub(crate) use init::init;
@@ -35,12 +37,14 @@ pub(crate) async fn resolve_target_version_id_in_session(
     tx: &mut SessionTransaction<'_>,
     requested_version_id: Option<&str>,
 ) -> Result<String, LixError> {
-    if let Some(version_id) = requested_version_id {
-        ensure_version_exists_in_session(tx, version_id).await?;
-        return Ok(version_id.to_string());
-    }
-
-    Ok(tx.context.active_version_id.clone())
+    let target = crate::version::context::resolve_target_version_in_transaction(
+        tx,
+        requested_version_id,
+        "version_id",
+    )
+    .await?;
+    ensure_version_exists_in_session(tx, &target.version_id).await?;
+    Ok(target.version_id)
 }
 
 async fn ensure_version_exists_in_session(
@@ -55,13 +59,7 @@ async fn ensure_version_exists_with_transaction(
     version_id: &str,
 ) -> Result<(), LixError> {
     let mut executor = crate::engine::TransactionBackendAdapter::new(transaction);
-    if !crate::live_state::version_exists_with_executor(&mut executor, version_id).await? {
-        return Err(LixError::unknown(format!(
-            "version '{}' does not exist",
-            version_id
-        )));
-    }
-    Ok(())
+    crate::version::context::ensure_version_exists_with_executor(&mut executor, version_id).await
 }
 
 pub(crate) async fn rebuild_semantic_undo_redo_stacks(
@@ -69,12 +67,19 @@ pub(crate) async fn rebuild_semantic_undo_redo_stacks(
     version_id: &str,
 ) -> Result<SemanticUndoRedoStacks, LixError> {
     let mut executor = crate::engine::TransactionBackendAdapter::new(transaction);
-    let Some(head_commit_id) =
-        load_committed_version_head_commit_id(&mut executor, version_id).await?
+    let Some(version_context) = load_version_context_with_executor(
+        &mut executor,
+        ResolvedVersionTarget {
+            version_id: version_id.to_string(),
+            source: VersionContextSource::ExplicitArgument,
+        },
+    )
+    .await?
     else {
         return Ok(SemanticUndoRedoStacks::default());
     };
-    let lineage = load_linear_commit_lineage(&mut executor, &head_commit_id).await?;
+    let lineage =
+        load_linear_commit_lineage(&mut executor, version_context.head_commit_id()).await?;
     let operations =
         store::load_undo_redo_operations_for_version_in_transaction(transaction, version_id)
             .await?;

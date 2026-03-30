@@ -55,6 +55,20 @@ pub(crate) async fn persist_workspace_active_account_ids(
     persist_workspace_metadata_value(backend, WORKSPACE_ACTIVE_ACCOUNT_IDS_KEY, &encoded).await
 }
 
+pub(crate) async fn persist_workspace_selectors(
+    backend: &dyn LixBackend,
+    active_version_id: Option<&str>,
+    active_account_ids: Option<&[String]>,
+) -> Result<(), LixError> {
+    if let Some(active_version_id) = active_version_id {
+        persist_workspace_active_version_id(backend, active_version_id).await?;
+    }
+    if let Some(active_account_ids) = active_account_ids {
+        persist_workspace_active_account_ids(backend, active_account_ids).await?;
+    }
+    Ok(())
+}
+
 async fn load_workspace_metadata_value(
     backend: &dyn LixBackend,
     key: &str,

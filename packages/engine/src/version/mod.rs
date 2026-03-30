@@ -7,6 +7,8 @@ use crate::schema::builtin::{
 };
 use crate::LixError;
 
+#[allow(dead_code)]
+pub(crate) mod context;
 mod create_version;
 mod init;
 mod merge_version;
