@@ -5,7 +5,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
-use crate::live_state::projection::local_version_head_write_row;
 use crate::live_state::ReplayCursor;
 use crate::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::{
@@ -277,7 +276,7 @@ pub(crate) async fn seed_local_version_head(
 ) -> Result<(), LixError> {
     commit_untracked_rows(
         backend,
-        vec![local_version_head_write_row(
+        vec![crate::live_state::testing::local_version_head_write_row(
             version_id, commit_id, timestamp,
         )],
     )

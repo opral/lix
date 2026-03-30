@@ -4,7 +4,7 @@ use crate::backend::prepared::PreparedBatch;
 use crate::engine::TransactionBackendAdapter;
 use crate::errors::classification::is_missing_relation_error;
 use crate::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
-use crate::live_state::key_value_queries::{
+use crate::key_value::{
     build_ensure_runtime_sequence_row_sql as build_ensure_runtime_sequence_row_sql_impl,
     build_lock_runtime_sequence_row_sql as build_lock_runtime_sequence_row_sql_impl,
     build_update_runtime_sequence_highest_sql as build_update_runtime_sequence_highest_sql_impl,

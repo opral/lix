@@ -1,4 +1,4 @@
-use crate::init::seed::{quote_ident, system_directory_name, text_value};
+use crate::init::seed::{system_directory_name, text_value};
 use crate::init::tables::{add_column_if_missing, execute_init_statements};
 use crate::init::InitExecutor;
 use crate::Value;
@@ -141,23 +141,16 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         path: &str,
         parent_id: Option<&str>,
     ) -> Result<String, LixError> {
-        let table_name = quote_ident(&crate::live_state::schema_access::tracked_relation_name(
-            "lix_directory_descriptor",
-        ));
         let name = system_directory_name(path);
         let existing = match parent_id {
             Some(parent_id) => {
-                self.execute_backend(
-                    &format!(
-                        "SELECT entity_id \
-                         FROM {table_name} \
-                         WHERE file_id = 'lix' \
-                           AND version_id = 'global' \
-                           AND name = $1 \
-                           AND parent_id = $2 \
-                         ORDER BY updated_at DESC, created_at DESC \
-                         LIMIT 1",
-                    ),
+                self.execute_internal(
+                    "SELECT id \
+                     FROM lix_directory_by_version \
+                     WHERE lixcol_version_id = 'global' \
+                       AND name = $1 \
+                       AND parent_id = $2 \
+                     LIMIT 1",
                     &[
                         Value::Text(name.clone()),
                         Value::Text(parent_id.to_string()),
@@ -166,23 +159,26 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 .await?
             }
             None => {
-                self.execute_backend(
-                    &format!(
-                        "SELECT entity_id \
-                         FROM {table_name} \
-                         WHERE file_id = 'lix' \
-                           AND version_id = 'global' \
-                           AND name = $1 \
-                           AND parent_id IS NULL \
-                         ORDER BY updated_at DESC, created_at DESC \
-                         LIMIT 1"
-                    ),
+                self.execute_internal(
+                    "SELECT id \
+                     FROM lix_directory_by_version \
+                     WHERE lixcol_version_id = 'global' \
+                       AND name = $1 \
+                       AND parent_id IS NULL \
+                     LIMIT 1",
                     &[Value::Text(name.clone())],
                 )
                 .await?
             }
         };
-        if let Some(row) = existing.rows.first() {
+        let [statement] = existing.statements.as_slice() else {
+            return Err(crate::errors::unexpected_statement_count_error(
+                "system directory existence query",
+                1,
+                existing.statements.len(),
+            ));
+        };
+        if let Some(row) = statement.rows.first() {
             return text_value(row.first(), "system directory entity_id");
         }
 

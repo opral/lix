@@ -184,11 +184,7 @@ async fn ensure_surface_read_freshness(
         return Ok(());
     }
 
-    let status =
-        crate::live_state::projection::status::load_live_state_projection_status_with_backend(
-            backend,
-        )
-        .await?;
+    let status = crate::live_state::load_live_state_projection_status_with_backend(backend).await?;
     if matches!(
         status.mode,
         crate::live_state::LiveStateMode::Ready | crate::live_state::LiveStateMode::Bootstrapping
@@ -217,10 +213,7 @@ async fn ensure_surface_read_freshness_in_transaction(
 
     let backend = crate::engine::TransactionBackendAdapter::new(transaction);
     let status =
-        crate::live_state::projection::status::load_live_state_projection_status_with_backend(
-            &backend,
-        )
-        .await?;
+        crate::live_state::load_live_state_projection_status_with_backend(&backend).await?;
     if status.mode == crate::live_state::LiveStateMode::Bootstrapping {
         return Ok(());
     }

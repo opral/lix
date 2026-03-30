@@ -17,7 +17,7 @@ use async_trait::async_trait;
 
 use crate::backend::QueryExecutor;
 use crate::change_view::TrackedDomainChangeView;
-use crate::live_state::shared::identity::RowIdentity;
+use crate::live_state::RowIdentity;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) const WORKSPACE_WRITER_KEY_TABLE: &str = "lix_internal_workspace_writer_key";
@@ -327,7 +327,7 @@ mod tests {
         load_workspace_writer_key_annotations_for_versions,
         persist_workspace_writer_key_annotation,
     };
-    use crate::live_state::shared::identity::RowIdentity;
+    use crate::live_state::RowIdentity;
     use crate::test_support::boot_test_engine;
     use std::collections::BTreeSet;
 

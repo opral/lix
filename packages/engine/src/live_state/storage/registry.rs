@@ -143,8 +143,8 @@ async fn load_live_table_layout_with_provider(
 fn requirement_from_registration(
     registration: &SchemaRegistration,
 ) -> Result<LiveTableRequirement, LixError> {
-    let layout = if let Some(layout) = registration.layout_override() {
-        Some(layout.clone())
+    let layout = if let Some(schema_definition) = registration.schema_definition_override() {
+        Some(live_table_layout_from_schema(schema_definition)?)
     } else {
         registration
             .registered_snapshot()

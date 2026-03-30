@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::{
-    coalesce_live_table_requirements, SchemaRegistration, SchemaRegistrationSet,
+    coalesce_live_table_requirements, RowIdentity, SchemaRegistration, SchemaRegistrationSet,
 };
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::sql::executor::{CompiledExecution, CompiledInternalExecution};

@@ -1,5 +1,4 @@
-use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::shared::identity::RowIdentity;
+use crate::live_state::{RowIdentity, ScanConstraint, ScanField, ScanOperator};
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
 };

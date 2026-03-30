@@ -22,8 +22,7 @@ pub(crate) const LIVE_STATE_STATUS_CREATE_TABLE_SQL: &str =
      updated_at TEXT NOT NULL\
      )";
 
-pub(crate) const LIVE_STATE_STATUS_SEED_ROW_SQL: &str =
-    "INSERT INTO lix_internal_live_state_status (\
+pub(crate) const LIVE_STATE_STATUS_SEED_ROW_SQL: &str = "INSERT INTO lix_internal_live_state_status (\
      singleton_id, mode, latest_change_id, latest_change_created_at, applied_committed_frontier, schema_epoch, updated_at\
      ) \
      SELECT 1, 'uninitialized', NULL, NULL, NULL, '1', '1970-01-01T00:00:00Z' \
@@ -659,7 +658,7 @@ fn live_state_status_row_from_values(row: &[Value]) -> Result<LiveStateStatusRow
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "live state replay cursor is partially populated",
-            ))
+            ));
         }
     };
 
@@ -1090,13 +1089,11 @@ mod tests {
             .await
             .expect("replay-boundary update should succeed");
         assert!(
-            backend
-                .executed_sql()
-                .iter()
-                .any(|sql| sql.contains("INSERT INTO lix_internal_live_state_status ")
-                    && sql.contains("'needs_rebuild'")
-                    && sql.contains("'change-2'")
-                    && sql.contains("commit-1")),
+            backend.executed_sql().iter().any(|sql| sql
+                .contains("INSERT INTO lix_internal_live_state_status ")
+                && sql.contains("'needs_rebuild'")
+                && sql.contains("'change-2'")
+                && sql.contains("commit-1")),
             "non-ready live-state status should keep a durable replay boundary instead of claiming readiness",
         );
         transaction

@@ -186,6 +186,113 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_current_and_by_version_reads_survive_boundary_sealing,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.initialize().await.unwrap();
+
+        register_test_schema(&engine).await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
+
+        insert_state_row(
+            &engine,
+            "entity-a",
+            "version-a",
+            "{\"value\":\"tracked-a\"}",
+            false,
+        )
+        .await;
+        insert_state_row(
+            &engine,
+            "entity-a",
+            "version-a",
+            "{\"value\":\"untracked-a\"}",
+            true,
+        )
+        .await;
+        insert_state_row(
+            &engine,
+            "entity-b",
+            "version-b",
+            "{\"value\":\"tracked-b\"}",
+            false,
+        )
+        .await;
+
+        engine
+            .switch_version("version-a".to_string())
+            .await
+            .unwrap();
+
+        let current = engine
+            .execute(
+                "SELECT entity_id, snapshot_content \
+                 FROM lix_state \
+                 WHERE schema_key = 'test_state_schema' \
+                 ORDER BY entity_id",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic_normalized(current.statements[0].rows.clone());
+        assert_eq!(current.statements[0].rows.len(), 1);
+        assert_text(&current.statements[0].rows[0][0], "entity-a");
+        assert_text(
+            &current.statements[0].rows[0][1],
+            "{\"value\":\"untracked-a\"}",
+        );
+
+        let explicit = engine
+            .execute(
+                "SELECT entity_id, snapshot_content \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND version_id = 'version-b' \
+                 ORDER BY entity_id",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic_normalized(explicit.statements[0].rows.clone());
+        assert_eq!(explicit.statements[0].rows.len(), 1);
+        assert_text(&explicit.statements[0].rows[0][0], "entity-b");
+        assert_text(
+            &explicit.statements[0].rows[0][1],
+            "{\"value\":\"tracked-b\"}",
+        );
+
+        engine
+            .switch_version("version-b".to_string())
+            .await
+            .unwrap();
+
+        let switched = engine
+            .execute(
+                "SELECT entity_id, snapshot_content \
+                 FROM lix_state \
+                 WHERE schema_key = 'test_state_schema'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic_normalized(switched.statements[0].rows.clone());
+        assert_eq!(switched.statements[0].rows.len(), 1);
+        assert_text(&switched.statements[0].rows[0][0], "entity-b");
+        assert_text(
+            &switched.statements[0].rows[0][1],
+            "{\"value\":\"tracked-b\"}",
+        );
+    }
+);
+
+simulation_test!(
     lix_state_select_prioritizes_untracked_in_active_version,
     |sim| async move {
         let engine = sim

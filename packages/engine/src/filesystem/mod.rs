@@ -9,6 +9,7 @@ pub(crate) mod history;
 mod init;
 pub(crate) mod live_projection;
 pub(crate) mod path;
+pub(crate) mod queries;
 pub(crate) mod runtime;
 pub(crate) use init::{init, seed_bootstrap};
 

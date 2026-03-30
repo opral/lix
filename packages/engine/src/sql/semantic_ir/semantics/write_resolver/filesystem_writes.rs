@@ -4,6 +4,16 @@ use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
+use crate::filesystem::queries::{
+    ensure_no_directory_at_file_path, ensure_no_file_at_directory_path, load_directory_row_by_id,
+    load_directory_row_by_id_with_pending_transaction_view, load_directory_rows_under_path,
+    load_file_row_by_id_with_pending_transaction_view,
+    load_file_row_by_id_without_path_with_pending_transaction_view,
+    load_file_row_by_path_with_pending_transaction_view, load_file_rows_under_path,
+    lookup_directory_id_by_path, lookup_directory_id_by_path_with_pending_transaction_view,
+    lookup_directory_path_by_id, lookup_file_id_by_path_with_pending_transaction_view,
+    DirectoryFilesystemRow, FileFilesystemRow,
+};
 use crate::filesystem::runtime::{
     FilesystemDescriptorState, FilesystemTransactionFileState, FilesystemTransactionState,
 };
@@ -15,16 +25,6 @@ use crate::sql::semantic_ir::semantics::filesystem_assignments::{
 };
 use crate::sql::semantic_ir::semantics::filesystem_planning::{
     plan_directory_insert_batch, plan_file_insert_batch,
-};
-use crate::sql::semantic_ir::semantics::filesystem_queries::{
-    ensure_no_directory_at_file_path, ensure_no_file_at_directory_path, load_directory_row_by_id,
-    load_directory_row_by_id_with_pending_transaction_view, load_directory_rows_under_path,
-    load_file_row_by_id_with_pending_transaction_view,
-    load_file_row_by_id_without_path_with_pending_transaction_view,
-    load_file_row_by_path_with_pending_transaction_view, load_file_rows_under_path,
-    lookup_directory_id_by_path, lookup_directory_id_by_path_with_pending_transaction_view,
-    lookup_directory_path_by_id, lookup_file_id_by_path_with_pending_transaction_view,
-    DirectoryFilesystemRow, FileFilesystemRow,
 };
 use crate::transaction::PendingTransactionView;
 use serde_json::json;

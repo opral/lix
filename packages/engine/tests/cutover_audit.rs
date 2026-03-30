@@ -48,6 +48,10 @@ fn relative_to_manifest(path: &Path) -> String {
         .to_string()
 }
 
+fn is_live_state_path(relative: &str) -> bool {
+    relative.starts_with("src/live_state/")
+}
+
 #[test]
 fn local_version_head_cutover_rejects_storage_ordering_and_limits_version_ref_table_reads() {
     for relative in [
@@ -74,9 +78,8 @@ fn local_version_head_cutover_rejects_storage_ordering_and_limits_version_ref_ta
         })
         .collect::<BTreeSet<_>>();
     let expected = BTreeSet::from([
-        "src/canonical/version_state.rs".to_string(),
         "src/live_state/filesystem_projection.rs".to_string(),
-        "src/sql/physical_plan/lowerer.rs".to_string(),
+        "src/live_state/public_read_sql.rs".to_string(),
     ]);
     assert_eq!(
         actual, expected,
@@ -143,5 +146,69 @@ fn canonical_cutover_does_not_reintroduce_compat_mirrors_or_fallback_depth() {
             !graph_sql_impl.contains(banned),
             "canonical graph seed must not depend on live commit-family mirrors: {banned}"
         );
+    }
+}
+
+#[test]
+fn projection_lifecycle_stays_behind_root_level_live_state_entrypoints() {
+    let actual = src_rs_files()
+        .into_iter()
+        .filter_map(|path| {
+            let relative = relative_to_manifest(&path);
+            if is_live_state_path(&relative) {
+                return None;
+            }
+            let source = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read '{}': {error}", path.display()));
+            (source.contains("crate::live_state::projection::")
+                || source.contains("use crate::live_state::projection")
+                || source.contains("crate::live_state::projection::{"))
+            .then_some(relative)
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(
+        actual.is_empty(),
+        "projection lifecycle escaped live_state/*: {actual:?}"
+    );
+
+    for (relative, required) in [
+        (
+            "src/canonical/append.rs",
+            &["apply_commit_projections_best_effort_in_transaction("][..],
+        ),
+        (
+            "src/canonical/pending_session.rs",
+            &["apply_commit_projections_best_effort_in_transaction("][..],
+        ),
+        (
+            "src/transaction/coordinator.rs",
+            &[
+                "mark_live_state_projection_ready_in_transaction(",
+                "apply_canonical_receipt_in_transaction(",
+            ][..],
+        ),
+        (
+            "src/init/run.rs",
+            &[
+                "load_latest_live_state_replay_cursor_with_backend(",
+                "mark_live_state_projection_ready_with_backend(",
+            ][..],
+        ),
+        (
+            "src/sql/executor/public_runtime/read.rs",
+            &["load_live_state_projection_status_with_backend("][..],
+        ),
+        (
+            "src/version/merge_version.rs",
+            &["mark_live_state_projection_ready_without_replay_cursor_in_transaction("][..],
+        ),
+    ] {
+        let source = read_source(relative);
+        for needle in required {
+            assert!(
+                source.contains(needle),
+                "{relative} must call the root-level live_state projection entrypoint '{needle}'",
+            );
+        }
     }
 }

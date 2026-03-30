@@ -14,7 +14,7 @@ pub(crate) struct LiveReadContract {
 }
 
 impl LiveReadContract {
-    pub(crate) fn raw_access(&self) -> &super::storage::LiveRowAccess {
+    fn raw_access(&self) -> &super::storage::LiveRowAccess {
         &self.access
     }
 
@@ -68,7 +68,7 @@ pub(crate) async fn load_schema_read_contract_for_table_name(
         .map(|access| access.map(read_contract_from_storage))
 }
 
-pub(crate) fn live_read_contract_from_layout(
+pub(super) fn live_read_contract_from_layout(
     layout: super::storage::LiveTableLayout,
 ) -> LiveReadContract {
     read_contract_from_storage(super::storage::LiveRowAccess::new(layout))
@@ -189,6 +189,7 @@ pub(crate) fn snapshot_select_expr_for_schema(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn normalized_values_for_schema(
     schema_key: &str,
     schema_definition: Option<&JsonValue>,

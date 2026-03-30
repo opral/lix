@@ -1,5 +1,5 @@
 use crate::filesystem::runtime::{merge_filesystem_transaction_state, FilesystemTransactionState};
-use crate::live_state::shared::identity::RowIdentity;
+use crate::live_state::RowIdentity;
 use crate::sql::catalog::{DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, SurfaceVariant};
 use crate::sql::semantic_ir::ExecutionContext;
 use crate::Value;

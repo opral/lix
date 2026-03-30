@@ -1,5 +1,8 @@
 use crate::engine::{DeferredTransactionSideEffects, Engine, TransactionBackendAdapter};
 use crate::filesystem::runtime::merge_filesystem_transaction_state;
+use crate::live_state::{
+    bootstrap_public_surface_registry_with_pending_transaction_view, public_read_execution_mode,
+};
 use crate::read::contracts::PublicReadExecutionMode;
 use crate::sql::catalog::SurfaceRegistry;
 use crate::sql::executor::execution_program::ExecutionContext;
@@ -8,9 +11,6 @@ use crate::sql::executor::{
     public_surface_registry_mutations, CompiledExecution, PreparedPublicWrite,
 };
 use crate::sql::physical_plan::PublicWriteExecutionPartition;
-use crate::sql::services::pending_reads::{
-    bootstrap_public_surface_registry_with_pending_transaction_view, public_read_execution_mode,
-};
 use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError};
 

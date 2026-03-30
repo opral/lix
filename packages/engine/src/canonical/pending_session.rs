@@ -355,7 +355,7 @@ async fn execute_generated_commit_result(
     binary_blob_writes: &[BinaryBlobWrite],
     functions: &mut dyn LixFunctionProvider,
     tracked_writer_key_annotations: &std::collections::BTreeMap<
-        crate::live_state::shared::identity::RowIdentity,
+        crate::live_state::RowIdentity,
         Option<String>,
     >,
 ) -> Result<CanonicalCommitReceipt, LixError> {
@@ -392,7 +392,7 @@ async fn execute_generated_commit_result(
     )
     .await?;
     let receipt = canonical_commit_receipt_from_generated_result(&result)?;
-    crate::live_state::projection::apply_commit_projections_best_effort_in_transaction(
+    crate::live_state::apply_commit_projections_best_effort_in_transaction(
         transaction,
         &receipt,
         tracked_writer_key_annotations,

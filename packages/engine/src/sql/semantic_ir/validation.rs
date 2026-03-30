@@ -10,8 +10,7 @@ use crate::checkpoint::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME};
 use crate::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
-use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::schema_access::LiveReadContract;
+use crate::live_state::{LiveReadContract, ScanConstraint, ScanField, ScanOperator};
 use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
     SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,
@@ -945,7 +944,9 @@ async fn validate_foreign_key_reference_targets<P: SchemaProvider + ?Sized>(
             .iter()
             .any(|group| group == &referenced_properties)
         {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
                     "foreign key at index {index} references properties that are not a primary key or unique key on schema '{}'",
                     referenced_key
                 ),
@@ -2138,7 +2139,7 @@ fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: format!("invalid JSON pointer segment '{segment}'"),
-                    })
+                    });
                 }
             }
         } else {

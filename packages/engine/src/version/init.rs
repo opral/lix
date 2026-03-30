@@ -1,5 +1,7 @@
 use crate::init::InitExecutor;
-use crate::live_state::untracked::{UntrackedWriteParticipant, UntrackedWriteRow};
+use crate::live_state::{
+    apply_untracked_write_batch_in_transaction, UntrackedWriteOperation, UntrackedWriteRow,
+};
 use crate::schema::builtin::types::LixCommit;
 use crate::{LixBackend, LixError, Value};
 
@@ -175,8 +177,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             snapshot_content: Some(super::version_ref_snapshot_content(version_id, commit_id)),
             created_at: Some(timestamp.clone()),
             updated_at: timestamp,
-            operation: crate::live_state::untracked::UntrackedWriteOperation::Upsert,
+            operation: UntrackedWriteOperation::Upsert,
         };
-        UntrackedWriteParticipant::apply_write_batch(self.backend_transaction_mut()?, &[row]).await
+        apply_untracked_write_batch_in_transaction(self.backend_transaction_mut()?, &[row]).await
     }
 }

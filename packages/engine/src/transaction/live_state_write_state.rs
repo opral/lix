@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::live_state::effective::{resolve_effective_rows, EffectiveRowsRequest};
-use crate::live_state::shared::query::entity_id_in_constraint;
+use crate::live_state::{entity_id_in_constraint, resolve_effective_rows, EffectiveRowsRequest};
 use crate::LixError;
 
 use super::contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
