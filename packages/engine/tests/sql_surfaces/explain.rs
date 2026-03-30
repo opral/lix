@@ -206,6 +206,178 @@ fn assert_no_rust_debug_leaks(explain_json: &JsonValue) {
     }
 }
 
+fn assert_broad_public_read_statement_snapshot(
+    broad_statement: &JsonValue,
+    expected_primary_kind: &str,
+    expected_primary_surface: &str,
+    expected_join_kind: &str,
+    expected_join_surface: &str,
+) {
+    let statement = json_object(broad_statement, "broad_statement");
+    assert_eq!(
+        statement.get("kind").and_then(JsonValue::as_str),
+        Some("query")
+    );
+    let statement_details = statement
+        .get("details")
+        .map(|value| json_object(value, "broad_statement.details"))
+        .expect("broad_statement should include details");
+    let body = statement_details
+        .get("body")
+        .map(|value| json_object(value, "broad_statement.details.body"))
+        .expect("broad_statement.details should include body");
+    assert_eq!(body.get("kind").and_then(JsonValue::as_str), Some("select"));
+    let body_details = body
+        .get("details")
+        .map(|value| json_object(value, "broad_statement.details.body.details"))
+        .expect("broad_statement.details.body should include details");
+    let from = body_details
+        .get("from")
+        .map(|value| json_array(value, "broad_statement.details.body.details.from"))
+        .expect("broad_statement.details.body.details should include from");
+    assert_eq!(
+        from.len(),
+        1,
+        "broad select should expose one root relation"
+    );
+
+    let root = json_object(&from[0], "broad_statement.from[0]");
+    let root_relation = root
+        .get("relation")
+        .map(|value| json_object(value, "broad_statement.from[0].relation"))
+        .expect("broad root should include relation");
+    assert_eq!(
+        root_relation.get("kind").and_then(JsonValue::as_str),
+        Some("table")
+    );
+    let root_relation_details = root_relation
+        .get("details")
+        .map(|value| json_object(value, "broad_statement.from[0].relation.details"))
+        .expect("broad root relation should include details");
+    let root_surface = root_relation_details
+        .get("relation")
+        .map(|value| json_object(value, "broad_statement.from[0].relation.details.relation"))
+        .expect("broad root relation should include relation");
+    assert_eq!(
+        root_surface.get("kind").and_then(JsonValue::as_str),
+        Some(expected_primary_kind)
+    );
+    let root_surface_details = root_surface
+        .get("details")
+        .map(|value| {
+            json_object(
+                value,
+                "broad_statement.from[0].relation.details.relation.details",
+            )
+        })
+        .expect("broad root public relation should include details");
+    assert_eq!(
+        root_surface_details
+            .get("public_name")
+            .and_then(JsonValue::as_str),
+        Some(expected_primary_surface)
+    );
+
+    let joins = root
+        .get("joins")
+        .map(|value| json_array(value, "broad_statement.from[0].joins"))
+        .expect("broad root should include joins");
+    assert_eq!(joins.len(), 1, "broad root should expose one join");
+    let join = json_object(&joins[0], "broad_statement.from[0].joins[0]");
+    assert_eq!(
+        join.get("operator").and_then(JsonValue::as_str),
+        Some("join")
+    );
+    let join_relation = join
+        .get("relation")
+        .map(|value| json_object(value, "broad_statement.from[0].joins[0].relation"))
+        .expect("broad join should include relation");
+    assert_eq!(
+        join_relation.get("kind").and_then(JsonValue::as_str),
+        Some("table")
+    );
+    let join_relation_details = join_relation
+        .get("details")
+        .map(|value| json_object(value, "broad_statement.from[0].joins[0].relation.details"))
+        .expect("broad join relation should include details");
+    let join_surface = join_relation_details
+        .get("relation")
+        .map(|value| {
+            json_object(
+                value,
+                "broad_statement.from[0].joins[0].relation.details.relation",
+            )
+        })
+        .expect("broad join relation should include relation");
+    assert_eq!(
+        join_surface.get("kind").and_then(JsonValue::as_str),
+        Some(expected_join_kind)
+    );
+    let join_surface_details = join_surface
+        .get("details")
+        .map(|value| {
+            json_object(
+                value,
+                "broad_statement.from[0].joins[0].relation.details.relation.details",
+            )
+        })
+        .expect("broad join public relation should include details");
+    assert_eq!(
+        join_surface_details
+            .get("public_name")
+            .and_then(JsonValue::as_str),
+        Some(expected_join_surface)
+    );
+}
+
+fn assert_broad_public_read_typed_statement_contract(explain_json: &JsonValue) {
+    let semantic_statement = json_object_at(explain_json, "semantic_statement", "explain_json");
+    let semantic_details = semantic_statement
+        .get("details")
+        .map(|value| json_object(value, "semantic_statement.details"))
+        .expect("semantic_statement should include details");
+    assert_broad_public_read_statement_snapshot(
+        semantic_details
+            .get("broad_statement")
+            .expect("semantic_statement.details should include broad_statement"),
+        "public",
+        "lix_state",
+        "public",
+        "lix_state_by_version",
+    );
+
+    let logical_plan = json_object_at(explain_json, "logical_plan", "explain_json");
+    let logical_details = logical_plan
+        .get("details")
+        .map(|value| json_object(value, "logical_plan.details"))
+        .expect("logical_plan should include details");
+    assert_broad_public_read_statement_snapshot(
+        logical_details
+            .get("broad_statement")
+            .expect("logical_plan.details should include broad_statement"),
+        "public",
+        "lix_state",
+        "public",
+        "lix_state_by_version",
+    );
+
+    let optimized_logical_plan =
+        json_object_at(explain_json, "optimized_logical_plan", "explain_json");
+    let optimized_details = optimized_logical_plan
+        .get("details")
+        .map(|value| json_object(value, "optimized_logical_plan.details"))
+        .expect("optimized_logical_plan should include details");
+    assert_broad_public_read_statement_snapshot(
+        optimized_details
+            .get("broad_statement")
+            .expect("optimized_logical_plan.details should include broad_statement"),
+        "lowered_public",
+        "lix_state",
+        "lowered_public",
+        "lix_state_by_version",
+    );
+}
+
 fn assert_public_read_json_contract(explain_json: &JsonValue) {
     let request = json_object_at(explain_json, "request", "explain_json");
     assert_object_keys(request, &["format", "mode"], "request");
@@ -1112,6 +1284,7 @@ simulation_test!(
         let explain_json = explain_json_payload(&result);
         assert_public_read_logical_strategy(explain_json, "logical_plan", "broad");
         assert_public_read_logical_strategy(explain_json, "optimized_logical_plan", "broad");
+        assert_broad_public_read_typed_statement_contract(explain_json);
         assert_public_read_physical_kind(explain_json, "lowered_sql");
         assert_lowered_sql_presence(explain_json, true);
         assert_stage_timings_contract(
@@ -1119,9 +1292,9 @@ simulation_test!(
             &[
                 "parse",
                 "bind",
+                "logical_planning",
                 "capability_resolution",
                 "optimizer",
-                "logical_planning",
                 "physical_planning",
                 "executor_preparation",
             ],

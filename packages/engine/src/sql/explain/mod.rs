@@ -30,9 +30,11 @@ use crate::sql::logical_plan::direct_reads::{
     StateHistorySortValue,
 };
 use crate::sql::logical_plan::public_ir::{
-    CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan,
-    CanonicalStateScan, CanonicalWorkingChangesScan, CommitPreconditions, ExpectedHead,
-    FilesystemKind, InsertOnConflict, InsertOnConflictAction, MutationPayload,
+    BroadPublicReadJoin, BroadPublicReadQuery, BroadPublicReadRelation, BroadPublicReadSelect,
+    BroadPublicReadSetExpr, BroadPublicReadStatement, BroadPublicReadTableFactor,
+    BroadPublicReadTableWithJoins, CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan,
+    CanonicalFilesystemScan, CanonicalStateScan, CanonicalWorkingChangesScan, CommitPreconditions,
+    ExpectedHead, FilesystemKind, InsertOnConflict, InsertOnConflictAction, MutationPayload,
     NormalizedPublicReadQuery, OptionalTextPatch, PlannedStateRow, PlannedWrite, ReadCommand,
     ReadContract, ReadPlan, ResolvedRowRef, ResolvedWritePartition, ResolvedWritePlan, RowLineage,
     SchemaProof, ScopeProof, StateSourceKind, StructuredPublicRead, TargetSetProof, VersionScope,
@@ -66,7 +68,9 @@ use crate::state::stream::StateCommitStreamChange;
 use crate::{LixError, QueryResult, Value};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use sqlparser::ast::{AnalyzeFormatKind, DescribeAlias, Expr, Statement, UtilityOption};
+use sqlparser::ast::{
+    AnalyzeFormatKind, DescribeAlias, Expr, SetOperator, SetQuantifier, Statement, UtilityOption,
+};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -1168,10 +1172,116 @@ pub(crate) enum ExplainPublicWriteExecution {
     Materialize(Box<PublicWriteMaterializationSnapshot>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
+pub(crate) enum ExplainBroadPublicReadStatementSnapshot {
+    Query(Box<ExplainBroadPublicReadQuerySnapshot>),
+    Explain {
+        statement: Box<ExplainBroadPublicReadStatementSnapshot>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExplainBroadPublicReadQuerySnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) with: Option<Box<ExplainBroadPublicReadWithSnapshot>>,
+    pub(crate) body: Box<ExplainBroadPublicReadSetExprSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExplainBroadPublicReadWithSnapshot {
+    pub(crate) cte_tables: Vec<ExplainBroadPublicReadQuerySnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
+pub(crate) enum ExplainBroadPublicReadSetExprSnapshot {
+    Select(Box<ExplainBroadPublicReadSelectSnapshot>),
+    Query(Box<ExplainBroadPublicReadQuerySnapshot>),
+    SetOperation {
+        operator: ExplainBroadSetOperationKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quantifier: Option<ExplainBroadSetQuantifier>,
+        left: Box<ExplainBroadPublicReadSetExprSnapshot>,
+        right: Box<ExplainBroadPublicReadSetExprSnapshot>,
+    },
+    Table {
+        relation: ExplainBroadPublicReadRelationSnapshot,
+    },
+    Other {
+        sql: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExplainBroadSetOperationKind {
+    Union,
+    Except,
+    Intersect,
+    Minus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExplainBroadSetQuantifier {
+    All,
+    Distinct,
+    ByName,
+    AllByName,
+    DistinctByName,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExplainBroadPublicReadSelectSnapshot {
+    pub(crate) from: Vec<ExplainBroadPublicReadTableWithJoinsSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExplainBroadPublicReadTableWithJoinsSnapshot {
+    pub(crate) relation: ExplainBroadPublicReadTableFactorSnapshot,
+    pub(crate) joins: Vec<ExplainBroadPublicReadJoinSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExplainBroadPublicReadJoinSnapshot {
+    pub(crate) operator: String,
+    pub(crate) relation: ExplainBroadPublicReadTableFactorSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
+pub(crate) enum ExplainBroadPublicReadTableFactorSnapshot {
+    Table {
+        relation: ExplainBroadPublicReadRelationSnapshot,
+    },
+    Derived {
+        subquery: Box<ExplainBroadPublicReadQuerySnapshot>,
+    },
+    NestedJoin {
+        table_with_joins: Box<ExplainBroadPublicReadTableWithJoinsSnapshot>,
+    },
+    Other {
+        sql: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
+pub(crate) enum ExplainBroadPublicReadRelationSnapshot {
+    Public(SurfaceBindingSnapshot),
+    LoweredPublic(SurfaceBindingSnapshot),
+    Internal { relation_name: String },
+    External { relation_name: String },
+    Cte { relation_name: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ExplainPublicReadLogicalPlan {
     pub(crate) strategy: ExplainPublicReadStrategy,
     pub(crate) surface_bindings: Vec<SurfaceBindingSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) broad_statement: Option<Box<ExplainBroadPublicReadStatementSnapshot>>,
     pub(crate) read: Option<Box<StructuredPublicReadSnapshot>>,
     pub(crate) dependency_spec: Option<Box<DependencySpecSnapshot>>,
     pub(crate) effective_state_request: Option<Box<EffectiveStateRequestSnapshot>>,
@@ -1201,6 +1311,8 @@ pub(crate) enum ExplainSemanticStatement {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ExplainPublicReadSemantics {
     pub(crate) surface_bindings: Vec<SurfaceBindingSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) broad_statement: Option<Box<ExplainBroadPublicReadStatementSnapshot>>,
     pub(crate) structured_read: Option<Box<StructuredPublicReadSnapshot>>,
     pub(crate) effective_state_request: Option<Box<EffectiveStateRequestSnapshot>>,
     pub(crate) effective_state_plan: Option<Box<EffectiveStatePlanSnapshot>>,
@@ -1435,8 +1547,9 @@ fn render_request_text(request: &ExplainRequest) -> String {
 fn render_semantic_statement_text(statement: &ExplainSemanticStatement) -> String {
     match statement {
         ExplainSemanticStatement::PublicRead(details) => format!(
-            "kind: public_read\nsurfaces: {}\nstructured_read: {}\neffective_state_request: {}\neffective_state_plan: {}",
+            "kind: public_read\nsurfaces: {}\nbroad_statement: {}\nstructured_read: {}\neffective_state_request: {}\neffective_state_plan: {}",
             join_public_names(&details.surface_bindings),
+            yes_no(details.broad_statement.is_some()),
             yes_no(details.structured_read.is_some()),
             yes_no(details.effective_state_request.is_some()),
             yes_no(details.effective_state_plan.is_some()),
@@ -1458,9 +1571,10 @@ fn render_semantic_statement_text(statement: &ExplainSemanticStatement) -> Strin
 fn render_logical_plan_text(plan: &ExplainLogicalPlanSnapshot) -> String {
     match plan {
         ExplainLogicalPlanSnapshot::PublicRead(details) => format!(
-            "kind: public_read\nstrategy: {}\nsurfaces: {}\nstructured_read: {}\ndirect_plan: {}\ndependency_spec: {}\neffective_state_plan: {}",
+            "kind: public_read\nstrategy: {}\nsurfaces: {}\nbroad_statement: {}\nstructured_read: {}\ndirect_plan: {}\ndependency_spec: {}\neffective_state_plan: {}",
             explain_public_read_strategy_label(details.strategy),
             join_public_names(&details.surface_bindings),
+            yes_no(details.broad_statement.is_some()),
             yes_no(details.read.is_some()),
             yes_no(details.direct_plan.is_some()),
             yes_no(details.dependency_spec.is_some()),
@@ -2197,6 +2311,11 @@ fn public_read_semantics_snapshot(semantics: &PublicReadSemantics) -> ExplainPub
             .iter()
             .map(surface_binding_snapshot)
             .collect(),
+        broad_statement: semantics
+            .broad_statement
+            .as_deref()
+            .map(broad_public_read_statement_snapshot)
+            .map(Box::new),
         structured_read: semantics
             .structured_read
             .as_ref()
@@ -2254,6 +2373,220 @@ fn internal_statements_snapshot(
     }
 }
 
+fn broad_public_read_statement_snapshot(
+    statement: &BroadPublicReadStatement,
+) -> ExplainBroadPublicReadStatementSnapshot {
+    match statement {
+        BroadPublicReadStatement::Query(query) => ExplainBroadPublicReadStatementSnapshot::Query(
+            Box::new(broad_public_read_query_snapshot(query)),
+        ),
+        BroadPublicReadStatement::Explain { statement, .. } => {
+            ExplainBroadPublicReadStatementSnapshot::Explain {
+                statement: Box::new(broad_public_read_statement_snapshot(statement)),
+            }
+        }
+    }
+}
+
+fn broad_public_read_query_snapshot(
+    query: &BroadPublicReadQuery,
+) -> ExplainBroadPublicReadQuerySnapshot {
+    ExplainBroadPublicReadQuerySnapshot {
+        with: query
+            .with
+            .as_ref()
+            .map(broad_public_read_with_snapshot)
+            .map(Box::new),
+        body: Box::new(broad_public_read_set_expr_snapshot(&query.body)),
+    }
+}
+
+fn broad_public_read_with_snapshot(
+    with: &crate::sql::logical_plan::public_ir::BroadPublicReadWith,
+) -> ExplainBroadPublicReadWithSnapshot {
+    ExplainBroadPublicReadWithSnapshot {
+        cte_tables: with
+            .cte_tables
+            .iter()
+            .map(broad_public_read_query_snapshot)
+            .collect(),
+    }
+}
+
+fn broad_public_read_set_expr_snapshot(
+    expr: &BroadPublicReadSetExpr,
+) -> ExplainBroadPublicReadSetExprSnapshot {
+    match expr {
+        BroadPublicReadSetExpr::Select(select) => ExplainBroadPublicReadSetExprSnapshot::Select(
+            Box::new(broad_public_read_select_snapshot(select)),
+        ),
+        BroadPublicReadSetExpr::Query(query) => ExplainBroadPublicReadSetExprSnapshot::Query(
+            Box::new(broad_public_read_query_snapshot(query)),
+        ),
+        BroadPublicReadSetExpr::SetOperation {
+            original,
+            left,
+            right,
+        } => {
+            let (operator, quantifier) = match original {
+                sqlparser::ast::SetExpr::SetOperation {
+                    op, set_quantifier, ..
+                } => (
+                    explain_broad_set_operation_kind(*op),
+                    explain_broad_set_quantifier(*set_quantifier),
+                ),
+                _ => unreachable!("broad set operation snapshot expects a set operation"),
+            };
+            ExplainBroadPublicReadSetExprSnapshot::SetOperation {
+                operator,
+                quantifier,
+                left: Box::new(broad_public_read_set_expr_snapshot(left)),
+                right: Box::new(broad_public_read_set_expr_snapshot(right)),
+            }
+        }
+        BroadPublicReadSetExpr::Table { relation, .. } => {
+            ExplainBroadPublicReadSetExprSnapshot::Table {
+                relation: broad_public_read_relation_snapshot(relation),
+            }
+        }
+        BroadPublicReadSetExpr::Other(expr) => ExplainBroadPublicReadSetExprSnapshot::Other {
+            sql: expr.to_string(),
+        },
+    }
+}
+
+fn broad_public_read_select_snapshot(
+    select: &BroadPublicReadSelect,
+) -> ExplainBroadPublicReadSelectSnapshot {
+    ExplainBroadPublicReadSelectSnapshot {
+        from: select
+            .from
+            .iter()
+            .map(broad_public_read_table_with_joins_snapshot)
+            .collect(),
+    }
+}
+
+fn broad_public_read_table_with_joins_snapshot(
+    table: &BroadPublicReadTableWithJoins,
+) -> ExplainBroadPublicReadTableWithJoinsSnapshot {
+    ExplainBroadPublicReadTableWithJoinsSnapshot {
+        relation: broad_public_read_table_factor_snapshot(&table.relation),
+        joins: table
+            .joins
+            .iter()
+            .map(broad_public_read_join_snapshot)
+            .collect(),
+    }
+}
+
+fn broad_public_read_join_snapshot(
+    join: &BroadPublicReadJoin,
+) -> ExplainBroadPublicReadJoinSnapshot {
+    ExplainBroadPublicReadJoinSnapshot {
+        operator: broad_public_read_join_operator_label(&join.original.join_operator).to_string(),
+        relation: broad_public_read_table_factor_snapshot(&join.relation),
+    }
+}
+
+fn broad_public_read_table_factor_snapshot(
+    relation: &BroadPublicReadTableFactor,
+) -> ExplainBroadPublicReadTableFactorSnapshot {
+    match relation {
+        BroadPublicReadTableFactor::Table { relation, .. } => {
+            ExplainBroadPublicReadTableFactorSnapshot::Table {
+                relation: broad_public_read_relation_snapshot(relation),
+            }
+        }
+        BroadPublicReadTableFactor::Derived { subquery, .. } => {
+            ExplainBroadPublicReadTableFactorSnapshot::Derived {
+                subquery: Box::new(broad_public_read_query_snapshot(subquery)),
+            }
+        }
+        BroadPublicReadTableFactor::NestedJoin {
+            table_with_joins, ..
+        } => ExplainBroadPublicReadTableFactorSnapshot::NestedJoin {
+            table_with_joins: Box::new(broad_public_read_table_with_joins_snapshot(
+                table_with_joins,
+            )),
+        },
+        BroadPublicReadTableFactor::Other(relation) => {
+            ExplainBroadPublicReadTableFactorSnapshot::Other {
+                sql: relation.to_string(),
+            }
+        }
+    }
+}
+
+fn broad_public_read_relation_snapshot(
+    relation: &BroadPublicReadRelation,
+) -> ExplainBroadPublicReadRelationSnapshot {
+    match relation {
+        BroadPublicReadRelation::Public(binding) => {
+            ExplainBroadPublicReadRelationSnapshot::Public(surface_binding_snapshot(binding))
+        }
+        BroadPublicReadRelation::LoweredPublic(binding) => {
+            ExplainBroadPublicReadRelationSnapshot::LoweredPublic(surface_binding_snapshot(binding))
+        }
+        BroadPublicReadRelation::Internal(name) => {
+            ExplainBroadPublicReadRelationSnapshot::Internal {
+                relation_name: name.clone(),
+            }
+        }
+        BroadPublicReadRelation::External(name) => {
+            ExplainBroadPublicReadRelationSnapshot::External {
+                relation_name: name.clone(),
+            }
+        }
+        BroadPublicReadRelation::Cte(name) => ExplainBroadPublicReadRelationSnapshot::Cte {
+            relation_name: name.clone(),
+        },
+    }
+}
+
+fn explain_broad_set_operation_kind(operator: SetOperator) -> ExplainBroadSetOperationKind {
+    match operator {
+        SetOperator::Union => ExplainBroadSetOperationKind::Union,
+        SetOperator::Except => ExplainBroadSetOperationKind::Except,
+        SetOperator::Intersect => ExplainBroadSetOperationKind::Intersect,
+        SetOperator::Minus => ExplainBroadSetOperationKind::Minus,
+    }
+}
+
+fn explain_broad_set_quantifier(quantifier: SetQuantifier) -> Option<ExplainBroadSetQuantifier> {
+    match quantifier {
+        SetQuantifier::All => Some(ExplainBroadSetQuantifier::All),
+        SetQuantifier::Distinct => Some(ExplainBroadSetQuantifier::Distinct),
+        SetQuantifier::ByName => Some(ExplainBroadSetQuantifier::ByName),
+        SetQuantifier::AllByName => Some(ExplainBroadSetQuantifier::AllByName),
+        SetQuantifier::DistinctByName => Some(ExplainBroadSetQuantifier::DistinctByName),
+        SetQuantifier::None => None,
+    }
+}
+
+fn broad_public_read_join_operator_label(operator: &sqlparser::ast::JoinOperator) -> &'static str {
+    match operator {
+        sqlparser::ast::JoinOperator::Join(_) => "join",
+        sqlparser::ast::JoinOperator::Inner(_) => "inner",
+        sqlparser::ast::JoinOperator::Left(_) => "left",
+        sqlparser::ast::JoinOperator::LeftOuter(_) => "left_outer",
+        sqlparser::ast::JoinOperator::Right(_) => "right",
+        sqlparser::ast::JoinOperator::RightOuter(_) => "right_outer",
+        sqlparser::ast::JoinOperator::FullOuter(_) => "full_outer",
+        sqlparser::ast::JoinOperator::CrossJoin(_) => "cross_join",
+        sqlparser::ast::JoinOperator::Semi(_) => "semi",
+        sqlparser::ast::JoinOperator::LeftSemi(_) => "left_semi",
+        sqlparser::ast::JoinOperator::RightSemi(_) => "right_semi",
+        sqlparser::ast::JoinOperator::Anti(_) => "anti",
+        sqlparser::ast::JoinOperator::LeftAnti(_) => "left_anti",
+        sqlparser::ast::JoinOperator::RightAnti(_) => "right_anti",
+        sqlparser::ast::JoinOperator::CrossApply => "cross_apply",
+        sqlparser::ast::JoinOperator::OuterApply => "outer_apply",
+        sqlparser::ast::JoinOperator::AsOf { .. } => "as_of",
+        sqlparser::ast::JoinOperator::StraightJoin(_) => "straight_join",
+    }
+}
+
 fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
     match plan {
         LogicalPlan::PublicRead(plan) => {
@@ -2266,6 +2599,7 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                 } => ExplainPublicReadLogicalPlan {
                     strategy: ExplainPublicReadStrategy::Structured,
                     surface_bindings: vec![surface_binding_snapshot(&read.surface_binding)],
+                    broad_statement: None,
                     read: Some(Box::new(structured_public_read_snapshot(read))),
                     dependency_spec: dependency_spec
                         .as_ref()
@@ -2290,6 +2624,7 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                 } => ExplainPublicReadLogicalPlan {
                     strategy: ExplainPublicReadStrategy::DirectHistory,
                     surface_bindings: vec![surface_binding_snapshot(&read.surface_binding)],
+                    broad_statement: None,
                     read: Some(Box::new(structured_public_read_snapshot(read))),
                     dependency_spec: dependency_spec
                         .as_ref()
@@ -2306,6 +2641,7 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                     direct_plan: Some(Box::new(direct_public_read_plan_snapshot(direct_plan))),
                 },
                 PublicReadLogicalPlan::Broad {
+                    broad_statement,
                     surface_bindings,
                     dependency_spec,
                 } => ExplainPublicReadLogicalPlan {
@@ -2314,6 +2650,9 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                         .iter()
                         .map(surface_binding_snapshot)
                         .collect(),
+                    broad_statement: Some(Box::new(broad_public_read_statement_snapshot(
+                        broad_statement,
+                    ))),
                     read: None,
                     dependency_spec: dependency_spec
                         .as_ref()

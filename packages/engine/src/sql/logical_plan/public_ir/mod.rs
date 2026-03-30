@@ -357,6 +357,7 @@ pub(crate) enum BroadPublicReadTableFactor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BroadPublicReadRelation {
     Public(SurfaceBinding),
+    LoweredPublic(SurfaceBinding),
     Internal(String),
     External(String),
     Cte(String),
