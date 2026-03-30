@@ -9,8 +9,8 @@ use crate::live_state::projection::local_version_head_write_row;
 use crate::live_state::ReplayCursor;
 use crate::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::{
-    boot, BootArgs, CommittedVersionFrontier, Engine, LixBackend, LixBackendTransaction,
-    LixError, NoopWasmRuntime, QueryResult, Session, SqlDialect, TransactionMode, Value,
+    boot, BootArgs, CommittedVersionFrontier, Engine, LixBackend, LixBackendTransaction, LixError,
+    NoopWasmRuntime, QueryResult, Session, SqlDialect, TransactionMode, Value,
 };
 
 type SqlPredicate = Arc<dyn Fn(&str, &[Value]) -> bool + Send + Sync>;
@@ -227,8 +227,8 @@ impl LixBackendTransaction for TestSqliteTransaction {
     }
 }
 
-pub(crate) async fn boot_test_engine(
-) -> Result<(TestSqliteBackend, Arc<Engine>, Session), LixError> {
+pub(crate) async fn boot_test_engine() -> Result<(TestSqliteBackend, Arc<Engine>, Session), LixError>
+{
     let backend = TestSqliteBackend::new();
     let engine = Arc::new(boot(BootArgs::new(
         Box::new(backend.clone()),
@@ -239,9 +239,7 @@ pub(crate) async fn boot_test_engine(
     Ok((backend, engine, session))
 }
 
-pub(crate) async fn init_test_backend_core(
-    backend: &dyn LixBackend,
-) -> Result<(), LixError> {
+pub(crate) async fn init_test_backend_core(backend: &dyn LixBackend) -> Result<(), LixError> {
     crate::live_state::init(backend).await?;
     crate::schema::init(backend).await?;
     crate::canonical::init(backend).await?;
@@ -279,7 +277,9 @@ pub(crate) async fn seed_local_version_head(
 ) -> Result<(), LixError> {
     commit_untracked_rows(
         backend,
-        vec![local_version_head_write_row(version_id, commit_id, timestamp)],
+        vec![local_version_head_write_row(
+            version_id, commit_id, timestamp,
+        )],
     )
     .await
 }
@@ -521,7 +521,9 @@ mod tests {
         tx.execute("SELECT 2 AS two", &[])
             .await
             .expect("transaction select should succeed");
-        tx.commit().await.expect("transaction commit should succeed");
+        tx.commit()
+            .await
+            .expect("transaction commit should succeed");
 
         let events = backend.recorded_events();
         assert!(matches!(
@@ -549,7 +551,10 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, TestSqliteBackendEvent::Commit)));
-        assert_eq!(backend.count_sql_matching(|sql| sql.starts_with("SELECT")), 2);
+        assert_eq!(
+            backend.count_sql_matching(|sql| sql.starts_with("SELECT")),
+            2
+        );
 
         backend.clear_query_log();
         assert!(backend.recorded_events().is_empty());

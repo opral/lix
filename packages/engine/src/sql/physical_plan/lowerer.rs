@@ -204,12 +204,13 @@ pub(crate) fn lower_read_for_execution_with_layouts(
         SurfaceFamily::Admin => {
             lower_admin_read_for_execution(dialect, structured_read, current_version_heads).map(
                 |program| {
-                program.map(|mut program| {
-                    program.pushdown_decision = admin_pushdown_decision(structured_read);
-                    program.result_columns = result_columns.clone();
-                    program
-                })
-            })
+                    program.map(|mut program| {
+                        program.pushdown_decision = admin_pushdown_decision(structured_read);
+                        program.result_columns = result_columns.clone();
+                        program
+                    })
+                },
+            )
         }
         SurfaceFamily::Filesystem => lower_filesystem_read_for_execution(dialect, structured_read)
             .map(|program| {

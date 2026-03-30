@@ -12,8 +12,8 @@ use crate::live_state::untracked::{
     UntrackedScanRequest,
 };
 use crate::version::{
-    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key, version_ref_schema_version,
-    version_ref_storage_version_id,
+    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
+    version_ref_schema_version, version_ref_storage_version_id,
 };
 use crate::{CommittedVersionFrontier, LixBackend, LixError};
 
@@ -137,7 +137,10 @@ async fn load_all_committed_version_refs_from_local_state(
             }
         }
         previous_version_id = Some(row.entity_id.clone());
-        version_refs.push(parse_version_ref_row_from_untracked(row.entity_id.clone(), &row)?);
+        version_refs.push(parse_version_ref_row_from_untracked(
+            row.entity_id.clone(),
+            &row,
+        )?);
     }
 
     Ok(version_refs)
@@ -150,13 +153,19 @@ fn parse_version_ref_row_from_untracked(
     let commit_id = row.property_text("commit_id").ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("local version head for '{}' is missing commit_id", version_id),
+            format!(
+                "local version head for '{}' is missing commit_id",
+                version_id
+            ),
         )
     })?;
     if commit_id.is_empty() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("local version head for '{}' has empty commit_id", version_id),
+            format!(
+                "local version head for '{}' has empty commit_id",
+                version_id
+            ),
         ));
     }
     Ok(VersionRefRow {
@@ -169,9 +178,9 @@ fn parse_version_ref_row_from_untracked(
 mod tests {
     use super::*;
     use crate::live_state::constraints::{quote_ident, sql_literal};
-    use crate::live_state::schema_access::normalized_values_for_schema;
-    use crate::live_state::live_schema_column_names;
     use crate::live_state::live_relation_name;
+    use crate::live_state::live_schema_column_names;
+    use crate::live_state::schema_access::normalized_values_for_schema;
     use crate::test_support::{init_test_backend_core, seed_local_version_head, TestSqliteBackend};
     use crate::{LixBackend, Value};
 
@@ -294,9 +303,14 @@ mod tests {
     #[tokio::test]
     async fn committed_ref_lookup_resolves_current_head_from_local_version_head_row() {
         let backend = init_refs_backend().await;
-        seed_local_version_head(&backend, "main", "commit-canonical", "2026-03-06T14:22:00.000Z")
-            .await
-            .expect("local version head seed should succeed");
+        seed_local_version_head(
+            &backend,
+            "main",
+            "commit-canonical",
+            "2026-03-06T14:22:00.000Z",
+        )
+        .await
+        .expect("local version head seed should succeed");
 
         let version_ref = load_committed_version_ref_with_backend(&backend, "main")
             .await
@@ -346,6 +360,8 @@ mod tests {
             .await
             .expect_err("lookup should reject multiple heads");
 
-        assert!(error.description.contains("expected at most one untracked row"));
+        assert!(error
+            .description
+            .contains("expected at most one untracked row"));
     }
 }

@@ -329,7 +329,9 @@ fn build_current_version_refs_unique_cte_sql(
     )
 }
 
-fn build_inline_current_version_refs_cte_sql(current_version_heads: &BTreeMap<String, String>) -> String {
+fn build_inline_current_version_refs_cte_sql(
+    current_version_heads: &BTreeMap<String, String>,
+) -> String {
     let current_refs_sql = if current_version_heads.is_empty() {
         "SELECT NULL AS version_id, NULL AS commit_id WHERE 1 = 0".to_string()
     } else {

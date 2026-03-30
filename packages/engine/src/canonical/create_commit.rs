@@ -1695,14 +1695,9 @@ mod tests {
         );
         args.active_account_ids = vec!["acct-session".to_string(), "acct-shadow".to_string()];
 
-        let result = create_commit(
-            transaction.as_mut(),
-            args,
-            &mut functions,
-            None,
-        )
-        .await
-        .expect("create_commit should succeed with explicit active accounts");
+        let result = create_commit(transaction.as_mut(), args, &mut functions, None)
+            .await
+            .expect("create_commit should succeed with explicit active accounts");
 
         let seed = result
             .applied_output
@@ -1944,9 +1939,14 @@ mod tests {
     #[tokio::test]
     async fn applies_global_admin_lane_when_head_matches_expected() {
         let backend = init_create_commit_backend().await;
-        seed_local_version_head(&backend, GLOBAL_VERSION_ID, "commit-global-123", TEST_TIMESTAMP)
-            .await
-            .expect("global local version head should seed");
+        seed_local_version_head(
+            &backend,
+            GLOBAL_VERSION_ID,
+            "commit-global-123",
+            TEST_TIMESTAMP,
+        )
+        .await
+        .expect("global local version head should seed");
         backend.clear_query_log();
         let mut transaction = backend
             .begin_transaction(crate::TransactionMode::Write)

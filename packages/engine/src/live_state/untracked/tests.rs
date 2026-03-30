@@ -340,9 +340,7 @@ async fn live_untracked_state_delete_removes_rows() {
         .expect("live_state init should succeed");
     commit_untracked_rows(
         &backend,
-        vec![local_version_head_write_row(
-            "main", "commit-1", timestamp,
-        )],
+        vec![local_version_head_write_row("main", "commit-1", timestamp)],
     )
     .await
     .expect("initial version ref transaction should succeed");

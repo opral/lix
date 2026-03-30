@@ -527,7 +527,10 @@ mod tests {
             .expect("canonical history fixture should seed");
         backend.clear_query_log();
 
-        let row = load_exact_committed_state_row_at_version_head(&backend, &exact_file_descriptor_request())
+        let row = load_exact_committed_state_row_at_version_head(
+            &backend,
+            &exact_file_descriptor_request(),
+        )
         .await
         .expect("canonical exact-state lookup should succeed")
         .expect("canonical exact-state lookup should return a row");
@@ -565,7 +568,10 @@ mod tests {
             .await
             .expect("canonical history fixture should seed");
 
-        let row = load_exact_committed_state_row_at_version_head(&backend, &exact_file_descriptor_request())
+        let row = load_exact_committed_state_row_at_version_head(
+            &backend,
+            &exact_file_descriptor_request(),
+        )
         .await
         .expect("canonical exact-state lookup should succeed")
         .expect("canonical exact-state lookup should return a row");
