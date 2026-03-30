@@ -71,7 +71,7 @@ pub struct DerivedProjectionStatus {
     pub latest_cursor: Option<ReplayCursor>,
     /// Semantic frontier currently served by this projection.
     pub applied_committed_frontier: Option<CommittedVersionFrontier>,
-    /// Current committed frontier resolved from canonical refs.
+    /// Current committed frontier resolved from replica-local version heads.
     pub current_committed_frontier: CommittedVersionFrontier,
 }
 
@@ -126,11 +126,7 @@ pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
     receipt: &CanonicalCommitReceipt,
     tracked_writer_key_hints: &BTreeMap<RowIdentity, Option<String>>,
 ) -> Result<(), LixError> {
-    apply_legacy_version_ref_compat_mirrors_best_effort_in_transaction(
-        transaction,
-        &receipt.updated_version_refs,
-    )
-    .await;
+    apply_local_version_head_rows_in_transaction(transaction, &receipt.updated_version_refs).await?;
 
     if receipt.affected_versions.is_empty() {
         return Ok(());
@@ -171,19 +167,18 @@ pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
     Ok(())
 }
 
-async fn apply_legacy_version_ref_compat_mirrors_best_effort_in_transaction(
+async fn apply_local_version_head_rows_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     version_ref_updates: &[UpdatedVersionRef],
-) {
-    if let Err(_mirror_error) =
-        apply_legacy_version_ref_compat_mirrors_in_transaction(transaction, version_ref_updates)
-            .await
-    {
-        // Legacy compatibility mirrors are disposable derived state kept only
-        // for older read paths. They must not block canonical commit
-        // durability, live-state projection readiness, or semantic rebuild
-        // correctness.
+) -> Result<(), LixError> {
+    if version_ref_updates.is_empty() {
+        return Ok(());
     }
+    let batch: UntrackedWriteBatch = version_ref_updates
+        .iter()
+        .map(local_version_head_write_row_from_update)
+        .collect();
+    UntrackedWriteParticipant::apply_write_batch(transaction, &batch).await
 }
 
 pub(crate) async fn mark_live_state_projection_ready_in_transaction(
@@ -427,25 +422,9 @@ async fn apply_live_state_replay_scope_to_cursor(
     transaction.commit().await
 }
 
-async fn apply_legacy_version_ref_compat_mirrors_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    version_ref_updates: &[UpdatedVersionRef],
-) -> Result<(), LixError> {
-    if version_ref_updates.is_empty() {
-        return Ok(());
-    }
-    let batch: UntrackedWriteBatch = version_ref_updates
-        .iter()
-        .map(legacy_compat_version_ref_mirror_write_row_from_update)
-        .collect();
-    UntrackedWriteParticipant::apply_write_batch(transaction, &batch).await
-}
-
-/// Legacy compatibility mirror row for older live-table readers.
-///
-/// Canonical committed version refs are read from canonical change history, not
-/// from this untracked derived row shape.
-pub(crate) fn legacy_compat_version_ref_mirror_write_row(
+/// Replica-local version-head row used to resolve committed heads on this
+/// engine instance.
+pub(crate) fn local_version_head_write_row(
     version_id: &str,
     commit_id: &str,
     timestamp: &str,
@@ -467,10 +446,8 @@ pub(crate) fn legacy_compat_version_ref_mirror_write_row(
     }
 }
 
-fn legacy_compat_version_ref_mirror_write_row_from_update(
-    update: &UpdatedVersionRef,
-) -> UntrackedWriteRow {
-    legacy_compat_version_ref_mirror_write_row(
+fn local_version_head_write_row_from_update(update: &UpdatedVersionRef) -> UntrackedWriteRow {
+    local_version_head_write_row(
         update.version_id.as_str(),
         &update.commit_id,
         &update.created_at,
@@ -487,6 +464,8 @@ mod tests {
     };
     use crate::canonical::CanonicalCommitReceipt;
     use crate::live_state::ReplayCursor;
+    use crate::live_state::{live_relation_name, live_schema_column_names};
+    use crate::live_state::schema_access::normalized_values_for_schema;
     use crate::live_state::{LiveStateMode, LIVE_STATE_SCHEMA_EPOCH};
     use crate::test_support::boot_test_engine;
     use crate::{CreateVersionOptions, VersionId};
@@ -514,7 +493,7 @@ mod tests {
             if is_committed_version_frontier_query(sql) {
                 return Ok(QueryResult {
                     rows: version_ref_rows(&self.version_heads),
-                    columns: vec!["version_id".to_string(), "commit_id".to_string()],
+                    columns: version_ref_row_columns(),
                 });
             }
             if sql.contains("FROM lix_internal_live_state_status") {
@@ -574,7 +553,7 @@ mod tests {
         latest_cursor: Option<(String, String)>,
         version_heads: BTreeMap<String, String>,
         executed_sql: Vec<String>,
-        fail_legacy_version_ref_compat_mirror: bool,
+        fail_local_version_head_write: bool,
     }
 
     #[async_trait(?Send)]
@@ -589,19 +568,19 @@ mod tests {
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             self.executed_sql.push(sql.to_string());
-            if self.fail_legacy_version_ref_compat_mirror
+            if self.fail_local_version_head_write
                 && sql.contains("lix_version_ref")
                 && sql.contains("INSERT INTO")
             {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    "legacy version-ref compat mirror failed",
+                    "local version-head write failed",
                 ));
             }
             if is_committed_version_frontier_query(sql) {
                 return Ok(QueryResult {
                     rows: version_ref_rows(&self.version_heads),
-                    columns: vec!["version_id".to_string(), "commit_id".to_string()],
+                    columns: version_ref_row_columns(),
                 });
             }
             if sql.contains("FROM lix_internal_live_state_status") {
@@ -645,21 +624,66 @@ mod tests {
     }
 
     fn is_committed_version_frontier_query(sql: &str) -> bool {
-        sql.contains("version_ref_facts")
-            && sql.contains("current_refs")
-            && sql.contains("SELECT version_id, commit_id")
+        sql.contains(&live_relation_name("lix_version_ref"))
+            && sql.contains("untracked = true")
+            && sql.contains("ORDER BY entity_id ASC, file_id ASC")
     }
 
     fn version_ref_rows(version_heads: &BTreeMap<String, String>) -> Vec<Vec<Value>> {
         version_heads
             .iter()
-            .map(|(version_id, commit_id)| {
-                vec![
-                    Value::Text(version_id.clone()),
-                    Value::Text(commit_id.clone()),
-                ]
-            })
+            .map(|(version_id, commit_id)| fake_version_ref_live_row(version_id, commit_id))
             .collect()
+    }
+
+    fn version_ref_row_columns() -> Vec<String> {
+        let mut columns = vec![
+            "entity_id".to_string(),
+            "schema_key".to_string(),
+            "schema_version".to_string(),
+            "file_id".to_string(),
+            "version_id".to_string(),
+            "global".to_string(),
+            "plugin_key".to_string(),
+            "metadata".to_string(),
+            "writer_key".to_string(),
+            "created_at".to_string(),
+            "updated_at".to_string(),
+        ];
+        columns.extend(
+            live_schema_column_names(crate::version::version_ref_schema_key(), None)
+                .expect("version ref schema should expose column names"),
+        );
+        columns
+    }
+
+    fn fake_version_ref_live_row(version_id: &str, commit_id: &str) -> Vec<Value> {
+        let snapshot = crate::version::version_ref_snapshot_content(version_id, commit_id);
+        let normalized = normalized_values_for_schema(
+            crate::version::version_ref_schema_key(),
+            None,
+            Some(&snapshot),
+        )
+        .expect("snapshot should normalize");
+        let mut row = vec![
+            Value::Text(version_id.to_string()),
+            Value::Text(crate::version::version_ref_schema_key().to_string()),
+            Value::Text(crate::version::version_ref_schema_version().to_string()),
+            Value::Text(crate::version::version_ref_file_id().to_string()),
+            Value::Text(crate::version::version_ref_storage_version_id().to_string()),
+            Value::Boolean(true),
+            Value::Text(crate::version::version_ref_plugin_key().to_string()),
+            Value::Null,
+            Value::Null,
+            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
+            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
+        ];
+        for column_name in live_schema_column_names(crate::version::version_ref_schema_key(), None)
+            .expect("version ref schema should expose column names")
+        {
+            row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
+        }
+        row
     }
 
     fn frontier_json(entries: &[(&str, &str)]) -> String {
@@ -731,7 +755,7 @@ mod tests {
             latest_cursor: Some(("change-1".to_string(), "2026-03-15T01:02:02Z".to_string())),
             version_heads: BTreeMap::from([("main".to_string(), "commit-2".to_string())]),
             executed_sql: Vec::new(),
-            fail_legacy_version_ref_compat_mirror: false,
+            fail_local_version_head_write: false,
         };
         let receipt = CanonicalCommitReceipt {
             commit_id: "commit-2".to_string(),
@@ -753,13 +777,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_version_ref_compat_mirror_failures_do_not_block_projection_application() {
+    async fn local_version_head_writes_are_required_for_projection_application() {
         let mut transaction = FakeTransaction {
             status_row: None,
             latest_cursor: None,
             version_heads: BTreeMap::new(),
             executed_sql: Vec::new(),
-            fail_legacy_version_ref_compat_mirror: true,
+            fail_local_version_head_write: true,
         };
         let receipt = CanonicalCommitReceipt {
             commit_id: "commit-2".to_string(),
@@ -778,7 +802,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .await
-        .expect("legacy compat mirror failures should not block projection application");
+        .expect_err("local version-head writes should block projection application");
 
         assert!(transaction
             .executed_sql

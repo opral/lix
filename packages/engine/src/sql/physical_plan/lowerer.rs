@@ -143,6 +143,7 @@ pub(crate) fn lower_read_for_execution_with_layouts(
     effective_state_request: Option<&EffectiveStateRequest>,
     effective_state_plan: Option<&EffectiveStatePlan>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
+    current_version_heads: &BTreeMap<String, String>,
 ) -> Result<Option<LoweredReadProgram>, LixError> {
     let result_columns = lowered_result_columns(structured_read);
     match structured_read.surface_binding.descriptor.surface_family {
@@ -207,7 +208,8 @@ pub(crate) fn lower_read_for_execution_with_layouts(
             })
         }
         SurfaceFamily::Admin => {
-            lower_admin_read_for_execution(dialect, structured_read).map(|program| {
+            lower_admin_read_for_execution(dialect, structured_read, current_version_heads).map(
+                |program| {
                 program.map(|mut program| {
                     program.pushdown_decision = admin_pushdown_decision(structured_read);
                     program.result_columns = result_columns.clone();
@@ -917,6 +919,7 @@ fn is_rewriteable_filesystem_public_surface_name(name: &str) -> bool {
 fn lower_admin_read_for_execution(
     dialect: SqlDialect,
     canonicalized: &StructuredPublicRead,
+    current_version_heads: &BTreeMap<String, String>,
 ) -> Result<Option<LoweredReadProgram>, LixError> {
     let Some(admin_scan) = canonical_admin_scan(&canonicalized.read_command.root) else {
         return Ok(None);
@@ -925,7 +928,7 @@ fn lower_admin_read_for_execution(
     build_lowered_read_program(
         dialect,
         canonicalized,
-        build_admin_source_sql(admin_scan.kind, dialect)?,
+        build_admin_source_sql_with_current_heads(admin_scan.kind, dialect, current_version_heads)?,
         canonicalized.query.selection.clone(),
     )
     .map(Some)
@@ -1011,6 +1014,21 @@ fn build_admin_source_sql(
     Ok(match kind {
         CanonicalAdminKind::Version => {
             crate::canonical::version_state::build_admin_version_source_sql(dialect)
+        }
+    })
+}
+
+fn build_admin_source_sql_with_current_heads(
+    kind: CanonicalAdminKind,
+    dialect: SqlDialect,
+    current_version_heads: &BTreeMap<String, String>,
+) -> Result<String, LixError> {
+    Ok(match kind {
+        CanonicalAdminKind::Version => {
+            crate::canonical::version_state::build_admin_version_source_sql_with_current_heads(
+                dialect,
+                Some(current_version_heads),
+            )
         }
     })
 }
@@ -1836,8 +1854,8 @@ fn build_change_source_sql() -> String {
 }
 
 fn build_working_changes_source_sql(active_version_id: &str) -> String {
-    // This still reads the legacy compatibility mirror for version refs until
-    // all working-change paths are fully canonicalized.
+    // Working-change resolution reads the replica-local version-head row to
+    // anchor committed history for the selected version.
     let version_ref_table = tracked_relation_name("lix_version_ref");
     let commit_tracked_table = tracked_relation_name("lix_commit");
     let cse_tracked_table = tracked_relation_name("lix_change_set_element");
@@ -1892,6 +1910,7 @@ fn build_working_changes_source_sql(active_version_id: &str) -> String {
                         WHERE file_id = 'lix' \
                           AND entity_id = (SELECT version_id FROM active_version) \
                           AND version_id = 'global' \
+                          AND untracked = true \
                           AND {version_ref_commit_id_column} IS NOT NULL \
                         LIMIT 1 \
                     ) AS head_commit_id \
@@ -1905,6 +1924,7 @@ fn build_working_changes_source_sql(active_version_id: &str) -> String {
                         WHERE file_id = 'lix' \
                           AND entity_id = 'global' \
                           AND version_id = 'global' \
+                          AND untracked = true \
                           AND {version_ref_commit_id_column} IS NOT NULL \
                         LIMIT 1 \
                     ) AS head_commit_id \
@@ -2684,6 +2704,7 @@ mod tests {
             effective_state.as_ref().map(|(request, _)| request),
             effective_state.as_ref().map(|(_, plan)| plan),
             known_live_layouts,
+            &BTreeMap::new(),
         )
         .expect("lowering should succeed")
     }
@@ -3014,7 +3035,8 @@ mod tests {
 
         assert!(lowered_sql.contains("FROM lix_internal_change c"));
         assert!(lowered_sql.contains("lix_version_descriptor"));
-        assert!(lowered_sql.contains("lix_version_ref"));
+        assert!(lowered_sql.contains("current_refs"));
+        assert!(!lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
         assert!(!lowered_sql.contains("FROM lix_version"));
         assert!(!lowered_sql.contains("lix_json_extract("));
         assert!(!lowered_sql.contains("lix_json_extract_boolean("));
@@ -3060,6 +3082,7 @@ mod tests {
             &structured_read,
             effective_state.as_ref().map(|(request, _)| request),
             effective_state.as_ref().map(|(_, plan)| plan),
+            &BTreeMap::new(),
             &BTreeMap::new(),
         )
         .expect("parameterized version read should lower")

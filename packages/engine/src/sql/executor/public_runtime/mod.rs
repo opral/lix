@@ -3121,52 +3121,60 @@ mod tests {
         });
     }
 
-    #[tokio::test]
-    async fn prepares_explain_over_history_surfaces_without_backend_rewrite() {
-        let backend = FakeBackend::default();
-        let prepared = prepare_public_execution(
-            &backend,
-            &parse_one(
-                "EXPLAIN SELECT key FROM lix_key_value_history \
-                 WHERE root_commit_id = 'root-1' AND key = 'hello'",
-            ),
-            &[],
-            "main",
-            &[],
-            None,
-        )
-        .await
-        .expect("history EXPLAIN should prepare")
-        .expect("history EXPLAIN should route through public execution");
+    #[test]
+    fn prepares_explain_over_history_surfaces_without_backend_rewrite() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let backend = FakeBackend::default();
+                    let prepared = prepare_public_execution(
+                        &backend,
+                        &parse_one(
+                            "EXPLAIN SELECT key FROM lix_key_value_history \
+                             WHERE root_commit_id = 'root-1' AND key = 'hello'",
+                        ),
+                        &[],
+                        "main",
+                        &[],
+                        None,
+                    )
+                    .await
+                    .expect("history EXPLAIN should prepare")
+                    .expect("history EXPLAIN should route through public execution");
 
-        match prepared {
-            PreparedPublicExecution::Read(prepared) => {
-                assert_eq!(prepared.surface_bindings(), vec!["lix_key_value_history"]);
-                assert!(
-                    prepared.explain.executor_artifacts.lowered_sql.is_empty(),
-                    "history EXPLAIN should stay on direct execution instead of lowering backend SQL"
-                );
-                assert!(
-                    stage_duration_us(
-                        &prepared,
-                        crate::sql::explain::ExplainStage::CapabilityResolution,
-                    )
-                    .is_none(),
-                    "direct-history EXPLAIN should not record capability_resolution timing"
-                );
-                assert!(
-                    stage_duration_us(
-                        &prepared,
-                        crate::sql::explain::ExplainStage::ExecutorPreparation,
-                    )
-                    .is_none(),
-                    "direct-history EXPLAIN should not record executor_preparation timing"
-                );
-            }
-            PreparedPublicExecution::Write(_) => {
-                panic!("history EXPLAIN must not route through public write execution")
-            }
-        }
+                    match prepared {
+                        PreparedPublicExecution::Read(prepared) => {
+                            assert_eq!(prepared.surface_bindings(), vec!["lix_key_value_history"]);
+                            assert!(
+                                prepared.explain.executor_artifacts.lowered_sql.is_empty(),
+                                "history EXPLAIN should stay on direct execution instead of lowering backend SQL"
+                            );
+                            assert!(
+                                stage_duration_us(
+                                    &prepared,
+                                    crate::sql::explain::ExplainStage::CapabilityResolution,
+                                )
+                                .is_none(),
+                                "direct-history EXPLAIN should not record capability_resolution timing"
+                            );
+                            assert!(
+                                stage_duration_us(
+                                    &prepared,
+                                    crate::sql::explain::ExplainStage::ExecutorPreparation,
+                                )
+                                .is_none(),
+                                "direct-history EXPLAIN should not record executor_preparation timing"
+                            );
+                        }
+                        PreparedPublicExecution::Write(_) => {
+                            panic!("history EXPLAIN must not route through public write execution")
+                        }
+                    }
+                })
+        });
     }
 
     #[tokio::test]
@@ -3682,7 +3690,8 @@ mod tests {
                         assert!(!lowered_sql.contains("FROM lix_version"));
                         assert!(lowered_sql.contains("FROM lix_internal_change c"));
                         assert!(lowered_sql.contains("lix_version_descriptor"));
-                        assert!(lowered_sql.contains("lix_version_ref"));
+                        assert!(lowered_sql.contains("current_refs"));
+                        assert!(!lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
                     }
                 })
         });

@@ -46,7 +46,7 @@ use contracts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
 pub struct OpenSessionOptions {
     /// Ephemeral workspace selector override for the child session.
     ///
-    /// This does not mutate canonical refs or committed version heads.
+    /// This does not mutate replica-local version heads or committed history.
     pub active_version_id: Option<String>,
     #[serde(default)]
     /// Ephemeral workspace account-selector override for the child session.
@@ -266,9 +266,9 @@ impl Session {
 
     /// Merges one committed version head into another.
     ///
-    /// This may update canonical refs and rebuild derived projections, but it
-    /// does not change workspace selectors unless the caller separately updates
-    /// them.
+    /// This may update replica-local version heads and rebuild derived
+    /// projections, but it does not change workspace selectors unless the
+    /// caller separately updates them.
     pub async fn merge_version(
         &self,
         options: crate::MergeVersionOptions,

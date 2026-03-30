@@ -1,4 +1,5 @@
 use crate::init::InitExecutor;
+use crate::live_state::untracked::{UntrackedWriteParticipant, UntrackedWriteRow};
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) async fn init(_backend: &dyn LixBackend) -> Result<(), LixError> {
@@ -51,18 +52,10 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             super::GLOBAL_VERSION_ID,
         )
         .await?;
-        self.seed_canonical_version_ref(
-            &bootstrap_commit_id,
-            super::GLOBAL_VERSION_ID,
-            &bootstrap_commit_id,
-        )
-        .await?;
-        self.seed_canonical_version_ref(
-            &bootstrap_commit_id,
-            &main_version_id,
-            &bootstrap_commit_id,
-        )
-        .await?;
+        self.seed_local_version_head(super::GLOBAL_VERSION_ID, &bootstrap_commit_id)
+            .await?;
+        self.seed_local_version_head(&main_version_id, &bootstrap_commit_id)
+            .await?;
 
         Ok(main_version_id)
     }
@@ -156,5 +149,33 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         }
 
         Ok(())
+    }
+
+    async fn seed_local_version_head(
+        &mut self,
+        version_id: &str,
+        commit_id: &str,
+    ) -> Result<(), LixError> {
+        let timestamp = self.generate_runtime_timestamp().await?;
+        let row = UntrackedWriteRow {
+            entity_id: version_id.to_string(),
+            schema_key: super::version_ref_schema_key().to_string(),
+            schema_version: super::version_ref_schema_version().to_string(),
+            file_id: super::version_ref_file_id().to_string(),
+            version_id: super::version_ref_storage_version_id().to_string(),
+            global: true,
+            plugin_key: super::version_ref_plugin_key().to_string(),
+            metadata: None,
+            writer_key: None,
+            snapshot_content: Some(super::version_ref_snapshot_content(version_id, commit_id)),
+            created_at: Some(timestamp.clone()),
+            updated_at: timestamp,
+            operation: crate::live_state::untracked::UntrackedWriteOperation::Upsert,
+        };
+        UntrackedWriteParticipant::apply_write_batch(
+            self.backend_transaction_mut()?,
+            &[row],
+        )
+        .await
     }
 }

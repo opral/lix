@@ -7,9 +7,9 @@
 //! The storage key is the semantic row identity:
 //! `(version_id, schema_key, entity_id, file_id)`.
 //!
-//! This table is intentionally separate from canonical changes, canonical refs,
-//! and derived live-state tables. It stores only workspace annotation data that
-//! may later be overlaid onto state-shaped reads.
+//! This table is intentionally separate from canonical changes, replica-local
+//! version-head state, and derived live-state tables. It stores only workspace
+//! annotation data that may later be overlaid onto state-shaped reads.
 
 use std::collections::{BTreeMap, BTreeSet};
 

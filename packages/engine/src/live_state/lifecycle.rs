@@ -86,7 +86,7 @@ pub(crate) struct LiveStateProjectionStatus {
     pub(crate) latest_cursor: Option<ReplayCursor>,
     /// Semantic frontier actually served by the current live-state projection.
     pub(crate) applied_committed_frontier: Option<CommittedVersionFrontier>,
-    /// Current committed frontier resolved from canonical refs.
+    /// Current committed frontier resolved from replica-local version heads.
     pub(crate) current_committed_frontier: CommittedVersionFrontier,
 }
 
@@ -805,6 +805,8 @@ async fn live_state_status_column_exists_in_transaction(
 mod tests {
     use super::*;
     use crate::backend::SqlDialect;
+    use crate::live_state::{live_relation_name, live_schema_column_names};
+    use crate::live_state::schema_access::normalized_values_for_schema;
     use async_trait::async_trait;
     use std::collections::BTreeMap;
 
@@ -827,7 +829,7 @@ mod tests {
             if is_committed_version_frontier_query(sql) {
                 return Ok(QueryResult {
                     rows: version_ref_rows(&self.version_heads),
-                    columns: vec!["version_id".to_string(), "commit_id".to_string()],
+                    columns: version_ref_row_columns(),
                 });
             }
             if sql.contains("FROM lix_internal_live_state_status") {
@@ -904,7 +906,7 @@ mod tests {
             if is_committed_version_frontier_query(sql) {
                 return Ok(QueryResult {
                     rows: version_ref_rows(&self.version_heads),
-                    columns: vec!["version_id".to_string(), "commit_id".to_string()],
+                    columns: version_ref_row_columns(),
                 });
             }
             if sql.contains("FROM lix_internal_live_state_status") {
@@ -948,21 +950,66 @@ mod tests {
     }
 
     fn is_committed_version_frontier_query(sql: &str) -> bool {
-        sql.contains("version_ref_facts")
-            && sql.contains("current_refs")
-            && sql.contains("SELECT version_id, commit_id")
+        sql.contains(&live_relation_name("lix_version_ref"))
+            && sql.contains("untracked = true")
+            && sql.contains("ORDER BY entity_id ASC, file_id ASC")
     }
 
     fn version_ref_rows(version_heads: &BTreeMap<String, String>) -> Vec<Vec<Value>> {
         version_heads
             .iter()
-            .map(|(version_id, commit_id)| {
-                vec![
-                    Value::Text(version_id.clone()),
-                    Value::Text(commit_id.clone()),
-                ]
-            })
+            .map(|(version_id, commit_id)| fake_version_ref_live_row(version_id, commit_id))
             .collect()
+    }
+
+    fn version_ref_row_columns() -> Vec<String> {
+        let mut columns = vec![
+            "entity_id".to_string(),
+            "schema_key".to_string(),
+            "schema_version".to_string(),
+            "file_id".to_string(),
+            "version_id".to_string(),
+            "global".to_string(),
+            "plugin_key".to_string(),
+            "metadata".to_string(),
+            "writer_key".to_string(),
+            "created_at".to_string(),
+            "updated_at".to_string(),
+        ];
+        columns.extend(
+            live_schema_column_names(crate::version::version_ref_schema_key(), None)
+                .expect("version ref schema should expose column names"),
+        );
+        columns
+    }
+
+    fn fake_version_ref_live_row(version_id: &str, commit_id: &str) -> Vec<Value> {
+        let snapshot = crate::version::version_ref_snapshot_content(version_id, commit_id);
+        let normalized = normalized_values_for_schema(
+            crate::version::version_ref_schema_key(),
+            None,
+            Some(&snapshot),
+        )
+        .expect("snapshot should normalize");
+        let mut row = vec![
+            Value::Text(version_id.to_string()),
+            Value::Text(crate::version::version_ref_schema_key().to_string()),
+            Value::Text(crate::version::version_ref_schema_version().to_string()),
+            Value::Text(crate::version::version_ref_file_id().to_string()),
+            Value::Text(crate::version::version_ref_storage_version_id().to_string()),
+            Value::Boolean(true),
+            Value::Text(crate::version::version_ref_plugin_key().to_string()),
+            Value::Null,
+            Value::Null,
+            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
+            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
+        ];
+        for column_name in live_schema_column_names(crate::version::version_ref_schema_key(), None)
+            .expect("version ref schema should expose column names")
+        {
+            row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
+        }
+        row
     }
 
     fn frontier_json(entries: &[(&str, &str)]) -> String {

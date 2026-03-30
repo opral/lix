@@ -1,9 +1,9 @@
 //! Committed-state resolution over canonical history.
 //!
-//! Semantically, committed meaning/state is resolved from canonical refs plus
-//! commit-graph facts derived from canonical changes. This module answers that
-//! question directly from canonical-owned data, independent of live-state
-//! replay status and other derived mirrors.
+//! Semantically, committed meaning/state is resolved from replica-local version
+//! heads plus commit-graph facts derived from canonical changes. This module
+//! answers that question directly from canonical-owned data, independent of
+//! live-state replay status and other derived mirrors.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,7 +16,8 @@ use super::types::{VersionInfo, VersionSnapshot};
 
 const CANONICAL_FALLBACK_MAX_COMMIT_DEPTH: usize = 2048;
 
-/// Canonical committed row resolved from commit-graph and ref facts.
+/// Canonical committed row resolved from commit-graph facts plus local
+/// version-head selection.
 ///
 /// This type intentionally excludes workspace-owned selectors and annotations.
 /// Callers that need workspace overlays such as `writer_key` must apply them in
@@ -468,16 +469,6 @@ mod tests {
             if sql.contains(&file_descriptor_table) || sql.contains(&version_ref_table) {
                 return Err(LixError::new("LIX_ERROR_UNKNOWN", "no such table"));
             }
-            if sql.contains("FROM current_refs") && sql.contains("schema_key = 'lix_version_ref'") {
-                self.canonical_query_seen.store(true, Ordering::SeqCst);
-                return Ok(QueryResult {
-                    rows: vec![vec![
-                        Value::Text("v1".to_string()),
-                        Value::Text("commit-1".to_string()),
-                    ]],
-                    columns: vec!["version_id".to_string(), "commit_id".to_string()],
-                });
-            }
             if sql.contains("WITH RECURSIVE commit_walk")
                 && sql.contains("c.schema_key = 'lix_file_descriptor'")
             {
@@ -540,7 +531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canonical_version_head_contract_falls_back_to_journal() {
+    async fn canonical_version_head_contract_does_not_fall_back_when_local_head_is_absent() {
         let canonical_query_seen = Arc::new(AtomicBool::new(false));
         let backend = CanonicalFallbackBackend {
             canonical_query_seen: Arc::clone(&canonical_query_seen),
@@ -552,10 +543,10 @@ mod tests {
             .expect("canonical version head lookup should succeed");
 
         assert!(
-            canonical_query_seen.load(Ordering::SeqCst),
-            "canonical version head lookup should read canonical changes when live mirrors are absent"
+            !canonical_query_seen.load(Ordering::SeqCst),
+            "local version-head lookup should not infer a fallback from canonical changes"
         );
-        assert_eq!(commit_id.as_deref(), Some("commit-1"));
+        assert!(commit_id.is_none());
     }
 
     #[tokio::test]

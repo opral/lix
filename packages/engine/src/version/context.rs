@@ -148,9 +148,9 @@ pub(crate) async fn load_version_context_with_executor(
     if version_ref.commit_id.trim().is_empty() {
         return Ok(None);
     }
-    // A version ref currently names the committed tip that also anchors
-    // version-scoped history reads, so the resolved head and history root are
-    // explicit facts even though they coincide today.
+    // The replica-local version head currently names the committed tip that
+    // also anchors version-scoped history reads, so the resolved head and
+    // history root are explicit facts even though they coincide today.
     Ok(Some(VersionContext {
         target: ResolvedVersionTarget {
             version_id: version_ref.version_id,

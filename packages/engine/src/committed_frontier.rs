@@ -3,10 +3,11 @@ use std::collections::BTreeMap;
 use crate::canonical::refs::VersionRefRow;
 use crate::LixError;
 
-/// Semantic frontier for committed state selected by canonical refs.
+/// Semantic frontier for committed state selected by replica-local version
+/// heads.
 ///
-/// This frontier is replica-independent committed meaning. It records the head
-/// commit currently selected for each version id.
+/// The commit DAG remains canonical, but this mapping records which committed
+/// head each local engine instance currently chooses for each version id.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct CommittedVersionFrontier {
     pub version_heads: BTreeMap<String, String>,

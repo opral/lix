@@ -784,8 +784,8 @@ fn quote_ident(identifier: &str) -> String {
 }
 
 fn active_version_commit_id_sql(active_version_id: &str) -> Result<String, LixError> {
-    // Filesystem current-version projection still consults the legacy
-    // compatibility mirror for active version refs.
+    // Filesystem current-version projection consults the replica-local version
+    // head row for the active version.
     let version_ref_commit_id_column =
         quote_ident(&live_payload_column_name("lix_version_ref", "commit_id"));
     let live_version_ref_table = tracked_relation_name("lix_version_ref");

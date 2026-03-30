@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
 
 use crate::backend::QueryExecutor;
+use crate::live_state::schema_access::{payload_column_name_for_schema, tracked_relation_name};
 use crate::version::{
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
-    version_descriptor_schema_key, version_descriptor_schema_version, GLOBAL_VERSION_ID,
+    version_descriptor_schema_key, version_descriptor_schema_version, version_ref_file_id,
+    version_ref_plugin_key, version_ref_schema_key, version_ref_schema_version,
+    version_ref_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
@@ -122,13 +125,26 @@ pub(crate) async fn version_exists_with_executor(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
 ) -> Result<bool, LixError> {
-    Ok(load_version_descriptor_with_executor(executor, version_id)
+    if load_version_descriptor_with_executor(executor, version_id)
         .await?
-        .is_some())
+        .is_some()
+    {
+        return Ok(true);
+    }
+
+    version_exists_in_descriptor_inventory_with_executor(executor, version_id).await
 }
 
 pub(crate) fn build_admin_version_source_sql(dialect: SqlDialect) -> String {
-    let current_refs_cte_sql = build_current_version_refs_unique_cte_sql(dialect);
+    build_admin_version_source_sql_with_current_heads(dialect, None)
+}
+
+pub(crate) fn build_admin_version_source_sql_with_current_heads(
+    dialect: SqlDialect,
+    current_version_heads: Option<&BTreeMap<String, String>>,
+) -> String {
+    let current_refs_cte_sql =
+        build_current_version_refs_unique_cte_sql(dialect, current_version_heads);
     let name_expr = json_text_extract_sql(dialect, "d.snapshot_content", "name");
     let hidden_expr = json_boolean_extract_sql(dialect, "d.snapshot_content", "hidden");
     let (parent_join_sql, parent_value_expr) = json_array_text_join_sql(
@@ -155,9 +171,17 @@ pub(crate) fn build_admin_version_source_sql(dialect: SqlDialect) -> String {
              FROM current_refs \
              WHERE version_id = '{global_version}' \
          ), \
+         descriptor_seed_commits AS ( \
+             SELECT commit_id \
+             FROM global_head \
+             UNION \
+             SELECT commit_id \
+             FROM canonical_commit_headers \
+             WHERE NOT EXISTS (SELECT 1 FROM global_head) \
+         ), \
          reachable_global_commit_walk AS ( \
              SELECT commit_id, 0 AS depth \
-             FROM global_head \
+             FROM descriptor_seed_commits \
              UNION ALL \
              SELECT \
                {parent_value_expr} AS commit_id, \
@@ -251,8 +275,23 @@ fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn build_current_version_refs_unique_cte_sql(dialect: SqlDialect) -> String {
-    let commit_id_expr = json_text_extract_sql(dialect, "ref_snapshot.content", "commit_id");
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn build_current_version_refs_unique_cte_sql(
+    _dialect: SqlDialect,
+    current_version_heads: Option<&BTreeMap<String, String>>,
+) -> String {
+    if let Some(current_version_heads) = current_version_heads {
+        return build_inline_current_version_refs_cte_sql(current_version_heads);
+    }
+
+    let version_ref_table = tracked_relation_name("lix_version_ref");
+    let commit_id_column = quote_ident(
+        &payload_column_name_for_schema("lix_version_ref", None, "commit_id")
+            .expect("version ref schema should expose commit_id"),
+    );
     format!(
         "canonical_commit_headers AS ( \
              SELECT \
@@ -266,38 +305,85 @@ fn build_current_version_refs_unique_cte_sql(dialect: SqlDialect) -> String {
                AND commit_change.plugin_key = 'lix' \
                AND commit_snapshot.content IS NOT NULL \
          ), \
-         ranked_ref_facts AS ( \
-             SELECT \
-               ref_change.entity_id AS version_id, \
-               {commit_id_expr} AS commit_id, \
-               ref_snapshot.content AS snapshot_content, \
-               ROW_NUMBER() OVER ( \
-                 PARTITION BY ref_change.entity_id \
-                 ORDER BY ref_change.created_at DESC, ref_change.id DESC \
-               ) AS rn \
-             FROM lix_internal_change ref_change \
-             LEFT JOIN lix_internal_snapshot ref_snapshot \
-               ON ref_snapshot.id = ref_change.snapshot_id \
-             WHERE ref_change.schema_key = '{ref_schema_key}' \
-               AND ref_change.schema_version = '{ref_schema_version}' \
-               AND ref_change.file_id = '{ref_file_id}' \
-               AND ref_change.plugin_key = '{ref_plugin_key}' \
-         ), \
          current_refs AS ( \
              SELECT \
-               version_id, \
-               commit_id \
-             FROM ranked_ref_facts \
-             WHERE rn = 1 \
-               AND snapshot_content IS NOT NULL \
-               AND COALESCE(commit_id, '') <> '' \
+               entity_id AS version_id, \
+               {commit_id_column} AS commit_id \
+             FROM {version_ref_table} \
+             WHERE schema_key = '{ref_schema_key}' \
+               AND schema_version = '{ref_schema_version}' \
+               AND file_id = '{ref_file_id}' \
+               AND plugin_key = '{ref_plugin_key}' \
+               AND version_id = '{storage_version_id}' \
+               AND untracked = true \
+               AND {commit_id_column} IS NOT NULL \
+               AND {commit_id_column} <> '' \
          ), ",
-        ref_schema_key = escape_sql_string(crate::version::version_ref_schema_key()),
-        ref_schema_version = escape_sql_string(crate::version::version_ref_schema_version()),
-        ref_file_id = escape_sql_string(crate::version::version_ref_file_id()),
-        ref_plugin_key = escape_sql_string(crate::version::version_ref_plugin_key()),
-        commit_id_expr = commit_id_expr,
+        ref_schema_key = escape_sql_string(version_ref_schema_key()),
+        ref_schema_version = escape_sql_string(version_ref_schema_version()),
+        ref_file_id = escape_sql_string(version_ref_file_id()),
+        ref_plugin_key = escape_sql_string(version_ref_plugin_key()),
+        storage_version_id = escape_sql_string(version_ref_storage_version_id()),
+        commit_id_column = commit_id_column,
+        version_ref_table = version_ref_table,
     )
+}
+
+fn build_inline_current_version_refs_cte_sql(current_version_heads: &BTreeMap<String, String>) -> String {
+    let current_refs_sql = if current_version_heads.is_empty() {
+        "SELECT NULL AS version_id, NULL AS commit_id WHERE 1 = 0".to_string()
+    } else {
+        let values = current_version_heads
+            .iter()
+            .map(|(version_id, commit_id)| {
+                format!(
+                    "('{}', '{}')",
+                    escape_sql_string(version_id),
+                    escape_sql_string(commit_id)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("VALUES {values}")
+    };
+    format!(
+        "canonical_commit_headers AS ( \
+             SELECT \
+               commit_change.entity_id AS commit_id, \
+               commit_snapshot.content AS commit_snapshot_content \
+             FROM lix_internal_change commit_change \
+             LEFT JOIN lix_internal_snapshot commit_snapshot \
+               ON commit_snapshot.id = commit_change.snapshot_id \
+             WHERE commit_change.schema_key = 'lix_commit' \
+               AND commit_change.file_id = 'lix' \
+               AND commit_change.plugin_key = 'lix' \
+               AND commit_snapshot.content IS NOT NULL \
+         ), \
+         current_refs(version_id, commit_id) AS ( \
+             {current_refs_sql} \
+         ), ",
+        current_refs_sql = current_refs_sql,
+    )
+}
+
+async fn version_exists_in_descriptor_inventory_with_executor(
+    executor: &mut dyn QueryExecutor,
+    version_id: &str,
+) -> Result<bool, LixError> {
+    let empty_heads = BTreeMap::new();
+    let sql = format!(
+        "SELECT id \
+         FROM ({source_sql}) version_inventory \
+         WHERE id = '{version_id}' \
+         LIMIT 1",
+        source_sql = build_admin_version_source_sql_with_current_heads(
+            executor.dialect(),
+            Some(&empty_heads),
+        ),
+        version_id = escape_sql_string(version_id),
+    );
+    let result = executor.execute(&sql, &[]).await?;
+    Ok(!result.rows.is_empty())
 }
 
 fn json_array_text_join_sql(
