@@ -2,17 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 
-use crate::live_state::constraints::matches_constraints;
-use crate::live_state::effective;
-use crate::live_state::shared::identity::RowIdentity;
-use crate::live_state::shared::views::ReadViews;
-use crate::live_state::tracked::{
-    BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedReadView, TrackedRow,
-    TrackedScanRequest, TrackedTombstoneMarker, TrackedTombstoneView,
-};
-use crate::live_state::untracked::{
-    BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedReadView, UntrackedRow,
-    UntrackedScanRequest,
+use crate::live_state::{
+    matches_constraints, BatchTrackedRowRequest, BatchUntrackedRowRequest, ExactTrackedRowRequest,
+    ExactUntrackedRowRequest, LiveReadViews, LiveTrackedReader, LiveTrackedTombstoneReader,
+    LiveUntrackedReader, RowIdentity, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
+    UntrackedRow, UntrackedScanRequest,
 };
 use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
 use crate::LixError;
@@ -20,24 +14,24 @@ use crate::LixError;
 use super::overlay::PendingWriteOverlay;
 
 pub struct ReadContext<'a> {
-    base: ReadViews<'a>,
+    base: LiveReadViews<'a>,
 }
 
 impl<'a> ReadContext<'a> {
     #[cfg(test)]
     pub(crate) fn new(
-        tracked: &'a dyn TrackedReadView,
-        untracked: &'a dyn UntrackedReadView,
+        tracked: &'a dyn LiveTrackedReader,
+        untracked: &'a dyn LiveUntrackedReader,
         workspace_writer_keys: &'a dyn WorkspaceWriterKeyReadView,
     ) -> Self {
         Self {
-            base: ReadViews::new(tracked, untracked, workspace_writer_keys),
+            base: LiveReadViews::new(tracked, untracked, workspace_writer_keys),
         }
     }
 
     pub fn with_tracked_tombstones(
         mut self,
-        tracked_tombstones: &'a dyn TrackedTombstoneView,
+        tracked_tombstones: &'a dyn LiveTrackedTombstoneReader,
     ) -> Self {
         self.base = self.base.with_tracked_tombstones(tracked_tombstones);
         self
@@ -76,12 +70,9 @@ pub(crate) struct PendingReadContext<'a> {
 }
 
 impl<'a> PendingReadContext<'a> {
-    pub(crate) fn effective_state_context(&'a self) -> effective::ReadContext<'a> {
-        let context = effective::ReadContext::new(
-            &self.tracked,
-            &self.untracked,
-            &self.workspace_writer_keys,
-        );
+    pub(crate) fn effective_state_context(&'a self) -> LiveReadViews<'a> {
+        let context =
+            LiveReadViews::new(&self.tracked, &self.untracked, &self.workspace_writer_keys);
         if self.tracked_tombstones.has_source() {
             context.with_tracked_tombstones(&self.tracked_tombstones)
         } else {
@@ -91,17 +82,17 @@ impl<'a> PendingReadContext<'a> {
 }
 
 struct PendingTrackedReadView<'a> {
-    base: &'a dyn TrackedReadView,
+    base: &'a dyn LiveTrackedReader,
     pending: &'a PendingWriteOverlay,
 }
 
 struct PendingUntrackedReadView<'a> {
-    base: &'a dyn UntrackedReadView,
+    base: &'a dyn LiveUntrackedReader,
     pending: &'a PendingWriteOverlay,
 }
 
 struct PendingTrackedTombstoneView<'a> {
-    base: Option<&'a dyn TrackedTombstoneView>,
+    base: Option<&'a dyn LiveTrackedTombstoneReader>,
     pending: &'a PendingWriteOverlay,
 }
 
@@ -147,7 +138,7 @@ impl WorkspaceWriterKeyReadView for PendingWorkspaceWriterKeyReadView<'_> {
 }
 
 #[async_trait(?Send)]
-impl TrackedReadView for PendingTrackedReadView<'_> {
+impl LiveTrackedReader for PendingTrackedReadView<'_> {
     async fn load_exact_row(
         &self,
         request: &ExactTrackedRowRequest,
@@ -223,7 +214,7 @@ impl TrackedReadView for PendingTrackedReadView<'_> {
 }
 
 #[async_trait(?Send)]
-impl UntrackedReadView for PendingUntrackedReadView<'_> {
+impl LiveUntrackedReader for PendingUntrackedReadView<'_> {
     async fn load_exact_row(
         &self,
         request: &ExactUntrackedRowRequest,
@@ -302,7 +293,7 @@ impl UntrackedReadView for PendingUntrackedReadView<'_> {
 }
 
 #[async_trait(?Send)]
-impl TrackedTombstoneView for PendingTrackedTombstoneView<'_> {
+impl LiveTrackedTombstoneReader for PendingTrackedTombstoneView<'_> {
     async fn load_exact_tombstone(
         &self,
         request: &ExactTrackedRowRequest,

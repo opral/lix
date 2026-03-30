@@ -7,10 +7,11 @@ use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::filesystem;
 use crate::key_value;
 use crate::live_state;
-use crate::live_state::projection::replay::load_latest_live_state_replay_cursor_with_backend;
 use crate::live_state::{
-    load_mode_with_backend, mark_mode_with_backend, try_claim_bootstrap_with_backend,
-    LiveStateMode, LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
+    load_latest_live_state_replay_cursor_with_backend, load_mode_with_backend,
+    mark_live_state_projection_ready_with_backend, mark_mode_with_backend,
+    try_claim_bootstrap_with_backend, LiveStateMode, LiveStateRebuildDebugMode,
+    LiveStateRebuildRequest, LiveStateRebuildScope,
 };
 use crate::observe;
 use crate::schema;
@@ -136,8 +137,7 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
                         "initialize expected replay cursor after bootstrap seeding",
                     )
                 })?;
-            live_state::projection::mark_live_state_projection_ready_with_backend(&backend, &cursor)
-                .await
+            mark_live_state_projection_ready_with_backend(&backend, &cursor).await
         }
     }
     .await;

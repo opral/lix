@@ -1,7 +1,5 @@
 use crate::canonical::readers::load_committed_version_head_commit_id;
 use crate::engine::{Engine, ExecuteOptions, TransactionBackendAdapter};
-use crate::live_state::schema_access::{normalized_values_for_schema, tracked_relation_name};
-use crate::sql::common::text::escape_sql_string;
 use crate::sql::executor::execution_program::{ExecutionContext, SessionExecutionRuntime};
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::sql::parser::parse_sql;
@@ -313,31 +311,19 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     ) -> Result<(), LixError> {
         let change_id = self.generate_runtime_uuid().await?;
         let timestamp = self.generate_runtime_timestamp().await?;
-        let normalized_values = normalized_seed_values(schema_key, Some(snapshot_content))?;
-        let insert_sql = format!(
-            "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, writer_key, is_tombstone, created_at, updated_at{normalized_columns}\
-             ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{change_id}', NULL, NULL, 0, '{timestamp}', '{timestamp}'{normalized_literals}\
-             )",
-            table = quote_ident(&tracked_relation_name(schema_key)),
-            entity_id = escape_sql_string(entity_id),
-            schema_key = escape_sql_string(schema_key),
-            schema_version = escape_sql_string(schema_version),
-            file_id = escape_sql_string(file_id),
-            version_id = escape_sql_string(version_id),
-            global = if version_id == GLOBAL_VERSION_ID {
-                "true"
-            } else {
-                "false"
-            },
-            plugin_key = escape_sql_string(plugin_key),
-            change_id = escape_sql_string(&change_id),
-            timestamp = escape_sql_string(&timestamp),
-            normalized_columns = normalized_insert_columns_sql(&normalized_values),
-            normalized_literals = normalized_insert_literals_sql(&normalized_values),
-        );
-        self.execute_backend(&insert_sql, &[]).await?;
+        crate::live_state::upsert_bootstrap_tracked_row_in_transaction(
+            self.backend_transaction_mut()?,
+            entity_id,
+            schema_key,
+            schema_version,
+            file_id,
+            version_id,
+            plugin_key,
+            &change_id,
+            snapshot_content,
+            &timestamp,
+        )
+        .await?;
 
         self.insert_change_row_for_snapshot(
             entity_id,
@@ -369,30 +355,18 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         snapshot_content: &str,
     ) -> Result<(), LixError> {
         let timestamp = self.generate_runtime_timestamp().await?;
-        let normalized_values = normalized_seed_values(schema_key, Some(snapshot_content))?;
-        let insert_sql = format!(
-            "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, writer_key, untracked, created_at, updated_at{normalized_columns}\
-             ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', NULL, NULL, true, '{timestamp}', '{timestamp}'{normalized_literals}\
-             )",
-            table = quote_ident(&tracked_relation_name(schema_key)),
-            entity_id = escape_sql_string(entity_id),
-            schema_key = escape_sql_string(schema_key),
-            schema_version = escape_sql_string(schema_version),
-            file_id = escape_sql_string(file_id),
-            version_id = escape_sql_string(version_id),
-            global = if version_id == GLOBAL_VERSION_ID {
-                "true"
-            } else {
-                "false"
-            },
-            plugin_key = escape_sql_string(plugin_key),
-            timestamp = escape_sql_string(&timestamp),
-            normalized_columns = normalized_insert_columns_sql(&normalized_values),
-            normalized_literals = normalized_insert_literals_sql(&normalized_values),
-        );
-        self.execute_backend(&insert_sql, &[]).await?;
+        crate::live_state::upsert_bootstrap_untracked_row_in_transaction(
+            self.backend_transaction_mut()?,
+            entity_id,
+            schema_key,
+            schema_version,
+            file_id,
+            version_id,
+            plugin_key,
+            snapshot_content,
+            &timestamp,
+        )
+        .await?;
         Ok(())
     }
 
@@ -479,59 +453,6 @@ pub(crate) fn text_value(value: Option<&Value>, label: &str) -> Result<String, L
             description: format!("missing {label}"),
         }),
     }
-}
-
-pub(crate) fn normalized_seed_values(
-    schema_key: &str,
-    snapshot_content: Option<&str>,
-) -> Result<Vec<(String, Value)>, LixError> {
-    Ok(
-        normalized_values_for_schema(schema_key, None, snapshot_content)?
-            .into_iter()
-            .collect(),
-    )
-}
-
-pub(crate) fn normalized_insert_columns_sql(values: &[(String, Value)]) -> String {
-    if values.is_empty() {
-        return String::new();
-    }
-    values
-        .iter()
-        .map(|(column, _)| format!(", {}", quote_ident(column)))
-        .collect::<String>()
-}
-
-pub(crate) fn normalized_insert_literals_sql(values: &[(String, Value)]) -> String {
-    if values.is_empty() {
-        return String::new();
-    }
-    values
-        .iter()
-        .map(|(_, value)| format!(", {}", sql_literal(value)))
-        .collect::<String>()
-}
-
-pub(crate) fn sql_literal(value: &Value) -> String {
-    match value {
-        Value::Null => "NULL".to_string(),
-        Value::Boolean(value) => {
-            if *value {
-                "true".to_string()
-            } else {
-                "false".to_string()
-            }
-        }
-        Value::Integer(value) => value.to_string(),
-        Value::Real(value) => value.to_string(),
-        Value::Text(value) => format!("'{}'", escape_sql_string(value)),
-        Value::Json(value) => format!("'{}'", escape_sql_string(&value.to_string())),
-        Value::Blob(_) => "NULL".to_string(),
-    }
-}
-
-pub(crate) fn quote_ident(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 pub(crate) fn system_directory_name(path: &str) -> String {

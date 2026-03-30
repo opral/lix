@@ -16,22 +16,16 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             return Ok(());
         };
         let bootstrap_commit_id = self.load_global_version_commit_id().await?;
-        let account_table =
-            crate::live_state::schema_access::tracked_relation_name(super::account_schema_key());
-
         let exists = self
-            .execute_backend(
-                &format!(
-                    "SELECT 1 \
-                     FROM {account_table} \
-                     WHERE schema_key = $1 \
-                       AND entity_id = $2 \
-                       AND file_id = $3 \
-                       AND version_id = $4 \
-                       AND is_tombstone = 0 \
-                     LIMIT 1",
-                    account_table = crate::init::seed::quote_ident(&account_table),
-                ),
+            .execute_internal(
+                "SELECT 1 \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = $1 \
+                   AND entity_id = $2 \
+                   AND file_id = $3 \
+                   AND version_id = $4 \
+                   AND snapshot_content IS NOT NULL \
+                 LIMIT 1",
                 &[
                     Value::Text(super::account_schema_key().to_string()),
                     Value::Text(account.id.clone()),
@@ -40,7 +34,14 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 ],
             )
             .await?;
-        if exists.rows.is_empty() {
+        let [statement] = exists.statements.as_slice() else {
+            return Err(crate::errors::unexpected_statement_count_error(
+                "boot account existence query",
+                1,
+                exists.statements.len(),
+            ));
+        };
+        if statement.rows.is_empty() {
             self.insert_bootstrap_tracked_row(
                 Some(&bootstrap_commit_id),
                 &account.id,

@@ -99,8 +99,7 @@ async fn scan_rows_with_limit_and_order(
     let selected_columns = selected_columns(&access, &request.required_columns, "untracked")?;
     let projection = selected_projection_sql(&selected_columns);
     let sql = build_partitioned_scan_sql(ScanSqlRequest {
-        select_prefix:
-            "SELECT entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, writer_key, created_at, updated_at",
+        select_prefix: "SELECT entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, writer_key, created_at, updated_at",
         schema_key: &request.schema_key,
         version_id: &request.version_id,
         projection: &projection,

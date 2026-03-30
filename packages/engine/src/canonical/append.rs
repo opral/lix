@@ -74,7 +74,7 @@ async fn append_tracked_unchecked(
             &tracked_writer_key_annotations,
         )
         .await?;
-        crate::live_state::projection::apply_commit_projections_best_effort_in_transaction(
+        crate::live_state::apply_commit_projections_best_effort_in_transaction(
             transaction,
             receipt,
             &tracked_writer_key_annotations,

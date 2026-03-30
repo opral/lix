@@ -4,24 +4,16 @@ use crate::canonical::readers::load_exact_committed_state_row_at_version_head;
 pub(crate) use crate::canonical::readers::{
     CommitQueryExecutor, ExactCommittedStateRow, ExactCommittedStateRowRequest,
 };
-use crate::live_state::is_untracked_live_table;
-use crate::live_state::schema_access::{
-    live_storage_relation_exists_with_backend, load_schema_read_contract_for_table_name,
-    load_schema_read_contract_with_backend, logical_snapshot_from_projected_row_with_contract,
-    LiveReadContract,
+use crate::live_state::{is_untracked_live_table, live_storage_relation_exists_with_backend};
+use crate::live_state::{
+    load_exact_tracked_tombstone_with_executor, load_live_read_contract_for_table_name,
+    load_live_read_contract_with_backend, logical_snapshot_from_projected_row_with_contract,
+    scan_tracked_rows_with_executor, scan_tracked_tombstones_with_executor,
+    scan_untracked_rows_with_executor, LiveReadContract, RowIdentity, ScanConstraint, TrackedRow,
+    UntrackedRow, UntrackedScanRequest,
 };
-use crate::live_state::shared::identity::RowIdentity;
-use crate::live_state::tracked::{
-    load_exact_tombstone_with_executor, scan_tombstones_with_executor,
-};
-use crate::live_state::tracked::{
-    scan_rows_with_executor as scan_tracked_rows_with_executor, TrackedRow,
-};
-pub(crate) use crate::live_state::tracked::{
+pub(crate) use crate::live_state::{
     ExactTrackedRowRequest, TrackedScanRequest, TrackedTombstoneMarker,
-};
-use crate::live_state::untracked::{
-    scan_rows_with_executor as scan_untracked_rows_with_executor, UntrackedRow,
 };
 use crate::workspace::writer_key::load_workspace_writer_key_annotations_for_versions_with_executor;
 use crate::{LixBackend, LixError, Value};
@@ -139,7 +131,7 @@ pub(crate) async fn scan_live_rows(
     storage: LiveStorageLane,
     schema_key: &str,
     version_id: &str,
-    constraints: &[crate::live_state::constraints::ScanConstraint],
+    constraints: &[ScanConstraint],
     required_columns: &[String],
 ) -> Result<Vec<LiveReadRow>, LixError> {
     let mut executor = backend;
@@ -159,7 +151,7 @@ pub(crate) async fn scan_live_rows_with_executor_ref(
     storage: LiveStorageLane,
     schema_key: &str,
     version_id: &str,
-    constraints: &[crate::live_state::constraints::ScanConstraint],
+    constraints: &[ScanConstraint],
     required_columns: &[String],
 ) -> Result<Vec<LiveReadRow>, LixError> {
     match storage {
@@ -180,7 +172,7 @@ pub(crate) async fn scan_live_rows_with_executor_ref(
         }
         LiveStorageLane::Untracked => scan_untracked_rows_with_executor(
             executor,
-            &crate::live_state::untracked::UntrackedScanRequest {
+            &UntrackedScanRequest {
                 schema_key: schema_key.to_string(),
                 version_id: version_id.to_string(),
                 constraints: constraints.to_vec(),
@@ -221,28 +213,28 @@ pub(crate) async fn load_exact_tombstone(
     executor: &mut dyn CommitQueryExecutor,
     request: &ExactTrackedRowRequest,
 ) -> Result<Option<TrackedTombstoneMarker>, LixError> {
-    load_exact_tombstone_with_executor(executor, request).await
+    load_exact_tracked_tombstone_with_executor(executor, request).await
 }
 
 pub(crate) async fn scan_tombstones(
     executor: &mut dyn CommitQueryExecutor,
     request: &TrackedScanRequest,
 ) -> Result<Vec<TrackedTombstoneMarker>, LixError> {
-    scan_tombstones_with_executor(executor, request).await
+    scan_tracked_tombstones_with_executor(executor, request).await
 }
 
 pub(crate) async fn load_live_row_access(
     backend: &dyn LixBackend,
     schema_key: &str,
 ) -> Result<LiveReadContract, LixError> {
-    load_schema_read_contract_with_backend(backend, schema_key).await
+    load_live_read_contract_with_backend(backend, schema_key).await
 }
 
 pub(crate) async fn load_live_row_access_for_table(
     backend: &dyn LixBackend,
     table_name: &str,
 ) -> Result<Option<LiveReadContract>, LixError> {
-    load_schema_read_contract_for_table_name(backend, table_name).await
+    load_live_read_contract_for_table_name(backend, table_name).await
 }
 
 pub(crate) fn normalized_values_from_snapshot(

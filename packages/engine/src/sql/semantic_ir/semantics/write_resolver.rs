@@ -1,9 +1,10 @@
 use crate::canonical::readers::load_version_ref_with_backend as load_version_ref;
 use crate::canonical::version_state::load_version_descriptor_with_backend;
+use crate::filesystem::queries::FilesystemQueryError;
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::live_state::shared::identity::RowIdentity;
+use crate::live_state::RowIdentity;
 use crate::sql::catalog::SurfaceFamily;
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateSelector, MutationPayload, PlannedStateRow, PlannedWrite, ResolvedRowRef,
@@ -15,7 +16,6 @@ use crate::sql::semantic_ir::semantics::effective_state_resolver::{
 };
 use crate::sql::semantic_ir::semantics::filesystem_assignments::FilesystemAssignmentsError;
 use crate::sql::semantic_ir::semantics::filesystem_planning::FilesystemPlanningError;
-use crate::sql::semantic_ir::semantics::filesystem_queries::FilesystemQueryError;
 use crate::sql::semantic_ir::semantics::state_assignments::StateAssignmentsError;
 use crate::sql::semantic_ir::semantics::surface_semantics::{
     public_selector_column_name, public_selector_version_column, OverlayLane,

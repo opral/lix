@@ -32,8 +32,7 @@ impl<'a> TransactionCoordinator<'a> {
 
     pub(crate) async fn finalize_live_state(&mut self) -> Result<ReplayCursor, LixError> {
         let transaction = self.backend_transaction_mut()?;
-        crate::live_state::projection::mark_live_state_projection_ready_in_transaction(transaction)
-            .await
+        crate::live_state::mark_live_state_projection_ready_in_transaction(transaction).await
     }
 
     pub(crate) async fn advance_live_state_replay_boundary_for_commit(
@@ -44,8 +43,7 @@ impl<'a> TransactionCoordinator<'a> {
             return Ok(());
         };
         let transaction = self.backend_transaction_mut()?;
-        crate::live_state::projection::apply_canonical_receipt_in_transaction(transaction, receipt)
-            .await
+        crate::live_state::apply_canonical_receipt_in_transaction(transaction, receipt).await
     }
 
     pub(crate) async fn commit(&mut self) -> Result<(), LixError> {

@@ -1,11 +1,6 @@
 use super::{checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot};
 use crate::canonical::readers::load_commit_lineage_entry_by_id;
 use crate::engine::TransactionBackendAdapter;
-use crate::init::seed::{
-    normalized_insert_columns_sql, normalized_insert_literals_sql, normalized_seed_values,
-    quote_ident,
-};
-use crate::live_state::schema_access::tracked_relation_name;
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::version::context::require_target_version_context_in_transaction;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
@@ -129,6 +124,19 @@ async fn ensure_checkpoint_label_on_commit(
     let snapshot_content = checkpoint_commit_label_snapshot(commit_id);
     let change_id = generate_runtime_uuid(tx).await?;
     let timestamp = generate_runtime_timestamp(tx).await?;
+    crate::live_state::upsert_bootstrap_tracked_row_in_transaction(
+        tx.backend_transaction_mut()?,
+        &state_entity_id,
+        "lix_entity_label",
+        "1",
+        "lix",
+        crate::version::GLOBAL_VERSION_ID,
+        "lix",
+        &change_id,
+        &snapshot_content,
+        &timestamp,
+    )
+    .await?;
     insert_canonical_checkpoint_label_change(
         tx,
         &state_entity_id,
@@ -137,28 +145,6 @@ async fn ensure_checkpoint_label_on_commit(
         &timestamp,
     )
     .await?;
-
-    let normalized_values = normalized_seed_values("lix_entity_label", Some(&snapshot_content))?;
-    let tracked_table = quote_ident(&tracked_relation_name("lix_entity_label"));
-    tx.backend_transaction_mut()?
-        .execute(
-            &format!(
-                "INSERT INTO {tracked_table} (\
-                 entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, writer_key, is_tombstone, created_at, updated_at{normalized_columns}\
-                 ) VALUES (\
-                 $1, 'lix_entity_label', '1', 'lix', $2, true, 'lix', $3, NULL, NULL, 0, $4, $4{normalized_literals}\
-                 )",
-                normalized_columns = normalized_insert_columns_sql(&normalized_values),
-                normalized_literals = normalized_insert_literals_sql(&normalized_values),
-            ),
-            &[
-                Value::Text(state_entity_id),
-                Value::Text(crate::version::GLOBAL_VERSION_ID.to_string()),
-                Value::Text(change_id),
-                Value::Text(timestamp),
-            ],
-        )
-        .await?;
     Ok(())
 }
 

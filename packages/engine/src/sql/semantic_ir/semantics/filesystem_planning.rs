@@ -3,13 +3,13 @@ use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
-use crate::sql::semantic_ir::semantics::filesystem_assignments::{
-    DirectoryInsertAssignments, FileInsertAssignments,
-};
-use crate::sql::semantic_ir::semantics::filesystem_queries::{
+use crate::filesystem::queries::{
     ensure_no_file_at_directory_path, load_directory_descriptors_by_parent_name_pairs,
     load_file_descriptors_by_directory_name_extension_triplets, lookup_directory_id_by_path,
     lookup_directory_path_by_id, FilesystemQueryError,
+};
+use crate::sql::semantic_ir::semantics::filesystem_assignments::{
+    DirectoryInsertAssignments, FileInsertAssignments,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixBackend;

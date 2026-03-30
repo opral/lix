@@ -6,10 +6,10 @@
 //! winner from canonical change order.
 
 use crate::backend::QueryExecutor;
-use crate::live_state::schema_access::live_storage_relation_exists_with_executor;
-use crate::live_state::untracked::{
-    load_exact_row_with_executor, scan_rows_with_executor, ExactUntrackedRowRequest,
-    UntrackedScanRequest,
+use crate::live_state::live_storage_relation_exists_with_executor;
+use crate::live_state::{
+    load_exact_untracked_row_with_executor, scan_untracked_rows_with_executor,
+    ExactUntrackedRowRequest, UntrackedRow, UntrackedScanRequest,
 };
 use crate::version::{
     version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
@@ -80,7 +80,7 @@ async fn load_committed_version_ref_from_local_state(
     if !live_storage_relation_exists_with_executor(executor, version_ref_schema_key()).await? {
         return Ok(None);
     }
-    let row = load_exact_row_with_executor(
+    let row = load_exact_untracked_row_with_executor(
         executor,
         &ExactUntrackedRowRequest {
             schema_key: version_ref_schema_key().to_string(),
@@ -105,7 +105,7 @@ async fn load_all_committed_version_refs_from_local_state(
     if !live_storage_relation_exists_with_executor(executor, version_ref_schema_key()).await? {
         return Ok(Vec::new());
     }
-    let rows = scan_rows_with_executor(
+    let rows = scan_untracked_rows_with_executor(
         executor,
         &UntrackedScanRequest {
             schema_key: version_ref_schema_key().to_string(),
@@ -148,7 +148,7 @@ async fn load_all_committed_version_refs_from_local_state(
 
 fn parse_version_ref_row_from_untracked(
     version_id: String,
-    row: &crate::live_state::untracked::UntrackedRow,
+    row: &UntrackedRow,
 ) -> Result<VersionRefRow, LixError> {
     let commit_id = row.property_text("commit_id").ok_or_else(|| {
         LixError::new(
@@ -178,9 +178,9 @@ fn parse_version_ref_row_from_untracked(
 mod tests {
     use super::*;
     use crate::live_state::constraints::{quote_ident, sql_literal};
-    use crate::live_state::live_relation_name;
-    use crate::live_state::live_schema_column_names;
-    use crate::live_state::schema_access::normalized_values_for_schema;
+    use crate::live_state::{
+        live_relation_name, live_schema_column_names, normalized_values_for_schema,
+    };
     use crate::test_support::{init_test_backend_core, seed_local_version_head, TestSqliteBackend};
     use crate::{LixBackend, Value};
 

@@ -1,4 +1,4 @@
-use crate::filesystem::live_projection::{
+use super::filesystem_projection::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
     FilesystemProjectionScope,
 };

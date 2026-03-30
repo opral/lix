@@ -126,7 +126,8 @@ pub(crate) async fn apply_live_state_scope_with_writer_key_hints_in_transaction(
             table = table_name,
             entity_id = crate::live_state::constraints::escape_sql_string(&write.entity_id),
             schema_key = crate::live_state::constraints::escape_sql_string(&write.schema_key),
-            schema_version = crate::live_state::constraints::escape_sql_string(&write.schema_version),
+            schema_version =
+                crate::live_state::constraints::escape_sql_string(&write.schema_version),
             file_id = crate::live_state::constraints::escape_sql_string(&write.file_id),
             version_id = crate::live_state::constraints::escape_sql_string(&write.version_id),
             global = global_sql,

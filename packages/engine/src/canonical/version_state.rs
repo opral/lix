@@ -1,12 +1,10 @@
 use std::collections::BTreeMap;
 
 use crate::backend::QueryExecutor;
-use crate::live_state::schema_access::{payload_column_name_for_schema, tracked_relation_name};
+use crate::live_state::build_local_version_ref_heads_source_sql;
 use crate::version::{
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
-    version_descriptor_schema_key, version_descriptor_schema_version, version_ref_file_id,
-    version_ref_plugin_key, version_ref_schema_key, version_ref_schema_version,
-    version_ref_storage_version_id, GLOBAL_VERSION_ID,
+    version_descriptor_schema_key, version_descriptor_schema_version, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
@@ -275,10 +273,6 @@ fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn quote_ident(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
 fn build_current_version_refs_unique_cte_sql(
     _dialect: SqlDialect,
     current_version_heads: Option<&BTreeMap<String, String>>,
@@ -287,11 +281,6 @@ fn build_current_version_refs_unique_cte_sql(
         return build_inline_current_version_refs_cte_sql(current_version_heads);
     }
 
-    let version_ref_table = tracked_relation_name("lix_version_ref");
-    let commit_id_column = quote_ident(
-        &payload_column_name_for_schema("lix_version_ref", None, "commit_id")
-            .expect("version ref schema should expose commit_id"),
-    );
     format!(
         "canonical_commit_headers AS ( \
              SELECT \
@@ -306,26 +295,9 @@ fn build_current_version_refs_unique_cte_sql(
                AND commit_snapshot.content IS NOT NULL \
          ), \
          current_refs AS ( \
-             SELECT \
-               entity_id AS version_id, \
-               {commit_id_column} AS commit_id \
-             FROM {version_ref_table} \
-             WHERE schema_key = '{ref_schema_key}' \
-               AND schema_version = '{ref_schema_version}' \
-               AND file_id = '{ref_file_id}' \
-               AND plugin_key = '{ref_plugin_key}' \
-               AND version_id = '{storage_version_id}' \
-               AND untracked = true \
-               AND {commit_id_column} IS NOT NULL \
-               AND {commit_id_column} <> '' \
+             {current_refs_source_sql} \
          ), ",
-        ref_schema_key = escape_sql_string(version_ref_schema_key()),
-        ref_schema_version = escape_sql_string(version_ref_schema_version()),
-        ref_file_id = escape_sql_string(version_ref_file_id()),
-        ref_plugin_key = escape_sql_string(version_ref_plugin_key()),
-        storage_version_id = escape_sql_string(version_ref_storage_version_id()),
-        commit_id_column = commit_id_column,
-        version_ref_table = version_ref_table,
+        current_refs_source_sql = build_local_version_ref_heads_source_sql(),
     )
 }
 

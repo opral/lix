@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::live_state::shared::identity::RowIdentity;
-use crate::live_state::shared::snapshot::values_from_snapshot_content;
-use crate::live_state::tracked::{
-    TrackedRow, TrackedTombstoneMarker, TrackedWriteOperation, TrackedWriteRow,
+use crate::live_state::{
+    values_from_snapshot_content, RowIdentity, TrackedRow, TrackedTombstoneMarker,
+    TrackedWriteOperation, TrackedWriteRow, UntrackedRow, UntrackedWriteOperation,
+    UntrackedWriteRow,
 };
-use crate::live_state::untracked::{UntrackedRow, UntrackedWriteOperation, UntrackedWriteRow};
 use crate::LixError;
 
 use super::contracts::TransactionDelta;

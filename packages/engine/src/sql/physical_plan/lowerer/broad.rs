@@ -500,15 +500,11 @@ fn ensure_broad_sql_expr_is_fully_typed(expr: &BroadSqlExpr, path: &str) -> Resu
                 ensure_broad_sql_case_when_is_fully_typed(when, &format!("{path}.when[{index}]"))?;
             }
             if let Some(else_result) = else_result {
-                ensure_broad_sql_expr_is_fully_typed(
-                    else_result,
-                    &format!("{path}.else_result"),
-                )?;
+                ensure_broad_sql_expr_is_fully_typed(else_result, &format!("{path}.else_result"))?;
             }
             Ok(())
         }
-        BroadSqlExprKind::Exists { subquery, .. }
-        | BroadSqlExprKind::ScalarSubquery(subquery) => {
+        BroadSqlExprKind::Exists { subquery, .. } | BroadSqlExprKind::ScalarSubquery(subquery) => {
             ensure_broad_public_read_query_is_fully_typed(subquery, &format!("{path}.subquery"))
         }
         BroadSqlExprKind::Tuple(items) => {
@@ -2195,10 +2191,10 @@ fn lower_broad_sql_expr(
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!(
-                "broad public-read physical lowering does not support unsupported expression '{}'",
-                diagnostics_sql
-            ),
-            ))
+                    "broad public-read physical lowering does not support unsupported expression '{}'",
+                    diagnostics_sql
+                ),
+            ));
         }
     })
 }
@@ -2713,10 +2709,12 @@ fn build_public_change_surface_sql(
         let Some(active_version_id) = active_version_id else {
             return Ok(None);
         };
-        return Ok(Some(build_working_changes_source_sql(
-            dialect,
-            active_version_id,
-        )));
+        return Ok(Some(
+            crate::live_state::build_working_changes_public_read_source_sql(
+                dialect,
+                active_version_id,
+            ),
+        ));
     }
     if CanonicalChangeScan::from_surface_binding(surface_binding.clone()).is_some() {
         return Ok(Some(build_change_source_sql()));

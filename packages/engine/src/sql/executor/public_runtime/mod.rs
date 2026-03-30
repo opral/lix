@@ -3804,7 +3804,7 @@ mod tests {
                         assert!(lowered_sql.contains("FROM lix_internal_change c"));
                         assert!(lowered_sql.contains("lix_version_descriptor"));
                         assert!(lowered_sql.contains("current_refs"));
-                        assert!(!lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
+                        assert!(!lowered_sql.contains("FROM lix_state_by_version"));
                     }
                 })
         });
