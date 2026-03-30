@@ -746,17 +746,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        engine
-            .execute(
-                "INSERT INTO lix_version (\
-                 id, name, hidden, commit_id\
-                 ) VALUES (\
-                 'version-state', 'version-state', false, 'commit-state'\
-                 )",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.create_named_version("version-state").await.unwrap();
         register_test_state_schema(&engine).await;
 
         let before_version = engine

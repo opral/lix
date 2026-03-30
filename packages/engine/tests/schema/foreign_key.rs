@@ -23,17 +23,6 @@ async fn register_parent_schema(
         .unwrap();
 }
 
-async fn insert_version(engine: &support::simulation_test::SimulationEngine, version_id: &str) {
-    let sql = format!(
-        "INSERT INTO lix_version (\
-         id, name, hidden, commit_id\
-         ) VALUES (\
-         '{version_id}', '{version_id}', false, 'commit-{version_id}'\
-         )"
-    );
-    engine.execute(&sql, &[]).await.unwrap();
-}
-
 async fn register_child_schema(
     engine: &support::simulation_test::SimulationEngine,
     schema_key: &str,
@@ -114,8 +103,8 @@ simulation_test!(
 
         register_parent_schema(&engine, "fk_parent_same_version").await;
         register_child_schema(&engine, "fk_child_same_version", "fk_parent_same_version").await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
 
         engine
         .execute(
@@ -159,7 +148,7 @@ simulation_test!(
 
         register_parent_schema(&engine, "fk_parent_same_file").await;
         register_child_schema(&engine, "fk_child_same_file", "fk_parent_same_file").await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         engine
         .execute(
@@ -203,7 +192,7 @@ simulation_test!(
 
         register_parent_schema(&engine, "fk_state_target_doc").await;
         register_state_ref_schema(&engine, "fk_state_ref_meta").await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         engine
             .execute(
@@ -264,7 +253,7 @@ simulation_test!(
             "fk_parent_delete_restrict",
         )
         .await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         engine
             .execute(

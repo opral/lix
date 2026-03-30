@@ -503,17 +503,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.unwrap();
 
-        engine
-            .execute(
-                "INSERT INTO lix_version (\
-                 id, name, hidden, commit_id\
-                 ) VALUES (\
-                 'version-child', 'version-child', false, 'commit-child'\
-                 )",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.create_named_version("version-child").await.unwrap();
 
         seed_key_value_row(&engine, "inherit-key", "from-global", "global").await;
 
@@ -595,17 +585,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
         install_global_override_schema_for_version_override_schema(&engine).await;
 
-        engine
-            .execute(
-                "INSERT INTO lix_version (\
-                 id, name, hidden, commit_id\
-                 ) VALUES (\
-                 'active-test', 'active-test', false, 'commit-active'\
-                 )",
-                &[],
-            )
-            .await
-            .unwrap();
+        engine.create_named_version("active-test").await.unwrap();
         engine
             .switch_version("active-test".to_string())
             .await
@@ -872,14 +852,7 @@ simulation_test!(
         install_inherited_override_schema(&engine).await;
 
         engine
-            .execute(
-                "INSERT INTO lix_version (\
-                 id, name, hidden, commit_id\
-                 ) VALUES (\
-                 'active-inherited', 'active-inherited', false, 'commit-inherited'\
-                 )",
-                &[],
-            )
+            .create_named_version("active-inherited")
             .await
             .unwrap();
         engine

@@ -21,17 +21,6 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
         .unwrap();
 }
 
-async fn insert_version(engine: &support::simulation_test::SimulationEngine, version_id: &str) {
-    let sql = format!(
-        "INSERT INTO lix_version (\
-         id, name, hidden, commit_id\
-         ) VALUES (\
-         '{version_id}', '{version_id}', false, 'commit-{version_id}'\
-         )",
-    );
-    engine.execute(&sql, &[]).await.unwrap();
-}
-
 simulation_test!(
     on_conflict_entity_view_do_update_is_applied,
     |sim| async move {
@@ -126,7 +115,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -183,7 +172,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         engine
             .execute(

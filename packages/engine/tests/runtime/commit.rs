@@ -35,17 +35,6 @@ async fn register_test_schema(engine: &SimulationEngine) {
         .unwrap();
 }
 
-async fn insert_version(engine: &SimulationEngine, version_id: &str) {
-    let sql = format!(
-        "INSERT INTO lix_version (\
-         id, name, hidden, commit_id\
-         ) VALUES (\
-         '{version_id}', '{version_id}', false, 'commit-{version_id}'\
-         )",
-    );
-    engine.execute(&sql, &[]).await.unwrap();
-}
-
 fn parse_json(value: &Value) -> JsonValue {
     match value {
         Value::Text(text) => serde_json::from_str(text).expect("expected valid json text"),
@@ -384,7 +373,7 @@ simulation_test!(
 
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-main").await;
+        engine.create_named_version("version-main").await.unwrap();
 
         engine
             .execute(
@@ -441,7 +430,7 @@ simulation_test!(
 
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-main").await;
+        engine.create_named_version("version-main").await.unwrap();
 
         engine
             .execute(

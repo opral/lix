@@ -25,17 +25,6 @@ async fn register_unique_schema(
         .unwrap();
 }
 
-async fn insert_version(engine: &support::simulation_test::SimulationEngine, version_id: &str) {
-    let sql = format!(
-        "INSERT INTO lix_version (\
-         id, name, hidden, commit_id\
-         ) VALUES (\
-         '{version_id}', '{version_id}', false, 'commit-{version_id}'\
-         )"
-    );
-    engine.execute(&sql, &[]).await.unwrap();
-}
-
 simulation_test!(
     unique_conflicts_within_same_version_and_file,
     simulations = [sqlite],
@@ -47,7 +36,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_unique_schema(&engine, "unique_scope_same_file").await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         engine
             .execute(
@@ -90,7 +79,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_unique_schema(&engine, "unique_scope_per_file").await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         engine
         .execute(
@@ -129,8 +118,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_unique_schema(&engine, "unique_scope_per_version").await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
 
         engine
             .execute(

@@ -142,17 +142,15 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             return Ok(Some(commit_id));
         }
 
-        let commit_table = tracked_relation_name("lix_commit");
         let has_commits = self
             .execute_backend(
-                &format!(
-                    "SELECT 1 \
-                     FROM {commit_table} \
-                     WHERE schema_key = 'lix_commit' \
-                       AND version_id = 'global' \
-                       AND is_tombstone = 0 \
-                     LIMIT 1"
-                ),
+                "SELECT 1 \
+                 FROM lix_internal_change c \
+                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+                 WHERE c.schema_key = 'lix_commit' \
+                   AND c.file_id = 'lix' \
+                   AND s.content IS NOT NULL \
+                 LIMIT 1",
                 &[],
             )
             .await?
@@ -190,36 +188,75 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         commit_id: &str,
         change_id: &str,
     ) -> Result<(), LixError> {
-        let snapshot_row = self
+        let snapshot_rows = self
             .execute_backend(
-                "SELECT s.content \
+                "SELECT c.snapshot_id, s.content \
                  FROM lix_internal_change c \
                  JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
                  WHERE c.entity_id = $1 \
                    AND c.schema_key = 'lix_commit' \
                    AND c.file_id = 'lix' \
-                 ORDER BY c.created_at DESC, c.id DESC \
-                 LIMIT 1",
+                   AND s.content IS NOT NULL",
                 &[Value::Text(commit_id.to_string())],
             )
             .await?;
 
-        let current_snapshot = snapshot_row
-            .rows
-            .first()
-            .and_then(|row| row.first())
-            .and_then(|value| match value {
-                Value::Text(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .ok_or_else(|| {
+        let [snapshot_row] = snapshot_rows.rows.as_slice() else {
+            return Err(if snapshot_rows.rows.is_empty() {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
                         "add_change_id_to_commit: commit '{commit_id}' canonical snapshot not found"
                     ),
                 )
-            })?;
+            } else {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "add_change_id_to_commit: expected exactly one canonical snapshot for commit '{commit_id}', got {}",
+                        snapshot_rows.rows.len()
+                    ),
+                )
+            });
+        };
+        let snapshot_id = match snapshot_row.first() {
+            Some(Value::Text(text)) if !text.is_empty() => text.clone(),
+            Some(other) => {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "add_change_id_to_commit: commit '{commit_id}' snapshot_id must be text, got {other:?}"
+                    ),
+                ));
+            }
+            None => {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "add_change_id_to_commit: commit '{commit_id}' canonical snapshot row missing snapshot_id"
+                    ),
+                ));
+            }
+        };
+        let current_snapshot = match snapshot_row.get(1) {
+            Some(Value::Text(text)) => text.as_str(),
+            Some(other) => {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "add_change_id_to_commit: commit '{commit_id}' snapshot content must be text, got {other:?}"
+                    ),
+                ));
+            }
+            None => {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "add_change_id_to_commit: commit '{commit_id}' canonical snapshot row missing content"
+                    ),
+                ));
+            }
+        };
 
         let mut parsed: JsonValue =
             serde_json::from_str(current_snapshot).map_err(|error| {
@@ -242,38 +279,14 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                     ),
                 )
             })?;
-        change_ids.push(JsonValue::String(change_id.to_string()));
+        if !change_ids
+            .iter()
+            .any(|existing| existing.as_str() == Some(change_id))
+        {
+            change_ids.push(JsonValue::String(change_id.to_string()));
+        }
 
         let updated_snapshot = parsed.to_string();
-
-        let snapshot_id_row = self
-            .execute_backend(
-                "SELECT c.snapshot_id \
-                 FROM lix_internal_change c \
-                 WHERE c.entity_id = $1 \
-                   AND c.schema_key = 'lix_commit' \
-                   AND c.file_id = 'lix' \
-                 ORDER BY c.created_at DESC, c.id DESC \
-                 LIMIT 1",
-                &[Value::Text(commit_id.to_string())],
-            )
-            .await?;
-        let snapshot_id = snapshot_id_row
-            .rows
-            .first()
-            .and_then(|row| row.first())
-            .and_then(|value| match value {
-                Value::Text(text) => Some(text.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "add_change_id_to_commit: could not find snapshot_id for commit '{commit_id}' change"
-                    ),
-                )
-            })?;
 
         self.execute_backend(
             "UPDATE lix_internal_snapshot SET content = $1 WHERE id = $2",
@@ -281,26 +294,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 Value::Text(updated_snapshot.clone()),
                 Value::Text(snapshot_id),
             ],
-        )
-        .await?;
-
-        let normalized_values = normalized_seed_values("lix_commit", Some(&updated_snapshot))?;
-        let set_sql = normalized_values
-            .iter()
-            .map(|(column, value)| format!("{} = {}", quote_ident(column), sql_literal(value)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        self.execute_backend(
-            &format!(
-                "UPDATE {table} \
-                 SET {set_sql} \
-                 WHERE entity_id = $1 \
-                   AND schema_key = 'lix_commit' \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global'",
-                table = quote_ident(&tracked_relation_name("lix_commit")),
-            ),
-            &[Value::Text(commit_id.to_string())],
         )
         .await?;
 

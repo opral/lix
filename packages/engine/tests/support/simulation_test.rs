@@ -141,6 +141,32 @@ impl SimulationEngine {
         self.opened_session().await?.create_version(options).await
     }
 
+    pub async fn create_named_version(
+        &self,
+        version_id: &str,
+    ) -> Result<CreateVersionResult, LixError> {
+        self.create_version(CreateVersionOptions {
+            id: Some(version_id.to_string()),
+            name: Some(version_id.to_string()),
+            ..CreateVersionOptions::default()
+        })
+        .await
+    }
+
+    pub async fn create_named_version_from(
+        &self,
+        version_id: &str,
+        source_version_id: &str,
+    ) -> Result<CreateVersionResult, LixError> {
+        self.create_version(CreateVersionOptions {
+            id: Some(version_id.to_string()),
+            name: Some(version_id.to_string()),
+            source_version_id: Some(source_version_id.to_string()),
+            ..CreateVersionOptions::default()
+        })
+        .await
+    }
+
     pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
         self.opened_session()
             .await?

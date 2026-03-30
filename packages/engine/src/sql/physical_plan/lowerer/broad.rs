@@ -2468,7 +2468,7 @@ fn build_supported_public_read_surface_sql(
         ),
         SurfaceFamily::Admin => build_public_admin_surface_sql(dialect, &surface_binding),
         SurfaceFamily::Change => {
-            build_public_change_surface_sql(&surface_binding, active_version_id)
+            build_public_change_surface_sql(dialect, &surface_binding, active_version_id)
         }
     }
 }
@@ -2526,6 +2526,7 @@ fn build_public_admin_surface_sql(
 }
 
 fn build_public_change_surface_sql(
+    dialect: SqlDialect,
     surface_binding: &SurfaceBinding,
     active_version_id: Option<&str>,
 ) -> Result<Option<String>, LixError> {
@@ -2533,7 +2534,10 @@ fn build_public_change_surface_sql(
         let Some(active_version_id) = active_version_id else {
             return Ok(None);
         };
-        return Ok(Some(build_working_changes_source_sql(active_version_id)));
+        return Ok(Some(build_working_changes_source_sql(
+            dialect,
+            active_version_id,
+        )));
     }
     if CanonicalChangeScan::from_surface_binding(surface_binding.clone()).is_some() {
         return Ok(Some(build_change_source_sql()));

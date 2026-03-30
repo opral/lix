@@ -101,21 +101,6 @@ async fn binary_blob_hash_for_file_version(
     }
 }
 
-async fn insert_version(
-    engine: &support::simulation_test::SimulationEngine,
-    version_id: &str,
-    _parent_version_id: &str,
-) {
-    let sql = format!(
-        "INSERT INTO lix_version (\
-         id, name, hidden, commit_id\
-         ) VALUES (\
-         '{version_id}', '{version_id}', false, 'commit-{version_id}'\
-         )",
-    );
-    engine.execute(&sql, &[]).await.unwrap();
-}
-
 simulation_test!(
     file_view_insert_reads_inserted_blob_data,
     |sim| async move {
@@ -1158,7 +1143,10 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
     let version_b = "fs-version-b";
     let version_a_sql = version_a.replace('\'', "''");
     let version_b_sql = version_b.replace('\'', "''");
-    insert_version(&engine, version_b, &version_a).await;
+    engine
+        .create_named_version_from(version_b, &version_a)
+        .await
+        .unwrap();
 
     engine
         .execute(
@@ -1639,7 +1627,10 @@ simulation_test!(
         let version_b = "dir-version-b";
         let version_a_sql = version_a.replace('\'', "''");
         let version_b_sql = version_b.replace('\'', "''");
-        insert_version(&engine, version_b, &version_a).await;
+        engine
+            .create_named_version_from(version_b, &version_a)
+            .await
+            .unwrap();
 
         engine
             .execute(
@@ -2582,7 +2573,10 @@ simulation_test!(
 
         let parent_version_id = engine.active_version_id().await.unwrap();
         let child_version_id = "directory-global-child";
-        insert_version(&engine, child_version_id, &parent_version_id).await;
+        engine
+            .create_named_version_from(child_version_id, &parent_version_id)
+            .await
+            .unwrap();
 
         engine
             .execute(
@@ -2658,7 +2652,10 @@ simulation_test!(
 
         let parent_version_id = engine.active_version_id().await.unwrap();
         let child_version_id = "file-global-child";
-        insert_version(&engine, child_version_id, &parent_version_id).await;
+        engine
+            .create_named_version_from(child_version_id, &parent_version_id)
+            .await
+            .unwrap();
 
         engine
             .execute(
@@ -2702,7 +2699,10 @@ simulation_test!(
 
         let parent_version_id = engine.active_version_id().await.unwrap();
         let child_version_id = "file-global-tombstone-child";
-        insert_version(&engine, child_version_id, &parent_version_id).await;
+        engine
+            .create_named_version_from(child_version_id, &parent_version_id)
+            .await
+            .unwrap();
 
         engine
             .execute(
@@ -3082,7 +3082,10 @@ simulation_test!(
 
         let parent_version_id = engine.active_version_id().await.unwrap();
         let child_version_id = "file-global-update-collision-child";
-        insert_version(&engine, child_version_id, &parent_version_id).await;
+        engine
+            .create_named_version_from(child_version_id, &parent_version_id)
+            .await
+            .unwrap();
 
         engine
             .execute(
@@ -3813,7 +3816,10 @@ simulation_test!(
         let version_b = "filesystem-switch-version-b";
         let version_a_sql = version_a.replace('\'', "''");
         let version_b_sql = version_b.replace('\'', "''");
-        insert_version(&engine, version_b, &version_a).await;
+        engine
+            .create_named_version_from(version_b, &version_a)
+            .await
+            .unwrap();
 
         engine
             .execute(

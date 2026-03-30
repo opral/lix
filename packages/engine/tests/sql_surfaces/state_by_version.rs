@@ -92,17 +92,6 @@ async fn register_registered_schema_snapshot(
         .unwrap();
 }
 
-async fn insert_version(engine: &support::simulation_test::SimulationEngine, version_id: &str) {
-    let sql = format!(
-        "INSERT INTO lix_version (\
-         id, name, hidden, commit_id\
-         ) VALUES (\
-         '{version_id}', '{version_id}', false, 'commit-{version_id}'\
-         )",
-    );
-    engine.execute(&sql, &[]).await.unwrap();
-}
-
 async fn insert_state_row(
     engine: &support::simulation_test::SimulationEngine,
     entity_id: &str,
@@ -150,7 +139,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         let err = engine
             .execute(
@@ -183,7 +172,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(&engine, "entity-commit", "version-a", "{\"value\":\"A\"}").await;
 
         let rows = engine
@@ -219,8 +208,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
         insert_state_row(&engine, "entity-sel", "version-a", "{\"value\":\"A\"}").await;
         insert_state_row(&engine, "entity-sel", "version-b", "{\"value\":\"B\"}").await;
 
@@ -254,7 +243,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-child").await;
+        engine.create_named_version("version-child").await.unwrap();
         insert_state_row(
             &engine,
             "entity-inherited",
@@ -294,7 +283,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-child").await;
+        engine.create_named_version("version-child").await.unwrap();
         insert_state_row(
             &engine,
             "entity-override",
@@ -368,7 +357,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-child").await;
+        engine.create_named_version("version-child").await.unwrap();
         insert_state_row(&engine, "entity-tomb", "global", "{\"value\":\"global\"}").await;
         insert_state_row(
             &engine,
@@ -417,7 +406,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         engine
             .execute(
@@ -468,7 +457,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         engine
             .execute(
@@ -509,7 +498,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         engine
             .execute(
@@ -554,7 +543,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         engine
             .execute(
@@ -601,7 +590,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         engine
             .execute(
@@ -671,7 +660,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         engine
             .execute(
@@ -724,7 +713,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         let err = engine
             .execute(
@@ -755,8 +744,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
 
         engine
             .execute(
@@ -804,7 +793,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
 
         engine
             .execute(
@@ -879,8 +868,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
         insert_state_row(&engine, "entity-upd", "version-a", "{\"value\":\"A\"}").await;
         insert_state_row(&engine, "entity-upd", "version-b", "{\"value\":\"B\"}").await;
 
@@ -929,7 +918,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_immutable_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row_for_schema(
             &engine,
             "entity-upd-immutable",
@@ -971,7 +960,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(
             &engine,
             "entity-upd-file-scope",
@@ -1022,7 +1011,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(
             &engine,
             "entity-existing-noop",
@@ -1085,7 +1074,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(
             &engine,
             "entity-upd-identity",
@@ -1142,7 +1131,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(
             &engine,
             "entity-upd-idem",
@@ -1198,7 +1187,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(&engine, "entity-upd-or-a", "version-a", "{\"value\":\"A\"}").await;
         insert_state_row(&engine, "entity-upd-or-b", "version-a", "{\"value\":\"B\"}").await;
 
@@ -1250,8 +1239,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
         insert_state_row(
             &engine,
             "entity-upd-multi",
@@ -1332,7 +1321,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(
             &engine,
             "entity-upd-unknown",
@@ -1374,8 +1363,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
         insert_state_row(&engine, "entity-del", "version-a", "{\"value\":\"A\"}").await;
         insert_state_row(&engine, "entity-del", "version-b", "{\"value\":\"B\"}").await;
 
@@ -1439,7 +1428,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(
             &engine,
             "entity-del-file-scope",
@@ -1489,7 +1478,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(
             &engine,
             "entity-del-idem",
@@ -1543,7 +1532,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(&engine, "entity-del-p", "version-a", "{\"value\":\"A\"}").await;
 
         engine
@@ -1591,7 +1580,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(&engine, "entity-del-or-a", "version-a", "{\"value\":\"A\"}").await;
         insert_state_row(&engine, "entity-del-or-b", "version-a", "{\"value\":\"B\"}").await;
 
@@ -1634,8 +1623,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
         insert_state_row(
             &engine,
             "entity-del-multi",

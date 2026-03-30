@@ -7,10 +7,7 @@ use crate::sql::binder::bind_sql;
 use crate::Value as EngineValue;
 use crate::{LixError, SqlDialect};
 
-use super::graph_sql::{
-    build_commit_generation_seed_sql as build_commit_generation_seed_sql_impl,
-    build_exact_commit_depth_cte_sql as build_exact_commit_depth_cte_sql_impl,
-};
+use super::graph_sql::build_commit_generation_seed_sql as build_commit_generation_seed_sql_impl;
 use super::state_source::CommitQueryExecutor;
 use super::types::CanonicalCommitOutput;
 
@@ -89,21 +86,6 @@ pub(crate) fn build_commit_graph_node_prepared_batch(
         });
     }
     Ok(batch)
-}
-
-#[allow(dead_code)]
-pub(crate) fn build_exact_commit_depth_cte_sql(
-    dialect: SqlDialect,
-    root_placeholder: &str,
-    target_placeholder: &str,
-    fallback_depth_placeholder: &str,
-) -> String {
-    build_exact_commit_depth_cte_sql_impl(
-        dialect,
-        root_placeholder,
-        target_placeholder,
-        fallback_depth_placeholder,
-    )
 }
 
 fn collect_commit_parent_map(
@@ -223,6 +205,6 @@ fn resolve_commit_generation(
     Ok(generation)
 }
 
-pub(crate) fn build_commit_generation_seed_sql() -> String {
-    build_commit_generation_seed_sql_impl()
+pub(crate) fn build_commit_generation_seed_sql(dialect: SqlDialect) -> String {
+    build_commit_generation_seed_sql_impl(dialect)
 }

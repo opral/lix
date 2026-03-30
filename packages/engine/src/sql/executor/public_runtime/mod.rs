@@ -2733,7 +2733,12 @@ mod tests {
         assert!(lowered_sql.contains("FROM lix_internal_last_checkpoint"));
         assert!(lowered_sql.contains("tip_ancestry_walk AS"));
         assert!(lowered_sql.contains("baseline_ancestry_walk AS"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_commit_edge"));
+        assert!(lowered_sql.contains("FROM lix_internal_change commit_change"));
+        assert!(lowered_sql.contains("LEFT JOIN lix_internal_snapshot commit_snapshot"));
+        assert!(
+            !lowered_sql.contains("lix_internal_live_v1_lix_commit_edge"),
+            "working-changes public lowering should not use live commit-edge mirrors: {lowered_sql}"
+        );
         assert!(!lowered_sql.contains("lix_internal_live_state_status"));
     }
 
