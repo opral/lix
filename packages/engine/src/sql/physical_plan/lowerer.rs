@@ -17,7 +17,8 @@ use crate::sql::logical_plan::public_ir::{
     StructuredPublicRead, VersionScope,
 };
 use crate::sql::physical_plan::plan::{
-    compile_lowered_read_statement, FilesystemPublicSurface, LoweredReadProgram,
+    compile_final_read_statement, compile_lowered_read_statement,
+    compile_terminal_read_statement_from_template, FilesystemPublicSurface, LoweredReadProgram,
     LoweredResultColumn, LoweredResultColumns, TerminalRelationRenderNode,
 };
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
@@ -29,9 +30,8 @@ use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
-    LimitClause, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
-    TableFactor, TableWithJoins,
+    BinaryOperator, Expr, GroupByExpr, Ident, OrderBy, OrderByKind, Query, Select, SelectItem,
+    SetExpr, Statement, TableAlias, TableFactor, TableWithJoins,
 };
 use sqlparser::ast::{ObjectName, ObjectNamePart};
 use sqlparser::ast::{Value as SqlValue, Visit, Visitor};
@@ -2663,9 +2663,14 @@ mod tests {
     };
     use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::logical_plan::public_ir::{
-        BroadPublicReadSetExpr, BroadPublicReadStatement, BroadPublicReadTableFactor,
-        BroadSqlProvenance,
+        BroadPublicReadDistinct, BroadPublicReadGroupBy, BroadPublicReadJoin,
+        BroadPublicReadLimitClause, BroadPublicReadOrderBy, BroadPublicReadQuery,
+        BroadPublicReadSelect, BroadPublicReadSetExpr, BroadPublicReadStatement,
+        BroadPublicReadTableFactor, BroadPublicReadTableWithJoins, BroadPublicReadWith,
+        BroadSqlCaseWhen, BroadSqlExpr, BroadSqlExprKind, BroadSqlFunction, BroadSqlFunctionArg,
+        BroadSqlFunctionArgExpr, BroadSqlFunctionArguments, BroadSqlProvenance,
     };
+    use crate::sql::physical_plan::plan::LoweredReadStatementShape;
     use crate::sql::routing::{
         forbid_broad_routing_for_test, route_broad_public_read_statement_with_known_live_layouts,
     };
@@ -2743,6 +2748,363 @@ mod tests {
             known_live_layouts,
         )
         .expect("broad lowering should succeed")
+    }
+
+    fn strip_provenance_from_broad_statement(statement: &mut BroadPublicReadStatement) {
+        match statement {
+            BroadPublicReadStatement::Query(query) => strip_provenance_from_broad_query(query),
+            BroadPublicReadStatement::Explain {
+                statement: inner, ..
+            } => strip_provenance_from_broad_statement(inner),
+        }
+    }
+
+    fn strip_provenance_from_broad_query(query: &mut BroadPublicReadQuery) {
+        query.provenance = BroadSqlProvenance::default();
+        if let Some(with) = &mut query.with {
+            strip_provenance_from_broad_with(with);
+        }
+        strip_provenance_from_broad_set_expr(&mut query.body);
+        if let Some(order_by) = &mut query.order_by {
+            strip_provenance_from_broad_order_by(order_by);
+        }
+        if let Some(limit_clause) = &mut query.limit_clause {
+            strip_provenance_from_broad_limit_clause(limit_clause);
+        }
+    }
+
+    fn strip_provenance_from_broad_with(with: &mut BroadPublicReadWith) {
+        with.provenance = BroadSqlProvenance::default();
+        for cte in &mut with.cte_tables {
+            strip_provenance_from_broad_query(&mut cte.query);
+        }
+    }
+
+    fn strip_provenance_from_broad_set_expr(expr: &mut BroadPublicReadSetExpr) {
+        match expr {
+            BroadPublicReadSetExpr::Select(select) => strip_provenance_from_broad_select(select),
+            BroadPublicReadSetExpr::Query(query) => strip_provenance_from_broad_query(query),
+            BroadPublicReadSetExpr::SetOperation {
+                provenance,
+                left,
+                right,
+                ..
+            } => {
+                *provenance = BroadSqlProvenance::default();
+                strip_provenance_from_broad_set_expr(left);
+                strip_provenance_from_broad_set_expr(right);
+            }
+            BroadPublicReadSetExpr::Table { provenance, .. }
+            | BroadPublicReadSetExpr::Other { provenance } => {
+                *provenance = BroadSqlProvenance::default();
+            }
+        }
+    }
+
+    fn strip_provenance_from_broad_select(select: &mut BroadPublicReadSelect) {
+        select.provenance = BroadSqlProvenance::default();
+        if let Some(distinct) = &mut select.distinct {
+            strip_provenance_from_broad_distinct(distinct);
+        }
+        for projection in &mut select.projection {
+            projection.provenance = BroadSqlProvenance::default();
+            if let crate::sql::logical_plan::public_ir::BroadPublicReadProjectionItemKind::Expr {
+                expr,
+                ..
+            } = &mut projection.kind
+            {
+                strip_provenance_from_broad_sql_expr(expr);
+            }
+        }
+        for table in &mut select.from {
+            strip_provenance_from_broad_table_with_joins(table);
+        }
+        if let Some(selection) = &mut select.selection {
+            strip_provenance_from_broad_sql_expr(selection);
+        }
+        strip_provenance_from_broad_group_by(&mut select.group_by);
+        if let Some(having) = &mut select.having {
+            strip_provenance_from_broad_sql_expr(having);
+        }
+    }
+
+    fn strip_provenance_from_broad_distinct(distinct: &mut BroadPublicReadDistinct) {
+        if let BroadPublicReadDistinct::On(expressions) = distinct {
+            for expr in expressions {
+                strip_provenance_from_broad_sql_expr(expr);
+            }
+        }
+    }
+
+    fn strip_provenance_from_broad_group_by(group_by: &mut BroadPublicReadGroupBy) {
+        group_by.provenance = BroadSqlProvenance::default();
+        if let crate::sql::logical_plan::public_ir::BroadPublicReadGroupByKind::Expressions(
+            expressions,
+        ) = &mut group_by.kind
+        {
+            for expr in expressions {
+                strip_provenance_from_broad_sql_expr(expr);
+            }
+        }
+    }
+
+    fn strip_provenance_from_broad_order_by(order_by: &mut BroadPublicReadOrderBy) {
+        order_by.provenance = BroadSqlProvenance::default();
+        if let crate::sql::logical_plan::public_ir::BroadPublicReadOrderByKind::Expressions(
+            expressions,
+        ) = &mut order_by.kind
+        {
+            for expr in expressions {
+                expr.provenance = BroadSqlProvenance::default();
+                strip_provenance_from_broad_sql_expr(&mut expr.expr);
+            }
+        }
+    }
+
+    fn strip_provenance_from_broad_limit_clause(limit_clause: &mut BroadPublicReadLimitClause) {
+        limit_clause.provenance = BroadSqlProvenance::default();
+        match &mut limit_clause.kind {
+            crate::sql::logical_plan::public_ir::BroadPublicReadLimitClauseKind::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            } => {
+                if let Some(limit) = limit {
+                    strip_provenance_from_broad_sql_expr(limit);
+                }
+                if let Some(offset) = offset {
+                    strip_provenance_from_broad_sql_expr(&mut offset.value);
+                }
+                for expr in limit_by {
+                    strip_provenance_from_broad_sql_expr(expr);
+                }
+            }
+            crate::sql::logical_plan::public_ir::BroadPublicReadLimitClauseKind::OffsetCommaLimit {
+                offset,
+                limit,
+            } => {
+                strip_provenance_from_broad_sql_expr(offset);
+                strip_provenance_from_broad_sql_expr(limit);
+            }
+        }
+    }
+
+    fn strip_provenance_from_broad_table_with_joins(table: &mut BroadPublicReadTableWithJoins) {
+        table.provenance = BroadSqlProvenance::default();
+        strip_provenance_from_broad_table_factor(&mut table.relation);
+        for join in &mut table.joins {
+            strip_provenance_from_broad_join(join);
+        }
+    }
+
+    fn strip_provenance_from_broad_join(join: &mut BroadPublicReadJoin) {
+        join.provenance = BroadSqlProvenance::default();
+        strip_provenance_from_broad_table_factor(&mut join.relation);
+        strip_provenance_from_broad_join_kind(&mut join.kind);
+    }
+
+    fn strip_provenance_from_broad_join_kind(
+        kind: &mut crate::sql::logical_plan::public_ir::BroadPublicReadJoinKind,
+    ) {
+        use crate::sql::logical_plan::public_ir::BroadPublicReadJoinConstraint;
+        use crate::sql::logical_plan::public_ir::BroadPublicReadJoinKind::*;
+
+        match kind {
+            Join(constraint)
+            | Inner(constraint)
+            | Left(constraint)
+            | LeftOuter(constraint)
+            | Right(constraint)
+            | RightOuter(constraint)
+            | FullOuter(constraint)
+            | CrossJoin(constraint)
+            | Semi(constraint)
+            | LeftSemi(constraint)
+            | RightSemi(constraint)
+            | Anti(constraint)
+            | LeftAnti(constraint)
+            | RightAnti(constraint)
+            | StraightJoin(constraint) => {
+                if let BroadPublicReadJoinConstraint::On(expr) = constraint {
+                    strip_provenance_from_broad_sql_expr(expr);
+                }
+            }
+            AsOf {
+                match_condition,
+                constraint,
+            } => {
+                strip_provenance_from_broad_sql_expr(match_condition);
+                if let BroadPublicReadJoinConstraint::On(expr) = constraint {
+                    strip_provenance_from_broad_sql_expr(expr);
+                }
+            }
+            CrossApply | OuterApply => {}
+        }
+    }
+
+    fn strip_provenance_from_broad_table_factor(factor: &mut BroadPublicReadTableFactor) {
+        match factor {
+            BroadPublicReadTableFactor::Table { provenance, .. }
+            | BroadPublicReadTableFactor::Other { provenance } => {
+                *provenance = BroadSqlProvenance::default();
+            }
+            BroadPublicReadTableFactor::Derived {
+                provenance,
+                subquery,
+                ..
+            } => {
+                *provenance = BroadSqlProvenance::default();
+                strip_provenance_from_broad_query(subquery);
+            }
+            BroadPublicReadTableFactor::NestedJoin {
+                provenance,
+                table_with_joins,
+                ..
+            } => {
+                *provenance = BroadSqlProvenance::default();
+                strip_provenance_from_broad_table_with_joins(table_with_joins);
+            }
+        }
+    }
+
+    fn strip_provenance_from_broad_sql_expr(expr: &mut BroadSqlExpr) {
+        match &mut expr.kind {
+            BroadSqlExprKind::Identifier(_)
+            | BroadSqlExprKind::CompoundIdentifier(_)
+            | BroadSqlExprKind::Value(_)
+            | BroadSqlExprKind::TypedString { .. }
+            | BroadSqlExprKind::Unsupported { .. } => {}
+            BroadSqlExprKind::BinaryOp { left, right, .. }
+            | BroadSqlExprKind::AnyOp { left, right, .. }
+            | BroadSqlExprKind::AllOp { left, right, .. }
+            | BroadSqlExprKind::IsDistinctFrom { left, right }
+            | BroadSqlExprKind::IsNotDistinctFrom { left, right } => {
+                strip_provenance_from_broad_sql_expr(left);
+                strip_provenance_from_broad_sql_expr(right);
+            }
+            BroadSqlExprKind::UnaryOp { expr, .. }
+            | BroadSqlExprKind::Nested(expr)
+            | BroadSqlExprKind::IsNull(expr)
+            | BroadSqlExprKind::IsNotNull(expr)
+            | BroadSqlExprKind::IsTrue(expr)
+            | BroadSqlExprKind::IsNotTrue(expr)
+            | BroadSqlExprKind::IsFalse(expr)
+            | BroadSqlExprKind::IsNotFalse(expr)
+            | BroadSqlExprKind::IsUnknown(expr)
+            | BroadSqlExprKind::IsNotUnknown(expr)
+            | BroadSqlExprKind::Cast { expr, .. } => {
+                strip_provenance_from_broad_sql_expr(expr);
+            }
+            BroadSqlExprKind::InList { expr, list, .. } => {
+                strip_provenance_from_broad_sql_expr(expr);
+                for item in list {
+                    strip_provenance_from_broad_sql_expr(item);
+                }
+            }
+            BroadSqlExprKind::InSubquery { expr, subquery, .. } => {
+                strip_provenance_from_broad_sql_expr(expr);
+                strip_provenance_from_broad_query(subquery);
+            }
+            BroadSqlExprKind::InUnnest {
+                expr, array_expr, ..
+            } => {
+                strip_provenance_from_broad_sql_expr(expr);
+                strip_provenance_from_broad_sql_expr(array_expr);
+            }
+            BroadSqlExprKind::Between {
+                expr, low, high, ..
+            } => {
+                strip_provenance_from_broad_sql_expr(expr);
+                strip_provenance_from_broad_sql_expr(low);
+                strip_provenance_from_broad_sql_expr(high);
+            }
+            BroadSqlExprKind::Like { expr, pattern, .. }
+            | BroadSqlExprKind::ILike { expr, pattern, .. } => {
+                strip_provenance_from_broad_sql_expr(expr);
+                strip_provenance_from_broad_sql_expr(pattern);
+            }
+            BroadSqlExprKind::Function(function) => {
+                strip_provenance_from_broad_sql_function(function);
+            }
+            BroadSqlExprKind::Case {
+                operand,
+                conditions,
+                else_result,
+            } => {
+                if let Some(operand) = operand {
+                    strip_provenance_from_broad_sql_expr(operand);
+                }
+                for when in conditions {
+                    strip_provenance_from_broad_case_when(when);
+                }
+                if let Some(else_result) = else_result {
+                    strip_provenance_from_broad_sql_expr(else_result);
+                }
+            }
+            BroadSqlExprKind::Exists { subquery, .. }
+            | BroadSqlExprKind::ScalarSubquery(subquery) => {
+                strip_provenance_from_broad_query(subquery);
+            }
+            BroadSqlExprKind::Tuple(items) => {
+                for item in items {
+                    strip_provenance_from_broad_sql_expr(item);
+                }
+            }
+        }
+    }
+
+    fn strip_provenance_from_broad_case_when(when: &mut BroadSqlCaseWhen) {
+        strip_provenance_from_broad_sql_expr(&mut when.condition);
+        strip_provenance_from_broad_sql_expr(&mut when.result);
+    }
+
+    fn strip_provenance_from_broad_sql_function(function: &mut BroadSqlFunction) {
+        strip_provenance_from_broad_sql_function_arguments(&mut function.parameters);
+        strip_provenance_from_broad_sql_function_arguments(&mut function.args);
+        if let Some(filter) = &mut function.filter {
+            strip_provenance_from_broad_sql_expr(filter);
+        }
+        for expr in &mut function.within_group {
+            expr.provenance = BroadSqlProvenance::default();
+            strip_provenance_from_broad_sql_expr(&mut expr.expr);
+        }
+    }
+
+    fn strip_provenance_from_broad_sql_function_arguments(
+        arguments: &mut BroadSqlFunctionArguments,
+    ) {
+        match arguments {
+            BroadSqlFunctionArguments::None => {}
+            BroadSqlFunctionArguments::Subquery(query) => {
+                strip_provenance_from_broad_query(query);
+            }
+            BroadSqlFunctionArguments::List(list) => {
+                for arg in &mut list.args {
+                    strip_provenance_from_broad_sql_function_arg(arg);
+                }
+            }
+        }
+    }
+
+    fn strip_provenance_from_broad_sql_function_arg(arg: &mut BroadSqlFunctionArg) {
+        match arg {
+            BroadSqlFunctionArg::Named { arg, .. } => {
+                strip_provenance_from_broad_sql_function_arg_expr(arg);
+            }
+            BroadSqlFunctionArg::ExprNamed { name, arg, .. } => {
+                strip_provenance_from_broad_sql_expr(name);
+                strip_provenance_from_broad_sql_function_arg_expr(arg);
+            }
+            BroadSqlFunctionArg::Unnamed(arg) => {
+                strip_provenance_from_broad_sql_function_arg_expr(arg);
+            }
+        }
+    }
+
+    fn strip_provenance_from_broad_sql_function_arg_expr(arg: &mut BroadSqlFunctionArgExpr) {
+        if let BroadSqlFunctionArgExpr::Expr(expr) = arg {
+            strip_provenance_from_broad_sql_expr(expr);
+        }
     }
 
     #[test]
@@ -3137,6 +3499,89 @@ mod tests {
     }
 
     #[test]
+    fn broad_physical_lowering_accepts_provenance_free_typed_ir() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let mut broad_statement = bound_broad_statement(
+            &registry,
+            "WITH keyed AS ( \
+               SELECT entity_id, schema_key \
+               FROM lix_state \
+               WHERE schema_key = 'lix_key_value' \
+             ) \
+             SELECT keyed.schema_key, COUNT(*) \
+             FROM keyed \
+             JOIN lix_state_by_version sv \
+               ON sv.entity_id = keyed.entity_id \
+             WHERE sv.lixcol_version_id = 'main' \
+             GROUP BY keyed.schema_key \
+             ORDER BY keyed.schema_key",
+        );
+        strip_provenance_from_broad_statement(&mut broad_statement);
+
+        let optimized = route_broad_public_read_statement_with_known_live_layouts(
+            &broad_statement,
+            &registry,
+            SqlDialect::Sqlite,
+            Some("main"),
+            &BTreeMap::new(),
+        )
+        .expect("broad routing should not require stored provenance for accepted typed IR");
+
+        let lowered = lower_broad_public_read_for_execution_with_layouts(
+            &optimized.broad_statement,
+            &registry,
+            SqlDialect::Sqlite,
+            0,
+            Some("main"),
+            &BTreeMap::new(),
+        )
+        .expect("broad lowering should not require stored provenance for accepted typed IR")
+        .expect("provenance-free typed broad IR should still lower");
+
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("provenance-free typed broad statement should render");
+        assert!(!lowered_sql.contains("FROM lix_state "));
+        assert!(!lowered_sql.contains("JOIN lix_state_by_version"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
+        assert!(lowered_sql.contains("all_target_versions AS"));
+    }
+
+    #[test]
+    fn broad_physical_lowering_emits_final_terminal_statement_artifacts() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let lowered = lowered_broad_program(
+            &registry,
+            "SELECT COUNT(*) \
+             FROM lix_working_changes wc \
+             WHERE wc.file_id IN (SELECT f.id FROM lix_file f WHERE f.path = '/hello.txt')",
+        )
+        .expect("optimized broad read should lower");
+
+        let statement = lowered
+            .statements
+            .first()
+            .expect("broad lowered program should contain a statement");
+        match &statement.shape {
+            LoweredReadStatementShape::Final { statement_sql } => {
+                assert!(
+                    !statement_sql.contains("__lix_lowered_relation_"),
+                    "broad physical artifacts must not fall back to placeholder shell SQL identity"
+                );
+                assert!(
+                    statement_sql.contains("lix_internal_live_v1_lix_file_descriptor"),
+                    "broad final artifact should already embed the terminal lowered relation SQL"
+                );
+            }
+            LoweredReadStatementShape::Template { .. } => {
+                panic!(
+                    "broad physical artifacts must remain terminal final statements, not shell-SQL templates"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn broad_physical_lowering_rejects_legacy_set_expr_fallbacks() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
         let mut broad_statement = bound_broad_statement(
@@ -3187,6 +3632,7 @@ mod tests {
         };
         let original_factor = match &select.from[0].relation {
             BroadPublicReadTableFactor::Table { provenance, .. } => provenance
+                .as_ref()
                 .cloned()
                 .expect("table factor provenance should be present"),
             _ => panic!("expected table factor"),
@@ -3368,6 +3814,29 @@ mod tests {
         assert_eq!(
             lowered.pushdown_decision.residual_predicate_sql(),
             vec!["lixcol_entity_id = 'x~1'".to_string()]
+        );
+    }
+
+    #[test]
+    fn broad_lowering_preserves_select_distinct() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let lowered = lowered_broad_program(
+            &registry,
+            "SELECT DISTINCT schema_key \
+             FROM lix_state_by_version \
+             WHERE entity_id = 'version-a' \
+               AND schema_key IN ('lix_version_descriptor', 'lix_version_ref') \
+               AND snapshot_content IS NOT NULL \
+             ORDER BY schema_key",
+        )
+        .expect("broad distinct read should lower");
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
+
+        assert!(
+            lowered_sql.contains("SELECT DISTINCT"),
+            "broad lowered SQL must preserve DISTINCT: {lowered_sql}"
         );
     }
 }

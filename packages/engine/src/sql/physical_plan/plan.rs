@@ -37,19 +37,26 @@ pub(crate) struct LoweredReadProgram {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LoweredReadStatement {
-    pub(crate) shell_statement: Statement,
+    pub(crate) shape: LoweredReadStatementShape,
     pub(crate) bindings: LoweredStatementBindings,
-    pub(crate) relation_render_nodes: Vec<TerminalRelationRenderNode>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LoweredReadStatementShape {
+    Final {
+        statement_sql: String,
+    },
+    Template {
+        shell_statement_sql: String,
+        relation_render_nodes: Vec<TerminalRelationRenderNode>,
+        sql_segments: Vec<String>,
+    },
 }
 
 impl LoweredReadStatement {
     #[cfg(test)]
     pub(crate) fn render_sql(&self, dialect: SqlDialect) -> Result<String, LixError> {
-        render_statement_sql(
-            self.shell_statement.clone(),
-            &self.relation_render_nodes,
-            dialect,
-        )
+        render_lowered_read_statement(&self.shape, dialect)
     }
 
     pub(crate) fn bind_and_render_sql(
@@ -59,11 +66,7 @@ impl LoweredReadStatement {
         dialect: SqlDialect,
     ) -> Result<(String, Vec<Value>), LixError> {
         let bound_params = self.bindings.bind_params(params, runtime_bindings)?;
-        let sql = render_statement_sql(
-            self.shell_statement.clone(),
-            &self.relation_render_nodes,
-            dialect,
-        )?;
+        let sql = render_lowered_read_statement(&self.shape, dialect)?;
         Ok((sql, bound_params))
     }
 }
@@ -126,29 +129,154 @@ pub(crate) fn compile_lowered_read_statement(
         dialect,
         PlaceholderState::new(),
     )?;
+    let shell_statement_sql = lower_statement(template.statement, dialect)?.to_string();
+    let (relation_render_nodes, sql_segments) =
+        compile_statement_sql_segments(&shell_statement_sql, relation_render_nodes)?;
 
     Ok(LoweredReadStatement {
-        shell_statement: template.statement,
+        shape: LoweredReadStatementShape::Template {
+            shell_statement_sql,
+            relation_render_nodes,
+            sql_segments,
+        },
         bindings: LoweredStatementBindings {
             used_bindings: template.used_bindings,
             minimum_param_count: template.minimum_param_count,
         },
-        relation_render_nodes,
     })
 }
 
-fn render_statement_sql(
-    statement: Statement,
-    relation_render_nodes: &[TerminalRelationRenderNode],
+pub(crate) fn compile_final_read_statement(
     dialect: SqlDialect,
+    params_len: usize,
+    statement: Statement,
+) -> Result<LoweredReadStatement, LixError> {
+    let template = compile_statement_binding_template_with_state(
+        &statement,
+        params_len,
+        dialect,
+        PlaceholderState::new(),
+    )?;
+    let lowered_statement = lower_statement(template.statement, dialect)?;
+    let statement_sql = lowered_statement.to_string();
+
+    Ok(LoweredReadStatement {
+        shape: LoweredReadStatementShape::Final { statement_sql },
+        bindings: LoweredStatementBindings {
+            used_bindings: template.used_bindings,
+            minimum_param_count: template.minimum_param_count,
+        },
+    })
+}
+
+pub(crate) fn compile_terminal_read_statement_from_template(
+    dialect: SqlDialect,
+    params_len: usize,
+    statement: Statement,
+    relation_render_nodes: Vec<TerminalRelationRenderNode>,
+) -> Result<LoweredReadStatement, LixError> {
+    let lowered =
+        compile_lowered_read_statement(dialect, params_len, statement, relation_render_nodes)?;
+    let statement_sql = match &lowered.shape {
+        LoweredReadStatementShape::Final { statement_sql } => statement_sql.clone(),
+        LoweredReadStatementShape::Template {
+            relation_render_nodes,
+            sql_segments,
+            ..
+        } => render_statement_sql(sql_segments, relation_render_nodes)?,
+    };
+
+    Ok(LoweredReadStatement {
+        shape: LoweredReadStatementShape::Final { statement_sql },
+        bindings: lowered.bindings,
+    })
+}
+
+fn render_lowered_read_statement(
+    shape: &LoweredReadStatementShape,
+    _dialect: SqlDialect,
 ) -> Result<String, LixError> {
-    let lowered = lower_statement(statement, dialect)?;
-    let mut sql = lowered.to_string();
-    for render_node in relation_render_nodes {
-        sql = sql.replace(
-            &placeholder_table_factor_sql(render_node),
-            &render_node.rendered_factor_sql,
-        );
+    match shape {
+        LoweredReadStatementShape::Final { statement_sql } => Ok(statement_sql.clone()),
+        LoweredReadStatementShape::Template {
+            relation_render_nodes,
+            sql_segments,
+            ..
+        } => render_statement_sql(sql_segments, relation_render_nodes),
+    }
+}
+
+fn compile_statement_sql_segments(
+    shell_statement_sql: &str,
+    relation_render_nodes: Vec<TerminalRelationRenderNode>,
+) -> Result<(Vec<TerminalRelationRenderNode>, Vec<String>), LixError> {
+    if relation_render_nodes.is_empty() {
+        return Ok((Vec::new(), vec![shell_statement_sql.to_string()]));
+    }
+
+    let mut occurrences = relation_render_nodes
+        .into_iter()
+        .map(|node| {
+            let placeholder_sql = placeholder_table_factor_sql(&node);
+            let Some(start) = shell_statement_sql.find(&placeholder_sql) else {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "lowered read statement shell SQL is missing placeholder relation '{}'",
+                        node.placeholder_relation_name
+                    ),
+                ));
+            };
+            Ok((start, start + placeholder_sql.len(), node))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+
+    occurrences.sort_by_key(|(start, _, _)| *start);
+
+    let mut sql_segments = Vec::with_capacity(occurrences.len() + 1);
+    let mut ordered_nodes = Vec::with_capacity(occurrences.len());
+    let mut cursor = 0;
+
+    for (start, end, node) in occurrences {
+        if start < cursor {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "lowered read statement placeholder relations overlap in shell SQL",
+            ));
+        }
+        sql_segments.push(shell_statement_sql[cursor..start].to_string());
+        ordered_nodes.push(node);
+        cursor = end;
+    }
+
+    sql_segments.push(shell_statement_sql[cursor..].to_string());
+
+    Ok((ordered_nodes, sql_segments))
+}
+
+fn render_statement_sql(
+    sql_segments: &[String],
+    relation_render_nodes: &[TerminalRelationRenderNode],
+) -> Result<String, LixError> {
+    if sql_segments.len() != relation_render_nodes.len() + 1 {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "lowered read SQL template expected {} segments for {} relation render nodes, got {}",
+                relation_render_nodes.len() + 1,
+                relation_render_nodes.len(),
+                sql_segments.len(),
+            ),
+        ));
+    }
+
+    let mut sql = String::new();
+    for (segment, render_node) in sql_segments.iter().zip(relation_render_nodes.iter()) {
+        sql.push_str(segment);
+        sql.push_str(&render_node.rendered_factor_sql);
+    }
+    if let Some(last_segment) = sql_segments.last() {
+        sql.push_str(last_segment);
     }
     Ok(sql)
 }
