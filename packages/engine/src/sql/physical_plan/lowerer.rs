@@ -2658,7 +2658,6 @@ mod tests {
     use crate::sql::semantic_ir::ExecutionContext;
     use crate::{SqlDialect, Value};
     use serde_json::{json, Value as JsonValue};
-    use sqlparser::ast::Statement;
     use std::collections::BTreeMap;
 
     fn lowered_program(registry: &SurfaceRegistry, sql: &str) -> Option<LoweredReadProgram> {
@@ -2772,8 +2771,7 @@ mod tests {
                 strip_provenance_from_broad_set_expr(left);
                 strip_provenance_from_broad_set_expr(right);
             }
-            BroadPublicReadSetExpr::Table { provenance, .. }
-            | BroadPublicReadSetExpr::Other { provenance } => {
+            BroadPublicReadSetExpr::Table { provenance, .. } => {
                 *provenance = BroadSqlProvenance::default();
             }
         }
@@ -2922,8 +2920,7 @@ mod tests {
 
     fn strip_provenance_from_broad_table_factor(factor: &mut BroadPublicReadTableFactor) {
         match factor {
-            BroadPublicReadTableFactor::Table { provenance, .. }
-            | BroadPublicReadTableFactor::Other { provenance } => {
+            BroadPublicReadTableFactor::Table { provenance, .. } => {
                 *provenance = BroadSqlProvenance::default();
             }
             BroadPublicReadTableFactor::Derived {
@@ -3595,76 +3592,20 @@ mod tests {
     }
 
     #[test]
-    fn broad_physical_lowering_rejects_legacy_set_expr_fallbacks() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
-        let mut broad_statement = bound_broad_statement(
-            &registry,
-            "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'",
-        );
-        let mut statements =
-            crate::sql::parser::parse_sql_script("SELECT entity_id FROM lix_state")
-                .expect("SQL should parse");
-        let statement = statements.pop().expect("single statement");
-        let Statement::Query(query) = statement else {
-            panic!("expected query statement");
-        };
+    fn broad_physical_lowerer_source_has_no_fallback_defense_branches() {
+        let lowerer_broad_src = include_str!("lowerer/broad.rs");
 
-        let BroadPublicReadStatement::Query(bound_query) = &mut broad_statement else {
-            panic!("expected broad query statement");
-        };
-        bound_query.body = BroadPublicReadSetExpr::Other {
-            provenance: BroadSqlProvenance::from_raw(query.body.as_ref().clone()),
-        };
-
-        let error = lower_broad_public_read_for_execution_with_layouts(
-            &broad_statement,
-            &registry,
-            SqlDialect::Sqlite,
-            0,
-            Some("main"),
-            &BTreeMap::new(),
-        )
-        .expect_err("legacy set-expression fallbacks must not be rescued during lowering");
-
-        assert!(error.description.contains("legacy set-expression fallback"));
-    }
-
-    #[test]
-    fn broad_physical_lowering_rejects_legacy_table_factor_fallbacks() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
-        let mut broad_statement = bound_broad_statement(
-            &registry,
-            "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'",
-        );
-
-        let BroadPublicReadStatement::Query(query) = &mut broad_statement else {
-            panic!("expected broad query statement");
-        };
-        let BroadPublicReadSetExpr::Select(select) = &mut query.body else {
-            panic!("expected broad select");
-        };
-        let original_factor = match &select.from[0].relation {
-            BroadPublicReadTableFactor::Table { provenance, .. } => provenance
-                .as_ref()
-                .cloned()
-                .expect("table factor provenance should be present"),
-            _ => panic!("expected table factor"),
-        };
-        select.from[0].relation = BroadPublicReadTableFactor::Other {
-            provenance: BroadSqlProvenance::from_raw(original_factor),
-        };
-
-        let error = lower_broad_public_read_for_execution_with_layouts(
-            &broad_statement,
-            &registry,
-            SqlDialect::Sqlite,
-            0,
-            Some("main"),
-            &BTreeMap::new(),
-        )
-        .expect_err("legacy table-factor fallbacks must not be rescued during lowering");
-
-        assert!(error.description.contains("legacy table-factor fallback"));
+        for forbidden in [
+            "BroadPublicReadSetExpr::Other",
+            "BroadPublicReadTableFactor::Other",
+            "legacy set-expression fallback",
+            "legacy table-factor fallback",
+        ] {
+            assert!(
+                !lowerer_broad_src.contains(forbidden),
+                "broad physical lowering must not reintroduce fallback-defense branch {forbidden}"
+            );
+        }
     }
 
     #[test]

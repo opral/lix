@@ -1237,9 +1237,6 @@ pub(crate) enum ExplainBroadPublicReadSetExprSnapshot {
     Table {
         relation: ExplainBroadPublicReadRelationSnapshot,
     },
-    Other {
-        sql: String,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1382,9 +1379,6 @@ pub(crate) enum ExplainBroadPublicReadTableFactorSnapshot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         alias: Option<ExplainBroadPublicReadAliasSnapshot>,
         table_with_joins: Box<ExplainBroadPublicReadTableWithJoinsSnapshot>,
-    },
-    Other {
-        sql: String,
     },
 }
 
@@ -3004,12 +2998,6 @@ fn broad_public_read_set_expr_snapshot(
                 relation: broad_public_read_relation_snapshot(relation),
             }
         }
-        BroadPublicReadSetExpr::Other { provenance } => ExplainBroadPublicReadSetExprSnapshot::Other {
-            sql: provenance
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "(missing set expression provenance)".to_string()),
-        },
     }
 }
 
@@ -3105,14 +3093,6 @@ fn broad_public_read_table_factor_snapshot(
                 table_with_joins,
             )),
         },
-        BroadPublicReadTableFactor::Other { provenance } => {
-            ExplainBroadPublicReadTableFactorSnapshot::Other {
-                sql: provenance
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "(missing table factor provenance)".to_string()),
-            }
-        }
     }
 }
 
@@ -3825,7 +3805,6 @@ fn collect_broad_public_read_relation_summary_in_set_expr(
             external_relations,
             cte_relations,
         ),
-        BroadPublicReadSetExpr::Other { .. } => {}
     }
 }
 
@@ -4169,7 +4148,6 @@ fn collect_broad_public_read_relation_summary_in_table_factor(
             external_relations,
             cte_relations,
         ),
-        BroadPublicReadTableFactor::Other { .. } => {}
     }
 }
 

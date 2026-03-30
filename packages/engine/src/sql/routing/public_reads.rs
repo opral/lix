@@ -469,9 +469,6 @@ fn route_broad_public_read_set_expr(
                 known_live_layouts,
             )?,
         }),
-        BroadPublicReadSetExpr::Other { provenance } => Ok(BroadPublicReadSetExpr::Other {
-            provenance: provenance.clone(),
-        }),
     }
 }
 
@@ -1740,9 +1737,6 @@ fn route_broad_public_read_table_factor(
                 known_live_layouts,
             )?),
         }),
-        BroadPublicReadTableFactor::Other { provenance } => Ok(BroadPublicReadTableFactor::Other {
-            provenance: provenance.clone(),
-        }),
     }
 }
 
@@ -1871,7 +1865,6 @@ fn collect_relation_names_in_set_expr<F>(
             collect_relation_names_in_set_expr(right, out, visit_relation);
         }
         BroadPublicReadSetExpr::Table { relation, .. } => visit_relation(relation, out),
-        BroadPublicReadSetExpr::Other { .. } => {}
     }
 }
 
@@ -2001,7 +1994,6 @@ fn collect_relation_names_in_table_factor<F>(
         BroadPublicReadTableFactor::NestedJoin {
             table_with_joins, ..
         } => collect_relation_names_in_table_with_joins(table_with_joins, out, visit_relation),
-        BroadPublicReadTableFactor::Other { .. } => {}
     }
 }
 
