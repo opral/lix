@@ -1,7 +1,9 @@
 use crate::sql::catalog::SurfaceBinding;
 use crate::sql::logical_plan::dependency_spec::DependencySpec;
 use crate::sql::logical_plan::direct_reads::DirectPublicReadPlan;
-use crate::sql::logical_plan::public_ir::{PlannedWrite, StructuredPublicRead};
+use crate::sql::logical_plan::public_ir::{
+    BroadPublicReadStatement, PlannedWrite, StructuredPublicRead,
+};
 use crate::sql::logical_plan::result_contract::ResultContract;
 use crate::sql::semantic_ir::internal::NormalizedInternalStatements;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
@@ -24,6 +26,7 @@ pub(crate) enum PublicReadLogicalPlan {
         effective_state_plan: Option<EffectiveStatePlan>,
     },
     Broad {
+        broad_statement: Box<BroadPublicReadStatement>,
         surface_bindings: Vec<SurfaceBinding>,
         dependency_spec: Option<DependencySpec>,
     },

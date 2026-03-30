@@ -8,7 +8,8 @@ use crate::sql::catalog::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
 use crate::sql::logical_plan::public_ir::{
-    CanonicalStateScan, PlannedWrite, ReadCommand, ReadContract, ReadPlan, StructuredPublicRead,
+    BroadPublicReadStatement, CanonicalStateScan, PlannedWrite, ReadCommand, ReadContract,
+    ReadPlan, StructuredPublicRead,
 };
 use crate::sql::logical_plan::{
     DependencySpec, DirectPublicReadPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan,
@@ -28,6 +29,7 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PublicReadSemantics {
     pub(crate) surface_bindings: Vec<SurfaceBinding>,
+    pub(crate) broad_statement: Option<Box<BroadPublicReadStatement>>,
     pub(crate) structured_read: Option<StructuredPublicRead>,
     pub(crate) effective_state_request: Option<EffectiveStateRequest>,
     pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
@@ -127,6 +129,7 @@ pub(crate) async fn prepare_structured_public_read_analysis(
             bound_statement,
             semantics: PublicReadSemantics {
                 surface_bindings: vec![structured_read.surface_binding.clone()],
+                broad_statement: None,
                 structured_read: Some(structured_read),
                 effective_state_request: effective_state
                     .as_ref()

@@ -12,8 +12,9 @@ use crate::sql::catalog::{
     SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
 };
 use crate::sql::logical_plan::public_ir::{
-    CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan, CanonicalStateScan,
-    CanonicalWorkingChangesScan, FilesystemKind, ReadPlan, StructuredPublicRead, VersionScope,
+    BroadPublicReadStatement, CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan,
+    CanonicalStateScan, CanonicalWorkingChangesScan, FilesystemKind, ReadPlan,
+    StructuredPublicRead, VersionScope,
 };
 use crate::sql::physical_plan::plan::{
     compile_lowered_read_statement, FilesystemPublicSurface, LoweredReadProgram,
@@ -36,13 +37,6 @@ use sqlparser::ast::{ObjectName, ObjectNamePart};
 use sqlparser::ast::{Value as SqlValue, Visit, Visitor};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct BroadPublicRelationSummary {
-    pub(crate) public_relations: BTreeSet<String>,
-    pub(crate) internal_relations: BTreeSet<String>,
-    pub(crate) external_relations: BTreeSet<String>,
-}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RenderRelationSubstitutionCollector {
@@ -104,15 +98,22 @@ pub(crate) fn rewrite_supported_public_read_surfaces_in_statement(
     broad::rewrite_supported_public_read_surfaces_in_statement(statement, SqlDialect::Sqlite)
 }
 
-pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id_and_layouts(
+pub(crate) fn bind_broad_public_read_statement_with_registry(
     statement: &Statement,
+    registry: &SurfaceRegistry,
+) -> Result<Option<BroadPublicReadStatement>, LixError> {
+    broad::bind_broad_public_read_statement_with_registry(statement, registry)
+}
+
+pub(crate) fn broad_public_relation_supports_terminal_render(
+    binding: &SurfaceBinding,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-) -> Result<RenderedBroadPublicReadStatement, LixError> {
-    broad::rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id(
-        statement,
+) -> Result<bool, LixError> {
+    broad::broad_public_relation_supports_terminal_render(
+        binding,
         registry,
         dialect,
         active_version_id,
@@ -120,11 +121,20 @@ pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry_
     )
 }
 
-pub(crate) fn summarize_bound_public_read_statement_with_registry(
-    statement: &Statement,
+pub(crate) fn render_broad_public_read_statement_with_registry_and_active_version_id_and_layouts(
+    statement: &BroadPublicReadStatement,
     registry: &SurfaceRegistry,
-) -> Result<Option<BroadPublicRelationSummary>, LixError> {
-    broad::summarize_bound_public_read_statement_with_registry(statement, registry)
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<RenderedBroadPublicReadStatement, LixError> {
+    broad::render_broad_public_read_statement_with_registry_and_active_version_id(
+        statement,
+        registry,
+        dialect,
+        active_version_id,
+        known_live_layouts,
+    )
 }
 
 pub(crate) fn lower_read_for_execution_with_layouts(
