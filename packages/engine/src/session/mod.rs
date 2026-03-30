@@ -28,8 +28,8 @@ use crate::sql::parser::parse_sql;
 use crate::sql::parser::parse_sql_with_timing;
 use crate::transaction::{TransactionCommitOutcome, WriteTransaction};
 use crate::workspace::{
-    load_workspace_active_account_ids, persist_workspace_active_account_ids,
-    persist_workspace_active_version_id, require_workspace_active_version_id,
+    load_workspace_active_account_ids, persist_workspace_selectors,
+    require_workspace_active_version_id,
 };
 use crate::{ExecuteResult, LixError, Value};
 
@@ -85,9 +85,10 @@ impl Session {
                 None => match engine.boot_active_account() {
                     Some(account) => {
                         let active_account_ids = vec![account.id.clone()];
-                        persist_workspace_active_account_ids(
+                        persist_workspace_selectors(
                             engine.backend.as_ref(),
-                            &active_account_ids,
+                            None,
+                            Some(&active_account_ids),
                         )
                         .await?;
                         active_account_ids
@@ -466,23 +467,24 @@ impl Session {
             ));
         }
         ensure_version_exists(self, &version_id).await?;
-        self.replace_active_version_id(version_id.clone());
-        if matches!(self.persistence, Persistence::Workspace) {
-            persist_workspace_active_version_id(self.engine.backend.as_ref(), &version_id).await?;
-        }
-        Ok(())
+        self.apply_selector_changes(
+            Some(version_id),
+            None,
+            self.should_persist_workspace_selectors(),
+        )
+        .await
     }
 
     pub async fn set_active_account_ids(
         &self,
         active_account_ids: Vec<String>,
     ) -> Result<(), LixError> {
-        self.replace_active_account_ids(active_account_ids.clone());
-        if matches!(self.persistence, Persistence::Workspace) {
-            persist_workspace_active_account_ids(self.engine.backend.as_ref(), &active_account_ids)
-                .await?;
-        }
-        Ok(())
+        self.apply_selector_changes(
+            None,
+            Some(active_account_ids),
+            self.should_persist_workspace_selectors(),
+        )
+        .await
     }
 
     pub(crate) fn replace_active_version_id(&self, version_id: String) {
@@ -515,27 +517,45 @@ impl Session {
         self.runtime_generation.fetch_add(1, Ordering::SeqCst);
     }
 
+    fn should_persist_workspace_selectors(&self) -> bool {
+        matches!(self.persistence, Persistence::Workspace)
+    }
+
+    async fn apply_selector_changes(
+        &self,
+        next_active_version_id: Option<String>,
+        next_active_account_ids: Option<Vec<String>>,
+        persist_workspace: bool,
+    ) -> Result<(), LixError> {
+        if let Some(version_id) = next_active_version_id.as_ref() {
+            self.replace_active_version_id(version_id.clone());
+        }
+        if let Some(active_account_ids) = next_active_account_ids.as_ref() {
+            self.replace_active_account_ids(active_account_ids.clone());
+        }
+        if persist_workspace {
+            persist_workspace_selectors(
+                self.engine.backend.as_ref(),
+                next_active_version_id.as_deref(),
+                next_active_account_ids.as_deref(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn apply_transaction_commit_outcome(
         &self,
         mut outcome: TransactionCommitOutcome,
     ) -> Result<(), LixError> {
-        if let Some(version_id) = outcome.session_delta.next_active_version_id.take() {
-            self.replace_active_version_id(version_id.clone());
-            if matches!(self.persistence, Persistence::Workspace) {
-                persist_workspace_active_version_id(self.engine.backend.as_ref(), &version_id)
-                    .await?;
-            }
-        }
-        if let Some(active_account_ids) = outcome.session_delta.next_active_account_ids.take() {
-            self.replace_active_account_ids(active_account_ids.clone());
-            if matches!(self.persistence, Persistence::Workspace) {
-                persist_workspace_active_account_ids(
-                    self.engine.backend.as_ref(),
-                    &active_account_ids,
-                )
-                .await?;
-            }
-        }
+        let persist_workspace =
+            self.should_persist_workspace_selectors() || outcome.session_delta.persist_workspace;
+        self.apply_selector_changes(
+            outcome.session_delta.next_active_version_id.take(),
+            outcome.session_delta.next_active_account_ids.take(),
+            persist_workspace,
+        )
+        .await?;
         if outcome.invalidate_deterministic_settings_cache {
             self.engine.invalidate_deterministic_settings_cache();
         }
@@ -742,18 +762,11 @@ impl Drop for SessionTransaction<'_> {
 }
 
 async fn ensure_version_exists(session: &Session, version_id: &str) -> Result<(), LixError> {
-    if !crate::canonical::version_state::version_exists_with_backend(
+    crate::version::context::ensure_version_exists_with_backend(
         session.engine.backend.as_ref(),
         version_id,
     )
-    .await?
-    {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("version '{version_id}' does not exist"),
-        ));
-    }
-    Ok(())
+    .await
 }
 
 fn contains_transaction_control_statement(statements: &[Statement]) -> bool {

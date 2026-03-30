@@ -29,8 +29,8 @@ pub(crate) mod writer_key;
 
 pub(crate) use init::init;
 pub(crate) use metadata::{
-    load_workspace_active_account_ids, persist_workspace_active_account_ids,
-    persist_workspace_active_version_id, require_workspace_active_version_id,
+    load_workspace_active_account_ids, persist_workspace_selectors,
+    require_workspace_active_version_id,
 };
 
 #[cfg(test)]
