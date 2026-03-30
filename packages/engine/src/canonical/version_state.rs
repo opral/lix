@@ -252,13 +252,6 @@ fn escape_sql_string(value: &str) -> String {
 }
 
 fn build_current_version_refs_unique_cte_sql(dialect: SqlDialect) -> String {
-    let (parent_join_sql, parent_value_expr) = json_array_text_join_sql(
-        dialect,
-        "commit_headers.commit_snapshot_content",
-        "parent_commit_ids",
-        "parent_rows",
-        "parent_commit_id",
-    );
     let commit_id_expr = json_text_extract_sql(dialect, "ref_snapshot.content", "commit_id");
     format!(
         "canonical_commit_headers AS ( \
@@ -273,10 +266,15 @@ fn build_current_version_refs_unique_cte_sql(dialect: SqlDialect) -> String {
                AND commit_change.plugin_key = 'lix' \
                AND commit_snapshot.content IS NOT NULL \
          ), \
-         version_ref_facts AS ( \
-             SELECT DISTINCT \
+         ranked_ref_facts AS ( \
+             SELECT \
                ref_change.entity_id AS version_id, \
-               {commit_id_expr} AS commit_id \
+               {commit_id_expr} AS commit_id, \
+               ref_snapshot.content AS snapshot_content, \
+               ROW_NUMBER() OVER ( \
+                 PARTITION BY ref_change.entity_id \
+                 ORDER BY ref_change.created_at DESC, ref_change.id DESC \
+               ) AS rn \
              FROM lix_internal_change ref_change \
              LEFT JOIN lix_internal_snapshot ref_snapshot \
                ON ref_snapshot.id = ref_change.snapshot_id \
@@ -284,66 +282,20 @@ fn build_current_version_refs_unique_cte_sql(dialect: SqlDialect) -> String {
                AND ref_change.schema_version = '{ref_schema_version}' \
                AND ref_change.file_id = '{ref_file_id}' \
                AND ref_change.plugin_key = '{ref_plugin_key}' \
-               AND ref_snapshot.content IS NOT NULL \
-               AND COALESCE({commit_id_expr}, '') <> '' \
-         ), \
-         ancestry_walk AS ( \
-             SELECT \
-               facts.version_id AS version_id, \
-               facts.commit_id AS head_commit_id, \
-               facts.commit_id AS ancestor_commit_id \
-             FROM version_ref_facts facts \
-             UNION ALL \
-             SELECT \
-               walk.version_id AS version_id, \
-               walk.head_commit_id AS head_commit_id, \
-               {parent_value_expr} AS ancestor_commit_id \
-             FROM ancestry_walk walk \
-             JOIN canonical_commit_headers commit_headers \
-               ON commit_headers.commit_id = walk.ancestor_commit_id \
-             {parent_join_sql} \
-             WHERE {parent_value_expr} IS NOT NULL \
-         ), \
-         overshadowed AS ( \
-             SELECT DISTINCT \
-               older.version_id AS version_id, \
-               older.commit_id AS commit_id \
-             FROM version_ref_facts older \
-             JOIN ancestry_walk walk \
-               ON walk.version_id = older.version_id \
-              AND walk.ancestor_commit_id = older.commit_id \
-              AND walk.head_commit_id <> older.commit_id \
-         ), \
-         current_ref_candidates AS ( \
-             SELECT \
-               facts.version_id AS version_id, \
-               facts.commit_id AS commit_id \
-             FROM version_ref_facts facts \
-             LEFT JOIN overshadowed \
-               ON overshadowed.version_id = facts.version_id \
-              AND overshadowed.commit_id = facts.commit_id \
-             WHERE overshadowed.commit_id IS NULL \
-         ), \
-         current_ref_counts AS ( \
-             SELECT version_id, COUNT(*) AS candidate_count \
-             FROM current_ref_candidates \
-             GROUP BY version_id \
          ), \
          current_refs AS ( \
              SELECT \
-               candidates.version_id AS version_id, \
-               candidates.commit_id AS commit_id \
-             FROM current_ref_candidates candidates \
-             JOIN current_ref_counts counts \
-               ON counts.version_id = candidates.version_id \
-             WHERE counts.candidate_count = 1 \
+               version_id, \
+               commit_id \
+             FROM ranked_ref_facts \
+             WHERE rn = 1 \
+               AND snapshot_content IS NOT NULL \
+               AND COALESCE(commit_id, '') <> '' \
          ), ",
         ref_schema_key = escape_sql_string(crate::version::version_ref_schema_key()),
         ref_schema_version = escape_sql_string(crate::version::version_ref_schema_version()),
         ref_file_id = escape_sql_string(crate::version::version_ref_file_id()),
         ref_plugin_key = escape_sql_string(crate::version::version_ref_plugin_key()),
-        parent_value_expr = parent_value_expr,
-        parent_join_sql = parent_join_sql,
         commit_id_expr = commit_id_expr,
     )
 }

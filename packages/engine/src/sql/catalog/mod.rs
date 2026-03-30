@@ -54,6 +54,19 @@ pub(crate) enum SurfaceReadFreshness {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SurfaceReadSemantics {
+    /// Reads committed graph/ref-selected state directly, without workspace overlays.
+    CommittedGraph,
+    /// Reads effective state selected by workspace version scope and may overlay
+    /// workspace-owned annotation or untracked rows.
+    WorkspaceEffective,
+    /// Reads canonical history/change facts rather than current selected state.
+    CanonicalHistory,
+    /// Reads workspace-local working or pending changes rather than committed state.
+    WorkspaceChanges,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefaultScopeSemantics {
     ActiveVersion,
     ExplicitVersion,
@@ -117,6 +130,7 @@ pub(crate) struct SurfaceDescriptor {
     pub(crate) surface_family: SurfaceFamily,
     pub(crate) surface_variant: SurfaceVariant,
     pub(crate) read_freshness: SurfaceReadFreshness,
+    pub(crate) read_semantics: SurfaceReadSemantics,
     pub(crate) visible_columns: Vec<String>,
     pub(crate) hidden_columns: Vec<String>,
     pub(crate) column_types: BTreeMap<String, SurfaceColumnType>,
@@ -135,6 +149,7 @@ pub(crate) struct SurfaceBinding {
     pub(crate) exposed_columns: Vec<String>,
     pub(crate) column_types: BTreeMap<String, SurfaceColumnType>,
     pub(crate) read_freshness: SurfaceReadFreshness,
+    pub(crate) read_semantics: SurfaceReadSemantics,
     pub(crate) capability: SurfaceCapability,
     pub(crate) default_scope: DefaultScopeSemantics,
     pub(crate) implicit_overrides: SurfaceImplicitOverrides,
@@ -195,6 +210,7 @@ impl SurfaceRegistry {
             exposed_columns: descriptor.visible_columns.clone(),
             column_types: descriptor.column_types.clone(),
             read_freshness: descriptor.read_freshness,
+            read_semantics: descriptor.read_semantics,
             capability: descriptor.capability,
             default_scope: descriptor.default_scope,
             implicit_overrides: descriptor.implicit_overrides.clone(),
@@ -374,6 +390,7 @@ fn builtin_surface_descriptors() -> Vec<SurfaceDescriptor> {
             surface_family: SurfaceFamily::Change,
             surface_variant: SurfaceVariant::History,
             read_freshness: SurfaceReadFreshness::AllowsStaleProjection,
+            read_semantics: SurfaceReadSemantics::CanonicalHistory,
             visible_columns: change_columns(),
             hidden_columns: Vec::new(),
             column_types: change_column_types(),
@@ -395,6 +412,7 @@ fn builtin_surface_descriptors() -> Vec<SurfaceDescriptor> {
             surface_family: SurfaceFamily::Change,
             surface_variant: SurfaceVariant::WorkingChanges,
             read_freshness: SurfaceReadFreshness::AllowsStaleProjection,
+            read_semantics: SurfaceReadSemantics::WorkspaceChanges,
             visible_columns: working_changes_columns(),
             hidden_columns: Vec::new(),
             column_types: working_changes_column_types(),
@@ -472,6 +490,12 @@ fn state_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescr
             | SurfaceVariant::ByVersion
             | SurfaceVariant::WorkingChanges => SurfaceReadFreshness::RequiresFreshProjection,
         },
+        read_semantics: match variant {
+            SurfaceVariant::History => SurfaceReadSemantics::CanonicalHistory,
+            SurfaceVariant::Default
+            | SurfaceVariant::ByVersion
+            | SurfaceVariant::WorkingChanges => SurfaceReadSemantics::WorkspaceEffective,
+        },
         visible_columns,
         hidden_columns,
         column_types: state_column_types(),
@@ -545,6 +569,12 @@ fn filesystem_surface_descriptor(name: &str, variant: SurfaceVariant) -> Surface
             | SurfaceVariant::ByVersion
             | SurfaceVariant::WorkingChanges => SurfaceReadFreshness::RequiresFreshProjection,
         },
+        read_semantics: match variant {
+            SurfaceVariant::History => SurfaceReadSemantics::CanonicalHistory,
+            SurfaceVariant::Default
+            | SurfaceVariant::ByVersion
+            | SurfaceVariant::WorkingChanges => SurfaceReadSemantics::WorkspaceEffective,
+        },
         visible_columns,
         hidden_columns: Vec::new(),
         column_types: filesystem_column_types(name),
@@ -579,6 +609,7 @@ fn admin_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescr
         surface_family: SurfaceFamily::Admin,
         surface_variant: variant,
         read_freshness: SurfaceReadFreshness::AllowsStaleProjection,
+        read_semantics: SurfaceReadSemantics::CommittedGraph,
         visible_columns: admin_columns(name),
         hidden_columns: Vec::new(),
         column_types: admin_column_types(name),
@@ -620,6 +651,7 @@ fn entity_descriptors_from_spec(
             surface_family: SurfaceFamily::Entity,
             surface_variant: SurfaceVariant::Default,
             read_freshness: SurfaceReadFreshness::RequiresFreshProjection,
+            read_semantics: SurfaceReadSemantics::WorkspaceEffective,
             visible_columns: default_visible,
             hidden_columns: hidden_columns.clone(),
             column_types: column_types.clone(),
@@ -651,6 +683,7 @@ fn entity_descriptors_from_spec(
             surface_family: SurfaceFamily::Entity,
             surface_variant: SurfaceVariant::ByVersion,
             read_freshness: SurfaceReadFreshness::RequiresFreshProjection,
+            read_semantics: SurfaceReadSemantics::WorkspaceEffective,
             visible_columns: by_version_visible,
             hidden_columns: hidden_columns.clone(),
             column_types: column_types.clone(),
@@ -683,6 +716,7 @@ fn entity_descriptors_from_spec(
             surface_family: SurfaceFamily::Entity,
             surface_variant: SurfaceVariant::History,
             read_freshness: SurfaceReadFreshness::AllowsStaleProjection,
+            read_semantics: SurfaceReadSemantics::CanonicalHistory,
             visible_columns: history_visible,
             hidden_columns,
             column_types,
@@ -1151,7 +1185,7 @@ mod tests {
         builtin_public_surface_columns, builtin_public_surface_names,
         entity_surface_spec_from_schema, CatalogEpoch, DefaultScopeSemantics,
         DynamicEntitySurfaceSpec, SurfaceCapability, SurfaceFamily, SurfaceOverrideValue,
-        SurfaceRegistry, SurfaceVariant,
+        SurfaceReadSemantics, SurfaceRegistry, SurfaceVariant,
     };
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
@@ -1175,7 +1209,52 @@ mod tests {
             binding.default_scope,
             DefaultScopeSemantics::ExplicitVersion
         );
+        assert_eq!(
+            binding.read_semantics,
+            SurfaceReadSemantics::WorkspaceEffective
+        );
         assert!(binding.implicit_overrides.expose_version_id);
+    }
+
+    #[test]
+    fn surfaces_declare_committed_vs_workspace_overlay_semantics() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+
+        assert_eq!(
+            registry
+                .bind_relation_name("lix_state")
+                .expect("lix_state should bind")
+                .read_semantics,
+            SurfaceReadSemantics::WorkspaceEffective
+        );
+        assert_eq!(
+            registry
+                .bind_relation_name("lix_key_value")
+                .expect("entity surface should bind")
+                .read_semantics,
+            SurfaceReadSemantics::WorkspaceEffective
+        );
+        assert_eq!(
+            registry
+                .bind_relation_name("lix_state_history")
+                .expect("lix_state_history should bind")
+                .read_semantics,
+            SurfaceReadSemantics::CanonicalHistory
+        );
+        assert_eq!(
+            registry
+                .bind_relation_name("lix_version")
+                .expect("lix_version should bind")
+                .read_semantics,
+            SurfaceReadSemantics::CommittedGraph
+        );
+        assert_eq!(
+            registry
+                .bind_relation_name("lix_working_changes")
+                .expect("lix_working_changes should bind")
+                .read_semantics,
+            SurfaceReadSemantics::WorkspaceChanges
+        );
     }
 
     #[test]

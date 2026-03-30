@@ -49,33 +49,21 @@ async fn create_checkpoint_in_transaction(
     if global_commit_id != local_commit_id {
         ensure_checkpoint_label_on_commit(tx, &global_commit_id).await?;
     }
-    // Keep the derived checkpoint pointer cache warm for the active version.
-    tx.backend_transaction_mut()?
-        .execute(
-            "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
-         VALUES ($1, $2) \
-         ON CONFLICT (version_id) DO UPDATE \
-         SET checkpoint_commit_id = excluded.checkpoint_commit_id",
-            &[
-                Value::Text(version_id),
-                Value::Text(local_commit_id.clone()),
-            ],
-        )
-        .await?;
+    // Keep the derived checkpoint-history cache warm for the active version.
+    super::history::upsert_last_checkpoint_for_version_in_transaction(
+        tx.backend_transaction_mut()?,
+        &version_id,
+        &local_commit_id,
+    )
+    .await?;
     // The global lane mirrors the same derived cache contract and remains
-    // rebuildable from canonical heads plus checkpoint labels.
-    tx.backend_transaction_mut()?
-        .execute(
-            "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
-         VALUES ($1, $2) \
-         ON CONFLICT (version_id) DO UPDATE \
-         SET checkpoint_commit_id = excluded.checkpoint_commit_id",
-            &[
-                Value::Text(crate::version::GLOBAL_VERSION_ID.to_string()),
-                Value::Text(global_commit_id.clone()),
-            ],
-        )
-        .await?;
+    // rebuildable from canonical heads plus canonical checkpoint labels.
+    super::history::upsert_last_checkpoint_for_version_in_transaction(
+        tx.backend_transaction_mut()?,
+        crate::version::GLOBAL_VERSION_ID,
+        &global_commit_id,
+    )
+    .await?;
 
     Ok(CreateCheckpointResult {
         id: local_commit_id,

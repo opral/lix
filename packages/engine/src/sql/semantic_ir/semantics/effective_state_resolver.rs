@@ -74,6 +74,14 @@ enum TrackedExactEffectiveRowLookup {
     Missing,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct WorkspaceAnnotatedTrackedExactRow {
+    // Canonical committed row plus a workspace-owned annotation overlay applied
+    // only for effective/public state reads.
+    committed: ExactCommittedStateRow,
+    writer_key: Option<String>,
+}
+
 pub(crate) fn build_effective_state(
     structured_read: &StructuredPublicRead,
     dependency_spec: Option<&DependencySpec>,
@@ -388,9 +396,12 @@ async fn load_exact_tracked_effective_row(
     .await?;
 
     if let Some(row) = row {
-        let row =
-            tracked_exact_row_with_workspace_writer_key(backend, pending_transaction_view, row)
-                .await?;
+        let row = annotate_tracked_exact_row_with_workspace_writer_key(
+            backend,
+            pending_transaction_view,
+            row,
+        )
+        .await?;
         if tracked_exact_row_matches_row_key(&row, &request.row_key) {
             return Ok(TrackedExactEffectiveRowLookup::Matched(
                 exact_effective_state_row_from_tracked(row, &request.version_id, overlay_lane),
@@ -429,10 +440,14 @@ async fn load_exact_untracked_effective_row(
 }
 
 fn exact_effective_state_row_from_tracked(
-    mut row: ExactCommittedStateRow,
+    row: WorkspaceAnnotatedTrackedExactRow,
     requested_version_id: &str,
     overlay_lane: OverlayLane,
 ) -> ExactEffectiveStateRow {
+    let WorkspaceAnnotatedTrackedExactRow {
+        committed: row,
+        writer_key,
+    } = row;
     let projected_version_id = if matches!(overlay_lane, OverlayLane::GlobalTracked)
         && row.version_id == GLOBAL_VERSION_ID
     {
@@ -440,7 +455,6 @@ fn exact_effective_state_row_from_tracked(
     } else {
         row.version_id.clone()
     };
-    let writer_key = row.writer_key.take();
     let mut values = row.values;
     values.insert(
         "version_id".to_string(),
@@ -599,11 +613,11 @@ fn tombstone_matches_row_key(row: &TrackedTombstoneMarker, row_key: &CanonicalSt
             .is_none_or(|schema_version| row.schema_version.as_deref() == Some(schema_version))
 }
 
-async fn tracked_exact_row_with_workspace_writer_key(
+async fn annotate_tracked_exact_row_with_workspace_writer_key(
     backend: &dyn LixBackend,
     pending_transaction_view: Option<&PendingTransactionView>,
-    mut row: ExactCommittedStateRow,
-) -> Result<ExactCommittedStateRow, LixError> {
+    row: ExactCommittedStateRow,
+) -> Result<WorkspaceAnnotatedTrackedExactRow, LixError> {
     let identity = RowIdentity {
         schema_key: row.schema_key.clone(),
         version_id: row.version_id.clone(),
@@ -617,12 +631,10 @@ async fn tracked_exact_row_with_workspace_writer_key(
     } else {
         load_workspace_writer_key_annotation(backend, &identity).await?
     };
-    row.writer_key = writer_key.clone();
-    row.values.insert(
-        "writer_key".to_string(),
-        writer_key.map(Value::Text).unwrap_or(Value::Null),
-    );
-    Ok(row)
+    Ok(WorkspaceAnnotatedTrackedExactRow {
+        committed: row,
+        writer_key,
+    })
 }
 
 fn pending_workspace_writer_key_annotation(
@@ -635,7 +647,7 @@ fn pending_workspace_writer_key_annotation(
 }
 
 fn tracked_exact_row_matches_row_key(
-    row: &ExactCommittedStateRow,
+    row: &WorkspaceAnnotatedTrackedExactRow,
     row_key: &CanonicalStateRowKey,
 ) -> bool {
     row_key

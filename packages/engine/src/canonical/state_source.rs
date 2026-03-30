@@ -16,6 +16,11 @@ use super::types::{VersionInfo, VersionSnapshot};
 
 const CANONICAL_FALLBACK_MAX_COMMIT_DEPTH: usize = 2048;
 
+/// Canonical committed row resolved from commit-graph and ref facts.
+///
+/// This type intentionally excludes workspace-owned selectors and annotations.
+/// Callers that need workspace overlays such as `writer_key` must apply them in
+/// a separate effective-state layer.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ExactCommittedStateRow {
     pub(crate) entity_id: String,
@@ -23,7 +28,6 @@ pub(crate) struct ExactCommittedStateRow {
     pub(crate) file_id: String,
     pub(crate) version_id: String,
     pub(crate) values: BTreeMap<String, Value>,
-    pub(crate) writer_key: Option<String>,
     pub(crate) source_change_id: Option<String>,
 }
 
@@ -253,7 +257,6 @@ pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
         file_id,
         version_id,
         values,
-        writer_key: None,
         source_change_id,
     }))
 }
@@ -605,5 +608,37 @@ mod tests {
         assert_eq!(entry.id, "commit-1");
         assert_eq!(entry.change_ids, vec!["change-fallback".to_string()]);
         assert_eq!(entry.parent_commit_ids, vec!["parent-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn canonical_exact_state_rows_do_not_carry_workspace_writer_key_annotation() {
+        let canonical_query_seen = Arc::new(AtomicBool::new(false));
+        let backend = CanonicalFallbackBackend {
+            canonical_query_seen: Arc::clone(&canonical_query_seen),
+        };
+
+        let mut executor = &backend;
+        let row = load_exact_committed_state_row_at_version_head_with_executor(
+            &mut executor,
+            &ExactCommittedStateRowRequest {
+                entity_id: "file-1".to_string(),
+                schema_key: "lix_file_descriptor".to_string(),
+                version_id: "v1".to_string(),
+                exact_filters: BTreeMap::from([
+                    ("file_id".to_string(), Value::Text("lix".to_string())),
+                    ("plugin_key".to_string(), Value::Text("lix".to_string())),
+                    ("schema_version".to_string(), Value::Text("1".to_string())),
+                ]),
+            },
+        )
+        .await
+        .expect("canonical exact-state lookup should succeed")
+        .expect("canonical exact-state lookup should return a row");
+
+        assert!(canonical_query_seen.load(Ordering::SeqCst));
+        assert!(
+            !row.values.contains_key("writer_key"),
+            "canonical committed rows should not carry workspace writer_key annotation"
+        );
     }
 }

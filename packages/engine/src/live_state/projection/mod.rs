@@ -482,9 +482,8 @@ mod tests {
     use super::{
         apply_canonical_receipt_in_transaction,
         apply_commit_projections_best_effort_in_transaction,
-        catch_up_live_state_to_current_frontier,
-        projection_status, replay, status, DerivedProjectionId, ProjectionCatchUpOutcome,
-        ProjectionReplayMode, UpdatedVersionRef,
+        catch_up_live_state_to_current_frontier, projection_status, replay, status,
+        DerivedProjectionId, ProjectionCatchUpOutcome, ProjectionReplayMode, UpdatedVersionRef,
     };
     use crate::canonical::CanonicalCommitReceipt;
     use crate::live_state::ReplayCursor;

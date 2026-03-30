@@ -91,6 +91,10 @@ impl Lix {
         observe_owned_session(Arc::clone(&self.session), query)
     }
 
+    /// Opens a child session with optional workspace-selector overrides.
+    ///
+    /// This changes workspace selection for the child session only; it does
+    /// not mutate canonical refs or committed heads.
     pub async fn open_session(&self, options: OpenSessionOptions) -> Result<Self, LixError> {
         let session = self.session.open_session(options).await?;
         Ok(Self {
@@ -105,6 +109,8 @@ impl Lix {
         self.session.create_version(options).await
     }
 
+    /// Updates the active workspace version selector without moving committed
+    /// version heads.
     pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
         self.session.switch_version(version_id).await
     }
@@ -116,6 +122,8 @@ impl Lix {
         self.session.merge_version(options).await
     }
 
+    /// Creates a canonical checkpoint label for the current workspace-selected
+    /// version. Replay progress remains separate replica-local state.
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointResult, LixError> {
         self.session.create_checkpoint().await
     }
