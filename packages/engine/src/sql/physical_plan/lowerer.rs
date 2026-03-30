@@ -30,8 +30,8 @@ use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
-    JoinConstraint, JoinOperator, LimitClause, OrderBy, OrderByExpr, OrderByKind, Query, Select,
-    SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins,
+    LimitClause, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
+    TableFactor, TableWithJoins,
 };
 use sqlparser::ast::{ObjectName, ObjectNamePart};
 use sqlparser::ast::{Value as SqlValue, Visit, Visitor};
@@ -2662,14 +2662,21 @@ mod tests {
     };
     use crate::sql::binder::bind_statement;
     use crate::sql::catalog::SurfaceRegistry;
-    use crate::sql::logical_plan::public_ir::BroadPublicReadStatement;
-    use crate::sql::optimizer::optimize_broad_public_read_statement_with_known_live_layouts;
+    use crate::sql::logical_plan::public_ir::{
+        BroadNestedQueryExpr, BroadPublicReadGroupByKind, BroadPublicReadLimitClauseKind,
+        BroadPublicReadOrderByKind, BroadPublicReadProjectionItemKind, BroadPublicReadSetExpr,
+        BroadPublicReadStatement, BroadPublicReadTableFactor, BroadSqlProvenance,
+    };
+    use crate::sql::routing::{
+        forbid_broad_routing_for_test, route_broad_public_read_statement_with_known_live_layouts,
+    };
     use crate::sql::semantic_ir::canonicalize::canonicalize_read;
     use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
     use crate::sql::semantic_ir::semantics::effective_state_resolver::build_effective_state;
     use crate::sql::semantic_ir::ExecutionContext;
     use crate::{SqlDialect, Value};
     use serde_json::{json, Value as JsonValue};
+    use sqlparser::ast::Statement;
     use std::collections::BTreeMap;
 
     fn lowered_program(registry: &SurfaceRegistry, sql: &str) -> Option<LoweredReadProgram> {
@@ -2719,7 +2726,7 @@ mod tests {
         known_live_layouts: &BTreeMap<String, JsonValue>,
     ) -> Option<LoweredReadProgram> {
         let broad_statement = bound_broad_statement(registry, sql);
-        let optimized = optimize_broad_public_read_statement_with_known_live_layouts(
+        let optimized = route_broad_public_read_statement_with_known_live_layouts(
             &broad_statement,
             registry,
             SqlDialect::Sqlite,
@@ -2767,7 +2774,7 @@ mod tests {
     }
 
     #[test]
-    fn broad_physical_lowering_requires_optimizer_lowered_relations() {
+    fn broad_physical_lowering_requires_routing_lowered_relations() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
         let broad_statement = bound_broad_statement(
             &registry,
@@ -2791,7 +2798,7 @@ mod tests {
 
         assert_eq!(
             lowered, None,
-            "physical lowering should decline broad statements until optimizer marks renderable relations as lowered_public"
+            "physical lowering should decline broad statements until routing marks renderable relations as lowered_public"
         );
     }
 
@@ -3037,6 +3044,278 @@ mod tests {
         assert!(!lowered_sql.contains("FROM lix_file"));
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_directory_descriptor"));
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_file_descriptor"));
+    }
+
+    #[test]
+    fn broad_physical_lowering_requires_routing_lowered_nested_relations() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let broad_statement = bound_broad_statement(
+            &registry,
+            "SELECT (SELECT lixcol_change_id FROM lix_directory WHERE id = 'dir-stable-parent')",
+        );
+
+        let lowered = lower_broad_public_read_for_execution_with_layouts(
+            &broad_statement,
+            &registry,
+            SqlDialect::Sqlite,
+            0,
+            Some("main"),
+            &BTreeMap::new(),
+        )
+        .expect("broad lowering should not error");
+
+        assert_eq!(
+            lowered, None,
+            "physical lowering should decline nested public relations until routing lowers them"
+        );
+
+        let optimized = route_broad_public_read_statement_with_known_live_layouts(
+            &broad_statement,
+            &registry,
+            SqlDialect::Sqlite,
+            Some("main"),
+            &BTreeMap::new(),
+        )
+        .expect("broad optimization should succeed");
+        let lowered = lower_broad_public_read_for_execution_with_layouts(
+            &optimized.broad_statement,
+            &registry,
+            SqlDialect::Sqlite,
+            0,
+            Some("main"),
+            &BTreeMap::new(),
+        )
+        .expect("optimized broad lowering should not error")
+        .expect("optimized nested public relation should lower");
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
+
+        assert!(!lowered_sql.contains("FROM lix_directory"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_directory_descriptor"));
+    }
+
+    #[test]
+    fn broad_physical_lowering_does_not_call_back_into_binding_or_routing() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let broad_statement = bound_broad_statement(
+            &registry,
+            "SELECT \
+               (SELECT lixcol_change_id FROM lix_directory WHERE id = 'dir-stable-parent') AS parent_change_id, \
+               EXISTS (SELECT 1 FROM lix_directory WHERE id = 'dir-stable-child') AS has_child_dir, \
+               'file-stable-child' IN (SELECT id FROM lix_file WHERE path = '/hello.txt') AS has_file",
+        );
+        let optimized = route_broad_public_read_statement_with_known_live_layouts(
+            &broad_statement,
+            &registry,
+            SqlDialect::Sqlite,
+            Some("main"),
+            &BTreeMap::new(),
+        )
+        .expect("broad routing should succeed");
+
+        let _binding_guard = super::broad::forbid_broad_binding_for_test();
+        let _routing_guard = forbid_broad_routing_for_test();
+        let lowered = lower_broad_public_read_for_execution_with_layouts(
+            &optimized.broad_statement,
+            &registry,
+            SqlDialect::Sqlite,
+            0,
+            Some("main"),
+            &BTreeMap::new(),
+        )
+        .expect("broad lowering should not error")
+        .expect("optimized broad nested query should lower without callback");
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
+
+        assert!(!lowered_sql.contains("FROM lix_directory"));
+        assert!(!lowered_sql.contains("FROM lix_file"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_directory_descriptor"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_file_descriptor"));
+    }
+
+    #[test]
+    fn broad_physical_lowering_rejects_legacy_set_expr_fallbacks() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let mut broad_statement = bound_broad_statement(
+            &registry,
+            "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'",
+        );
+        let mut statements =
+            crate::sql::parser::parse_sql_script("SELECT entity_id FROM lix_state")
+                .expect("SQL should parse");
+        let statement = statements.pop().expect("single statement");
+        let Statement::Query(query) = statement else {
+            panic!("expected query statement");
+        };
+
+        let BroadPublicReadStatement::Query(bound_query) = &mut broad_statement else {
+            panic!("expected broad query statement");
+        };
+        bound_query.body = BroadPublicReadSetExpr::Other {
+            provenance: BroadSqlProvenance::from_raw(query.body.as_ref().clone()),
+        };
+
+        let error = lower_broad_public_read_for_execution_with_layouts(
+            &broad_statement,
+            &registry,
+            SqlDialect::Sqlite,
+            0,
+            Some("main"),
+            &BTreeMap::new(),
+        )
+        .expect_err("legacy set-expression fallbacks must not be rescued during lowering");
+
+        assert!(error.description.contains("legacy set-expression fallback"));
+    }
+
+    #[test]
+    fn broad_physical_lowering_rejects_legacy_table_factor_fallbacks() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let mut broad_statement = bound_broad_statement(
+            &registry,
+            "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'",
+        );
+
+        let BroadPublicReadStatement::Query(query) = &mut broad_statement else {
+            panic!("expected broad query statement");
+        };
+        let BroadPublicReadSetExpr::Select(select) = &mut query.body else {
+            panic!("expected broad select");
+        };
+        let original_factor = match &select.from[0].relation {
+            BroadPublicReadTableFactor::Table { provenance, .. } => provenance
+                .cloned()
+                .expect("table factor provenance should be present"),
+            _ => panic!("expected table factor"),
+        };
+        select.from[0].relation = BroadPublicReadTableFactor::Other {
+            provenance: BroadSqlProvenance::from_raw(original_factor),
+        };
+
+        let error = lower_broad_public_read_for_execution_with_layouts(
+            &broad_statement,
+            &registry,
+            SqlDialect::Sqlite,
+            0,
+            Some("main"),
+            &BTreeMap::new(),
+        )
+        .expect_err("legacy table-factor fallbacks must not be rescued during lowering");
+
+        assert!(error.description.contains("legacy table-factor fallback"));
+    }
+
+    #[test]
+    fn binds_broad_public_read_queries_into_typed_ir_shapes() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let bound = bound_broad_statement(
+            &registry,
+            "WITH latest AS ( \
+               SELECT entity_id \
+               FROM lix_state_by_version \
+               WHERE lixcol_version_id = 'main' \
+             ) \
+             SELECT \
+               s.schema_key, \
+               (SELECT COUNT(*) FROM lix_file f WHERE f.id = 'file-stable-child') AS file_count \
+             FROM lix_state s \
+             WHERE EXISTS (SELECT 1 FROM latest) \
+               AND s.entity_id IN (SELECT entity_id FROM latest) \
+             GROUP BY s.schema_key \
+             HAVING COUNT(*) > 0 \
+             ORDER BY s.schema_key \
+             LIMIT 5",
+        );
+
+        let BroadPublicReadStatement::Query(query) = bound else {
+            panic!("expected broad query statement");
+        };
+
+        assert!(query.provenance.as_ref().is_some());
+        assert!(query.order_by.is_some());
+        assert!(query.limit_clause.is_some());
+
+        let with = query.with.as_ref().expect("expected typed WITH clause");
+        assert!(with.provenance.as_ref().is_some());
+        assert_eq!(with.cte_tables.len(), 1);
+        assert_eq!(with.cte_tables[0].name, "latest");
+        assert!(matches!(
+            with.cte_tables[0].query.body,
+            BroadPublicReadSetExpr::Select(_)
+        ));
+
+        let BroadPublicReadSetExpr::Select(select) = &query.body else {
+            panic!("expected top-level broad select");
+        };
+
+        assert_eq!(select.projection.len(), 2);
+        match &select.projection[0].kind {
+            BroadPublicReadProjectionItemKind::Expr {
+                alias,
+                nested_queries,
+                ..
+            } => {
+                assert_eq!(alias, &None);
+                assert!(nested_queries.is_empty());
+            }
+            other => panic!("unexpected first projection item: {other:?}"),
+        }
+        match &select.projection[1].kind {
+            BroadPublicReadProjectionItemKind::Expr {
+                alias,
+                nested_queries,
+                ..
+            } => {
+                assert_eq!(alias.as_deref(), Some("file_count"));
+                assert!(matches!(
+                    nested_queries.as_slice(),
+                    [BroadNestedQueryExpr::ScalarSubquery(_)]
+                ));
+            }
+            other => panic!("unexpected second projection item: {other:?}"),
+        }
+
+        let selection = select
+            .selection
+            .as_ref()
+            .expect("expected typed selection expression");
+        assert_eq!(selection.nested_queries.len(), 2);
+        assert!(selection
+            .nested_queries
+            .iter()
+            .any(|expr| matches!(expr, BroadNestedQueryExpr::Exists { .. })));
+        assert!(selection
+            .nested_queries
+            .iter()
+            .any(|expr| matches!(expr, BroadNestedQueryExpr::InSubquery { .. })));
+
+        assert!(matches!(
+            &select.group_by.kind,
+            BroadPublicReadGroupByKind::Expressions(expressions) if expressions.len() == 1
+        ));
+        assert!(select.having.is_some());
+
+        let order_by = query.order_by.as_ref().expect("expected typed ORDER BY");
+        assert!(matches!(
+            &order_by.kind,
+            BroadPublicReadOrderByKind::Expressions(expressions) if expressions.len() == 1
+        ));
+
+        let limit_clause = query
+            .limit_clause
+            .as_ref()
+            .expect("expected typed LIMIT clause");
+        assert!(matches!(
+            &limit_clause.kind,
+            BroadPublicReadLimitClauseKind::LimitOffset {
+                limit: Some(_),
+                offset: None,
+                ..
+            }
+        ));
     }
 
     #[test]
