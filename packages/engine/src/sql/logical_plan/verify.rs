@@ -6,10 +6,11 @@ use crate::sql::logical_plan::plan::{
     InternalLogicalPlan, LogicalPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan,
 };
 use crate::sql::logical_plan::public_ir::{
-    BroadNestedQueryExpr, BroadPublicReadGroupByKind, BroadPublicReadProjectionItemKind,
-    BroadPublicReadQuery, BroadPublicReadRelation, BroadPublicReadSetExpr,
-    BroadPublicReadStatement, BroadPublicReadTableFactor, BroadPublicReadTableWithJoins,
-    BroadSqlExpr,
+    BroadPublicReadGroupByKind, BroadPublicReadJoinConstraint, BroadPublicReadJoinKind,
+    BroadPublicReadProjectionItemKind, BroadPublicReadQuery, BroadPublicReadRelation,
+    BroadPublicReadSetExpr, BroadPublicReadStatement, BroadPublicReadTableFactor,
+    BroadPublicReadTableWithJoins, BroadSqlExpr, BroadSqlExprKind, BroadSqlFunction,
+    BroadSqlFunctionArg, BroadSqlFunctionArgExpr, BroadSqlFunctionArguments,
 };
 use crate::sql::logical_plan::result_contract::ResultContract;
 
@@ -130,10 +131,11 @@ fn broad_public_read_set_expr_has_typed_surface_relation(expr: &BroadPublicReadS
 fn broad_public_read_select_has_typed_surface_relation(
     select: &crate::sql::logical_plan::public_ir::BroadPublicReadSelect,
 ) -> bool {
-    select
-        .from
-        .iter()
-        .any(broad_public_read_table_with_joins_has_typed_surface_relation)
+    broad_public_read_distinct_has_typed_surface_relation(select.distinct.as_ref())
+        || select
+            .from
+            .iter()
+            .any(broad_public_read_table_with_joins_has_typed_surface_relation)
         || select
             .projection
             .iter()
@@ -149,13 +151,28 @@ fn broad_public_read_select_has_typed_surface_relation(
             .is_some_and(broad_sql_expr_has_typed_surface_relation)
 }
 
+fn broad_public_read_distinct_has_typed_surface_relation(
+    distinct: Option<&crate::sql::logical_plan::public_ir::BroadPublicReadDistinct>,
+) -> bool {
+    match distinct {
+        Some(crate::sql::logical_plan::public_ir::BroadPublicReadDistinct::On(expressions)) => {
+            expressions
+                .iter()
+                .any(broad_sql_expr_has_typed_surface_relation)
+        }
+        Some(crate::sql::logical_plan::public_ir::BroadPublicReadDistinct::Distinct) | None => {
+            false
+        }
+    }
+}
+
 fn broad_public_read_projection_item_has_typed_surface_relation(
     item: &crate::sql::logical_plan::public_ir::BroadPublicReadProjectionItem,
 ) -> bool {
     match &item.kind {
-        BroadPublicReadProjectionItemKind::Expr { nested_queries, .. } => nested_queries
-            .iter()
-            .any(broad_nested_query_expr_has_typed_surface_relation),
+        BroadPublicReadProjectionItemKind::Expr { expr, .. } => {
+            broad_sql_expr_has_typed_surface_relation(expr)
+        }
         BroadPublicReadProjectionItemKind::Wildcard
         | BroadPublicReadProjectionItemKind::QualifiedWildcard { .. } => false,
     }
@@ -199,7 +216,7 @@ fn broad_public_read_limit_clause_has_typed_surface_relation(
                 .is_some_and(broad_sql_expr_has_typed_surface_relation)
                 || offset
                     .as_ref()
-                    .is_some_and(broad_sql_expr_has_typed_surface_relation)
+                    .is_some_and(|offset| broad_sql_expr_has_typed_surface_relation(&offset.value))
                 || limit_by
                     .iter()
                     .any(broad_sql_expr_has_typed_surface_relation)
@@ -228,10 +245,7 @@ fn broad_public_read_join_has_typed_surface_relation(
     join: &crate::sql::logical_plan::public_ir::BroadPublicReadJoin,
 ) -> bool {
     broad_public_read_table_factor_has_typed_surface_relation(&join.relation)
-        || join
-            .constraint_expressions
-            .iter()
-            .any(broad_sql_expr_has_typed_surface_relation)
+        || broad_public_read_join_kind_has_typed_surface_relation(&join.kind)
 }
 
 fn broad_public_read_table_factor_has_typed_surface_relation(
@@ -255,23 +269,176 @@ fn broad_public_read_table_factor_has_typed_surface_relation(
 }
 
 fn broad_sql_expr_has_typed_surface_relation(expr: &BroadSqlExpr) -> bool {
-    expr.nested_queries
-        .iter()
-        .any(broad_nested_query_expr_has_typed_surface_relation)
-}
-
-fn broad_nested_query_expr_has_typed_surface_relation(expr: &BroadNestedQueryExpr) -> bool {
-    match expr {
-        BroadNestedQueryExpr::ScalarSubquery(query) => {
-            broad_public_read_query_has_typed_surface_relation(query)
+    match &expr.kind {
+        BroadSqlExprKind::Identifier(_)
+        | BroadSqlExprKind::CompoundIdentifier(_)
+        | BroadSqlExprKind::Value(_)
+        | BroadSqlExprKind::TypedString { .. }
+        | BroadSqlExprKind::Unsupported { .. } => false,
+        BroadSqlExprKind::BinaryOp { left, right, .. }
+        | BroadSqlExprKind::IsDistinctFrom { left, right }
+        | BroadSqlExprKind::IsNotDistinctFrom { left, right } => {
+            broad_sql_expr_has_typed_surface_relation(left)
+                || broad_sql_expr_has_typed_surface_relation(right)
         }
-        BroadNestedQueryExpr::Exists { subquery, .. } => {
-            broad_public_read_query_has_typed_surface_relation(subquery)
+        BroadSqlExprKind::AnyOp { left, right, .. }
+        | BroadSqlExprKind::AllOp { left, right, .. } => {
+            broad_sql_expr_has_typed_surface_relation(left)
+                || broad_sql_expr_has_typed_surface_relation(right)
         }
-        BroadNestedQueryExpr::InSubquery { expr, subquery, .. } => {
+        BroadSqlExprKind::UnaryOp { expr, .. }
+        | BroadSqlExprKind::Nested(expr)
+        | BroadSqlExprKind::IsNull(expr)
+        | BroadSqlExprKind::IsNotNull(expr)
+        | BroadSqlExprKind::IsTrue(expr)
+        | BroadSqlExprKind::IsNotTrue(expr)
+        | BroadSqlExprKind::IsFalse(expr)
+        | BroadSqlExprKind::IsNotFalse(expr)
+        | BroadSqlExprKind::IsUnknown(expr)
+        | BroadSqlExprKind::IsNotUnknown(expr)
+        | BroadSqlExprKind::Cast { expr, .. } => broad_sql_expr_has_typed_surface_relation(expr),
+        BroadSqlExprKind::InList { expr, list, .. } => {
+            broad_sql_expr_has_typed_surface_relation(expr)
+                || list.iter().any(broad_sql_expr_has_typed_surface_relation)
+        }
+        BroadSqlExprKind::InSubquery { expr, subquery, .. } => {
             broad_sql_expr_has_typed_surface_relation(expr)
                 || broad_public_read_query_has_typed_surface_relation(subquery)
         }
+        BroadSqlExprKind::InUnnest {
+            expr, array_expr, ..
+        } => {
+            broad_sql_expr_has_typed_surface_relation(expr)
+                || broad_sql_expr_has_typed_surface_relation(array_expr)
+        }
+        BroadSqlExprKind::Between {
+            expr, low, high, ..
+        } => {
+            broad_sql_expr_has_typed_surface_relation(expr)
+                || broad_sql_expr_has_typed_surface_relation(low)
+                || broad_sql_expr_has_typed_surface_relation(high)
+        }
+        BroadSqlExprKind::Like { expr, pattern, .. }
+        | BroadSqlExprKind::ILike { expr, pattern, .. } => {
+            broad_sql_expr_has_typed_surface_relation(expr)
+                || broad_sql_expr_has_typed_surface_relation(pattern)
+        }
+        BroadSqlExprKind::Function(function) => {
+            broad_sql_function_has_typed_surface_relation(function)
+        }
+        BroadSqlExprKind::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|expr| broad_sql_expr_has_typed_surface_relation(expr))
+                || conditions.iter().any(|when| {
+                    broad_sql_expr_has_typed_surface_relation(&when.condition)
+                        || broad_sql_expr_has_typed_surface_relation(&when.result)
+                })
+                || else_result
+                    .as_ref()
+                    .is_some_and(|expr| broad_sql_expr_has_typed_surface_relation(expr))
+        }
+        BroadSqlExprKind::Exists { subquery, .. } | BroadSqlExprKind::ScalarSubquery(subquery) => {
+            broad_public_read_query_has_typed_surface_relation(subquery)
+        }
+        BroadSqlExprKind::Tuple(items) => {
+            items.iter().any(broad_sql_expr_has_typed_surface_relation)
+        }
+    }
+}
+
+fn broad_public_read_join_kind_has_typed_surface_relation(kind: &BroadPublicReadJoinKind) -> bool {
+    match kind {
+        BroadPublicReadJoinKind::Join(constraint)
+        | BroadPublicReadJoinKind::Inner(constraint)
+        | BroadPublicReadJoinKind::Left(constraint)
+        | BroadPublicReadJoinKind::LeftOuter(constraint)
+        | BroadPublicReadJoinKind::Right(constraint)
+        | BroadPublicReadJoinKind::RightOuter(constraint)
+        | BroadPublicReadJoinKind::FullOuter(constraint)
+        | BroadPublicReadJoinKind::CrossJoin(constraint)
+        | BroadPublicReadJoinKind::Semi(constraint)
+        | BroadPublicReadJoinKind::LeftSemi(constraint)
+        | BroadPublicReadJoinKind::RightSemi(constraint)
+        | BroadPublicReadJoinKind::Anti(constraint)
+        | BroadPublicReadJoinKind::LeftAnti(constraint)
+        | BroadPublicReadJoinKind::RightAnti(constraint)
+        | BroadPublicReadJoinKind::StraightJoin(constraint) => {
+            broad_public_read_join_constraint_has_typed_surface_relation(constraint)
+        }
+        BroadPublicReadJoinKind::CrossApply | BroadPublicReadJoinKind::OuterApply => false,
+        BroadPublicReadJoinKind::AsOf {
+            match_condition,
+            constraint,
+        } => {
+            broad_sql_expr_has_typed_surface_relation(match_condition)
+                || broad_public_read_join_constraint_has_typed_surface_relation(constraint)
+        }
+    }
+}
+
+fn broad_public_read_join_constraint_has_typed_surface_relation(
+    constraint: &BroadPublicReadJoinConstraint,
+) -> bool {
+    match constraint {
+        BroadPublicReadJoinConstraint::On(expr) => broad_sql_expr_has_typed_surface_relation(expr),
+        BroadPublicReadJoinConstraint::None
+        | BroadPublicReadJoinConstraint::Natural
+        | BroadPublicReadJoinConstraint::Using(_) => false,
+    }
+}
+
+fn broad_sql_function_has_typed_surface_relation(function: &BroadSqlFunction) -> bool {
+    broad_sql_function_arguments_have_typed_surface_relation(&function.parameters)
+        || broad_sql_function_arguments_have_typed_surface_relation(&function.args)
+        || function
+            .filter
+            .as_ref()
+            .is_some_and(|expr| broad_sql_expr_has_typed_surface_relation(expr))
+        || function
+            .within_group
+            .iter()
+            .any(|expr| broad_sql_expr_has_typed_surface_relation(&expr.expr))
+}
+
+fn broad_sql_function_arguments_have_typed_surface_relation(
+    arguments: &BroadSqlFunctionArguments,
+) -> bool {
+    match arguments {
+        BroadSqlFunctionArguments::None => false,
+        BroadSqlFunctionArguments::Subquery(query) => {
+            broad_public_read_query_has_typed_surface_relation(query)
+        }
+        BroadSqlFunctionArguments::List(list) => list
+            .args
+            .iter()
+            .any(broad_sql_function_arg_has_typed_surface_relation),
+    }
+}
+
+fn broad_sql_function_arg_has_typed_surface_relation(arg: &BroadSqlFunctionArg) -> bool {
+    match arg {
+        BroadSqlFunctionArg::Named { arg, .. } => {
+            broad_sql_function_arg_expr_has_typed_surface_relation(arg)
+        }
+        BroadSqlFunctionArg::ExprNamed { name, arg, .. } => {
+            broad_sql_expr_has_typed_surface_relation(name)
+                || broad_sql_function_arg_expr_has_typed_surface_relation(arg)
+        }
+        BroadSqlFunctionArg::Unnamed(arg) => {
+            broad_sql_function_arg_expr_has_typed_surface_relation(arg)
+        }
+    }
+}
+
+fn broad_sql_function_arg_expr_has_typed_surface_relation(arg: &BroadSqlFunctionArgExpr) -> bool {
+    match arg {
+        BroadSqlFunctionArgExpr::Expr(expr) => broad_sql_expr_has_typed_surface_relation(expr),
+        BroadSqlFunctionArgExpr::QualifiedWildcard(_) | BroadSqlFunctionArgExpr::Wildcard => false,
     }
 }
 

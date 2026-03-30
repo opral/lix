@@ -4,8 +4,10 @@ use crate::sql::catalog::{DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, 
 use crate::sql::semantic_ir::ExecutionContext;
 use crate::Value;
 use sqlparser::ast::{
-    Expr, GroupByExpr, Join, LimitClause, OrderBy, OrderByExpr, Query, Select, SelectItem, SetExpr,
-    Statement, TableAlias, TableFactor, TableWithJoins, With,
+    BinaryOperator, CastFormat, CastKind, CteAsMaterialized, DataType, DuplicateTreatment, Expr,
+    FunctionArgOperator, GroupByExpr, Ident, Join, LimitClause, NullTreatment, ObjectName,
+    OffsetRows, OrderBy, OrderByExpr, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
+    TableFactor, TableWithJoins, UnaryOperator, ValueWithSpan, With,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -280,9 +282,15 @@ pub(crate) struct StructuredPublicRead {
     pub(crate) query: NormalizedPublicReadQuery,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct BroadSqlProvenance<T> {
     raw: Option<T>,
+}
+
+impl<T> Default for BroadSqlProvenance<T> {
+    fn default() -> Self {
+        Self { raw: None }
+    }
 }
 
 impl<T> BroadSqlProvenance<T> {
@@ -292,12 +300,6 @@ impl<T> BroadSqlProvenance<T> {
 
     pub(crate) fn as_ref(&self) -> Option<&T> {
         self.raw.as_ref()
-    }
-}
-
-impl<T: Clone> BroadSqlProvenance<T> {
-    pub(crate) fn cloned(&self) -> Option<T> {
-        self.raw.clone()
     }
 }
 
@@ -330,12 +332,15 @@ pub(crate) struct BroadPublicReadQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BroadPublicReadWith {
     pub(crate) provenance: BroadSqlProvenance<With>,
+    pub(crate) recursive: bool,
     pub(crate) cte_tables: Vec<BroadPublicReadCte>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BroadPublicReadCte {
-    pub(crate) name: String,
+    pub(crate) alias: BroadPublicReadAlias,
+    pub(crate) materialized: Option<CteAsMaterialized>,
+    pub(crate) from: Option<String>,
     pub(crate) query: BroadPublicReadQuery,
 }
 
@@ -379,11 +384,18 @@ pub(crate) enum BroadPublicReadSetQuantifier {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BroadPublicReadSelect {
     pub(crate) provenance: BroadSqlProvenance<Select>,
+    pub(crate) distinct: Option<BroadPublicReadDistinct>,
     pub(crate) projection: Vec<BroadPublicReadProjectionItem>,
     pub(crate) from: Vec<BroadPublicReadTableWithJoins>,
     pub(crate) selection: Option<BroadSqlExpr>,
     pub(crate) group_by: BroadPublicReadGroupBy,
     pub(crate) having: Option<BroadSqlExpr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BroadPublicReadDistinct {
+    Distinct,
+    On(Vec<BroadSqlExpr>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,12 +408,11 @@ pub(crate) struct BroadPublicReadProjectionItem {
 pub(crate) enum BroadPublicReadProjectionItemKind {
     Wildcard,
     QualifiedWildcard {
-        qualifier: Vec<String>,
+        qualifier: ObjectName,
     },
     Expr {
         alias: Option<String>,
-        sql: String,
-        nested_queries: Vec<BroadNestedQueryExpr>,
+        expr: BroadSqlExpr,
     },
 }
 
@@ -447,7 +458,7 @@ pub(crate) struct BroadPublicReadLimitClause {
 pub(crate) enum BroadPublicReadLimitClauseKind {
     LimitOffset {
         limit: Option<BroadSqlExpr>,
-        offset: Option<BroadSqlExpr>,
+        offset: Option<BroadPublicReadOffset>,
         limit_by: Vec<BroadSqlExpr>,
     },
     OffsetCommaLimit {
@@ -458,23 +469,202 @@ pub(crate) enum BroadPublicReadLimitClauseKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BroadSqlExpr {
-    pub(crate) provenance: BroadSqlProvenance<Expr>,
-    pub(crate) sql: String,
-    pub(crate) nested_queries: Vec<BroadNestedQueryExpr>,
+    pub(crate) kind: BroadSqlExprKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BroadNestedQueryExpr {
-    ScalarSubquery(Box<BroadPublicReadQuery>),
+pub(crate) enum BroadSqlExprKind {
+    Identifier(Ident),
+    CompoundIdentifier(Vec<Ident>),
+    Value(ValueWithSpan),
+    TypedString {
+        data_type: DataType,
+        value: ValueWithSpan,
+        uses_odbc_syntax: bool,
+    },
+    BinaryOp {
+        left: Box<BroadSqlExpr>,
+        op: BinaryOperator,
+        right: Box<BroadSqlExpr>,
+    },
+    AnyOp {
+        left: Box<BroadSqlExpr>,
+        compare_op: BinaryOperator,
+        right: Box<BroadSqlExpr>,
+        is_some: bool,
+    },
+    AllOp {
+        left: Box<BroadSqlExpr>,
+        compare_op: BinaryOperator,
+        right: Box<BroadSqlExpr>,
+    },
+    UnaryOp {
+        op: UnaryOperator,
+        expr: Box<BroadSqlExpr>,
+    },
+    Nested(Box<BroadSqlExpr>),
+    IsNull(Box<BroadSqlExpr>),
+    IsNotNull(Box<BroadSqlExpr>),
+    IsTrue(Box<BroadSqlExpr>),
+    IsNotTrue(Box<BroadSqlExpr>),
+    IsFalse(Box<BroadSqlExpr>),
+    IsNotFalse(Box<BroadSqlExpr>),
+    IsUnknown(Box<BroadSqlExpr>),
+    IsNotUnknown(Box<BroadSqlExpr>),
+    IsDistinctFrom {
+        left: Box<BroadSqlExpr>,
+        right: Box<BroadSqlExpr>,
+    },
+    IsNotDistinctFrom {
+        left: Box<BroadSqlExpr>,
+        right: Box<BroadSqlExpr>,
+    },
+    Cast {
+        kind: CastKind,
+        expr: Box<BroadSqlExpr>,
+        data_type: DataType,
+        format: Option<CastFormat>,
+    },
+    InList {
+        expr: Box<BroadSqlExpr>,
+        list: Vec<BroadSqlExpr>,
+        negated: bool,
+    },
+    InSubquery {
+        expr: Box<BroadSqlExpr>,
+        subquery: Box<BroadPublicReadQuery>,
+        negated: bool,
+    },
+    InUnnest {
+        expr: Box<BroadSqlExpr>,
+        array_expr: Box<BroadSqlExpr>,
+        negated: bool,
+    },
+    Between {
+        expr: Box<BroadSqlExpr>,
+        negated: bool,
+        low: Box<BroadSqlExpr>,
+        high: Box<BroadSqlExpr>,
+    },
+    Like {
+        negated: bool,
+        any: bool,
+        expr: Box<BroadSqlExpr>,
+        pattern: Box<BroadSqlExpr>,
+        escape_char: Option<sqlparser::ast::Value>,
+    },
+    ILike {
+        negated: bool,
+        any: bool,
+        expr: Box<BroadSqlExpr>,
+        pattern: Box<BroadSqlExpr>,
+        escape_char: Option<sqlparser::ast::Value>,
+    },
+    Function(BroadSqlFunction),
+    Case {
+        operand: Option<Box<BroadSqlExpr>>,
+        conditions: Vec<BroadSqlCaseWhen>,
+        else_result: Option<Box<BroadSqlExpr>>,
+    },
     Exists {
         negated: bool,
         subquery: Box<BroadPublicReadQuery>,
     },
-    InSubquery {
-        negated: bool,
-        expr_sql: String,
-        expr: Box<BroadSqlExpr>,
-        subquery: Box<BroadPublicReadQuery>,
+    ScalarSubquery(Box<BroadPublicReadQuery>),
+    Tuple(Vec<BroadSqlExpr>),
+    Unsupported {
+        diagnostics_sql: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BroadSqlCaseWhen {
+    pub(crate) condition: BroadSqlExpr,
+    pub(crate) result: BroadSqlExpr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BroadSqlFunction {
+    pub(crate) name: ObjectName,
+    pub(crate) uses_odbc_syntax: bool,
+    pub(crate) parameters: BroadSqlFunctionArguments,
+    pub(crate) args: BroadSqlFunctionArguments,
+    pub(crate) filter: Option<Box<BroadSqlExpr>>,
+    pub(crate) null_treatment: Option<NullTreatment>,
+    pub(crate) within_group: Vec<BroadPublicReadOrderByExpr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BroadSqlFunctionArguments {
+    None,
+    Subquery(Box<BroadPublicReadQuery>),
+    List(BroadSqlFunctionArgumentList),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BroadSqlFunctionArgumentList {
+    pub(crate) duplicate_treatment: Option<DuplicateTreatment>,
+    pub(crate) args: Vec<BroadSqlFunctionArg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BroadSqlFunctionArg {
+    Named {
+        name: Ident,
+        arg: BroadSqlFunctionArgExpr,
+        operator: FunctionArgOperator,
+    },
+    ExprNamed {
+        name: BroadSqlExpr,
+        arg: BroadSqlFunctionArgExpr,
+        operator: FunctionArgOperator,
+    },
+    Unnamed(BroadSqlFunctionArgExpr),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BroadSqlFunctionArgExpr {
+    Expr(BroadSqlExpr),
+    QualifiedWildcard(ObjectName),
+    Wildcard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BroadPublicReadOffset {
+    pub(crate) value: BroadSqlExpr,
+    pub(crate) rows: OffsetRows,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BroadPublicReadJoinConstraint {
+    None,
+    Natural,
+    Using(Vec<String>),
+    On(BroadSqlExpr),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BroadPublicReadJoinKind {
+    Join(BroadPublicReadJoinConstraint),
+    Inner(BroadPublicReadJoinConstraint),
+    Left(BroadPublicReadJoinConstraint),
+    LeftOuter(BroadPublicReadJoinConstraint),
+    Right(BroadPublicReadJoinConstraint),
+    RightOuter(BroadPublicReadJoinConstraint),
+    FullOuter(BroadPublicReadJoinConstraint),
+    CrossJoin(BroadPublicReadJoinConstraint),
+    Semi(BroadPublicReadJoinConstraint),
+    LeftSemi(BroadPublicReadJoinConstraint),
+    RightSemi(BroadPublicReadJoinConstraint),
+    Anti(BroadPublicReadJoinConstraint),
+    LeftAnti(BroadPublicReadJoinConstraint),
+    RightAnti(BroadPublicReadJoinConstraint),
+    StraightJoin(BroadPublicReadJoinConstraint),
+    CrossApply,
+    OuterApply,
+    AsOf {
+        match_condition: BroadSqlExpr,
+        constraint: BroadPublicReadJoinConstraint,
     },
 }
 
@@ -488,9 +678,9 @@ pub(crate) struct BroadPublicReadTableWithJoins {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BroadPublicReadJoin {
     pub(crate) provenance: BroadSqlProvenance<Join>,
-    pub(crate) operator: String,
+    pub(crate) global: bool,
+    pub(crate) kind: BroadPublicReadJoinKind,
     pub(crate) relation: BroadPublicReadTableFactor,
-    pub(crate) constraint_expressions: Vec<BroadSqlExpr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -502,6 +692,7 @@ pub(crate) enum BroadPublicReadTableFactor {
     },
     Derived {
         provenance: BroadSqlProvenance<TableFactor>,
+        lateral: bool,
         alias: Option<BroadPublicReadAlias>,
         subquery: Box<BroadPublicReadQuery>,
     },
@@ -517,6 +708,7 @@ pub(crate) enum BroadPublicReadTableFactor {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BroadPublicReadAlias {
+    pub(crate) explicit: bool,
     pub(crate) name: String,
     pub(crate) columns: Vec<String>,
 }

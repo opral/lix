@@ -1,20 +1,68 @@
 use super::*;
 use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::logical_plan::public_ir::{
-    BroadNestedQueryExpr, BroadPublicReadGroupBy, BroadPublicReadGroupByKind, BroadPublicReadJoin,
-    BroadPublicReadLimitClause, BroadPublicReadLimitClauseKind, BroadPublicReadOrderBy,
+    BroadPublicReadAlias, BroadPublicReadDistinct, BroadPublicReadGroupBy,
+    BroadPublicReadGroupByKind, BroadPublicReadJoin, BroadPublicReadJoinConstraint,
+    BroadPublicReadJoinKind, BroadPublicReadLimitClause, BroadPublicReadLimitClauseKind,
+    BroadPublicReadOffset, BroadPublicReadOrderBy, BroadPublicReadOrderByExpr,
     BroadPublicReadOrderByKind, BroadPublicReadProjectionItem, BroadPublicReadProjectionItemKind,
     BroadPublicReadQuery, BroadPublicReadRelation, BroadPublicReadSelect, BroadPublicReadSetExpr,
-    BroadPublicReadStatement, BroadPublicReadTableFactor, BroadPublicReadTableWithJoins,
-    BroadPublicReadWith, BroadSqlExpr,
+    BroadPublicReadSetOperationKind, BroadPublicReadSetQuantifier, BroadPublicReadStatement,
+    BroadPublicReadTableFactor, BroadPublicReadTableWithJoins, BroadPublicReadWith,
+    BroadSqlCaseWhen, BroadSqlExpr, BroadSqlExprKind, BroadSqlFunction, BroadSqlFunctionArg,
+    BroadSqlFunctionArgExpr, BroadSqlFunctionArguments,
 };
 use serde_json::Value as JsonValue;
-use sqlparser::ast::{JoinConstraint, JoinOperator, With};
+use sqlparser::ast::helpers::attached_token::AttachedToken;
+use sqlparser::ast::{
+    Cte, Distinct, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+    FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, Offset, OrderBy,
+    OrderByExpr, OrderByKind, OrderByOptions, Query, Select, SelectFlavor, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier, Statement, Table,
+    TableAlias, TableFactor, TableWithJoins, TypedString, With,
+};
+use std::cell::RefCell;
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RenderedBroadPublicReadStatement {
-    pub(crate) shell_statement: Statement,
-    pub(crate) relation_render_nodes: Vec<TerminalRelationRenderNode>,
+std::thread_local! {
+    static BROAD_RENDER_SUBSTITUTION_STACK: RefCell<Vec<RenderRelationSubstitutionCollector>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn with_broad_render_substitution_collector<T>(
+    work: impl FnOnce() -> Result<T, LixError>,
+) -> Result<(T, Vec<TerminalRelationRenderNode>), LixError> {
+    BROAD_RENDER_SUBSTITUTION_STACK.with(|stack| {
+        stack
+            .borrow_mut()
+            .push(RenderRelationSubstitutionCollector::default());
+    });
+
+    let result = work();
+
+    let substitutions = BROAD_RENDER_SUBSTITUTION_STACK.with(|stack| {
+        stack
+            .borrow_mut()
+            .pop()
+            .expect("broad render substitution collector stack should not underflow")
+            .into_substitutions()
+    });
+
+    result.map(|value| (value, substitutions))
+}
+
+fn with_current_broad_render_substitution_collector<T>(
+    work: impl FnOnce(&mut RenderRelationSubstitutionCollector) -> Result<T, LixError>,
+) -> Result<T, LixError> {
+    BROAD_RENDER_SUBSTITUTION_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let Some(collector) = stack.last_mut() else {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "broad public-read lowering lost its terminal relation substitution collector",
+            ));
+        };
+        work(collector)
+    })
 }
 
 pub(crate) fn lower_broad_public_read_for_execution(
@@ -27,28 +75,36 @@ pub(crate) fn lower_broad_public_read_for_execution(
 ) -> Result<Option<LoweredReadProgram>, LixError> {
     ensure_broad_public_read_statement_is_fully_typed(statement)?;
 
-    if broad_public_read_statement_contains_public_relations(statement) {
+    if broad_public_read_statement_contains_public_relations(statement)
+        || !broad_public_read_statement_contains_lowered_public_relations(statement)
+    {
         return Ok(None);
     }
 
-    let rendered = lower_broad_public_read_statement(
-        statement,
-        registry,
-        dialect,
-        active_version_id,
-        known_live_layouts,
-    )?;
-    if rendered.relation_render_nodes.is_empty() {
-        return Ok(None);
-    }
+    let (lowered_statement, relation_render_nodes) =
+        with_broad_render_substitution_collector(|| {
+            lower_broad_public_read_statement(
+                statement,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )
+        })?;
 
-    Ok(Some(LoweredReadProgram {
-        statements: vec![compile_lowered_read_statement(
+    let compiled_statement = if relation_render_nodes.is_empty() {
+        compile_final_read_statement(dialect, params_len, lowered_statement)?
+    } else {
+        compile_terminal_read_statement_from_template(
             dialect,
             params_len,
-            rendered.shell_statement,
-            rendered.relation_render_nodes,
-        )?],
+            lowered_statement,
+            relation_render_nodes,
+        )?
+    };
+
+    Ok(Some(LoweredReadProgram {
+        statements: vec![compiled_statement],
         pushdown_decision: PushdownDecision::default(),
         result_columns: LoweredResultColumns::Static(Vec::new()),
     }))
@@ -72,33 +128,19 @@ pub(crate) fn broad_public_relation_supports_terminal_render(
     .map(|sql| sql.is_some())
 }
 
-fn lower_broad_public_read_statement(
-    statement: &BroadPublicReadStatement,
-    registry: &SurfaceRegistry,
-    dialect: SqlDialect,
-    active_version_id: Option<&str>,
-    known_live_layouts: &BTreeMap<String, JsonValue>,
-) -> Result<RenderedBroadPublicReadStatement, LixError> {
-    let mut substitutions = RenderRelationSubstitutionCollector::default();
-    let shell_statement = lower_broad_public_read_statement_into_shell(
-        statement,
-        registry,
-        dialect,
-        active_version_id,
-        known_live_layouts,
-        &mut substitutions,
-    )?;
-    Ok(RenderedBroadPublicReadStatement {
-        shell_statement,
-        relation_render_nodes: substitutions.into_substitutions(),
-    })
-}
-
 fn broad_public_read_statement_contains_public_relations(
     statement: &BroadPublicReadStatement,
 ) -> bool {
     broad_public_read_statement_contains_relation_kind(statement, |relation| {
         matches!(relation, BroadPublicReadRelation::Public(_))
+    })
+}
+
+fn broad_public_read_statement_contains_lowered_public_relations(
+    statement: &BroadPublicReadStatement,
+) -> bool {
+    broad_public_read_statement_contains_relation_kind(statement, |relation| {
+        matches!(relation, BroadPublicReadRelation::LoweredPublic(_))
     })
 }
 
@@ -169,6 +211,9 @@ fn ensure_broad_public_read_select_is_fully_typed(
     select: &BroadPublicReadSelect,
     path: &str,
 ) -> Result<(), LixError> {
+    if let Some(distinct) = &select.distinct {
+        ensure_broad_public_read_distinct_is_fully_typed(distinct, &format!("{path}.distinct"))?;
+    }
     for (index, projection) in select.projection.iter().enumerate() {
         ensure_broad_public_read_projection_item_is_fully_typed(
             projection,
@@ -194,6 +239,18 @@ fn ensure_broad_public_read_select_is_fully_typed(
     Ok(())
 }
 
+fn ensure_broad_public_read_distinct_is_fully_typed(
+    distinct: &BroadPublicReadDistinct,
+    path: &str,
+) -> Result<(), LixError> {
+    if let BroadPublicReadDistinct::On(expressions) = distinct {
+        for (index, expr) in expressions.iter().enumerate() {
+            ensure_broad_sql_expr_is_fully_typed(expr, &format!("{path}.on[{index}]"))?;
+        }
+    }
+    Ok(())
+}
+
 fn ensure_broad_public_read_table_with_joins_is_fully_typed(
     table: &BroadPublicReadTableWithJoins,
     path: &str,
@@ -203,18 +260,70 @@ fn ensure_broad_public_read_table_with_joins_is_fully_typed(
         &format!("{path}.relation"),
     )?;
     for (index, join) in table.joins.iter().enumerate() {
-        ensure_broad_public_read_table_factor_is_fully_typed(
-            &join.relation,
-            &format!("{path}.joins[{index}].relation"),
-        )?;
-        for (expr_index, expr) in join.constraint_expressions.iter().enumerate() {
-            ensure_broad_sql_expr_is_fully_typed(
-                expr,
-                &format!("{path}.joins[{index}].constraint_expressions[{expr_index}]"),
-            )?;
-        }
+        ensure_broad_public_read_join_is_fully_typed(join, &format!("{path}.joins[{index}]"))?;
     }
     Ok(())
+}
+
+fn ensure_broad_public_read_join_is_fully_typed(
+    join: &BroadPublicReadJoin,
+    path: &str,
+) -> Result<(), LixError> {
+    ensure_broad_public_read_table_factor_is_fully_typed(
+        &join.relation,
+        &format!("{path}.relation"),
+    )?;
+    ensure_broad_public_read_join_kind_is_fully_typed(&join.kind, &format!("{path}.kind"))
+}
+
+fn ensure_broad_public_read_join_kind_is_fully_typed(
+    kind: &BroadPublicReadJoinKind,
+    path: &str,
+) -> Result<(), LixError> {
+    match kind {
+        BroadPublicReadJoinKind::Join(constraint)
+        | BroadPublicReadJoinKind::Inner(constraint)
+        | BroadPublicReadJoinKind::Left(constraint)
+        | BroadPublicReadJoinKind::LeftOuter(constraint)
+        | BroadPublicReadJoinKind::Right(constraint)
+        | BroadPublicReadJoinKind::RightOuter(constraint)
+        | BroadPublicReadJoinKind::FullOuter(constraint)
+        | BroadPublicReadJoinKind::CrossJoin(constraint)
+        | BroadPublicReadJoinKind::Semi(constraint)
+        | BroadPublicReadJoinKind::LeftSemi(constraint)
+        | BroadPublicReadJoinKind::RightSemi(constraint)
+        | BroadPublicReadJoinKind::Anti(constraint)
+        | BroadPublicReadJoinKind::LeftAnti(constraint)
+        | BroadPublicReadJoinKind::RightAnti(constraint)
+        | BroadPublicReadJoinKind::StraightJoin(constraint) => {
+            ensure_broad_public_read_join_constraint_is_fully_typed(constraint, path)
+        }
+        BroadPublicReadJoinKind::CrossApply | BroadPublicReadJoinKind::OuterApply => Ok(()),
+        BroadPublicReadJoinKind::AsOf {
+            match_condition,
+            constraint,
+        } => {
+            ensure_broad_sql_expr_is_fully_typed(match_condition, &format!("{path}.match"))?;
+            ensure_broad_public_read_join_constraint_is_fully_typed(
+                constraint,
+                &format!("{path}.constraint"),
+            )
+        }
+    }
+}
+
+fn ensure_broad_public_read_join_constraint_is_fully_typed(
+    constraint: &BroadPublicReadJoinConstraint,
+    path: &str,
+) -> Result<(), LixError> {
+    match constraint {
+        BroadPublicReadJoinConstraint::On(expr) => {
+            ensure_broad_sql_expr_is_fully_typed(expr, &format!("{path}.on"))
+        }
+        BroadPublicReadJoinConstraint::None
+        | BroadPublicReadJoinConstraint::Natural
+        | BroadPublicReadJoinConstraint::Using(_) => Ok(()),
+    }
 }
 
 fn ensure_broad_public_read_table_factor_is_fully_typed(
@@ -246,14 +355,8 @@ fn ensure_broad_public_read_projection_item_is_fully_typed(
     path: &str,
 ) -> Result<(), LixError> {
     match &item.kind {
-        BroadPublicReadProjectionItemKind::Expr { nested_queries, .. } => {
-            for (index, nested_query) in nested_queries.iter().enumerate() {
-                ensure_broad_nested_query_expr_is_fully_typed(
-                    nested_query,
-                    &format!("{path}.nested_queries[{index}]"),
-                )?;
-            }
-            Ok(())
+        BroadPublicReadProjectionItemKind::Expr { expr, .. } => {
+            ensure_broad_sql_expr_is_fully_typed(expr, path)
         }
         BroadPublicReadProjectionItemKind::Wildcard
         | BroadPublicReadProjectionItemKind::QualifiedWildcard { .. } => Ok(()),
@@ -310,7 +413,7 @@ fn ensure_broad_public_read_limit_clause_is_fully_typed(
                 ensure_broad_sql_expr_is_fully_typed(limit, &format!("{path}.limit"))?;
             }
             if let Some(offset) = offset {
-                ensure_broad_sql_expr_is_fully_typed(offset, &format!("{path}.offset"))?;
+                ensure_broad_sql_expr_is_fully_typed(&offset.value, &format!("{path}.offset"))?;
             }
             for (index, expr) in limit_by.iter().enumerate() {
                 ensure_broad_sql_expr_is_fully_typed(expr, &format!("{path}.limit_by[{index}]"))?;
@@ -325,30 +428,176 @@ fn ensure_broad_public_read_limit_clause_is_fully_typed(
 }
 
 fn ensure_broad_sql_expr_is_fully_typed(expr: &BroadSqlExpr, path: &str) -> Result<(), LixError> {
-    for (index, nested_query) in expr.nested_queries.iter().enumerate() {
-        ensure_broad_nested_query_expr_is_fully_typed(
-            nested_query,
-            &format!("{path}.nested_queries[{index}]"),
-        )?;
+    match &expr.kind {
+        BroadSqlExprKind::Identifier(_)
+        | BroadSqlExprKind::CompoundIdentifier(_)
+        | BroadSqlExprKind::Value(_)
+        | BroadSqlExprKind::TypedString { .. } => Ok(()),
+        BroadSqlExprKind::BinaryOp { left, right, .. }
+        | BroadSqlExprKind::AnyOp { left, right, .. }
+        | BroadSqlExprKind::AllOp { left, right, .. }
+        | BroadSqlExprKind::IsDistinctFrom { left, right }
+        | BroadSqlExprKind::IsNotDistinctFrom { left, right } => {
+            ensure_broad_sql_expr_is_fully_typed(left, &format!("{path}.left"))?;
+            ensure_broad_sql_expr_is_fully_typed(right, &format!("{path}.right"))
+        }
+        BroadSqlExprKind::UnaryOp { expr, .. }
+        | BroadSqlExprKind::Nested(expr)
+        | BroadSqlExprKind::IsNull(expr)
+        | BroadSqlExprKind::IsNotNull(expr)
+        | BroadSqlExprKind::IsTrue(expr)
+        | BroadSqlExprKind::IsNotTrue(expr)
+        | BroadSqlExprKind::IsFalse(expr)
+        | BroadSqlExprKind::IsNotFalse(expr)
+        | BroadSqlExprKind::IsUnknown(expr)
+        | BroadSqlExprKind::IsNotUnknown(expr) => {
+            ensure_broad_sql_expr_is_fully_typed(expr, &format!("{path}.expr"))
+        }
+        BroadSqlExprKind::Cast { expr, .. } => {
+            ensure_broad_sql_expr_is_fully_typed(expr, &format!("{path}.expr"))
+        }
+        BroadSqlExprKind::InList { expr, list, .. } => {
+            ensure_broad_sql_expr_is_fully_typed(expr, &format!("{path}.expr"))?;
+            for (index, item) in list.iter().enumerate() {
+                ensure_broad_sql_expr_is_fully_typed(item, &format!("{path}.list[{index}]"))?;
+            }
+            Ok(())
+        }
+        BroadSqlExprKind::InSubquery { expr, subquery, .. } => {
+            ensure_broad_sql_expr_is_fully_typed(expr, &format!("{path}.expr"))?;
+            ensure_broad_public_read_query_is_fully_typed(subquery, &format!("{path}.subquery"))
+        }
+        BroadSqlExprKind::InUnnest {
+            expr, array_expr, ..
+        } => {
+            ensure_broad_sql_expr_is_fully_typed(expr, &format!("{path}.expr"))?;
+            ensure_broad_sql_expr_is_fully_typed(array_expr, &format!("{path}.array_expr"))
+        }
+        BroadSqlExprKind::Between {
+            expr, low, high, ..
+        } => {
+            ensure_broad_sql_expr_is_fully_typed(expr, &format!("{path}.expr"))?;
+            ensure_broad_sql_expr_is_fully_typed(low, &format!("{path}.low"))?;
+            ensure_broad_sql_expr_is_fully_typed(high, &format!("{path}.high"))
+        }
+        BroadSqlExprKind::Like { expr, pattern, .. }
+        | BroadSqlExprKind::ILike { expr, pattern, .. } => {
+            ensure_broad_sql_expr_is_fully_typed(expr, &format!("{path}.expr"))?;
+            ensure_broad_sql_expr_is_fully_typed(pattern, &format!("{path}.pattern"))
+        }
+        BroadSqlExprKind::Function(function) => {
+            ensure_broad_sql_function_is_fully_typed(function, path)
+        }
+        BroadSqlExprKind::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                ensure_broad_sql_expr_is_fully_typed(operand, &format!("{path}.operand"))?;
+            }
+            for (index, when) in conditions.iter().enumerate() {
+                ensure_broad_sql_case_when_is_fully_typed(when, &format!("{path}.when[{index}]"))?;
+            }
+            if let Some(else_result) = else_result {
+                ensure_broad_sql_expr_is_fully_typed(
+                    else_result,
+                    &format!("{path}.else_result"),
+                )?;
+            }
+            Ok(())
+        }
+        BroadSqlExprKind::Exists { subquery, .. }
+        | BroadSqlExprKind::ScalarSubquery(subquery) => {
+            ensure_broad_public_read_query_is_fully_typed(subquery, &format!("{path}.subquery"))
+        }
+        BroadSqlExprKind::Tuple(items) => {
+            for (index, item) in items.iter().enumerate() {
+                ensure_broad_sql_expr_is_fully_typed(item, &format!("{path}.items[{index}]"))?;
+            }
+            Ok(())
+        }
+        BroadSqlExprKind::Unsupported { .. } => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "broad public-read physical lowering requires fully typed scalar IR; unsupported expression remains at {path}"
+            ),
+        )),
+    }
+}
+
+fn ensure_broad_sql_case_when_is_fully_typed(
+    when: &BroadSqlCaseWhen,
+    path: &str,
+) -> Result<(), LixError> {
+    ensure_broad_sql_expr_is_fully_typed(&when.condition, &format!("{path}.condition"))?;
+    ensure_broad_sql_expr_is_fully_typed(&when.result, &format!("{path}.result"))
+}
+
+fn ensure_broad_sql_function_is_fully_typed(
+    function: &BroadSqlFunction,
+    path: &str,
+) -> Result<(), LixError> {
+    ensure_broad_sql_function_arguments_are_fully_typed(
+        &function.parameters,
+        &format!("{path}.parameters"),
+    )?;
+    ensure_broad_sql_function_arguments_are_fully_typed(&function.args, &format!("{path}.args"))?;
+    if let Some(filter) = &function.filter {
+        ensure_broad_sql_expr_is_fully_typed(filter, &format!("{path}.filter"))?;
+    }
+    for (index, expr) in function.within_group.iter().enumerate() {
+        ensure_broad_sql_expr_is_fully_typed(&expr.expr, &format!("{path}.within_group[{index}]"))?;
     }
     Ok(())
 }
 
-fn ensure_broad_nested_query_expr_is_fully_typed(
-    expr: &BroadNestedQueryExpr,
+fn ensure_broad_sql_function_arguments_are_fully_typed(
+    arguments: &BroadSqlFunctionArguments,
     path: &str,
 ) -> Result<(), LixError> {
-    match expr {
-        BroadNestedQueryExpr::ScalarSubquery(query) => {
-            ensure_broad_public_read_query_is_fully_typed(query, path)
+    match arguments {
+        BroadSqlFunctionArguments::None => Ok(()),
+        BroadSqlFunctionArguments::Subquery(query) => {
+            ensure_broad_public_read_query_is_fully_typed(query, &format!("{path}.subquery"))
         }
-        BroadNestedQueryExpr::Exists { subquery, .. } => {
-            ensure_broad_public_read_query_is_fully_typed(subquery, &format!("{path}.subquery"))
+        BroadSqlFunctionArguments::List(list) => {
+            for (index, arg) in list.args.iter().enumerate() {
+                ensure_broad_sql_function_arg_is_fully_typed(
+                    arg,
+                    &format!("{path}.args[{index}]"),
+                )?;
+            }
+            Ok(())
         }
-        BroadNestedQueryExpr::InSubquery { expr, subquery, .. } => {
-            ensure_broad_sql_expr_is_fully_typed(expr, &format!("{path}.expr"))?;
-            ensure_broad_public_read_query_is_fully_typed(subquery, &format!("{path}.subquery"))
+    }
+}
+
+fn ensure_broad_sql_function_arg_is_fully_typed(
+    arg: &BroadSqlFunctionArg,
+    path: &str,
+) -> Result<(), LixError> {
+    match arg {
+        BroadSqlFunctionArg::Named { arg, .. } => {
+            ensure_broad_sql_function_arg_expr_is_fully_typed(arg, &format!("{path}.value"))
         }
+        BroadSqlFunctionArg::ExprNamed { name, arg, .. } => {
+            ensure_broad_sql_expr_is_fully_typed(name, &format!("{path}.name"))?;
+            ensure_broad_sql_function_arg_expr_is_fully_typed(arg, &format!("{path}.value"))
+        }
+        BroadSqlFunctionArg::Unnamed(arg) => {
+            ensure_broad_sql_function_arg_expr_is_fully_typed(arg, &format!("{path}.value"))
+        }
+    }
+}
+
+fn ensure_broad_sql_function_arg_expr_is_fully_typed(
+    arg: &BroadSqlFunctionArgExpr,
+    path: &str,
+) -> Result<(), LixError> {
+    match arg {
+        BroadSqlFunctionArgExpr::Expr(expr) => ensure_broad_sql_expr_is_fully_typed(expr, path),
+        BroadSqlFunctionArgExpr::QualifiedWildcard(_) | BroadSqlFunctionArgExpr::Wildcard => Ok(()),
     }
 }
 
@@ -407,12 +656,13 @@ fn broad_public_read_select_contains_relation_kind(
     select: &BroadPublicReadSelect,
     predicate: impl Copy + Fn(&BroadPublicReadRelation) -> bool,
 ) -> bool {
-    select.projection.iter().any(|projection| {
-        broad_public_read_projection_item_contains_relation_kind(projection, predicate)
-    }) || select
-        .from
-        .iter()
-        .any(|table| broad_public_read_table_with_joins_contains_relation_kind(table, predicate))
+    broad_public_read_distinct_contains_relation_kind(select.distinct.as_ref(), predicate)
+        || select.projection.iter().any(|projection| {
+            broad_public_read_projection_item_contains_relation_kind(projection, predicate)
+        })
+        || select.from.iter().any(|table| {
+            broad_public_read_table_with_joins_contains_relation_kind(table, predicate)
+        })
         || select
             .selection
             .as_ref()
@@ -424,15 +674,82 @@ fn broad_public_read_select_contains_relation_kind(
             .is_some_and(|having| broad_sql_expr_contains_relation_kind(having, predicate))
 }
 
+fn broad_public_read_distinct_contains_relation_kind(
+    distinct: Option<&BroadPublicReadDistinct>,
+    predicate: impl Copy + Fn(&BroadPublicReadRelation) -> bool,
+) -> bool {
+    match distinct {
+        Some(BroadPublicReadDistinct::On(expressions)) => expressions
+            .iter()
+            .any(|expr| broad_sql_expr_contains_relation_kind(expr, predicate)),
+        Some(BroadPublicReadDistinct::Distinct) | None => false,
+    }
+}
+
 fn broad_public_read_table_with_joins_contains_relation_kind(
     table: &BroadPublicReadTableWithJoins,
     predicate: impl Copy + Fn(&BroadPublicReadRelation) -> bool,
 ) -> bool {
     broad_public_read_table_factor_contains_relation_kind(&table.relation, predicate)
-        || table.joins.iter().any(|join| {
-            broad_public_read_table_factor_contains_relation_kind(&join.relation, predicate)
-                || broad_public_read_join_contains_relation_kind(join, predicate)
-        })
+        || table
+            .joins
+            .iter()
+            .any(|join| broad_public_read_join_contains_relation_kind(join, predicate))
+}
+
+fn broad_public_read_join_contains_relation_kind(
+    join: &BroadPublicReadJoin,
+    predicate: impl Copy + Fn(&BroadPublicReadRelation) -> bool,
+) -> bool {
+    broad_public_read_table_factor_contains_relation_kind(&join.relation, predicate)
+        || broad_public_read_join_kind_contains_relation_kind(&join.kind, predicate)
+}
+
+fn broad_public_read_join_kind_contains_relation_kind(
+    kind: &BroadPublicReadJoinKind,
+    predicate: impl Copy + Fn(&BroadPublicReadRelation) -> bool,
+) -> bool {
+    match kind {
+        BroadPublicReadJoinKind::Join(constraint)
+        | BroadPublicReadJoinKind::Inner(constraint)
+        | BroadPublicReadJoinKind::Left(constraint)
+        | BroadPublicReadJoinKind::LeftOuter(constraint)
+        | BroadPublicReadJoinKind::Right(constraint)
+        | BroadPublicReadJoinKind::RightOuter(constraint)
+        | BroadPublicReadJoinKind::FullOuter(constraint)
+        | BroadPublicReadJoinKind::CrossJoin(constraint)
+        | BroadPublicReadJoinKind::Semi(constraint)
+        | BroadPublicReadJoinKind::LeftSemi(constraint)
+        | BroadPublicReadJoinKind::RightSemi(constraint)
+        | BroadPublicReadJoinKind::Anti(constraint)
+        | BroadPublicReadJoinKind::LeftAnti(constraint)
+        | BroadPublicReadJoinKind::RightAnti(constraint)
+        | BroadPublicReadJoinKind::StraightJoin(constraint) => {
+            broad_public_read_join_constraint_contains_relation_kind(constraint, predicate)
+        }
+        BroadPublicReadJoinKind::CrossApply | BroadPublicReadJoinKind::OuterApply => false,
+        BroadPublicReadJoinKind::AsOf {
+            match_condition,
+            constraint,
+        } => {
+            broad_sql_expr_contains_relation_kind(match_condition, predicate)
+                || broad_public_read_join_constraint_contains_relation_kind(constraint, predicate)
+        }
+    }
+}
+
+fn broad_public_read_join_constraint_contains_relation_kind(
+    constraint: &BroadPublicReadJoinConstraint,
+    predicate: impl Copy + Fn(&BroadPublicReadRelation) -> bool,
+) -> bool {
+    match constraint {
+        BroadPublicReadJoinConstraint::On(expr) => {
+            broad_sql_expr_contains_relation_kind(expr, predicate)
+        }
+        BroadPublicReadJoinConstraint::None
+        | BroadPublicReadJoinConstraint::Natural
+        | BroadPublicReadJoinConstraint::Using(_) => false,
+    }
 }
 
 fn broad_public_read_table_factor_contains_relation_kind(
@@ -456,9 +773,9 @@ fn broad_public_read_projection_item_contains_relation_kind(
     predicate: impl Copy + Fn(&BroadPublicReadRelation) -> bool,
 ) -> bool {
     match &item.kind {
-        BroadPublicReadProjectionItemKind::Expr { nested_queries, .. } => nested_queries
-            .iter()
-            .any(|expr| broad_nested_query_expr_contains_relation_kind(expr, predicate)),
+        BroadPublicReadProjectionItemKind::Expr { expr, .. } => {
+            broad_sql_expr_contains_relation_kind(expr, predicate)
+        }
         BroadPublicReadProjectionItemKind::Wildcard
         | BroadPublicReadProjectionItemKind::QualifiedWildcard { .. } => false,
     }
@@ -501,9 +818,9 @@ fn broad_public_read_limit_clause_contains_relation_kind(
             limit
                 .as_ref()
                 .is_some_and(|expr| broad_sql_expr_contains_relation_kind(expr, predicate))
-                || offset
-                    .as_ref()
-                    .is_some_and(|expr| broad_sql_expr_contains_relation_kind(expr, predicate))
+                || offset.as_ref().is_some_and(|offset| {
+                    broad_sql_expr_contains_relation_kind(&offset.value, predicate)
+                })
                 || limit_by
                     .iter()
                     .any(|expr| broad_sql_expr_contains_relation_kind(expr, predicate))
@@ -515,49 +832,153 @@ fn broad_public_read_limit_clause_contains_relation_kind(
     }
 }
 
-fn broad_public_read_join_contains_relation_kind(
-    join: &BroadPublicReadJoin,
-    predicate: impl Copy + Fn(&BroadPublicReadRelation) -> bool,
-) -> bool {
-    join.constraint_expressions
-        .iter()
-        .any(|expr| broad_sql_expr_contains_relation_kind(expr, predicate))
-}
-
 fn broad_sql_expr_contains_relation_kind(
     expr: &BroadSqlExpr,
     predicate: impl Copy + Fn(&BroadPublicReadRelation) -> bool,
 ) -> bool {
-    expr.nested_queries
-        .iter()
-        .any(|expr| broad_nested_query_expr_contains_relation_kind(expr, predicate))
-}
-
-fn broad_nested_query_expr_contains_relation_kind(
-    expr: &BroadNestedQueryExpr,
-    predicate: impl Copy + Fn(&BroadPublicReadRelation) -> bool,
-) -> bool {
-    match expr {
-        BroadNestedQueryExpr::ScalarSubquery(query) => {
-            broad_public_read_query_contains_relation_kind(query, predicate)
+    match &expr.kind {
+        BroadSqlExprKind::Identifier(_)
+        | BroadSqlExprKind::CompoundIdentifier(_)
+        | BroadSqlExprKind::Value(_)
+        | BroadSqlExprKind::TypedString { .. }
+        | BroadSqlExprKind::Unsupported { .. } => false,
+        BroadSqlExprKind::BinaryOp { left, right, .. }
+        | BroadSqlExprKind::AnyOp { left, right, .. }
+        | BroadSqlExprKind::AllOp { left, right, .. }
+        | BroadSqlExprKind::IsDistinctFrom { left, right }
+        | BroadSqlExprKind::IsNotDistinctFrom { left, right } => {
+            broad_sql_expr_contains_relation_kind(left, predicate)
+                || broad_sql_expr_contains_relation_kind(right, predicate)
         }
-        BroadNestedQueryExpr::Exists { subquery, .. } => {
-            broad_public_read_query_contains_relation_kind(subquery, predicate)
+        BroadSqlExprKind::UnaryOp { expr, .. }
+        | BroadSqlExprKind::Nested(expr)
+        | BroadSqlExprKind::IsNull(expr)
+        | BroadSqlExprKind::IsNotNull(expr)
+        | BroadSqlExprKind::IsTrue(expr)
+        | BroadSqlExprKind::IsNotTrue(expr)
+        | BroadSqlExprKind::IsFalse(expr)
+        | BroadSqlExprKind::IsNotFalse(expr)
+        | BroadSqlExprKind::IsUnknown(expr)
+        | BroadSqlExprKind::IsNotUnknown(expr) => {
+            broad_sql_expr_contains_relation_kind(expr, predicate)
         }
-        BroadNestedQueryExpr::InSubquery { expr, subquery, .. } => {
+        BroadSqlExprKind::Cast { expr, .. } => {
+            broad_sql_expr_contains_relation_kind(expr, predicate)
+        }
+        BroadSqlExprKind::InList { expr, list, .. } => {
+            broad_sql_expr_contains_relation_kind(expr, predicate)
+                || list
+                    .iter()
+                    .any(|item| broad_sql_expr_contains_relation_kind(item, predicate))
+        }
+        BroadSqlExprKind::InSubquery { expr, subquery, .. } => {
             broad_sql_expr_contains_relation_kind(expr, predicate)
                 || broad_public_read_query_contains_relation_kind(subquery, predicate)
         }
+        BroadSqlExprKind::InUnnest {
+            expr, array_expr, ..
+        } => {
+            broad_sql_expr_contains_relation_kind(expr, predicate)
+                || broad_sql_expr_contains_relation_kind(array_expr, predicate)
+        }
+        BroadSqlExprKind::Between {
+            expr, low, high, ..
+        } => {
+            broad_sql_expr_contains_relation_kind(expr, predicate)
+                || broad_sql_expr_contains_relation_kind(low, predicate)
+                || broad_sql_expr_contains_relation_kind(high, predicate)
+        }
+        BroadSqlExprKind::Like { expr, pattern, .. }
+        | BroadSqlExprKind::ILike { expr, pattern, .. } => {
+            broad_sql_expr_contains_relation_kind(expr, predicate)
+                || broad_sql_expr_contains_relation_kind(pattern, predicate)
+        }
+        BroadSqlExprKind::Function(function) => {
+            broad_sql_function_contains_relation_kind(function, predicate)
+        }
+        BroadSqlExprKind::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|expr| broad_sql_expr_contains_relation_kind(expr, predicate))
+                || conditions.iter().any(|when| {
+                    broad_sql_expr_contains_relation_kind(&when.condition, predicate)
+                        || broad_sql_expr_contains_relation_kind(&when.result, predicate)
+                })
+                || else_result
+                    .as_ref()
+                    .is_some_and(|expr| broad_sql_expr_contains_relation_kind(expr, predicate))
+        }
+        BroadSqlExprKind::Exists { subquery, .. } | BroadSqlExprKind::ScalarSubquery(subquery) => {
+            broad_public_read_query_contains_relation_kind(subquery, predicate)
+        }
+        BroadSqlExprKind::Tuple(items) => items
+            .iter()
+            .any(|item| broad_sql_expr_contains_relation_kind(item, predicate)),
     }
 }
 
-fn lower_broad_public_read_statement_into_shell(
+fn broad_sql_function_contains_relation_kind(
+    function: &BroadSqlFunction,
+    predicate: impl Copy + Fn(&BroadPublicReadRelation) -> bool,
+) -> bool {
+    broad_sql_function_arguments_contains_relation_kind(&function.parameters, predicate)
+        || broad_sql_function_arguments_contains_relation_kind(&function.args, predicate)
+        || function
+            .filter
+            .as_ref()
+            .is_some_and(|filter| broad_sql_expr_contains_relation_kind(filter, predicate))
+        || function
+            .within_group
+            .iter()
+            .any(|expr| broad_sql_expr_contains_relation_kind(&expr.expr, predicate))
+}
+
+fn broad_sql_function_arguments_contains_relation_kind(
+    arguments: &BroadSqlFunctionArguments,
+    predicate: impl Copy + Fn(&BroadPublicReadRelation) -> bool,
+) -> bool {
+    match arguments {
+        BroadSqlFunctionArguments::None => false,
+        BroadSqlFunctionArguments::Subquery(query) => {
+            broad_public_read_query_contains_relation_kind(query, predicate)
+        }
+        BroadSqlFunctionArguments::List(list) => list.args.iter().any(|arg| match arg {
+            BroadSqlFunctionArg::Named { arg, .. } => {
+                broad_sql_function_arg_expr_contains_relation_kind(arg, predicate)
+            }
+            BroadSqlFunctionArg::ExprNamed { name, arg, .. } => {
+                broad_sql_expr_contains_relation_kind(name, predicate)
+                    || broad_sql_function_arg_expr_contains_relation_kind(arg, predicate)
+            }
+            BroadSqlFunctionArg::Unnamed(arg) => {
+                broad_sql_function_arg_expr_contains_relation_kind(arg, predicate)
+            }
+        }),
+    }
+}
+
+fn broad_sql_function_arg_expr_contains_relation_kind(
+    arg: &BroadSqlFunctionArgExpr,
+    predicate: impl Copy + Fn(&BroadPublicReadRelation) -> bool,
+) -> bool {
+    match arg {
+        BroadSqlFunctionArgExpr::Expr(expr) => {
+            broad_sql_expr_contains_relation_kind(expr, predicate)
+        }
+        BroadSqlFunctionArgExpr::QualifiedWildcard(_) | BroadSqlFunctionArgExpr::Wildcard => false,
+    }
+}
+
+fn lower_broad_public_read_statement(
     statement: &BroadPublicReadStatement,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<Statement, LixError> {
     match statement {
         BroadPublicReadStatement::Query(query) => {
@@ -567,26 +988,20 @@ fn lower_broad_public_read_statement_into_shell(
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
             )?)))
         }
         BroadPublicReadStatement::Explain {
             original,
-            statement: bound_statement,
+            statement: inner,
         } => {
             let mut lowered = original.clone();
-            if let Statement::Explain {
-                statement: lowered_statement,
-                ..
-            } = &mut lowered
-            {
-                **lowered_statement = lower_broad_public_read_statement_into_shell(
-                    bound_statement.as_ref(),
+            if let Statement::Explain { statement, .. } = &mut lowered {
+                **statement = lower_broad_public_read_statement(
+                    inner,
                     registry,
                     dialect,
                     active_version_id,
                     known_live_layouts,
-                    substitutions,
                 )?;
             }
             Ok(lowered)
@@ -600,65 +1015,61 @@ fn lower_broad_public_read_query(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<Query, LixError> {
-    let mut lowered = query.provenance.cloned().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "broad public-read query lowering requires query provenance",
-        )
-    })?;
-    lowered.with = query
-        .with
-        .as_ref()
-        .map(|with| {
-            lower_broad_public_read_with(
-                with,
-                registry,
-                dialect,
-                active_version_id,
-                known_live_layouts,
-                substitutions,
-            )
-        })
-        .transpose()?;
-    lowered.body = Box::new(lower_broad_public_read_set_expr(
-        &query.body,
-        registry,
-        dialect,
-        active_version_id,
-        known_live_layouts,
-        substitutions,
-    )?);
-    lowered.order_by = query
-        .order_by
-        .as_ref()
-        .map(|order_by| {
-            lower_broad_public_read_order_by_clause(
-                order_by,
-                registry,
-                dialect,
-                active_version_id,
-                known_live_layouts,
-                substitutions,
-            )
-        })
-        .transpose()?;
-    lowered.limit_clause = query
-        .limit_clause
-        .as_ref()
-        .map(|limit_clause| {
-            lower_broad_public_read_limit_clause_exprs(
-                limit_clause,
-                registry,
-                dialect,
-                active_version_id,
-                known_live_layouts,
-                substitutions,
-            )
-        })
-        .transpose()?;
-    Ok(lowered)
+    Ok(Query {
+        with: query
+            .with
+            .as_ref()
+            .map(|with| {
+                lower_broad_public_read_with(
+                    with,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .transpose()?,
+        body: Box::new(lower_broad_public_read_set_expr(
+            &query.body,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?),
+        order_by: query
+            .order_by
+            .as_ref()
+            .map(|order_by| {
+                lower_broad_public_read_order_by(
+                    order_by,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .transpose()?,
+        limit_clause: query
+            .limit_clause
+            .as_ref()
+            .map(|limit_clause| {
+                lower_broad_public_read_limit_clause(
+                    limit_clause,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .transpose()?,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    })
 }
 
 fn lower_broad_public_read_with(
@@ -667,25 +1078,30 @@ fn lower_broad_public_read_with(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<With, LixError> {
-    let mut lowered = with.provenance.cloned().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "broad public-read WITH lowering requires WITH provenance",
-        )
-    })?;
-    for (cte, bound_query) in lowered.cte_tables.iter_mut().zip(&with.cte_tables) {
-        cte.query = Box::new(lower_broad_public_read_query(
-            &bound_query.query,
-            registry,
-            dialect,
-            active_version_id,
-            known_live_layouts,
-            substitutions,
-        )?);
-    }
-    Ok(lowered)
+    Ok(With {
+        with_token: AttachedToken::empty(),
+        recursive: with.recursive,
+        cte_tables: with
+            .cte_tables
+            .iter()
+            .map(|cte| {
+                Ok(Cte {
+                    alias: lower_broad_public_read_alias(&cte.alias),
+                    query: Box::new(lower_broad_public_read_query(
+                        &cte.query,
+                        registry,
+                        dialect,
+                        active_version_id,
+                        known_live_layouts,
+                    )?),
+                    from: cte.from.as_ref().map(Ident::new),
+                    materialized: cte.materialized.clone(),
+                    closing_paren_token: AttachedToken::empty(),
+                })
+            })
+            .collect::<Result<_, LixError>>()?,
+    })
 }
 
 fn lower_broad_public_read_set_expr(
@@ -694,7 +1110,6 @@ fn lower_broad_public_read_set_expr(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<SetExpr, LixError> {
     match expr {
         BroadPublicReadSetExpr::Select(select) => {
@@ -704,7 +1119,6 @@ fn lower_broad_public_read_set_expr(
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
             )?)))
         }
         BroadPublicReadSetExpr::Query(query) => {
@@ -714,73 +1128,43 @@ fn lower_broad_public_read_set_expr(
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
             )?)))
         }
         BroadPublicReadSetExpr::SetOperation {
-            provenance,
+            operator,
+            quantifier,
             left,
             right,
             ..
-        } => {
-            let mut lowered = provenance.cloned().ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "broad public-read set operation lowering requires provenance",
-                )
-            })?;
-            if let SetExpr::SetOperation {
-                left: lowered_left,
-                right: lowered_right,
-                ..
-            } = &mut lowered
-            {
-                *lowered_left = Box::new(lower_broad_public_read_set_expr(
-                    left.as_ref(),
-                    registry,
-                    dialect,
-                    active_version_id,
-                    known_live_layouts,
-                    substitutions,
-                )?);
-                *lowered_right = Box::new(lower_broad_public_read_set_expr(
-                    right.as_ref(),
-                    registry,
-                    dialect,
-                    active_version_id,
-                    known_live_layouts,
-                    substitutions,
-                )?);
-            }
-            Ok(lowered)
-        }
-        BroadPublicReadSetExpr::Table {
-            provenance,
-            relation,
-        } => {
-            let original = provenance.cloned().ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "broad public-read table set-expr lowering requires provenance",
-                )
-            })?;
-            lower_broad_public_read_table_relation(
-                relation,
-                &original,
+        } => Ok(SetExpr::SetOperation {
+            op: lower_broad_public_read_set_operation_kind(*operator),
+            set_quantifier: lower_broad_public_read_set_quantifier(*quantifier),
+            left: Box::new(lower_broad_public_read_set_expr(
+                left,
                 registry,
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
-            )
-        }
-        BroadPublicReadSetExpr::Other { provenance } => {
-            let _ = provenance;
-            Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "broad public-read physical lowering does not support legacy set-expression fallbacks",
-            ))
-        }
+            )?),
+            right: Box::new(lower_broad_public_read_set_expr(
+                right,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+        }),
+        BroadPublicReadSetExpr::Table { relation, .. } => lower_broad_public_read_table_set_expr(
+            relation,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        ),
+        BroadPublicReadSetExpr::Other { .. } => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "broad public-read physical lowering does not support legacy set-expression fallbacks",
+        )),
     }
 }
 
@@ -790,68 +1174,157 @@ fn lower_broad_public_read_select(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<Select, LixError> {
-    let mut lowered = select.provenance.cloned().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "broad public-read select lowering requires select provenance",
-        )
-    })?;
-    lowered.from = select
-        .from
-        .iter()
-        .map(|table| {
-            lower_broad_public_read_table_with_joins(
-                table,
+    Ok(Select {
+        select_token: AttachedToken::empty(),
+        distinct: select
+            .distinct
+            .as_ref()
+            .map(|distinct| {
+                lower_broad_public_read_distinct(
+                    distinct,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .transpose()?,
+        top: None,
+        top_before_distinct: false,
+        projection: select
+            .projection
+            .iter()
+            .map(|item| {
+                lower_broad_public_read_projection_item(
+                    item,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .collect::<Result<_, _>>()?,
+        exclude: None,
+        into: None,
+        from: select
+            .from
+            .iter()
+            .map(|table| {
+                lower_broad_public_read_table_with_joins(
+                    table,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .collect::<Result<_, _>>()?,
+        lateral_views: Vec::new(),
+        prewhere: None,
+        selection: select
+            .selection
+            .as_ref()
+            .map(|expr| {
+                lower_broad_sql_expr(
+                    expr,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .transpose()?,
+        group_by: lower_broad_public_read_group_by(
+            &select.group_by,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?,
+        cluster_by: Vec::new(),
+        distribute_by: Vec::new(),
+        sort_by: Vec::new(),
+        having: select
+            .having
+            .as_ref()
+            .map(|expr| {
+                lower_broad_sql_expr(
+                    expr,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .transpose()?,
+        named_window: Vec::new(),
+        qualify: None,
+        window_before_qualify: false,
+        value_table_mode: None,
+        connect_by: None,
+        flavor: SelectFlavor::Standard,
+    })
+}
+
+fn lower_broad_public_read_distinct(
+    distinct: &BroadPublicReadDistinct,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<Distinct, LixError> {
+    match distinct {
+        BroadPublicReadDistinct::Distinct => Ok(Distinct::Distinct),
+        BroadPublicReadDistinct::On(expressions) => Ok(Distinct::On(
+            expressions
+                .iter()
+                .map(|expr| {
+                    lower_broad_sql_expr(
+                        expr,
+                        registry,
+                        dialect,
+                        active_version_id,
+                        known_live_layouts,
+                    )
+                })
+                .collect::<Result<_, _>>()?,
+        )),
+    }
+}
+
+fn lower_broad_public_read_projection_item(
+    item: &BroadPublicReadProjectionItem,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<SelectItem, LixError> {
+    match &item.kind {
+        BroadPublicReadProjectionItemKind::Wildcard => Ok(SelectItem::Wildcard(Default::default())),
+        BroadPublicReadProjectionItemKind::QualifiedWildcard { qualifier } => {
+            Ok(SelectItem::QualifiedWildcard(
+                SelectItemQualifiedWildcardKind::ObjectName(qualifier.clone()),
+                Default::default(),
+            ))
+        }
+        BroadPublicReadProjectionItemKind::Expr { alias, expr } => {
+            let lowered = lower_broad_sql_expr(
+                expr,
                 registry,
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
-            )
-        })
-        .collect::<Result<_, _>>()?;
-    for (projection, typed_projection) in lowered.projection.iter_mut().zip(&select.projection) {
-        lower_broad_public_read_projection_item_nested_queries(
-            projection,
-            typed_projection,
-            registry,
-            dialect,
-            active_version_id,
-            known_live_layouts,
-            substitutions,
-        )?;
+            )?;
+            Ok(match alias {
+                Some(alias) => SelectItem::ExprWithAlias {
+                    expr: lowered,
+                    alias: Ident::new(alias),
+                },
+                None => SelectItem::UnnamedExpr(lowered),
+            })
+        }
     }
-    if let Some(selection) = &select.selection {
-        lowered.selection = Some(lower_broad_sql_expr(
-            selection,
-            registry,
-            dialect,
-            active_version_id,
-            known_live_layouts,
-            substitutions,
-        )?);
-    }
-    lowered.group_by = lower_broad_public_read_group_by_clause(
-        &select.group_by,
-        registry,
-        dialect,
-        active_version_id,
-        known_live_layouts,
-        substitutions,
-    )?;
-    if let Some(having) = &select.having {
-        lowered.having = Some(lower_broad_sql_expr(
-            having,
-            registry,
-            dialect,
-            active_version_id,
-            known_live_layouts,
-            substitutions,
-        )?);
-    }
-    Ok(lowered)
 }
 
 fn lower_broad_public_read_table_with_joins(
@@ -860,37 +1333,29 @@ fn lower_broad_public_read_table_with_joins(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<TableWithJoins, LixError> {
-    let mut lowered = table.provenance.cloned().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "broad public-read table-with-joins lowering requires provenance",
-        )
-    })?;
-    lowered.relation = lower_broad_public_read_table_factor(
-        &table.relation,
-        registry,
-        dialect,
-        active_version_id,
-        known_live_layouts,
-        substitutions,
-    )?;
-    lowered.joins = table
-        .joins
-        .iter()
-        .map(|join| {
-            lower_broad_public_read_join(
-                join,
-                registry,
-                dialect,
-                active_version_id,
-                known_live_layouts,
-                substitutions,
-            )
-        })
-        .collect::<Result<_, _>>()?;
-    Ok(lowered)
+    Ok(TableWithJoins {
+        relation: lower_broad_public_read_table_factor(
+            &table.relation,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?,
+        joins: table
+            .joins
+            .iter()
+            .map(|join| {
+                lower_broad_public_read_join(
+                    join,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .collect::<Result<_, _>>()?,
+    })
 }
 
 fn lower_broad_public_read_join(
@@ -899,219 +1364,386 @@ fn lower_broad_public_read_join(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<sqlparser::ast::Join, LixError> {
-    let mut lowered = join.provenance.cloned().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "broad public-read join lowering requires provenance",
-        )
-    })?;
-    lowered.relation = lower_broad_public_read_table_factor(
-        &join.relation,
-        registry,
-        dialect,
-        active_version_id,
-        known_live_layouts,
-        substitutions,
-    )?;
-    lower_broad_public_read_join_operator_exprs(
-        &mut lowered.join_operator,
-        &join.constraint_expressions,
-        registry,
-        dialect,
-        active_version_id,
-        known_live_layouts,
-        substitutions,
-    )?;
-    Ok(lowered)
+    Ok(sqlparser::ast::Join {
+        relation: lower_broad_public_read_table_factor(
+            &join.relation,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?,
+        global: join.global,
+        join_operator: lower_broad_public_read_join_kind(
+            &join.kind,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?,
+    })
 }
 
-fn lower_broad_public_read_projection_item_nested_queries(
-    item: &mut SelectItem,
-    typed_item: &BroadPublicReadProjectionItem,
+fn lower_broad_public_read_join_kind(
+    kind: &BroadPublicReadJoinKind,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
-) -> Result<(), LixError> {
-    let nested_queries = match &typed_item.kind {
-        BroadPublicReadProjectionItemKind::Expr { nested_queries, .. } => nested_queries.as_slice(),
-        BroadPublicReadProjectionItemKind::Wildcard
-        | BroadPublicReadProjectionItemKind::QualifiedWildcard { .. } => return Ok(()),
-    };
-
-    match item {
-        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-            apply_lowered_nested_queries_to_expr(
-                expr,
-                &mut nested_queries.iter(),
+) -> Result<JoinOperator, LixError> {
+    Ok(match kind {
+        BroadPublicReadJoinKind::Join(constraint) => {
+            JoinOperator::Join(lower_broad_public_read_join_constraint(
+                constraint,
                 registry,
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
-            )
+            )?)
         }
-        _ => Ok(()),
-    }
+        BroadPublicReadJoinKind::Inner(constraint) => {
+            JoinOperator::Inner(lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+        BroadPublicReadJoinKind::Left(constraint) => {
+            JoinOperator::Left(lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+        BroadPublicReadJoinKind::LeftOuter(constraint) => {
+            JoinOperator::LeftOuter(lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+        BroadPublicReadJoinKind::Right(constraint) => {
+            JoinOperator::Right(lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+        BroadPublicReadJoinKind::RightOuter(constraint) => {
+            JoinOperator::RightOuter(lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+        BroadPublicReadJoinKind::FullOuter(constraint) => {
+            JoinOperator::FullOuter(lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+        BroadPublicReadJoinKind::CrossJoin(constraint) => {
+            JoinOperator::CrossJoin(lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+        BroadPublicReadJoinKind::Semi(constraint) => {
+            JoinOperator::Semi(lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+        BroadPublicReadJoinKind::LeftSemi(constraint) => {
+            JoinOperator::LeftSemi(lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+        BroadPublicReadJoinKind::RightSemi(constraint) => {
+            JoinOperator::RightSemi(lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+        BroadPublicReadJoinKind::Anti(constraint) => {
+            JoinOperator::Anti(lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+        BroadPublicReadJoinKind::LeftAnti(constraint) => {
+            JoinOperator::LeftAnti(lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+        BroadPublicReadJoinKind::RightAnti(constraint) => {
+            JoinOperator::RightAnti(lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+        BroadPublicReadJoinKind::StraightJoin(constraint) => {
+            JoinOperator::StraightJoin(lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+        BroadPublicReadJoinKind::CrossApply => JoinOperator::CrossApply,
+        BroadPublicReadJoinKind::OuterApply => JoinOperator::OuterApply,
+        BroadPublicReadJoinKind::AsOf {
+            match_condition,
+            constraint,
+        } => JoinOperator::AsOf {
+            match_condition: lower_broad_sql_expr(
+                match_condition,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?,
+            constraint: lower_broad_public_read_join_constraint(
+                constraint,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?,
+        },
+    })
 }
 
-fn lower_broad_public_read_group_by_clause(
+fn lower_broad_public_read_join_constraint(
+    constraint: &BroadPublicReadJoinConstraint,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<JoinConstraint, LixError> {
+    Ok(match constraint {
+        BroadPublicReadJoinConstraint::None => JoinConstraint::None,
+        BroadPublicReadJoinConstraint::Natural => JoinConstraint::Natural,
+        BroadPublicReadJoinConstraint::Using(columns) => JoinConstraint::Using(
+            columns
+                .iter()
+                .map(|column| ObjectName(vec![ObjectNamePart::Identifier(Ident::new(column))]))
+                .collect(),
+        ),
+        BroadPublicReadJoinConstraint::On(expr) => JoinConstraint::On(lower_broad_sql_expr(
+            expr,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?),
+    })
+}
+
+fn lower_broad_public_read_group_by(
     group_by: &BroadPublicReadGroupBy,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<GroupByExpr, LixError> {
-    let mut lowered = group_by.provenance.cloned().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "broad public-read GROUP BY lowering requires provenance",
-        )
-    })?;
-    if let (
-        GroupByExpr::Expressions(lowered_expressions, _),
-        BroadPublicReadGroupByKind::Expressions(expressions),
-    ) = (&mut lowered, &group_by.kind)
-    {
-        for (lowered_expr, typed_expr) in lowered_expressions.iter_mut().zip(expressions) {
-            *lowered_expr = lower_broad_sql_expr(
-                typed_expr,
-                registry,
-                dialect,
-                active_version_id,
-                known_live_layouts,
-                substitutions,
-            )?;
-        }
+    match &group_by.kind {
+        BroadPublicReadGroupByKind::All => Ok(GroupByExpr::All(Vec::new())),
+        BroadPublicReadGroupByKind::Expressions(expressions) => Ok(GroupByExpr::Expressions(
+            expressions
+                .iter()
+                .map(|expr| {
+                    lower_broad_sql_expr(
+                        expr,
+                        registry,
+                        dialect,
+                        active_version_id,
+                        known_live_layouts,
+                    )
+                })
+                .collect::<Result<_, _>>()?,
+            Vec::new(),
+        )),
     }
-    Ok(lowered)
 }
 
-fn lower_broad_public_read_order_by_clause(
+fn lower_broad_public_read_order_by(
     order_by: &BroadPublicReadOrderBy,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<OrderBy, LixError> {
-    let mut lowered = order_by.provenance.cloned().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "broad public-read ORDER BY lowering requires provenance",
-        )
-    })?;
-    if let (
-        sqlparser::ast::OrderByKind::Expressions(lowered_expressions),
-        BroadPublicReadOrderByKind::Expressions(expressions),
-    ) = (&mut lowered.kind, &order_by.kind)
-    {
-        for (lowered_expr, typed_expr) in lowered_expressions.iter_mut().zip(expressions) {
-            lowered_expr.expr = lower_broad_sql_expr(
-                &typed_expr.expr,
-                registry,
-                dialect,
-                active_version_id,
-                known_live_layouts,
-                substitutions,
-            )?;
-        }
-    }
-    Ok(lowered)
+    Ok(OrderBy {
+        kind: match &order_by.kind {
+            BroadPublicReadOrderByKind::All => OrderByKind::All(Default::default()),
+            BroadPublicReadOrderByKind::Expressions(expressions) => OrderByKind::Expressions(
+                expressions
+                    .iter()
+                    .map(|expr| {
+                        lower_broad_public_read_order_by_expr(
+                            expr,
+                            registry,
+                            dialect,
+                            active_version_id,
+                            known_live_layouts,
+                        )
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+        },
+        interpolate: None,
+    })
 }
 
-fn lower_broad_public_read_limit_clause_exprs(
+fn lower_broad_public_read_order_by_expr(
+    expr: &BroadPublicReadOrderByExpr,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<OrderByExpr, LixError> {
+    Ok(OrderByExpr {
+        expr: lower_broad_sql_expr(
+            &expr.expr,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?,
+        options: OrderByOptions {
+            asc: expr.asc,
+            nulls_first: expr.nulls_first,
+        },
+        with_fill: None,
+    })
+}
+
+fn lower_broad_public_read_limit_clause(
     limit_clause: &BroadPublicReadLimitClause,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<LimitClause, LixError> {
-    let mut lowered = limit_clause.provenance.cloned().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "broad public-read LIMIT lowering requires provenance",
-        )
-    })?;
-    match (&mut lowered, &limit_clause.kind) {
-        (
-            LimitClause::LimitOffset {
-                limit,
-                offset,
-                limit_by,
-            },
-            BroadPublicReadLimitClauseKind::LimitOffset {
-                limit: typed_limit,
-                offset: typed_offset,
-                limit_by: typed_limit_by,
-            },
-        ) => {
-            if let (Some(lowered_limit), Some(typed_limit)) = (limit.as_mut(), typed_limit.as_ref())
-            {
-                *lowered_limit = lower_broad_sql_expr(
-                    typed_limit,
+    Ok(match &limit_clause.kind {
+        BroadPublicReadLimitClauseKind::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => LimitClause::LimitOffset {
+            limit: limit
+                .as_ref()
+                .map(|expr| {
+                    lower_broad_sql_expr(
+                        expr,
+                        registry,
+                        dialect,
+                        active_version_id,
+                        known_live_layouts,
+                    )
+                })
+                .transpose()?,
+            offset: offset
+                .as_ref()
+                .map(|offset| {
+                    lower_broad_public_read_offset(
+                        offset,
+                        registry,
+                        dialect,
+                        active_version_id,
+                        known_live_layouts,
+                    )
+                })
+                .transpose()?,
+            limit_by: limit_by
+                .iter()
+                .map(|expr| {
+                    lower_broad_sql_expr(
+                        expr,
+                        registry,
+                        dialect,
+                        active_version_id,
+                        known_live_layouts,
+                    )
+                })
+                .collect::<Result<_, _>>()?,
+        },
+        BroadPublicReadLimitClauseKind::OffsetCommaLimit { offset, limit } => {
+            LimitClause::OffsetCommaLimit {
+                offset: lower_broad_sql_expr(
+                    offset,
                     registry,
                     dialect,
                     active_version_id,
                     known_live_layouts,
-                    substitutions,
-                )?;
-            }
-            if let (Some(lowered_offset), Some(typed_offset)) =
-                (offset.as_mut(), typed_offset.as_ref())
-            {
-                lowered_offset.value = lower_broad_sql_expr(
-                    typed_offset,
+                )?,
+                limit: lower_broad_sql_expr(
+                    limit,
                     registry,
                     dialect,
                     active_version_id,
                     known_live_layouts,
-                    substitutions,
-                )?;
-            }
-            for (lowered_expr, typed_expr) in limit_by.iter_mut().zip(typed_limit_by) {
-                *lowered_expr = lower_broad_sql_expr(
-                    typed_expr,
-                    registry,
-                    dialect,
-                    active_version_id,
-                    known_live_layouts,
-                    substitutions,
-                )?;
+                )?,
             }
         }
-        (
-            LimitClause::OffsetCommaLimit { offset, limit },
-            BroadPublicReadLimitClauseKind::OffsetCommaLimit {
-                offset: typed_offset,
-                limit: typed_limit,
-            },
-        ) => {
-            *offset = lower_broad_sql_expr(
-                typed_offset,
-                registry,
-                dialect,
-                active_version_id,
-                known_live_layouts,
-                substitutions,
-            )?;
-            *limit = lower_broad_sql_expr(
-                typed_limit,
-                registry,
-                dialect,
-                active_version_id,
-                known_live_layouts,
-                substitutions,
-            )?;
-        }
-        _ => {}
-    }
-    Ok(lowered)
+    })
+}
+
+fn lower_broad_public_read_offset(
+    offset: &BroadPublicReadOffset,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<Offset, LixError> {
+    Ok(Offset {
+        value: lower_broad_sql_expr(
+            &offset.value,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?,
+        rows: offset.rows,
+    })
 }
 
 fn lower_broad_sql_expr(
@@ -1120,523 +1752,677 @@ fn lower_broad_sql_expr(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<Expr, LixError> {
-    let mut lowered = expr.provenance.cloned().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "broad public-read expression lowering requires provenance",
-        )
-    })?;
-    let mut nested_queries = expr.nested_queries.iter();
-    apply_lowered_nested_queries_to_expr(
-        &mut lowered,
-        &mut nested_queries,
-        registry,
-        dialect,
-        active_version_id,
-        known_live_layouts,
-        substitutions,
-    )?;
-    if nested_queries.next().is_some() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "broad public-read expression lowering left nested queries unapplied",
-        ));
-    }
-    Ok(lowered)
-}
-
-fn apply_lowered_nested_queries_to_expr<'a>(
-    expr: &mut Expr,
-    nested_queries: &mut std::slice::Iter<'a, BroadNestedQueryExpr>,
-    registry: &SurfaceRegistry,
-    dialect: SqlDialect,
-    active_version_id: Option<&str>,
-    known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
-) -> Result<(), LixError> {
-    match expr {
-        Expr::BinaryOp { left, right, .. }
-        | Expr::AnyOp { left, right, .. }
-        | Expr::AllOp { left, right, .. } => {
-            apply_lowered_nested_queries_to_expr(
+    Ok(match &expr.kind {
+        BroadSqlExprKind::Identifier(ident) => Expr::Identifier(ident.clone()),
+        BroadSqlExprKind::CompoundIdentifier(parts) => Expr::CompoundIdentifier(parts.clone()),
+        BroadSqlExprKind::Value(value) => Expr::Value(value.clone()),
+        BroadSqlExprKind::TypedString {
+            data_type,
+            value,
+            uses_odbc_syntax,
+        } => Expr::TypedString(TypedString {
+            data_type: data_type.clone(),
+            value: value.clone(),
+            uses_odbc_syntax: *uses_odbc_syntax,
+        }),
+        BroadSqlExprKind::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(lower_broad_sql_expr(
                 left,
-                nested_queries,
                 registry,
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
-            )?;
-            apply_lowered_nested_queries_to_expr(
+            )?),
+            op: op.clone(),
+            right: Box::new(lower_broad_sql_expr(
                 right,
-                nested_queries,
                 registry,
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
-            )
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::Nested(expr)
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::Cast { expr, .. } => apply_lowered_nested_queries_to_expr(
+            )?),
+        },
+        BroadSqlExprKind::AnyOp {
+            left,
+            compare_op,
+            right,
+            is_some,
+        } => Expr::AnyOp {
+            left: Box::new(lower_broad_sql_expr(
+                left,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+            compare_op: compare_op.clone(),
+            right: Box::new(lower_broad_sql_expr(
+                right,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+            is_some: *is_some,
+        },
+        BroadSqlExprKind::AllOp {
+            left,
+            compare_op,
+            right,
+        } => Expr::AllOp {
+            left: Box::new(lower_broad_sql_expr(
+                left,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+            compare_op: compare_op.clone(),
+            right: Box::new(lower_broad_sql_expr(
+                right,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+        },
+        BroadSqlExprKind::UnaryOp { op, expr } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(lower_broad_sql_expr(
+                expr,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+        },
+        BroadSqlExprKind::Nested(expr) => Expr::Nested(Box::new(lower_broad_sql_expr(
             expr,
-            nested_queries,
             registry,
             dialect,
             active_version_id,
             known_live_layouts,
-            substitutions,
+        )?)),
+        BroadSqlExprKind::IsNull(expr) => Expr::IsNull(Box::new(lower_broad_sql_expr(
+            expr,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?)),
+        BroadSqlExprKind::IsNotNull(expr) => Expr::IsNotNull(Box::new(lower_broad_sql_expr(
+            expr,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?)),
+        BroadSqlExprKind::IsTrue(expr) => Expr::IsTrue(Box::new(lower_broad_sql_expr(
+            expr,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?)),
+        BroadSqlExprKind::IsNotTrue(expr) => Expr::IsNotTrue(Box::new(lower_broad_sql_expr(
+            expr,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?)),
+        BroadSqlExprKind::IsFalse(expr) => Expr::IsFalse(Box::new(lower_broad_sql_expr(
+            expr,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?)),
+        BroadSqlExprKind::IsNotFalse(expr) => Expr::IsNotFalse(Box::new(lower_broad_sql_expr(
+            expr,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?)),
+        BroadSqlExprKind::IsUnknown(expr) => Expr::IsUnknown(Box::new(lower_broad_sql_expr(
+            expr,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?)),
+        BroadSqlExprKind::IsNotUnknown(expr) => Expr::IsNotUnknown(Box::new(lower_broad_sql_expr(
+            expr,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?)),
+        BroadSqlExprKind::IsDistinctFrom { left, right } => Expr::IsDistinctFrom(
+            Box::new(lower_broad_sql_expr(
+                left,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+            Box::new(lower_broad_sql_expr(
+                right,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
         ),
-        Expr::InList { expr, list, .. } => {
-            apply_lowered_nested_queries_to_expr(
+        BroadSqlExprKind::IsNotDistinctFrom { left, right } => Expr::IsNotDistinctFrom(
+            Box::new(lower_broad_sql_expr(
+                left,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+            Box::new(lower_broad_sql_expr(
+                right,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+        ),
+        BroadSqlExprKind::Cast {
+            kind,
+            expr,
+            data_type,
+            format,
+        } => Expr::Cast {
+            kind: kind.clone(),
+            expr: Box::new(lower_broad_sql_expr(
                 expr,
-                nested_queries,
                 registry,
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
-            )?;
-            for item in list {
-                apply_lowered_nested_queries_to_expr(
-                    item,
-                    nested_queries,
-                    registry,
-                    dialect,
-                    active_version_id,
-                    known_live_layouts,
-                    substitutions,
-                )?;
-            }
-            Ok(())
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            apply_lowered_nested_queries_to_expr(
+            )?),
+            data_type: data_type.clone(),
+            format: format.clone(),
+        },
+        BroadSqlExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(lower_broad_sql_expr(
                 expr,
-                nested_queries,
                 registry,
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
-            )?;
-            apply_lowered_nested_queries_to_expr(
-                low,
-                nested_queries,
-                registry,
-                dialect,
-                active_version_id,
-                known_live_layouts,
-                substitutions,
-            )?;
-            apply_lowered_nested_queries_to_expr(
-                high,
-                nested_queries,
-                registry,
-                dialect,
-                active_version_id,
-                known_live_layouts,
-                substitutions,
-            )
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            apply_lowered_nested_queries_to_expr(
+            )?),
+            list: list
+                .iter()
+                .map(|item| {
+                    lower_broad_sql_expr(
+                        item,
+                        registry,
+                        dialect,
+                        active_version_id,
+                        known_live_layouts,
+                    )
+                })
+                .collect::<Result<_, _>>()?,
+            negated: *negated,
+        },
+        BroadSqlExprKind::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Expr::InSubquery {
+            expr: Box::new(lower_broad_sql_expr(
                 expr,
-                nested_queries,
                 registry,
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
-            )?;
-            apply_lowered_nested_queries_to_expr(
-                pattern,
-                nested_queries,
+            )?),
+            subquery: Box::new(lower_broad_public_read_query(
+                subquery,
                 registry,
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
-            )
-        }
-        Expr::Subquery(query) => {
-            let Some(BroadNestedQueryExpr::ScalarSubquery(typed_query)) = nested_queries.next()
-            else {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "broad public-read expression lowering expected a scalar subquery node",
-                ));
-            };
-            *query = Box::new(lower_broad_public_read_query(
-                typed_query,
-                registry,
-                dialect,
-                active_version_id,
-                known_live_layouts,
-                substitutions,
-            )?);
-            Ok(())
-        }
-        Expr::Exists { subquery, .. } => {
-            let Some(BroadNestedQueryExpr::Exists {
-                subquery: typed_query,
-                ..
-            }) = nested_queries.next()
-            else {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "broad public-read expression lowering expected an EXISTS subquery node",
-                ));
-            };
-            *subquery = Box::new(lower_broad_public_read_query(
-                typed_query,
-                registry,
-                dialect,
-                active_version_id,
-                known_live_layouts,
-                substitutions,
-            )?);
-            Ok(())
-        }
-        Expr::InSubquery { expr, subquery, .. } => {
-            let Some(BroadNestedQueryExpr::InSubquery {
-                expr: typed_expr,
-                subquery: typed_query,
-                ..
-            }) = nested_queries.next()
-            else {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "broad public-read expression lowering expected an IN-subquery node",
-                ));
-            };
-            *expr = Box::new(lower_broad_sql_expr(
-                typed_expr,
-                registry,
-                dialect,
-                active_version_id,
-                known_live_layouts,
-                substitutions,
-            )?);
-            *subquery = Box::new(lower_broad_public_read_query(
-                typed_query,
-                registry,
-                dialect,
-                active_version_id,
-                known_live_layouts,
-                substitutions,
-            )?);
-            Ok(())
-        }
-        Expr::InUnnest {
-            expr, array_expr, ..
-        } => {
-            apply_lowered_nested_queries_to_expr(
+            )?),
+            negated: *negated,
+        },
+        BroadSqlExprKind::InUnnest {
+            expr,
+            array_expr,
+            negated,
+        } => Expr::InUnnest {
+            expr: Box::new(lower_broad_sql_expr(
                 expr,
-                nested_queries,
                 registry,
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
-            )?;
-            apply_lowered_nested_queries_to_expr(
+            )?),
+            array_expr: Box::new(lower_broad_sql_expr(
                 array_expr,
-                nested_queries,
                 registry,
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
-            )
-        }
-        Expr::Function(function) => apply_lowered_nested_queries_to_function_args(
-            &mut function.args,
-            nested_queries,
+            )?),
+            negated: *negated,
+        },
+        BroadSqlExprKind::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Expr::Between {
+            expr: Box::new(lower_broad_sql_expr(
+                expr,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+            negated: *negated,
+            low: Box::new(lower_broad_sql_expr(
+                low,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+            high: Box::new(lower_broad_sql_expr(
+                high,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+        },
+        BroadSqlExprKind::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => Expr::Like {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(lower_broad_sql_expr(
+                expr,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+            pattern: Box::new(lower_broad_sql_expr(
+                pattern,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+            escape_char: escape_char.clone(),
+        },
+        BroadSqlExprKind::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => Expr::ILike {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(lower_broad_sql_expr(
+                expr,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+            pattern: Box::new(lower_broad_sql_expr(
+                pattern,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+            escape_char: escape_char.clone(),
+        },
+        BroadSqlExprKind::Function(function) => Expr::Function(lower_broad_sql_function(
+            function,
             registry,
             dialect,
             active_version_id,
             known_live_layouts,
-            substitutions,
-        ),
-        Expr::Case {
+        )?),
+        BroadSqlExprKind::Case {
             operand,
             conditions,
             else_result,
-            ..
-        } => {
-            if let Some(operand) = operand {
-                apply_lowered_nested_queries_to_expr(
-                    operand,
-                    nested_queries,
-                    registry,
-                    dialect,
-                    active_version_id,
-                    known_live_layouts,
-                    substitutions,
-                )?;
-            }
-            for condition in conditions {
-                apply_lowered_nested_queries_to_expr(
-                    &mut condition.condition,
-                    nested_queries,
-                    registry,
-                    dialect,
-                    active_version_id,
-                    known_live_layouts,
-                    substitutions,
-                )?;
-                apply_lowered_nested_queries_to_expr(
-                    &mut condition.result,
-                    nested_queries,
-                    registry,
-                    dialect,
-                    active_version_id,
-                    known_live_layouts,
-                    substitutions,
-                )?;
-            }
-            if let Some(else_result) = else_result {
-                apply_lowered_nested_queries_to_expr(
-                    else_result,
-                    nested_queries,
-                    registry,
-                    dialect,
-                    active_version_id,
-                    known_live_layouts,
-                    substitutions,
-                )?;
-            }
-            Ok(())
-        }
-        Expr::Tuple(items) => {
-            for item in items {
-                apply_lowered_nested_queries_to_expr(
-                    item,
-                    nested_queries,
-                    registry,
-                    dialect,
-                    active_version_id,
-                    known_live_layouts,
-                    substitutions,
-                )?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-fn apply_lowered_nested_queries_to_function_args<'a>(
-    args: &mut FunctionArguments,
-    nested_queries: &mut std::slice::Iter<'a, BroadNestedQueryExpr>,
-    registry: &SurfaceRegistry,
-    dialect: SqlDialect,
-    active_version_id: Option<&str>,
-    known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
-) -> Result<(), LixError> {
-    match args {
-        FunctionArguments::List(list) => {
-            for arg in &mut list.args {
-                match arg {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
-                        apply_lowered_nested_queries_to_expr(
-                            expr,
-                            nested_queries,
+        } => Expr::Case {
+            case_token: AttachedToken::empty(),
+            end_token: AttachedToken::empty(),
+            operand: operand
+                .as_ref()
+                .map(|expr| {
+                    lower_broad_sql_expr(
+                        expr,
+                        registry,
+                        dialect,
+                        active_version_id,
+                        known_live_layouts,
+                    )
+                })
+                .transpose()?
+                .map(Box::new),
+            conditions: conditions
+                .iter()
+                .map(|when| {
+                    Ok(sqlparser::ast::CaseWhen {
+                        condition: lower_broad_sql_expr(
+                            &when.condition,
                             registry,
                             dialect,
                             active_version_id,
                             known_live_layouts,
-                            substitutions,
-                        )?;
-                    }
-                    FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
-                        if let FunctionArgExpr::Expr(expr) = arg {
-                            apply_lowered_nested_queries_to_expr(
-                                expr,
-                                nested_queries,
-                                registry,
-                                dialect,
-                                active_version_id,
-                                known_live_layouts,
-                                substitutions,
-                            )?;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-fn lower_broad_public_read_join_operator_exprs(
-    join_operator: &mut JoinOperator,
-    typed_exprs: &[BroadSqlExpr],
-    registry: &SurfaceRegistry,
-    dialect: SqlDialect,
-    active_version_id: Option<&str>,
-    known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
-) -> Result<(), LixError> {
-    let mut typed_exprs = typed_exprs.iter();
-    let (match_condition, constraint) = match join_operator {
-        JoinOperator::AsOf {
-            match_condition,
-            constraint,
-        } => (Some(match_condition), Some(constraint)),
-        JoinOperator::Join(constraint)
-        | JoinOperator::Inner(constraint)
-        | JoinOperator::Left(constraint)
-        | JoinOperator::LeftOuter(constraint)
-        | JoinOperator::Right(constraint)
-        | JoinOperator::RightOuter(constraint)
-        | JoinOperator::FullOuter(constraint)
-        | JoinOperator::CrossJoin(constraint)
-        | JoinOperator::Semi(constraint)
-        | JoinOperator::LeftSemi(constraint)
-        | JoinOperator::RightSemi(constraint)
-        | JoinOperator::Anti(constraint)
-        | JoinOperator::LeftAnti(constraint)
-        | JoinOperator::RightAnti(constraint)
-        | JoinOperator::StraightJoin(constraint) => (None, Some(constraint)),
-        JoinOperator::CrossApply | JoinOperator::OuterApply => (None, None),
-    };
-    if let Some(match_condition) = match_condition {
-        let typed_match_condition = typed_exprs.next().ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "broad public-read join lowering expected a typed match condition",
-            )
-        })?;
-        *match_condition = lower_broad_sql_expr(
-            typed_match_condition,
-            registry,
-            dialect,
-            active_version_id,
-            known_live_layouts,
-            substitutions,
-        )?;
-    }
-    if let Some(JoinConstraint::On(on_expr)) = constraint {
-        let typed_on_expr = typed_exprs.next().ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "broad public-read join lowering expected a typed ON condition",
-            )
-        })?;
-        *on_expr = lower_broad_sql_expr(
-            typed_on_expr,
-            registry,
-            dialect,
-            active_version_id,
-            known_live_layouts,
-            substitutions,
-        )?;
-    }
-    if typed_exprs.next().is_some() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "broad public-read join lowering left typed join expressions unapplied",
-        ));
-    }
-    Ok(())
-}
-
-fn lower_broad_public_read_table_factor(
-    relation: &BroadPublicReadTableFactor,
-    registry: &SurfaceRegistry,
-    dialect: SqlDialect,
-    active_version_id: Option<&str>,
-    known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
-) -> Result<TableFactor, LixError> {
-    match relation {
-        BroadPublicReadTableFactor::Table {
-            provenance,
-            relation,
-            ..
-        } => {
-            let original = provenance.cloned().ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "broad public-read table factor lowering requires provenance",
-                )
-            })?;
-            lower_broad_public_read_relation(
-                relation,
-                &original,
+                        )?,
+                        result: lower_broad_sql_expr(
+                            &when.result,
+                            registry,
+                            dialect,
+                            active_version_id,
+                            known_live_layouts,
+                        )?,
+                    })
+                })
+                .collect::<Result<_, LixError>>()?,
+            else_result: else_result
+                .as_ref()
+                .map(|expr| {
+                    lower_broad_sql_expr(
+                        expr,
+                        registry,
+                        dialect,
+                        active_version_id,
+                        known_live_layouts,
+                    )
+                })
+                .transpose()?
+                .map(Box::new),
+        },
+        BroadSqlExprKind::Exists { negated, subquery } => Expr::Exists {
+            negated: *negated,
+            subquery: Box::new(lower_broad_public_read_query(
+                subquery,
                 registry,
                 dialect,
                 active_version_id,
                 known_live_layouts,
-                substitutions,
-            )
+            )?),
+        },
+        BroadSqlExprKind::ScalarSubquery(subquery) => {
+            Expr::Subquery(Box::new(lower_broad_public_read_query(
+                subquery,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?))
         }
+        BroadSqlExprKind::Tuple(items) => Expr::Tuple(
+            items
+                .iter()
+                .map(|item| {
+                    lower_broad_sql_expr(
+                        item,
+                        registry,
+                        dialect,
+                        active_version_id,
+                        known_live_layouts,
+                    )
+                })
+                .collect::<Result<_, _>>()?,
+        ),
+        BroadSqlExprKind::Unsupported { diagnostics_sql } => {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                "broad public-read physical lowering does not support unsupported expression '{}'",
+                diagnostics_sql
+            ),
+            ))
+        }
+    })
+}
+
+fn lower_broad_sql_function(
+    function: &BroadSqlFunction,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<Function, LixError> {
+    Ok(Function {
+        name: function.name.clone(),
+        uses_odbc_syntax: function.uses_odbc_syntax,
+        parameters: lower_broad_sql_function_arguments(
+            &function.parameters,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?,
+        args: lower_broad_sql_function_arguments(
+            &function.args,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?,
+        filter: function
+            .filter
+            .as_ref()
+            .map(|expr| {
+                lower_broad_sql_expr(
+                    expr,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .transpose()?
+            .map(Box::new),
+        null_treatment: function.null_treatment,
+        over: None,
+        within_group: function
+            .within_group
+            .iter()
+            .map(|expr| {
+                lower_broad_public_read_order_by_expr(
+                    expr,
+                    registry,
+                    dialect,
+                    active_version_id,
+                    known_live_layouts,
+                )
+            })
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn lower_broad_sql_function_arguments(
+    arguments: &BroadSqlFunctionArguments,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<FunctionArguments, LixError> {
+    Ok(match arguments {
+        BroadSqlFunctionArguments::None => FunctionArguments::None,
+        BroadSqlFunctionArguments::Subquery(query) => {
+            FunctionArguments::Subquery(Box::new(lower_broad_public_read_query(
+                query,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?))
+        }
+        BroadSqlFunctionArguments::List(list) => FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: list.duplicate_treatment,
+            args: list
+                .args
+                .iter()
+                .map(|arg| {
+                    lower_broad_sql_function_arg(
+                        arg,
+                        registry,
+                        dialect,
+                        active_version_id,
+                        known_live_layouts,
+                    )
+                })
+                .collect::<Result<_, _>>()?,
+            clauses: Vec::new(),
+        }),
+    })
+}
+
+fn lower_broad_sql_function_arg(
+    arg: &BroadSqlFunctionArg,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<FunctionArg, LixError> {
+    Ok(match arg {
+        BroadSqlFunctionArg::Named {
+            name,
+            arg,
+            operator,
+        } => FunctionArg::Named {
+            name: name.clone(),
+            arg: lower_broad_sql_function_arg_expr(
+                arg,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?,
+            operator: operator.clone(),
+        },
+        BroadSqlFunctionArg::ExprNamed {
+            name,
+            arg,
+            operator,
+        } => FunctionArg::ExprNamed {
+            name: lower_broad_sql_expr(
+                name,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?,
+            arg: lower_broad_sql_function_arg_expr(
+                arg,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?,
+            operator: operator.clone(),
+        },
+        BroadSqlFunctionArg::Unnamed(arg) => {
+            FunctionArg::Unnamed(lower_broad_sql_function_arg_expr(
+                arg,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?)
+        }
+    })
+}
+
+fn lower_broad_sql_function_arg_expr(
+    arg: &BroadSqlFunctionArgExpr,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<FunctionArgExpr, LixError> {
+    Ok(match arg {
+        BroadSqlFunctionArgExpr::Expr(expr) => FunctionArgExpr::Expr(lower_broad_sql_expr(
+            expr,
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        )?),
+        BroadSqlFunctionArgExpr::QualifiedWildcard(object_name) => {
+            FunctionArgExpr::QualifiedWildcard(object_name.clone())
+        }
+        BroadSqlFunctionArgExpr::Wildcard => FunctionArgExpr::Wildcard,
+    })
+}
+
+fn lower_broad_public_read_table_factor(
+    factor: &BroadPublicReadTableFactor,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<TableFactor, LixError> {
+    match factor {
+        BroadPublicReadTableFactor::Table {
+            alias, relation, ..
+        } => lower_broad_public_read_relation_factor(
+            relation,
+            alias.as_ref(),
+            registry,
+            dialect,
+            active_version_id,
+            known_live_layouts,
+        ),
         BroadPublicReadTableFactor::Derived {
-            provenance,
+            lateral,
+            alias,
             subquery,
             ..
-        } => {
-            let mut lowered = provenance.cloned().ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "broad public-read derived table lowering requires provenance",
-                )
-            })?;
-            if let TableFactor::Derived {
-                subquery: lowered_subquery,
-                ..
-            } = &mut lowered
-            {
-                *lowered_subquery = Box::new(lower_broad_public_read_query(
-                    subquery.as_ref(),
-                    registry,
-                    dialect,
-                    active_version_id,
-                    known_live_layouts,
-                    substitutions,
-                )?);
-            }
-            Ok(lowered)
-        }
+        } => Ok(TableFactor::Derived {
+            lateral: *lateral,
+            subquery: Box::new(lower_broad_public_read_query(
+                subquery,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+            alias: alias.as_ref().map(lower_broad_public_read_alias),
+        }),
         BroadPublicReadTableFactor::NestedJoin {
-            provenance,
+            alias,
             table_with_joins,
             ..
-        } => {
-            let mut lowered = provenance.cloned().ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "broad public-read nested join lowering requires provenance",
-                )
-            })?;
-            if let TableFactor::NestedJoin {
-                table_with_joins: lowered_table_with_joins,
-                ..
-            } = &mut lowered
-            {
-                *lowered_table_with_joins = Box::new(lower_broad_public_read_table_with_joins(
-                    table_with_joins.as_ref(),
-                    registry,
-                    dialect,
-                    active_version_id,
-                    known_live_layouts,
-                    substitutions,
-                )?);
-            }
-            Ok(lowered)
-        }
+        } => Ok(TableFactor::NestedJoin {
+            table_with_joins: Box::new(lower_broad_public_read_table_with_joins(
+                table_with_joins,
+                registry,
+                dialect,
+                active_version_id,
+                known_live_layouts,
+            )?),
+            alias: alias.as_ref().map(lower_broad_public_read_alias),
+        }),
         BroadPublicReadTableFactor::Other { .. } => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "broad public-read physical lowering does not support legacy table-factor fallbacks",
@@ -1644,14 +2430,13 @@ fn lower_broad_public_read_table_factor(
     }
 }
 
-fn lower_broad_public_read_relation(
+fn lower_broad_public_read_relation_factor(
     relation: &BroadPublicReadRelation,
-    original: &TableFactor,
+    alias: Option<&BroadPublicReadAlias>,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<TableFactor, LixError> {
     match relation {
         BroadPublicReadRelation::LoweredPublic(binding) => {
@@ -1664,38 +2449,37 @@ fn lower_broad_public_read_relation(
                 known_live_layouts,
             )?
             else {
-                return Ok(original.clone());
+                return Ok(table_factor_for_relation_name(
+                    &binding.descriptor.public_name,
+                    alias,
+                ));
             };
-            let TableFactor::Table { alias, .. } = original else {
-                return Ok(original.clone());
-            };
-            Ok(substitutions.replacement_table_factor(
-                &binding.descriptor.public_name,
-                alias.clone().or_else(|| {
-                    Some(TableAlias {
-                        explicit: true,
-                        name: Ident::new(&binding.descriptor.public_name),
-                        columns: Vec::new(),
-                    })
-                }),
-                source_sql,
-            ))
+            with_current_broad_render_substitution_collector(|collector| {
+                Ok(collector.replacement_table_factor(
+                    &binding.descriptor.public_name,
+                    alias.map(lower_broad_public_read_alias),
+                    source_sql,
+                ))
+            })
         }
-        BroadPublicReadRelation::Public(_)
-        | BroadPublicReadRelation::Internal(_)
-        | BroadPublicReadRelation::External(_)
-        | BroadPublicReadRelation::Cte(_) => Ok(original.clone()),
+        BroadPublicReadRelation::Public(binding) => Ok(table_factor_for_relation_name(
+            &binding.descriptor.public_name,
+            alias,
+        )),
+        BroadPublicReadRelation::Internal(relation_name)
+        | BroadPublicReadRelation::External(relation_name)
+        | BroadPublicReadRelation::Cte(relation_name) => {
+            Ok(table_factor_for_relation_name(relation_name, alias))
+        }
     }
 }
 
-fn lower_broad_public_read_table_relation(
+fn lower_broad_public_read_table_set_expr(
     relation: &BroadPublicReadRelation,
-    original: &SetExpr,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-    substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<SetExpr, LixError> {
     match relation {
         BroadPublicReadRelation::LoweredPublic(binding) => {
@@ -1708,59 +2492,125 @@ fn lower_broad_public_read_table_relation(
                 known_live_layouts,
             )?
             else {
-                return Ok(original.clone());
+                return Ok(table_set_expr_for_relation_name(
+                    &binding.descriptor.public_name,
+                ));
             };
-            Ok(SetExpr::Query(Box::new(Query {
-                with: None,
-                body: Box::new(SetExpr::Select(Box::new(Select {
-                    select_token: AttachedToken::empty(),
-                    distinct: None,
-                    top: None,
-                    top_before_distinct: false,
-                    projection: vec![SelectItem::Wildcard(Default::default())],
-                    exclude: None,
-                    into: None,
-                    from: vec![TableWithJoins {
-                        relation: substitutions.replacement_table_factor(
-                            &binding.descriptor.public_name,
-                            Some(TableAlias {
-                                explicit: true,
-                                name: Ident::new(&binding.descriptor.public_name),
-                                columns: Vec::new(),
-                            }),
-                            source_sql,
-                        ),
-                        joins: Vec::new(),
-                    }],
-                    lateral_views: Vec::new(),
-                    prewhere: None,
-                    selection: None,
-                    group_by: GroupByExpr::Expressions(Vec::new(), Vec::new()),
-                    cluster_by: Vec::new(),
-                    distribute_by: Vec::new(),
-                    sort_by: Vec::new(),
-                    having: None,
-                    named_window: Vec::new(),
-                    qualify: None,
-                    window_before_qualify: false,
-                    value_table_mode: None,
-                    connect_by: None,
-                    flavor: sqlparser::ast::SelectFlavor::Standard,
-                }))),
-                order_by: None,
-                limit_clause: None,
-                fetch: None,
-                locks: Vec::new(),
-                for_clause: None,
-                settings: None,
-                format_clause: None,
-                pipe_operators: Vec::new(),
-            })))
+            with_current_broad_render_substitution_collector(|collector| {
+                Ok(SetExpr::Query(Box::new(Query {
+                    with: None,
+                    body: Box::new(SetExpr::Select(Box::new(Select {
+                        select_token: AttachedToken::empty(),
+                        distinct: None,
+                        top: None,
+                        top_before_distinct: false,
+                        projection: vec![SelectItem::Wildcard(Default::default())],
+                        exclude: None,
+                        into: None,
+                        from: vec![TableWithJoins {
+                            relation: collector.replacement_table_factor(
+                                &binding.descriptor.public_name,
+                                None,
+                                source_sql,
+                            ),
+                            joins: Vec::new(),
+                        }],
+                        lateral_views: Vec::new(),
+                        prewhere: None,
+                        selection: None,
+                        group_by: GroupByExpr::Expressions(Vec::new(), Vec::new()),
+                        cluster_by: Vec::new(),
+                        distribute_by: Vec::new(),
+                        sort_by: Vec::new(),
+                        having: None,
+                        named_window: Vec::new(),
+                        qualify: None,
+                        window_before_qualify: false,
+                        value_table_mode: None,
+                        connect_by: None,
+                        flavor: SelectFlavor::Standard,
+                    }))),
+                    order_by: None,
+                    limit_clause: None,
+                    fetch: None,
+                    locks: Vec::new(),
+                    for_clause: None,
+                    settings: None,
+                    format_clause: None,
+                    pipe_operators: Vec::new(),
+                })))
+            })
         }
-        BroadPublicReadRelation::Public(_)
-        | BroadPublicReadRelation::Internal(_)
-        | BroadPublicReadRelation::External(_)
-        | BroadPublicReadRelation::Cte(_) => Ok(original.clone()),
+        BroadPublicReadRelation::Public(binding) => Ok(table_set_expr_for_relation_name(
+            &binding.descriptor.public_name,
+        )),
+        BroadPublicReadRelation::Internal(relation_name)
+        | BroadPublicReadRelation::External(relation_name)
+        | BroadPublicReadRelation::Cte(relation_name) => {
+            Ok(table_set_expr_for_relation_name(relation_name))
+        }
+    }
+}
+
+fn lower_broad_public_read_alias(alias: &BroadPublicReadAlias) -> TableAlias {
+    TableAlias {
+        explicit: alias.explicit,
+        name: Ident::new(&alias.name),
+        columns: alias
+            .columns
+            .iter()
+            .cloned()
+            .map(sqlparser::ast::TableAliasColumnDef::from_name)
+            .collect(),
+    }
+}
+
+fn table_factor_for_relation_name(
+    relation_name: &str,
+    alias: Option<&BroadPublicReadAlias>,
+) -> TableFactor {
+    TableFactor::Table {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(relation_name))]),
+        alias: alias.map(lower_broad_public_read_alias),
+        args: None,
+        with_hints: vec![],
+        version: None,
+        with_ordinality: false,
+        partitions: vec![],
+        json_path: None,
+        sample: None,
+        index_hints: vec![],
+    }
+}
+
+fn table_set_expr_for_relation_name(relation_name: &str) -> SetExpr {
+    SetExpr::Table(Box::new(Table {
+        table_name: Some(relation_name.to_string()),
+        schema_name: None,
+    }))
+}
+
+fn lower_broad_public_read_set_operation_kind(
+    kind: BroadPublicReadSetOperationKind,
+) -> SetOperator {
+    match kind {
+        BroadPublicReadSetOperationKind::Union => SetOperator::Union,
+        BroadPublicReadSetOperationKind::Except => SetOperator::Except,
+        BroadPublicReadSetOperationKind::Intersect => SetOperator::Intersect,
+        BroadPublicReadSetOperationKind::Minus => SetOperator::Minus,
+    }
+}
+
+fn lower_broad_public_read_set_quantifier(
+    quantifier: Option<BroadPublicReadSetQuantifier>,
+) -> SetQuantifier {
+    match quantifier {
+        Some(BroadPublicReadSetQuantifier::All) => SetQuantifier::All,
+        Some(BroadPublicReadSetQuantifier::Distinct) => SetQuantifier::Distinct,
+        Some(BroadPublicReadSetQuantifier::ByName) => SetQuantifier::ByName,
+        Some(BroadPublicReadSetQuantifier::AllByName) => SetQuantifier::AllByName,
+        Some(BroadPublicReadSetQuantifier::DistinctByName) => SetQuantifier::DistinctByName,
+        None => SetQuantifier::None,
     }
 }
 
