@@ -71,7 +71,7 @@ use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     AnalyzeFormatKind, DescribeAlias, Expr, SetOperator, SetQuantifier, Statement, UtilityOption,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1276,12 +1276,23 @@ pub(crate) enum ExplainBroadPublicReadRelationSnapshot {
     Cte { relation_name: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExplainBroadPublicReadRelationSummarySnapshot {
+    pub(crate) public_relations: Vec<String>,
+    pub(crate) lowered_public_relations: Vec<String>,
+    pub(crate) internal_relations: Vec<String>,
+    pub(crate) external_relations: Vec<String>,
+    pub(crate) cte_relations: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ExplainPublicReadLogicalPlan {
     pub(crate) strategy: ExplainPublicReadStrategy,
     pub(crate) surface_bindings: Vec<SurfaceBindingSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) broad_statement: Option<Box<ExplainBroadPublicReadStatementSnapshot>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) broad_relation_summary: Option<Box<ExplainBroadPublicReadRelationSummarySnapshot>>,
     pub(crate) read: Option<Box<StructuredPublicReadSnapshot>>,
     pub(crate) dependency_spec: Option<Box<DependencySpecSnapshot>>,
     pub(crate) effective_state_request: Option<Box<EffectiveStateRequestSnapshot>>,
@@ -1570,16 +1581,59 @@ fn render_semantic_statement_text(statement: &ExplainSemanticStatement) -> Strin
 
 fn render_logical_plan_text(plan: &ExplainLogicalPlanSnapshot) -> String {
     match plan {
-        ExplainLogicalPlanSnapshot::PublicRead(details) => format!(
-            "kind: public_read\nstrategy: {}\nsurfaces: {}\nbroad_statement: {}\nstructured_read: {}\ndirect_plan: {}\ndependency_spec: {}\neffective_state_plan: {}",
-            explain_public_read_strategy_label(details.strategy),
-            join_public_names(&details.surface_bindings),
-            yes_no(details.broad_statement.is_some()),
-            yes_no(details.read.is_some()),
-            yes_no(details.direct_plan.is_some()),
-            yes_no(details.dependency_spec.is_some()),
-            yes_no(details.effective_state_plan.is_some()),
-        ),
+        ExplainLogicalPlanSnapshot::PublicRead(details) => {
+            let mut lines = vec![
+                "kind: public_read".to_string(),
+                format!(
+                    "strategy: {}",
+                    explain_public_read_strategy_label(details.strategy)
+                ),
+                format!("surfaces: {}", join_public_names(&details.surface_bindings)),
+                format!(
+                    "broad_statement: {}",
+                    yes_no(details.broad_statement.is_some())
+                ),
+            ];
+            if let Some(summary) = details.broad_relation_summary.as_ref() {
+                lines.push(format!(
+                    "broad_public_relations: {}",
+                    join_names_or_none(&summary.public_relations)
+                ));
+                lines.push(format!(
+                    "broad_lowered_public_relations: {}",
+                    join_names_or_none(&summary.lowered_public_relations)
+                ));
+                lines.push(format!(
+                    "broad_internal_relations: {}",
+                    join_names_or_none(&summary.internal_relations)
+                ));
+                lines.push(format!(
+                    "broad_external_relations: {}",
+                    join_names_or_none(&summary.external_relations)
+                ));
+                lines.push(format!(
+                    "broad_cte_relations: {}",
+                    join_names_or_none(&summary.cte_relations)
+                ));
+            }
+            lines.push(format!(
+                "structured_read: {}",
+                yes_no(details.read.is_some())
+            ));
+            lines.push(format!(
+                "direct_plan: {}",
+                yes_no(details.direct_plan.is_some())
+            ));
+            lines.push(format!(
+                "dependency_spec: {}",
+                yes_no(details.dependency_spec.is_some())
+            ));
+            lines.push(format!(
+                "effective_state_plan: {}",
+                yes_no(details.effective_state_plan.is_some())
+            ));
+            lines.join("\n")
+        }
         ExplainLogicalPlanSnapshot::PublicWrite(details) => format!(
             "kind: public_write\ntarget: {}\noperation: {}\nstate_source: {}",
             details.planned_write.command.target.public_name,
@@ -2020,14 +2074,15 @@ fn explain_output_format_from_word(word: &str) -> Result<ExplainOutputFormat, Li
 
 pub(crate) fn build_public_read_explain_artifacts(
     input: PublicReadExplainBuildInput,
-) -> ExplainArtifacts {
+) -> Result<ExplainArtifacts, LixError> {
+    validate_public_read_explain_artifacts(&input)?;
     let executor_artifacts = executor_artifacts_for_public_read(
         &input.semantics,
         &input.optimized_logical_plan,
         &input.runtime_artifacts,
     );
 
-    build_explain_artifacts(
+    Ok(build_explain_artifacts(
         input.request,
         Some(SemanticStatement::PublicRead(input.semantics)),
         Some(LogicalPlan::PublicRead(input.logical_plan)),
@@ -2036,7 +2091,7 @@ pub(crate) fn build_public_read_explain_artifacts(
         executor_artifacts,
         input.optimizer_passes,
         input.stage_timings,
-    )
+    ))
 }
 
 pub(crate) fn build_public_write_explain_artifacts(
@@ -2062,6 +2117,37 @@ pub(crate) fn build_public_write_explain_artifacts(
         Vec::new(),
         input.stage_timings,
     )
+}
+
+fn validate_public_read_explain_artifacts(
+    input: &PublicReadExplainBuildInput,
+) -> Result<(), LixError> {
+    if broad_public_read_explain_artifacts_collapsed(
+        &input.logical_plan,
+        &input.optimized_logical_plan,
+        &input.optimizer_passes,
+    ) {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "public read explain artifacts are inconsistent: broad optimizer reported changes but logical_plan and optimized_logical_plan collapsed to the same artifact",
+        ));
+    }
+    Ok(())
+}
+
+fn broad_public_read_explain_artifacts_collapsed(
+    logical_plan: &PublicReadLogicalPlan,
+    optimized_logical_plan: &PublicReadLogicalPlan,
+    optimizer_passes: &[OptimizerPassTrace],
+) -> bool {
+    matches!(
+        (logical_plan, optimized_logical_plan),
+        (
+            PublicReadLogicalPlan::Broad { .. },
+            PublicReadLogicalPlan::Broad { .. }
+        )
+    ) && optimizer_passes.iter().any(|pass| pass.changed)
+        && logical_plan == optimized_logical_plan
 }
 
 pub(crate) fn build_internal_explain_artifacts(
@@ -2388,6 +2474,31 @@ fn broad_public_read_statement_snapshot(
     }
 }
 
+fn broad_public_read_relation_summary_snapshot(
+    statement: &BroadPublicReadStatement,
+) -> ExplainBroadPublicReadRelationSummarySnapshot {
+    let mut public_relations = BTreeSet::new();
+    let mut lowered_public_relations = BTreeSet::new();
+    let mut internal_relations = BTreeSet::new();
+    let mut external_relations = BTreeSet::new();
+    let mut cte_relations = BTreeSet::new();
+    collect_broad_public_read_relation_summary(
+        statement,
+        &mut public_relations,
+        &mut lowered_public_relations,
+        &mut internal_relations,
+        &mut external_relations,
+        &mut cte_relations,
+    );
+    ExplainBroadPublicReadRelationSummarySnapshot {
+        public_relations: public_relations.into_iter().collect(),
+        lowered_public_relations: lowered_public_relations.into_iter().collect(),
+        internal_relations: internal_relations.into_iter().collect(),
+        external_relations: external_relations.into_iter().collect(),
+        cte_relations: cte_relations.into_iter().collect(),
+    }
+}
+
 fn broad_public_read_query_snapshot(
     query: &BroadPublicReadQuery,
 ) -> ExplainBroadPublicReadQuerySnapshot {
@@ -2544,6 +2655,223 @@ fn broad_public_read_relation_snapshot(
     }
 }
 
+fn collect_broad_public_read_relation_summary(
+    statement: &BroadPublicReadStatement,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
+    match statement {
+        BroadPublicReadStatement::Query(query) => collect_broad_public_read_query_relation_summary(
+            query,
+            public_relations,
+            lowered_public_relations,
+            internal_relations,
+            external_relations,
+            cte_relations,
+        ),
+        BroadPublicReadStatement::Explain { statement, .. } => {
+            collect_broad_public_read_relation_summary(
+                statement,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            )
+        }
+    }
+}
+
+fn collect_broad_public_read_query_relation_summary(
+    query: &BroadPublicReadQuery,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            collect_broad_public_read_query_relation_summary(
+                cte,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+    }
+    collect_broad_public_read_set_expr_relation_summary(
+        &query.body,
+        public_relations,
+        lowered_public_relations,
+        internal_relations,
+        external_relations,
+        cte_relations,
+    );
+}
+
+fn collect_broad_public_read_set_expr_relation_summary(
+    expr: &BroadPublicReadSetExpr,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
+    match expr {
+        BroadPublicReadSetExpr::Select(select) => {
+            for table in &select.from {
+                collect_broad_public_read_table_with_joins_relation_summary(
+                    table,
+                    public_relations,
+                    lowered_public_relations,
+                    internal_relations,
+                    external_relations,
+                    cte_relations,
+                );
+            }
+        }
+        BroadPublicReadSetExpr::Query(query) => collect_broad_public_read_query_relation_summary(
+            query,
+            public_relations,
+            lowered_public_relations,
+            internal_relations,
+            external_relations,
+            cte_relations,
+        ),
+        BroadPublicReadSetExpr::SetOperation { left, right, .. } => {
+            collect_broad_public_read_set_expr_relation_summary(
+                left,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+            collect_broad_public_read_set_expr_relation_summary(
+                right,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+        BroadPublicReadSetExpr::Table { relation, .. } => collect_broad_public_read_relation_name(
+            relation,
+            public_relations,
+            lowered_public_relations,
+            internal_relations,
+            external_relations,
+            cte_relations,
+        ),
+        BroadPublicReadSetExpr::Other(_) => {}
+    }
+}
+
+fn collect_broad_public_read_table_with_joins_relation_summary(
+    table: &BroadPublicReadTableWithJoins,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
+    collect_broad_public_read_table_factor_relation_summary(
+        &table.relation,
+        public_relations,
+        lowered_public_relations,
+        internal_relations,
+        external_relations,
+        cte_relations,
+    );
+    for join in &table.joins {
+        collect_broad_public_read_table_factor_relation_summary(
+            &join.relation,
+            public_relations,
+            lowered_public_relations,
+            internal_relations,
+            external_relations,
+            cte_relations,
+        );
+    }
+}
+
+fn collect_broad_public_read_table_factor_relation_summary(
+    factor: &BroadPublicReadTableFactor,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
+    match factor {
+        BroadPublicReadTableFactor::Table { relation, .. } => {
+            collect_broad_public_read_relation_name(
+                relation,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            )
+        }
+        BroadPublicReadTableFactor::Derived { subquery, .. } => {
+            collect_broad_public_read_query_relation_summary(
+                subquery,
+                public_relations,
+                lowered_public_relations,
+                internal_relations,
+                external_relations,
+                cte_relations,
+            );
+        }
+        BroadPublicReadTableFactor::NestedJoin {
+            table_with_joins, ..
+        } => collect_broad_public_read_table_with_joins_relation_summary(
+            table_with_joins,
+            public_relations,
+            lowered_public_relations,
+            internal_relations,
+            external_relations,
+            cte_relations,
+        ),
+        BroadPublicReadTableFactor::Other(_) => {}
+    }
+}
+
+fn collect_broad_public_read_relation_name(
+    relation: &BroadPublicReadRelation,
+    public_relations: &mut BTreeSet<String>,
+    lowered_public_relations: &mut BTreeSet<String>,
+    internal_relations: &mut BTreeSet<String>,
+    external_relations: &mut BTreeSet<String>,
+    cte_relations: &mut BTreeSet<String>,
+) {
+    match relation {
+        BroadPublicReadRelation::Public(binding) => {
+            public_relations.insert(binding.descriptor.public_name.clone());
+        }
+        BroadPublicReadRelation::LoweredPublic(binding) => {
+            lowered_public_relations.insert(binding.descriptor.public_name.clone());
+        }
+        BroadPublicReadRelation::Internal(name) => {
+            internal_relations.insert(name.clone());
+        }
+        BroadPublicReadRelation::External(name) => {
+            external_relations.insert(name.clone());
+        }
+        BroadPublicReadRelation::Cte(name) => {
+            cte_relations.insert(name.clone());
+        }
+    }
+}
+
 fn explain_broad_set_operation_kind(operator: SetOperator) -> ExplainBroadSetOperationKind {
     match operator {
         SetOperator::Union => ExplainBroadSetOperationKind::Union,
@@ -2600,6 +2928,7 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                     strategy: ExplainPublicReadStrategy::Structured,
                     surface_bindings: vec![surface_binding_snapshot(&read.surface_binding)],
                     broad_statement: None,
+                    broad_relation_summary: None,
                     read: Some(Box::new(structured_public_read_snapshot(read))),
                     dependency_spec: dependency_spec
                         .as_ref()
@@ -2625,6 +2954,7 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                     strategy: ExplainPublicReadStrategy::DirectHistory,
                     surface_bindings: vec![surface_binding_snapshot(&read.surface_binding)],
                     broad_statement: None,
+                    broad_relation_summary: None,
                     read: Some(Box::new(structured_public_read_snapshot(read))),
                     dependency_spec: dependency_spec
                         .as_ref()
@@ -2653,6 +2983,9 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                     broad_statement: Some(Box::new(broad_public_read_statement_snapshot(
                         broad_statement,
                     ))),
+                    broad_relation_summary: Some(Box::new(
+                        broad_public_read_relation_summary_snapshot(broad_statement),
+                    )),
                     read: None,
                     dependency_spec: dependency_spec
                         .as_ref()
@@ -4567,6 +4900,13 @@ fn join_public_names(bindings: &[SurfaceBindingSnapshot]) -> String {
         .map(|binding| binding.public_name.as_str())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn join_names_or_none(names: &[String]) -> String {
+    if names.is_empty() {
+        return "(none)".to_string();
+    }
+    names.join(", ")
 }
 
 fn yes_no(value: bool) -> &'static str {

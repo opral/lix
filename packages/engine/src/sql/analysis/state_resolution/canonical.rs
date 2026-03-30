@@ -16,10 +16,15 @@ pub(crate) fn canonicalize_state_resolution(statements: &[Statement]) -> Canonic
 }
 
 pub(crate) fn is_query_only_statements(statements: &[Statement]) -> bool {
-    !statements.is_empty()
-        && statements
-            .iter()
-            .all(|statement| matches!(statement, Statement::Query(_)))
+    !statements.is_empty() && statements.iter().all(statement_is_query_only)
+}
+
+fn statement_is_query_only(statement: &Statement) -> bool {
+    match statement {
+        Statement::Query(_) => true,
+        Statement::Explain { statement, .. } => statement_is_query_only(statement.as_ref()),
+        _ => false,
+    }
 }
 
 pub(crate) fn should_invalidate_installed_plugins_cache_for_statements(
@@ -70,4 +75,29 @@ fn object_name_targets_table_name(name: &ObjectName, table_name: &str) -> bool {
         .and_then(ObjectNamePart::as_ident)
         .map(|ident| ident.value.eq_ignore_ascii_case(table_name))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_query_only_statements;
+
+    fn parse_one(sql: &str) -> sqlparser::ast::Statement {
+        crate::sql::parser::parse_sql_script(sql)
+            .expect("SQL should parse")
+            .pop()
+            .expect("single statement")
+    }
+
+    #[test]
+    fn explain_wrapped_query_counts_as_read_only() {
+        let statement = parse_one("EXPLAIN ANALYZE SELECT 1");
+        assert!(is_query_only_statements(&[statement]));
+    }
+
+    #[test]
+    fn explain_wrapped_insert_is_not_read_only() {
+        let statement =
+            parse_one("EXPLAIN INSERT INTO lix_active_version (version_id) VALUES ('main')");
+        assert!(!is_query_only_statements(&[statement]));
+    }
 }

@@ -24,6 +24,13 @@ fn explain_text_rows(result: &lix_engine::ExecuteResult) -> Vec<(&str, &str)> {
         .collect()
 }
 
+fn explain_text_section<'a>(result: &'a lix_engine::ExecuteResult, key: &str) -> &'a str {
+    explain_text_rows(result)
+        .into_iter()
+        .find_map(|(candidate_key, value)| (candidate_key == key).then_some(value))
+        .unwrap_or_else(|| panic!("FORMAT TEXT should include {key}"))
+}
+
 fn explain_stage_names(explain_json: &serde_json::Value) -> Vec<String> {
     explain_json
         .get("stage_timings")
@@ -79,6 +86,18 @@ fn json_bool_at(value: &JsonValue, key: &str, context: &str) -> bool {
         .get(key)
         .and_then(JsonValue::as_bool)
         .unwrap_or_else(|| panic!("{context}.{key} should be a bool"))
+}
+
+fn assert_string_array(value: &JsonValue, expected: &[&str], context: &str) {
+    let actual = json_array(value, context)
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .unwrap_or_else(|| panic!("{context} items should be strings"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "{context} should match the contract");
 }
 
 fn assert_object_keys(object: &Map<String, JsonValue>, expected: &[&str], context: &str) {
@@ -204,6 +223,48 @@ fn assert_no_rust_debug_leaks(explain_json: &JsonValue) {
             "explain JSON should not contain Rust debug fragment {forbidden}: {serialized}"
         );
     }
+}
+
+fn assert_explain_request_json(
+    result: &lix_engine::ExecuteResult,
+    expected_mode: &str,
+    expected_format: &str,
+) {
+    assert_eq!(
+        result.statements[0].columns,
+        vec!["explain_json".to_string()],
+        "FORMAT JSON should expose a single explain_json column"
+    );
+    let request = json_object_at(explain_json_payload(result), "request", "explain_json");
+    assert_eq!(
+        request.get("mode").and_then(JsonValue::as_str),
+        Some(expected_mode)
+    );
+    assert_eq!(
+        request.get("format").and_then(JsonValue::as_str),
+        Some(expected_format)
+    );
+}
+
+fn assert_explain_request_text(
+    result: &lix_engine::ExecuteResult,
+    expected_mode: &str,
+    expected_format: &str,
+) {
+    assert_eq!(
+        result.statements[0].columns,
+        vec!["explain_key".to_string(), "explain_value".to_string()],
+        "FORMAT TEXT should expose explain_key/explain_value rows"
+    );
+    let request = explain_text_section(result, "request");
+    assert!(
+        request.contains(&format!("mode: {expected_mode}")),
+        "FORMAT TEXT request should contain mode: {expected_mode}: {request}"
+    );
+    assert!(
+        request.contains(&format!("format: {expected_format}")),
+        "FORMAT TEXT request should contain format: {expected_format}: {request}"
+    );
 }
 
 fn assert_broad_public_read_statement_snapshot(
@@ -360,6 +421,13 @@ fn assert_broad_public_read_typed_statement_contract(explain_json: &JsonValue) {
         "public",
         "lix_state_by_version",
     );
+    assert_broad_public_read_relation_summary(
+        logical_details
+            .get("broad_relation_summary")
+            .expect("logical_plan.details should include broad_relation_summary"),
+        &["lix_state", "lix_state_by_version"],
+        &[],
+    );
 
     let optimized_logical_plan =
         json_object_at(explain_json, "optimized_logical_plan", "explain_json");
@@ -375,6 +443,176 @@ fn assert_broad_public_read_typed_statement_contract(explain_json: &JsonValue) {
         "lix_state",
         "lowered_public",
         "lix_state_by_version",
+    );
+    assert_broad_public_read_relation_summary(
+        optimized_details
+            .get("broad_relation_summary")
+            .expect("optimized_logical_plan.details should include broad_relation_summary"),
+        &[],
+        &["lix_state", "lix_state_by_version"],
+    );
+    assert_ne!(
+        logical_details.get("broad_statement"),
+        optimized_details.get("broad_statement"),
+        "broad logical_plan and optimized_logical_plan should stay distinct when optimization rewrites the broad IR"
+    );
+    assert_ne!(
+        logical_details.get("broad_relation_summary"),
+        optimized_details.get("broad_relation_summary"),
+        "broad logical summaries should differ when optimization rewrites public relations"
+    );
+    assert_broad_public_read_physical_execution_contract(explain_json);
+}
+
+fn assert_broad_public_read_relation_summary(
+    summary: &JsonValue,
+    expected_public_relations: &[&str],
+    expected_lowered_public_relations: &[&str],
+) {
+    let summary = json_object(summary, "broad_relation_summary");
+    assert_object_keys(
+        summary,
+        &[
+            "cte_relations",
+            "external_relations",
+            "internal_relations",
+            "lowered_public_relations",
+            "public_relations",
+        ],
+        "broad_relation_summary",
+    );
+    assert_string_array(
+        summary
+            .get("public_relations")
+            .expect("broad_relation_summary should include public_relations"),
+        expected_public_relations,
+        "broad_relation_summary.public_relations",
+    );
+    assert_string_array(
+        summary
+            .get("lowered_public_relations")
+            .expect("broad_relation_summary should include lowered_public_relations"),
+        expected_lowered_public_relations,
+        "broad_relation_summary.lowered_public_relations",
+    );
+    assert_string_array(
+        summary
+            .get("internal_relations")
+            .expect("broad_relation_summary should include internal_relations"),
+        &[],
+        "broad_relation_summary.internal_relations",
+    );
+    assert_string_array(
+        summary
+            .get("external_relations")
+            .expect("broad_relation_summary should include external_relations"),
+        &[],
+        "broad_relation_summary.external_relations",
+    );
+    assert_string_array(
+        summary
+            .get("cte_relations")
+            .expect("broad_relation_summary should include cte_relations"),
+        &[],
+        "broad_relation_summary.cte_relations",
+    );
+}
+
+fn assert_broad_public_read_physical_execution_contract(explain_json: &JsonValue) {
+    let logical_details = json_object_at(explain_json, "logical_plan", "explain_json")
+        .get("details")
+        .map(|value| json_object(value, "logical_plan.details"))
+        .expect("logical_plan should include details");
+    let optimized_details = json_object_at(explain_json, "optimized_logical_plan", "explain_json")
+        .get("details")
+        .map(|value| json_object(value, "optimized_logical_plan.details"))
+        .expect("optimized_logical_plan should include details");
+    assert!(
+        logical_details.get("shell_statement_sql").is_none(),
+        "logical broad artifacts should not expose physical shell SQL"
+    );
+    assert!(
+        optimized_details.get("shell_statement_sql").is_none(),
+        "optimized logical broad artifacts should not expose physical shell SQL"
+    );
+    assert!(
+        logical_details.get("relation_render_nodes").is_none(),
+        "logical broad artifacts should not expose terminal relation render nodes"
+    );
+    assert!(
+        optimized_details.get("relation_render_nodes").is_none(),
+        "optimized logical broad artifacts should not expose terminal relation render nodes"
+    );
+
+    let physical_details = json_object_at(explain_json, "physical_plan", "explain_json")
+        .get("details")
+        .map(|value| json_object(value, "physical_plan.details"))
+        .expect("physical_plan should include details");
+    assert_eq!(
+        physical_details.get("kind").and_then(JsonValue::as_str),
+        Some("lowered_sql")
+    );
+    let lowered_program = physical_details
+        .get("details")
+        .map(|value| json_object(value, "physical_plan.details.details"))
+        .expect("physical_plan.details should include lowered_sql details");
+    assert_object_keys(
+        lowered_program,
+        &["pushdown_decision", "result_columns", "statements"],
+        "physical_plan.details.details",
+    );
+
+    let statements = json_array(
+        lowered_program
+            .get("statements")
+            .expect("physical_plan.details.details should include statements"),
+        "physical_plan.details.details.statements",
+    );
+    assert_eq!(statements.len(), 1);
+    let statement = json_object(
+        &statements[0],
+        "physical_plan.details.details.statements[0]",
+    );
+    assert_object_keys(
+        statement,
+        &["bindings", "relation_render_nodes", "shell_statement_sql"],
+        "physical_plan.details.details.statements[0]",
+    );
+    let shell_statement_sql = statement
+        .get("shell_statement_sql")
+        .and_then(JsonValue::as_str)
+        .expect("physical broad plan should expose shell_statement_sql");
+    assert!(
+        shell_statement_sql.contains("__lix_lowered_relation_"),
+        "physical broad shell should retain placeholder relation markers before executor SQL rendering"
+    );
+
+    let relation_render_nodes = json_array(
+        statement
+            .get("relation_render_nodes")
+            .expect("physical broad plan should expose relation_render_nodes"),
+        "physical_plan.details.details.statements[0].relation_render_nodes",
+    );
+    assert!(
+        !relation_render_nodes.is_empty(),
+        "physical broad plan should retain terminal relation render nodes"
+    );
+    let render_node = json_object(
+        &relation_render_nodes[0],
+        "physical_plan.details.details.statements[0].relation_render_nodes[0]",
+    );
+    assert_object_keys(
+        render_node,
+        &["alias", "placeholder_relation_name", "rendered_factor_sql"],
+        "physical_plan.details.details.statements[0].relation_render_nodes[0]",
+    );
+    let rendered_factor_sql = render_node
+        .get("rendered_factor_sql")
+        .and_then(JsonValue::as_str)
+        .expect("physical broad render node should expose rendered_factor_sql");
+    assert!(
+        rendered_factor_sql.contains("lix_internal_live_v1_lix_key_value"),
+        "physical broad render nodes should carry lowered backend SQL fragments"
     );
 }
 
@@ -1304,6 +1542,57 @@ simulation_test!(
 );
 
 simulation_test!(
+    explain_broad_public_read_text_shows_optimization_delta,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute(
+                "EXPLAIN (FORMAT TEXT) \
+                 SELECT s.schema_key, COUNT(*) \
+                 FROM lix_state s \
+                 JOIN lix_state_by_version sv ON sv.entity_id = s.entity_id \
+                 WHERE s.schema_key = 'lix_key_value' AND sv.lixcol_version_id = 'main' \
+                 GROUP BY s.schema_key \
+                 ORDER BY s.schema_key",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_text_explain_contract(
+            &result,
+            &["logical_plan", "optimized_logical_plan"],
+            &[
+                (
+                    "logical_plan",
+                    &[
+                        "kind: public_read",
+                        "strategy: broad",
+                        "broad_public_relations: lix_state, lix_state_by_version",
+                        "broad_lowered_public_relations: (none)",
+                    ],
+                ),
+                (
+                    "optimized_logical_plan",
+                    &[
+                        "kind: public_read",
+                        "strategy: broad",
+                        "broad_public_relations: (none)",
+                        "broad_lowered_public_relations: lix_state, lix_state_by_version",
+                    ],
+                ),
+            ],
+        );
+    }
+);
+
+simulation_test!(
     internal_explain_omits_unmeasured_stages,
     simulations = [sqlite, postgres],
     |sim| async move {
@@ -1541,6 +1830,87 @@ simulation_test!(
 );
 
 simulation_test!(
+    explain_analyze_internal_read_only_query_reports_runtime_metrics,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute("EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1 AS value", &[])
+            .await
+            .unwrap();
+
+        assert_explain_request_json(&result, "analyze", "json");
+        let explain_json = explain_json_payload(&result);
+        assert_eq!(
+            explain_json
+                .get("semantic_statement")
+                .and_then(|value| value.get("kind"))
+                .and_then(JsonValue::as_str),
+            Some("internal")
+        );
+        assert_eq!(
+            explain_json
+                .get("logical_plan")
+                .and_then(|value| value.get("kind"))
+                .and_then(JsonValue::as_str),
+            Some("internal")
+        );
+        assert_eq!(
+            explain_json
+                .get("optimized_logical_plan")
+                .and_then(|value| value.get("kind"))
+                .and_then(JsonValue::as_str),
+            Some("internal")
+        );
+        assert!(
+            explain_json.get("physical_plan").is_none(),
+            "internal analyzed explain should not invent a physical_plan section"
+        );
+        assert_stage_timings_contract(explain_json, &["parse", "logical_planning"]);
+        assert_missing_stage_names(
+            explain_json,
+            &[
+                "bind",
+                "semantic_analysis",
+                "optimizer",
+                "capability_resolution",
+                "physical_planning",
+                "executor_preparation",
+            ],
+        );
+        let analyzed_runtime = explain_json
+            .get("analyzed_runtime")
+            .and_then(|value| value.as_object())
+            .expect("internal EXPLAIN ANALYZE should expose analyzed_runtime");
+        assert_eq!(
+            analyzed_runtime
+                .get("output_row_count")
+                .and_then(|value| value.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            analyzed_runtime
+                .get("output_column_count")
+                .and_then(|value| value.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            analyzed_runtime
+                .get("output_columns")
+                .and_then(|value| value.as_array())
+                .cloned(),
+            Some(vec![serde_json::Value::String("value".to_string())])
+        );
+        assert_no_rust_debug_leaks(explain_json);
+    }
+);
+
+simulation_test!(
     plain_explain_omits_analyzed_runtime,
     simulations = [sqlite, postgres],
     |sim| async move {
@@ -1567,6 +1937,138 @@ simulation_test!(
             explain_json.get("analyzed_runtime").is_none(),
             "plain EXPLAIN should not expose analyzed runtime metrics"
         );
+    }
+);
+
+simulation_test!(
+    explain_launch_matrix_accepts_exact_supported_forms,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        struct AcceptedCase<'a> {
+            sql: &'a str,
+            expected_mode: &'a str,
+            expected_format: &'a str,
+        }
+
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let cases = [
+            AcceptedCase {
+                sql: "EXPLAIN SELECT 1 AS value",
+                expected_mode: "plan",
+                expected_format: "text",
+            },
+            AcceptedCase {
+                sql: "EXPLAIN ANALYZE SELECT 1 AS value",
+                expected_mode: "analyze",
+                expected_format: "text",
+            },
+            AcceptedCase {
+                sql: "EXPLAIN (FORMAT JSON) SELECT 1 AS value",
+                expected_mode: "plan",
+                expected_format: "json",
+            },
+            AcceptedCase {
+                sql: "EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1 AS value",
+                expected_mode: "analyze",
+                expected_format: "json",
+            },
+            AcceptedCase {
+                sql: "EXPLAIN (ANALYZE FALSE, FORMAT JSON) SELECT 1 AS value",
+                expected_mode: "plan",
+                expected_format: "json",
+            },
+            AcceptedCase {
+                sql: "EXPLAIN (FORMAT JSON, ANALYZE FALSE) SELECT 1 AS value",
+                expected_mode: "plan",
+                expected_format: "json",
+            },
+            AcceptedCase {
+                sql: "EXPLAIN (ANALYZE TRUE, FORMAT TEXT) SELECT 1 AS value",
+                expected_mode: "analyze",
+                expected_format: "text",
+            },
+        ];
+
+        for case in cases {
+            let result = engine.execute(case.sql, &[]).await.unwrap_or_else(|error| {
+                panic!(
+                    "accepted EXPLAIN form should succeed: {} -> {}",
+                    case.sql, error
+                )
+            });
+            match case.expected_format {
+                "json" => {
+                    assert_explain_request_json(&result, case.expected_mode, case.expected_format)
+                }
+                "text" => {
+                    assert_explain_request_text(&result, case.expected_mode, case.expected_format)
+                }
+                other => panic!("unsupported expected format {other}"),
+            }
+        }
+    }
+);
+
+simulation_test!(
+    explain_launch_matrix_rejects_exact_unsupported_forms,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        struct RejectedCase<'a> {
+            sql: &'a str,
+            expected_error_fragment: &'a str,
+        }
+
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let cases = [
+            RejectedCase {
+                sql: "EXPLAIN ESTIMATE SELECT 1",
+                expected_error_fragment: "unsupported EXPLAIN modifier ESTIMATE",
+            },
+            RejectedCase {
+                sql: "EXPLAIN (ANALYZE, ANALYZE FALSE) SELECT 1",
+                expected_error_fragment: "duplicate EXPLAIN option ANALYZE",
+            },
+            RejectedCase {
+                sql: "EXPLAIN (FORMAT JSON, FORMAT TEXT) SELECT 1",
+                expected_error_fragment: "duplicate EXPLAIN option FORMAT",
+            },
+            RejectedCase {
+                sql: "EXPLAIN (COSTS TRUE) SELECT 1",
+                expected_error_fragment: "unsupported EXPLAIN option COSTS",
+            },
+            RejectedCase {
+                sql: "EXPLAIN (ANALYZE 'maybe') SELECT 1",
+                expected_error_fragment: "invalid EXPLAIN option ANALYZE: expected TRUE or FALSE",
+            },
+            RejectedCase {
+                sql: "EXPLAIN (FORMAT 1) SELECT 1",
+                expected_error_fragment: "invalid EXPLAIN option FORMAT: expected TEXT or JSON",
+            },
+        ];
+
+        for case in cases {
+            let error = engine
+                .execute(case.sql, &[])
+                .await
+                .expect_err("unsupported EXPLAIN launch form should be rejected explicitly");
+            assert_eq!(error.code, "LIX_ERROR_UNKNOWN");
+            assert!(
+                error.description.contains(case.expected_error_fragment),
+                "unexpected error for {}: {}",
+                case.sql,
+                error.description
+            );
+        }
     }
 );
 
