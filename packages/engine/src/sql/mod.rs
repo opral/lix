@@ -1,7 +1,7 @@
 //! `sql/*` is the engine's SQL compiler subsystem.
 //!
 //! The long-term ownership model is stage-oriented:
-//! parser -> binder -> semantic IR -> logical plan -> optimizer
+//! parser -> binder -> semantic IR -> logical plan -> routing / optimizer
 //! -> physical plan -> executor -> explain.
 
 pub(crate) mod analysis;
@@ -17,6 +17,7 @@ pub(crate) mod logical_plan;
 pub(crate) mod optimizer;
 pub(crate) mod parser;
 pub(crate) mod physical_plan;
+pub(crate) mod routing;
 pub(crate) mod semantic_ir;
 pub(crate) mod services;
 pub(crate) mod storage;

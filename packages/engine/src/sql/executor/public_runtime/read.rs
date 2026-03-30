@@ -28,18 +28,16 @@ use crate::sql::logical_plan::{
     StateHistoryDirectReadPlan, StateHistoryPredicate, StateHistoryProjection,
     StateHistoryProjectionValue, StateHistorySortKey, StateHistorySortValue,
 };
-use crate::sql::optimizer::{
-    choose_specialized_public_read_strategy,
-    optimize_broad_public_read_statement_with_known_live_layouts,
-};
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::physical_plan::lowerer::{
-    bind_broad_public_read_statement_with_registry, lower_read_for_execution_with_layouts,
-    render_broad_public_read_statement_with_registry_and_active_version_id_and_layouts,
+    bind_broad_public_read_statement_with_registry,
+    lower_broad_public_read_for_execution_with_layouts, lower_read_for_execution_with_layouts,
 };
 use crate::sql::physical_plan::{
-    compile_lowered_read_statement, LoweredReadProgram, LoweredResultColumn, LoweredResultColumns,
-    PreparedPublicReadExecution,
+    LoweredReadProgram, LoweredResultColumn, LoweredResultColumns, PreparedPublicReadExecution,
+};
+use crate::sql::routing::{
+    route_broad_public_read_statement_with_known_live_layouts, route_public_read_execution_strategy,
 };
 use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_bound_public_surface_bindings;
 use crate::sql::semantic_ir::{
@@ -4354,8 +4352,8 @@ async fn try_prepare_public_read_via_specialized_optimization(
     // - semantic_analysis: canonicalize the bound statement into a structured public read and
     //   derive dependency/effective-state semantics.
     // - logical_planning: construct the structured logical plan before any execution-strategy
-    //   optimization happens.
-    // - optimizer: choose between direct-history execution and lowered-SQL execution.
+    //   routing happens.
+    // - routing: choose between direct-history execution and lowered-SQL execution.
     // - capability_resolution: load external schemas/layouts needed to lower specialized SQL
     //   execution once the strategy requires backend capability state.
     // - physical_planning: build the direct history plan or the lowered read program after any
@@ -4391,12 +4389,12 @@ async fn try_prepare_public_read_via_specialized_optimization(
     let logical_started = Instant::now();
     let logical_plan = analysis.logical_plan();
     stage_timings.record(ExplainStage::LogicalPlanning, logical_started.elapsed());
-    let optimizer_started = Instant::now();
-    let strategy_decision = choose_specialized_public_read_strategy(&surface_binding);
+    let routing_started = Instant::now();
+    let strategy_decision = route_public_read_execution_strategy(&surface_binding);
     let direct_execution =
         strategy_decision.direct_execution && is_direct_only_history_surface(&surface_binding);
-    stage_timings.record(ExplainStage::Optimizer, optimizer_started.elapsed());
-    let optimizer_passes = strategy_decision.pass_traces;
+    stage_timings.record(ExplainStage::Routing, routing_started.elapsed());
+    let routing_passes = strategy_decision.pass_traces;
 
     let physical_started = Instant::now();
     let (execution, pushdown_decision) = if direct_execution {
@@ -4626,9 +4624,9 @@ async fn try_prepare_public_read_via_specialized_optimization(
             pushdown_decision: pushdown_decision.clone(),
             lowered_sql,
         },
-        optimizer_passes: optimizer_passes.clone(),
+        routing_passes: routing_passes.clone(),
         stage_timings: stage_timings.finish(),
-    });
+    })?;
 
     Ok(SpecializedPublicReadPreparation::Prepared(
         PreparedPublicRead {
@@ -5030,9 +5028,9 @@ async fn prepare_public_read_via_surface_lowering(
 ) -> Result<Option<PreparedPublicRead>, LixError> {
     // Broad public-read stage semantics:
     // - logical_planning: construct the typed broad logical plan directly from broad binding.
-    // - capability_resolution: load external schemas/layouts required before broad optimization
+    // - capability_resolution: load external schemas/layouts required before broad routing
     //   can choose stable lowered relations.
-    // - optimizer: rewrite typed broad public relations into lowered typed broad relations.
+    // - routing: route typed broad public relations into lowerable broad relations.
     // - physical_planning: render backend SQL and compile the lowered read program from the
     //   optimized typed broad statement.
     // - executor_preparation: render backend SQL from the lowered read program.
@@ -5104,8 +5102,8 @@ async fn prepare_public_read_via_surface_lowering(
         capability_started.elapsed(),
     );
 
-    let optimizer_started = Instant::now();
-    let optimized_broad_read = match optimize_broad_public_read_statement_with_known_live_layouts(
+    let routing_started = Instant::now();
+    let routed_broad_read = match route_broad_public_read_statement_with_known_live_layouts(
         &broad_statement,
         registry,
         backend.dialect(),
@@ -5124,7 +5122,7 @@ async fn prepare_public_read_via_surface_lowering(
         }
     };
     let optimized_logical_plan = PublicReadLogicalPlan::Broad {
-        broad_statement: Box::new(optimized_broad_read.broad_statement.clone()),
+        broad_statement: Box::new(routed_broad_read.broad_statement.clone()),
         surface_bindings: read_summary.bound_surface_bindings.clone(),
         dependency_spec: dependency_spec.clone(),
     };
@@ -5139,35 +5137,19 @@ async fn prepare_public_read_via_surface_lowering(
             )
         },
     )?;
-    stage_timings.record(ExplainStage::Optimizer, optimizer_started.elapsed());
+    stage_timings.record(ExplainStage::Routing, routing_started.elapsed());
 
     let physical_started = Instant::now();
-    let rendered_statement =
-        render_broad_public_read_statement_with_registry_and_active_version_id_and_layouts(
-            &optimized_broad_read.broad_statement,
-            registry,
-            backend.dialect(),
-            active_version_id,
-            &known_live_layouts,
-        )?;
-    let rewritten_statement = rendered_statement.shell_statement;
-    if statement_references_public_surface(registry, &rewritten_statement) {
+    let Some(lowered_read) = lower_broad_public_read_for_execution_with_layouts(
+        &routed_broad_read.broad_statement,
+        registry,
+        backend.dialect(),
+        bound_statement.bound_parameters.len(),
+        active_version_id,
+        &known_live_layouts,
+    )?
+    else {
         return Ok(None);
-    }
-    if rewritten_statement == bound_statement.statement
-        && rendered_statement.relation_render_nodes.is_empty()
-    {
-        return Ok(None);
-    }
-    let lowered_read = LoweredReadProgram {
-        statements: vec![compile_lowered_read_statement(
-            backend.dialect(),
-            bound_statement.bound_parameters.len(),
-            rewritten_statement,
-            rendered_statement.relation_render_nodes,
-        )?],
-        pushdown_decision: PushdownDecision::default(),
-        result_columns: LoweredResultColumns::Static(Vec::new()),
     };
     stage_timings.record(ExplainStage::PhysicalPlanning, physical_started.elapsed());
     let freshness_contract =
@@ -5208,9 +5190,9 @@ async fn prepare_public_read_via_surface_lowering(
             pushdown_decision: Some(PushdownDecision::default()),
             lowered_sql,
         },
-        optimizer_passes: optimized_broad_read.pass_traces.clone(),
+        routing_passes: routed_broad_read.pass_traces.clone(),
         stage_timings: stage_timings.finish(),
-    });
+    })?;
 
     Ok(Some(PreparedPublicRead {
         optimization: None,
