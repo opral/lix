@@ -114,13 +114,28 @@ pub(crate) enum ExplainStateSourceKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExplainStage {
+    /// Parse SQL text into AST statements.
     Parse,
+    /// Bind parsed statements into runtime-bound form.
+    ///
+    /// For broad public reads this includes both generic statement binding and
+    /// the broad front-end bind that produces typed broad IR.
     Bind,
+    /// Canonicalize already-bound public statements into semantic IR.
     SemanticAnalysis,
+    /// Construct and verify logical plans from already-bound IR.
+    ///
+    /// For broad public reads this stage begins only after `Bind` has already
+    /// produced the typed broad statement.
     LogicalPlanning,
+    /// Route logical plans into execution strategies or lowerable relations.
     Routing,
+    /// Load backend capability state such as live schemas or layouts required
+    /// before routing or physical planning can proceed.
     CapabilityResolution,
+    /// Lower logical plans into physical plans or lowered programs.
     PhysicalPlanning,
+    /// Prepare executor artifacts such as rendered backend SQL.
     ExecutorPreparation,
 }
 

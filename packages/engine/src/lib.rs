@@ -68,6 +68,10 @@ pub use live_state::{
 pub use lix::{InitResult, Lix, LixConfig};
 pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
 pub use session::{OpenSessionOptions, Session, SessionTransaction};
+#[doc(hidden)]
+pub use sql::binder::{delay_broad_binding_for_test, BroadBindingDelayForTestGuard};
+#[doc(hidden)]
+pub use sql::routing::{delay_broad_routing_for_test, BroadRoutingDelayForTestGuard};
 pub use state::image::{ImageChunkReader, ImageChunkWriter};
 pub use state::stream::{
     StateCommitStream, StateCommitStreamBatch, StateCommitStreamChange, StateCommitStreamFilter,
