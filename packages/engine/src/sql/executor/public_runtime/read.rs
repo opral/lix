@@ -4292,6 +4292,18 @@ async fn try_prepare_public_read_via_specialized_optimization(
     public_output_columns: Option<Vec<String>>,
     mut stage_timings: ExplainTimingCollector,
 ) -> Result<SpecializedPublicReadPreparation, LixError> {
+    // Specialized public-read stage semantics:
+    // - semantic_analysis: canonicalize the bound statement into a structured public read and
+    //   derive dependency/effective-state semantics.
+    // - logical_planning: construct the structured logical plan before any execution-strategy
+    //   optimization happens.
+    // - optimizer: choose between direct-history execution and lowered-SQL execution.
+    // - capability_resolution: load external schemas/layouts needed to lower specialized SQL
+    //   execution once the strategy requires backend capability state.
+    // - physical_planning: build the direct history plan or the lowered read program after any
+    //   required capability resolution has completed.
+    // - executor_preparation: render lowered backend SQL from a lowered read program. Direct
+    //   history plans omit this stage because they do not prepare backend SQL text.
     let runtime_bindings =
         runtime_binding_values_from_execution_context(&bound_statement.execution_context)?;
     let bound_parameters = bound_statement.bound_parameters.clone();
@@ -4314,30 +4326,22 @@ async fn try_prepare_public_read_via_specialized_optimization(
     };
     stage_timings.record(ExplainStage::SemanticAnalysis, semantic_started.elapsed());
     let structured_read = analysis.structured_read().clone();
-    let known_live_layouts = load_known_live_layouts_for_public_read(
-        backend,
-        &structured_read,
-        analysis.dependency_spec.as_ref(),
-        analysis.semantics.effective_state_request.as_ref(),
-    )
-    .await?;
     let surface_binding = structured_read.surface_binding.clone();
     let freshness_contract = surface_binding.read_freshness;
     let effective_state_request = analysis.semantics.effective_state_request.clone();
     let effective_state_plan = analysis.semantics.effective_state_plan.clone();
+    let logical_started = Instant::now();
+    let logical_plan = analysis.logical_plan();
+    stage_timings.record(ExplainStage::LogicalPlanning, logical_started.elapsed());
     let optimizer_started = Instant::now();
     let strategy_decision = choose_specialized_public_read_strategy(&surface_binding);
     let direct_execution =
         strategy_decision.direct_execution && is_direct_only_history_surface(&surface_binding);
     stage_timings.record(ExplainStage::Optimizer, optimizer_started.elapsed());
     let optimizer_passes = strategy_decision.pass_traces;
-    let dependency_spec: Option<DependencySpec> = analysis.dependency_spec.clone();
-    let logical_started = Instant::now();
-    let logical_plan = analysis.logical_plan();
-    stage_timings.record(ExplainStage::LogicalPlanning, logical_started.elapsed());
 
     let physical_started = Instant::now();
-    let (execution, pushdown_decision, lowered_sql, _dependency_spec) = if direct_execution {
+    let (execution, pushdown_decision) = if direct_execution {
         match (
             surface_binding.descriptor.surface_family,
             surface_binding.descriptor.public_name.as_str(),
@@ -4351,8 +4355,6 @@ async fn try_prepare_public_read_via_specialized_optimization(
                                 DirectPublicReadPlan::StateHistory(plan),
                             ),
                             pushdown_decision,
-                            Vec::new(),
-                            dependency_spec,
                         )
                     }
                     Ok(None) => {
@@ -4384,8 +4386,6 @@ async fn try_prepare_public_read_via_specialized_optimization(
                                 DirectPublicReadPlan::EntityHistory(plan),
                             ),
                             pushdown_decision,
-                            Vec::new(),
-                            dependency_spec,
                         )
                     }
                     Ok(None) => {
@@ -4417,8 +4417,6 @@ async fn try_prepare_public_read_via_specialized_optimization(
                                 DirectPublicReadPlan::DirectoryHistory(plan),
                             ),
                             pushdown_decision,
-                            Vec::new(),
-                            dependency_spec,
                         )
                     }
                     Ok(None) => {
@@ -4450,8 +4448,6 @@ async fn try_prepare_public_read_via_specialized_optimization(
                                 plan,
                             )),
                             pushdown_decision,
-                            Vec::new(),
-                            dependency_spec,
                         )
                     }
                     Ok(None) => {
@@ -4479,6 +4475,18 @@ async fn try_prepare_public_read_via_specialized_optimization(
             }
         }
     } else {
+        let capability_started = Instant::now();
+        let known_live_layouts = load_known_live_layouts_for_public_read(
+            backend,
+            &structured_read,
+            analysis.dependency_spec.as_ref(),
+            analysis.semantics.effective_state_request.as_ref(),
+        )
+        .await?;
+        stage_timings.record(
+            ExplainStage::CapabilityResolution,
+            capability_started.elapsed(),
+        );
         let lowered_read = match lower_read_for_execution_with_layouts(
             backend.dialect(),
             &structured_read,
@@ -4504,21 +4512,31 @@ async fn try_prepare_public_read_via_specialized_optimization(
                 })
             }
         }?;
-        let lowered_sql = render_lowered_read_sql(
-            &lowered_read,
-            &analysis.bound_statement.bound_parameters,
-            &analysis.bound_statement.execution_context,
-            backend.dialect(),
-        )?;
         let pushdown_decision = Some(lowered_read.pushdown_decision.clone());
         (
             PreparedPublicReadExecution::LoweredSql(lowered_read),
             pushdown_decision,
-            lowered_sql,
-            dependency_spec,
         )
     };
     stage_timings.record(ExplainStage::PhysicalPlanning, physical_started.elapsed());
+
+    let lowered_sql = match &execution {
+        PreparedPublicReadExecution::LoweredSql(lowered_read) => {
+            let executor_started = Instant::now();
+            let lowered_sql = render_lowered_read_sql(
+                lowered_read,
+                &analysis.bound_statement.bound_parameters,
+                &analysis.bound_statement.execution_context,
+                backend.dialect(),
+            )?;
+            stage_timings.record(
+                ExplainStage::ExecutorPreparation,
+                executor_started.elapsed(),
+            );
+            lowered_sql
+        }
+        PreparedPublicReadExecution::Direct(_) => Vec::new(),
+    };
 
     let optimized_logical_plan = match &execution {
         PreparedPublicReadExecution::LoweredSql(_) => logical_plan.clone(),
@@ -4559,6 +4577,12 @@ async fn try_prepare_public_read_via_specialized_optimization(
                 effective_state_plan: effective_state_plan.clone(),
             }),
             freshness_contract,
+            surface_bindings: analysis
+                .semantics
+                .surface_bindings
+                .iter()
+                .map(|binding| binding.descriptor.public_name.clone())
+                .collect(),
             logical_plan: optimized_logical_plan,
             bound_parameters,
             runtime_bindings,
@@ -4926,6 +4950,15 @@ async fn prepare_public_read_via_surface_lowering(
     public_output_columns: Option<Vec<String>>,
     mut stage_timings: ExplainTimingCollector,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
+    // Broad public-read stage semantics:
+    // - capability_resolution: load external schemas/layouts required before broad rewrite can
+    //   choose stable lowered relations.
+    // - optimizer: rewrite broad public-surface SQL into lowered/internal relations using the
+    //   already resolved capability inputs.
+    // - logical_planning: construct the broad logical plan after rewrite.
+    // - physical_planning: compile the lowered read program from the rewritten statement.
+    // - executor_preparation: render backend SQL from the lowered read program.
+    // Broad lowering does not run structured semantic analysis, so semantic_analysis is omitted.
     let read_summary = summarize_bound_public_read_statement(registry, &bound_statement.statement);
     if bound_summary_contains_direct_only_history_surface(&read_summary) {
         return Err(LixError::new(
@@ -4946,13 +4979,18 @@ async fn prepare_public_read_via_surface_lowering(
         .execution_context
         .requested_version_id
         .as_deref();
-    let optimizer_started = Instant::now();
+    let capability_started = Instant::now();
     let known_live_layouts = load_known_live_layouts_for_broad_public_read(
         backend,
         registry,
         &read_summary.bound_surface_bindings,
     )
     .await?;
+    stage_timings.record(
+        ExplainStage::CapabilityResolution,
+        capability_started.elapsed(),
+    );
+    let optimizer_started = Instant::now();
     let optimized_statement = match optimize_broad_public_read_statement_with_known_live_layouts(
         &bound_statement.statement,
         registry,
@@ -5042,6 +5080,11 @@ async fn prepare_public_read_via_surface_lowering(
         ExplainStage::ExecutorPreparation,
         executor_started.elapsed(),
     );
+    let surface_bindings = semantic_read
+        .surface_bindings
+        .iter()
+        .map(|binding| binding.descriptor.public_name.clone())
+        .collect();
     let explain = build_public_read_explain_artifacts(PublicReadExplainBuildInput {
         request: explain_request.cloned(),
         semantics: semantic_read,
@@ -5059,6 +5102,7 @@ async fn prepare_public_read_via_surface_lowering(
     Ok(Some(PreparedPublicRead {
         optimization: None,
         freshness_contract,
+        surface_bindings,
         logical_plan,
         bound_parameters: bound_statement.bound_parameters.clone(),
         runtime_bindings: runtime_binding_values_from_execution_context(

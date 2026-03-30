@@ -223,7 +223,7 @@ async fn compile_execution_with_backend(
                     .map(|_| vec![explained.statement.clone()])
             })
             .unwrap_or_else(|| statements.clone());
-        let internal_compile_started = Instant::now();
+        let internal_logical_planning_started = Instant::now();
         let internal_logical_plan = preprocess_with_surfaces_to_logical_plan(
             backend,
             &engine.cel_evaluator,
@@ -241,6 +241,7 @@ async fn compile_execution_with_backend(
                 error.description
             ),
         })?;
+        let internal_logical_planning_duration = internal_logical_planning_started.elapsed();
         let preprocess: PlannedStatementSet =
             internal_logical_plan.normalized_statements.clone().into();
         validate_compiled_internal_execution(&preprocess, internal_logical_plan.result_contract)?;
@@ -285,7 +286,7 @@ async fn compile_execution_with_backend(
             let mut stage_timings = ExplainTimingCollector::new(static_artifacts.parse_duration);
             stage_timings.record(
                 ExplainStage::LogicalPlanning,
-                internal_compile_started.elapsed(),
+                internal_logical_planning_duration,
             );
             internal_explain = Some(build_internal_explain_artifacts(
                 InternalExplainBuildInput {

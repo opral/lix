@@ -44,8 +44,6 @@ pub(crate) mod shared;
 mod storage;
 pub mod tracked;
 pub mod untracked;
-
-use crate::backend::QueryExecutor;
 use crate::live_state::shared::identity::RowIdentity;
 use crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::{LixBackend, LixBackendTransaction, LixError};
@@ -300,13 +298,6 @@ pub(crate) async fn rebuild_scope_with_writer_key_hints_in_transaction(
         rows_deleted,
         tables_touched: tables_touched.into_iter().collect(),
     })
-}
-
-pub(crate) async fn version_exists_with_executor(
-    executor: &mut dyn QueryExecutor,
-    version_id: &str,
-) -> Result<bool, LixError> {
-    crate::canonical::version_state::version_exists_with_executor(executor, version_id).await
 }
 
 pub(crate) fn snapshot_json_from_values(

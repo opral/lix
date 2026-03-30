@@ -1,3 +1,4 @@
+use crate::canonical::readers::load_version_ref_with_backend as load_version_ref;
 use crate::canonical::version_state::load_version_descriptor_with_backend;
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
@@ -20,7 +21,6 @@ use crate::sql::semantic_ir::semantics::surface_semantics::{
     public_selector_column_name, public_selector_version_column, OverlayLane,
 };
 use crate::sql::services::public_reads::execute_public_query_with_optional_pending_transaction_view;
-use crate::sql::services::state_reader::load_version_ref;
 use crate::transaction::PendingTransactionView;
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
