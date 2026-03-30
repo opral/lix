@@ -1892,6 +1892,7 @@ mod tests {
         PreparedPublicExecution, PreparedPublicReadExecution,
     };
     use crate::read::models::StateHistoryRootScope;
+    use crate::sql::routing::delay_broad_routing_for_test;
     use crate::sql::{
         catalog::SurfaceReadFreshness,
         logical_plan::{DependencyPrecision, DirectPublicReadPlan},
@@ -2265,11 +2266,11 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .optimizer_passes
+                .routing_passes
                 .iter()
                 .map(|pass| pass.name)
                 .collect::<Vec<_>>(),
-            vec!["public-read.choose-direct-history-strategy"]
+            vec!["public-read.route-execution-strategy"]
         );
         assert_eq!(
             prepared
@@ -2398,16 +2399,16 @@ mod tests {
             crate::sql::explain::ExplainStage::CapabilityResolution,
         )
         .expect("specialized lowered read should record capability_resolution");
-        let optimizer = stage_duration_us(&prepared, crate::sql::explain::ExplainStage::Optimizer)
-            .expect("specialized lowered read should record optimizer timing");
+        let routing = stage_duration_us(&prepared, crate::sql::explain::ExplainStage::Routing)
+            .expect("specialized lowered read should record routing timing");
 
         assert!(
             capability_resolution >= (delay.as_micros() / 2) as u64,
             "capability_resolution should absorb the injected schema-load delay: {capability_resolution}us"
         );
         assert!(
-            optimizer < (delay.as_micros() / 2) as u64,
-            "optimizer should stay below the injected schema-load delay when capability loading is timed separately: {optimizer}us"
+            routing < (delay.as_micros() / 2) as u64,
+            "routing should stay below the injected schema-load delay when capability loading is timed separately: {routing}us"
         );
     }
 
@@ -2452,16 +2453,56 @@ mod tests {
             crate::sql::explain::ExplainStage::CapabilityResolution,
         )
         .expect("broad lowered read should record capability_resolution");
-        let optimizer = stage_duration_us(&prepared, crate::sql::explain::ExplainStage::Optimizer)
-            .expect("broad lowered read should record optimizer timing");
+        let routing = stage_duration_us(&prepared, crate::sql::explain::ExplainStage::Routing)
+            .expect("broad lowered read should record routing timing");
 
         assert!(
             capability_resolution >= (delay.as_micros() / 2) as u64,
             "capability_resolution should absorb the injected schema-load delay: {capability_resolution}us"
         );
         assert!(
-            optimizer < (delay.as_micros() / 2) as u64,
-            "optimizer should stay below the injected schema-load delay when capability loading is timed separately: {optimizer}us"
+            routing < (delay.as_micros() / 2) as u64,
+            "routing should stay below the injected schema-load delay when capability loading is timed separately: {routing}us"
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_broad_reads_charge_routing_delay_to_routing_stage() {
+        let delay = Duration::from_millis(150);
+        let backend = FakeBackend::default();
+        let _routing_delay_guard = delay_broad_routing_for_test(delay);
+
+        let prepared = prepare_public_read_strict(
+            &backend,
+            &parse_one(
+                "SELECT \
+                   (SELECT lixcol_change_id FROM lix_directory WHERE id = 'dir-stable-parent') AS parent_change_id, \
+                   EXISTS (SELECT 1 FROM lix_directory WHERE id = 'dir-stable-child') AS has_child_dir, \
+                   'file-stable-child' IN (SELECT id FROM lix_file WHERE path = '/hello.txt') AS has_file",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("broad read with nested subqueries should not error")
+        .expect("broad read with nested subqueries should prepare");
+
+        let routing = stage_duration_us(&prepared, crate::sql::explain::ExplainStage::Routing)
+            .expect("broad explain should record routing timing");
+        let physical_planning = stage_duration_us(
+            &prepared,
+            crate::sql::explain::ExplainStage::PhysicalPlanning,
+        )
+        .expect("broad explain should record physical_planning timing");
+
+        assert!(
+            routing >= (delay.as_micros() / 2) as u64,
+            "routing should absorb the injected routing delay: {routing}us"
+        );
+        assert!(
+            physical_planning < (delay.as_micros() / 2) as u64,
+            "physical_planning should stay below the injected routing delay when routing work is timed separately: {physical_planning}us"
         );
     }
 
@@ -2596,11 +2637,11 @@ mod tests {
                     assert_eq!(
                         prepared
                             .explain
-                            .optimizer_passes
+                            .routing_passes
                             .iter()
                             .map(|pass| pass.name)
                             .collect::<Vec<_>>(),
-                        vec!["public-read.choose-direct-history-strategy"]
+                        vec!["public-read.route-execution-strategy"]
                     );
                     assert_eq!(
                         prepared

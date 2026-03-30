@@ -4,8 +4,8 @@ use crate::sql::catalog::{DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, 
 use crate::sql::semantic_ir::ExecutionContext;
 use crate::Value;
 use sqlparser::ast::{
-    Expr, GroupByExpr, Join, LimitClause, OrderBy, Query, Select, SelectItem, SetExpr, Statement,
-    TableAlias, TableFactor, TableWithJoins, With,
+    Expr, GroupByExpr, Join, LimitClause, OrderBy, OrderByExpr, Query, Select, SelectItem, SetExpr,
+    Statement, TableAlias, TableFactor, TableWithJoins, With,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -280,6 +280,35 @@ pub(crate) struct StructuredPublicRead {
     pub(crate) query: NormalizedPublicReadQuery,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BroadSqlProvenance<T> {
+    raw: Option<T>,
+}
+
+impl<T> BroadSqlProvenance<T> {
+    pub(crate) fn from_raw(raw: T) -> Self {
+        Self { raw: Some(raw) }
+    }
+
+    pub(crate) fn as_ref(&self) -> Option<&T> {
+        self.raw.as_ref()
+    }
+}
+
+impl<T: Clone> BroadSqlProvenance<T> {
+    pub(crate) fn cloned(&self) -> Option<T> {
+        self.raw.clone()
+    }
+}
+
+impl<T> PartialEq for BroadSqlProvenance<T> {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl<T> Eq for BroadSqlProvenance<T> {}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BroadPublicReadStatement {
     Query(BroadPublicReadQuery),
@@ -289,69 +318,207 @@ pub(crate) enum BroadPublicReadStatement {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BroadPublicReadQuery {
-    pub(crate) original: Query,
+    pub(crate) provenance: BroadSqlProvenance<Query>,
     pub(crate) with: Option<BroadPublicReadWith>,
     pub(crate) body: BroadPublicReadSetExpr,
+    pub(crate) order_by: Option<BroadPublicReadOrderBy>,
+    pub(crate) limit_clause: Option<BroadPublicReadLimitClause>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BroadPublicReadWith {
-    pub(crate) original: With,
-    pub(crate) cte_tables: Vec<BroadPublicReadQuery>,
+    pub(crate) provenance: BroadSqlProvenance<With>,
+    pub(crate) cte_tables: Vec<BroadPublicReadCte>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BroadPublicReadCte {
+    pub(crate) name: String,
+    pub(crate) query: BroadPublicReadQuery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BroadPublicReadSetExpr {
     Select(BroadPublicReadSelect),
     Query(Box<BroadPublicReadQuery>),
     SetOperation {
-        original: SetExpr,
+        provenance: BroadSqlProvenance<SetExpr>,
+        operator: BroadPublicReadSetOperationKind,
+        quantifier: Option<BroadPublicReadSetQuantifier>,
         left: Box<BroadPublicReadSetExpr>,
         right: Box<BroadPublicReadSetExpr>,
     },
     Table {
-        original: SetExpr,
+        provenance: BroadSqlProvenance<SetExpr>,
         relation: BroadPublicReadRelation,
     },
-    Other(SetExpr),
+    Other {
+        provenance: BroadSqlProvenance<SetExpr>,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BroadPublicReadSetOperationKind {
+    Union,
+    Except,
+    Intersect,
+    Minus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BroadPublicReadSetQuantifier {
+    All,
+    Distinct,
+    ByName,
+    AllByName,
+    DistinctByName,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BroadPublicReadSelect {
-    pub(crate) original: Select,
+    pub(crate) provenance: BroadSqlProvenance<Select>,
+    pub(crate) projection: Vec<BroadPublicReadProjectionItem>,
     pub(crate) from: Vec<BroadPublicReadTableWithJoins>,
+    pub(crate) selection: Option<BroadSqlExpr>,
+    pub(crate) group_by: BroadPublicReadGroupBy,
+    pub(crate) having: Option<BroadSqlExpr>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BroadPublicReadProjectionItem {
+    pub(crate) provenance: BroadSqlProvenance<SelectItem>,
+    pub(crate) kind: BroadPublicReadProjectionItemKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BroadPublicReadProjectionItemKind {
+    Wildcard,
+    QualifiedWildcard {
+        qualifier: Vec<String>,
+    },
+    Expr {
+        alias: Option<String>,
+        sql: String,
+        nested_queries: Vec<BroadNestedQueryExpr>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BroadPublicReadGroupBy {
+    pub(crate) provenance: BroadSqlProvenance<GroupByExpr>,
+    pub(crate) kind: BroadPublicReadGroupByKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BroadPublicReadGroupByKind {
+    All,
+    Expressions(Vec<BroadSqlExpr>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BroadPublicReadOrderBy {
+    pub(crate) provenance: BroadSqlProvenance<OrderBy>,
+    pub(crate) kind: BroadPublicReadOrderByKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BroadPublicReadOrderByKind {
+    All,
+    Expressions(Vec<BroadPublicReadOrderByExpr>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BroadPublicReadOrderByExpr {
+    pub(crate) provenance: BroadSqlProvenance<OrderByExpr>,
+    pub(crate) expr: BroadSqlExpr,
+    pub(crate) asc: Option<bool>,
+    pub(crate) nulls_first: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BroadPublicReadLimitClause {
+    pub(crate) provenance: BroadSqlProvenance<LimitClause>,
+    pub(crate) kind: BroadPublicReadLimitClauseKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BroadPublicReadLimitClauseKind {
+    LimitOffset {
+        limit: Option<BroadSqlExpr>,
+        offset: Option<BroadSqlExpr>,
+        limit_by: Vec<BroadSqlExpr>,
+    },
+    OffsetCommaLimit {
+        offset: BroadSqlExpr,
+        limit: BroadSqlExpr,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BroadSqlExpr {
+    pub(crate) provenance: BroadSqlProvenance<Expr>,
+    pub(crate) sql: String,
+    pub(crate) nested_queries: Vec<BroadNestedQueryExpr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BroadNestedQueryExpr {
+    ScalarSubquery(Box<BroadPublicReadQuery>),
+    Exists {
+        negated: bool,
+        subquery: Box<BroadPublicReadQuery>,
+    },
+    InSubquery {
+        negated: bool,
+        expr_sql: String,
+        expr: Box<BroadSqlExpr>,
+        subquery: Box<BroadPublicReadQuery>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BroadPublicReadTableWithJoins {
-    pub(crate) original: TableWithJoins,
+    pub(crate) provenance: BroadSqlProvenance<TableWithJoins>,
     pub(crate) relation: BroadPublicReadTableFactor,
     pub(crate) joins: Vec<BroadPublicReadJoin>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BroadPublicReadJoin {
-    pub(crate) original: Join,
+    pub(crate) provenance: BroadSqlProvenance<Join>,
+    pub(crate) operator: String,
     pub(crate) relation: BroadPublicReadTableFactor,
+    pub(crate) constraint_expressions: Vec<BroadSqlExpr>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BroadPublicReadTableFactor {
     Table {
-        original: TableFactor,
+        provenance: BroadSqlProvenance<TableFactor>,
+        alias: Option<BroadPublicReadAlias>,
         relation: BroadPublicReadRelation,
     },
     Derived {
-        original: TableFactor,
+        provenance: BroadSqlProvenance<TableFactor>,
+        alias: Option<BroadPublicReadAlias>,
         subquery: Box<BroadPublicReadQuery>,
     },
     NestedJoin {
-        original: TableFactor,
+        provenance: BroadSqlProvenance<TableFactor>,
+        alias: Option<BroadPublicReadAlias>,
         table_with_joins: Box<BroadPublicReadTableWithJoins>,
     },
-    Other(TableFactor),
+    Other {
+        provenance: BroadSqlProvenance<TableFactor>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BroadPublicReadAlias {
+    pub(crate) name: String,
+    pub(crate) columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
