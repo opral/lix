@@ -1,12 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::canonical::append::{
-    append_tracked, CreateCommitArgs, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
-    CreateCommitPreconditions, CreateCommitWriteLane,
-};
+use crate::canonical::append::{append_tracked, CreateCommitArgs};
 use crate::canonical::readers::{
     load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,
-    load_committed_version_head_commit_id,
     load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
@@ -18,6 +14,10 @@ use crate::live_state::{
     LiveStateRebuildScope,
 };
 use crate::state::stream::{StateCommitStreamChange, StateCommitStreamOperation};
+use crate::version::context::{
+    exact_resolved_head_preconditions, require_version_context_pair_in_transaction,
+    validate_expected_head_commit_id,
+};
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -107,15 +107,34 @@ async fn merge_version_in_transaction(
         ));
     }
 
-    let source_head = load_version_head_commit_id(tx, &source_version_id).await?;
-    let target_head = load_version_head_commit_id(tx, &target_version_id).await?;
-    validate_expected_heads(
-        options.expected_heads.as_ref(),
-        &source_head,
-        &target_head,
+    let pair = require_version_context_pair_in_transaction(
+        tx,
         &source_version_id,
         &target_version_id,
+        "source_version_id",
+        "target_version_id",
+    )
+    .await?;
+    validate_expected_head_commit_id(
+        options
+            .expected_heads
+            .as_ref()
+            .and_then(|expected| expected.source_head_commit_id.as_deref()),
+        &pair.source,
+        "merge_version",
+        "source",
     )?;
+    validate_expected_head_commit_id(
+        options
+            .expected_heads
+            .as_ref()
+            .and_then(|expected| expected.target_head_commit_id.as_deref()),
+        &pair.target,
+        "merge_version",
+        "target",
+    )?;
+    let source_head = pair.source.head_commit_id().to_string();
+    let target_head = pair.target.head_commit_id().to_string();
 
     let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
 
@@ -304,14 +323,13 @@ async fn merge_version_in_transaction(
                 timestamp: Some(functions.timestamp()),
                 changes: proposed_changes,
                 filesystem_state: Default::default(),
-                preconditions: CreateCommitPreconditions {
-                    write_lane: CreateCommitWriteLane::Version(target_version_id.clone()),
-                    expected_head: CreateCommitExpectedHead::CommitId(target_head.clone()),
-                    idempotency_key: CreateCommitIdempotencyKey::Exact(format!(
+                preconditions: exact_resolved_head_preconditions(
+                    &pair.target,
+                    format!(
                         "merge:{}:{}:{}:{}",
                         source_version_id, target_version_id, source_head, target_head
-                    )),
-                },
+                    ),
+                ),
                 active_account_ids,
                 lane_parent_commit_ids_override: Some(vec![
                     target_head.clone(),
@@ -350,56 +368,6 @@ async fn merge_version_in_transaction(
         applied_change_count,
         created_tombstone_count,
     })
-}
-
-async fn load_version_head_commit_id(
-    tx: &mut SessionTransaction<'_>,
-    version_id: &str,
-) -> Result<String, LixError> {
-    let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
-    let Some(commit_id) = load_committed_version_head_commit_id(&mut executor, version_id).await?
-    else {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("version '{}' does not exist", version_id),
-        ));
-    };
-    Ok(commit_id)
-}
-
-fn validate_expected_heads(
-    expected: Option<&ExpectedVersionHeads>,
-    source_head: &str,
-    target_head: &str,
-    source_version_id: &str,
-    target_version_id: &str,
-) -> Result<(), LixError> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
-    if let Some(expected_source_head) = expected.source_head_commit_id.as_deref() {
-        if expected_source_head != source_head {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "merge_version expected source version '{}' head '{}' but found '{}'",
-                    source_version_id, expected_source_head, source_head
-                ),
-            ));
-        }
-    }
-    if let Some(expected_target_head) = expected.target_head_commit_id.as_deref() {
-        if expected_target_head != target_head {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "merge_version expected target version '{}' head '{}' but found '{}'",
-                    target_version_id, expected_target_head, target_head
-                ),
-            ));
-        }
-    }
-    Ok(())
 }
 
 async fn load_commit_depths(
