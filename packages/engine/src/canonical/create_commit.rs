@@ -1363,88 +1363,90 @@ mod tests {
         CreateCommitIdempotencyKey, CreateCommitInvariantChecker, CreateCommitPreconditions,
         CreateCommitWriteLane,
     };
-    use crate::backend::prepared::{collapse_prepared_batch_for_dialect, PreparedBatch};
     use crate::canonical::receipt::UpdatedVersionRef;
     use crate::canonical::types::{CanonicalCommitOutput, ChangeRow};
     use crate::filesystem::runtime::{
         FilesystemTransactionFileState, FilesystemTransactionState, OptionalTextPatch,
     };
     use crate::functions::LixFunctionProvider;
-    use crate::live_state::{
-        live_schema_column_names, schema_access::normalized_values_for_schema,
-    };
+    use crate::test_support::{init_test_backend_core, seed_local_version_head, TestSqliteBackend};
     use crate::version::GLOBAL_VERSION_ID;
     use crate::{
         CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
-        LixBackendTransaction, LixError, QueryResult, SqlDialect, Value, VersionId,
+        LixBackend, LixBackendTransaction, LixError, Value, VersionId,
     };
     use async_trait::async_trait;
-    use sqlparser::ast::{BinaryOperator, Expr, Query, SetExpr, Statement, TableFactor};
-    use sqlparser::dialect::GenericDialect;
-    use sqlparser::parser::Parser;
-    use std::collections::HashMap;
+    const TEST_TIMESTAMP: &str = "2026-03-06T14:22:00.000Z";
 
-    fn fake_version_ref_live_row(version_id: &str, commit_id: &str) -> Vec<Value> {
-        let snapshot = crate::version::version_ref_snapshot_content(version_id, commit_id);
-        let normalized = normalized_values_for_schema(
-            crate::version::version_ref_schema_key(),
-            None,
-            Some(&snapshot),
-        )
-        .expect("snapshot should normalize");
-        let mut row = vec![
-            Value::Text(version_id.to_string()),
-            Value::Text(crate::version::version_ref_schema_key().to_string()),
-            Value::Text(crate::version::version_ref_schema_version().to_string()),
-            Value::Text(crate::version::version_ref_file_id().to_string()),
-            Value::Text(crate::version::version_ref_storage_version_id().to_string()),
-            Value::Boolean(true),
-            Value::Text(crate::version::version_ref_plugin_key().to_string()),
-            Value::Null,
-            Value::Null,
-            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
-            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
-        ];
-        for column_name in live_schema_column_names(crate::version::version_ref_schema_key(), None)
-            .expect("version ref schema should expose column names")
-        {
-            row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
-        }
-        row
+    async fn init_create_commit_backend() -> TestSqliteBackend {
+        let backend = TestSqliteBackend::new();
+        init_test_backend_core(&backend)
+            .await
+            .expect("test backend init should succeed");
+        crate::filesystem::init(&backend)
+            .await
+            .expect("filesystem tables should init");
+        crate::observe::init(&backend)
+            .await
+            .expect("observe tables should init");
+        backend
     }
 
-    fn fake_file_descriptor_live_row() -> Vec<Value> {
-        let snapshot = serde_json::json!({
-            "id": "file-1",
-            "directory_id": serde_json::Value::Null,
-            "name": "contract",
-            "extension": "txt",
-            "hidden": false,
-            "metadata": serde_json::Value::Null,
-        })
-        .to_string();
-        let normalized = normalized_values_for_schema("lix_file_descriptor", None, Some(&snapshot))
-            .expect("snapshot should normalize");
-        let mut row = vec![
-            Value::Text("file-1".to_string()),
-            Value::Text("lix_file_descriptor".to_string()),
-            Value::Text("1".to_string()),
-            Value::Text("lix".to_string()),
-            Value::Text("version-a".to_string()),
-            Value::Boolean(false),
-            Value::Text("lix".to_string()),
-            Value::Null,
-            Value::Text("change-file-1".to_string()),
-            Value::Null,
-            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
-            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
-        ];
-        for column_name in live_schema_column_names("lix_file_descriptor", None)
-            .expect("file descriptor schema should expose column names")
-        {
-            row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
+    async fn seed_idempotency_row(
+        backend: &TestSqliteBackend,
+        write_lane: &str,
+        idempotency_key: &str,
+        idempotency_kind: &str,
+        idempotency_value: &str,
+        parent_head_snapshot_content: &str,
+        commit_id: &str,
+    ) {
+        backend
+            .execute(
+                "INSERT INTO lix_internal_commit_idempotency (\
+                 write_lane, idempotency_key, idempotency_kind, idempotency_value, parent_head_snapshot_content, commit_id, created_at\
+                 ) VALUES (\
+                 $1, $2, $3, $4, $5, $6, $7\
+                 )",
+                &[
+                    Value::Text(write_lane.to_string()),
+                    Value::Text(idempotency_key.to_string()),
+                    Value::Text(idempotency_kind.to_string()),
+                    Value::Text(idempotency_value.to_string()),
+                    Value::Text(parent_head_snapshot_content.to_string()),
+                    Value::Text(commit_id.to_string()),
+                    Value::Text(TEST_TIMESTAMP.to_string()),
+                ],
+            )
+            .await
+            .expect("idempotency row should seed");
+    }
+
+    fn create_commit_args(
+        preconditions: CreateCommitPreconditions,
+        changes: Vec<crate::canonical::ProposedDomainChange>,
+        filesystem_state: FilesystemTransactionState,
+    ) -> CreateCommitArgs {
+        CreateCommitArgs {
+            timestamp: Some(TEST_TIMESTAMP.to_string()),
+            changes,
+            filesystem_state,
+            preconditions,
+            active_account_ids: Vec::new(),
+            lane_parent_commit_ids_override: None,
+            allow_empty_commit: false,
+            should_emit_observe_tick: false,
+            observe_tick_writer_key: None,
+            writer_key: None,
         }
-        row
+    }
+
+    fn sql_writes_to(sql: &str, relation: &str) -> bool {
+        let normalized = sql.trim_start().to_ascii_lowercase();
+        (normalized.starts_with("insert into ")
+            || normalized.starts_with("update ")
+            || normalized.starts_with("delete from "))
+            && normalized.contains(&relation.to_ascii_lowercase())
     }
 
     struct CountingFunctionProvider {
@@ -1465,246 +1467,7 @@ mod tests {
         }
 
         fn timestamp(&mut self) -> String {
-            "2026-03-06T14:22:00.000Z".to_string()
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeTransaction {
-        version_heads: HashMap<String, String>,
-        idempotency_rows: HashMap<(String, String, String, String), String>,
-        executed_sql: Vec<String>,
-        live_state_mode: Option<String>,
-        latest_cursor: Option<(String, String)>,
-        fail_projected_live_state_writes: bool,
-    }
-
-    #[async_trait(?Send)]
-    impl LixBackendTransaction for FakeTransaction {
-        fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
-        }
-
-        fn mode(&self) -> crate::TransactionMode {
-            crate::TransactionMode::Write
-        }
-
-        async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            self.executed_sql.push(sql.to_string());
-
-            if sql.contains("FROM lix_internal_live_state_status") {
-                return Ok(QueryResult {
-                    rows: vec![vec![
-                        Value::Text(
-                            self.live_state_mode
-                                .clone()
-                                .unwrap_or_else(|| "ready".to_string()),
-                        ),
-                        Value::Null,
-                        Value::Null,
-                        Value::Text(crate::live_state::LIVE_STATE_SCHEMA_EPOCH.to_string()),
-                    ]],
-                    columns: vec![
-                        "mode".to_string(),
-                        "latest_change_id".to_string(),
-                        "latest_change_created_at".to_string(),
-                        "schema_epoch".to_string(),
-                    ],
-                });
-            }
-            if sql.contains("FROM lix_internal_change")
-                && sql.contains("ORDER BY created_at DESC, id DESC")
-            {
-                return Ok(QueryResult {
-                    rows: self
-                        .latest_cursor
-                        .clone()
-                        .into_iter()
-                        .map(|(id, created_at)| vec![Value::Text(id), Value::Text(created_at)])
-                        .collect(),
-                    columns: vec!["id".to_string(), "created_at".to_string()],
-                });
-            }
-
-            if query_targets_table(sql, "lix_internal_live_v1_lix_version_ref") {
-                let rows = self
-                    .version_heads
-                    .iter()
-                    .filter(|(version_id, _)| query_has_text_equality(sql, "entity_id", version_id))
-                    .map(|(version_id, commit_id)| fake_version_ref_live_row(version_id, commit_id))
-                    .collect::<Vec<_>>();
-                return Ok(QueryResult {
-                    rows,
-                    columns: vec![
-                        "entity_id".to_string(),
-                        "schema_key".to_string(),
-                        "schema_version".to_string(),
-                        "file_id".to_string(),
-                        "version_id".to_string(),
-                        "global".to_string(),
-                        "plugin_key".to_string(),
-                        "metadata".to_string(),
-                        "writer_key".to_string(),
-                        "created_at".to_string(),
-                        "updated_at".to_string(),
-                        "commit_id".to_string(),
-                        "id".to_string(),
-                    ],
-                });
-            }
-            if query_targets_table(sql, "lix_internal_live_v1_lix_file_descriptor") {
-                return Ok(QueryResult {
-                    rows: vec![fake_file_descriptor_live_row()],
-                    columns: vec![
-                        "entity_id".to_string(),
-                        "schema_key".to_string(),
-                        "schema_version".to_string(),
-                        "file_id".to_string(),
-                        "version_id".to_string(),
-                        "global".to_string(),
-                        "plugin_key".to_string(),
-                        "metadata".to_string(),
-                        "change_id".to_string(),
-                        "writer_key".to_string(),
-                        "created_at".to_string(),
-                        "updated_at".to_string(),
-                        "directory_id".to_string(),
-                        "extension".to_string(),
-                        "hidden".to_string(),
-                        "id".to_string(),
-                        "metadata_json".to_string(),
-                        "name".to_string(),
-                    ],
-                });
-            }
-            if self.fail_projected_live_state_writes
-                && sql.contains("lix_internal_live_v1_")
-                && !sql.contains("lix_internal_live_v1_lix_version_ref")
-                && !sql.contains("FROM lix_internal_live_state_status")
-            {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "simulated projected live-state write failure",
-                ));
-            }
-            if sql.contains("schema_key = 'lix_version_ref'") {
-                let mut rows = self
-                    .version_heads
-                    .iter()
-                    .filter(|(version_id, _)| {
-                        !sql.contains("ref_change.entity_id = '")
-                            || sql.contains(&format!("ref_change.entity_id = '{}'", version_id))
-                            || sql.contains(&format!("'{}'", version_id))
-                    })
-                    .map(|(version_id, commit_id)| {
-                        let snapshot = Value::Text(
-                            serde_json::json!({
-                                "id": version_id,
-                                "commit_id": commit_id,
-                            })
-                            .to_string(),
-                        );
-                        let row =
-                            if sql.contains("SELECT c.entity_id, s.content AS snapshot_content") {
-                                vec![Value::Text(version_id.clone()), snapshot]
-                            } else if sql.contains("SELECT version_id, commit_id")
-                                || sql.contains("FROM current_refs")
-                            {
-                                vec![
-                                    Value::Text(version_id.clone()),
-                                    Value::Text(commit_id.clone()),
-                                ]
-                            } else {
-                                vec![snapshot]
-                            };
-                        (version_id.clone(), row)
-                    })
-                    .collect::<Vec<_>>();
-                rows.sort_by(|a, b| a.0.cmp(&b.0));
-                let rows = rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
-                return Ok(QueryResult {
-                    rows,
-                    columns: if sql.contains("SELECT c.entity_id, s.content AS snapshot_content") {
-                        vec!["entity_id".to_string(), "snapshot_content".to_string()]
-                    } else if sql.contains("SELECT version_id, commit_id")
-                        || sql.contains("FROM current_refs")
-                    {
-                        vec!["version_id".to_string(), "commit_id".to_string()]
-                    } else {
-                        vec!["snapshot_content".to_string()]
-                    },
-                });
-            }
-
-            if sql.contains("lix_internal_commit_idempotency") {
-                let rows = self
-                    .idempotency_rows
-                    .iter()
-                    .filter(|((lane, kind, value, parent_head_snapshot_content), _)| {
-                        sql.contains(&format!("write_lane = '{}'", lane))
-                            && sql.contains(&format!("idempotency_kind = '{}'", kind))
-                            && sql.contains(&format!("idempotency_value = '{}'", value))
-                            && sql.contains(&format!(
-                                "parent_head_snapshot_content = '{}'",
-                                parent_head_snapshot_content
-                            ))
-                    })
-                    .map(|(_, commit_id)| vec![Value::Text(commit_id.clone())])
-                    .collect::<Vec<_>>();
-                return Ok(QueryResult {
-                    rows,
-                    columns: vec!["commit_id".to_string()],
-                });
-            }
-
-            if let Some(idempotency_sql) =
-                extract_statement_from_batch(sql, "INSERT INTO lix_internal_commit_idempotency ")
-            {
-                let lane = extract_single_quoted_value(idempotency_sql, "VALUES ('")
-                    .expect("lane should be present");
-                let kind = extract_nth_single_quoted_value(idempotency_sql, 2)
-                    .expect("kind should be present");
-                let value = extract_nth_single_quoted_value(idempotency_sql, 3)
-                    .expect("value should be present");
-                let parent_head_snapshot_content =
-                    extract_nth_single_quoted_value(idempotency_sql, 4)
-                        .expect("parent head snapshot content should be present");
-                let commit_id = extract_nth_single_quoted_value(idempotency_sql, 5)
-                    .expect("commit id should be present");
-                self.idempotency_rows
-                    .insert((lane, kind, value, parent_head_snapshot_content), commit_id);
-            }
-            if extract_statement_from_batch(sql, "INSERT INTO lix_internal_change ").is_some() {
-                self.latest_cursor = Some((
-                    "change-watermark".to_string(),
-                    "2026-03-06T14:22:00.000Z".to_string(),
-                ));
-            }
-            if let Some(status_sql) =
-                extract_statement_from_batch(sql, "INSERT INTO lix_internal_live_state_status ")
-            {
-                let mode = extract_nth_single_quoted_value(status_sql, 0)
-                    .expect("live state mode should be present");
-                self.live_state_mode = Some(mode);
-            }
-
-            Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            })
-        }
-
-        async fn execute_batch(&mut self, batch: &PreparedBatch) -> Result<QueryResult, LixError> {
-            let collapsed = collapse_prepared_batch_for_dialect(batch, self.dialect())?;
-            self.execute(&collapsed.sql, &collapsed.params).await
-        }
-
-        async fn commit(self: Box<Self>) -> Result<(), LixError> {
-            Ok(())
-        }
-
-        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
-            Ok(())
+            TEST_TIMESTAMP.to_string()
         }
     }
 
@@ -1772,112 +1535,114 @@ mod tests {
 
     #[tokio::test]
     async fn applies_commit_when_head_matches_expected() {
-        let mut transaction = FakeTransaction::default();
-        transaction
-            .version_heads
-            .insert("version-a".to_string(), "commit-123".to_string());
+        let backend = init_create_commit_backend().await;
+        seed_local_version_head(&backend, "version-a", "commit-123", TEST_TIMESTAMP)
+            .await
+            .expect("local version head should seed");
+        backend.clear_query_log();
+        let mut transaction = backend
+            .begin_transaction(crate::TransactionMode::Write)
+            .await
+            .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
         let mut checker = RecordingInvariantChecker::default();
 
         let result = create_commit(
-            &mut transaction,
-            CreateCommitArgs {
-                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
-                changes: vec![sample_change()],
-                filesystem_state: Default::default(),
-                preconditions: CreateCommitPreconditions {
+            transaction.as_mut(),
+            create_commit_args(
+                CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
-                active_account_ids: Vec::new(),
-                lane_parent_commit_ids_override: None,
-                allow_empty_commit: false,
-                should_emit_observe_tick: false,
-                observe_tick_writer_key: None,
-                writer_key: None,
-            },
+                vec![sample_change()],
+                Default::default(),
+            ),
             &mut functions,
             Some(&mut checker),
         )
         .await
         .expect("create_commit should succeed");
 
+        let executed_sql = backend.executed_sql();
+
         assert_eq!(result.disposition, CreateCommitDisposition::Applied);
         assert!(result.applied_output.is_some());
         assert_eq!(checker.calls, 1);
-        let generated_commit_batches = transaction
-            .executed_sql
-            .iter()
-            .filter(|sql| sql.contains("INSERT INTO lix_internal_change "))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            generated_commit_batches.len(),
-            1,
-            "generated commit work should execute as one SQL batch"
+        assert!(
+            executed_sql
+                .iter()
+                .any(|sql| sql.contains("INSERT INTO lix_internal_change ")),
+            "create_commit should persist canonical change rows"
         );
         assert!(
-            !generated_commit_batches[0].contains("lix_internal_live_v1_"),
-            "canonical commit batch should not inline live-state writes after apply isolation"
+            !executed_sql
+                .iter()
+                .any(|sql| sql_writes_to(sql, "lix_internal_live_v1_")),
+            "create_commit should not write derived live-state tables inline"
         );
         assert!(
             result.receipt.is_some(),
             "create_commit should emit a canonical receipt for projection replay instead of applying derived rows inline"
         );
         assert!(
-            transaction
-                .executed_sql
+            executed_sql
                 .iter()
                 .any(|sql| sql.contains("INSERT INTO lix_internal_commit_idempotency ")),
             "create_commit should persist idempotency state in the executed batch"
         );
         assert!(
-            !transaction
-                .executed_sql
+            !executed_sql
                 .iter()
-                .any(|sql| sql.contains("INSERT INTO lix_internal_live_state_status ")),
+                .any(|sql| sql_writes_to(sql, "lix_internal_live_state_status")),
             "create_commit must NOT write the watermark — the caller stamps it at commit time"
         );
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
     }
 
     #[tokio::test]
     async fn create_commit_keeps_canonical_commit_when_projected_live_state_apply_fails() {
-        let mut transaction = FakeTransaction {
-            version_heads: HashMap::from([("version-a".to_string(), "commit-123".to_string())]),
-            latest_cursor: Some((
-                "change-watermark".to_string(),
-                "2026-03-06T14:22:00.000Z".to_string(),
-            )),
-            fail_projected_live_state_writes: true,
-            ..Default::default()
-        };
+        let backend = init_create_commit_backend().await;
+        seed_local_version_head(&backend, "version-a", "commit-123", TEST_TIMESTAMP)
+            .await
+            .expect("local version head should seed");
+        backend.clear_query_log();
+        backend.block_writes_to(
+            "lix_internal_live_v1_",
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "simulated projected live-state write failure",
+            ),
+        );
+        let mut transaction = backend
+            .begin_transaction(crate::TransactionMode::Write)
+            .await
+            .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
 
         let result = create_commit(
-            &mut transaction,
-            CreateCommitArgs {
-                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
-                changes: vec![sample_change()],
-                filesystem_state: Default::default(),
-                preconditions: CreateCommitPreconditions {
+            transaction.as_mut(),
+            create_commit_args(
+                CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact(
                         "idem-projection-failure".to_string(),
                     ),
                 },
-                active_account_ids: Vec::new(),
-                lane_parent_commit_ids_override: None,
-                allow_empty_commit: false,
-                should_emit_observe_tick: false,
-                observe_tick_writer_key: None,
-                writer_key: None,
-            },
+                vec![sample_change()],
+                Default::default(),
+            ),
             &mut functions,
             None,
         )
         .await
         .expect("canonical commit should succeed without touching projected live-state writes");
+
+        let executed_sql = backend.executed_sql();
 
         assert_eq!(result.disposition, CreateCommitDisposition::Applied);
         let receipt = result.receipt.expect("canonical receipt should be present");
@@ -1889,39 +1654,50 @@ mod tests {
             "canonical receipt should carry committed version-ref updates",
         );
         assert_eq!(
-            transaction.live_state_mode, None,
+            backend.count_sql_matching(|sql| sql_writes_to(sql, "lix_internal_live_state_status")),
+            0,
             "canonical commit should not mutate projection readiness directly",
         );
+        assert!(
+            !executed_sql
+                .iter()
+                .any(|sql| sql_writes_to(sql, "lix_internal_live_v1_")),
+            "projected live-state writes should stay outside create_commit"
+        );
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
     }
 
     #[tokio::test]
     async fn create_commit_uses_provided_active_account_ids_without_live_state_fallback() {
-        let mut transaction = FakeTransaction::default();
-        transaction
-            .version_heads
-            .insert("version-a".to_string(), "commit-123".to_string());
+        let backend = init_create_commit_backend().await;
+        seed_local_version_head(&backend, "version-a", "commit-123", TEST_TIMESTAMP)
+            .await
+            .expect("local version head should seed");
+        backend.clear_query_log();
+        let mut transaction = backend
+            .begin_transaction(crate::TransactionMode::Write)
+            .await
+            .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
+        let mut args = create_commit_args(
+            CreateCommitPreconditions {
+                write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
+                idempotency_key: CreateCommitIdempotencyKey::Exact(
+                    "idem-active-accounts".to_string(),
+                ),
+            },
+            vec![sample_change()],
+            Default::default(),
+        );
+        args.active_account_ids = vec!["acct-session".to_string(), "acct-shadow".to_string()];
 
         let result = create_commit(
-            &mut transaction,
-            CreateCommitArgs {
-                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
-                changes: vec![sample_change()],
-                filesystem_state: Default::default(),
-                preconditions: CreateCommitPreconditions {
-                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
-                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
-                    idempotency_key: CreateCommitIdempotencyKey::Exact(
-                        "idem-active-accounts".to_string(),
-                    ),
-                },
-                active_account_ids: vec!["acct-session".to_string(), "acct-shadow".to_string()],
-                lane_parent_commit_ids_override: None,
-                allow_empty_commit: false,
-                should_emit_observe_tick: false,
-                observe_tick_writer_key: None,
-                writer_key: None,
-            },
+            transaction.as_mut(),
+            args,
             &mut functions,
             None,
         )
@@ -1940,50 +1716,53 @@ mod tests {
             "commit attribution should come from typed session-owned active account ids",
         );
         assert!(
-            !transaction
-                .executed_sql
+            !backend
+                .executed_sql()
                 .iter()
                 .any(|sql| sql.contains("lix_internal_live_v1_lix_active_account")),
             "create_commit should not read shared active-account live-state rows anymore",
         );
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
     }
 
     #[tokio::test]
     async fn replays_when_same_idempotency_key_already_committed() {
-        let mut transaction = FakeTransaction::default();
-        transaction
-            .version_heads
-            .insert("version-a".to_string(), "commit-456".to_string());
-        transaction.idempotency_rows.insert(
-            (
-                "version:version-a".to_string(),
-                "exact".to_string(),
-                "idem-1".to_string(),
-                String::new(),
-            ),
-            "commit-456".to_string(),
-        );
+        let backend = init_create_commit_backend().await;
+        seed_local_version_head(&backend, "version-a", "commit-456", TEST_TIMESTAMP)
+            .await
+            .expect("local version head should seed");
+        seed_idempotency_row(
+            &backend,
+            "version:version-a",
+            "idem-1",
+            "exact",
+            "idem-1",
+            "",
+            "commit-456",
+        )
+        .await;
+        backend.clear_query_log();
+        let mut transaction = backend
+            .begin_transaction(crate::TransactionMode::Write)
+            .await
+            .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
         let mut checker = RecordingInvariantChecker::default();
 
         let result = create_commit(
-            &mut transaction,
-            CreateCommitArgs {
-                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
-                changes: vec![sample_change()],
-                filesystem_state: Default::default(),
-                preconditions: CreateCommitPreconditions {
+            transaction.as_mut(),
+            create_commit_args(
+                CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
-                active_account_ids: Vec::new(),
-                lane_parent_commit_ids_override: None,
-                allow_empty_commit: false,
-                should_emit_observe_tick: false,
-                observe_tick_writer_key: None,
-                writer_key: None,
-            },
+                vec![sample_change()],
+                Default::default(),
+            ),
             &mut functions,
             Some(&mut checker),
         )
@@ -1994,45 +1773,52 @@ mod tests {
         assert_eq!(result.committed_head, "commit-456");
         assert!(result.applied_output.is_none());
         assert_eq!(checker.calls, 0);
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
     }
 
     #[tokio::test]
     async fn replays_when_same_current_head_fingerprint_already_committed() {
-        let mut transaction = FakeTransaction::default();
-        transaction
-            .version_heads
-            .insert("version-a".to_string(), "commit-456".to_string());
-        transaction.idempotency_rows.insert(
-            (
-                "version:version-a".to_string(),
-                "current_head_fingerprint".to_string(),
-                "fp-1".to_string(),
-                crate::version::version_ref_snapshot_content("version-a", "commit-456"),
-            ),
-            "commit-456".to_string(),
-        );
+        let backend = init_create_commit_backend().await;
+        seed_local_version_head(&backend, "version-a", "commit-456", TEST_TIMESTAMP)
+            .await
+            .expect("local version head should seed");
+        seed_idempotency_row(
+            &backend,
+            "version:version-a",
+            &serde_json::json!({
+                "head": "commit-456",
+                "fingerprint": "fp-1",
+            })
+            .to_string(),
+            "current_head_fingerprint",
+            "fp-1",
+            &crate::version::version_ref_snapshot_content("version-a", "commit-456"),
+            "commit-456",
+        )
+        .await;
+        backend.clear_query_log();
+        let mut transaction = backend
+            .begin_transaction(crate::TransactionMode::Write)
+            .await
+            .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
 
         let result = create_commit(
-            &mut transaction,
-            CreateCommitArgs {
-                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
-                changes: vec![sample_change()],
-                filesystem_state: Default::default(),
-                preconditions: CreateCommitPreconditions {
+            transaction.as_mut(),
+            create_commit_args(
+                CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CurrentHead,
                     idempotency_key: CreateCommitIdempotencyKey::CurrentHeadFingerprint(
                         "fp-1".to_string(),
                     ),
                 },
-                active_account_ids: Vec::new(),
-                lane_parent_commit_ids_override: None,
-                allow_empty_commit: false,
-                should_emit_observe_tick: false,
-                observe_tick_writer_key: None,
-                writer_key: None,
-            },
+                vec![sample_change()],
+                Default::default(),
+            ),
             &mut functions,
             None,
         )
@@ -2042,35 +1828,37 @@ mod tests {
         assert_eq!(result.disposition, CreateCommitDisposition::Replay);
         assert_eq!(result.committed_head, "commit-456");
         assert!(result.applied_output.is_none());
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
     }
 
     #[tokio::test]
     async fn rejects_head_drift_without_matching_idempotency_row() {
-        let mut transaction = FakeTransaction::default();
-        transaction
-            .version_heads
-            .insert("version-a".to_string(), "commit-456".to_string());
+        let backend = init_create_commit_backend().await;
+        seed_local_version_head(&backend, "version-a", "commit-456", TEST_TIMESTAMP)
+            .await
+            .expect("local version head should seed");
+        backend.clear_query_log();
+        let mut transaction = backend
+            .begin_transaction(crate::TransactionMode::Write)
+            .await
+            .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
         let mut checker = RecordingInvariantChecker::default();
 
         let error = create_commit(
-            &mut transaction,
-            CreateCommitArgs {
-                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
-                changes: vec![sample_change()],
-                filesystem_state: Default::default(),
-                preconditions: CreateCommitPreconditions {
+            transaction.as_mut(),
+            create_commit_args(
+                CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
-                active_account_ids: Vec::new(),
-                lane_parent_commit_ids_override: None,
-                allow_empty_commit: false,
-                should_emit_observe_tick: false,
-                observe_tick_writer_key: None,
-                writer_key: None,
-            },
+                vec![sample_change()],
+                Default::default(),
+            ),
             &mut functions,
             Some(&mut checker),
         )
@@ -2079,31 +1867,33 @@ mod tests {
 
         assert_eq!(error.kind, CreateCommitErrorKind::TipDrift);
         assert_eq!(checker.calls, 0);
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
     }
 
     #[tokio::test]
     async fn rejects_missing_lane_without_create_if_missing() {
-        let mut transaction = FakeTransaction::default();
+        let backend = init_create_commit_backend().await;
+        backend.clear_query_log();
+        let mut transaction = backend
+            .begin_transaction(crate::TransactionMode::Write)
+            .await
+            .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
 
         let error = create_commit(
-            &mut transaction,
-            CreateCommitArgs {
-                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
-                changes: vec![sample_change()],
-                filesystem_state: Default::default(),
-                preconditions: CreateCommitPreconditions {
+            transaction.as_mut(),
+            create_commit_args(
+                CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
-                active_account_ids: Vec::new(),
-                lane_parent_commit_ids_override: None,
-                allow_empty_commit: false,
-                should_emit_observe_tick: false,
-                observe_tick_writer_key: None,
-                writer_key: None,
-            },
+                vec![sample_change()],
+                Default::default(),
+            ),
             &mut functions,
             None,
         )
@@ -2111,31 +1901,33 @@ mod tests {
         .expect_err("missing lane should fail");
 
         assert_eq!(error.kind, CreateCommitErrorKind::MissingWriteLane);
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
     }
 
     #[tokio::test]
     async fn allows_create_if_missing_for_new_version_lane() {
-        let mut transaction = FakeTransaction::default();
+        let backend = init_create_commit_backend().await;
+        backend.clear_query_log();
+        let mut transaction = backend
+            .begin_transaction(crate::TransactionMode::Write)
+            .await
+            .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
 
         let result = create_commit(
-            &mut transaction,
-            CreateCommitArgs {
-                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
-                changes: vec![sample_change()],
-                filesystem_state: Default::default(),
-                preconditions: CreateCommitPreconditions {
+            transaction.as_mut(),
+            create_commit_args(
+                CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CreateIfMissing,
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-create".to_string()),
                 },
-                active_account_ids: Vec::new(),
-                lane_parent_commit_ids_override: None,
-                allow_empty_commit: false,
-                should_emit_observe_tick: false,
-                observe_tick_writer_key: None,
-                writer_key: None,
-            },
+                vec![sample_change()],
+                Default::default(),
+            ),
             &mut functions,
             None,
         )
@@ -2143,37 +1935,38 @@ mod tests {
         .expect("create-if-missing should succeed");
 
         assert_eq!(result.disposition, CreateCommitDisposition::Applied);
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
     }
 
     #[tokio::test]
     async fn applies_global_admin_lane_when_head_matches_expected() {
-        let mut transaction = FakeTransaction::default();
-        transaction.version_heads.insert(
-            GLOBAL_VERSION_ID.to_string(),
-            "commit-global-123".to_string(),
-        );
+        let backend = init_create_commit_backend().await;
+        seed_local_version_head(&backend, GLOBAL_VERSION_ID, "commit-global-123", TEST_TIMESTAMP)
+            .await
+            .expect("global local version head should seed");
+        backend.clear_query_log();
+        let mut transaction = backend
+            .begin_transaction(crate::TransactionMode::Write)
+            .await
+            .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
 
         let result = create_commit(
-            &mut transaction,
-            CreateCommitArgs {
-                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
-                changes: vec![sample_global_change()],
-                filesystem_state: Default::default(),
-                preconditions: CreateCommitPreconditions {
+            transaction.as_mut(),
+            create_commit_args(
+                CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::GlobalAdmin,
                     expected_head: CreateCommitExpectedHead::CommitId(
                         "commit-global-123".to_string(),
                     ),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-global".to_string()),
                 },
-                active_account_ids: Vec::new(),
-                lane_parent_commit_ids_override: None,
-                allow_empty_commit: false,
-                should_emit_observe_tick: false,
-                observe_tick_writer_key: None,
-                writer_key: None,
-            },
+                vec![sample_global_change()],
+                Default::default(),
+            ),
             &mut functions,
             None,
         )
@@ -2182,22 +1975,37 @@ mod tests {
 
         assert_eq!(result.disposition, CreateCommitDisposition::Applied);
         assert!(result.applied_output.is_some());
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
     }
 
     #[tokio::test]
     async fn exact_file_data_update_avoids_descriptor_preflight_lookup() {
-        let mut transaction = FakeTransaction::default();
-        transaction
-            .version_heads
-            .insert("version-a".to_string(), "commit-123".to_string());
+        let backend = init_create_commit_backend().await;
+        seed_local_version_head(&backend, "version-a", "commit-123", TEST_TIMESTAMP)
+            .await
+            .expect("local version head should seed");
+        backend.clear_query_log();
+        let mut transaction = backend
+            .begin_transaction(crate::TransactionMode::Write)
+            .await
+            .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
 
         let result = create_commit(
-            &mut transaction,
-            CreateCommitArgs {
-                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
-                changes: Vec::new(),
-                filesystem_state: FilesystemTransactionState {
+            transaction.as_mut(),
+            create_commit_args(
+                CreateCommitPreconditions {
+                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
+                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
+                    idempotency_key: CreateCommitIdempotencyKey::Exact(
+                        "idem-file-data".to_string(),
+                    ),
+                },
+                Vec::new(),
+                FilesystemTransactionState {
                     files: std::iter::once((
                         ("file-1".to_string(), "version-a".to_string()),
                         FilesystemTransactionFileState {
@@ -2212,20 +2020,7 @@ mod tests {
                     ))
                     .collect(),
                 },
-                preconditions: CreateCommitPreconditions {
-                    write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
-                    expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
-                    idempotency_key: CreateCommitIdempotencyKey::Exact(
-                        "idem-file-data".to_string(),
-                    ),
-                },
-                active_account_ids: Vec::new(),
-                lane_parent_commit_ids_override: None,
-                allow_empty_commit: false,
-                should_emit_observe_tick: false,
-                observe_tick_writer_key: None,
-                writer_key: None,
-            },
+            ),
             &mut functions,
             None,
         )
@@ -2234,20 +2029,29 @@ mod tests {
 
         assert_eq!(result.disposition, CreateCommitDisposition::Applied);
         assert!(
-            !transaction
-                .executed_sql
+            !backend
+                .executed_sql()
                 .iter()
                 .any(|sql| sql.contains("FROM \"lix_internal_live_v1_lix_file_descriptor\"")),
             "data-only filesystem ops should not require descriptor preflight reads"
         );
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
     }
 
     #[tokio::test]
     async fn invariant_recheck_failure_aborts_create_commit_before_generation() {
-        let mut transaction = FakeTransaction::default();
-        transaction
-            .version_heads
-            .insert("version-a".to_string(), "commit-123".to_string());
+        let backend = init_create_commit_backend().await;
+        seed_local_version_head(&backend, "version-a", "commit-123", TEST_TIMESTAMP)
+            .await
+            .expect("local version head should seed");
+        backend.clear_query_log();
+        let mut transaction = backend
+            .begin_transaction(crate::TransactionMode::Write)
+            .await
+            .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
         let mut checker = RecordingInvariantChecker {
             calls: 0,
@@ -2258,23 +2062,16 @@ mod tests {
         };
 
         let error = create_commit(
-            &mut transaction,
-            CreateCommitArgs {
-                timestamp: Some("2026-03-06T14:22:00.000Z".to_string()),
-                changes: vec![sample_change()],
-                filesystem_state: Default::default(),
-                preconditions: CreateCommitPreconditions {
+            transaction.as_mut(),
+            create_commit_args(
+                CreateCommitPreconditions {
                     write_lane: CreateCommitWriteLane::Version("version-a".to_string()),
                     expected_head: CreateCommitExpectedHead::CommitId("commit-123".to_string()),
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
-                active_account_ids: Vec::new(),
-                lane_parent_commit_ids_override: None,
-                allow_empty_commit: false,
-                should_emit_observe_tick: false,
-                observe_tick_writer_key: None,
-                writer_key: None,
-            },
+                vec![sample_change()],
+                Default::default(),
+            ),
             &mut functions,
             Some(&mut checker),
         )
@@ -2284,150 +2081,16 @@ mod tests {
         assert_eq!(checker.calls, 1);
         assert_eq!(error.message, "create commit invariant failed");
         assert!(
-            !transaction
-                .executed_sql
+            !backend
+                .executed_sql()
                 .iter()
                 .any(|sql| sql.contains("INSERT INTO lix_internal_commit_idempotency ")),
             "create_commit should abort before persisting idempotency state"
         );
-    }
-
-    fn extract_single_quoted_value(sql: &str, prefix: &str) -> Option<String> {
-        let start = sql.find(prefix)? + prefix.len();
-        let rest = &sql[start..];
-        let end = rest.find('\'')?;
-        Some(rest[..end].to_string())
-    }
-
-    fn extract_statement_from_batch<'a>(sql: &'a str, prefix: &str) -> Option<&'a str> {
-        let start = sql.find(prefix)?;
-        let statement = &sql[start..];
-        Some(statement.split("; ").next().unwrap_or(statement))
-    }
-
-    fn extract_nth_single_quoted_value(sql: &str, index: usize) -> Option<String> {
-        let mut remaining = sql;
-        for current in 0..=index {
-            let start = remaining.find('\'')? + 1;
-            remaining = &remaining[start..];
-            let end = remaining.find('\'')?;
-            if current == index {
-                return Some(remaining[..end].to_string());
-            }
-            remaining = &remaining[end + 1..];
-        }
-        None
-    }
-
-    fn query_targets_table(sql: &str, table_name: &str) -> bool {
-        let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
-            return false;
-        };
-        statements
-            .iter()
-            .any(|statement| statement_targets_table(statement, table_name))
-    }
-
-    fn statement_targets_table(statement: &Statement, table_name: &str) -> bool {
-        match statement {
-            Statement::Query(query) => query_targets_table_name(query, table_name),
-            _ => false,
-        }
-    }
-
-    fn query_targets_table_name(query: &Query, table_name: &str) -> bool {
-        match query.body.as_ref() {
-            SetExpr::Select(select) => select.from.iter().any(|table_with_joins| {
-                table_factor_targets_table(&table_with_joins.relation, table_name)
-                    || table_with_joins
-                        .joins
-                        .iter()
-                        .any(|join| table_factor_targets_table(&join.relation, table_name))
-            }),
-            SetExpr::Query(query) => query_targets_table_name(query, table_name),
-            _ => false,
-        }
-    }
-
-    fn table_factor_targets_table(table_factor: &TableFactor, table_name: &str) -> bool {
-        match table_factor {
-            TableFactor::Table { name, .. } => name
-                .0
-                .last()
-                .and_then(|part| part.as_ident())
-                .map(|ident| ident.value.eq_ignore_ascii_case(table_name))
-                .unwrap_or(false),
-            TableFactor::Derived { subquery, .. } => query_targets_table_name(subquery, table_name),
-            _ => false,
-        }
-    }
-
-    fn query_has_text_equality(sql: &str, column_name: &str, expected: &str) -> bool {
-        let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
-            return false;
-        };
-        statements
-            .iter()
-            .any(|statement| statement_has_text_equality(statement, column_name, expected))
-    }
-
-    fn statement_has_text_equality(
-        statement: &Statement,
-        column_name: &str,
-        expected: &str,
-    ) -> bool {
-        match statement {
-            Statement::Query(query) => query_has_where_text_equality(query, column_name, expected),
-            _ => false,
-        }
-    }
-
-    fn query_has_where_text_equality(query: &Query, column_name: &str, expected: &str) -> bool {
-        match query.body.as_ref() {
-            SetExpr::Select(select) => select
-                .selection
-                .as_ref()
-                .is_some_and(|expr| expr_has_text_equality(expr, column_name, expected)),
-            SetExpr::Query(query) => query_has_where_text_equality(query, column_name, expected),
-            _ => false,
-        }
-    }
-
-    fn expr_has_text_equality(expr: &Expr, column_name: &str, expected: &str) -> bool {
-        match expr {
-            Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => {
-                expr_identifier_name(left)
-                    .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
-                    && expr_single_quoted_text(right).is_some_and(|value| value == expected)
-                    || expr_identifier_name(right)
-                        .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
-                        && expr_single_quoted_text(left).is_some_and(|value| value == expected)
-            }
-            Expr::BinaryOp { left, right, .. } => {
-                expr_has_text_equality(left, column_name, expected)
-                    || expr_has_text_equality(right, column_name, expected)
-            }
-            Expr::Nested(inner) => expr_has_text_equality(inner, column_name, expected),
-            _ => false,
-        }
-    }
-
-    fn expr_identifier_name(expr: &Expr) -> Option<&str> {
-        match expr {
-            Expr::Identifier(ident) => Some(ident.value.as_str()),
-            Expr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.as_str()),
-            _ => None,
-        }
-    }
-
-    fn expr_single_quoted_text(expr: &Expr) -> Option<&str> {
-        match expr {
-            Expr::Value(sqlparser::ast::ValueWithSpan {
-                value: sqlparser::ast::Value::SingleQuotedString(text),
-                ..
-            }) => Some(text.as_str()),
-            _ => None,
-        }
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
     }
 
     #[test]

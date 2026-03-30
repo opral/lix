@@ -8,7 +8,9 @@ use crate::read::contracts::{
 };
 use crate::sql::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::sql::executor::{
-    decode_public_read_result, execute_prepared_public_read, PreparedPublicRead,
+    decode_public_read_result, execute_prepared_public_read,
+    execute_prepared_public_read_in_transaction, PreparedPublicRead,
+    execute_prepared_public_read_without_freshness_check,
 };
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::services::state_reader::{
@@ -20,7 +22,7 @@ use crate::transaction::{
     PendingSemanticRow, PendingSemanticStorage, PendingTransactionView,
     PendingWorkspaceWriterKeyOverlay,
 };
-use crate::{LixBackend, LixError, QueryResult, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, OrderBy, OrderByExpr,
@@ -105,7 +107,7 @@ impl<'a> TransactionReadModel<'a> {
             }
             PublicReadExecutionMode::Committed(CommittedReadMode::CommittedOnly)
             | PublicReadExecutionMode::Committed(CommittedReadMode::MaterializedState) => {
-                execute_prepared_public_read(self.base, public_read).await
+                execute_prepared_public_read_without_freshness_check(self.base, public_read).await
             }
         }
     }
@@ -408,6 +410,23 @@ pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view(
     TransactionReadModel::new(base, Some(pending_transaction_view))
         .execute_prepared_public_read(public_read)
         .await
+}
+
+pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    public_read: &PreparedPublicRead,
+) -> Result<QueryResult, LixError> {
+    let execution_mode = public_read_execution_mode(public_read);
+    match (pending_transaction_view, execution_mode) {
+        (Some(pending_transaction_view), PublicReadExecutionMode::PendingView) => {
+            let backend = crate::engine::TransactionBackendAdapter::new(transaction);
+            TransactionReadModel::new(&backend, Some(pending_transaction_view))
+                .execute_prepared_public_read(public_read)
+                .await
+        }
+        _ => execute_prepared_public_read_in_transaction(transaction, public_read).await,
+    }
 }
 
 pub(crate) fn public_read_execution_mode(

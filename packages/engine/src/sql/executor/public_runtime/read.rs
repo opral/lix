@@ -46,7 +46,7 @@ use crate::sql::semantic_ir::{
     augment_dependency_spec_for_broad_public_read, prepare_structured_public_read_analysis,
     unknown_public_state_schema_error, PublicReadSemantics, StructuredPublicReadPreparation,
 };
-use crate::SqlDialect;
+use crate::{LixBackendTransaction, SqlDialect};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
@@ -130,6 +130,34 @@ pub(crate) async fn execute_prepared_public_read(
     )
     .await?;
 
+    execute_prepared_public_read_unchecked(backend, prepared).await
+}
+
+pub(crate) async fn execute_prepared_public_read_without_freshness_check(
+    backend: &dyn LixBackend,
+    prepared: &PreparedPublicRead,
+) -> Result<QueryResult, LixError> {
+    execute_prepared_public_read_unchecked(backend, prepared).await
+}
+
+pub(crate) async fn execute_prepared_public_read_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    prepared: &PreparedPublicRead,
+) -> Result<QueryResult, LixError> {
+    ensure_surface_read_freshness_in_transaction(
+        transaction,
+        prepared.freshness_contract,
+        prepared.surface_bindings(),
+    )
+    .await?;
+    let backend = crate::engine::TransactionBackendAdapter::new(transaction);
+    execute_prepared_public_read_unchecked(&backend, prepared).await
+}
+
+async fn execute_prepared_public_read_unchecked(
+    backend: &dyn LixBackend,
+    prepared: &PreparedPublicRead,
+) -> Result<QueryResult, LixError> {
     let result = match &prepared.execution {
         PreparedPublicReadExecution::LoweredSql(lowered) => {
             execute_lowered_public_read(
@@ -142,9 +170,7 @@ pub(crate) async fn execute_prepared_public_read(
             )
             .await
         }
-        PreparedPublicReadExecution::Direct(plan) => {
-            execute_direct_public_read(backend, plan).await
-        }
+        PreparedPublicReadExecution::Direct(plan) => execute_direct_public_read(backend, plan).await,
     }?;
     Ok(finalize_prepared_public_read_result(result, prepared))
 }
@@ -170,6 +196,34 @@ async fn ensure_surface_read_freshness(
         return Ok(());
     }
 
+    Err(public_read_projection_stale_error(surface_names, &status))
+}
+
+async fn ensure_surface_read_freshness_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    freshness_contract: SurfaceReadFreshness,
+    surface_names: &[String],
+) -> Result<(), LixError> {
+    if freshness_contract == SurfaceReadFreshness::AllowsStaleProjection {
+        return Ok(());
+    }
+
+    if crate::live_state::require_ready_in_transaction(transaction)
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    let backend = crate::engine::TransactionBackendAdapter::new(transaction);
+    let status =
+        crate::live_state::projection::status::load_live_state_projection_status_with_backend(
+            &backend,
+        )
+        .await?;
+    if status.mode == crate::live_state::LiveStateMode::Bootstrapping {
+        return Ok(());
+    }
     Err(public_read_projection_stale_error(surface_names, &status))
 }
 
