@@ -284,6 +284,7 @@ pub(crate) struct StructuredPublicRead {
 
 #[derive(Debug, Clone)]
 pub(crate) struct BroadSqlProvenance<T> {
+    #[cfg_attr(not(test), allow(dead_code))]
     raw: Option<T>,
 }
 
@@ -298,6 +299,7 @@ impl<T> BroadSqlProvenance<T> {
         Self { raw: Some(raw) }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn as_ref(&self) -> Option<&T> {
         self.raw.as_ref()
     }
@@ -358,9 +360,6 @@ pub(crate) enum BroadPublicReadSetExpr {
     Table {
         provenance: BroadSqlProvenance<SetExpr>,
         relation: BroadPublicReadRelation,
-    },
-    Other {
-        provenance: BroadSqlProvenance<SetExpr>,
     },
 }
 
@@ -700,9 +699,6 @@ pub(crate) enum BroadPublicReadTableFactor {
         provenance: BroadSqlProvenance<TableFactor>,
         alias: Option<BroadPublicReadAlias>,
         table_with_joins: Box<BroadPublicReadTableWithJoins>,
-    },
-    Other {
-        provenance: BroadSqlProvenance<TableFactor>,
     },
 }
 

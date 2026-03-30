@@ -124,7 +124,6 @@ fn broad_public_read_set_expr_has_typed_surface_relation(expr: &BroadPublicReadS
                 BroadPublicReadRelation::Public(_) | BroadPublicReadRelation::LoweredPublic(_)
             )
         }
-        BroadPublicReadSetExpr::Other { .. } => false,
     }
 }
 
@@ -264,7 +263,6 @@ fn broad_public_read_table_factor_has_typed_surface_relation(
         BroadPublicReadTableFactor::NestedJoin {
             table_with_joins, ..
         } => broad_public_read_table_with_joins_has_typed_surface_relation(table_with_joins),
-        BroadPublicReadTableFactor::Other { .. } => false,
     }
 }
 

@@ -197,18 +197,18 @@ fn bind_broad_public_read_set_expr(
         }),
         SetExpr::Table(table) => {
             let Some(table_name) = table.table_name.as_deref() else {
-                return Ok(BroadPublicReadSetExpr::Other {
-                    provenance: BroadSqlProvenance::from_raw(expr.clone()),
-                });
+                return Err(unsupported_broad_public_read_set_expr(expr));
             };
             Ok(BroadPublicReadSetExpr::Table {
                 provenance: BroadSqlProvenance::from_raw(expr.clone()),
                 relation: classify_broad_public_read_relation(table_name, registry, visible_ctes),
             })
         }
-        _ => Ok(BroadPublicReadSetExpr::Other {
-            provenance: BroadSqlProvenance::from_raw(expr.clone()),
-        }),
+        SetExpr::Values(_)
+        | SetExpr::Insert(_)
+        | SetExpr::Update(_)
+        | SetExpr::Delete(_)
+        | SetExpr::Merge(_) => Err(unsupported_broad_public_read_set_expr(expr)),
     }
 }
 
@@ -301,9 +301,7 @@ fn bind_broad_public_read_table_factor(
     match relation {
         TableFactor::Table { name, alias, .. } => {
             let Some(relation_name) = table_name_terminal(name) else {
-                return Ok(BroadPublicReadTableFactor::Other {
-                    provenance: BroadSqlProvenance::from_raw(relation.clone()),
-                });
+                return Err(unsupported_broad_public_read_table_factor(relation));
             };
             Ok(BroadPublicReadTableFactor::Table {
                 provenance: BroadSqlProvenance::from_raw(relation.clone()),
@@ -340,9 +338,18 @@ fn bind_broad_public_read_table_factor(
                 visible_ctes,
             )?),
         }),
-        _ => Ok(BroadPublicReadTableFactor::Other {
-            provenance: BroadSqlProvenance::from_raw(relation.clone()),
-        }),
+        TableFactor::TableFunction { .. }
+        | TableFactor::Function { .. }
+        | TableFactor::UNNEST { .. }
+        | TableFactor::JsonTable { .. }
+        | TableFactor::OpenJsonTable { .. }
+        | TableFactor::Pivot { .. }
+        | TableFactor::Unpivot { .. }
+        | TableFactor::MatchRecognize { .. }
+        | TableFactor::XmlTable { .. }
+        | TableFactor::SemanticView { .. } => {
+            Err(unsupported_broad_public_read_table_factor(relation))
+        }
     }
 }
 
@@ -950,6 +957,77 @@ fn broad_public_read_alias(alias: &TableAlias) -> BroadPublicReadAlias {
     }
 }
 
+fn unsupported_broad_public_read_set_expr(expr: &SetExpr) -> LixError {
+    let construct = match expr {
+        SetExpr::Values(_) => "VALUES query bodies",
+        SetExpr::Insert(_) => "INSERT query bodies",
+        SetExpr::Update(_) => "UPDATE query bodies",
+        SetExpr::Delete(_) => "DELETE query bodies",
+        SetExpr::Merge(_) => "MERGE query bodies",
+        SetExpr::Table(table) if table.table_name.is_none() => {
+            "TABLE query bodies without a terminal relation name"
+        }
+        _ => "this broad query body shape",
+    };
+
+    LixError::new(
+        "LIX_ERROR_INVALID_INPUT",
+        format!(
+            "broad public reads do not support {construct}: {}",
+            broad_public_read_set_expr_diagnostics_sql(expr)
+        ),
+    )
+}
+
+fn broad_public_read_set_expr_diagnostics_sql(expr: &SetExpr) -> String {
+    match expr {
+        SetExpr::Table(table) if table.table_name.is_none() => {
+            if let Some(schema_name) = &table.schema_name {
+                format!("TABLE {schema_name}.<missing relation name>")
+            } else {
+                "TABLE <missing relation name>".to_string()
+            }
+        }
+        _ => expr.to_string(),
+    }
+}
+
+fn unsupported_broad_public_read_table_factor(relation: &TableFactor) -> LixError {
+    let construct = match relation {
+        TableFactor::Table { name, .. } if table_name_terminal(name).is_none() => {
+            "table factors without a terminal relation name"
+        }
+        TableFactor::TableFunction { .. } => "TABLE(...) table factors",
+        TableFactor::Function { .. } => "function table factors",
+        TableFactor::UNNEST { .. } => "UNNEST table factors",
+        TableFactor::JsonTable { .. } => "JSON_TABLE table factors",
+        TableFactor::OpenJsonTable { .. } => "OPENJSON table factors",
+        TableFactor::Pivot { .. } => "PIVOT table factors",
+        TableFactor::Unpivot { .. } => "UNPIVOT table factors",
+        TableFactor::MatchRecognize { .. } => "MATCH_RECOGNIZE table factors",
+        TableFactor::XmlTable { .. } => "XMLTABLE table factors",
+        TableFactor::SemanticView { .. } => "SEMANTIC_VIEW table factors",
+        _ => "this FROM relation shape",
+    };
+
+    LixError::new(
+        "LIX_ERROR_INVALID_INPUT",
+        format!(
+            "broad public reads do not support {construct}: {}",
+            broad_public_read_table_factor_diagnostics_sql(relation)
+        ),
+    )
+}
+
+fn broad_public_read_table_factor_diagnostics_sql(relation: &TableFactor) -> String {
+    match relation {
+        TableFactor::Table { name, .. } if table_name_terminal(name).is_none() => {
+            "<missing relation name>".to_string()
+        }
+        _ => relation.to_string(),
+    }
+}
+
 fn table_name_terminal(name: &ObjectName) -> Option<&str> {
     name.0
         .last()
@@ -966,7 +1044,7 @@ mod tests {
         BroadPublicReadOrderByKind, BroadPublicReadProjectionItemKind, BroadPublicReadSetExpr,
         BroadPublicReadStatement, BroadSqlExpr, BroadSqlExprKind,
     };
-    use sqlparser::ast::Statement;
+    use sqlparser::ast::{ObjectName, Statement, Table, TableFactor};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
@@ -1156,7 +1234,7 @@ mod tests {
                 set_expr_contains_variant(left, predicate)
                     || set_expr_contains_variant(right, predicate)
             }
-            BroadPublicReadSetExpr::Table { .. } | BroadPublicReadSetExpr::Other { .. } => false,
+            BroadPublicReadSetExpr::Table { .. } => false,
         }
     }
 
@@ -1170,6 +1248,103 @@ mod tests {
                 .any(|expr| expr_contains_variant(expr, predicate)),
             Some(BroadPublicReadDistinct::Distinct) | None => false,
         }
+    }
+
+    #[test]
+    fn broad_binding_no_longer_constructs_legacy_fallback_nodes() {
+        let binder_src = include_str!("public_reads.rs");
+        let production_src = binder_src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("binder source should contain a production section");
+
+        assert_eq!(
+            production_src.matches("Ok(BroadPublicReadSetExpr::Other").count(),
+            0,
+            "broad binding should reject unsupported set-expression shapes instead of constructing legacy fallback IR"
+        );
+        assert_eq!(
+            production_src
+                .matches("Ok(BroadPublicReadTableFactor::Other")
+                .count(),
+            0,
+            "broad binding should reject unsupported table-factor shapes instead of constructing legacy fallback IR"
+        );
+    }
+
+    #[test]
+    fn broad_binding_rejects_unsupported_values_query_bodies_early() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let error =
+            bind_broad_public_read_statement_with_registry(&parse_one("VALUES (1)"), &registry)
+                .expect_err("unsupported VALUES broad query bodies should fail during binding");
+
+        assert!(error
+            .description
+            .contains("broad public reads do not support VALUES query bodies"));
+        assert!(error.description.contains("VALUES (1)"));
+    }
+
+    #[test]
+    fn broad_binding_rejects_table_query_bodies_without_terminal_relation_name() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let mut statement = parse_one("SELECT entity_id FROM lix_state");
+        let Statement::Query(query) = &mut statement else {
+            panic!("expected query statement");
+        };
+        query.body = Box::new(sqlparser::ast::SetExpr::Table(Box::new(Table {
+            table_name: None,
+            schema_name: None,
+        })));
+
+        let error = bind_broad_public_read_statement_with_registry(&statement, &registry)
+            .expect_err(
+                "broad TABLE query bodies without a terminal name should fail during binding",
+            );
+
+        assert!(error.description.contains(
+            "broad public reads do not support TABLE query bodies without a terminal relation name"
+        ));
+        assert!(error.description.contains("TABLE <missing relation name>"));
+    }
+
+    #[test]
+    fn broad_binding_rejects_unsupported_table_factors_early() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let error = bind_broad_public_read_statement_with_registry(
+            &parse_one("SELECT * FROM UNNEST(items) AS expanded"),
+            &registry,
+        )
+        .expect_err("unsupported UNNEST broad table factors should fail during binding");
+
+        assert!(error
+            .description
+            .contains("broad public reads do not support UNNEST table factors"));
+        assert!(error.description.contains("UNNEST(items)"));
+    }
+
+    #[test]
+    fn broad_binding_rejects_table_factors_without_terminal_relation_name() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let mut statement = parse_one("SELECT entity_id FROM lix_state");
+        let Statement::Query(query) = &mut statement else {
+            panic!("expected query statement");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+            panic!("expected SELECT query body");
+        };
+        let TableFactor::Table { name, .. } = &mut select.from[0].relation else {
+            panic!("expected table factor");
+        };
+        *name = ObjectName(vec![]);
+
+        let error = bind_broad_public_read_statement_with_registry(&statement, &registry)
+            .expect_err("broad table factors without a terminal name should fail during binding");
+
+        assert!(error.description.contains(
+            "broad public reads do not support table factors without a terminal relation name"
+        ));
+        assert!(error.description.contains("<missing relation name>"));
     }
 
     #[test]

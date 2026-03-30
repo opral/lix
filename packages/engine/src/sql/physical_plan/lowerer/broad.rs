@@ -198,12 +198,6 @@ fn ensure_broad_public_read_set_expr_is_fully_typed(
             ensure_broad_public_read_set_expr_is_fully_typed(right, &format!("{path}.right"))
         }
         BroadPublicReadSetExpr::Table { .. } => Ok(()),
-        BroadPublicReadSetExpr::Other { .. } => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "broad public-read physical lowering requires fully typed routed IR; legacy set-expression fallback remains at {path}"
-            ),
-        )),
     }
 }
 
@@ -341,12 +335,6 @@ fn ensure_broad_public_read_table_factor_is_fully_typed(
             table_with_joins,
             &format!("{path}.nested_join"),
         ),
-        BroadPublicReadTableFactor::Other { .. } => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "broad public-read physical lowering requires fully typed routed IR; legacy table-factor fallback remains at {path}"
-            ),
-        )),
     }
 }
 
@@ -644,7 +632,6 @@ fn broad_public_read_set_expr_contains_relation_kind(
                 || broad_public_read_set_expr_contains_relation_kind(right, predicate)
         }
         BroadPublicReadSetExpr::Table { relation, .. } => predicate(relation),
-        BroadPublicReadSetExpr::Other { .. } => false,
     }
 }
 
@@ -760,7 +747,6 @@ fn broad_public_read_table_factor_contains_relation_kind(
         BroadPublicReadTableFactor::NestedJoin {
             table_with_joins, ..
         } => broad_public_read_table_with_joins_contains_relation_kind(table_with_joins, predicate),
-        BroadPublicReadTableFactor::Other { .. } => false,
     }
 }
 
@@ -1157,10 +1143,6 @@ fn lower_broad_public_read_set_expr(
             active_version_id,
             known_live_layouts,
         ),
-        BroadPublicReadSetExpr::Other { .. } => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "broad public-read physical lowering does not support legacy set-expression fallbacks",
-        )),
     }
 }
 
@@ -2419,10 +2401,6 @@ fn lower_broad_public_read_table_factor(
             )?),
             alias: alias.as_ref().map(lower_broad_public_read_alias),
         }),
-        BroadPublicReadTableFactor::Other { .. } => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "broad public-read physical lowering does not support legacy table-factor fallbacks",
-        )),
     }
 }
 
