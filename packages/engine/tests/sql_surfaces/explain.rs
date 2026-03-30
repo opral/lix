@@ -31,6 +31,38 @@ fn explain_text_section<'a>(result: &'a lix_engine::ExecuteResult, key: &str) ->
         .unwrap_or_else(|| panic!("FORMAT TEXT should include {key}"))
 }
 
+const BROAD_PUBLIC_READ_STAGE_CONTRACT: &[&str] = &[
+    "parse",
+    "bind",
+    "logical_planning",
+    "capability_resolution",
+    "routing",
+    "physical_planning",
+    "executor_preparation",
+];
+
+fn broad_public_read_stage_contract_query() -> &'static str {
+    "EXPLAIN (FORMAT JSON) \
+     WITH latest AS ( \
+       SELECT entity_id \
+       FROM lix_state_by_version \
+       WHERE lixcol_version_id = 'main' \
+     ) \
+     SELECT \
+       s.schema_key, \
+       (SELECT COUNT(*) FROM lix_file f WHERE f.id = 'file-stable-child') AS file_count \
+     FROM lix_state s \
+     JOIN lix_state_by_version sv ON sv.entity_id = s.entity_id \
+     WHERE s.schema_key = 'lix_key_value' \
+       AND EXISTS (SELECT 1 FROM latest) \
+       AND s.entity_id IN (SELECT entity_id FROM latest) \
+       AND sv.lixcol_version_id = 'main' \
+     GROUP BY s.schema_key \
+     HAVING COUNT(*) > 0 \
+     ORDER BY s.schema_key \
+     LIMIT 5"
+}
+
 fn explain_stage_names(explain_json: &serde_json::Value) -> Vec<String> {
     explain_json
         .get("stage_timings")
@@ -45,6 +77,20 @@ fn explain_stage_names(explain_json: &serde_json::Value) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+fn explain_stage_duration_us(explain_json: &serde_json::Value, stage: &str) -> Option<u64> {
+    explain_json
+        .get("stage_timings")
+        .and_then(|value| value.as_array())
+        .and_then(|timings| {
+            timings.iter().find_map(|timing| {
+                let object = timing.as_object()?;
+                (object.get("stage").and_then(JsonValue::as_str) == Some(stage))
+                    .then(|| object.get("duration_us").and_then(JsonValue::as_u64))
+                    .flatten()
+            })
+        })
 }
 
 fn json_object<'a>(value: &'a JsonValue, context: &str) -> &'a Map<String, JsonValue> {
@@ -142,6 +188,24 @@ fn assert_missing_stage_names(explain_json: &JsonValue, missing: &[&str]) {
             "stage_timings should omit {stage}"
         );
     }
+}
+
+fn assert_stage_duration_at_least(explain_json: &JsonValue, stage: &str, minimum_us: u64) {
+    let duration = explain_stage_duration_us(explain_json, stage)
+        .unwrap_or_else(|| panic!("stage_timings should include {stage}"));
+    assert!(
+        duration >= minimum_us,
+        "{stage} should be at least {minimum_us}us, got {duration}us"
+    );
+}
+
+fn assert_stage_duration_below(explain_json: &JsonValue, stage: &str, maximum_us: u64) {
+    let duration = explain_stage_duration_us(explain_json, stage)
+        .unwrap_or_else(|| panic!("stage_timings should include {stage}"));
+    assert!(
+        duration < maximum_us,
+        "{stage} should stay below {maximum_us}us, got {duration}us"
+    );
 }
 
 fn assert_text_explain_contract(
@@ -2086,28 +2150,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         let result = engine
-            .execute(
-                "EXPLAIN (FORMAT JSON) \
-                 WITH latest AS ( \
-                   SELECT entity_id \
-                   FROM lix_state_by_version \
-                   WHERE lixcol_version_id = 'main' \
-                 ) \
-                 SELECT \
-                   s.schema_key, \
-                   (SELECT COUNT(*) FROM lix_file f WHERE f.id = 'file-stable-child') AS file_count \
-                 FROM lix_state s \
-                 JOIN lix_state_by_version sv ON sv.entity_id = s.entity_id \
-                 WHERE s.schema_key = 'lix_key_value' \
-                   AND EXISTS (SELECT 1 FROM latest) \
-                   AND s.entity_id IN (SELECT entity_id FROM latest) \
-                   AND sv.lixcol_version_id = 'main' \
-                 GROUP BY s.schema_key \
-                 HAVING COUNT(*) > 0 \
-                 ORDER BY s.schema_key \
-                 LIMIT 5",
-                &[],
-            )
+            .execute(broad_public_read_stage_contract_query(), &[])
             .await
             .unwrap();
 
@@ -2117,18 +2160,7 @@ simulation_test!(
         assert_broad_public_read_typed_statement_contract(explain_json);
         assert_public_read_physical_kind(explain_json, "lowered_sql");
         assert_lowered_sql_presence(explain_json, true);
-        assert_stage_timings_contract(
-            explain_json,
-            &[
-                "parse",
-                "bind",
-                "logical_planning",
-                "capability_resolution",
-                "routing",
-                "physical_planning",
-                "executor_preparation",
-            ],
-        );
+        assert_stage_timings_contract(explain_json, BROAD_PUBLIC_READ_STAGE_CONTRACT);
         assert_missing_stage_names(explain_json, &["semantic_analysis"]);
     }
 );
@@ -2206,6 +2238,60 @@ simulation_test!(
             optimized_details.get("broad_relation_summary"),
             "nested-only broad relation summaries should reflect nested routed public relations",
         );
+    }
+);
+
+simulation_test!(
+    explain_broad_public_read_binding_delay_lands_in_bind_stage,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let delay = std::time::Duration::from_millis(150);
+        let _binding_delay_guard = lix_engine::delay_broad_binding_for_test(delay);
+
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute(broad_public_read_stage_contract_query(), &[])
+            .await
+            .unwrap();
+
+        let explain_json = explain_json_payload(&result);
+        let threshold_us = (delay.as_micros() / 2) as u64;
+        assert_stage_timings_contract(explain_json, BROAD_PUBLIC_READ_STAGE_CONTRACT);
+        assert_missing_stage_names(explain_json, &["semantic_analysis"]);
+        assert_stage_duration_at_least(explain_json, "bind", threshold_us);
+        assert_stage_duration_below(explain_json, "logical_planning", threshold_us);
+    }
+);
+
+simulation_test!(
+    explain_broad_public_read_routing_delay_lands_in_routing_stage,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let delay = std::time::Duration::from_millis(150);
+        let _routing_delay_guard = lix_engine::delay_broad_routing_for_test(delay);
+
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute(broad_public_read_stage_contract_query(), &[])
+            .await
+            .unwrap();
+
+        let explain_json = explain_json_payload(&result);
+        let threshold_us = (delay.as_micros() / 2) as u64;
+        assert_stage_timings_contract(explain_json, BROAD_PUBLIC_READ_STAGE_CONTRACT);
+        assert_missing_stage_names(explain_json, &["semantic_analysis"]);
+        assert_stage_duration_at_least(explain_json, "routing", threshold_us);
+        assert_stage_duration_below(explain_json, "physical_planning", threshold_us);
     }
 );
 

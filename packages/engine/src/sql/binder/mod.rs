@@ -22,6 +22,7 @@ pub(crate) struct BoundPublicReadArtifacts {
 pub(crate) use public_reads::bind_broad_public_read_statement_with_registry;
 #[cfg(test)]
 pub(crate) use public_reads::forbid_broad_binding_for_test;
+pub use public_reads::{delay_broad_binding_for_test, BroadBindingDelayForTestGuard};
 #[cfg(test)]
 pub(crate) use runtime::{
     advance_placeholder_state_for_statement_ast, is_transaction_control_statement,

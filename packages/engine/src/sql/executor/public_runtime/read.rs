@@ -4917,6 +4917,12 @@ async fn try_prepare_public_read_with_internal_access(
     allow_internal_tables: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
+    // Public-read stage ownership starts here after `parse` has already
+    // produced the SQL AST:
+    // - bind: `bind_public_read_statement` performs generic statement binding.
+    //   For broad public reads it also performs the broad front-end bind that
+    //   produces typed broad IR, so later stages start from already-bound
+    //   broad statements.
     if parsed_statements.len() != 1 {
         return Ok(None);
     }
@@ -5035,14 +5041,19 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
     mut stage_timings: ExplainTimingCollector,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
     // Broad public-read stage semantics:
-    // - logical_planning: construct the typed broad logical plan from already-bound broad IR.
+    // - bind: completed by `try_prepare_public_read_with_internal_access`
+    //   before this helper runs. This owns generic binding plus the broad
+    //   front-end bind that produces typed broad IR.
+    // - logical_planning: construct and verify the typed broad logical plan
+    //   from already-bound broad IR.
     // - capability_resolution: load external schemas/layouts required before broad routing
     //   can choose stable lowered relations.
     // - routing: route typed broad public relations into lowerable broad relations.
-    // - physical_planning: render backend SQL and compile the lowered read program from the
-    //   optimized typed broad statement.
+    // - physical_planning: lower the optimized typed broad statement into the
+    //   lowered read program.
     // - executor_preparation: render backend SQL from the lowered read program.
     // Broad lowering does not run structured semantic analysis, so semantic_analysis is omitted.
+    let logical_started = Instant::now();
     let read_summary = summarize_bound_public_read_statement(registry, &bound_statement.statement);
     if bound_summary_contains_direct_only_history_surface(&read_summary) {
         return Err(LixError::new(
@@ -5075,7 +5086,6 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
         return Err(error);
     }
 
-    let logical_started = Instant::now();
     let logical_plan = PublicReadLogicalPlan::Broad {
         broad_statement: Box::new(broad_statement.clone()),
         surface_bindings: read_summary.bound_surface_bindings.clone(),

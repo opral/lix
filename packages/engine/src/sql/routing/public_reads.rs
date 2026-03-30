@@ -20,16 +20,17 @@ use crate::sql::routing::registry::{
 };
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
-#[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
 use std::time::Duration;
+
+thread_local! {
+    static BROAD_ROUTING_DELAY_US_FOR_TEST: Cell<u64> = const { Cell::new(0) };
+}
 
 #[cfg(test)]
 thread_local! {
     static FORBID_BROAD_ROUTING_FOR_TEST: Cell<bool> = const { Cell::new(false) };
-    static BROAD_ROUTING_DELAY_US_FOR_TEST: Cell<u64> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -50,20 +51,19 @@ pub(crate) fn forbid_broad_routing_for_test() -> ForbidBroadRoutingForTestGuard 
     ForbidBroadRoutingForTestGuard { previous }
 }
 
-#[cfg(test)]
-pub(crate) struct BroadRoutingDelayForTestGuard {
+#[doc(hidden)]
+pub struct BroadRoutingDelayForTestGuard {
     previous_delay_us: u64,
 }
 
-#[cfg(test)]
 impl Drop for BroadRoutingDelayForTestGuard {
     fn drop(&mut self) {
         BROAD_ROUTING_DELAY_US_FOR_TEST.set(self.previous_delay_us);
     }
 }
 
-#[cfg(test)]
-pub(crate) fn delay_broad_routing_for_test(delay: Duration) -> BroadRoutingDelayForTestGuard {
+#[doc(hidden)]
+pub fn delay_broad_routing_for_test(delay: Duration) -> BroadRoutingDelayForTestGuard {
     let previous_delay_us =
         BROAD_ROUTING_DELAY_US_FOR_TEST.replace(delay.as_micros().min(u128::from(u64::MAX)) as u64);
     BroadRoutingDelayForTestGuard { previous_delay_us }
@@ -76,7 +76,6 @@ fn assert_broad_routing_allowed_for_test() {
     }
 }
 
-#[cfg(test)]
 fn apply_broad_routing_delay_for_test() {
     let delay_us = BROAD_ROUTING_DELAY_US_FOR_TEST.get();
     if delay_us > 0 {
@@ -223,10 +222,8 @@ fn route_broad_public_read_statement_with_settings(
     settings: &RoutingPassSettings,
 ) -> Result<RoutedBroadPublicRead, LixError> {
     #[cfg(test)]
-    {
-        assert_broad_routing_allowed_for_test();
-        apply_broad_routing_delay_for_test();
-    }
+    assert_broad_routing_allowed_for_test();
+    apply_broad_routing_delay_for_test();
 
     let metadata = public_read_routing_pass_registry().passes[1];
     let before_summary = summarize_broad_public_read_statement(statement);

@@ -1898,7 +1898,9 @@ mod tests {
     use crate::read::models::StateHistoryRootScope;
     use crate::sql::routing::delay_broad_routing_for_test;
     use crate::sql::{
-        binder::{bind_public_read_statement, forbid_broad_binding_for_test},
+        binder::{
+            bind_public_read_statement, delay_broad_binding_for_test, forbid_broad_binding_for_test,
+        },
         catalog::{SurfaceReadFreshness, SurfaceRegistry},
         explain::ExplainTimingCollector,
         logical_plan::{DependencyPrecision, DirectPublicReadPlan},
@@ -2472,6 +2474,46 @@ mod tests {
         assert!(
             physical_planning < (delay.as_micros() / 2) as u64,
             "physical_planning should stay below the injected routing delay when routing work is timed separately: {physical_planning}us"
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_broad_reads_charge_binding_delay_to_bind_stage() {
+        let delay = Duration::from_millis(150);
+        let backend = FakeBackend::default();
+        let _binding_delay_guard = delay_broad_binding_for_test(delay);
+
+        let prepared = prepare_public_read_strict(
+            &backend,
+            &parse_one(
+                "SELECT \
+                   (SELECT lixcol_change_id FROM lix_directory WHERE id = 'dir-stable-parent') AS parent_change_id, \
+                   EXISTS (SELECT 1 FROM lix_directory WHERE id = 'dir-stable-child') AS has_child_dir, \
+                   'file-stable-child' IN (SELECT id FROM lix_file WHERE path = '/hello.txt') AS has_file",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("broad read with nested subqueries should not error")
+        .expect("broad read with nested subqueries should prepare");
+
+        let bind = stage_duration_us(&prepared, crate::sql::explain::ExplainStage::Bind)
+            .expect("broad explain should record bind timing");
+        let logical_planning = stage_duration_us(
+            &prepared,
+            crate::sql::explain::ExplainStage::LogicalPlanning,
+        )
+        .expect("broad explain should record logical_planning timing");
+
+        assert!(
+            bind >= (delay.as_micros() / 2) as u64,
+            "bind should absorb the injected broad-binding delay: {bind}us"
+        );
+        assert!(
+            logical_planning < (delay.as_micros() / 2) as u64,
+            "logical_planning should stay below the injected broad-binding delay when binding work is timed separately: {logical_planning}us"
         );
     }
 

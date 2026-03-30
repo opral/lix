@@ -19,13 +19,35 @@ use sqlparser::ast::{
     SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier, Statement, TableAlias,
     TableFactor, TableWithJoins, TypedString,
 };
-#[cfg(test)]
 use std::cell::Cell;
 use std::collections::BTreeSet;
+use std::time::Duration;
+
+thread_local! {
+    static BROAD_BINDING_DELAY_US_FOR_TEST: Cell<u64> = const { Cell::new(0) };
+}
 
 #[cfg(test)]
 thread_local! {
     static FORBID_BROAD_BINDING_FOR_TEST: Cell<bool> = const { Cell::new(false) };
+}
+
+#[doc(hidden)]
+pub struct BroadBindingDelayForTestGuard {
+    previous_delay_us: u64,
+}
+
+impl Drop for BroadBindingDelayForTestGuard {
+    fn drop(&mut self) {
+        BROAD_BINDING_DELAY_US_FOR_TEST.set(self.previous_delay_us);
+    }
+}
+
+#[doc(hidden)]
+pub fn delay_broad_binding_for_test(delay: Duration) -> BroadBindingDelayForTestGuard {
+    let previous_delay_us =
+        BROAD_BINDING_DELAY_US_FOR_TEST.replace(delay.as_micros().min(u128::from(u64::MAX)) as u64);
+    BroadBindingDelayForTestGuard { previous_delay_us }
 }
 
 #[cfg(test)]
@@ -53,17 +75,27 @@ fn assert_broad_binding_allowed_for_test() {
     }
 }
 
+fn apply_broad_binding_delay_for_test() {
+    let delay_us = BROAD_BINDING_DELAY_US_FOR_TEST.get();
+    if delay_us > 0 {
+        std::thread::sleep(Duration::from_micros(delay_us));
+    }
+}
+
 pub(crate) fn bind_broad_public_read_statement_with_registry(
     statement: &Statement,
     registry: &SurfaceRegistry,
 ) -> Result<Option<BroadPublicReadStatement>, LixError> {
-    #[cfg(test)]
-    assert_broad_binding_allowed_for_test();
-
     match statement {
-        Statement::Query(query) => Ok(Some(BroadPublicReadStatement::Query(
-            bind_broad_public_read_query_scoped(query, registry, &BTreeSet::new())?,
-        ))),
+        Statement::Query(query) => {
+            #[cfg(test)]
+            assert_broad_binding_allowed_for_test();
+            apply_broad_binding_delay_for_test();
+
+            Ok(Some(BroadPublicReadStatement::Query(
+                bind_broad_public_read_query_scoped(query, registry, &BTreeSet::new())?,
+            )))
+        }
         Statement::Explain {
             statement: inner, ..
         } => {
