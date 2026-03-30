@@ -390,6 +390,17 @@ fn assert_no_broad_public_read_fallbacks(value: &JsonValue, context: &str) {
     }
 }
 
+fn rust_item_section<'a>(source: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+    let start = source
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("source should contain {start_marker}"));
+    let rest = &source[start..];
+    let end = rest
+        .find(end_marker)
+        .unwrap_or_else(|| panic!("source should contain {end_marker} after {start_marker}"));
+    &rest[..end]
+}
+
 fn broad_expr_kind<'a>(expr: &'a JsonValue, context: &str) -> &'a str {
     json_object(expr, context)
         .get("kind")
@@ -1031,6 +1042,38 @@ fn assert_nested_only_broad_public_read_statement_snapshot(
         expected_file_kind,
         "lix_file",
         "nested_broad_statement.details.body.details.projection[2].details.expr.details.subquery",
+    );
+}
+
+#[test]
+fn broad_explain_snapshot_model_has_no_fallback_variants() {
+    let explain_src = include_str!("../../src/sql/explain/mod.rs");
+    let set_expr_enum = rust_item_section(
+        explain_src,
+        "pub(crate) enum ExplainBroadPublicReadSetExprSnapshot",
+        "pub(crate) enum ExplainBroadSetOperationKind",
+    );
+    let table_factor_enum = rust_item_section(
+        explain_src,
+        "pub(crate) enum ExplainBroadPublicReadTableFactorSnapshot",
+        "pub(crate) struct ExplainBroadPublicReadAliasSnapshot",
+    );
+
+    assert!(
+        !set_expr_enum.contains("Other"),
+        "accepted broad explain snapshot model must not reintroduce set-expression fallback variants"
+    );
+    assert!(
+        !table_factor_enum.contains("Other"),
+        "accepted broad explain snapshot model must not reintroduce table-factor fallback variants"
+    );
+    assert!(
+        !explain_src.contains("ExplainBroadPublicReadSetExprSnapshot::Other"),
+        "accepted broad explain serialization must not construct set-expression fallback snapshots"
+    );
+    assert!(
+        !explain_src.contains("ExplainBroadPublicReadTableFactorSnapshot::Other"),
+        "accepted broad explain serialization must not construct table-factor fallback snapshots"
     );
 }
 
@@ -2162,6 +2205,92 @@ simulation_test!(
         assert_lowered_sql_presence(explain_json, true);
         assert_stage_timings_contract(explain_json, BROAD_PUBLIC_READ_STAGE_CONTRACT);
         assert_missing_stage_names(explain_json, &["semantic_analysis"]);
+    }
+);
+
+simulation_test!(
+    explain_broad_public_read_rejects_unsupported_values_branch_early,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let error = engine
+            .execute(
+                "EXPLAIN (FORMAT JSON) \
+                 SELECT entity_id \
+                 FROM lix_state \
+                 WHERE schema_key = 'lix_key_value' \
+                 UNION VALUES ('entity-1')",
+                &[],
+            )
+            .await
+            .expect_err("unsupported VALUES broad branch should fail during binding");
+
+        assert_eq!(error.code, "LIX_ERROR_INVALID_INPUT");
+        assert!(
+            error
+                .description
+                .contains("broad public reads do not support VALUES query bodies"),
+            "unexpected error: {}",
+            error.description
+        );
+        assert!(
+            error.description.contains("VALUES ('entity-1')"),
+            "unexpected error: {}",
+            error.description
+        );
+        assert!(
+            !error.description.contains("legacy set-expression fallback"),
+            "unsupported broad VALUES must fail before any fallback-lowering defense: {}",
+            error.description
+        );
+    }
+);
+
+simulation_test!(
+    explain_broad_public_read_rejects_unsupported_unnest_table_factor_early,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let error = engine
+            .execute(
+                "EXPLAIN (FORMAT JSON) \
+                 SELECT s.entity_id \
+                 FROM lix_state s \
+                 JOIN UNNEST(items) AS expanded ON 1 = 1 \
+                 WHERE s.schema_key = 'lix_key_value'",
+                &[],
+            )
+            .await
+            .expect_err("unsupported UNNEST broad table factor should fail during binding");
+
+        assert_eq!(error.code, "LIX_ERROR_INVALID_INPUT");
+        assert!(
+            error
+                .description
+                .contains("broad public reads do not support UNNEST table factors"),
+            "unexpected error: {}",
+            error.description
+        );
+        assert!(
+            error.description.contains("UNNEST(items)"),
+            "unexpected error: {}",
+            error.description
+        );
+        assert!(
+            !error.description.contains("legacy table-factor fallback"),
+            "unsupported broad UNNEST must fail before any fallback-lowering defense: {}",
+            error.description
+        );
     }
 );
 
