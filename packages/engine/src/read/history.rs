@@ -7,7 +7,7 @@ use crate::canonical::roots::{
     RootCommitResolutionRequest, RootCommitScope, RootLineageScope, RootVersionScope,
 };
 use crate::sql::common::text::escape_sql_string;
-use crate::workspace::require_workspace_active_version_id;
+use crate::version::context::resolve_target_version_with_backend;
 use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
 #[allow(dead_code)]
@@ -107,7 +107,11 @@ async fn resolve_active_version_id(
             if let Some(active_version_id) = request.active_version_id.clone() {
                 return Ok(Some(active_version_id));
             }
-            Ok(Some(require_workspace_active_version_id(backend).await?))
+            Ok(Some(
+                resolve_target_version_with_backend(backend, None, "active_version_id")
+                    .await?
+                    .version_id,
+            ))
         }
     }
 }
