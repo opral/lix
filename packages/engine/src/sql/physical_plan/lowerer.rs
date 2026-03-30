@@ -90,13 +90,6 @@ impl RenderRelationSubstitutionCollector {
 
 mod broad;
 
-pub(crate) fn bind_broad_public_read_statement_with_registry(
-    statement: &Statement,
-    registry: &SurfaceRegistry,
-) -> Result<Option<BroadPublicReadStatement>, LixError> {
-    broad::bind_broad_public_read_statement_with_registry(statement, registry)
-}
-
 pub(crate) fn broad_public_relation_supports_terminal_render(
     binding: &SurfaceBinding,
     registry: &SurfaceRegistry,
@@ -2661,16 +2654,17 @@ fn escape_sql_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_broad_public_read_statement_with_registry,
         lower_broad_public_read_for_execution_with_layouts, lower_read_for_execution_with_layouts,
         LoweredReadProgram,
     };
-    use crate::sql::binder::bind_statement;
+    use crate::sql::binder::{
+        bind_broad_public_read_statement_with_registry, bind_statement,
+        forbid_broad_binding_for_test,
+    };
     use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::logical_plan::public_ir::{
-        BroadNestedQueryExpr, BroadPublicReadGroupByKind, BroadPublicReadLimitClauseKind,
-        BroadPublicReadOrderByKind, BroadPublicReadProjectionItemKind, BroadPublicReadSetExpr,
-        BroadPublicReadStatement, BroadPublicReadTableFactor, BroadSqlProvenance,
+        BroadPublicReadSetExpr, BroadPublicReadStatement, BroadPublicReadTableFactor,
+        BroadSqlProvenance,
     };
     use crate::sql::routing::{
         forbid_broad_routing_for_test, route_broad_public_read_statement_with_known_live_layouts,
@@ -3120,7 +3114,7 @@ mod tests {
         )
         .expect("broad routing should succeed");
 
-        let _binding_guard = super::broad::forbid_broad_binding_for_test();
+        let _binding_guard = forbid_broad_binding_for_test();
         let _routing_guard = forbid_broad_routing_for_test();
         let lowered = lower_broad_public_read_for_execution_with_layouts(
             &optimized.broad_statement,
@@ -3212,116 +3206,6 @@ mod tests {
         .expect_err("legacy table-factor fallbacks must not be rescued during lowering");
 
         assert!(error.description.contains("legacy table-factor fallback"));
-    }
-
-    #[test]
-    fn binds_broad_public_read_queries_into_typed_ir_shapes() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
-        let bound = bound_broad_statement(
-            &registry,
-            "WITH latest AS ( \
-               SELECT entity_id \
-               FROM lix_state_by_version \
-               WHERE lixcol_version_id = 'main' \
-             ) \
-             SELECT \
-               s.schema_key, \
-               (SELECT COUNT(*) FROM lix_file f WHERE f.id = 'file-stable-child') AS file_count \
-             FROM lix_state s \
-             WHERE EXISTS (SELECT 1 FROM latest) \
-               AND s.entity_id IN (SELECT entity_id FROM latest) \
-             GROUP BY s.schema_key \
-             HAVING COUNT(*) > 0 \
-             ORDER BY s.schema_key \
-             LIMIT 5",
-        );
-
-        let BroadPublicReadStatement::Query(query) = bound else {
-            panic!("expected broad query statement");
-        };
-
-        assert!(query.provenance.as_ref().is_some());
-        assert!(query.order_by.is_some());
-        assert!(query.limit_clause.is_some());
-
-        let with = query.with.as_ref().expect("expected typed WITH clause");
-        assert!(with.provenance.as_ref().is_some());
-        assert_eq!(with.cte_tables.len(), 1);
-        assert_eq!(with.cte_tables[0].name, "latest");
-        assert!(matches!(
-            with.cte_tables[0].query.body,
-            BroadPublicReadSetExpr::Select(_)
-        ));
-
-        let BroadPublicReadSetExpr::Select(select) = &query.body else {
-            panic!("expected top-level broad select");
-        };
-
-        assert_eq!(select.projection.len(), 2);
-        match &select.projection[0].kind {
-            BroadPublicReadProjectionItemKind::Expr {
-                alias,
-                nested_queries,
-                ..
-            } => {
-                assert_eq!(alias, &None);
-                assert!(nested_queries.is_empty());
-            }
-            other => panic!("unexpected first projection item: {other:?}"),
-        }
-        match &select.projection[1].kind {
-            BroadPublicReadProjectionItemKind::Expr {
-                alias,
-                nested_queries,
-                ..
-            } => {
-                assert_eq!(alias.as_deref(), Some("file_count"));
-                assert!(matches!(
-                    nested_queries.as_slice(),
-                    [BroadNestedQueryExpr::ScalarSubquery(_)]
-                ));
-            }
-            other => panic!("unexpected second projection item: {other:?}"),
-        }
-
-        let selection = select
-            .selection
-            .as_ref()
-            .expect("expected typed selection expression");
-        assert_eq!(selection.nested_queries.len(), 2);
-        assert!(selection
-            .nested_queries
-            .iter()
-            .any(|expr| matches!(expr, BroadNestedQueryExpr::Exists { .. })));
-        assert!(selection
-            .nested_queries
-            .iter()
-            .any(|expr| matches!(expr, BroadNestedQueryExpr::InSubquery { .. })));
-
-        assert!(matches!(
-            &select.group_by.kind,
-            BroadPublicReadGroupByKind::Expressions(expressions) if expressions.len() == 1
-        ));
-        assert!(select.having.is_some());
-
-        let order_by = query.order_by.as_ref().expect("expected typed ORDER BY");
-        assert!(matches!(
-            &order_by.kind,
-            BroadPublicReadOrderByKind::Expressions(expressions) if expressions.len() == 1
-        ));
-
-        let limit_clause = query
-            .limit_clause
-            .as_ref()
-            .expect("expected typed LIMIT clause");
-        assert!(matches!(
-            &limit_clause.kind,
-            BroadPublicReadLimitClauseKind::LimitOffset {
-                limit: Some(_),
-                offset: None,
-                ..
-            }
-        ));
     }
 
     #[test]

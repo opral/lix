@@ -11,12 +11,13 @@ use crate::read::models::{
     StateHistoryRequest, StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
 };
 use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
-use crate::sql::binder::{bind_statement, RuntimeBindingValues};
+use crate::sql::binder::{bind_public_read_statement, RuntimeBindingValues};
 use crate::sql::catalog::{SurfaceBinding, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry};
 use crate::sql::explain::{
     build_public_read_explain_artifacts, unwrap_explain_statement, ExplainStage,
     ExplainTimingCollector, PublicReadExplainBuildInput, PublicReadExplainRuntimeArtifacts,
 };
+use crate::sql::logical_plan::public_ir::BroadPublicReadStatement;
 use crate::sql::logical_plan::{
     verify_logical_plan, DirectDirectoryHistoryField, DirectEntityHistoryField,
     DirectFileHistoryField, DirectPublicReadPlan, DirectStateHistoryField,
@@ -30,7 +31,6 @@ use crate::sql::logical_plan::{
 };
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::physical_plan::lowerer::{
-    bind_broad_public_read_statement_with_registry,
     lower_broad_public_read_for_execution_with_layouts, lower_read_for_execution_with_layouts,
 };
 use crate::sql::physical_plan::{
@@ -4946,7 +4946,7 @@ async fn try_prepare_public_read_with_internal_access(
         ));
     }
     let bind_started = Instant::now();
-    let bound_statement = bind_statement(
+    let bound_public_read = bind_public_read_statement(
         statement,
         params.to_vec(),
         ExecutionContext {
@@ -4955,7 +4955,10 @@ async fn try_prepare_public_read_with_internal_access(
             requested_version_id: Some(active_version_id.to_string()),
             active_account_ids: Vec::new(),
         },
-    );
+        &registry,
+    )?;
+    let bound_statement = bound_public_read.bound_statement;
+    let broad_statement = bound_public_read.broad_statement;
     let mut stage_timings = ExplainTimingCollector::new(parse_duration);
     stage_timings.record(ExplainStage::Bind, bind_started.elapsed());
     let mut attempted_broad_lowering = false;
@@ -4964,6 +4967,7 @@ async fn try_prepare_public_read_with_internal_access(
         if let Some(prepared) = prepare_public_read_via_surface_lowering(
             backend,
             bound_statement.clone(),
+            broad_statement.clone(),
             explain_request.as_ref(),
             &registry,
             allow_internal_tables,
@@ -4995,6 +4999,7 @@ async fn try_prepare_public_read_with_internal_access(
                 if let Some(prepared) = prepare_public_read_via_surface_lowering(
                     backend,
                     bound_statement,
+                    broad_statement,
                     explain_request.as_ref(),
                     &registry,
                     allow_internal_tables,
@@ -5019,9 +5024,10 @@ async fn try_prepare_public_read_with_internal_access(
     }
 }
 
-async fn prepare_public_read_via_surface_lowering(
+pub(super) async fn prepare_public_read_via_surface_lowering(
     backend: &dyn LixBackend,
     bound_statement: BoundStatement,
+    broad_statement: Option<BroadPublicReadStatement>,
     explain_request: Option<&crate::sql::explain::ExplainRequest>,
     registry: &SurfaceRegistry,
     allow_internal_tables: bool,
@@ -5029,7 +5035,7 @@ async fn prepare_public_read_via_surface_lowering(
     mut stage_timings: ExplainTimingCollector,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
     // Broad public-read stage semantics:
-    // - logical_planning: construct the typed broad logical plan directly from broad binding.
+    // - logical_planning: construct the typed broad logical plan from already-bound broad IR.
     // - capability_resolution: load external schemas/layouts required before broad routing
     //   can choose stable lowered relations.
     // - routing: route typed broad public relations into lowerable broad relations.
@@ -5052,14 +5058,12 @@ async fn prepare_public_read_via_surface_lowering(
             &read_summary.internal_relations,
         ));
     }
-    let broad_statement =
-        bind_broad_public_read_statement_with_registry(&bound_statement.statement, registry)?
-            .ok_or_else(|| {
-                LixError::new(
+    let broad_statement = broad_statement.ok_or_else(|| {
+        LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "broad public read preparation failed: typed broad statement binding was unavailable",
+            "broad public read preparation failed: typed broad statement was unavailable after binding",
         )
-            })?;
+    })?;
 
     let dependency_spec = augment_dependency_spec_for_broad_public_read(
         registry,

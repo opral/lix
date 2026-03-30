@@ -1898,8 +1898,11 @@ mod tests {
     use crate::read::models::StateHistoryRootScope;
     use crate::sql::routing::delay_broad_routing_for_test;
     use crate::sql::{
-        catalog::SurfaceReadFreshness,
+        binder::{bind_public_read_statement, forbid_broad_binding_for_test},
+        catalog::{SurfaceReadFreshness, SurfaceRegistry},
+        explain::ExplainTimingCollector,
         logical_plan::{DependencyPrecision, DirectPublicReadPlan},
+        semantic_ir::ExecutionContext,
     };
     use crate::{LixBackend, LixError, QueryResult, Session, SqlDialect, Value};
     use async_trait::async_trait;
@@ -3395,6 +3398,62 @@ mod tests {
         assert!(!lowered_sql.contains("JOIN lix_state_by_version"));
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
         assert!(lowered_sql.contains("all_target_versions AS"));
+    }
+
+    #[tokio::test]
+    async fn broad_surface_lowering_uses_prebound_broad_statement() {
+        let backend = FakeBackend::default();
+        let statement = parse_one(
+            "WITH keyed AS ( \
+               SELECT entity_id, schema_key \
+               FROM lix_state \
+               WHERE schema_key = 'lix_key_value' \
+             ) \
+             SELECT keyed.schema_key, COUNT(*) \
+             FROM keyed \
+             JOIN lix_state_by_version sv \
+               ON sv.entity_id = keyed.entity_id \
+             WHERE sv.lixcol_version_id = 'main' \
+             GROUP BY keyed.schema_key \
+             ORDER BY keyed.schema_key",
+        )
+        .into_iter()
+        .next()
+        .expect("statement should exist");
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let bound = bind_public_read_statement(
+            statement,
+            Vec::new(),
+            ExecutionContext {
+                dialect: Some(SqlDialect::Sqlite),
+                writer_key: None,
+                requested_version_id: Some("main".to_string()),
+                active_account_ids: Vec::new(),
+            },
+            &registry,
+        )
+        .expect("public read bind should succeed");
+
+        let _binding_guard = forbid_broad_binding_for_test();
+        let prepared = super::read::prepare_public_read_via_surface_lowering(
+            &backend,
+            bound.bound_statement,
+            bound.broad_statement,
+            None,
+            &registry,
+            false,
+            None,
+            ExplainTimingCollector::new(Some(Duration::ZERO)),
+        )
+        .await
+        .expect("surface lowering should reuse the prebound broad statement")
+        .expect("broad public read should still prepare");
+
+        assert!(prepared.structured_read().is_none());
+        assert_eq!(
+            prepared.surface_bindings(),
+            vec!["lix_state", "lix_state_by_version"]
+        );
     }
 
     #[tokio::test]
