@@ -10,6 +10,7 @@ use crate::canonical::ProposedDomainChange;
 use crate::engine::TransactionBackendAdapter;
 use crate::functions::LixFunctionProvider;
 use crate::live_state::{
+    projection::replay::mark_live_state_projection_ready_without_replay_cursor_in_transaction,
     rebuild_scope_in_transaction, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
     LiveStateRebuildScope,
 };
@@ -190,6 +191,7 @@ async fn merge_version_in_transaction(
             },
         )
         .await?;
+        mark_live_state_projection_ready_without_replay_cursor_in_transaction(transaction).await?;
 
         return Ok(MergeVersionResult {
             outcome: MergeOutcome::FastForwarded,

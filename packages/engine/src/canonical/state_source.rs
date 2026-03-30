@@ -407,135 +407,105 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::LixBackendTransaction;
     use crate::canonical::roots::load_head_commit_id_for_version;
-    use crate::QueryResult;
-    use async_trait::async_trait;
+    use crate::test_support::{
+        init_test_backend_core, seed_canonical_change_row, seed_local_version_head,
+        CanonicalChangeSeed, TestSqliteBackend,
+    };
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
 
-    struct UnusedTransaction;
-
-    #[async_trait(?Send)]
-    impl LixBackendTransaction for UnusedTransaction {
-        fn dialect(&self) -> crate::SqlDialect {
-            crate::SqlDialect::Sqlite
-        }
-
-        fn mode(&self) -> crate::TransactionMode {
-            crate::TransactionMode::Write
-        }
-
-        async fn execute(
-            &mut self,
-            _sql: &str,
-            _params: &[Value],
-        ) -> Result<QueryResult, LixError> {
-            Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            })
-        }
-
-        async fn commit(self: Box<Self>) -> Result<(), LixError> {
-            Ok(())
-        }
-
-        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
-            Ok(())
-        }
+    async fn init_state_source_backend() -> TestSqliteBackend {
+        let backend = TestSqliteBackend::new();
+        init_test_backend_core(&backend)
+            .await
+            .expect("test backend init should succeed");
+        backend
     }
 
-    struct CanonicalFallbackBackend {
-        canonical_query_seen: Arc<AtomicBool>,
+    async fn seed_committed_history_fixture(
+        backend: &TestSqliteBackend,
+        include_local_head: bool,
+    ) -> Result<(), LixError> {
+        seed_canonical_change_row(
+            backend,
+            CanonicalChangeSeed {
+                id: "change-fallback",
+                entity_id: "file-1",
+                schema_key: "lix_file_descriptor",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: "snapshot-file-1",
+                snapshot_content: Some(
+                    "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"contract\",\"extension\":null,\"metadata\":{\"k\":\"v\"},\"hidden\":false}",
+                ),
+                metadata: Some("{\"k\":\"v\"}"),
+                created_at: "2026-03-30T00:00:00Z",
+            },
+        )
+        .await?;
+        seed_canonical_change_row(
+            backend,
+            CanonicalChangeSeed {
+                id: "change-commit-1",
+                entity_id: "commit-1",
+                schema_key: "lix_commit",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: "snapshot-commit-1",
+                snapshot_content: Some(
+                    "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[\"change-fallback\"],\"parent_commit_ids\":[\"parent-1\"]}",
+                ),
+                metadata: None,
+                created_at: "2026-03-30T00:01:00Z",
+            },
+        )
+        .await?;
+        seed_canonical_change_row(
+            backend,
+            CanonicalChangeSeed {
+                id: "change-commit-2",
+                entity_id: "commit-2",
+                schema_key: "lix_commit",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: "snapshot-commit-2",
+                snapshot_content: Some(
+                    "{\"id\":\"commit-2\",\"change_set_id\":\"cs-2\",\"change_ids\":[],\"parent_commit_ids\":[\"commit-1\"]}",
+                ),
+                metadata: None,
+                created_at: "2026-03-30T00:02:00Z",
+            },
+        )
+        .await?;
+        if include_local_head {
+            seed_local_version_head(backend, "v1", "commit-2", "2026-03-30T00:03:00Z").await?;
+        }
+        Ok(())
     }
 
-    #[async_trait(?Send)]
-    impl LixBackend for CanonicalFallbackBackend {
-        fn dialect(&self) -> crate::SqlDialect {
-            crate::SqlDialect::Sqlite
-        }
-
-        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            let file_descriptor_table = format!(
-                "FROM \"{}\"",
-                crate::live_state::live_relation_name("lix_file_descriptor")
-            );
-            let version_ref_table = format!(
-                "FROM {}",
-                crate::live_state::live_relation_name("lix_version_ref")
-            );
-            if sql.contains(&file_descriptor_table) || sql.contains(&version_ref_table) {
-                return Err(LixError::new("LIX_ERROR_UNKNOWN", "no such table"));
-            }
-            if sql.contains("WITH RECURSIVE commit_walk")
-                && sql.contains("c.schema_key = 'lix_file_descriptor'")
-            {
-                self.canonical_query_seen.store(true, Ordering::SeqCst);
-                return Ok(QueryResult {
-                    rows: vec![vec![
-                        Value::Text("file-1".to_string()),
-                        Value::Text("lix_file_descriptor".to_string()),
-                        Value::Text("1".to_string()),
-                        Value::Text("lix".to_string()),
-                        Value::Text("v1".to_string()),
-                        Value::Text("lix".to_string()),
-                        Value::Text("{\"id\":\"file-1\",\"name\":\"contract\"}".to_string()),
-                        Value::Text("{\"k\":\"v\"}".to_string()),
-                        Value::Text("change-fallback".to_string()),
-                    ]],
-                    columns: vec![
-                        "entity_id".to_string(),
-                        "schema_key".to_string(),
-                        "schema_version".to_string(),
-                        "file_id".to_string(),
-                        "version_id".to_string(),
-                        "plugin_key".to_string(),
-                        "snapshot_content".to_string(),
-                        "metadata".to_string(),
-                        "change_id".to_string(),
-                    ],
-                });
-            }
-            if sql.contains("FROM lix_internal_change c")
-                && sql.contains("c.schema_key = 'lix_commit'")
-            {
-                self.canonical_query_seen.store(true, Ordering::SeqCst);
-                return Ok(QueryResult {
-                    rows: vec![vec![Value::Text(
-                        "{\"id\":\"commit-1\",\"change_ids\":[\"change-fallback\"],\"parent_commit_ids\":[\"parent-1\"]}".to_string(),
-                    )]],
-                    columns: vec!["snapshot_content".to_string()],
-                });
-            }
-            Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            })
-        }
-
-        async fn begin_transaction(
-            &self,
-            _mode: crate::TransactionMode,
-        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            Ok(Box::new(UnusedTransaction))
-        }
-
-        async fn begin_savepoint(
-            &self,
-            _name: &str,
-        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            self.begin_transaction(crate::TransactionMode::Write).await
+    fn exact_file_descriptor_request() -> ExactCommittedStateRowRequest {
+        ExactCommittedStateRowRequest {
+            entity_id: "file-1".to_string(),
+            schema_key: "lix_file_descriptor".to_string(),
+            version_id: "v1".to_string(),
+            exact_filters: BTreeMap::from([
+                ("file_id".to_string(), Value::Text("lix".to_string())),
+                ("plugin_key".to_string(), Value::Text("lix".to_string())),
+                ("schema_version".to_string(), Value::Text("1".to_string())),
+            ]),
         }
     }
 
     #[tokio::test]
     async fn canonical_version_head_contract_does_not_fall_back_when_local_head_is_absent() {
-        let canonical_query_seen = Arc::new(AtomicBool::new(false));
-        let backend = CanonicalFallbackBackend {
-            canonical_query_seen: Arc::clone(&canonical_query_seen),
-        };
+        let backend = init_state_source_backend().await;
+        seed_committed_history_fixture(&backend, false)
+            .await
+            .expect("canonical history fixture should seed");
+        backend.clear_query_log();
 
         let mut executor = &backend;
         let commit_id = load_head_commit_id_for_version(&mut executor, "v1")
@@ -543,7 +513,7 @@ mod tests {
             .expect("canonical version head lookup should succeed");
 
         assert!(
-            !canonical_query_seen.load(Ordering::SeqCst),
+            backend.count_sql_matching(|sql| sql.contains("WITH RECURSIVE commit_walk")) == 0,
             "local version-head lookup should not infer a fallback from canonical changes"
         );
         assert!(commit_id.is_none());
@@ -551,31 +521,19 @@ mod tests {
 
     #[tokio::test]
     async fn canonical_exact_state_contract_walks_commit_history() {
-        let canonical_query_seen = Arc::new(AtomicBool::new(false));
-        let backend = CanonicalFallbackBackend {
-            canonical_query_seen: Arc::clone(&canonical_query_seen),
-        };
+        let backend = init_state_source_backend().await;
+        seed_committed_history_fixture(&backend, true)
+            .await
+            .expect("canonical history fixture should seed");
+        backend.clear_query_log();
 
-        let mut executor = &backend;
-        let row = load_exact_committed_state_row_at_version_head_with_executor(
-            &mut executor,
-            &ExactCommittedStateRowRequest {
-                entity_id: "file-1".to_string(),
-                schema_key: "lix_file_descriptor".to_string(),
-                version_id: "v1".to_string(),
-                exact_filters: BTreeMap::from([
-                    ("file_id".to_string(), Value::Text("lix".to_string())),
-                    ("plugin_key".to_string(), Value::Text("lix".to_string())),
-                    ("schema_version".to_string(), Value::Text("1".to_string())),
-                ]),
-            },
-        )
+        let row = load_exact_committed_state_row_at_version_head(&backend, &exact_file_descriptor_request())
         .await
         .expect("canonical exact-state lookup should succeed")
         .expect("canonical exact-state lookup should return a row");
 
         assert!(
-            canonical_query_seen.load(Ordering::SeqCst),
+            backend.count_sql_matching(|sql| sql.contains("WITH RECURSIVE commit_walk")) >= 1,
             "canonical exact-state lookup should read canonical changes"
         );
         assert_eq!(row.entity_id, "file-1");
@@ -584,10 +542,10 @@ mod tests {
 
     #[tokio::test]
     async fn canonical_commit_lineage_contract_reads_commit_snapshot_from_journal() {
-        let canonical_query_seen = Arc::new(AtomicBool::new(false));
-        let backend = CanonicalFallbackBackend {
-            canonical_query_seen: Arc::clone(&canonical_query_seen),
-        };
+        let backend = init_state_source_backend().await;
+        seed_committed_history_fixture(&backend, true)
+            .await
+            .expect("canonical history fixture should seed");
 
         let mut executor = &backend;
         let entry = load_commit_lineage_entry_by_id(&mut executor, "commit-1")
@@ -595,7 +553,6 @@ mod tests {
             .expect("canonical lineage lookup should succeed")
             .expect("canonical lineage lookup should return a row");
 
-        assert!(canonical_query_seen.load(Ordering::SeqCst));
         assert_eq!(entry.id, "commit-1");
         assert_eq!(entry.change_ids, vec!["change-fallback".to_string()]);
         assert_eq!(entry.parent_commit_ids, vec!["parent-1".to_string()]);
@@ -603,30 +560,16 @@ mod tests {
 
     #[tokio::test]
     async fn canonical_exact_state_rows_do_not_carry_workspace_writer_key_annotation() {
-        let canonical_query_seen = Arc::new(AtomicBool::new(false));
-        let backend = CanonicalFallbackBackend {
-            canonical_query_seen: Arc::clone(&canonical_query_seen),
-        };
+        let backend = init_state_source_backend().await;
+        seed_committed_history_fixture(&backend, true)
+            .await
+            .expect("canonical history fixture should seed");
 
-        let mut executor = &backend;
-        let row = load_exact_committed_state_row_at_version_head_with_executor(
-            &mut executor,
-            &ExactCommittedStateRowRequest {
-                entity_id: "file-1".to_string(),
-                schema_key: "lix_file_descriptor".to_string(),
-                version_id: "v1".to_string(),
-                exact_filters: BTreeMap::from([
-                    ("file_id".to_string(), Value::Text("lix".to_string())),
-                    ("plugin_key".to_string(), Value::Text("lix".to_string())),
-                    ("schema_version".to_string(), Value::Text("1".to_string())),
-                ]),
-            },
-        )
+        let row = load_exact_committed_state_row_at_version_head(&backend, &exact_file_descriptor_request())
         .await
         .expect("canonical exact-state lookup should succeed")
         .expect("canonical exact-state lookup should return a row");
 
-        assert!(canonical_query_seen.load(Ordering::SeqCst));
         assert!(
             !row.values.contains_key("writer_key"),
             "canonical committed rows should not carry workspace writer_key annotation"

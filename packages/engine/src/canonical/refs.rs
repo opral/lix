@@ -168,59 +168,66 @@ fn parse_version_ref_row_from_untracked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::live_state::live_relation_name;
+    use crate::live_state::constraints::{quote_ident, sql_literal};
     use crate::live_state::schema_access::normalized_values_for_schema;
     use crate::live_state::live_schema_column_names;
-    use crate::{QueryResult, SqlDialect, Value};
-    use async_trait::async_trait;
+    use crate::live_state::live_relation_name;
+    use crate::test_support::{init_test_backend_core, seed_local_version_head, TestSqliteBackend};
+    use crate::{LixBackend, Value};
 
-    struct FakeQueryExecutor {
-        current_ref_rows: Vec<(String, String)>,
+    async fn init_refs_backend() -> TestSqliteBackend {
+        let backend = TestSqliteBackend::new();
+        init_test_backend_core(&backend)
+            .await
+            .expect("test backend init should succeed");
+        backend
     }
 
-    #[async_trait(?Send)]
-    impl QueryExecutor for FakeQueryExecutor {
-        fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
-        }
-
-        async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains(&live_relation_name("lix_version_ref")) && sql.contains("untracked = true")
-            {
-                let rows = self
-                    .current_ref_rows
-                    .iter()
-                    .filter(|(version_id, _)| {
-                        !sql.contains("entity_id = '")
-                            || sql.contains(&format!("entity_id = '{}'", version_id))
-                    })
-                    .map(|(version_id, commit_id)| fake_version_ref_live_row(version_id, commit_id))
-                    .collect::<Vec<_>>();
-                return Ok(QueryResult {
-                    rows,
-                    columns: vec![
-                        "entity_id".to_string(),
-                        "schema_key".to_string(),
-                        "schema_version".to_string(),
-                        "file_id".to_string(),
-                        "version_id".to_string(),
-                        "global".to_string(),
-                        "plugin_key".to_string(),
-                        "metadata".to_string(),
-                        "writer_key".to_string(),
-                        "created_at".to_string(),
-                        "updated_at".to_string(),
-                        "commit_id".to_string(),
-                        "id".to_string(),
-                    ],
-                });
-            }
-
-            Err(LixError::unknown(format!("unexpected sql: {sql}")))
-        }
+    async fn rebuild_local_version_head_storage_without_exact_key(
+        backend: &TestSqliteBackend,
+    ) -> Result<(), LixError> {
+        let relation_name = live_relation_name(version_ref_schema_key());
+        let relation_ident = quote_ident(&relation_name);
+        let normalized_column_defs = live_schema_column_names(version_ref_schema_key(), None)?
+            .into_iter()
+            .map(|column_name| format!(", {} TEXT", quote_ident(&column_name)))
+            .collect::<String>();
+        backend
+            .execute(&format!("DROP TABLE IF EXISTS {relation_ident}"), &[])
+            .await?;
+        backend
+            .execute(
+                &format!(
+                    "CREATE TABLE {relation_ident} (\
+                     entity_id TEXT NOT NULL,\
+                     schema_key TEXT NOT NULL,\
+                     schema_version TEXT NOT NULL,\
+                     file_id TEXT NOT NULL,\
+                     version_id TEXT NOT NULL,\
+                     global BOOLEAN NOT NULL DEFAULT false,\
+                     plugin_key TEXT NOT NULL,\
+                     change_id TEXT,\
+                     metadata TEXT,\
+                     writer_key TEXT,\
+                     is_tombstone INTEGER NOT NULL DEFAULT 0,\
+                     untracked BOOLEAN NOT NULL DEFAULT false,\
+                     created_at TEXT NOT NULL,\
+                     updated_at TEXT NOT NULL\
+                     {normalized_column_defs}\
+                     )"
+                ),
+                &[],
+            )
+            .await?;
+        Ok(())
     }
 
-    fn fake_version_ref_live_row(version_id: &str, commit_id: &str) -> Vec<Value> {
+    async fn insert_corrupt_local_version_head_row(
+        backend: &TestSqliteBackend,
+        version_id: &str,
+        commit_id: &str,
+        timestamp: &str,
+    ) -> Result<(), LixError> {
         let snapshot = crate::version::version_ref_snapshot_content(version_id, commit_id);
         let normalized = normalized_values_for_schema(
             crate::version::version_ref_schema_key(),
@@ -228,34 +235,70 @@ mod tests {
             Some(&snapshot),
         )
         .expect("snapshot should normalize");
-        let mut row = vec![
-            Value::Text(version_id.to_string()),
-            Value::Text(crate::version::version_ref_schema_key().to_string()),
-            Value::Text(crate::version::version_ref_schema_version().to_string()),
-            Value::Text(crate::version::version_ref_file_id().to_string()),
-            Value::Text(crate::version::version_ref_storage_version_id().to_string()),
-            Value::Boolean(true),
-            Value::Text(crate::version::version_ref_plugin_key().to_string()),
-            Value::Null,
-            Value::Null,
-            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
-            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
+        let mut columns = vec![
+            "entity_id".to_string(),
+            "schema_key".to_string(),
+            "schema_version".to_string(),
+            "file_id".to_string(),
+            "version_id".to_string(),
+            "global".to_string(),
+            "plugin_key".to_string(),
+            "change_id".to_string(),
+            "metadata".to_string(),
+            "writer_key".to_string(),
+            "is_tombstone".to_string(),
+            "untracked".to_string(),
+            "created_at".to_string(),
+            "updated_at".to_string(),
         ];
-        for column_name in live_schema_column_names(crate::version::version_ref_schema_key(), None)
+        let mut values = vec![
+            Value::Text(version_id.to_string()),
+            Value::Text(version_ref_schema_key().to_string()),
+            Value::Text(version_ref_schema_version().to_string()),
+            Value::Text(version_ref_file_id().to_string()),
+            Value::Text(version_ref_storage_version_id().to_string()),
+            Value::Boolean(true),
+            Value::Text(version_ref_plugin_key().to_string()),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Integer(0),
+            Value::Boolean(true),
+            Value::Text(timestamp.to_string()),
+            Value::Text(timestamp.to_string()),
+        ];
+        for column_name in live_schema_column_names(version_ref_schema_key(), None)
             .expect("version ref schema should expose column names")
         {
-            row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
+            columns.push(column_name.clone());
+            values.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
         }
-        row
+        let sql = format!(
+            "INSERT INTO {table} ({columns}) VALUES ({values})",
+            table = quote_ident(&live_relation_name(version_ref_schema_key())),
+            columns = columns
+                .into_iter()
+                .map(|column_name| quote_ident(&column_name))
+                .collect::<Vec<_>>()
+                .join(", "),
+            values = values
+                .iter()
+                .map(sql_literal)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        backend.execute(&sql, &[]).await?;
+        Ok(())
     }
 
     #[tokio::test]
     async fn committed_ref_lookup_resolves_current_head_from_local_version_head_row() {
-        let mut executor = FakeQueryExecutor {
-            current_ref_rows: vec![("main".to_string(), "commit-canonical".to_string())],
-        };
+        let backend = init_refs_backend().await;
+        seed_local_version_head(&backend, "main", "commit-canonical", "2026-03-06T14:22:00.000Z")
+            .await
+            .expect("local version head seed should succeed");
 
-        let version_ref = load_committed_version_ref_with_executor(&mut executor, "main")
+        let version_ref = load_committed_version_ref_with_backend(&backend, "main")
             .await
             .expect("lookup should succeed")
             .expect("ref should exist");
@@ -265,11 +308,9 @@ mod tests {
 
     #[tokio::test]
     async fn committed_ref_lookup_returns_none_when_local_version_head_row_is_absent() {
-        let mut executor = FakeQueryExecutor {
-            current_ref_rows: Vec::new(),
-        };
+        let backend = init_refs_backend().await;
 
-        let version_ref = load_committed_version_ref_with_executor(&mut executor, "main")
+        let version_ref = load_committed_version_ref_with_backend(&backend, "main")
             .await
             .expect("lookup should succeed");
 
@@ -278,14 +319,30 @@ mod tests {
 
     #[tokio::test]
     async fn committed_ref_lookup_rejects_multiple_exact_rows_for_one_version() {
-        let mut executor = FakeQueryExecutor {
-            current_ref_rows: vec![
-                ("main".to_string(), "commit-a".to_string()),
-                ("main".to_string(), "commit-b".to_string()),
-            ],
-        };
+        let backend = init_refs_backend().await;
+        // Corruption-only setup: the real untracked write path enforces one exact
+        // local head row, so duplicates must be injected below that contract.
+        rebuild_local_version_head_storage_without_exact_key(&backend)
+            .await
+            .expect("corrupt local head storage should be rebuildable");
+        insert_corrupt_local_version_head_row(
+            &backend,
+            "main",
+            "commit-a",
+            "2026-03-06T14:22:00.000Z",
+        )
+        .await
+        .expect("first corrupt local version head should insert");
+        insert_corrupt_local_version_head_row(
+            &backend,
+            "main",
+            "commit-b",
+            "2026-03-06T14:23:00.000Z",
+        )
+        .await
+        .expect("second corrupt local version head should insert");
 
-        let error = load_committed_version_ref_with_executor(&mut executor, "main")
+        let error = load_committed_version_ref_with_backend(&backend, "main")
             .await
             .expect_err("lookup should reject multiple heads");
 

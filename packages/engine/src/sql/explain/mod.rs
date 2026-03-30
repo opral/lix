@@ -214,23 +214,6 @@ pub(crate) enum ExplainSqlDialect {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ExplainSurfaceReadFreshness {
-    RequiresFreshProjection,
-    AllowsStaleProjection,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ExplainDefaultScope {
-    ActiveVersion,
-    ExplicitVersion,
-    History,
-    GlobalAdmin,
-    WorkingChanges,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub(crate) enum ExplainDependencyPrecision {
     Precise,
     Conservative,
@@ -3671,39 +3654,10 @@ fn sql_dialect_snapshot(dialect: SqlDialect) -> ExplainSqlDialect {
     }
 }
 
-fn surface_read_freshness_snapshot(freshness: SurfaceReadFreshness) -> ExplainSurfaceReadFreshness {
-    match freshness {
-        SurfaceReadFreshness::RequiresFreshProjection => {
-            ExplainSurfaceReadFreshness::RequiresFreshProjection
-        }
-        SurfaceReadFreshness::AllowsStaleProjection => {
-            ExplainSurfaceReadFreshness::AllowsStaleProjection
-        }
-    }
-}
-
 fn surface_read_freshness_name(freshness: SurfaceReadFreshness) -> &'static str {
     match freshness {
         SurfaceReadFreshness::RequiresFreshProjection => "requires_fresh_projection",
         SurfaceReadFreshness::AllowsStaleProjection => "allows_stale_projection",
-    }
-}
-
-fn default_scope_snapshot(
-    scope: crate::sql::catalog::DefaultScopeSemantics,
-) -> ExplainDefaultScope {
-    match scope {
-        crate::sql::catalog::DefaultScopeSemantics::ActiveVersion => {
-            ExplainDefaultScope::ActiveVersion
-        }
-        crate::sql::catalog::DefaultScopeSemantics::ExplicitVersion => {
-            ExplainDefaultScope::ExplicitVersion
-        }
-        crate::sql::catalog::DefaultScopeSemantics::History => ExplainDefaultScope::History,
-        crate::sql::catalog::DefaultScopeSemantics::GlobalAdmin => ExplainDefaultScope::GlobalAdmin,
-        crate::sql::catalog::DefaultScopeSemantics::WorkingChanges => {
-            ExplainDefaultScope::WorkingChanges
-        }
     }
 }
 

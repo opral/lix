@@ -162,6 +162,11 @@ pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
             &receipt.replay_cursor,
         )
         .await?;
+    } else {
+        replay::mark_live_state_projection_ready_without_replay_cursor_in_transaction(
+            transaction,
+        )
+        .await?;
     }
 
     Ok(())
@@ -464,230 +469,50 @@ mod tests {
     };
     use crate::canonical::CanonicalCommitReceipt;
     use crate::live_state::ReplayCursor;
-    use crate::live_state::{live_relation_name, live_schema_column_names};
-    use crate::live_state::schema_access::normalized_values_for_schema;
-    use crate::live_state::{LiveStateMode, LIVE_STATE_SCHEMA_EPOCH};
-    use crate::test_support::boot_test_engine;
+    use crate::live_state::LiveStateMode;
+    use crate::test_support::{
+        boot_test_engine, init_test_backend_core, seed_canonical_change_row,
+        seed_live_state_status_row, seed_local_version_head, CanonicalChangeSeed,
+        TestSqliteBackend,
+    };
     use crate::{CreateVersionOptions, VersionId};
-    use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, TransactionMode, Value};
-    use async_trait::async_trait;
+    use crate::{CommittedVersionFrontier, LixBackend, LixError, TransactionMode};
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
 
-    #[derive(Default)]
-    struct FakeBackend {
-        status_row: Option<Vec<Value>>,
-        latest_cursor: Option<(String, String)>,
-        version_heads: BTreeMap<String, String>,
-        executed_sql: Mutex<Vec<String>>,
+    async fn init_projection_backend() -> TestSqliteBackend {
+        let backend = TestSqliteBackend::new();
+        init_test_backend_core(&backend)
+            .await
+            .expect("test backend init should succeed");
+        backend
     }
 
-    #[async_trait(?Send)]
-    impl LixBackend for FakeBackend {
-        fn dialect(&self) -> crate::SqlDialect {
-            crate::SqlDialect::Sqlite
-        }
-
-        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            self.executed_sql.lock().unwrap().push(sql.to_string());
-            if is_committed_version_frontier_query(sql) {
-                return Ok(QueryResult {
-                    rows: version_ref_rows(&self.version_heads),
-                    columns: version_ref_row_columns(),
-                });
-            }
-            if sql.contains("FROM lix_internal_live_state_status") {
-                return Ok(QueryResult {
-                    rows: self.status_row.clone().into_iter().collect(),
-                    columns: vec![
-                        "mode".to_string(),
-                        "latest_change_id".to_string(),
-                        "latest_change_created_at".to_string(),
-                        "schema_epoch".to_string(),
-                        "applied_committed_frontier".to_string(),
-                    ],
-                });
-            }
-            if sql.contains("FROM lix_internal_change")
-                && sql.contains("ORDER BY created_at DESC, id DESC")
-            {
-                return Ok(QueryResult {
-                    rows: self
-                        .latest_cursor
-                        .clone()
-                        .into_iter()
-                        .map(|(id, created_at)| vec![Value::Text(id), Value::Text(created_at)])
-                        .collect(),
-                    columns: vec!["id".to_string(), "created_at".to_string()],
-                });
-            }
-            Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            })
-        }
-
-        async fn begin_transaction(
-            &self,
-            _mode: TransactionMode,
-        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "transactions not used in fake backend",
-            ))
-        }
-
-        async fn begin_savepoint(
-            &self,
-            _name: &str,
-        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "begin_savepoint not supported in test backend",
-            ))
-        }
-    }
-
-    struct FakeTransaction {
-        status_row: Option<Vec<Value>>,
-        latest_cursor: Option<(String, String)>,
-        version_heads: BTreeMap<String, String>,
-        executed_sql: Vec<String>,
-        fail_local_version_head_write: bool,
-    }
-
-    #[async_trait(?Send)]
-    impl LixBackendTransaction for FakeTransaction {
-        fn dialect(&self) -> crate::SqlDialect {
-            crate::SqlDialect::Sqlite
-        }
-
-        fn mode(&self) -> TransactionMode {
-            TransactionMode::Write
-        }
-
-        async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            self.executed_sql.push(sql.to_string());
-            if self.fail_local_version_head_write
-                && sql.contains("lix_version_ref")
-                && sql.contains("INSERT INTO")
-            {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "local version-head write failed",
-                ));
-            }
-            if is_committed_version_frontier_query(sql) {
-                return Ok(QueryResult {
-                    rows: version_ref_rows(&self.version_heads),
-                    columns: version_ref_row_columns(),
-                });
-            }
-            if sql.contains("FROM lix_internal_live_state_status") {
-                return Ok(QueryResult {
-                    rows: self.status_row.clone().into_iter().collect(),
-                    columns: vec![
-                        "mode".to_string(),
-                        "latest_change_id".to_string(),
-                        "latest_change_created_at".to_string(),
-                        "schema_epoch".to_string(),
-                        "applied_committed_frontier".to_string(),
-                    ],
-                });
-            }
-            if sql.contains("FROM lix_internal_change")
-                && sql.contains("ORDER BY created_at DESC, id DESC")
-            {
-                return Ok(QueryResult {
-                    rows: self
-                        .latest_cursor
-                        .clone()
-                        .into_iter()
-                        .map(|(id, created_at)| vec![Value::Text(id), Value::Text(created_at)])
-                        .collect(),
-                    columns: vec!["id".to_string(), "created_at".to_string()],
-                });
-            }
-            Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            })
-        }
-
-        async fn commit(self: Box<Self>) -> Result<(), LixError> {
-            Ok(())
-        }
-
-        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
-            Ok(())
-        }
-    }
-
-    fn is_committed_version_frontier_query(sql: &str) -> bool {
-        sql.contains(&live_relation_name("lix_version_ref"))
-            && sql.contains("untracked = true")
-            && sql.contains("ORDER BY entity_id ASC, file_id ASC")
-    }
-
-    fn version_ref_rows(version_heads: &BTreeMap<String, String>) -> Vec<Vec<Value>> {
-        version_heads
-            .iter()
-            .map(|(version_id, commit_id)| fake_version_ref_live_row(version_id, commit_id))
-            .collect()
-    }
-
-    fn version_ref_row_columns() -> Vec<String> {
-        let mut columns = vec![
-            "entity_id".to_string(),
-            "schema_key".to_string(),
-            "schema_version".to_string(),
-            "file_id".to_string(),
-            "version_id".to_string(),
-            "global".to_string(),
-            "plugin_key".to_string(),
-            "metadata".to_string(),
-            "writer_key".to_string(),
-            "created_at".to_string(),
-            "updated_at".to_string(),
-        ];
-        columns.extend(
-            live_schema_column_names(crate::version::version_ref_schema_key(), None)
-                .expect("version ref schema should expose column names"),
-        );
-        columns
-    }
-
-    fn fake_version_ref_live_row(version_id: &str, commit_id: &str) -> Vec<Value> {
-        let snapshot = crate::version::version_ref_snapshot_content(version_id, commit_id);
-        let normalized = normalized_values_for_schema(
-            crate::version::version_ref_schema_key(),
-            None,
-            Some(&snapshot),
+    async fn seed_latest_replay_cursor(
+        backend: &TestSqliteBackend,
+        change_id: &str,
+        created_at: &str,
+    ) {
+        seed_canonical_change_row(
+            backend,
+            CanonicalChangeSeed {
+                id: change_id,
+                entity_id: "cursor-entity",
+                schema_key: "lix_key_value",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: "no-content",
+                snapshot_content: None,
+                metadata: None,
+                created_at,
+            },
         )
-        .expect("snapshot should normalize");
-        let mut row = vec![
-            Value::Text(version_id.to_string()),
-            Value::Text(crate::version::version_ref_schema_key().to_string()),
-            Value::Text(crate::version::version_ref_schema_version().to_string()),
-            Value::Text(crate::version::version_ref_file_id().to_string()),
-            Value::Text(crate::version::version_ref_storage_version_id().to_string()),
-            Value::Boolean(true),
-            Value::Text(crate::version::version_ref_plugin_key().to_string()),
-            Value::Null,
-            Value::Null,
-            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
-            Value::Text("2026-03-06T14:22:00.000Z".to_string()),
-        ];
-        for column_name in live_schema_column_names(crate::version::version_ref_schema_key(), None)
-            .expect("version ref schema should expose column names")
-        {
-            row.push(normalized.get(&column_name).cloned().unwrap_or(Value::Null));
-        }
-        row
+        .await
+        .expect("latest replay cursor row should seed");
     }
 
-    fn frontier_json(entries: &[(&str, &str)]) -> String {
-        crate::CommittedVersionFrontier {
+    fn frontier(entries: &[(&str, &str)]) -> CommittedVersionFrontier {
+        CommittedVersionFrontier {
             version_heads: entries
                 .iter()
                 .map(|(version_id, commit_id)| {
@@ -695,23 +520,24 @@ mod tests {
                 })
                 .collect(),
         }
-        .to_json_string()
     }
 
     #[tokio::test]
     async fn projection_status_reports_live_state_applied_cursor() {
-        let backend = FakeBackend {
-            status_row: Some(vec![
-                Value::Text("ready".to_string()),
-                Value::Text("change-1".to_string()),
-                Value::Text("2026-03-15T01:02:02Z".to_string()),
-                Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
-                Value::Text(frontier_json(&[("main", "commit-1")])),
-            ]),
-            latest_cursor: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
-            version_heads: BTreeMap::from([("main".to_string(), "commit-1".to_string())]),
-            executed_sql: Mutex::new(Vec::new()),
-        };
+        let backend = init_projection_backend().await;
+        seed_local_version_head(&backend, "main", "commit-1", "2026-03-15T01:02:02Z")
+            .await
+            .expect("local version head should seed");
+        seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z").await;
+        seed_live_state_status_row(
+            &backend,
+            LiveStateMode::Ready,
+            Some(&ReplayCursor::new("change-1", "2026-03-15T01:02:02Z")),
+            Some(&frontier(&[("main", "commit-1")])),
+            "2026-03-15T01:02:03Z",
+        )
+        .await
+        .expect("status row should seed");
 
         let status = projection_status(&backend)
             .await
@@ -744,19 +570,24 @@ mod tests {
 
     #[tokio::test]
     async fn apply_canonical_receipt_routes_commit_boundary_through_projection_layer() {
-        let mut transaction = FakeTransaction {
-            status_row: Some(vec![
-                Value::Text("ready".to_string()),
-                Value::Text("change-1".to_string()),
-                Value::Text("2026-03-15T01:02:02Z".to_string()),
-                Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
-                Value::Text(frontier_json(&[("main", "commit-1")])),
-            ]),
-            latest_cursor: Some(("change-1".to_string(), "2026-03-15T01:02:02Z".to_string())),
-            version_heads: BTreeMap::from([("main".to_string(), "commit-2".to_string())]),
-            executed_sql: Vec::new(),
-            fail_local_version_head_write: false,
-        };
+        let backend = init_projection_backend().await;
+        seed_local_version_head(&backend, "main", "commit-2", "2026-03-15T01:02:03Z")
+            .await
+            .expect("local version head should seed");
+        seed_live_state_status_row(
+            &backend,
+            LiveStateMode::Ready,
+            Some(&ReplayCursor::new("change-1", "2026-03-15T01:02:02Z")),
+            Some(&frontier(&[("main", "commit-1")])),
+            "2026-03-15T01:02:02Z",
+        )
+        .await
+        .expect("status row should seed");
+        backend.clear_query_log();
+        let mut transaction = backend
+            .begin_transaction(TransactionMode::Write)
+            .await
+            .expect("transaction should begin");
         let receipt = CanonicalCommitReceipt {
             commit_id: "commit-2".to_string(),
             replay_cursor: ReplayCursor::new("change-2", "2026-03-15T01:02:03Z"),
@@ -764,27 +595,37 @@ mod tests {
             affected_versions: vec!["main".to_string()],
         };
 
-        apply_canonical_receipt_in_transaction(&mut transaction, &receipt)
+        apply_canonical_receipt_in_transaction(transaction.as_mut(), &receipt)
             .await
             .expect("projection layer should apply canonical receipt");
 
-        assert!(transaction.executed_sql.iter().any(|sql| {
+        assert!(backend.executed_sql().iter().any(|sql| {
             sql.contains("INSERT INTO lix_internal_live_state_status ")
                 && sql.contains("'ready'")
                 && sql.contains("'change-2'")
                 && sql.contains("commit-2")
         }));
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
     }
 
     #[tokio::test]
     async fn local_version_head_writes_are_required_for_projection_application() {
-        let mut transaction = FakeTransaction {
-            status_row: None,
-            latest_cursor: None,
-            version_heads: BTreeMap::new(),
-            executed_sql: Vec::new(),
-            fail_local_version_head_write: true,
-        };
+        let backend = init_projection_backend().await;
+        let version_ref_table = crate::live_state::schema_access::tracked_relation_name(
+            crate::version::version_ref_schema_key(),
+        );
+        backend.block_writes_to(
+            &version_ref_table,
+            LixError::new("LIX_ERROR_UNKNOWN", "local version-head write failed"),
+        );
+        backend.clear_query_log();
+        let mut transaction = backend
+            .begin_transaction(TransactionMode::Write)
+            .await
+            .expect("transaction should begin");
         let receipt = CanonicalCommitReceipt {
             commit_id: "commit-2".to_string(),
             replay_cursor: ReplayCursor::new("change-2", "2026-03-15T01:02:03Z"),
@@ -797,33 +638,40 @@ mod tests {
         };
 
         apply_commit_projections_best_effort_in_transaction(
-            &mut transaction,
+            transaction.as_mut(),
             &receipt,
             &BTreeMap::new(),
         )
         .await
         .expect_err("local version-head writes should block projection application");
 
-        assert!(transaction
-            .executed_sql
+        assert!(backend
+            .executed_sql()
             .iter()
-            .any(|sql| sql.contains("lix_version_ref")));
+            .any(|sql| sql.contains(&version_ref_table)));
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
     }
 
     #[tokio::test]
     async fn catch_up_is_noop_when_frontier_is_already_applied() {
-        let backend = FakeBackend {
-            status_row: Some(vec![
-                Value::Text("ready".to_string()),
-                Value::Text("change-1".to_string()),
-                Value::Text("2026-03-15T01:02:02Z".to_string()),
-                Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string()),
-                Value::Text(frontier_json(&[("main", "commit-2")])),
-            ]),
-            latest_cursor: Some(("change-2".to_string(), "2026-03-15T01:02:03Z".to_string())),
-            version_heads: BTreeMap::from([("main".to_string(), "commit-2".to_string())]),
-            executed_sql: Mutex::new(Vec::new()),
-        };
+        let backend = init_projection_backend().await;
+        seed_local_version_head(&backend, "main", "commit-2", "2026-03-15T01:02:03Z")
+            .await
+            .expect("local version head should seed");
+        seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z").await;
+        seed_live_state_status_row(
+            &backend,
+            LiveStateMode::Ready,
+            Some(&ReplayCursor::new("change-1", "2026-03-15T01:02:02Z")),
+            Some(&frontier(&[("main", "commit-2")])),
+            "2026-03-15T01:02:03Z",
+        )
+        .await
+        .expect("status row should seed");
+        backend.clear_query_log();
 
         let report = catch_up_live_state_to_current_frontier(&backend)
             .await
@@ -846,6 +694,12 @@ mod tests {
         );
         assert_eq!(report.full_rebuild_passes, 0);
         assert_eq!(report.delta_merge_passes, 0);
+        assert!(
+            backend.executed_sql().iter().all(|sql| !sql
+                .to_ascii_lowercase()
+                .contains("insert into lix_internal_live_state_status")),
+            "already-applied catch-up should not rewrite projection status"
+        );
     }
 
     #[test]

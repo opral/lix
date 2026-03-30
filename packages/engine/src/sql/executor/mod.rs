@@ -27,7 +27,8 @@ pub(crate) use compiled::{
 pub(crate) use public_runtime::{
     apply_public_surface_registry_mutations, build_tracked_txn_unit,
     classify_public_execution_route_with_registry, decode_public_read_result,
-    execute_prepared_public_read, public_surface_registry_mutations,
+    execute_prepared_public_read, execute_prepared_public_read_in_transaction,
+    execute_prepared_public_read_without_freshness_check, public_surface_registry_mutations,
     semantic_plan_effects_from_domain_changes, state_commit_stream_operation,
     statement_references_public_surface_with_backend,
     try_prepare_public_read_with_registry_and_internal_access, PreparedPublicRead,

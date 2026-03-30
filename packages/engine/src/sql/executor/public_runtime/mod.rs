@@ -89,7 +89,11 @@ pub(crate) struct PreparedPublicRead {
     pub(crate) explain: ExplainArtifacts,
 }
 
-pub(crate) use read::{decode_public_read_result, execute_prepared_public_read};
+pub(crate) use read::{
+    decode_public_read_result, execute_prepared_public_read,
+    execute_prepared_public_read_in_transaction,
+    execute_prepared_public_read_without_freshness_check,
+};
 
 impl PreparedPublicRead {
     pub(crate) fn structured_read(&self) -> Option<&StructuredPublicRead> {
@@ -1913,8 +1917,6 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         registered_schema_rows: HashMap<String, String>,
-        change_rows: Vec<Vec<Value>>,
-        untracked_rows: Vec<Vec<Value>>,
         registered_schema_delay: Option<Duration>,
         registered_schema_query_count: Arc<AtomicUsize>,
     }
@@ -1987,42 +1989,6 @@ mod tests {
                     columns: vec!["value".to_string()],
                 });
             }
-            if sql.contains("FROM lix_internal_live_v1_")
-                && sql.contains("untracked = true")
-                && !sql.contains("lix_version_ref")
-            {
-                return Ok(QueryResult {
-                    rows: self.untracked_rows.clone(),
-                    columns: vec![
-                        "entity_id".to_string(),
-                        "schema_key".to_string(),
-                        "schema_version".to_string(),
-                        "file_id".to_string(),
-                        "version_id".to_string(),
-                        "plugin_key".to_string(),
-                        "snapshot_content".to_string(),
-                        "metadata".to_string(),
-                    ],
-                });
-            }
-            if sql.contains("SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at")
-                && sql.contains("FROM lix_internal_change c")
-            {
-                return Ok(QueryResult {
-                    rows: self.change_rows.clone(),
-                    columns: vec![
-                        "id".to_string(),
-                        "entity_id".to_string(),
-                        "schema_key".to_string(),
-                        "schema_version".to_string(),
-                        "file_id".to_string(),
-                        "plugin_key".to_string(),
-                        "snapshot_content".to_string(),
-                        "metadata".to_string(),
-                        "created_at".to_string(),
-                    ],
-                });
-            }
             Ok(QueryResult {
                 rows: Vec::new(),
                 columns: Vec::new(),
@@ -2089,7 +2055,7 @@ mod tests {
         .to_string()
     }
 
-    async fn boot_real_backend() -> (crate::test_support::InMemorySqliteBackend, Session) {
+    async fn boot_real_backend() -> (crate::test_support::TestSqliteBackend, Session) {
         let (backend, _engine, session) = crate::test_support::boot_test_engine()
             .await
             .expect("test engine should boot");
@@ -2097,7 +2063,7 @@ mod tests {
     }
 
     async fn active_version_fixture() -> (
-        crate::test_support::InMemorySqliteBackend,
+        crate::test_support::TestSqliteBackend,
         Session,
         String,
         String,

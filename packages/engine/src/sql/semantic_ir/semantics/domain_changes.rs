@@ -418,7 +418,7 @@ mod tests {
         params: Vec<Value>,
     ) -> (
         crate::sql::logical_plan::public_ir::PlannedWrite,
-        crate::test_support::InMemorySqliteBackend,
+        crate::test_support::TestSqliteBackend,
     ) {
         let (backend, _engine, session) = crate::test_support::boot_test_engine()
             .await
@@ -458,7 +458,7 @@ mod tests {
         sql: &str,
     ) -> (
         crate::sql::logical_plan::public_ir::PlannedWrite,
-        crate::test_support::InMemorySqliteBackend,
+        crate::test_support::TestSqliteBackend,
     ) {
         planned_write_with_params(sql, Vec::new()).await
     }

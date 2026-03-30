@@ -17,7 +17,7 @@ use crate::sql::executor::{
     PreparedPublicRead,
 };
 use crate::sql::logical_plan::ResultContract;
-use crate::sql::services::pending_reads::execute_prepared_public_read_with_pending_transaction_view;
+use crate::sql::services::pending_reads::execute_prepared_public_read_with_pending_transaction_view_in_transaction;
 use crate::state::stream::StateCommitStreamChange;
 use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, QueryResult};
@@ -128,10 +128,9 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
             explain.render_query_result()?,
         )),
         CompiledExecutionRoute::PublicRead(public_read) => {
-            let backend = TransactionBackendAdapter::new(transaction);
             let execution_started = Instant::now();
-            let public_result = match execute_prepared_public_read_with_pending_transaction_view(
-                &backend,
+            let public_result = match execute_prepared_public_read_with_pending_transaction_view_in_transaction(
+                transaction,
                 pending_transaction_view,
                 public_read,
             )
@@ -139,6 +138,7 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
             {
                 Ok(result) => result,
                 Err(error) => {
+                    let backend = TransactionBackendAdapter::new(transaction);
                     let normalized = normalize_sql_execution_error_with_backend(
                         &backend,
                         error,
