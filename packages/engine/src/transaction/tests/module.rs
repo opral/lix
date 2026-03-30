@@ -219,9 +219,7 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
     write_tx
         .stage(TransactionDelta {
             tracked_writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
-            untracked_writes: vec![local_version_head_write_row(
-                "main", "commit-1", timestamp,
-            )],
+            untracked_writes: vec![local_version_head_write_row("main", "commit-1", timestamp)],
         })
         .expect("staging should succeed");
 
@@ -328,9 +326,7 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
     write_tx
         .stage(TransactionDelta {
             tracked_writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
-            untracked_writes: vec![local_version_head_write_row(
-                "main", "commit-1", timestamp,
-            )],
+            untracked_writes: vec![local_version_head_write_row("main", "commit-1", timestamp)],
         })
         .expect("staging should succeed");
 

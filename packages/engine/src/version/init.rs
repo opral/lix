@@ -172,10 +172,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             updated_at: timestamp,
             operation: crate::live_state::untracked::UntrackedWriteOperation::Upsert,
         };
-        UntrackedWriteParticipant::apply_write_batch(
-            self.backend_transaction_mut()?,
-            &[row],
-        )
-        .await
+        UntrackedWriteParticipant::apply_write_batch(self.backend_transaction_mut()?, &[row]).await
     }
 }

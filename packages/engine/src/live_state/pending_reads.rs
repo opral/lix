@@ -9,8 +9,8 @@ use crate::read::contracts::{
 use crate::sql::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::sql::executor::{
     decode_public_read_result, execute_prepared_public_read,
-    execute_prepared_public_read_in_transaction, PreparedPublicRead,
-    execute_prepared_public_read_without_freshness_check,
+    execute_prepared_public_read_in_transaction,
+    execute_prepared_public_read_without_freshness_check, PreparedPublicRead,
 };
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::services::state_reader::{

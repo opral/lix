@@ -168,7 +168,9 @@ async fn execute_prepared_public_read_unchecked(
             )
             .await
         }
-        PreparedPublicReadExecution::Direct(plan) => execute_direct_public_read(backend, plan).await,
+        PreparedPublicReadExecution::Direct(plan) => {
+            execute_direct_public_read(backend, plan).await
+        }
     }?;
     Ok(finalize_prepared_public_read_result(result, prepared))
 }

@@ -883,10 +883,10 @@ mod tests {
             &backend,
             LiveStateMode::Ready,
             Some(&ReplayCursor::new("change-1", "2026-03-15T01:02:02Z")),
-            Some(&CommittedVersionFrontier::from_json_str(&frontier_json(&[(
-                "main", "commit-2",
-            )]))
-            .expect("frontier json should parse")),
+            Some(
+                &CommittedVersionFrontier::from_json_str(&frontier_json(&[("main", "commit-2")]))
+                    .expect("frontier json should parse"),
+            ),
             "2026-03-15T01:02:04Z",
         )
         .await
@@ -909,10 +909,10 @@ mod tests {
             &backend,
             LiveStateMode::Ready,
             Some(&ReplayCursor::new("change-1", "2026-03-15T01:02:02Z")),
-            Some(&CommittedVersionFrontier::from_json_str(&frontier_json(&[(
-                "main", "commit-1",
-            )]))
-            .expect("frontier json should parse")),
+            Some(
+                &CommittedVersionFrontier::from_json_str(&frontier_json(&[("main", "commit-1")]))
+                    .expect("frontier json should parse"),
+            ),
             "2026-03-15T01:02:03Z",
         )
         .await
@@ -997,10 +997,10 @@ mod tests {
             &backend,
             LiveStateMode::Ready,
             Some(&ReplayCursor::new("change-1", "2026-03-15T01:02:02Z")),
-            Some(&CommittedVersionFrontier::from_json_str(&frontier_json(&[(
-                "main", "commit-1",
-            )]))
-            .expect("frontier json should parse")),
+            Some(
+                &CommittedVersionFrontier::from_json_str(&frontier_json(&[("main", "commit-1")]))
+                    .expect("frontier json should parse"),
+            ),
             "2026-03-15T01:02:03Z",
         )
         .await
@@ -1030,10 +1030,10 @@ mod tests {
             &backend,
             LiveStateMode::Ready,
             Some(&ReplayCursor::new("change-1", "2026-03-15T01:02:02Z")),
-            Some(&CommittedVersionFrontier::from_json_str(&frontier_json(&[(
-                "main", "commit-1",
-            )]))
-            .expect("frontier json should parse")),
+            Some(
+                &CommittedVersionFrontier::from_json_str(&frontier_json(&[("main", "commit-1")]))
+                    .expect("frontier json should parse"),
+            ),
             "2026-03-15T01:02:03Z",
         )
         .await
@@ -1072,10 +1072,10 @@ mod tests {
             &backend,
             LiveStateMode::NeedsRebuild,
             Some(&ReplayCursor::new("change-1", "2026-03-15T01:02:02Z")),
-            Some(&CommittedVersionFrontier::from_json_str(&frontier_json(&[(
-                "main", "commit-1",
-            )]))
-            .expect("frontier json should parse")),
+            Some(
+                &CommittedVersionFrontier::from_json_str(&frontier_json(&[("main", "commit-1")]))
+                    .expect("frontier json should parse"),
+            ),
             "2026-03-15T01:02:03Z",
         )
         .await

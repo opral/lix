@@ -126,7 +126,8 @@ pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
     receipt: &CanonicalCommitReceipt,
     tracked_writer_key_hints: &BTreeMap<RowIdentity, Option<String>>,
 ) -> Result<(), LixError> {
-    apply_local_version_head_rows_in_transaction(transaction, &receipt.updated_version_refs).await?;
+    apply_local_version_head_rows_in_transaction(transaction, &receipt.updated_version_refs)
+        .await?;
 
     if receipt.affected_versions.is_empty() {
         return Ok(());
@@ -163,10 +164,8 @@ pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
         )
         .await?;
     } else {
-        replay::mark_live_state_projection_ready_without_replay_cursor_in_transaction(
-            transaction,
-        )
-        .await?;
+        replay::mark_live_state_projection_ready_without_replay_cursor_in_transaction(transaction)
+            .await?;
     }
 
     Ok(())
@@ -468,15 +467,15 @@ mod tests {
         DerivedProjectionId, ProjectionCatchUpOutcome, ProjectionReplayMode, UpdatedVersionRef,
     };
     use crate::canonical::CanonicalCommitReceipt;
-    use crate::live_state::ReplayCursor;
     use crate::live_state::LiveStateMode;
+    use crate::live_state::ReplayCursor;
     use crate::test_support::{
         boot_test_engine, init_test_backend_core, seed_canonical_change_row,
         seed_live_state_status_row, seed_local_version_head, CanonicalChangeSeed,
         TestSqliteBackend,
     };
-    use crate::{CreateVersionOptions, VersionId};
     use crate::{CommittedVersionFrontier, LixBackend, LixError, TransactionMode};
+    use crate::{CreateVersionOptions, VersionId};
     use std::collections::BTreeMap;
 
     async fn init_projection_backend() -> TestSqliteBackend {
