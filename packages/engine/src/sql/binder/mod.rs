@@ -4,12 +4,24 @@
 //! parameter/caller-specific AST binding concerns.
 
 pub(crate) mod classifier;
+pub(crate) mod public_reads;
 pub(crate) mod runtime;
 
+use crate::sql::catalog::SurfaceRegistry;
+use crate::sql::logical_plan::public_ir::BroadPublicReadStatement;
 use crate::sql::semantic_ir::{BoundStatement, ExecutionContext};
-use crate::Value;
+use crate::{LixError, Value};
 use sqlparser::ast::Statement;
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundPublicReadArtifacts {
+    pub(crate) bound_statement: BoundStatement,
+    pub(crate) broad_statement: Option<BroadPublicReadStatement>,
+}
+
+pub(crate) use public_reads::bind_broad_public_read_statement_with_registry;
+#[cfg(test)]
+pub(crate) use public_reads::forbid_broad_binding_for_test;
 #[cfg(test)]
 pub(crate) use runtime::{
     advance_placeholder_state_for_statement_ast, is_transaction_control_statement,
@@ -33,4 +45,18 @@ pub(crate) fn bind_statement(
         normalized_scalar_literals: Vec::new(),
         execution_context: metadata.execution_context,
     }
+}
+
+pub(crate) fn bind_public_read_statement(
+    statement: Statement,
+    bound_parameters: Vec<Value>,
+    execution_context: ExecutionContext,
+    registry: &SurfaceRegistry,
+) -> Result<BoundPublicReadArtifacts, LixError> {
+    let broad_statement = bind_broad_public_read_statement_with_registry(&statement, registry)?;
+    let bound_statement = bind_statement(statement, bound_parameters, execution_context);
+    Ok(BoundPublicReadArtifacts {
+        bound_statement,
+        broad_statement,
+    })
 }

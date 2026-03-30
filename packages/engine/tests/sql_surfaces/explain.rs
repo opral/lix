@@ -326,6 +326,107 @@ fn assert_no_broad_public_read_fallbacks(value: &JsonValue, context: &str) {
     }
 }
 
+fn broad_expr_kind<'a>(expr: &'a JsonValue, context: &str) -> &'a str {
+    json_object(expr, context)
+        .get("kind")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_else(|| panic!("{context} should expose a broad expression kind"))
+}
+
+fn broad_expr_details<'a>(expr: &'a JsonValue, context: &str) -> &'a Map<String, JsonValue> {
+    json_object(
+        json_object(expr, context)
+            .get("details")
+            .unwrap_or_else(|| panic!("{context} should include details")),
+        &format!("{context}.details"),
+    )
+}
+
+fn assert_expr_compound_identifier(expr: &JsonValue, expected_parts: &[&str], context: &str) {
+    assert_eq!(broad_expr_kind(expr, context), "compound_identifier");
+    assert_string_array(
+        broad_expr_details(expr, context)
+            .get("parts")
+            .expect("compound_identifier should include parts"),
+        expected_parts,
+        &format!("{context}.details.parts"),
+    );
+}
+
+fn assert_expr_value(expr: &JsonValue, expected_value: &str, context: &str) {
+    assert_eq!(broad_expr_kind(expr, context), "value");
+    assert_eq!(
+        broad_expr_details(expr, context)
+            .get("value")
+            .and_then(JsonValue::as_str),
+        Some(expected_value)
+    );
+}
+
+fn find_value_with_kind<'a>(value: &'a JsonValue, expected_kind: &str) -> Option<&'a JsonValue> {
+    match value {
+        JsonValue::Array(items) => items
+            .iter()
+            .find_map(|item| find_value_with_kind(item, expected_kind)),
+        JsonValue::Object(object) => {
+            if object.get("kind").and_then(JsonValue::as_str) == Some(expected_kind) {
+                return Some(value);
+            }
+            object
+                .values()
+                .find_map(|child| find_value_with_kind(child, expected_kind))
+        }
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_) => None,
+    }
+}
+
+fn assert_query_root_surface(
+    query: &JsonValue,
+    expected_kind: &str,
+    expected_surface: &str,
+    context: &str,
+) {
+    let query = json_object(query, context);
+    let body = query
+        .get("body")
+        .map(|value| json_object(value, &format!("{context}.body")))
+        .expect("query should include body");
+    assert_eq!(body.get("kind").and_then(JsonValue::as_str), Some("select"));
+    let body_details = body
+        .get("details")
+        .map(|value| json_object(value, &format!("{context}.body.details")))
+        .expect("query body should include details");
+    let from = json_array(
+        body_details
+            .get("from")
+            .expect("query body should include from"),
+        &format!("{context}.body.details.from"),
+    );
+    assert!(!from.is_empty(), "{context} should include a root relation");
+    let root = json_object(&from[0], &format!("{context}.body.details.from[0]"));
+    let relation = root
+        .get("relation")
+        .map(|value| json_object(value, &format!("{context}.body.details.from[0].relation")))
+        .expect("root relation should include relation");
+    let relation_details = relation
+        .get("details")
+        .map(|value| {
+            json_object(
+                value,
+                &format!("{context}.body.details.from[0].relation.details"),
+            )
+        })
+        .expect("root relation should include details");
+    assert_broad_relation_snapshot(
+        relation_details
+            .get("relation")
+            .expect("root relation details should include relation"),
+        expected_kind,
+        expected_surface,
+        &format!("{context}.body.details.from[0].relation.details.relation"),
+    );
+}
+
 fn assert_rich_broad_public_read_statement_snapshot(
     broad_statement: &JsonValue,
     expected_surface_kind: &str,
@@ -344,77 +445,26 @@ fn assert_rich_broad_public_read_statement_snapshot(
         .get("with")
         .map(|value| json_object(value, "broad_statement.details.with"))
         .expect("broad_statement.details should include a WITH snapshot");
+    assert_eq!(
+        with.get("recursive").and_then(JsonValue::as_bool),
+        Some(false)
+    );
     let cte_tables = with
         .get("cte_tables")
         .map(|value| json_array(value, "broad_statement.details.with.cte_tables"))
         .expect("broad_statement.details.with should include cte_tables");
     assert_eq!(cte_tables.len(), 1, "broad query should expose one CTE");
     let cte = json_object(&cte_tables[0], "broad_statement.details.with.cte_tables[0]");
-    assert_eq!(cte.get("name").and_then(JsonValue::as_str), Some("latest"));
-    let cte_query = cte
-        .get("query")
-        .map(|value| json_object(value, "broad_statement.details.with.cte_tables[0].query"))
-        .expect("CTE snapshot should include query");
-    let cte_query_body = cte_query
-        .get("body")
-        .map(|value| {
-            json_object(
-                value,
-                "broad_statement.details.with.cte_tables[0].query.body",
-            )
-        })
-        .expect("CTE query should include body");
-    assert_eq!(
-        cte_query_body.get("kind").and_then(JsonValue::as_str),
-        Some("select")
+    assert_broad_alias_snapshot(
+        cte.get("alias").expect("CTE snapshot should include alias"),
+        "latest",
+        "broad_statement.details.with.cte_tables[0].alias",
     );
-    let cte_body_details = cte_query_body
-        .get("details")
-        .map(|value| {
-            json_object(
-                value,
-                "broad_statement.details.with.cte_tables[0].query.body.details",
-            )
-        })
-        .expect("CTE body should include details");
-    let cte_from = cte_body_details
-        .get("from")
-        .map(|value| {
-            json_array(
-                value,
-                "broad_statement.details.with.cte_tables[0].query.body.details.from",
-            )
-        })
-        .expect("CTE body should include from");
-    assert_eq!(cte_from.len(), 1);
-    let cte_root = json_object(
-        &cte_from[0],
-        "broad_statement.details.with.cte_tables[0].query.body.details.from[0]",
-    );
-    let cte_root_relation = cte_root
-        .get("relation")
-        .map(|value| {
-            json_object(
-                value,
-                "broad_statement.details.with.cte_tables[0].query.body.details.from[0].relation",
-            )
-        })
-        .expect("CTE root should include relation");
-    assert_eq!(
-        cte_root_relation.get("kind").and_then(JsonValue::as_str),
-        Some("table")
-    );
-    let cte_root_relation_details = cte_root_relation
-        .get("details")
-        .map(|value| json_object(value, "broad_statement.details.with.cte_tables[0].query.body.details.from[0].relation.details"))
-        .expect("CTE root relation should include details");
-    assert_broad_relation_snapshot(
-        cte_root_relation_details
-            .get("relation")
-            .expect("CTE root relation details should include relation"),
+    assert_query_root_surface(
+        cte.get("query").expect("CTE snapshot should include query"),
         expected_surface_kind,
         "lix_state_by_version",
-        "broad_statement.details.with.cte_tables[0].query.body.details.from[0].relation.details.relation",
+        "broad_statement.details.with.cte_tables[0].query",
     );
 
     let order_by = statement_details
@@ -443,18 +493,12 @@ fn assert_rich_broad_public_read_statement_snapshot(
         &order_by_expressions[0],
         "broad_statement.details.order_by.details.expressions[0]",
     );
-    let order_expr_sql = order_expr
-        .get("expr")
-        .map(|value| {
-            json_object(
-                value,
-                "broad_statement.details.order_by.details.expressions[0].expr",
-            )
-        })
-        .expect("order_by expression should include expr");
-    assert_eq!(
-        order_expr_sql.get("sql").and_then(JsonValue::as_str),
-        Some("s.schema_key")
+    assert_expr_compound_identifier(
+        order_expr
+            .get("expr")
+            .expect("order_by expression should include expr"),
+        &["s", "schema_key"],
+        "broad_statement.details.order_by.details.expressions[0].expr",
     );
 
     let limit_clause = statement_details
@@ -471,9 +515,12 @@ fn assert_rich_broad_public_read_statement_snapshot(
         .expect("limit_clause should include details");
     let limit_expr = limit_details
         .get("limit")
-        .map(|value| json_object(value, "broad_statement.details.limit_clause.details.limit"))
         .expect("limit_clause should include limit");
-    assert_eq!(limit_expr.get("sql").and_then(JsonValue::as_str), Some("5"));
+    assert_expr_value(
+        limit_expr,
+        "5",
+        "broad_statement.details.limit_clause.details.limit",
+    );
 
     let body = statement_details
         .get("body")
@@ -512,11 +559,12 @@ fn assert_rich_broad_public_read_statement_snapshot(
             )
         })
         .expect("first projection should include details");
-    assert_eq!(
+    assert_expr_compound_identifier(
         schema_key_projection_details
-            .get("sql")
-            .and_then(JsonValue::as_str),
-        Some("s.schema_key")
+            .get("expr")
+            .expect("first projection should include expr"),
+        &["s", "schema_key"],
+        "broad_statement.details.body.details.projection[0].details.expr",
     );
 
     let file_count_projection = json_object(
@@ -544,162 +592,64 @@ fn assert_rich_broad_public_read_statement_snapshot(
             .and_then(JsonValue::as_str),
         Some("file_count")
     );
-    let projection_nested_queries = file_count_projection_details
-        .get("nested_queries")
-        .map(|value| {
-            json_array(
-                value,
-                "broad_statement.details.body.details.projection[1].details.nested_queries",
-            )
-        })
-        .expect("second projection should include nested_queries");
-    assert_eq!(projection_nested_queries.len(), 1);
-    let projection_scalar_query = json_object(
-        &projection_nested_queries[0],
-        "broad_statement.details.body.details.projection[1].details.nested_queries[0]",
-    );
+    let projection_expr = file_count_projection_details
+        .get("expr")
+        .expect("second projection should include expr");
     assert_eq!(
-        projection_scalar_query
-            .get("kind")
-            .and_then(JsonValue::as_str),
-        Some("scalar_subquery")
+        broad_expr_kind(
+            projection_expr,
+            "broad_statement.details.body.details.projection[1].details.expr",
+        ),
+        "scalar_subquery"
     );
-    let projection_scalar_query_details = projection_scalar_query
-        .get("details")
-        .map(|value| json_object(value, "broad_statement.details.body.details.projection[1].details.nested_queries[0].details"))
-        .expect("scalar subquery should include details");
-    let projection_scalar_body = projection_scalar_query_details
+    assert_query_root_surface(
+        broad_expr_details(
+            projection_expr,
+            "broad_statement.details.body.details.projection[1].details.expr",
+        )
         .get("query")
-        .map(|value| json_object(value, "broad_statement.details.body.details.projection[1].details.nested_queries[0].details.query"))
-        .expect("scalar subquery should include query")
-        .get("body")
-        .map(|value| json_object(value, "broad_statement.details.body.details.projection[1].details.nested_queries[0].details.query.body"))
-        .expect("scalar subquery query should include body");
-    let projection_scalar_body_details = projection_scalar_body
-        .get("details")
-        .map(|value| json_object(value, "broad_statement.details.body.details.projection[1].details.nested_queries[0].details.query.body.details"))
-        .expect("scalar subquery body should include details");
-    let projection_scalar_from = projection_scalar_body_details
-        .get("from")
-        .map(|value| json_array(value, "broad_statement.details.body.details.projection[1].details.nested_queries[0].details.query.body.details.from"))
-        .expect("scalar subquery body should include from");
-    let projection_scalar_root = json_object(
-        &projection_scalar_from[0],
-        "broad_statement.details.body.details.projection[1].details.nested_queries[0].details.query.body.details.from[0]",
-    );
-    let projection_scalar_root_details = projection_scalar_root
-        .get("relation")
-        .map(|value| json_object(value, "broad_statement.details.body.details.projection[1].details.nested_queries[0].details.query.body.details.from[0].relation"))
-        .expect("scalar subquery root should include relation")
-        .get("details")
-        .map(|value| json_object(value, "broad_statement.details.body.details.projection[1].details.nested_queries[0].details.query.body.details.from[0].relation.details"))
-        .expect("scalar subquery root relation should include details");
-    assert_broad_relation_snapshot(
-        projection_scalar_root_details
-            .get("relation")
-            .expect("scalar subquery root relation should include relation"),
+        .expect("scalar_subquery should include query"),
         expected_surface_kind,
         "lix_file",
-        "broad_statement.details.body.details.projection[1].details.nested_queries[0].details.query.body.details.from[0].relation.details.relation",
+        "broad_statement.details.body.details.projection[1].details.expr.details.query",
     );
 
     let selection = body_details
         .get("selection")
-        .map(|value| json_object(value, "broad_statement.details.body.details.selection"))
         .expect("broad select should include selection");
-    let selection_sql = selection
-        .get("sql")
-        .and_then(JsonValue::as_str)
-        .expect("selection should expose sql");
-    for marker in [
-        "s.schema_key = 'lix_key_value'",
-        "EXISTS",
-        "IN (SELECT entity_id FROM latest)",
-        "sv.lixcol_version_id = 'main'",
-    ] {
-        assert!(
-            selection_sql.contains(marker),
-            "selection sql should contain marker {marker}: {selection_sql}"
-        );
-    }
-    let selection_nested_queries = selection
-        .get("nested_queries")
-        .map(|value| {
-            json_array(
-                value,
-                "broad_statement.details.body.details.selection.nested_queries",
-            )
-        })
-        .expect("selection should include nested_queries");
-    assert_eq!(selection_nested_queries.len(), 2);
-    let selection_kinds = selection_nested_queries
-        .iter()
-        .map(|value| {
-            value
-                .get("kind")
-                .and_then(JsonValue::as_str)
-                .expect("nested query should expose kind")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(selection_kinds, vec!["exists", "in_subquery"]);
-    let exists_details = json_object(
-        selection_nested_queries[0]
-            .get("details")
-            .expect("exists nested query should include details"),
-        "broad_statement.details.body.details.selection.nested_queries[0].details",
-    );
-    let exists_body = json_object(
-        exists_details
-            .get("subquery")
-            .expect("exists nested query should include subquery"),
-        "broad_statement.details.body.details.selection.nested_queries[0].details.subquery",
-    )
-    .get("body")
-    .map(|value| json_object(value, "broad_statement.details.body.details.selection.nested_queries[0].details.subquery.body"))
-    .expect("exists subquery should include body");
-    let exists_from = exists_body
-        .get("details")
-        .map(|value| json_object(value, "broad_statement.details.body.details.selection.nested_queries[0].details.subquery.body.details"))
-        .expect("exists subquery body should include details")
-        .get("from")
-        .map(|value| json_array(value, "broad_statement.details.body.details.selection.nested_queries[0].details.subquery.body.details.from"))
-        .expect("exists subquery body should include from");
-    let exists_root = json_object(
-        &exists_from[0],
-        "broad_statement.details.body.details.selection.nested_queries[0].details.subquery.body.details.from[0]",
-    );
-    let exists_root_details = exists_root
-        .get("relation")
-        .map(|value| json_object(value, "broad_statement.details.body.details.selection.nested_queries[0].details.subquery.body.details.from[0].relation"))
-        .expect("exists subquery root should include relation")
-        .get("details")
-        .map(|value| json_object(value, "broad_statement.details.body.details.selection.nested_queries[0].details.subquery.body.details.from[0].relation.details"))
-        .expect("exists subquery relation should include details");
-    assert_broad_relation_snapshot(
-        exists_root_details
-            .get("relation")
-            .expect("exists subquery relation should include relation"),
+    let exists_expr = find_value_with_kind(selection, "exists")
+        .expect("selection should include an exists expression");
+    assert_query_root_surface(
+        broad_expr_details(
+            exists_expr,
+            "broad_statement.details.body.details.selection.exists",
+        )
+        .get("subquery")
+        .expect("exists expression should include subquery"),
         "cte",
         "latest",
-        "broad_statement.details.body.details.selection.nested_queries[0].details.subquery.body.details.from[0].relation.details.relation",
+        "broad_statement.details.body.details.selection.exists.details.subquery",
     );
-    let in_subquery_details = json_object(
-        selection_nested_queries[1]
-            .get("details")
-            .expect("in_subquery should include details"),
-        "broad_statement.details.body.details.selection.nested_queries[1].details",
+    let in_subquery_expr = find_value_with_kind(selection, "in_subquery")
+        .expect("selection should include an in_subquery expression");
+    let in_subquery_details = broad_expr_details(
+        in_subquery_expr,
+        "broad_statement.details.body.details.selection.in_subquery",
     );
-    assert_eq!(
+    assert_expr_compound_identifier(
         in_subquery_details
             .get("expr")
-            .map(|value| json_object(
-                value,
-                "broad_statement.details.body.details.selection.nested_queries[1].details.expr"
-            ))
-            .expect("in_subquery should include expr")
-            .get("sql")
-            .and_then(JsonValue::as_str),
-        Some("s.entity_id")
+            .expect("in_subquery should include expr"),
+        &["s", "entity_id"],
+        "broad_statement.details.body.details.selection.in_subquery.details.expr",
+    );
+    assert_query_root_surface(
+        in_subquery_details
+            .get("subquery")
+            .expect("in_subquery should include subquery"),
+        "cte",
+        "latest",
+        "broad_statement.details.body.details.selection.in_subquery.details.subquery",
     );
 
     let group_by = body_details
@@ -728,25 +678,16 @@ fn assert_rich_broad_public_read_statement_snapshot(
         })
         .expect("group_by should include expressions");
     assert_eq!(group_by_expressions.len(), 1);
-    assert_eq!(
-        json_object(
-            &group_by_expressions[0],
-            "broad_statement.details.body.details.group_by.details.expressions[0]"
-        )
-        .get("sql")
-        .and_then(JsonValue::as_str),
-        Some("s.schema_key")
+    assert_expr_compound_identifier(
+        &group_by_expressions[0],
+        &["s", "schema_key"],
+        "broad_statement.details.body.details.group_by.details.expressions[0]",
     );
 
     let having = body_details
         .get("having")
-        .map(|value| json_object(value, "broad_statement.details.body.details.having"))
         .expect("broad select should include having");
-    assert!(having
-        .get("sql")
-        .and_then(JsonValue::as_str)
-        .expect("having should expose sql")
-        .contains("COUNT(*) > 0"));
+    assert!(find_value_with_kind(having, "function").is_some());
 
     let from = body_details
         .get("from")
@@ -793,8 +734,13 @@ fn assert_rich_broad_public_read_statement_snapshot(
         .expect("broad root should include joins");
     assert_eq!(joins.len(), 1, "broad root should expose one join");
     let join = json_object(&joins[0], "broad_statement.from[0].joins[0]");
+    assert_eq!(join.get("global").and_then(JsonValue::as_bool), Some(false));
+    let join_kind = join
+        .get("kind")
+        .map(|value| json_object(value, "broad_statement.from[0].joins[0].kind"))
+        .expect("broad join should include kind");
     assert_eq!(
-        join.get("operator").and_then(JsonValue::as_str),
+        join_kind.get("kind").and_then(JsonValue::as_str),
         Some("join")
     );
     let join_relation = join
@@ -824,24 +770,36 @@ fn assert_rich_broad_public_read_statement_snapshot(
         "lix_state_by_version",
         "broad_statement.from[0].joins[0].relation.details.relation",
     );
-    let join_constraints = join
-        .get("constraint_expressions")
-        .map(|value| {
-            json_array(
-                value,
-                "broad_statement.from[0].joins[0].constraint_expressions",
-            )
-        })
-        .expect("broad join should include constraint_expressions");
-    assert_eq!(join_constraints.len(), 1);
+    let join_constraint = json_object(
+        join_kind
+            .get("details")
+            .and_then(|value| {
+                json_object(value, "broad_statement.from[0].joins[0].kind.details")
+                    .get("constraint")
+            })
+            .expect("broad join kind should include constraint"),
+        "broad_statement.from[0].joins[0].kind.details.constraint",
+    );
     assert_eq!(
-        json_object(
-            &join_constraints[0],
-            "broad_statement.from[0].joins[0].constraint_expressions[0]",
-        )
-        .get("sql")
-        .and_then(JsonValue::as_str),
-        Some("sv.entity_id = s.entity_id")
+        join_constraint.get("kind").and_then(JsonValue::as_str),
+        Some("on")
+    );
+    let join_constraint_expr = broad_expr_details(
+        join_constraint
+            .get("details")
+            .and_then(|value| {
+                json_object(
+                    value,
+                    "broad_statement.from[0].joins[0].kind.details.constraint.details",
+                )
+                .get("expr")
+            })
+            .expect("join constraint should include expr"),
+        "broad_statement.from[0].joins[0].kind.details.constraint.details.expr",
+    );
+    assert_eq!(
+        join_constraint_expr.get("op").and_then(JsonValue::as_str),
+        Some("=")
     );
 }
 
@@ -906,19 +864,15 @@ fn assert_nested_only_broad_public_read_statement_snapshot(
             .and_then(JsonValue::as_str),
         Some("parent_change_id")
     );
-    let scalar_nested = scalar_projection_details
-        .get("nested_queries")
-        .map(|value| {
-            json_array(
-                value,
-                "nested_broad_statement.details.body.details.projection[0].details.nested_queries",
-            )
-        })
-        .expect("first nested projection should include nested_queries");
-    assert_eq!(scalar_nested.len(), 1);
+    let scalar_expr = scalar_projection_details
+        .get("expr")
+        .expect("first nested projection should include expr");
     assert_eq!(
-        scalar_nested[0].get("kind").and_then(JsonValue::as_str),
-        Some("scalar_subquery")
+        broad_expr_kind(
+            scalar_expr,
+            "nested_broad_statement.details.body.details.projection[0].details.expr",
+        ),
+        "scalar_subquery"
     );
 
     let exists_projection = json_object(
@@ -940,19 +894,15 @@ fn assert_nested_only_broad_public_read_statement_snapshot(
             .and_then(JsonValue::as_str),
         Some("has_child_dir")
     );
-    let exists_nested = exists_projection_details
-        .get("nested_queries")
-        .map(|value| {
-            json_array(
-                value,
-                "nested_broad_statement.details.body.details.projection[1].details.nested_queries",
-            )
-        })
-        .expect("second nested projection should include nested_queries");
-    assert_eq!(exists_nested.len(), 1);
+    let exists_expr = exists_projection_details
+        .get("expr")
+        .expect("second nested projection should include expr");
     assert_eq!(
-        exists_nested[0].get("kind").and_then(JsonValue::as_str),
-        Some("exists")
+        broad_expr_kind(
+            exists_expr,
+            "nested_broad_statement.details.body.details.projection[1].details.expr",
+        ),
+        "exists"
     );
 
     let in_projection = json_object(
@@ -974,91 +924,50 @@ fn assert_nested_only_broad_public_read_statement_snapshot(
             .and_then(JsonValue::as_str),
         Some("has_file")
     );
-    let in_nested = in_projection_details
-        .get("nested_queries")
-        .map(|value| {
-            json_array(
-                value,
-                "nested_broad_statement.details.body.details.projection[2].details.nested_queries",
-            )
-        })
-        .expect("third nested projection should include nested_queries");
-    assert_eq!(in_nested.len(), 1);
+    let in_expr = in_projection_details
+        .get("expr")
+        .expect("third nested projection should include expr");
     assert_eq!(
-        in_nested[0].get("kind").and_then(JsonValue::as_str),
-        Some("in_subquery")
+        broad_expr_kind(
+            in_expr,
+            "nested_broad_statement.details.body.details.projection[2].details.expr",
+        ),
+        "in_subquery"
     );
 
-    let projection_expectations = [
-        (&scalar_nested[0], expected_directory_kind, "lix_directory"),
-        (&exists_nested[0], expected_directory_kind, "lix_directory"),
-        (&in_nested[0], expected_file_kind, "lix_file"),
-    ];
-    for (nested_query, expected_kind, expected_surface) in projection_expectations {
-        let nested_details = json_object(
-            nested_query
-                .get("details")
-                .expect("nested projection should include details"),
-            "nested_broad_statement.nested_projection.details",
-        );
-        let query_key = if nested_query.get("kind").and_then(JsonValue::as_str) == Some("exists") {
-            "subquery"
-        } else if nested_query.get("kind").and_then(JsonValue::as_str) == Some("scalar_subquery") {
-            "query"
-        } else {
-            "subquery"
-        };
-        let nested_query_body = json_object(
-            nested_details
-                .get(query_key)
-                .expect("nested projection should include query payload"),
-            "nested_broad_statement.nested_projection.details.query",
+    assert_query_root_surface(
+        broad_expr_details(
+            scalar_expr,
+            "nested_broad_statement.details.body.details.projection[0].details.expr",
         )
-        .get("body")
-        .map(|value| {
-            json_object(
-                value,
-                "nested_broad_statement.nested_projection.details.query.body",
-            )
-        })
-        .expect("nested projection query should include body");
-        let nested_query_from = nested_query_body
-            .get("details")
-            .map(|value| {
-                json_object(
-                    value,
-                    "nested_broad_statement.nested_projection.details.query.body.details",
-                )
-            })
-            .expect("nested projection query body should include details")
-            .get("from")
-            .map(|value| {
-                json_array(
-                    value,
-                    "nested_broad_statement.nested_projection.details.query.body.details.from",
-                )
-            })
-            .expect("nested projection query body should include from");
-        let nested_root = json_object(
-            &nested_query_from[0],
-            "nested_broad_statement.nested_projection.details.query.body.details.from[0]",
-        );
-        let nested_root_relation_details = nested_root
-            .get("relation")
-            .map(|value| json_object(value, "nested_broad_statement.nested_projection.details.query.body.details.from[0].relation"))
-            .expect("nested projection root should include relation")
-            .get("details")
-            .map(|value| json_object(value, "nested_broad_statement.nested_projection.details.query.body.details.from[0].relation.details"))
-            .expect("nested projection relation should include details");
-        assert_broad_relation_snapshot(
-            nested_root_relation_details
-                .get("relation")
-                .expect("nested projection relation should include relation"),
-            expected_kind,
-            expected_surface,
-            "nested_broad_statement.nested_projection.details.query.body.details.from[0].relation.details.relation",
-        );
-    }
+        .get("query")
+        .expect("scalar_subquery should include query"),
+        expected_directory_kind,
+        "lix_directory",
+        "nested_broad_statement.details.body.details.projection[0].details.expr.details.query",
+    );
+    assert_query_root_surface(
+        broad_expr_details(
+            exists_expr,
+            "nested_broad_statement.details.body.details.projection[1].details.expr",
+        )
+        .get("subquery")
+        .expect("exists should include subquery"),
+        expected_directory_kind,
+        "lix_directory",
+        "nested_broad_statement.details.body.details.projection[1].details.expr.details.subquery",
+    );
+    assert_query_root_surface(
+        broad_expr_details(
+            in_expr,
+            "nested_broad_statement.details.body.details.projection[2].details.expr",
+        )
+        .get("subquery")
+        .expect("in_subquery should include subquery"),
+        expected_file_kind,
+        "lix_file",
+        "nested_broad_statement.details.body.details.projection[2].details.expr.details.subquery",
+    );
 }
 
 fn assert_broad_public_read_typed_statement_contract(explain_json: &JsonValue) {
@@ -1248,53 +1157,34 @@ fn assert_broad_public_read_physical_execution_contract(
     );
     assert_object_keys(
         statement,
-        &["bindings", "relation_render_nodes", "shell_statement_sql"],
+        &["details", "kind"],
         "physical_plan.details.details.statements[0]",
     );
-    let shell_statement_sql = statement
-        .get("shell_statement_sql")
-        .and_then(JsonValue::as_str)
-        .expect("physical broad plan should expose shell_statement_sql");
-    assert!(
-        shell_statement_sql.contains("__lix_lowered_relation_"),
-        "physical broad shell should retain placeholder relation markers before executor SQL rendering"
+    assert_eq!(
+        statement.get("kind").and_then(JsonValue::as_str),
+        Some("final")
     );
-
-    let relation_render_nodes = json_array(
-        statement
-            .get("relation_render_nodes")
-            .expect("physical broad plan should expose relation_render_nodes"),
-        "physical_plan.details.details.statements[0].relation_render_nodes",
-    );
-    assert!(
-        !relation_render_nodes.is_empty(),
-        "physical broad plan should retain terminal relation render nodes"
-    );
-    let render_node = json_object(
-        &relation_render_nodes[0],
-        "physical_plan.details.details.statements[0].relation_render_nodes[0]",
-    );
+    let statement_details = statement
+        .get("details")
+        .map(|value| json_object(value, "physical_plan.details.details.statements[0].details"))
+        .expect("physical broad plan should expose final statement details");
     assert_object_keys(
-        render_node,
-        &["alias", "placeholder_relation_name", "rendered_factor_sql"],
-        "physical_plan.details.details.statements[0].relation_render_nodes[0]",
+        statement_details,
+        &["bindings", "statement_sql"],
+        "physical_plan.details.details.statements[0].details",
     );
-    let rendered_factor_sql = relation_render_nodes
-        .iter()
-        .map(|node| {
-            json_object(
-                node,
-                "physical_plan.details.details.statements[0].relation_render_nodes[*]",
-            )
-            .get("rendered_factor_sql")
-            .and_then(JsonValue::as_str)
-            .expect("physical broad render node should expose rendered_factor_sql")
-        })
-        .collect::<Vec<_>>();
+    let statement_sql = statement_details
+        .get("statement_sql")
+        .and_then(JsonValue::as_str)
+        .expect("physical broad plan should expose final statement_sql");
+    assert!(
+        !statement_sql.contains("__lix_lowered_relation_"),
+        "physical broad statement should not retain placeholder relation markers"
+    );
     for marker in expected_render_sql_markers {
         assert!(
-            rendered_factor_sql.iter().any(|sql| sql.contains(marker)),
-            "physical broad render nodes should include marker {marker}: {rendered_factor_sql:?}"
+            statement_sql.contains(marker),
+            "physical broad final statement should include marker {marker}: {statement_sql}"
         );
     }
 }
