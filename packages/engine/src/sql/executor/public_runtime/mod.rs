@@ -80,6 +80,7 @@ pub(crate) struct PublicReadOptimization {
 pub(crate) struct PreparedPublicRead {
     pub(crate) optimization: Option<PublicReadOptimization>,
     pub(crate) freshness_contract: SurfaceReadFreshness,
+    pub(crate) surface_bindings: Vec<String>,
     pub(crate) logical_plan: PublicReadLogicalPlan,
     pub(crate) execution: PreparedPublicReadExecution,
     pub(crate) bound_parameters: Vec<Value>,
@@ -115,7 +116,7 @@ impl PreparedPublicRead {
     }
 
     pub(crate) fn surface_bindings(&self) -> &[String] {
-        &self.explain.executor_artifacts.surface_bindings
+        &self.surface_bindings
     }
 }
 
@@ -124,6 +125,7 @@ pub(crate) struct PreparedPublicWrite {
     pub(crate) canonicalized: CanonicalizedWrite,
     pub(crate) planned_write: PlannedWrite,
     pub(crate) domain_change_batches: Vec<DomainChangeBatch>,
+    pub(crate) surface_bindings: Vec<String>,
     pub(crate) execution: PreparedPublicWriteExecution,
     pub(crate) explain: ExplainArtifacts,
 }
@@ -1275,7 +1277,6 @@ where
         )
     })?;
     stage_timings.record(ExplainStage::PhysicalPlanning, physical_started.elapsed());
-    let write_phase_trace = public_write_phase_trace();
     let explain = build_public_write_explain_artifacts(PublicWriteExplainBuildInput {
         request: explain_request,
         semantics: write_analysis.semantics.clone(),
@@ -1283,7 +1284,6 @@ where
         execution: execution.clone(),
         domain_change_batches: domain_change_batches.clone(),
         invariant_trace: invariant_trace.clone(),
-        write_phase_trace: write_phase_trace.clone(),
         stage_timings: stage_timings.finish(),
     });
 
@@ -1291,6 +1291,7 @@ where
         explain,
         planned_write,
         domain_change_batches,
+        surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
         execution,
         canonicalized: canonicalized.clone(),
     }))
@@ -1817,19 +1818,6 @@ fn public_filesystem_write_error(target_name: &str, message: &str) -> LixError {
     )
 }
 
-fn public_write_phase_trace() -> Vec<String> {
-    vec![
-        "canonicalize_write".to_string(),
-        "analyze_write".to_string(),
-        "resolve_authoritative_pre_state".to_string(),
-        "build_domain_change_batch".to_string(),
-        "derive_commit_preconditions".to_string(),
-        "validate_batch_local_write".to_string(),
-        "commit_time_invariant_recheck".to_string(),
-        "create_commit".to_string(),
-    ]
-}
-
 fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWriteInvariantTrace {
     let mut batch_local_checks = Vec::new();
     let mut commit_time_checks = vec![
@@ -1915,12 +1903,31 @@ mod tests {
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
     use std::collections::HashMap;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+    use tokio::time::sleep;
 
     #[derive(Default)]
     struct FakeBackend {
         registered_schema_rows: HashMap<String, String>,
         change_rows: Vec<Vec<Value>>,
         untracked_rows: Vec<Vec<Value>>,
+        registered_schema_delay: Option<Duration>,
+        registered_schema_query_count: Arc<AtomicUsize>,
+    }
+
+    impl FakeBackend {
+        fn with_registered_schema_delay(mut self, delay: Duration) -> Self {
+            self.registered_schema_delay = Some(delay);
+            self
+        }
+
+        fn registered_schema_query_count(&self) -> usize {
+            self.registered_schema_query_count.load(Ordering::SeqCst)
+        }
     }
 
     #[async_trait(?Send)]
@@ -1931,6 +1938,11 @@ mod tests {
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             if sql.contains("FROM lix_internal_registered_schema_bootstrap") {
+                self.registered_schema_query_count
+                    .fetch_add(1, Ordering::SeqCst);
+                if let Some(delay) = self.registered_schema_delay {
+                    sleep(delay).await;
+                }
                 let rows = self
                     .registered_schema_rows
                     .iter()
@@ -2048,6 +2060,33 @@ mod tests {
         let rest = &sql[start..];
         let end = rest.find('\'')?;
         Some(rest[..end].to_string())
+    }
+
+    fn stage_duration_us(
+        prepared: &super::PreparedPublicRead,
+        stage: crate::sql::explain::ExplainStage,
+    ) -> Option<u64> {
+        prepared
+            .explain
+            .stage_timings
+            .iter()
+            .find(|timing| timing.stage == stage)
+            .map(|timing| timing.duration_us)
+    }
+
+    fn message_registered_schema_snapshot() -> String {
+        json!({
+            "value": {
+                "x-lix-key": "message",
+                "x-lix-version": "1",
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "body": { "type": "string" }
+                }
+            }
+        })
+        .to_string()
     }
 
     async fn boot_real_backend() -> (crate::test_support::InMemorySqliteBackend, Session) {
@@ -2222,10 +2261,7 @@ mod tests {
         .await
         .expect("builtin entity read should canonicalize");
 
-        assert_eq!(
-            prepared.explain.executor_artifacts.surface_bindings,
-            vec!["lix_key_value"]
-        );
+        assert_eq!(prepared.surface_bindings(), vec!["lix_key_value"]);
         assert_eq!(
             prepared
                 .explain
@@ -2292,21 +2328,9 @@ mod tests {
     #[tokio::test]
     async fn prepares_registered_schema_derived_entity_reads() {
         let mut backend = FakeBackend::default();
-        backend.registered_schema_rows.insert(
-            "message".to_string(),
-            json!({
-                "value": {
-                    "x-lix-key": "message",
-                    "x-lix-version": "1",
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "body": { "type": "string" }
-                    }
-                }
-            })
-            .to_string(),
-        );
+        backend
+            .registered_schema_rows
+            .insert("message".to_string(), message_registered_schema_snapshot());
 
         let prepared = prepare_public_read(
             &backend,
@@ -2318,10 +2342,7 @@ mod tests {
         .await
         .expect("registered-schema entity read should canonicalize");
 
-        assert_eq!(
-            prepared.explain.executor_artifacts.surface_bindings,
-            vec!["message"]
-        );
+        assert_eq!(prepared.surface_bindings(), vec!["message"]);
         assert_eq!(
             prepared
                 .structured_read()
@@ -2342,6 +2363,106 @@ mod tests {
             .expect("registered-schema entity read should lower");
         assert!(lowered_sql.contains("FROM (SELECT"));
         assert!(lowered_sql.contains("lix_internal_live_v1_message"));
+    }
+
+    #[tokio::test]
+    async fn explain_specialized_registered_schema_reads_charge_layout_loading_to_capability_resolution(
+    ) {
+        let delay = Duration::from_millis(150);
+        let mut backend = FakeBackend::default().with_registered_schema_delay(delay);
+        backend
+            .registered_schema_rows
+            .insert("message".to_string(), message_registered_schema_snapshot());
+
+        let prepared = prepare_public_read(
+            &backend,
+            &parse_one("SELECT body FROM message WHERE id = 'm1'"),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("registered-schema specialized read should prepare");
+
+        assert!(
+            prepared.structured_read().is_some(),
+            "specialized registered-schema read should stay on the structured path"
+        );
+        assert!(
+            backend.registered_schema_query_count() > 0,
+            "registered-schema read should fetch schema state from the backend"
+        );
+
+        let capability_resolution = stage_duration_us(
+            &prepared,
+            crate::sql::explain::ExplainStage::CapabilityResolution,
+        )
+        .expect("specialized lowered read should record capability_resolution");
+        let optimizer = stage_duration_us(&prepared, crate::sql::explain::ExplainStage::Optimizer)
+            .expect("specialized lowered read should record optimizer timing");
+
+        assert!(
+            capability_resolution >= (delay.as_micros() / 2) as u64,
+            "capability_resolution should absorb the injected schema-load delay: {capability_resolution}us"
+        );
+        assert!(
+            optimizer < (delay.as_micros() / 2) as u64,
+            "optimizer should stay below the injected schema-load delay when capability loading is timed separately: {optimizer}us"
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_broad_registered_schema_reads_charge_layout_loading_to_capability_resolution()
+    {
+        let delay = Duration::from_millis(150);
+        let mut backend = FakeBackend::default().with_registered_schema_delay(delay);
+        backend
+            .registered_schema_rows
+            .insert("message".to_string(), message_registered_schema_snapshot());
+
+        let prepared = prepare_public_read_strict(
+            &backend,
+            &parse_one(
+                "SELECT body, COUNT(*) \
+                 FROM message \
+                 WHERE id = 'm1' \
+                 GROUP BY body \
+                 HAVING COUNT(*) > 0 \
+                 ORDER BY body",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("registered-schema broad read should not error")
+        .expect("registered-schema broad read should prepare through surface lowering");
+
+        assert!(
+            prepared.structured_read().is_none(),
+            "group-by/having registered-schema read should route through broad lowering"
+        );
+        assert!(
+            backend.registered_schema_query_count() > 0,
+            "broad registered-schema read should fetch schema state from the backend"
+        );
+
+        let capability_resolution = stage_duration_us(
+            &prepared,
+            crate::sql::explain::ExplainStage::CapabilityResolution,
+        )
+        .expect("broad lowered read should record capability_resolution");
+        let optimizer = stage_duration_us(&prepared, crate::sql::explain::ExplainStage::Optimizer)
+            .expect("broad lowered read should record optimizer timing");
+
+        assert!(
+            capability_resolution >= (delay.as_micros() / 2) as u64,
+            "capability_resolution should absorb the injected schema-load delay: {capability_resolution}us"
+        );
+        assert!(
+            optimizer < (delay.as_micros() / 2) as u64,
+            "optimizer should stay below the injected schema-load delay when capability loading is timed separately: {optimizer}us"
+        );
     }
 
     #[test]
@@ -2419,7 +2540,7 @@ mod tests {
         .expect("builtin entity by-version read should canonicalize");
 
         assert_eq!(
-            prepared.explain.executor_artifacts.surface_bindings,
+            prepared.surface_bindings(),
             vec!["lix_key_value_by_version"]
         );
         assert_eq!(
@@ -2471,10 +2592,7 @@ mod tests {
                     .await
                     .expect("builtin entity history read should canonicalize");
 
-                    assert_eq!(
-                        prepared.explain.executor_artifacts.surface_bindings,
-                        vec!["lix_key_value_history"]
-                    );
+                    assert_eq!(prepared.surface_bindings(), vec!["lix_key_value_history"]);
                     assert_eq!(
                         prepared
                             .explain
@@ -2530,10 +2648,7 @@ mod tests {
         .await
         .expect("change read should canonicalize");
 
-        assert_eq!(
-            prepared.explain.executor_artifacts.surface_bindings,
-            vec!["lix_change"]
-        );
+        assert_eq!(prepared.surface_bindings(), vec!["lix_change"]);
         assert!(prepared.effective_state_request().is_none());
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
@@ -2581,10 +2696,7 @@ mod tests {
         .await
         .expect("working-changes read should canonicalize");
 
-        assert_eq!(
-            prepared.explain.executor_artifacts.surface_bindings,
-            vec!["lix_working_changes"]
-        );
+        assert_eq!(prepared.surface_bindings(), vec!["lix_working_changes"]);
         assert!(prepared.effective_state_request().is_none());
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
@@ -2630,10 +2742,7 @@ mod tests {
         .await
         .expect("filesystem read should canonicalize");
 
-        assert_eq!(
-            prepared.explain.executor_artifacts.surface_bindings,
-            vec!["lix_file"]
-        );
+        assert_eq!(prepared.surface_bindings(), vec!["lix_file"]);
         assert!(prepared.effective_state_request().is_none());
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
@@ -2695,7 +2804,7 @@ mod tests {
         .expect("filesystem by-version read should canonicalize");
 
         assert_eq!(
-            prepared.explain.executor_artifacts.surface_bindings,
+            prepared.surface_bindings(),
             vec!["lix_directory_by_version"]
         );
         assert!(prepared.effective_state_request().is_none());
@@ -2742,10 +2851,7 @@ mod tests {
         .await
         .expect("filesystem history read should canonicalize");
 
-        assert_eq!(
-            prepared.explain.executor_artifacts.surface_bindings,
-            vec!["lix_file_history"]
-        );
+        assert_eq!(prepared.surface_bindings(), vec!["lix_file_history"]);
         assert!(prepared.effective_state_request().is_none());
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
@@ -2804,7 +2910,7 @@ mod tests {
         .expect("filesystem by-version history read should canonicalize");
 
         assert_eq!(
-            prepared.explain.executor_artifacts.surface_bindings,
+            prepared.surface_bindings(),
             vec!["lix_file_history_by_version"]
         );
         assert_eq!(
@@ -2869,10 +2975,7 @@ mod tests {
         .await
         .expect("directory history read should canonicalize");
 
-        assert_eq!(
-            prepared.explain.executor_artifacts.surface_bindings,
-            vec!["lix_directory_history"]
-        );
+        assert_eq!(prepared.surface_bindings(), vec!["lix_directory_history"]);
         assert_eq!(
             prepared
                 .explain
@@ -3037,13 +3140,26 @@ mod tests {
 
         match prepared {
             PreparedPublicExecution::Read(prepared) => {
-                assert_eq!(
-                    prepared.explain.executor_artifacts.surface_bindings,
-                    vec!["lix_key_value_history"]
-                );
+                assert_eq!(prepared.surface_bindings(), vec!["lix_key_value_history"]);
                 assert!(
                     prepared.explain.executor_artifacts.lowered_sql.is_empty(),
                     "history EXPLAIN should stay on direct execution instead of lowering backend SQL"
+                );
+                assert!(
+                    stage_duration_us(
+                        &prepared,
+                        crate::sql::explain::ExplainStage::CapabilityResolution,
+                    )
+                    .is_none(),
+                    "direct-history EXPLAIN should not record capability_resolution timing"
+                );
+                assert!(
+                    stage_duration_us(
+                        &prepared,
+                        crate::sql::explain::ExplainStage::ExecutorPreparation,
+                    )
+                    .is_none(),
+                    "direct-history EXPLAIN should not record executor_preparation timing"
                 );
             }
             PreparedPublicExecution::Write(_) => {
@@ -3067,10 +3183,7 @@ mod tests {
         .await
         .expect("explain state read should canonicalize");
 
-        assert_eq!(
-            prepared.explain.executor_artifacts.surface_bindings,
-            vec!["lix_state"]
-        );
+        assert_eq!(prepared.surface_bindings(), vec!["lix_state"]);
         assert_eq!(
             prepared
                 .explain
@@ -3236,7 +3349,7 @@ mod tests {
         assert!(prepared.structured_read().is_none());
         assert!(prepared.dependency_spec().is_some());
         assert_eq!(
-            prepared.explain.executor_artifacts.surface_bindings,
+            prepared.surface_bindings(),
             vec!["lix_state", "lix_state_by_version"]
         );
         assert_eq!(
@@ -3290,10 +3403,7 @@ mod tests {
         .expect("group-by/having public read should prepare through public lowering");
 
         assert!(prepared.structured_read().is_none());
-        assert_eq!(
-            prepared.explain.executor_artifacts.surface_bindings,
-            vec!["lix_state"]
-        );
+        assert_eq!(prepared.surface_bindings(), vec!["lix_state"]);
         let lowered_sql = prepared
             .explain
             .executor_artifacts
@@ -3564,10 +3674,7 @@ mod tests {
                     .await
                     .expect("session runtime function read should prepare through public lowering");
 
-                    assert_eq!(
-                        prepared.explain.executor_artifacts.surface_bindings,
-                        vec!["lix_version"]
-                    );
+                    assert_eq!(prepared.surface_bindings(), vec!["lix_version"]);
                     if let Some(lowered_sql) =
                         prepared.explain.executor_artifacts.lowered_sql.first()
                     {

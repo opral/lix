@@ -125,7 +125,11 @@ fn assert_missing_stage_names(explain_json: &JsonValue, missing: &[&str]) {
     }
 }
 
-fn assert_text_explain_contract(result: &lix_engine::ExecuteResult, required_keys: &[&str]) {
+fn assert_text_explain_contract(
+    result: &lix_engine::ExecuteResult,
+    required_keys: &[&str],
+    required_markers: &[(&str, &[&str])],
+) {
     assert_eq!(
         result.statements[0].columns,
         vec!["explain_key".to_string(), "explain_value".to_string()]
@@ -145,10 +149,28 @@ fn assert_text_explain_contract(result: &lix_engine::ExecuteResult, required_key
         );
     }
 
-    for (key, value) in rows {
-        serde_json::from_str::<JsonValue>(value).unwrap_or_else(|error| {
-            panic!("FORMAT TEXT row {key} should contain JSON text: {error}")
-        });
+    for (key, value) in &rows {
+        assert!(
+            !value.trim().is_empty(),
+            "FORMAT TEXT row {key} should contain human-readable text"
+        );
+        assert!(
+            serde_json::from_str::<JsonValue>(value).is_err(),
+            "FORMAT TEXT row {key} should not be raw JSON"
+        );
+    }
+
+    for (key, markers) in required_markers {
+        let value = rows
+            .iter()
+            .find_map(|(candidate_key, value)| (*candidate_key == *key).then_some(*value))
+            .unwrap_or_else(|| panic!("FORMAT TEXT should include {key}"));
+        for marker in *markers {
+            assert!(
+                value.contains(marker),
+                "FORMAT TEXT row {key} should contain marker {marker}: {value}"
+            );
+        }
     }
 }
 
@@ -168,6 +190,7 @@ fn assert_no_rust_debug_leaks(explain_json: &JsonValue) {
         "SemanticAnalysis",
         "LogicalPlanning",
         "PhysicalPlanning",
+        "CapabilityResolution",
         "ExecutorPreparation",
         "PushdownSupport",
         "SurfaceFamily",
@@ -275,11 +298,82 @@ fn assert_public_read_json_contract(explain_json: &JsonValue) {
         "expose_version_id",
         "surface_binding"
     ));
+    let effective_state_request = semantic_details
+        .get("effective_state_request")
+        .map(|value| json_object(value, "semantic_statement.details.effective_state_request"))
+        .expect("semantic_statement.details should include effective_state_request");
+    assert_object_keys(
+        effective_state_request,
+        &[
+            "include_global_overlay",
+            "include_tombstones",
+            "include_untracked_overlay",
+            "predicate_classes",
+            "required_columns",
+            "schema_set",
+            "version_scope",
+        ],
+        "effective_state_request",
+    );
+    assert_eq!(
+        effective_state_request
+            .get("version_scope")
+            .and_then(JsonValue::as_str),
+        Some("active_version")
+    );
+    let effective_state_plan = semantic_details
+        .get("effective_state_plan")
+        .map(|value| json_object(value, "semantic_statement.details.effective_state_plan"))
+        .expect("semantic_statement.details should include effective_state_plan");
+    assert_object_keys(
+        effective_state_plan,
+        &[
+            "overlay_lanes",
+            "pushdown_safe_predicates",
+            "residual_predicates",
+            "state_source",
+        ],
+        "effective_state_plan",
+    );
+    assert_eq!(
+        effective_state_plan
+            .get("state_source")
+            .and_then(JsonValue::as_str),
+        Some("authoritative_committed")
+    );
 
     let logical_plan = json_object_at(explain_json, "logical_plan", "explain_json");
     assert_eq!(
         logical_plan.get("kind").and_then(JsonValue::as_str),
         Some("public_read")
+    );
+    let logical_details = logical_plan
+        .get("details")
+        .map(|value| json_object(value, "logical_plan.details"))
+        .expect("logical_plan should include details");
+    let dependency_spec = logical_details
+        .get("dependency_spec")
+        .map(|value| json_object(value, "logical_plan.details.dependency_spec"))
+        .expect("logical_plan.details should include dependency_spec");
+    assert_object_keys(
+        dependency_spec,
+        &[
+            "depends_on_active_version",
+            "entity_ids",
+            "file_ids",
+            "include_untracked",
+            "precision",
+            "relations",
+            "schema_keys",
+            "session_dependencies",
+            "version_ids",
+            "writer_filter",
+        ],
+        "dependency_spec",
+    );
+    assert_eq!(
+        dependency_spec.get("precision").and_then(JsonValue::as_str),
+        Some("precise")
     );
     let optimized_logical_plan =
         json_object_at(explain_json, "optimized_logical_plan", "explain_json");
@@ -310,12 +404,9 @@ fn assert_public_read_json_contract(explain_json: &JsonValue) {
     );
 
     let executor_artifacts = json_object_at(explain_json, "executor_artifacts", "explain_json");
-    assert_eq!(
-        executor_artifacts
-            .get("surface_bindings")
-            .and_then(JsonValue::as_array)
-            .cloned(),
-        Some(vec![JsonValue::String("lix_state".to_string())])
+    assert!(
+        executor_artifacts.get("surface_bindings").is_none(),
+        "executor_artifacts should not duplicate typed surface bindings as top-level names"
     );
     let bound_public_leaves = json_array(
         executor_artifacts
@@ -415,6 +506,217 @@ fn assert_public_read_json_contract(explain_json: &JsonValue) {
     assert_no_rust_debug_leaks(explain_json);
 }
 
+fn assert_public_read_logical_strategy(
+    explain_json: &JsonValue,
+    plan_key: &str,
+    expected_strategy: &str,
+) {
+    let plan = json_object_at(explain_json, plan_key, "explain_json");
+    assert_eq!(
+        plan.get("kind").and_then(JsonValue::as_str),
+        Some("public_read")
+    );
+    let details = plan
+        .get("details")
+        .map(|value| json_object(value, "public_read_logical_plan.details"))
+        .expect("public read logical plan should include details");
+    assert_eq!(
+        details.get("strategy").and_then(JsonValue::as_str),
+        Some(expected_strategy),
+        "{plan_key} should expose strategy {expected_strategy}"
+    );
+}
+
+fn assert_entity_history_direct_plan_contract(explain_json: &JsonValue) {
+    let optimized_plan = json_object_at(explain_json, "optimized_logical_plan", "explain_json");
+    let optimized_details = optimized_plan
+        .get("details")
+        .map(|value| json_object(value, "optimized_logical_plan.details"))
+        .expect("optimized_logical_plan should include details");
+    let direct_plan = optimized_details
+        .get("direct_plan")
+        .map(|value| json_object(value, "optimized_logical_plan.details.direct_plan"))
+        .expect("optimized_logical_plan should include a direct_plan");
+    assert_eq!(
+        direct_plan.get("kind").and_then(JsonValue::as_str),
+        Some("entity_history")
+    );
+    let direct_details = direct_plan
+        .get("details")
+        .map(|value| json_object(value, "optimized_logical_plan.details.direct_plan.details"))
+        .expect("direct_plan should include details");
+    assert_object_keys(
+        direct_details,
+        &[
+            "limit",
+            "offset",
+            "predicates",
+            "projections",
+            "request",
+            "result_columns",
+            "sort_keys",
+            "surface_binding",
+            "wildcard_columns",
+            "wildcard_projection",
+        ],
+        "entity_history_direct_plan",
+    );
+
+    let predicates = json_array(
+        direct_details
+            .get("predicates")
+            .expect("entity_history_direct_plan should include predicates"),
+        "entity_history_direct_plan.predicates",
+    );
+    let predicate = predicates
+        .iter()
+        .find_map(|predicate| {
+            let predicate = json_object(predicate, "entity_history_direct_plan.predicate");
+            let field = predicate
+                .get("field")
+                .map(|value| json_object(value, "entity_history_direct_plan.predicate.field"))?;
+            (field.get("kind").and_then(JsonValue::as_str) == Some("property")).then_some(predicate)
+        })
+        .expect("entity_history_direct_plan should include a property predicate");
+    assert_object_keys(
+        predicate,
+        &["field", "operator", "value", "values"],
+        "entity_history_direct_plan.predicate",
+    );
+    assert_eq!(
+        predicate.get("operator").and_then(JsonValue::as_str),
+        Some("is_not_null")
+    );
+    let predicate_field = predicate
+        .get("field")
+        .map(|value| json_object(value, "entity_history_direct_plan.predicate.field"))
+        .expect("predicate should include field");
+    assert_object_keys(
+        predicate_field,
+        &["details", "kind"],
+        "entity_history_direct_plan.predicate.field",
+    );
+    assert_eq!(
+        predicate_field.get("kind").and_then(JsonValue::as_str),
+        Some("property")
+    );
+    assert_eq!(
+        predicate_field.get("details").and_then(JsonValue::as_str),
+        Some("key")
+    );
+
+    let projections = json_array(
+        direct_details
+            .get("projections")
+            .expect("entity_history_direct_plan should include projections"),
+        "entity_history_direct_plan.projections",
+    );
+    let projection = projections
+        .iter()
+        .find_map(|projection| {
+            let projection = json_object(projection, "entity_history_direct_plan.projection");
+            let field = projection
+                .get("field")
+                .map(|value| json_object(value, "entity_history_direct_plan.projection.field"))?;
+            (field.get("kind").and_then(JsonValue::as_str) == Some("property")
+                && field.get("details").and_then(JsonValue::as_str) == Some("key"))
+            .then_some(projection)
+        })
+        .expect("entity_history_direct_plan should include a property projection for key");
+    assert_object_keys(
+        projection,
+        &["field", "output_name"],
+        "entity_history_direct_plan.projection",
+    );
+    let projection_field = projection
+        .get("field")
+        .map(|value| json_object(value, "entity_history_direct_plan.projection.field"))
+        .expect("projection should include field");
+    assert_eq!(
+        projection_field.get("kind").and_then(JsonValue::as_str),
+        Some("property")
+    );
+    assert_eq!(
+        projection_field.get("details").and_then(JsonValue::as_str),
+        Some("key")
+    );
+
+    let sort_keys = json_array(
+        direct_details
+            .get("sort_keys")
+            .expect("entity_history_direct_plan should include sort_keys"),
+        "entity_history_direct_plan.sort_keys",
+    );
+    let sort_key = sort_keys
+        .iter()
+        .find_map(|sort_key| {
+            let sort_key = json_object(sort_key, "entity_history_direct_plan.sort_key");
+            let field = sort_key
+                .get("field")
+                .map(|value| json_object(value, "entity_history_direct_plan.sort_key.field"))?;
+            (field.get("kind").and_then(JsonValue::as_str) == Some("state")
+                && field.get("details").and_then(JsonValue::as_str) == Some("depth"))
+            .then_some(sort_key)
+        })
+        .expect("entity_history_direct_plan should include a state sort key for depth");
+    assert_object_keys(
+        sort_key,
+        &["descending", "field", "output_name"],
+        "entity_history_direct_plan.sort_key",
+    );
+    assert_eq!(
+        sort_key.get("descending").and_then(JsonValue::as_bool),
+        Some(false)
+    );
+    let sort_field = sort_key
+        .get("field")
+        .map(|value| json_object(value, "entity_history_direct_plan.sort_key.field"))
+        .expect("sort_key should include field");
+    assert_eq!(
+        sort_field.get("kind").and_then(JsonValue::as_str),
+        Some("state")
+    );
+    assert_eq!(
+        sort_field.get("details").and_then(JsonValue::as_str),
+        Some("depth")
+    );
+}
+
+fn assert_public_read_physical_kind(explain_json: &JsonValue, expected_kind: &str) {
+    let physical_plan = json_object_at(explain_json, "physical_plan", "explain_json");
+    assert_eq!(
+        physical_plan.get("kind").and_then(JsonValue::as_str),
+        Some("public_read")
+    );
+    let physical_details = physical_plan
+        .get("details")
+        .map(|value| json_object(value, "physical_plan.details"))
+        .expect("physical_plan should include details");
+    assert_eq!(
+        physical_details.get("kind").and_then(JsonValue::as_str),
+        Some(expected_kind),
+        "physical_plan should expose {expected_kind}"
+    );
+}
+
+fn assert_lowered_sql_presence(explain_json: &JsonValue, expected_non_empty: bool) {
+    let lowered_sql = json_object_at(explain_json, "executor_artifacts", "explain_json")
+        .get("lowered_sql")
+        .and_then(JsonValue::as_array)
+        .expect("executor_artifacts.lowered_sql should be an array");
+    if expected_non_empty {
+        assert!(
+            !lowered_sql.is_empty(),
+            "executor_artifacts.lowered_sql should be populated"
+        );
+    } else {
+        assert!(
+            lowered_sql.is_empty(),
+            "executor_artifacts.lowered_sql should be empty"
+        );
+    }
+}
+
 fn assert_public_write_json_contract(explain_json: &JsonValue) {
     let request = json_object_at(explain_json, "request", "explain_json");
     assert_object_keys(request, &["format", "mode"], "request");
@@ -437,6 +739,52 @@ fn assert_public_write_json_contract(explain_json: &JsonValue) {
         logical_plan.get("kind").and_then(JsonValue::as_str),
         Some("public_write")
     );
+    let logical_details = logical_plan
+        .get("details")
+        .map(|value| json_object(value, "logical_plan.details"))
+        .expect("public_write logical_plan should include details");
+    let planned_write = logical_details
+        .get("planned_write")
+        .map(|value| json_object(value, "logical_plan.details.planned_write"))
+        .expect("public_write logical_plan should include planned_write");
+    let write_command = planned_write
+        .get("command")
+        .map(|value| json_object(value, "logical_plan.details.planned_write.command"))
+        .expect("public_write logical_plan should include planned_write.command");
+    assert_eq!(
+        write_command
+            .get("operation_kind")
+            .and_then(JsonValue::as_str),
+        Some("insert")
+    );
+    assert_eq!(
+        write_command
+            .get("requested_mode")
+            .and_then(JsonValue::as_str),
+        Some("auto")
+    );
+    let scope_proof = planned_write
+        .get("scope_proof")
+        .map(|value| json_object(value, "logical_plan.details.planned_write.scope_proof"))
+        .expect("public_write logical_plan should include planned_write.scope_proof");
+    assert_eq!(
+        scope_proof.get("kind").and_then(JsonValue::as_str),
+        Some("active_version")
+    );
+    let schema_proof = planned_write
+        .get("schema_proof")
+        .map(|value| json_object(value, "logical_plan.details.planned_write.schema_proof"))
+        .expect("public_write logical_plan should include planned_write.schema_proof");
+    assert_eq!(
+        schema_proof.get("kind").and_then(JsonValue::as_str),
+        Some("exact")
+    );
+    assert_eq!(
+        planned_write
+            .get("state_source")
+            .and_then(JsonValue::as_str),
+        Some("authoritative_committed")
+    );
     let physical_plan = json_object_at(explain_json, "physical_plan", "explain_json");
     assert_eq!(
         physical_plan.get("kind").and_then(JsonValue::as_str),
@@ -444,25 +792,13 @@ fn assert_public_write_json_contract(explain_json: &JsonValue) {
     );
 
     let executor_artifacts = json_object_at(explain_json, "executor_artifacts", "explain_json");
-    assert_eq!(
-        executor_artifacts
-            .get("surface_bindings")
-            .and_then(JsonValue::as_array)
-            .cloned(),
-        Some(vec![JsonValue::String("lix_file".to_string())])
-    );
-
-    let write_phase_trace = json_array(
-        executor_artifacts
-            .get("write_phase_trace")
-            .expect("executor_artifacts should include write_phase_trace"),
-        "write_phase_trace",
+    assert!(
+        executor_artifacts.get("surface_bindings").is_none(),
+        "executor_artifacts should not duplicate typed surface bindings as top-level names"
     );
     assert!(
-        write_phase_trace
-            .iter()
-            .any(|value| value.as_str() == Some("build_domain_change_batch")),
-        "public write explain should expose the write phase trace"
+        executor_artifacts.get("write_phase_trace").is_none(),
+        "plain public-write explain should not expose a static write phase trace shim"
     );
 
     let commit_preconditions = json_array(
@@ -586,6 +922,22 @@ simulation_test!(
                 "executor_artifacts",
                 "stage_timings",
             ],
+            &[
+                ("request", &["mode: plan", "format: text"]),
+                (
+                    "semantic_statement",
+                    &["kind: public_read", "surfaces: lix_state"],
+                ),
+                (
+                    "logical_plan",
+                    &["kind: public_read", "strategy: structured"],
+                ),
+                (
+                    "physical_plan",
+                    &["kind: public_read", "execution: lowered_sql"],
+                ),
+                ("stage_timings", &["parse:", "executor_preparation:"]),
+            ],
         );
     }
 );
@@ -617,7 +969,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    explain_public_read_stage_timings_follow_compile_order,
+    explain_specialized_lowered_public_read_stage_contract,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -635,19 +987,146 @@ simulation_test!(
             .unwrap();
 
         let explain_json = explain_json_payload(&result);
+        assert_public_read_logical_strategy(explain_json, "logical_plan", "structured");
+        assert_public_read_logical_strategy(explain_json, "optimized_logical_plan", "structured");
+        assert_public_read_physical_kind(explain_json, "lowered_sql");
+        assert_lowered_sql_presence(explain_json, true);
         assert_stage_timings_contract(
             explain_json,
             vec![
                 "parse",
                 "bind",
                 "semantic_analysis",
-                "optimizer",
                 "logical_planning",
+                "optimizer",
+                "capability_resolution",
                 "physical_planning",
+                "executor_preparation",
             ]
             .as_slice(),
         );
-        assert_missing_stage_names(explain_json, &["executor_preparation"]);
+    }
+);
+
+simulation_test!(
+    explain_direct_history_public_read_omits_executor_preparation,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute(
+                "EXPLAIN (FORMAT JSON) SELECT entity_id FROM lix_state_history WHERE root_commit_id = 'commit-1' ORDER BY depth ASC",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let explain_json = explain_json_payload(&result);
+        assert_public_read_logical_strategy(explain_json, "logical_plan", "structured");
+        assert_public_read_logical_strategy(
+            explain_json,
+            "optimized_logical_plan",
+            "direct_history",
+        );
+        assert_public_read_physical_kind(explain_json, "direct");
+        assert_lowered_sql_presence(explain_json, false);
+        assert_stage_timings_contract(
+            explain_json,
+            &[
+                "parse",
+                "bind",
+                "semantic_analysis",
+                "logical_planning",
+                "optimizer",
+                "physical_planning",
+            ],
+        );
+        assert_missing_stage_names(
+            explain_json,
+            &["capability_resolution", "executor_preparation"],
+        );
+    }
+);
+
+simulation_test!(
+    explain_direct_history_public_read_exposes_typed_nested_plan_artifacts,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute(
+                "EXPLAIN (FORMAT JSON) \
+                 SELECT key \
+                 FROM lix_key_value_history \
+                 WHERE root_commit_id = 'commit-1' AND key IS NOT NULL \
+                 ORDER BY lixcol_depth ASC",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let explain_json = explain_json_payload(&result);
+        assert_public_read_logical_strategy(
+            explain_json,
+            "optimized_logical_plan",
+            "direct_history",
+        );
+        assert_entity_history_direct_plan_contract(explain_json);
+    }
+);
+
+simulation_test!(
+    explain_broad_public_read_stage_contract,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute(
+                "EXPLAIN (FORMAT JSON) \
+                 SELECT s.schema_key, COUNT(*) \
+                 FROM lix_state s \
+                 JOIN lix_state_by_version sv ON sv.entity_id = s.entity_id \
+                 WHERE s.schema_key = 'lix_key_value' AND sv.lixcol_version_id = 'main' \
+                 GROUP BY s.schema_key \
+                 ORDER BY s.schema_key",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let explain_json = explain_json_payload(&result);
+        assert_public_read_logical_strategy(explain_json, "logical_plan", "broad");
+        assert_public_read_logical_strategy(explain_json, "optimized_logical_plan", "broad");
+        assert_public_read_physical_kind(explain_json, "lowered_sql");
+        assert_lowered_sql_presence(explain_json, true);
+        assert_stage_timings_contract(
+            explain_json,
+            &[
+                "parse",
+                "bind",
+                "capability_resolution",
+                "optimizer",
+                "logical_planning",
+                "physical_planning",
+                "executor_preparation",
+            ],
+        );
+        assert_missing_stage_names(explain_json, &["semantic_analysis"]);
     }
 );
 
@@ -674,6 +1153,7 @@ simulation_test!(
                 "bind",
                 "semantic_analysis",
                 "optimizer",
+                "capability_resolution",
                 "physical_planning",
                 "executor_preparation",
             ],
@@ -711,8 +1191,112 @@ simulation_test!(
                 "physical_planning",
             ],
         );
-        assert_missing_stage_names(explain_json, &["optimizer", "executor_preparation"]);
+        assert_missing_stage_names(
+            explain_json,
+            &["optimizer", "capability_resolution", "executor_preparation"],
+        );
         assert_public_write_json_contract(explain_json);
+    }
+);
+
+simulation_test!(
+    explain_public_write_update_contract_pins_target_set_proof_kind,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.initialize().await.unwrap();
+        let active_version_id = engine.active_version_id().await.unwrap();
+
+        let result = engine
+            .execute(
+                &format!(
+                    "EXPLAIN (FORMAT JSON) UPDATE lix_state_by_version \
+                     SET snapshot_content = '{{\"value\":\"after\"}}' \
+                     WHERE schema_key = 'lix_key_value' \
+                       AND entity_id = 'entity-1' \
+                       AND version_id = '{active_version_id}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let explain_json = explain_json_payload(&result);
+        let logical_plan = json_object_at(explain_json, "logical_plan", "explain_json");
+        let logical_details = logical_plan
+            .get("details")
+            .map(|value| json_object(value, "logical_plan.details"))
+            .expect("logical_plan should include details");
+        let planned_write = logical_details
+            .get("planned_write")
+            .map(|value| json_object(value, "logical_plan.details.planned_write"))
+            .expect("logical_plan.details should include planned_write");
+        let write_command = planned_write
+            .get("command")
+            .map(|value| json_object(value, "logical_plan.details.planned_write.command"))
+            .expect("planned_write should include command");
+        assert_eq!(
+            write_command
+                .get("operation_kind")
+                .and_then(JsonValue::as_str),
+            Some("update")
+        );
+        assert_eq!(
+            write_command
+                .get("requested_mode")
+                .and_then(JsonValue::as_str),
+            Some("auto")
+        );
+
+        let scope_proof = planned_write
+            .get("scope_proof")
+            .map(|value| json_object(value, "logical_plan.details.planned_write.scope_proof"))
+            .expect("planned_write should include scope_proof");
+        assert_eq!(
+            scope_proof.get("kind").and_then(JsonValue::as_str),
+            Some("single_version")
+        );
+        assert_eq!(
+            scope_proof.get("version").and_then(JsonValue::as_str),
+            Some(active_version_id.as_str())
+        );
+
+        let schema_proof = planned_write
+            .get("schema_proof")
+            .map(|value| json_object(value, "logical_plan.details.planned_write.schema_proof"))
+            .expect("planned_write should include schema_proof");
+        assert_eq!(
+            schema_proof.get("kind").and_then(JsonValue::as_str),
+            Some("exact")
+        );
+        assert_eq!(
+            schema_proof
+                .get("schema_keys")
+                .and_then(JsonValue::as_array)
+                .cloned(),
+            Some(vec![JsonValue::String("lix_key_value".to_string())])
+        );
+
+        let target_set_proof = planned_write
+            .get("target_set_proof")
+            .map(|value| json_object(value, "logical_plan.details.planned_write.target_set_proof"))
+            .expect("planned_write should include target_set_proof");
+        assert_eq!(
+            target_set_proof.get("kind").and_then(JsonValue::as_str),
+            Some("exact")
+        );
+        assert_eq!(
+            target_set_proof
+                .get("entity_ids")
+                .and_then(JsonValue::as_array)
+                .cloned(),
+            Some(vec![JsonValue::String("entity-1".to_string())])
+        );
+
+        assert_no_rust_debug_leaks(explain_json);
     }
 );
 
@@ -896,6 +1480,16 @@ simulation_test!(
                 "optimized_logical_plan",
                 "executor_artifacts",
                 "stage_timings",
+            ],
+            &[
+                ("request", &["mode: plan", "format: text"]),
+                ("semantic_statement", &["kind: internal"]),
+                (
+                    "logical_plan",
+                    &["kind: internal", "result_contract: select"],
+                ),
+                ("executor_artifacts", &["lowered_sql_statements: 1"]),
+                ("stage_timings", &["parse:", "logical_planning:"]),
             ],
         );
     }
