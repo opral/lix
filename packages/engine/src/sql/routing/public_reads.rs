@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::sql::binder::bind_broad_public_read_statement_with_registry;
 use crate::sql::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
 use crate::sql::logical_plan::public_ir::{
     BroadNestedQueryExpr, BroadPublicReadCte, BroadPublicReadGroupBy, BroadPublicReadGroupByKind,
@@ -8,8 +10,6 @@ use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, BroadPublicReadTableFactor, BroadPublicReadTableWithJoins,
     BroadPublicReadWith, BroadSqlExpr,
 };
-#[cfg(test)]
-use crate::sql::physical_plan::lowerer::bind_broad_public_read_statement_with_registry;
 use crate::sql::physical_plan::lowerer::broad_public_relation_supports_terminal_render;
 use crate::sql::routing::registry::{
     run_fallible_pass, run_infallible_pass, RoutingPassMetadata, RoutingPassOutcome,
