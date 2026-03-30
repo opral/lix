@@ -79,6 +79,11 @@ impl LiveReadRow {
         self.metadata.as_deref()
     }
 
+    /// Workspace-annotated writer key for live/effective reads.
+    ///
+    /// This is not canonical committed meaning; tracked scans overlay it from
+    /// `workspace/*`, and untracked scans return the local pending/untracked
+    /// value already stored in the row shape.
     pub(crate) fn writer_key(&self) -> Option<&str> {
         self.writer_key.as_deref()
     }

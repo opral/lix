@@ -2615,6 +2615,7 @@ mod tests {
         assert!(lowered_sql.contains("tip_ancestry_walk AS"));
         assert!(lowered_sql.contains("baseline_ancestry_walk AS"));
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_commit_edge"));
+        assert!(!lowered_sql.contains("lix_internal_live_state_status"));
     }
 
     #[tokio::test]

@@ -1,3 +1,10 @@
+//! Session and workspace-selector orchestration.
+//!
+//! `Session` owns workspace-scoped selectors such as the active version and
+//! active accounts. Those selectors may be persisted for the workspace session
+//! or kept ephemeral for child sessions, but they are distinct from canonical
+//! version refs and committed graph state.
+
 pub mod contracts;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,8 +44,12 @@ use contracts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct OpenSessionOptions {
+    /// Ephemeral workspace selector override for the child session.
+    ///
+    /// This does not mutate canonical refs or committed version heads.
     pub active_version_id: Option<String>,
     #[serde(default)]
+    /// Ephemeral workspace account-selector override for the child session.
     pub active_account_ids: Option<Vec<String>>,
 }
 
@@ -110,6 +121,10 @@ impl Session {
         })
     }
 
+    /// Opens a child session with optional workspace-selector overrides.
+    ///
+    /// The returned session may read or write committed state, but these
+    /// overrides only affect workspace selection for that session.
     pub async fn open_session(&self, options: OpenSessionOptions) -> Result<Self, LixError> {
         let active_version_id = options
             .active_version_id
@@ -227,6 +242,11 @@ impl Session {
             .collect()
     }
 
+    /// Creates committed version descriptor/ref state rooted at a source
+    /// version head.
+    ///
+    /// This mutates canonical owners but does not switch the caller's
+    /// workspace selector to the new version.
     pub async fn create_version(
         &self,
         options: crate::CreateVersionOptions,
@@ -234,10 +254,20 @@ impl Session {
         crate::version::create_version_in_session(self, options).await
     }
 
+    /// Creates a canonical checkpoint label on committed history for the
+    /// current workspace-selected version.
+    ///
+    /// Replay status remains local projection state; this API only mutates
+    /// checkpoint label facts plus derived checkpoint-history helpers.
     pub async fn create_checkpoint(&self) -> Result<crate::CreateCheckpointResult, LixError> {
         crate::checkpoint::create_checkpoint_in_session(self).await
     }
 
+    /// Merges one committed version head into another.
+    ///
+    /// This may update canonical refs and rebuild derived projections, but it
+    /// does not change workspace selectors unless the caller separately updates
+    /// them.
     pub async fn merge_version(
         &self,
         options: crate::MergeVersionOptions,
@@ -458,6 +488,10 @@ impl Session {
         }
     }
 
+    /// Replaces the session or workspace active-version selector.
+    ///
+    /// This does not move canonical version heads; it only changes which
+    /// committed head later default-scoped reads and writes target.
     pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
         if version_id.trim().is_empty() {
             return Err(LixError::new(
@@ -473,6 +507,7 @@ impl Session {
         Ok(())
     }
 
+    /// Replaces the session or workspace active-account selector set.
     pub async fn set_active_account_ids(
         &self,
         active_account_ids: Vec<String>,

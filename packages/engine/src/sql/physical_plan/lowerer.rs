@@ -998,27 +998,11 @@ fn build_admin_source_sql(
     kind: CanonicalAdminKind,
     dialect: SqlDialect,
 ) -> Result<String, LixError> {
-    let sql = match kind {
+    Ok(match kind {
         CanonicalAdminKind::Version => {
             crate::canonical::version_state::build_admin_version_source_sql(dialect)
         }
-    };
-
-    lower_embedded_query_sql(&sql, dialect)
-}
-
-fn lower_embedded_query_sql(sql: &str, dialect: SqlDialect) -> Result<String, LixError> {
-    let mut statements = crate::sql::parser::parse_sql_statements(sql)?;
-    let statement = statements
-        .pop()
-        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "expected embedded query SQL"))?;
-    if !statements.is_empty() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "embedded query SQL must contain exactly one statement",
-        ));
-    }
-    Ok(crate::sql::ast::lowering::lower_statement(statement, dialect)?.to_string())
+    })
 }
 
 fn build_entity_source_sql(
@@ -3032,6 +3016,60 @@ mod tests {
             lowered.pushdown_decision.residual_predicate_sql(),
             vec!["name = 'main'".to_string()]
         );
+
+        let lowered_postgres_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Postgres)
+            .expect("postgres lowered statement should render");
+        crate::sql::parser::parse_sql_script(&lowered_postgres_sql).unwrap_or_else(|error| {
+            panic!("postgres lix_version lowered sql should parse: {error}\n{lowered_postgres_sql}")
+        });
+    }
+
+    #[test]
+    fn parameterized_version_reads_render_parseable_postgres_sql() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let mut statements = crate::sql::parser::parse_sql_script(
+            "SELECT id, commit_id FROM lix_version WHERE id = $1 LIMIT 1",
+        )
+        .expect("SQL should parse");
+        let statement = statements.pop().expect("single statement");
+        let mut execution_context = ExecutionContext::with_dialect(SqlDialect::Postgres);
+        execution_context.requested_version_id = Some("main".to_string());
+        let bound = bind_statement(
+            statement,
+            vec![Value::Text("main".to_string())],
+            execution_context,
+        );
+        let structured_read = canonicalize_read(bound, &registry)
+            .expect("query should canonicalize")
+            .structured_read();
+        let dependency_spec = derive_dependency_spec_from_structured_public_read(&structured_read);
+        let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
+        let lowered = lower_read_for_execution_with_layouts(
+            SqlDialect::Postgres,
+            &structured_read,
+            effective_state.as_ref().map(|(request, _)| request),
+            effective_state.as_ref().map(|(_, plan)| plan),
+            &BTreeMap::new(),
+        )
+        .expect("parameterized version read should lower")
+        .expect("parameterized version read should produce lowered sql");
+        let runtime_bindings = crate::sql::binder::RuntimeBindingValues {
+            active_version_id: "main".to_string(),
+            active_account_ids_json: "[]".to_string(),
+        };
+        let (sql, bound_params) = lowered.statements[0]
+            .bind_and_render_sql(
+                &[Value::Text("main".to_string())],
+                &runtime_bindings,
+                SqlDialect::Postgres,
+            )
+            .expect("postgres parameterized lowered statement should render");
+
+        assert_eq!(bound_params, vec![Value::Text("main".to_string())]);
+        assert!(sql.contains("WITH RECURSIVE canonical_commit_headers AS"));
+        assert!(sql.contains("FROM descriptor_state d"));
+        assert!(sql.contains("WHERE id = $1"));
     }
 
     #[test]

@@ -12,7 +12,8 @@ use crate::session::contracts::{SessionDependency, SessionStateDelta};
 use crate::sql::backend::{PushdownDecision, PushdownSupport};
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::catalog::{
-    SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceVariant,
+    SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
+    SurfaceVariant,
 };
 use crate::sql::executor::contracts::effects::PlanEffects;
 use crate::sql::executor::contracts::planned_statement::{
@@ -200,6 +201,7 @@ pub(crate) struct SurfaceBindingSnapshot {
     pub(crate) surface_variant: ExplainSurfaceVariant,
     pub(crate) capability: ExplainSurfaceCapability,
     pub(crate) read_freshness: String,
+    pub(crate) read_semantics: String,
     pub(crate) default_scope: String,
     pub(crate) exposed_columns: Vec<String>,
     pub(crate) visible_columns: Vec<String>,
@@ -2642,6 +2644,7 @@ fn surface_binding_snapshot(binding: &SurfaceBinding) -> SurfaceBindingSnapshot 
         surface_variant: surface_variant_snapshot(binding.descriptor.surface_variant),
         capability: surface_capability_snapshot(binding.capability),
         read_freshness: surface_read_freshness_name(binding.read_freshness).to_string(),
+        read_semantics: surface_read_semantics_name(binding.read_semantics).to_string(),
         default_scope: default_scope_name(binding.default_scope).to_string(),
         exposed_columns: binding.exposed_columns.clone(),
         visible_columns: binding.descriptor.visible_columns.clone(),
@@ -2666,6 +2669,15 @@ fn dependency_spec_snapshot(spec: &DependencySpec) -> DependencySpecSnapshot {
         include_untracked: spec.include_untracked,
         depends_on_active_version: spec.depends_on_active_version,
         precision: dependency_precision_name(spec.precision).to_string(),
+    }
+}
+
+fn surface_read_semantics_name(semantics: SurfaceReadSemantics) -> &'static str {
+    match semantics {
+        SurfaceReadSemantics::CommittedGraph => "committed_graph",
+        SurfaceReadSemantics::WorkspaceEffective => "workspace_effective",
+        SurfaceReadSemantics::CanonicalHistory => "canonical_history",
+        SurfaceReadSemantics::WorkspaceChanges => "workspace_changes",
     }
 }
 
