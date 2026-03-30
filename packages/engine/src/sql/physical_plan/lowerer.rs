@@ -539,7 +539,7 @@ fn lower_working_changes_read_for_execution(
     build_lowered_read_program(
         dialect,
         canonicalized,
-        build_working_changes_source_sql(active_version_id),
+        build_working_changes_source_sql(dialect, active_version_id),
         canonicalized.query.selection.clone(),
     )
     .map(Some)
@@ -1848,43 +1848,49 @@ fn build_change_source_sql() -> String {
         .to_string()
 }
 
-fn build_working_changes_source_sql(active_version_id: &str) -> String {
+fn json_array_text_join_sql(
+    dialect: SqlDialect,
+    json_column: &str,
+    field: &str,
+    alias: &str,
+    value_column: &str,
+) -> (String, String) {
+    match dialect {
+        SqlDialect::Sqlite => (
+            format!("JOIN json_each({json_column}, '$.{field}') AS {alias}"),
+            format!("{alias}.value"),
+        ),
+        SqlDialect::Postgres => (
+            format!(
+                "JOIN LATERAL jsonb_array_elements_text(CAST({json_column} AS JSONB) -> '{field}') AS {alias}({value_column}) ON TRUE"
+            ),
+            format!("{alias}.{value_column}"),
+        ),
+    }
+}
+
+fn build_working_changes_source_sql(dialect: SqlDialect, active_version_id: &str) -> String {
     // Working-change resolution reads the replica-local version-head row to
     // anchor committed history for the selected version.
     let version_ref_table = tracked_relation_name("lix_version_ref");
-    let commit_tracked_table = tracked_relation_name("lix_commit");
-    let cse_tracked_table = tracked_relation_name("lix_change_set_element");
-    let commit_edge_table = tracked_relation_name("lix_commit_edge");
     let version_ref_commit_id_column = quote_ident(&builtin_payload_column_name(
         version_ref_schema_key(),
         "commit_id",
     ));
-    let commit_change_set_id_column =
-        quote_ident(&builtin_payload_column_name("lix_commit", "change_set_id"));
-    let cse_change_set_id_column = quote_ident(&builtin_payload_column_name(
-        "lix_change_set_element",
-        "change_set_id",
-    ));
-    let cse_change_id_column = quote_ident(&builtin_payload_column_name(
-        "lix_change_set_element",
+    let (parent_join_sql, parent_value_expr) = json_array_text_join_sql(
+        dialect,
+        "commit_rows.commit_snapshot_content",
+        "parent_commit_ids",
+        "parent_rows",
+        "parent_id",
+    );
+    let (change_id_join_sql, change_id_value_expr) = json_array_text_join_sql(
+        dialect,
+        "commit_rows.commit_snapshot_content",
+        "change_ids",
+        "member_change_rows",
         "change_id",
-    ));
-    let cse_entity_id_column = quote_ident(&builtin_payload_column_name(
-        "lix_change_set_element",
-        "entity_id",
-    ));
-    let cse_schema_key_column = quote_ident(&builtin_payload_column_name(
-        "lix_change_set_element",
-        "schema_key",
-    ));
-    let cse_file_id_column = quote_ident(&builtin_payload_column_name(
-        "lix_change_set_element",
-        "file_id",
-    ));
-    let commit_edge_child_id_column =
-        quote_ident(&builtin_payload_column_name("lix_commit_edge", "child_id"));
-    let commit_edge_parent_id_column =
-        quote_ident(&builtin_payload_column_name("lix_commit_edge", "parent_id"));
+    );
     let active_version_cte = format!(
         "active_version AS ( \
             SELECT '{active_version_id}' AS version_id \
@@ -1941,55 +1947,42 @@ fn build_working_changes_source_sql(active_version_id: &str) -> String {
             ), \
             commit_rows AS ( \
                 SELECT \
-                    entity_id AS id, \
-                    {commit_change_set_id_column} AS change_set_id, \
-                    created_at \
-                FROM {commit_untracked_table} \
-                WHERE file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND {commit_change_set_id_column} IS NOT NULL \
-                UNION \
-                SELECT \
-                    entity_id AS id, \
-                    {commit_change_set_id_column} AS change_set_id, \
-                    created_at \
-                FROM {commit_tracked_table} \
-                WHERE file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND is_tombstone = 0 \
-                  AND {commit_change_set_id_column} IS NOT NULL \
+                    commit_change.entity_id AS id, \
+                    commit_change.created_at AS created_at, \
+                    commit_snapshot.content AS commit_snapshot_content \
+                FROM lix_internal_change commit_change \
+                LEFT JOIN lix_internal_snapshot commit_snapshot \
+                    ON commit_snapshot.id = commit_change.snapshot_id \
+                WHERE commit_change.schema_key = 'lix_commit' \
+                  AND commit_snapshot.content IS NOT NULL \
             ), \
             change_rows AS ( \
                 SELECT \
                     ch.id AS change_id, \
+                    ch.entity_id AS entity_id, \
+                    ch.schema_key AS schema_key, \
+                    ch.file_id AS file_id, \
                     snap.content AS row_snapshot \
                 FROM lix_internal_change ch \
                 LEFT JOIN lix_internal_snapshot snap \
                     ON snap.id = ch.snapshot_id \
             ), \
-            change_set_element_rows AS ( \
+            commit_edges AS ( \
                 SELECT \
-                    {cse_change_set_id_column} AS change_set_id, \
-                    {cse_change_id_column} AS change_id, \
-                    {cse_entity_id_column} AS entity_id, \
-                    {cse_schema_key_column} AS schema_key, \
-                    {cse_file_id_column} AS file_id \
-                FROM {cse_untracked_table} \
-                WHERE file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND {cse_change_set_id_column} IS NOT NULL \
-                UNION \
+                    {parent_value_expr} AS parent_id, \
+                    commit_rows.id AS child_id \
+                FROM commit_rows \
+                {parent_join_sql} \
+                WHERE {parent_value_expr} IS NOT NULL \
+            ), \
+            commit_members AS ( \
                 SELECT \
-                    {cse_change_set_id_column} AS change_set_id, \
-                    {cse_change_id_column} AS change_id, \
-                    {cse_entity_id_column} AS entity_id, \
-                    {cse_schema_key_column} AS schema_key, \
-                    {cse_file_id_column} AS file_id \
-                FROM {cse_tracked_table} \
-                WHERE file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND is_tombstone = 0 \
-                  AND {cse_change_set_id_column} IS NOT NULL \
+                    commit_rows.id AS commit_id, \
+                    commit_rows.created_at AS commit_created_at, \
+                    {change_id_value_expr} AS change_id \
+                FROM commit_rows \
+                {change_id_join_sql} \
+                WHERE {change_id_value_expr} IS NOT NULL \
             ), \
             tip_ancestry_walk AS ( \
                 SELECT \
@@ -2000,15 +1993,12 @@ fn build_working_changes_source_sql(active_version_id: &str) -> String {
                 UNION ALL \
                 SELECT \
                     walk.scope AS scope, \
-                    edge.{commit_edge_parent_id_column} AS commit_id, \
+                    edge.parent_id AS commit_id, \
                     walk.depth + 1 AS depth \
                 FROM tip_ancestry_walk walk \
-                JOIN {commit_edge_table} edge \
-                    ON edge.{commit_edge_child_id_column} = walk.commit_id \
-                WHERE edge.version_id = 'global' \
-                  AND edge.is_tombstone = 0 \
-                  AND edge.{commit_edge_parent_id_column} IS NOT NULL \
-                  AND walk.depth < 512 \
+                JOIN commit_edges edge \
+                    ON edge.child_id = walk.commit_id \
+                AND walk.depth < 512 \
             ), \
             tip_ancestry AS ( \
                 SELECT scope, commit_id, MIN(depth) AS depth \
@@ -2024,14 +2014,11 @@ fn build_working_changes_source_sql(active_version_id: &str) -> String {
                 UNION ALL \
                 SELECT \
                     walk.scope AS scope, \
-                    edge.{commit_edge_parent_id_column} AS commit_id, \
+                    edge.parent_id AS commit_id, \
                     walk.depth + 1 AS depth \
                 FROM baseline_ancestry_walk walk \
-                JOIN {commit_edge_table} edge \
-                    ON edge.{commit_edge_child_id_column} = walk.commit_id \
-                WHERE edge.version_id = 'global' \
-                  AND edge.is_tombstone = 0 \
-                  AND edge.{commit_edge_parent_id_column} IS NOT NULL \
+                JOIN commit_edges edge \
+                    ON edge.child_id = walk.commit_id \
                   AND walk.depth < 512 \
             ), \
             baseline_ancestry AS ( \
@@ -2042,17 +2029,17 @@ fn build_working_changes_source_sql(active_version_id: &str) -> String {
             tip_candidates AS ( \
                 SELECT \
                     anc.scope AS scope, \
-                    cse.entity_id, \
-                    cse.schema_key, \
-                    cse.file_id, \
-                    cse.change_id, \
+                    ch.entity_id, \
+                    ch.schema_key, \
+                    ch.file_id, \
+                    members.change_id, \
                     anc.depth, \
-                    c.created_at AS commit_created_at \
+                    members.commit_created_at AS commit_created_at \
                 FROM tip_ancestry anc \
-                JOIN commit_rows c \
-                    ON c.id = anc.commit_id \
-                JOIN change_set_element_rows cse \
-                    ON cse.change_set_id = c.change_set_id \
+                JOIN commit_members members \
+                    ON members.commit_id = anc.commit_id \
+                JOIN change_rows ch \
+                    ON ch.change_id = members.change_id \
             ), \
             tip_min_depth AS ( \
                 SELECT \
@@ -2105,17 +2092,17 @@ fn build_working_changes_source_sql(active_version_id: &str) -> String {
             baseline_candidates AS ( \
                 SELECT \
                     anc.scope AS scope, \
-                    cse.entity_id, \
-                    cse.schema_key, \
-                    cse.file_id, \
-                    cse.change_id, \
+                    ch.entity_id, \
+                    ch.schema_key, \
+                    ch.file_id, \
+                    members.change_id, \
                     anc.depth, \
-                    c.created_at AS commit_created_at \
+                    members.commit_created_at AS commit_created_at \
                 FROM baseline_ancestry anc \
-                JOIN commit_rows c \
-                    ON c.id = anc.commit_id \
-                JOIN change_set_element_rows cse \
-                    ON cse.change_set_id = c.change_set_id \
+                JOIN commit_members members \
+                    ON members.commit_id = anc.commit_id \
+                JOIN change_rows ch \
+                    ON ch.change_id = members.change_id \
             ), \
             baseline_min_depth AS ( \
                 SELECT \
@@ -2256,19 +2243,10 @@ fn build_working_changes_source_sql(active_version_id: &str) -> String {
         active_version_cte = active_version_cte,
         version_ref_table = version_ref_table,
         version_ref_commit_id_column = version_ref_commit_id_column,
-        commit_change_set_id_column = commit_change_set_id_column,
-        commit_tracked_table = commit_tracked_table,
-        commit_untracked_table = quote_ident(&tracked_relation_name("lix_commit")),
-        cse_change_set_id_column = cse_change_set_id_column,
-        cse_change_id_column = cse_change_id_column,
-        cse_entity_id_column = cse_entity_id_column,
-        cse_schema_key_column = cse_schema_key_column,
-        cse_file_id_column = cse_file_id_column,
-        cse_tracked_table = cse_tracked_table,
-        cse_untracked_table = quote_ident(&tracked_relation_name("lix_change_set_element")),
-        commit_edge_table = commit_edge_table,
-        commit_edge_parent_id_column = commit_edge_parent_id_column,
-        commit_edge_child_id_column = commit_edge_child_id_column,
+        parent_join_sql = parent_join_sql,
+        parent_value_expr = parent_value_expr,
+        change_id_join_sql = change_id_join_sql,
+        change_id_value_expr = change_id_value_expr,
     )
 }
 
@@ -2982,6 +2960,41 @@ mod tests {
         assert!(
             !lowered_sql.contains("json_extract(\"ranked\".\"entity_id\""),
             "string payload predicates should not rely on sqlite JSON extraction: {lowered_sql}"
+        );
+    }
+
+    #[test]
+    fn lowers_working_changes_reads_through_canonical_commit_sources() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let lowered = lowered_program(
+            &registry,
+            "SELECT status, before_change_id, after_change_id \
+             FROM lix_working_changes \
+             WHERE schema_key = 'lix_key_value'",
+        )
+        .expect("working changes read should lower");
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
+
+        assert!(lowered_sql.contains("FROM lix_internal_change commit_change"));
+        assert!(lowered_sql.contains("LEFT JOIN lix_internal_snapshot commit_snapshot"));
+        assert!(lowered_sql.contains(
+            "JOIN json_each(commit_rows.commit_snapshot_content, '$.parent_commit_ids')"
+        ));
+        assert!(lowered_sql
+            .contains("JOIN json_each(commit_rows.commit_snapshot_content, '$.change_ids')"));
+        assert!(
+            !lowered_sql.contains("lix_internal_live_v1_lix_commit"),
+            "working changes lowering should not use live commit mirrors: {lowered_sql}"
+        );
+        assert!(
+            !lowered_sql.contains("lix_internal_live_v1_lix_change_set_element"),
+            "working changes lowering should not use live change-set element mirrors: {lowered_sql}"
+        );
+        assert!(
+            !lowered_sql.contains("lix_internal_live_v1_lix_commit_edge"),
+            "working changes lowering should not use live commit-edge mirrors: {lowered_sql}"
         );
     }
 

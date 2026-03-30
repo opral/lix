@@ -1,5 +1,6 @@
 use crate::init::InitExecutor;
 use crate::live_state::untracked::{UntrackedWriteParticipant, UntrackedWriteRow};
+use crate::schema::builtin::types::LixCommit;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) async fn init(_backend: &dyn LixBackend) -> Result<(), LixError> {
@@ -74,72 +75,76 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         commit_id: &str,
     ) -> Result<(), LixError> {
         let commit_row = self
-            .execute_internal(
-                "SELECT lix_json_extract(snapshot_content, 'change_set_id') \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_commit' \
-                   AND entity_id = $1 \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global' \
-                   AND snapshot_content IS NOT NULL \
-                 ORDER BY updated_at DESC, created_at DESC, change_id DESC \
-                 LIMIT 1",
+            .execute_backend(
+                "SELECT s.content \
+                 FROM lix_internal_change c \
+                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+                 WHERE c.schema_key = 'lix_commit' \
+                   AND c.entity_id = $1 \
+                   AND c.file_id = 'lix' \
+                   AND s.content IS NOT NULL",
                 &[Value::Text(commit_id.to_string())],
             )
             .await?;
-        let [statement] = commit_row.statements.as_slice() else {
-            return Err(crate::errors::unexpected_statement_count_error(
-                "commit integrity commit query",
-                1,
-                commit_row.statements.len(),
-            ));
+        let [row] = commit_row.rows.as_slice() else {
+            return Err(if commit_row.rows.is_empty() {
+                LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
+                        "init invariant violation: commit '{commit_id}' is missing from canonical lix_commit facts"
+                    ),
+                }
+            } else {
+                LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
+                        "init invariant violation: expected exactly one canonical lix_commit fact for '{commit_id}', got {}",
+                        commit_row.rows.len()
+                    ),
+                }
+            });
         };
-        let Some(row) = statement.rows.first() else {
+        let Some(Value::Text(raw_snapshot)) = row.first() else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
-                    "init invariant violation: commit '{commit_id}' is missing from lix_commit"
+                    "init invariant violation: commit '{commit_id}' canonical snapshot must be text"
                 ),
             });
         };
-        let Some(Value::Text(change_set_id)) = row.first() else {
-            return Err(LixError {
+        let commit_snapshot: LixCommit =
+            serde_json::from_str(raw_snapshot).map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
-                    "init invariant violation: commit '{commit_id}' has non-text change_set_id"
+                    "init invariant violation: commit '{commit_id}' canonical snapshot is invalid JSON: {error}"
                 ),
-            });
-        };
-        if change_set_id.is_empty() {
+            })?;
+        let Some(change_set_id) = commit_snapshot
+            .change_set_id
+            .filter(|change_set_id| !change_set_id.is_empty())
+        else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
                     "init invariant violation: commit '{commit_id}' has empty change_set_id"
                 ),
             });
-        }
+        };
 
         let existing = self
-            .execute_internal(
+            .execute_backend(
                 "SELECT 1 \
-                 FROM lix_state_by_version \
-                   WHERE schema_key = 'lix_change_set' \
-                   AND entity_id = $1 \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global' \
-                   AND snapshot_content IS NOT NULL \
+                 FROM lix_internal_change c \
+                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+                 WHERE c.schema_key = 'lix_change_set' \
+                   AND c.entity_id = $1 \
+                   AND c.file_id = 'lix' \
+                   AND s.content IS NOT NULL \
                  LIMIT 1",
                 &[Value::Text(change_set_id.clone())],
             )
             .await?;
-        let [statement] = existing.statements.as_slice() else {
-            return Err(crate::errors::unexpected_statement_count_error(
-                "commit integrity change_set query",
-                1,
-                existing.statements.len(),
-            ));
-        };
-        if statement.rows.is_empty() {
+        if existing.rows.is_empty() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(

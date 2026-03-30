@@ -1369,7 +1369,10 @@ mod tests {
         FilesystemTransactionFileState, FilesystemTransactionState, OptionalTextPatch,
     };
     use crate::functions::LixFunctionProvider;
-    use crate::test_support::{init_test_backend_core, seed_local_version_head, TestSqliteBackend};
+    use crate::test_support::{
+        init_test_backend_core, seed_canonical_change_row, seed_local_version_head,
+        CanonicalChangeSeed, TestSqliteBackend,
+    };
     use crate::version::GLOBAL_VERSION_ID;
     use crate::{
         CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
@@ -1420,6 +1423,36 @@ mod tests {
             )
             .await
             .expect("idempotency row should seed");
+    }
+
+    async fn seed_canonical_head_commit(
+        backend: &TestSqliteBackend,
+        commit_id: &str,
+        created_at: &str,
+    ) {
+        let snapshot_id = format!("snapshot-{commit_id}");
+        let change_id = format!("change-{commit_id}");
+        let change_set_id = format!("cs-{commit_id}");
+        let snapshot_content = format!(
+            "{{\"id\":\"{commit_id}\",\"change_set_id\":\"{change_set_id}\",\"change_ids\":[],\"parent_commit_ids\":[]}}"
+        );
+        seed_canonical_change_row(
+            backend,
+            CanonicalChangeSeed {
+                id: &change_id,
+                entity_id: commit_id,
+                schema_key: "lix_commit",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: &snapshot_id,
+                snapshot_content: Some(&snapshot_content),
+                metadata: None,
+                created_at,
+            },
+        )
+        .await
+        .expect("canonical head commit should seed");
     }
 
     fn create_commit_args(
@@ -1536,6 +1569,7 @@ mod tests {
     #[tokio::test]
     async fn applies_commit_when_head_matches_expected() {
         let backend = init_create_commit_backend().await;
+        seed_canonical_head_commit(&backend, "commit-123", TEST_TIMESTAMP).await;
         seed_local_version_head(&backend, "version-a", "commit-123", TEST_TIMESTAMP)
             .await
             .expect("local version head should seed");
@@ -1606,6 +1640,7 @@ mod tests {
     #[tokio::test]
     async fn create_commit_keeps_canonical_commit_when_projected_live_state_apply_fails() {
         let backend = init_create_commit_backend().await;
+        seed_canonical_head_commit(&backend, "commit-123", TEST_TIMESTAMP).await;
         seed_local_version_head(&backend, "version-a", "commit-123", TEST_TIMESTAMP)
             .await
             .expect("local version head should seed");
@@ -1673,6 +1708,7 @@ mod tests {
     #[tokio::test]
     async fn create_commit_uses_provided_active_account_ids_without_live_state_fallback() {
         let backend = init_create_commit_backend().await;
+        seed_canonical_head_commit(&backend, "commit-123", TEST_TIMESTAMP).await;
         seed_local_version_head(&backend, "version-a", "commit-123", TEST_TIMESTAMP)
             .await
             .expect("local version head should seed");
@@ -1939,6 +1975,7 @@ mod tests {
     #[tokio::test]
     async fn applies_global_admin_lane_when_head_matches_expected() {
         let backend = init_create_commit_backend().await;
+        seed_canonical_head_commit(&backend, "commit-global-123", TEST_TIMESTAMP).await;
         seed_local_version_head(
             &backend,
             GLOBAL_VERSION_ID,
@@ -1984,6 +2021,7 @@ mod tests {
     #[tokio::test]
     async fn exact_file_data_update_avoids_descriptor_preflight_lookup() {
         let backend = init_create_commit_backend().await;
+        seed_canonical_head_commit(&backend, "commit-123", TEST_TIMESTAMP).await;
         seed_local_version_head(&backend, "version-a", "commit-123", TEST_TIMESTAMP)
             .await
             .expect("local version head should seed");

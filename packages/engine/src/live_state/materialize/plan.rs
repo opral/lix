@@ -146,17 +146,12 @@ fn build_all_commit_edges(
                 commit.snapshot.parent_commit_ids.clone(),
             )
         }),
-        data.commit_edges.iter().map(|edge| {
-            (
-                edge.snapshot.parent_id.clone(),
-                edge.snapshot.child_id.clone(),
-            )
-        }),
+        std::iter::empty(),
     );
 
     stats.push(StageStat {
         stage: "all_commit_edges".to_string(),
-        input_rows: data.commits.len() + data.commit_edges.len(),
+        input_rows: data.commits.len(),
         output_rows: edges.len(),
     });
 
@@ -290,8 +285,8 @@ fn build_global_projection_rows(
     warnings: &mut Vec<LiveStateRebuildWarning>,
 ) -> Vec<VisibleRow> {
     let version_descriptor_schema = builtin_projection_schema_meta("lix_version_descriptor");
-    let version_ref_schema = builtin_projection_schema_meta("lix_version_ref");
     let commit_schema = builtin_projection_schema_meta("lix_commit");
+    let change_set_schema = builtin_projection_schema_meta("lix_change_set");
     let change_set_element_schema = builtin_projection_schema_meta("lix_change_set_element");
     let commit_edge_schema = builtin_projection_schema_meta("lix_commit_edge");
     let change_author_schema = builtin_projection_schema_meta("lix_change_author");
@@ -325,57 +320,6 @@ fn build_global_projection_rows(
             metadata: descriptor.metadata.clone(),
             created_at: descriptor.created_at.clone(),
             updated_at: descriptor.created_at.clone(),
-        };
-        let key = (
-            row.version_id.clone(),
-            row.entity_id.clone(),
-            row.schema_key.clone(),
-            row.file_id.clone(),
-        );
-        candidates
-            .entry(key)
-            .or_default()
-            .push(ProjectionCandidate { depth, row });
-    }
-
-    let mut latest_version_ref_changes: BTreeMap<String, &ChangeRecord> = BTreeMap::new();
-    for change in data.changes.values() {
-        if change.schema_key != "lix_version_ref" {
-            continue;
-        }
-        match latest_version_ref_changes.get(&change.entity_id) {
-            Some(existing) if existing.replay_cursor >= change.replay_cursor => {}
-            _ => {
-                latest_version_ref_changes.insert(change.entity_id.clone(), change);
-            }
-        }
-    }
-
-    for change in latest_version_ref_changes.into_values() {
-        let effective_commit_id = version_refs
-            .get(&change.entity_id)
-            .and_then(|tips| tips.first())
-            .cloned()
-            .unwrap_or_default();
-        let depth = commit_depths
-            .get(&effective_commit_id)
-            .copied()
-            .unwrap_or(usize::MAX / 4);
-
-        let row = VisibleRow {
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            commit_id: effective_commit_id,
-            replay_cursor: change.replay_cursor.clone(),
-            change_id: change.id.clone(),
-            entity_id: change.entity_id.clone(),
-            schema_key: version_ref_schema.schema_key.clone(),
-            schema_version: change.schema_version.clone(),
-            file_id: change.file_id.clone(),
-            plugin_key: change.plugin_key.clone(),
-            snapshot_content: change.snapshot_content.clone(),
-            metadata: change.metadata.clone(),
-            created_at: change.created_at.clone(),
-            updated_at: change.created_at.clone(),
         };
         let key = (
             row.version_id.clone(),
@@ -480,6 +424,37 @@ fn build_global_projection_rows(
             .as_ref()
             .filter(|value| !value.is_empty())
         {
+            let change_set_row = VisibleRow {
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                commit_id: commit.entity_id.clone(),
+                replay_cursor: commit_change.replay_cursor.clone(),
+                change_id: commit_change.id.clone(),
+                entity_id: change_set_id.clone(),
+                schema_key: change_set_schema.schema_key.clone(),
+                schema_version: change_set_schema.schema_version.clone(),
+                file_id: change_set_schema.file_id.clone(),
+                plugin_key: change_set_schema.plugin_key.clone(),
+                snapshot_content: Some(canonical_json_value(json!({
+                    "id": change_set_id,
+                }))),
+                metadata: commit_change.metadata.clone(),
+                created_at: commit_change.created_at.clone(),
+                updated_at: commit_change.created_at.clone(),
+            };
+            let change_set_key = (
+                change_set_row.version_id.clone(),
+                change_set_row.entity_id.clone(),
+                change_set_row.schema_key.clone(),
+                change_set_row.file_id.clone(),
+            );
+            candidates
+                .entry(change_set_key)
+                .or_default()
+                .push(ProjectionCandidate {
+                    depth: *depth,
+                    row: change_set_row,
+                });
+
             for change_id in &commit.snapshot.change_ids {
                 let Some(change) = data.changes.get(change_id) else {
                     warnings.push(LiveStateRebuildWarning {
@@ -959,4 +934,97 @@ where
             value
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{
+        init_test_backend_core, seed_canonical_change_row, seed_local_version_head,
+        CanonicalChangeSeed, TestSqliteBackend,
+    };
+
+    #[tokio::test]
+    async fn rebuild_plan_rejects_canonical_version_ref_changes() {
+        let backend = TestSqliteBackend::new();
+        init_test_backend_core(&backend)
+            .await
+            .expect("test backend init should succeed");
+
+        seed_canonical_change_row(
+            &backend,
+            CanonicalChangeSeed {
+                id: "change-commit-local",
+                entity_id: "commit-local",
+                schema_key: "lix_commit",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: "snapshot-commit-local",
+                snapshot_content: Some(
+                    "{\"id\":\"commit-local\",\"change_set_id\":\"cs-local\",\"change_ids\":[],\"parent_commit_ids\":[]}",
+                ),
+                metadata: None,
+                created_at: "2026-03-30T03:00:00Z",
+            },
+        )
+        .await
+        .expect("local commit should seed");
+        seed_canonical_change_row(
+            &backend,
+            CanonicalChangeSeed {
+                id: "change-commit-legacy",
+                entity_id: "commit-legacy",
+                schema_key: "lix_commit",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: "snapshot-commit-legacy",
+                snapshot_content: Some(
+                    "{\"id\":\"commit-legacy\",\"change_set_id\":\"cs-legacy\",\"change_ids\":[],\"parent_commit_ids\":[]}",
+                ),
+                metadata: None,
+                created_at: "2026-03-30T03:01:00Z",
+            },
+        )
+        .await
+        .expect("legacy commit should seed");
+        seed_canonical_change_row(
+            &backend,
+            CanonicalChangeSeed {
+                id: "change-version-ref-legacy",
+                entity_id: "main",
+                schema_key: "lix_version_ref",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: "snapshot-version-ref-legacy",
+                snapshot_content: Some("{\"id\":\"main\",\"commit_id\":\"commit-legacy\"}"),
+                metadata: None,
+                created_at: "2026-03-30T03:02:00Z",
+            },
+        )
+        .await
+        .expect("legacy canonical version-ref row should seed");
+        seed_local_version_head(&backend, "main", "commit-local", "2026-03-30T03:03:00Z")
+            .await
+            .expect("local version head should seed");
+
+        let req = LiveStateRebuildRequest {
+            scope: LiveStateRebuildScope::Full,
+            debug: LiveStateRebuildDebugMode::Summary,
+            debug_row_limit: 32,
+        };
+        let mut executor = &backend;
+        let error = live_state_rebuild_plan_with_executor(&mut executor, &req)
+            .await
+            .expect_err("canonical version-ref changes must fail rebuild planning");
+        assert!(
+            error
+                .description
+                .contains("forbidden schema 'lix_version_ref'"),
+            "expected explicit canonical version-ref rejection, got: {}",
+            error.description
+        );
+    }
 }

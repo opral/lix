@@ -31,17 +31,6 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
         .unwrap();
 }
 
-async fn insert_version(engine: &support::simulation_test::SimulationEngine, version_id: &str) {
-    let sql = format!(
-        "INSERT INTO lix_version (\
-         id, name, hidden, commit_id\
-         ) VALUES (\
-         '{version_id}', '{version_id}', false, 'commit-{version_id}'\
-         )",
-    );
-    engine.execute(&sql, &[]).await.unwrap();
-}
-
 async fn insert_state_row(
     engine: &support::simulation_test::SimulationEngine,
     entity_id: &str,
@@ -71,7 +60,7 @@ simulation_test!(lix_state_select_exposes_commit_id, |sim| async move {
     engine.initialize().await.unwrap();
 
     register_test_schema(&engine).await;
-    insert_version(&engine, "version-a").await;
+    engine.create_named_version("version-a").await.unwrap();
     engine
         .switch_version("version-a".to_string())
         .await
@@ -116,8 +105,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
 
         engine
             .switch_version("version-a".to_string())
@@ -155,8 +144,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
         insert_state_row(&engine, "entity-a", "version-a", "{\"value\":\"A\"}", false).await;
         insert_state_row(&engine, "entity-b", "version-b", "{\"value\":\"B\"}", false).await;
 
@@ -206,7 +195,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -256,8 +245,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -294,7 +283,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -337,7 +326,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -380,7 +369,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -423,7 +412,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -479,8 +468,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
 
         engine
             .switch_version("version-a".to_string())
@@ -564,7 +553,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -643,7 +632,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -716,7 +705,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -772,7 +761,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -808,8 +797,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
         insert_state_row(
             &engine,
             "entity-u",
@@ -904,7 +893,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(
             &engine,
             "entity-placeholder-schema",
@@ -964,7 +953,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -1018,7 +1007,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -1103,7 +1092,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -1184,7 +1173,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(
             &engine,
             "entity-ver",
@@ -1228,7 +1217,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(
             &engine,
             "entity-ver-pred",
@@ -1272,7 +1261,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
+        engine.create_named_version("version-a").await.unwrap();
         insert_state_row(
             &engine,
             "entity-unknown-col",
@@ -1316,8 +1305,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
         insert_state_row(
             &engine,
             "entity-d",
@@ -1398,8 +1387,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
         engine
             .switch_version("version-a".to_string())
             .await
@@ -1468,8 +1457,8 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
-        insert_version(&engine, "version-a").await;
-        insert_version(&engine, "version-b").await;
+        engine.create_named_version("version-a").await.unwrap();
+        engine.create_named_version("version-b").await.unwrap();
         insert_state_row(&engine, "entity-s", "version-a", "{\"value\":\"A\"}", false).await;
         insert_state_row(&engine, "entity-s", "version-b", "{\"value\":\"B\"}", false).await;
         engine

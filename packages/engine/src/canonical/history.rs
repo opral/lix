@@ -33,6 +33,9 @@ pub(crate) fn build_state_history_source_sql(
     content_mode: CanonicalHistoryContentMode,
     max_depth: Option<i64>,
 ) -> Result<String, LixError> {
+    let max_depth_filter_sql = max_depth
+        .map(|max_depth| format!("AND walk.commit_depth < {max_depth} "))
+        .unwrap_or_default();
     let (parent_join_sql, parent_value_expr) = json_array_text_join_sql(
         dialect,
         "COALESCE(commit_headers.commit_snapshot_content, '{}')",
@@ -101,7 +104,7 @@ pub(crate) fn build_state_history_source_sql(
                ON commit_headers.commit_id = walk.commit_id \
              {parent_join_sql} \
              WHERE {parent_value_expr} IS NOT NULL \
-               AND walk.commit_depth < {max_depth} \
+               {max_depth_filter_sql}\
            ), \
            reachable_commits AS ( \
              SELECT \
@@ -258,7 +261,7 @@ pub(crate) fn build_state_history_source_sql(
         change_join_sql = change_join_sql,
         change_value_expr = change_value_expr,
         change_position_expr = change_position_expr,
-        max_depth = max_depth.unwrap_or(512),
+        max_depth_filter_sql = max_depth_filter_sql,
         snapshot_projection = snapshot_projection,
         snapshot_join = snapshot_join,
     ))
@@ -478,5 +481,25 @@ mod tests {
         assert!(sql.contains("resolved_root_commits AS (SELECT 'commit-main' AS commit_id, 'main' AS root_version_id"));
         assert!(sql.contains("UNION ALL SELECT 'commit-feature', 'feature'"));
         assert!(!sql.contains("root_version_refs AS (SELECT 'commit-main'"));
+    }
+
+    #[test]
+    fn canonical_history_has_no_hidden_default_depth_cap() {
+        let sql = build_state_history_source_sql(
+            SqlDialect::Sqlite,
+            &CanonicalHistoryRootFacts {
+                traversal: CanonicalHistoryRootSelection::AllRoots,
+                root_version_refs: vec![CanonicalRootCommit {
+                    commit_id: "commit-main".to_string(),
+                    version_id: "main".to_string(),
+                }],
+            },
+            CanonicalHistoryContentMode::MetadataOnly,
+            None,
+        )
+        .expect("canonical history SQL should build");
+
+        assert!(!sql.contains("walk.commit_depth < 512"));
+        assert!(!sql.contains("walk.commit_depth < {max_depth}"));
     }
 }

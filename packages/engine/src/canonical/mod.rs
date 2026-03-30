@@ -13,8 +13,7 @@
 //!   local selectors
 //!
 //! `canonical` owns:
-//! - canonical change facts for canonical-owned entities such as `lix_commit`,
-//!   `lix_commit_edge`, `lix_change_set`, and `lix_change_set_element`
+//! - canonical change facts and commit headers stored in the journal
 //! - commit DAG interpretation and canonical history indexes
 //! - head/root resolution
 //! - commit-addressed and root-addressed state lookup
@@ -23,8 +22,10 @@
 //! execution, but they must not redefine committed semantics.
 //!
 //! `checkpoint` depends on canonical as a derived acceleration layer.
-//! `live_state` may mirror canonical facts as read-only query surfaces for
-//! SQL/public reads, but it does not own the meaning of those facts.
+//! `live_state` may mirror canonical facts and derived commit-family surfaces
+//! such as `lix_commit`, `lix_change_set`, `lix_change_set_element`, and
+//! `lix_commit_edge` as read-only query surfaces for SQL/public reads, but it
+//! does not own the meaning of those facts.
 //!
 pub(crate) mod append;
 mod change_log;

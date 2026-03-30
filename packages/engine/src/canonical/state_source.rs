@@ -5,7 +5,7 @@
 //! answers that question directly from canonical-owned data, independent of
 //! live-state replay status and other derived mirrors.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::errors::classification::is_missing_relation_error;
 use crate::schema::builtin::types::LixCommit;
@@ -13,8 +13,6 @@ use crate::{LixBackend, LixError, Value, VersionId};
 
 use super::roots::{load_committed_version_head_commit_id, load_head_commit_id_for_version};
 use super::types::{VersionInfo, VersionSnapshot};
-
-const CANONICAL_FALLBACK_MAX_COMMIT_DEPTH: usize = 2048;
 
 /// Canonical committed row resolved from commit-graph facts plus local
 /// version-head selection.
@@ -128,137 +126,192 @@ pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
     head_commit_id: &str,
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    // Resolve committed state by walking the canonical commit lineage selected
-    // by the requested head commit and then choosing the nearest visible change
-    // for the requested entity. This is semantic resolution, not live-state
-    // replay.
-    let (parent_join_sql, parent_value_expr) = json_array_text_join_sql(
-        executor.dialect(),
-        "commit_snapshot.content",
-        "parent_commit_ids",
-        "parent_rows",
-        "parent_id",
+    let lineage = load_reachable_commit_lineage(executor, head_commit_id).await?;
+    let reachable_depths = compute_min_commit_depths(head_commit_id, &lineage);
+    let mut ordered_commits = reachable_depths.into_iter().collect::<Vec<_>>();
+    ordered_commits.sort_by(
+        |(left_commit_id, left_depth), (right_commit_id, right_depth)| {
+            left_depth
+                .cmp(right_depth)
+                .then_with(|| left_commit_id.cmp(right_commit_id))
+        },
     );
-    let (change_join_sql, change_value_expr, change_position_expr) =
-        json_array_text_join_with_position_sql(
-            executor.dialect(),
-            "commit_snapshot.content",
-            "change_ids",
-            "change_rows",
-            "change_id",
-            "change_position",
-        );
 
-    let mut filters = vec![
-        format!("c.entity_id = '{}'", escape_sql_string(&request.entity_id)),
-        format!(
-            "c.schema_key = '{}'",
-            escape_sql_string(&request.schema_key)
-        ),
-    ];
+    let mut change_cache = BTreeMap::<String, Option<CommittedCanonicalChangeRow>>::new();
+    for (commit_id, _) in ordered_commits {
+        let Some(commit) = lineage.get(&commit_id) else {
+            return Err(LixError::unknown(format!(
+                "committed state traversal lost commit '{}'",
+                commit_id
+            )));
+        };
+        for change_id in commit.change_ids.iter().rev() {
+            let change = match change_cache.get(change_id) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let loaded = load_canonical_change_row_by_id(executor, change_id).await?;
+                    change_cache.insert(change_id.clone(), loaded.clone());
+                    loaded
+                }
+            };
+            let Some(change) = change else {
+                return Err(LixError::unknown(format!(
+                    "canonical commit '{}' references missing change '{}'",
+                    commit_id, change_id
+                )));
+            };
+            if !canonical_change_matches_request(&change, request) {
+                continue;
+            }
+            return exact_committed_state_row_from_change(change, &request.version_id);
+        }
+    }
+
+    Ok(None)
+}
+
+async fn load_reachable_commit_lineage(
+    executor: &mut dyn CommitQueryExecutor,
+    head_commit_id: &str,
+) -> Result<BTreeMap<String, CommitLineageEntry>, LixError> {
+    let mut lineage = BTreeMap::new();
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![(head_commit_id.to_string(), false)];
+
+    while let Some((commit_id, finishing)) = stack.pop() {
+        if finishing {
+            visiting.remove(&commit_id);
+            visited.insert(commit_id);
+            continue;
+        }
+        if visited.contains(&commit_id) {
+            continue;
+        }
+        let Some(mut entry) = load_commit_lineage_entry_by_id(executor, &commit_id).await? else {
+            return Err(LixError::unknown(format!(
+                "canonical lineage references missing commit '{}'",
+                commit_id
+            )));
+        };
+        entry.change_ids.retain(|value| !value.is_empty());
+        entry.parent_commit_ids.retain(|value| !value.is_empty());
+        if !visiting.insert(commit_id.clone()) {
+            return Err(LixError::unknown(format!(
+                "canonical commit graph contains a cycle at '{}'",
+                commit_id
+            )));
+        }
+        let parent_commit_ids = entry.parent_commit_ids.clone();
+        lineage.insert(commit_id.clone(), entry);
+        stack.push((commit_id.clone(), true));
+        for parent_commit_id in parent_commit_ids.into_iter().rev() {
+            if visiting.contains(&parent_commit_id) {
+                return Err(LixError::unknown(format!(
+                    "canonical commit graph contains a cycle via '{}' -> '{}'",
+                    commit_id, parent_commit_id
+                )));
+            }
+            if !visited.contains(&parent_commit_id) {
+                stack.push((parent_commit_id, false));
+            }
+        }
+    }
+
+    Ok(lineage)
+}
+
+fn compute_min_commit_depths(
+    head_commit_id: &str,
+    lineage: &BTreeMap<String, CommitLineageEntry>,
+) -> BTreeMap<String, usize> {
+    let mut depths = BTreeMap::new();
+    let mut queue = VecDeque::from([(head_commit_id.to_string(), 0_usize)]);
+
+    while let Some((commit_id, depth)) = queue.pop_front() {
+        if matches!(depths.get(&commit_id), Some(existing) if *existing <= depth) {
+            continue;
+        }
+        depths.insert(commit_id.clone(), depth);
+        if let Some(entry) = lineage.get(&commit_id) {
+            for parent_commit_id in &entry.parent_commit_ids {
+                queue.push_back((parent_commit_id.clone(), depth + 1));
+            }
+        }
+    }
+
+    depths
+}
+
+fn canonical_change_matches_request(
+    change: &CommittedCanonicalChangeRow,
+    request: &ExactCommittedStateRowRequest,
+) -> bool {
+    if change.entity_id != request.entity_id || change.schema_key != request.schema_key {
+        return false;
+    }
     for column in ["file_id", "plugin_key", "schema_version"] {
         let Some(expected) = request.exact_filters.get(column).and_then(text_from_value) else {
             continue;
         };
-        filters.push(format!(
-            "c.{column} = '{expected}'",
-            column = column,
-            expected = escape_sql_string(&expected),
-        ));
+        let actual = match column {
+            "file_id" => &change.file_id,
+            "plugin_key" => &change.plugin_key,
+            "schema_version" => &change.schema_version,
+            _ => continue,
+        };
+        if actual != &expected {
+            return false;
+        }
     }
+    true
+}
 
-    let sql = format!(
-        "WITH RECURSIVE commit_walk(commit_id, depth) AS ( \
-           SELECT '{head_commit_id}' AS commit_id, 0 AS depth \
-           UNION ALL \
-           SELECT {parent_value_expr} AS commit_id, commit_walk.depth + 1 AS depth \
-           FROM commit_walk \
-           JOIN lix_internal_change commit_change \
-             ON commit_change.schema_key = 'lix_commit' \
-            AND commit_change.entity_id = commit_walk.commit_id \
-           LEFT JOIN lix_internal_snapshot commit_snapshot \
-             ON commit_snapshot.id = commit_change.snapshot_id \
-           {parent_join_sql} \
-           WHERE commit_snapshot.content IS NOT NULL \
-             AND {parent_value_expr} IS NOT NULL \
-             AND commit_walk.depth < {max_depth} \
-         ), reachable_commits AS ( \
-           SELECT commit_id, MIN(depth) AS depth \
-           FROM commit_walk \
-           GROUP BY commit_id \
-         ), ranked_changes AS ( \
-           SELECT c.entity_id, c.schema_key, c.schema_version, c.file_id, '{version_id}' AS version_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.id AS change_id, reachable_commits.depth, {change_position_expr} AS change_position \
-           FROM reachable_commits \
-           JOIN lix_internal_change commit_change \
-             ON commit_change.schema_key = 'lix_commit' \
-            AND commit_change.entity_id = reachable_commits.commit_id \
-           LEFT JOIN lix_internal_snapshot commit_snapshot \
-             ON commit_snapshot.id = commit_change.snapshot_id \
-           {change_join_sql} \
-           JOIN lix_internal_change c \
-             ON c.id = {change_value_expr} \
-           LEFT JOIN lix_internal_snapshot s \
-             ON s.id = c.snapshot_id \
-           WHERE {filters} \
-         ) \
-         SELECT entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, metadata, change_id \
-         FROM ranked_changes \
-         ORDER BY depth ASC, change_position DESC \
-         LIMIT 1",
-        head_commit_id = escape_sql_string(head_commit_id),
-        parent_value_expr = parent_value_expr,
-        parent_join_sql = parent_join_sql,
-        max_depth = CANONICAL_FALLBACK_MAX_COMMIT_DEPTH,
-        version_id = escape_sql_string(&request.version_id),
-        change_join_sql = change_join_sql,
-        change_value_expr = change_value_expr,
-        change_position_expr = change_position_expr,
-        filters = filters.join(" AND "),
-    );
-
-    let result = match executor.execute(&sql, &[]).await {
-        Ok(result) => result,
-        Err(err) if is_missing_relation_error(&err) => return Ok(None),
-        Err(err) => return Err(err),
-    };
-
-    let Some(row) = result.rows.first() else {
+fn exact_committed_state_row_from_change(
+    change: CommittedCanonicalChangeRow,
+    version_id: &str,
+) -> Result<Option<ExactCommittedStateRow>, LixError> {
+    let Some(snapshot_content) = change.snapshot_content else {
         return Ok(None);
     };
-    let entity_id = required_text(row, 0, "committed_state.entity_id")?;
-    let schema_key = required_text(row, 1, "committed_state.schema_key")?;
-    let schema_version = required_text(row, 2, "committed_state.schema_version")?;
-    let file_id = required_text(row, 3, "committed_state.file_id")?;
-    let version_id = required_text(row, 4, "committed_state.version_id")?;
-    let plugin_key = required_text(row, 5, "committed_state.plugin_key")?;
-    let Some(snapshot_content) = row.get(6).and_then(text_from_value) else {
-        return Ok(None);
-    };
-    let metadata = row.get(7).and_then(text_from_value);
-    let source_change_id = row.get(8).and_then(text_from_value);
 
     let mut values = BTreeMap::new();
-    values.insert("entity_id".to_string(), Value::Text(entity_id.clone()));
-    values.insert("schema_key".to_string(), Value::Text(schema_key.clone()));
-    values.insert("schema_version".to_string(), Value::Text(schema_version));
-    values.insert("file_id".to_string(), Value::Text(file_id.clone()));
-    values.insert("version_id".to_string(), Value::Text(version_id.clone()));
-    values.insert("plugin_key".to_string(), Value::Text(plugin_key));
+    values.insert(
+        "entity_id".to_string(),
+        Value::Text(change.entity_id.clone()),
+    );
+    values.insert(
+        "schema_key".to_string(),
+        Value::Text(change.schema_key.clone()),
+    );
+    values.insert(
+        "schema_version".to_string(),
+        Value::Text(change.schema_version.clone()),
+    );
+    values.insert("file_id".to_string(), Value::Text(change.file_id.clone()));
+    values.insert(
+        "version_id".to_string(),
+        Value::Text(version_id.to_string()),
+    );
+    values.insert(
+        "plugin_key".to_string(),
+        Value::Text(change.plugin_key.clone()),
+    );
     values.insert(
         "snapshot_content".to_string(),
         Value::Text(snapshot_content),
     );
-    if let Some(metadata) = metadata {
+    if let Some(metadata) = change.metadata.clone() {
         values.insert("metadata".to_string(), Value::Text(metadata));
     }
 
     Ok(Some(ExactCommittedStateRow {
-        entity_id,
-        schema_key,
-        file_id,
-        version_id,
+        entity_id: change.entity_id,
+        schema_key: change.schema_key,
+        file_id: change.file_id,
+        version_id: version_id.to_string(),
         values,
-        source_change_id,
+        source_change_id: Some(change.id),
     }))
 }
 
@@ -347,51 +400,6 @@ fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn json_array_text_join_sql(
-    dialect: crate::SqlDialect,
-    json_column: &str,
-    field: &str,
-    alias: &str,
-    value_column: &str,
-) -> (String, String) {
-    match dialect {
-        crate::SqlDialect::Sqlite => (
-            format!("JOIN json_each({json_column}, '$.{field}') AS {alias}"),
-            format!("{alias}.value"),
-        ),
-        crate::SqlDialect::Postgres => (
-            format!(
-                "JOIN LATERAL jsonb_array_elements_text(CAST({json_column} AS JSONB) -> '{field}') AS {alias}({value_column}) ON TRUE"
-            ),
-            format!("{alias}.{value_column}"),
-        ),
-    }
-}
-
-fn json_array_text_join_with_position_sql(
-    dialect: crate::SqlDialect,
-    json_column: &str,
-    field: &str,
-    alias: &str,
-    value_column: &str,
-    position_column: &str,
-) -> (String, String, String) {
-    match dialect {
-        crate::SqlDialect::Sqlite => (
-            format!("JOIN json_each({json_column}, '$.{field}') AS {alias}"),
-            format!("{alias}.value"),
-            format!("CAST({alias}.key AS INTEGER)"),
-        ),
-        crate::SqlDialect::Postgres => (
-            format!(
-                "JOIN LATERAL jsonb_array_elements_text(CAST({json_column} AS JSONB) -> '{field}') WITH ORDINALITY AS {alias}({value_column}, {position_column}) ON TRUE"
-            ),
-            format!("{alias}.{value_column}"),
-            format!("{alias}.{position_column}"),
-        ),
-    }
-}
-
 fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, LixError> {
     match row.get(index) {
         Some(Value::Text(value)) if !value.is_empty() => Ok(value.clone()),
@@ -447,6 +455,24 @@ mod tests {
         seed_canonical_change_row(
             backend,
             CanonicalChangeSeed {
+                id: "change-parent-1",
+                entity_id: "parent-1",
+                schema_key: "lix_commit",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: "snapshot-parent-1",
+                snapshot_content: Some(
+                    "{\"id\":\"parent-1\",\"change_set_id\":\"cs-parent\",\"change_ids\":[],\"parent_commit_ids\":[]}",
+                ),
+                metadata: None,
+                created_at: "2026-03-30T00:00:30Z",
+            },
+        )
+        .await?;
+        seed_canonical_change_row(
+            backend,
+            CanonicalChangeSeed {
                 id: "change-commit-1",
                 entity_id: "commit-1",
                 schema_key: "lix_commit",
@@ -483,6 +509,81 @@ mod tests {
         if include_local_head {
             seed_local_version_head(backend, "v1", "commit-2", "2026-03-30T00:03:00Z").await?;
         }
+        Ok(())
+    }
+
+    fn synthetic_timestamp(step: usize) -> String {
+        let day = 1 + (step / (24 * 60));
+        let hour = (step / 60) % 24;
+        let minute = step % 60;
+        format!("2026-03-{day:02}T{hour:02}:{minute:02}:00Z")
+    }
+
+    async fn seed_deep_committed_history_fixture(
+        backend: &TestSqliteBackend,
+        depth: usize,
+    ) -> Result<(), LixError> {
+        seed_canonical_change_row(
+            backend,
+            CanonicalChangeSeed {
+                id: "change-deep-root",
+                entity_id: "file-1",
+                schema_key: "lix_file_descriptor",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: "snapshot-deep-root",
+                snapshot_content: Some(
+                    "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"deep\",\"extension\":null,\"metadata\":null,\"hidden\":false}",
+                ),
+                metadata: None,
+                created_at: &synthetic_timestamp(0),
+            },
+        )
+        .await?;
+
+        for index in 0..=depth {
+            let parent_commit_ids = if index == 0 {
+                "[]".to_string()
+            } else {
+                format!("[\"commit-{}\"]", index - 1)
+            };
+            let change_ids = if index == 0 {
+                "[\"change-deep-root\"]".to_string()
+            } else {
+                "[]".to_string()
+            };
+            let snapshot_content = format!(
+                "{{\"id\":\"commit-{index}\",\"change_set_id\":\"cs-{index}\",\"change_ids\":{change_ids},\"parent_commit_ids\":{parent_commit_ids}}}"
+            );
+            let change_id = format!("change-commit-{index}");
+            let snapshot_id = format!("snapshot-commit-{index}");
+            let created_at = synthetic_timestamp(index + 1);
+            seed_canonical_change_row(
+                backend,
+                CanonicalChangeSeed {
+                    id: &change_id,
+                    entity_id: &format!("commit-{index}"),
+                    schema_key: "lix_commit",
+                    schema_version: "1",
+                    file_id: "lix",
+                    plugin_key: "lix",
+                    snapshot_id: &snapshot_id,
+                    snapshot_content: Some(&snapshot_content),
+                    metadata: None,
+                    created_at: &created_at,
+                },
+            )
+            .await?;
+        }
+
+        seed_local_version_head(
+            backend,
+            "v1",
+            &format!("commit-{depth}"),
+            &synthetic_timestamp(depth + 2),
+        )
+        .await?;
         Ok(())
     }
 
@@ -536,11 +637,182 @@ mod tests {
         .expect("canonical exact-state lookup should return a row");
 
         assert!(
-            backend.count_sql_matching(|sql| sql.contains("WITH RECURSIVE commit_walk")) >= 1,
-            "canonical exact-state lookup should read canonical changes"
+            backend.count_sql_matching(|sql| sql.contains("FROM lix_internal_change c")) >= 1,
+            "canonical exact-state lookup should read canonical journal rows"
+        );
+        assert_eq!(
+            backend.count_sql_matching(|sql| sql.contains("WITH RECURSIVE commit_walk")),
+            0,
+            "canonical exact-state lookup should no longer rely on hidden recursive SQL fallback"
+        );
+        assert_eq!(
+            backend.count_sql_matching(|sql| {
+                sql.contains("lix_internal_live_v1_lix_commit")
+                    || sql.contains("lix_internal_live_v1_lix_commit_edge")
+                    || sql.contains("lix_internal_live_v1_lix_change_set")
+                    || sql.contains("lix_internal_live_v1_lix_change_set_element")
+            }),
+            0,
+            "canonical exact-state lookup should not depend on live commit-family mirrors"
         );
         assert_eq!(row.entity_id, "file-1");
         assert_eq!(row.source_change_id.as_deref(), Some("change-fallback"));
+    }
+
+    #[tokio::test]
+    async fn canonical_exact_state_contract_resolves_history_beyond_old_depth_limit() {
+        let backend = init_state_source_backend().await;
+        seed_deep_committed_history_fixture(&backend, 2055)
+            .await
+            .expect("deep canonical history fixture should seed");
+
+        let row = load_exact_committed_state_row_at_version_head(
+            &backend,
+            &exact_file_descriptor_request(),
+        )
+        .await
+        .expect("deep canonical exact-state lookup should succeed")
+        .expect("deep canonical exact-state lookup should return a row");
+
+        assert_eq!(row.entity_id, "file-1");
+        assert_eq!(row.source_change_id.as_deref(), Some("change-deep-root"));
+    }
+
+    #[tokio::test]
+    async fn canonical_exact_state_contract_rejects_commit_cycles_explicitly() {
+        let backend = init_state_source_backend().await;
+        seed_canonical_change_row(
+            &backend,
+            CanonicalChangeSeed {
+                id: "change-cycle-row",
+                entity_id: "file-1",
+                schema_key: "lix_file_descriptor",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: "snapshot-cycle-row",
+                snapshot_content: Some(
+                    "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"cycle\",\"extension\":null,\"metadata\":null,\"hidden\":false}",
+                ),
+                metadata: None,
+                created_at: "2026-03-30T01:00:00Z",
+            },
+        )
+        .await
+        .expect("cycle fixture change should seed");
+        seed_canonical_change_row(
+            &backend,
+            CanonicalChangeSeed {
+                id: "change-cycle-commit-1",
+                entity_id: "commit-1",
+                schema_key: "lix_commit",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: "snapshot-cycle-commit-1",
+                snapshot_content: Some(
+                    "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[\"change-cycle-row\"],\"parent_commit_ids\":[\"commit-2\"]}",
+                ),
+                metadata: None,
+                created_at: "2026-03-30T01:01:00Z",
+            },
+        )
+        .await
+        .expect("cycle fixture commit-1 should seed");
+        seed_canonical_change_row(
+            &backend,
+            CanonicalChangeSeed {
+                id: "change-cycle-commit-2",
+                entity_id: "commit-2",
+                schema_key: "lix_commit",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: "snapshot-cycle-commit-2",
+                snapshot_content: Some(
+                    "{\"id\":\"commit-2\",\"change_set_id\":\"cs-2\",\"change_ids\":[],\"parent_commit_ids\":[\"commit-1\"]}",
+                ),
+                metadata: None,
+                created_at: "2026-03-30T01:02:00Z",
+            },
+        )
+        .await
+        .expect("cycle fixture commit-2 should seed");
+        seed_local_version_head(&backend, "v1", "commit-2", "2026-03-30T01:03:00Z")
+            .await
+            .expect("cycle fixture local head should seed");
+
+        let error = load_exact_committed_state_row_at_version_head(
+            &backend,
+            &exact_file_descriptor_request(),
+        )
+        .await
+        .expect_err("cycle fixture should fail explicitly");
+        assert!(
+            error.description.contains("cycle"),
+            "expected explicit cycle error, got: {}",
+            error.description
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_exact_state_contract_rejects_missing_parent_commit_explicitly() {
+        let backend = init_state_source_backend().await;
+        seed_canonical_change_row(
+            &backend,
+            CanonicalChangeSeed {
+                id: "change-missing-parent-row",
+                entity_id: "file-1",
+                schema_key: "lix_file_descriptor",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: "snapshot-missing-parent-row",
+                snapshot_content: Some(
+                    "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"broken-parent\",\"extension\":null,\"metadata\":null,\"hidden\":false}",
+                ),
+                metadata: None,
+                created_at: "2026-03-30T02:00:00Z",
+            },
+        )
+        .await
+        .expect("missing-parent fixture change should seed");
+        seed_canonical_change_row(
+            &backend,
+            CanonicalChangeSeed {
+                id: "change-missing-parent-commit",
+                entity_id: "commit-1",
+                schema_key: "lix_commit",
+                schema_version: "1",
+                file_id: "lix",
+                plugin_key: "lix",
+                snapshot_id: "snapshot-missing-parent-commit",
+                snapshot_content: Some(
+                    "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[\"change-missing-parent-row\"],\"parent_commit_ids\":[\"missing-parent\"]}",
+                ),
+                metadata: None,
+                created_at: "2026-03-30T02:01:00Z",
+            },
+        )
+        .await
+        .expect("missing-parent fixture commit should seed");
+        seed_local_version_head(&backend, "v1", "commit-1", "2026-03-30T02:02:00Z")
+            .await
+            .expect("missing-parent fixture local head should seed");
+
+        let error = load_exact_committed_state_row_at_version_head(
+            &backend,
+            &exact_file_descriptor_request(),
+        )
+        .await
+        .expect_err("missing-parent fixture should fail explicitly");
+        assert!(
+            error
+                .description
+                .contains("missing commit 'missing-parent'"),
+            "expected explicit missing-parent error, got: {}",
+            error.description
+        );
     }
 
     #[tokio::test]

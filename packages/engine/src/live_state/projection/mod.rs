@@ -15,7 +15,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::receipt::UpdatedVersionRef;
 use crate::canonical::CanonicalCommitReceipt;
-use crate::errors::classification::is_missing_relation_error;
 use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::untracked::{
     UntrackedWriteBatch, UntrackedWriteOperation, UntrackedWriteParticipant, UntrackedWriteRow,
@@ -30,7 +29,7 @@ use crate::version::{
     version_ref_schema_version, version_ref_snapshot_content, version_ref_storage_version_id,
 };
 use crate::{
-    CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, TransactionMode, Value,
+    CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, TransactionMode,
 };
 
 const MAX_LIVE_STATE_DELTA_MERGE_PASSES: usize = 16;
@@ -231,21 +230,22 @@ pub(crate) async fn catch_up_live_state_to_current_frontier(
             });
         }
 
-        let scope = match (
-            projection_status.applied_cursor.as_ref(),
-            projection_status.latest_cursor.as_ref(),
+        if live_state_projection_needs_replay_recovery(&projection_status) {
+            recover_live_state_projection_replay_state(
+                backend,
+                projection_status.latest_cursor.as_ref(),
+            )
+            .await?;
+            continue;
+        }
+
+        let scope = match changed_version_ids_between_frontiers(
+            projection_status.applied_committed_frontier.as_ref(),
+            &projection_status.current_committed_frontier,
         ) {
-            (Some(applied), Some(target_cursor)) if target_cursor.is_newer_than(applied) => {
-                match resolve_incremental_live_state_scope(backend, applied, target_cursor).await? {
-                    Some(version_ids) => {
-                        delta_merge_passes += 1;
-                        LiveStateRebuildScope::Versions(version_ids)
-                    }
-                    _ => {
-                        full_rebuild_passes += 1;
-                        LiveStateRebuildScope::Full
-                    }
-                }
+            Some(version_ids) if !version_ids.is_empty() => {
+                delta_merge_passes += 1;
+                LiveStateRebuildScope::Versions(version_ids)
             }
             _ => {
                 full_rebuild_passes += 1;
@@ -270,93 +270,60 @@ pub(crate) async fn catch_up_live_state_to_current_frontier(
     ))
 }
 
-async fn resolve_incremental_live_state_scope(
-    backend: &dyn LixBackend,
-    older_exclusive: &ReplayCursor,
-    newer_inclusive: &ReplayCursor,
-) -> Result<Option<BTreeSet<String>>, LixError> {
-    if let Some(version_ids) = load_version_ids_with_ref_changes_between_cursors_with_backend(
-        backend,
-        older_exclusive,
-        newer_inclusive,
-    )
-    .await?
-    {
-        if !version_ids.is_empty() {
-            return Ok(Some(version_ids));
-        }
-    }
-
-    let mut executor = backend;
-    let version_ids = crate::canonical::roots::load_all_version_head_commit_ids(&mut executor)
-        .await?
-        .into_iter()
-        .map(|row| row.version_id)
-        .collect::<BTreeSet<_>>();
-    if version_ids.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(version_ids))
+fn live_state_projection_needs_replay_recovery(status: &LiveStateProjectionStatus) -> bool {
+    status.mode == LiveStateMode::NeedsRebuild
+        && status.applied_committed_frontier.as_ref() == Some(&status.current_committed_frontier)
 }
 
-async fn load_version_ids_with_ref_changes_between_cursors_with_backend(
+fn changed_version_ids_between_frontiers(
+    applied_frontier: Option<&CommittedVersionFrontier>,
+    current_frontier: &CommittedVersionFrontier,
+) -> Option<BTreeSet<String>> {
+    let applied_frontier = applied_frontier?;
+    let version_ids = applied_frontier
+        .version_heads
+        .keys()
+        .chain(current_frontier.version_heads.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    Some(
+        version_ids
+            .into_iter()
+            .filter(|version_id| {
+                applied_frontier.version_heads.get(version_id)
+                    != current_frontier.version_heads.get(version_id)
+            })
+            .collect(),
+    )
+}
+
+async fn recover_live_state_projection_replay_state(
     backend: &dyn LixBackend,
-    older_exclusive: &ReplayCursor,
-    newer_inclusive: &ReplayCursor,
-) -> Result<Option<BTreeSet<String>>, LixError> {
-    if !newer_inclusive.is_newer_than(older_exclusive) {
-        return Ok(Some(BTreeSet::new()));
-    }
-
-    let sql = format!(
-        "SELECT DISTINCT c.entity_id \
-         FROM lix_internal_change c \
-         WHERE c.schema_key = '{schema_key}' \
-           AND c.schema_version = '{schema_version}' \
-           AND c.file_id = '{file_id}' \
-           AND c.plugin_key = '{plugin_key}' \
-           AND (\
-             c.created_at > '{older_created_at}' \
-             OR (c.created_at = '{older_created_at}' AND c.id > '{older_change_id}')\
-           ) \
-           AND (\
-             c.created_at < '{newer_created_at}' \
-             OR (c.created_at = '{newer_created_at}' AND c.id <= '{newer_change_id}')\
-           ) \
-         ORDER BY c.entity_id ASC",
-        schema_key = escape_sql_string(version_ref_schema_key()),
-        schema_version = escape_sql_string(version_ref_schema_version()),
-        file_id = escape_sql_string(version_ref_file_id()),
-        plugin_key = escape_sql_string(version_ref_plugin_key()),
-        older_created_at = escape_sql_string(&older_exclusive.created_at),
-        older_change_id = escape_sql_string(&older_exclusive.change_id),
-        newer_created_at = escape_sql_string(&newer_inclusive.created_at),
-        newer_change_id = escape_sql_string(&newer_inclusive.change_id),
-    );
-
-    let result = match backend.execute(&sql, &[]).await {
-        Ok(result) => result,
-        Err(error) if is_missing_relation_error(&error) => return Ok(None),
-        Err(error) => return Err(error),
+    target: Option<&ReplayCursor>,
+) -> Result<(), LixError> {
+    let mut transaction = backend.begin_transaction(TransactionMode::Write).await?;
+    let recovery_result = match target {
+        Some(target) => {
+            replay::mark_live_state_projection_ready_at_replay_cursor_in_transaction(
+                transaction.as_mut(),
+                target,
+            )
+            .await
+        }
+        None => {
+            replay::mark_live_state_projection_ready_without_replay_cursor_in_transaction(
+                transaction.as_mut(),
+            )
+            .await
+        }
     };
 
-    let mut version_ids = BTreeSet::new();
-    for row in &result.rows {
-        match row.first() {
-            Some(Value::Text(version_id)) if !version_id.is_empty() => {
-                version_ids.insert(version_id.clone());
-            }
-            Some(Value::Null) | None => {}
-            Some(other) => {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("version ref replay query returned non-text entity_id: {other:?}"),
-                ));
-            }
-        }
+    if let Err(error) = recovery_result {
+        let _ = transaction.rollback().await;
+        return Err(error);
     }
 
-    Ok(Some(version_ids))
+    transaction.commit().await
 }
 
 fn derived_projection_status_from_live_state(
@@ -375,10 +342,6 @@ fn derived_projection_status_from_live_state(
 fn live_state_projection_serves_current_frontier(status: &LiveStateProjectionStatus) -> bool {
     status.mode == LiveStateMode::Ready
         && status.applied_committed_frontier.as_ref() == Some(&status.current_committed_frontier)
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 async fn apply_live_state_replay_scope_to_cursor(
@@ -702,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_merges_newer_canonical_version_ref_deltas_without_full_rebuild() {
+    fn catch_up_restamps_replay_state_without_rebuild_when_frontier_is_current() {
         run_checkpoint_test(|| async {
             let (backend, _engine, session) = boot_test_engine()
                 .await
@@ -752,7 +715,7 @@ mod tests {
 
             let report = catch_up_live_state_to_current_frontier(&backend)
                 .await
-                .expect("catch-up should merge newer replay deltas");
+                .expect("catch-up should restamp replay state without rebuilding");
 
             let projection_status =
                 status::load_live_state_projection_status_with_backend(&backend)
@@ -762,6 +725,81 @@ mod tests {
             assert_eq!(
                 projection_status.applied_cursor,
                 Some(latest_cursor.clone())
+            );
+            assert_eq!(report.projection, DerivedProjectionId::LiveState);
+            assert_eq!(report.outcome, ProjectionCatchUpOutcome::AlreadyApplied);
+            assert_eq!(report.final_cursor, Some(latest_cursor.clone()));
+            assert_eq!(report.target_cursor, Some(latest_cursor));
+            assert_eq!(report.full_rebuild_passes, 0);
+            assert_eq!(report.delta_merge_passes, 0);
+        });
+    }
+
+    #[test]
+    fn catch_up_rebuilds_only_changed_frontier_versions_without_full_rebuild() {
+        run_checkpoint_test(|| async {
+            let (backend, _engine, session) = boot_test_engine()
+                .await
+                .expect("boot test engine should succeed");
+
+            session
+                .create_version(CreateVersionOptions {
+                    id: Some("version-b".to_string()),
+                    name: Some("version-b".to_string()),
+                    ..CreateVersionOptions::default()
+                })
+                .await
+                .expect("create version-b should succeed");
+            let frontier_before_delta =
+                status::load_live_state_projection_status_with_backend(&backend)
+                    .await
+                    .expect("projection status should load after version-b")
+                    .current_committed_frontier;
+            let cursor_before_delta =
+                replay::load_latest_live_state_replay_cursor_with_backend(&backend)
+                    .await
+                    .expect("latest replay cursor lookup should succeed")
+                    .expect("version-b creation should produce a replay cursor");
+
+            session
+                .create_version(CreateVersionOptions {
+                    id: Some("version-c".to_string()),
+                    name: Some("version-c".to_string()),
+                    ..CreateVersionOptions::default()
+                })
+                .await
+                .expect("create version-c should succeed");
+            let latest_cursor = replay::load_latest_live_state_replay_cursor_with_backend(&backend)
+                .await
+                .expect("latest replay cursor lookup should succeed")
+                .expect("version-c creation should produce a replay cursor");
+
+            seed_live_state_status_row(
+                &backend,
+                LiveStateMode::NeedsRebuild,
+                Some(&cursor_before_delta),
+                Some(&frontier_before_delta),
+                "2026-03-15T01:02:03Z",
+            )
+            .await
+            .expect("status row should seed");
+
+            let report = catch_up_live_state_to_current_frontier(&backend)
+                .await
+                .expect("catch-up should rebuild only changed frontier versions");
+
+            let projection_status =
+                status::load_live_state_projection_status_with_backend(&backend)
+                    .await
+                    .expect("projection status should load after catch-up");
+            assert_eq!(projection_status.mode, LiveStateMode::Ready);
+            assert_eq!(
+                projection_status.applied_cursor,
+                Some(latest_cursor.clone())
+            );
+            assert_eq!(
+                projection_status.applied_committed_frontier,
+                Some(projection_status.current_committed_frontier.clone())
             );
             assert_eq!(report.projection, DerivedProjectionId::LiveState);
             assert_eq!(report.outcome, ProjectionCatchUpOutcome::RebuiltToTarget);

@@ -24,12 +24,6 @@ pub(crate) struct LixCommit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct LixCommitEdge {
-    pub parent_id: String,
-    pub child_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LixVersionDescriptor {
     pub id: String,
     #[serde(default)]

@@ -1,4 +1,3 @@
-use crate::errors;
 use crate::init::seed::read_scalar_count;
 use crate::init::tables::execute_init_statements;
 use crate::init::InitExecutor;
@@ -63,16 +62,14 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             return Ok(());
         }
 
-        let commit_table = crate::live_state::schema_access::tracked_relation_name("lix_commit");
         let commit_count_result = self
             .execute_backend(
-                &format!(
-                    "SELECT COUNT(*) \
-                     FROM {commit_table} \
-                     WHERE schema_key = 'lix_commit' \
-                       AND version_id = 'global' \
-                       AND is_tombstone = 0"
-                ),
+                "SELECT COUNT(*) \
+                 FROM lix_internal_change c \
+                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+                 WHERE c.schema_key = 'lix_commit' \
+                   AND c.file_id = 'lix' \
+                   AND s.content IS NOT NULL",
                 &[],
             )
             .await?;
@@ -81,8 +78,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             return Ok(());
         }
 
+        let dialect = self.backend_transaction_mut()?.dialect();
         self.execute_backend(
-            &crate::canonical::graph::build_commit_generation_seed_sql(),
+            &crate::canonical::graph::build_commit_generation_seed_sql(dialect),
             &[],
         )
         .await?;
@@ -125,26 +123,19 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         change_set_id: &str,
     ) -> Result<(), LixError> {
         let existing = self
-            .execute_internal(
+            .execute_backend(
                 "SELECT 1 \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_commit' \
-                   AND entity_id = $1 \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global' \
-                   AND snapshot_content IS NOT NULL \
+                 FROM lix_internal_change c \
+                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+                 WHERE c.schema_key = 'lix_commit' \
+                   AND c.entity_id = $1 \
+                   AND c.file_id = 'lix' \
+                   AND s.content IS NOT NULL \
                  LIMIT 1",
                 &[Value::Text(commit_id.to_string())],
             )
             .await?;
-        let [statement] = existing.statements.as_slice() else {
-            return Err(errors::unexpected_statement_count_error(
-                "seed_bootstrap_commit existence query",
-                1,
-                existing.statements.len(),
-            ));
-        };
-        if !statement.rows.is_empty() {
+        if !existing.rows.is_empty() {
             return Ok(());
         }
 
@@ -155,15 +146,17 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             "change_ids": [],
         })
         .to_string();
-        self.insert_bootstrap_tracked_row(
-            None,
+        let change_id = self.generate_runtime_uuid().await?;
+        let timestamp = self.generate_runtime_timestamp().await?;
+        self.insert_change_row_for_snapshot(
             commit_id,
             "lix_commit",
             "1",
             "lix",
-            "global",
             "lix",
             &snapshot_content,
+            &change_id,
+            &timestamp,
         )
         .await?;
         Ok(())
@@ -174,39 +167,34 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         change_set_id: &str,
     ) -> Result<(), LixError> {
         let existing = self
-            .execute_internal(
+            .execute_backend(
                 "SELECT 1 \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_change_set' \
-                   AND entity_id = $1 \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global' \
-                   AND snapshot_content IS NOT NULL \
+                 FROM lix_internal_change c \
+                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+                 WHERE c.schema_key = 'lix_change_set' \
+                   AND c.entity_id = $1 \
+                   AND c.file_id = 'lix' \
+                   AND s.content IS NOT NULL \
                  LIMIT 1",
                 &[Value::Text(change_set_id.to_string())],
             )
             .await?;
-        let [statement] = existing.statements.as_slice() else {
-            return Err(errors::unexpected_statement_count_error(
-                "seed_bootstrap_change_set existence query",
-                1,
-                existing.statements.len(),
-            ));
-        };
-        if !statement.rows.is_empty() {
+        if !existing.rows.is_empty() {
             return Ok(());
         }
 
         let snapshot_content = serde_json::json!({ "id": change_set_id }).to_string();
-        self.insert_bootstrap_tracked_row(
-            None,
+        let change_id = self.generate_runtime_uuid().await?;
+        let timestamp = self.generate_runtime_timestamp().await?;
+        self.insert_change_row_for_snapshot(
             change_set_id,
             "lix_change_set",
             "1",
             "lix",
-            "global",
             "lix",
             &snapshot_content,
+            &change_id,
+            &timestamp,
         )
         .await?;
         Ok(())

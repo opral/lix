@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::backend::QueryExecutor;
 use crate::live_state::ReplayCursor;
-use crate::schema::builtin::types::{LixCommit, LixCommitEdge, LixVersionDescriptor};
+use crate::schema::builtin::types::{LixCommit, LixVersionDescriptor};
 
 use crate::{CanonicalJson, LixError, Value};
 
@@ -42,17 +42,10 @@ pub(crate) struct VersionDescriptorRecord {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CommitEdgeRecord {
-    pub id: String,
-    pub snapshot: LixCommitEdge,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct LoadedData {
     pub changes: BTreeMap<String, ChangeRecord>,
     pub commits: BTreeMap<String, CommitRecord>,
     pub version_descriptors: BTreeMap<String, VersionDescriptorRecord>,
-    pub commit_edges: Vec<CommitEdgeRecord>,
 }
 
 pub(crate) async fn load_data_with_executor(
@@ -66,7 +59,6 @@ pub(crate) async fn load_data_with_executor(
     let mut changes = BTreeMap::new();
     let mut commits = BTreeMap::new();
     let mut version_descriptors = BTreeMap::new();
-    let mut commit_edges = Vec::new();
 
     for row in result.rows {
         let id = text_required(&row, 0, "id")?;
@@ -121,7 +113,13 @@ pub(crate) async fn load_data_with_executor(
         }
 
         if schema_key == "lix_version_ref" {
-            continue;
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "materialization: canonical change '{}' uses forbidden schema 'lix_version_ref'; version heads must remain replica-local untracked state",
+                    id
+                ),
+            });
         }
 
         if schema_key == "lix_version_descriptor" {
@@ -149,29 +147,12 @@ pub(crate) async fn load_data_with_executor(
             });
             continue;
         }
-
-        if schema_key == "lix_commit_edge" {
-            if let Some(ref snapshot_canonical) = snapshot_content {
-                if let Some(snapshot) = parse_commit_edge_snapshot(snapshot_canonical)? {
-                    commit_edges.push(CommitEdgeRecord { id, snapshot });
-                }
-            }
-        }
     }
-
-    commit_edges.sort_by(|a, b| {
-        a.snapshot
-            .parent_id
-            .cmp(&b.snapshot.parent_id)
-            .then_with(|| a.snapshot.child_id.cmp(&b.snapshot.child_id))
-            .then_with(|| b.id.cmp(&a.id))
-    });
 
     Ok(LoadedData {
         changes,
         commits,
         version_descriptors,
-        commit_edges,
     })
 }
 
@@ -242,22 +223,6 @@ fn parse_version_descriptor_snapshot(
         return Ok(None);
     }
     Ok(Some(parsed))
-}
-
-fn parse_commit_edge_snapshot(raw: &CanonicalJson) -> Result<Option<LixCommitEdge>, LixError> {
-    let parsed: LixCommitEdge = raw.parse().map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "materialization: invalid lix_commit_edge snapshot JSON: {}",
-            error.description
-        ),
-    })?;
-
-    if parsed.parent_id.is_empty() || parsed.child_id.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(parsed))
-    }
 }
 
 fn text_required(row: &[Value], index: usize, label: &str) -> Result<String, LixError> {
