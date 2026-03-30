@@ -51,6 +51,7 @@ pub(crate) fn rewrite_supported_public_read_surfaces_in_statement(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry_and_active_version_id(
     statement: &Statement,
     registry: &SurfaceRegistry,
@@ -67,6 +68,7 @@ pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry_
     )
 }
 
+#[cfg(test)]
 pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry(
     statement: &Statement,
     registry: &SurfaceRegistry,
@@ -74,7 +76,9 @@ pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry(
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<RenderedBroadPublicReadStatement, LixError> {
-    let Some(bound_statement) = bind_broad_public_read_statement(statement, registry)? else {
+    let Some(bound_statement) =
+        bind_broad_public_read_statement_with_registry(statement, registry)?
+    else {
         return Ok(RenderedBroadPublicReadStatement {
             shell_statement: statement.clone(),
             relation_render_nodes: Vec::new(),
@@ -89,19 +93,41 @@ pub(crate) fn rewrite_supported_public_read_surfaces_in_statement_with_registry(
     )
 }
 
-pub(crate) fn summarize_bound_public_read_statement_with_registry(
-    statement: &Statement,
+pub(crate) fn broad_public_relation_supports_terminal_render(
+    binding: &SurfaceBinding,
     registry: &SurfaceRegistry,
-) -> Result<Option<BroadPublicRelationSummary>, LixError> {
-    let Some(bound_statement) = bind_broad_public_read_statement(statement, registry)? else {
-        return Ok(None);
-    };
-    let mut summary = BroadPublicRelationSummary::default();
-    collect_broad_public_read_statement_summary(&bound_statement, registry, &mut summary)?;
-    Ok(Some(summary))
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<bool, LixError> {
+    build_supported_public_read_surface_sql(
+        &binding.descriptor.public_name,
+        registry,
+        false,
+        dialect,
+        active_version_id,
+        known_live_layouts,
+    )
+    .map(|sql| sql.is_some())
 }
 
-fn bind_broad_public_read_statement(
+pub(crate) fn render_broad_public_read_statement_with_registry_and_active_version_id(
+    statement: &BroadPublicReadStatement,
+    registry: &SurfaceRegistry,
+    dialect: SqlDialect,
+    active_version_id: Option<&str>,
+    known_live_layouts: &BTreeMap<String, JsonValue>,
+) -> Result<RenderedBroadPublicReadStatement, LixError> {
+    lower_broad_public_read_statement(
+        statement,
+        registry,
+        dialect,
+        active_version_id,
+        known_live_layouts,
+    )
+}
+
+pub(crate) fn bind_broad_public_read_statement_with_registry(
     statement: &Statement,
     registry: &SurfaceRegistry,
 ) -> Result<Option<BroadPublicReadStatement>, LixError> {
@@ -112,7 +138,9 @@ fn bind_broad_public_read_statement(
         Statement::Explain {
             statement: inner, ..
         } => {
-            let Some(bound_inner) = bind_broad_public_read_statement(inner, registry)? else {
+            let Some(bound_inner) =
+                bind_broad_public_read_statement_with_registry(inner, registry)?
+            else {
                 return Ok(None);
             };
             Ok(Some(BroadPublicReadStatement::Explain {
@@ -668,7 +696,8 @@ fn lower_broad_public_read_relation(
     substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<TableFactor, LixError> {
     match relation {
-        BroadPublicReadRelation::Public(binding) => {
+        BroadPublicReadRelation::Public(binding)
+        | BroadPublicReadRelation::LoweredPublic(binding) => {
             let Some(source_sql) = build_supported_public_read_surface_sql(
                 &binding.descriptor.public_name,
                 registry,
@@ -711,7 +740,8 @@ fn lower_broad_public_read_table_relation(
     substitutions: &mut RenderRelationSubstitutionCollector,
 ) -> Result<SetExpr, LixError> {
     match relation {
-        BroadPublicReadRelation::Public(binding) => {
+        BroadPublicReadRelation::Public(binding)
+        | BroadPublicReadRelation::LoweredPublic(binding) => {
             let Some(source_sql) = build_supported_public_read_surface_sql(
                 &binding.descriptor.public_name,
                 registry,
@@ -1562,381 +1592,6 @@ fn lower_query_via_broad_binding(
         known_live_layouts,
         substitutions,
     )
-}
-
-fn collect_broad_public_read_statement_summary(
-    statement: &BroadPublicReadStatement,
-    registry: &SurfaceRegistry,
-    out: &mut BroadPublicRelationSummary,
-) -> Result<(), LixError> {
-    match statement {
-        BroadPublicReadStatement::Query(query) => {
-            collect_broad_public_read_query_summary(query, registry, out)
-        }
-        BroadPublicReadStatement::Explain { statement, .. } => {
-            collect_broad_public_read_statement_summary(statement, registry, out)
-        }
-    }
-}
-
-fn collect_broad_public_read_query_summary(
-    query: &BroadPublicReadQuery,
-    registry: &SurfaceRegistry,
-    out: &mut BroadPublicRelationSummary,
-) -> Result<(), LixError> {
-    if let Some(with) = &query.with {
-        for cte_query in &with.cte_tables {
-            collect_broad_public_read_query_summary(cte_query, registry, out)?;
-        }
-    }
-    collect_broad_public_read_set_expr_summary(&query.body, registry, out)
-}
-
-fn collect_broad_public_read_set_expr_summary(
-    expr: &BroadPublicReadSetExpr,
-    registry: &SurfaceRegistry,
-    out: &mut BroadPublicRelationSummary,
-) -> Result<(), LixError> {
-    match expr {
-        BroadPublicReadSetExpr::Select(select) => {
-            collect_broad_public_read_select_summary(select, registry, out)
-        }
-        BroadPublicReadSetExpr::Query(query) => {
-            collect_broad_public_read_query_summary(query, registry, out)
-        }
-        BroadPublicReadSetExpr::SetOperation { left, right, .. } => {
-            collect_broad_public_read_set_expr_summary(left, registry, out)?;
-            collect_broad_public_read_set_expr_summary(right, registry, out)
-        }
-        BroadPublicReadSetExpr::Table { relation, .. } => {
-            collect_broad_public_read_relation_summary(relation, out);
-            Ok(())
-        }
-        BroadPublicReadSetExpr::Other(expr) => {
-            collect_nested_public_query_summaries_in_set_expr(expr, registry, out)
-        }
-    }
-}
-
-fn collect_broad_public_read_select_summary(
-    select: &BroadPublicReadSelect,
-    registry: &SurfaceRegistry,
-    out: &mut BroadPublicRelationSummary,
-) -> Result<(), LixError> {
-    for table in &select.from {
-        collect_broad_public_read_table_with_joins_summary(table, registry, out)?;
-    }
-    if let Some(prewhere) = &select.original.prewhere {
-        collect_nested_public_query_summaries_in_expr(prewhere, registry, out)?;
-    }
-    if let Some(selection) = &select.original.selection {
-        collect_nested_public_query_summaries_in_expr(selection, registry, out)?;
-    }
-    for item in &select.original.projection {
-        match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-            }
-            SelectItem::QualifiedWildcard(
-                sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr),
-                _,
-            ) => collect_nested_public_query_summaries_in_expr(expr, registry, out)?,
-            _ => {}
-        }
-    }
-    match &select.original.group_by {
-        GroupByExpr::All(_) => {}
-        GroupByExpr::Expressions(expressions, _) => {
-            for expr in expressions {
-                collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-            }
-        }
-    }
-    for expr in &select.original.cluster_by {
-        collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-    }
-    for expr in &select.original.distribute_by {
-        collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-    }
-    for expr in &select.original.sort_by {
-        collect_nested_public_query_summaries_in_order_by_expr(expr, registry, out)?;
-    }
-    if let Some(having) = &select.original.having {
-        collect_nested_public_query_summaries_in_expr(having, registry, out)?;
-    }
-    if let Some(qualify) = &select.original.qualify {
-        collect_nested_public_query_summaries_in_expr(qualify, registry, out)?;
-    }
-    if let Some(connect_by) = &select.original.connect_by {
-        collect_nested_public_query_summaries_in_expr(&connect_by.condition, registry, out)?;
-        for expr in &connect_by.relationships {
-            collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-        }
-    }
-    Ok(())
-}
-
-fn collect_broad_public_read_table_with_joins_summary(
-    table: &BroadPublicReadTableWithJoins,
-    registry: &SurfaceRegistry,
-    out: &mut BroadPublicRelationSummary,
-) -> Result<(), LixError> {
-    collect_broad_public_read_table_factor_summary(&table.relation, registry, out)?;
-    for join in &table.joins {
-        collect_broad_public_read_table_factor_summary(&join.relation, registry, out)?;
-        collect_nested_public_query_summaries_in_join_operator(
-            &join.original.join_operator,
-            registry,
-            out,
-        )?;
-    }
-    Ok(())
-}
-
-fn collect_broad_public_read_table_factor_summary(
-    relation: &BroadPublicReadTableFactor,
-    registry: &SurfaceRegistry,
-    out: &mut BroadPublicRelationSummary,
-) -> Result<(), LixError> {
-    match relation {
-        BroadPublicReadTableFactor::Table { relation, .. } => {
-            collect_broad_public_read_relation_summary(relation, out);
-            Ok(())
-        }
-        BroadPublicReadTableFactor::Derived { subquery, .. } => {
-            collect_broad_public_read_query_summary(subquery, registry, out)
-        }
-        BroadPublicReadTableFactor::NestedJoin {
-            table_with_joins, ..
-        } => collect_broad_public_read_table_with_joins_summary(table_with_joins, registry, out),
-        BroadPublicReadTableFactor::Other(_) => Ok(()),
-    }
-}
-
-fn collect_broad_public_read_relation_summary(
-    relation: &BroadPublicReadRelation,
-    out: &mut BroadPublicRelationSummary,
-) {
-    match relation {
-        BroadPublicReadRelation::Public(binding) => {
-            out.public_relations
-                .insert(binding.descriptor.public_name.clone());
-        }
-        BroadPublicReadRelation::Internal(name) => {
-            out.internal_relations.insert(name.clone());
-        }
-        BroadPublicReadRelation::External(name) => {
-            out.external_relations.insert(name.clone());
-        }
-        BroadPublicReadRelation::Cte(_) => {}
-    }
-}
-
-fn collect_nested_public_query_summaries_in_set_expr(
-    expr: &SetExpr,
-    registry: &SurfaceRegistry,
-    out: &mut BroadPublicRelationSummary,
-) -> Result<(), LixError> {
-    match expr {
-        SetExpr::Select(select) => {
-            if let Some(prewhere) = &select.prewhere {
-                collect_nested_public_query_summaries_in_expr(prewhere, registry, out)?;
-            }
-            if let Some(selection) = &select.selection {
-                collect_nested_public_query_summaries_in_expr(selection, registry, out)?;
-            }
-            for item in &select.projection {
-                match item {
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-                    }
-                    SelectItem::QualifiedWildcard(
-                        sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr),
-                        _,
-                    ) => collect_nested_public_query_summaries_in_expr(expr, registry, out)?,
-                    _ => {}
-                }
-            }
-            Ok(())
-        }
-        SetExpr::Query(query) => {
-            let bound = bind_broad_public_read_query_scoped(query, registry, &BTreeSet::new())?;
-            collect_broad_public_read_query_summary(&bound, registry, out)
-        }
-        SetExpr::SetOperation { left, right, .. } => {
-            collect_nested_public_query_summaries_in_set_expr(left, registry, out)?;
-            collect_nested_public_query_summaries_in_set_expr(right, registry, out)
-        }
-        SetExpr::Values(values) => {
-            for row in &values.rows {
-                for expr in row {
-                    collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-                }
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-fn collect_nested_public_query_summaries_in_order_by_expr(
-    order_by_expr: &OrderByExpr,
-    registry: &SurfaceRegistry,
-    out: &mut BroadPublicRelationSummary,
-) -> Result<(), LixError> {
-    collect_nested_public_query_summaries_in_expr(&order_by_expr.expr, registry, out)?;
-    if let Some(with_fill) = &order_by_expr.with_fill {
-        if let Some(from) = &with_fill.from {
-            collect_nested_public_query_summaries_in_expr(from, registry, out)?;
-        }
-        if let Some(to) = &with_fill.to {
-            collect_nested_public_query_summaries_in_expr(to, registry, out)?;
-        }
-        if let Some(step) = &with_fill.step {
-            collect_nested_public_query_summaries_in_expr(step, registry, out)?;
-        }
-    }
-    Ok(())
-}
-
-fn collect_nested_public_query_summaries_in_join_operator(
-    join_operator: &JoinOperator,
-    registry: &SurfaceRegistry,
-    out: &mut BroadPublicRelationSummary,
-) -> Result<(), LixError> {
-    let (match_condition, constraint) = match join_operator {
-        JoinOperator::AsOf {
-            match_condition,
-            constraint,
-        } => (Some(match_condition), Some(constraint)),
-        JoinOperator::Join(constraint)
-        | JoinOperator::Inner(constraint)
-        | JoinOperator::Left(constraint)
-        | JoinOperator::LeftOuter(constraint)
-        | JoinOperator::Right(constraint)
-        | JoinOperator::RightOuter(constraint)
-        | JoinOperator::FullOuter(constraint)
-        | JoinOperator::CrossJoin(constraint)
-        | JoinOperator::Semi(constraint)
-        | JoinOperator::LeftSemi(constraint)
-        | JoinOperator::RightSemi(constraint)
-        | JoinOperator::Anti(constraint)
-        | JoinOperator::LeftAnti(constraint)
-        | JoinOperator::RightAnti(constraint)
-        | JoinOperator::StraightJoin(constraint) => (None, Some(constraint)),
-        JoinOperator::CrossApply | JoinOperator::OuterApply => (None, None),
-    };
-    if let Some(expr) = match_condition {
-        collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-    }
-    if let Some(JoinConstraint::On(expr)) = constraint {
-        collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-    }
-    Ok(())
-}
-
-fn collect_nested_public_query_summaries_in_expr(
-    expr: &Expr,
-    registry: &SurfaceRegistry,
-    out: &mut BroadPublicRelationSummary,
-) -> Result<(), LixError> {
-    match expr {
-        Expr::BinaryOp { left, right, .. } => {
-            collect_nested_public_query_summaries_in_expr(left, registry, out)?;
-            collect_nested_public_query_summaries_in_expr(right, registry, out)
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::Nested(expr)
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::Cast { expr, .. } => {
-            collect_nested_public_query_summaries_in_expr(expr, registry, out)
-        }
-        Expr::InList { expr, list, .. } => {
-            collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-            for item in list {
-                collect_nested_public_query_summaries_in_expr(item, registry, out)?;
-            }
-            Ok(())
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-            collect_nested_public_query_summaries_in_expr(low, registry, out)?;
-            collect_nested_public_query_summaries_in_expr(high, registry, out)
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-            collect_nested_public_query_summaries_in_expr(pattern, registry, out)
-        }
-        Expr::Subquery(query)
-        | Expr::Exists {
-            subquery: query, ..
-        } => {
-            let bound = bind_broad_public_read_query_scoped(query, registry, &BTreeSet::new())?;
-            collect_broad_public_read_query_summary(&bound, registry, out)
-        }
-        Expr::InSubquery { expr, subquery, .. } => {
-            collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-            let bound = bind_broad_public_read_query_scoped(subquery, registry, &BTreeSet::new())?;
-            collect_broad_public_read_query_summary(&bound, registry, out)
-        }
-        Expr::InUnnest {
-            expr, array_expr, ..
-        } => {
-            collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-            collect_nested_public_query_summaries_in_expr(array_expr, registry, out)
-        }
-        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
-            collect_nested_public_query_summaries_in_expr(left, registry, out)?;
-            collect_nested_public_query_summaries_in_expr(right, registry, out)
-        }
-        Expr::Function(function) => match &function.args {
-            FunctionArguments::List(list) => {
-                for arg in &list.args {
-                    match arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
-                            collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-                        }
-                        FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
-                            if let FunctionArgExpr::Expr(expr) = arg {
-                                collect_nested_public_query_summaries_in_expr(expr, registry, out)?;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        },
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(operand) = operand {
-                collect_nested_public_query_summaries_in_expr(operand, registry, out)?;
-            }
-            for condition in conditions {
-                collect_nested_public_query_summaries_in_expr(&condition.condition, registry, out)?;
-                collect_nested_public_query_summaries_in_expr(&condition.result, registry, out)?;
-            }
-            if let Some(else_result) = else_result {
-                collect_nested_public_query_summaries_in_expr(else_result, registry, out)?;
-            }
-            Ok(())
-        }
-        Expr::Tuple(items) => {
-            for item in items {
-                collect_nested_public_query_summaries_in_expr(item, registry, out)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
 }
 
 fn build_supported_public_read_surface_sql(

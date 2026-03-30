@@ -32,7 +32,10 @@ use crate::sql::optimizer::{
     optimize_broad_public_read_statement_with_known_live_layouts,
 };
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
-use crate::sql::physical_plan::lowerer::lower_read_for_execution_with_layouts;
+use crate::sql::physical_plan::lowerer::{
+    bind_broad_public_read_statement_with_registry, lower_read_for_execution_with_layouts,
+    render_broad_public_read_statement_with_registry_and_active_version_id_and_layouts,
+};
 use crate::sql::physical_plan::{
     compile_lowered_read_statement, LoweredReadProgram, LoweredResultColumn, LoweredResultColumns,
     PreparedPublicReadExecution,
@@ -4932,12 +4935,12 @@ async fn prepare_public_read_via_surface_lowering(
     mut stage_timings: ExplainTimingCollector,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
     // Broad public-read stage semantics:
-    // - capability_resolution: load external schemas/layouts required before broad rewrite can
-    //   choose stable lowered relations.
-    // - optimizer: rewrite broad public-surface SQL into lowered/internal relations using the
-    //   already resolved capability inputs.
-    // - logical_planning: construct the broad logical plan after rewrite.
-    // - physical_planning: compile the lowered read program from the rewritten statement.
+    // - logical_planning: construct the typed broad logical plan directly from broad binding.
+    // - capability_resolution: load external schemas/layouts required before broad optimization
+    //   can choose stable lowered relations.
+    // - optimizer: rewrite typed broad public relations into lowered typed broad relations.
+    // - physical_planning: render backend SQL and compile the lowered read program from the
+    //   optimized typed broad statement.
     // - executor_preparation: render backend SQL from the lowered read program.
     // Broad lowering does not run structured semantic analysis, so semantic_analysis is omitted.
     let read_summary = summarize_bound_public_read_statement(registry, &bound_statement.statement);
@@ -4955,6 +4958,41 @@ async fn prepare_public_read_via_surface_lowering(
             &read_summary.internal_relations,
         ));
     }
+    let broad_statement =
+        bind_broad_public_read_statement_with_registry(&bound_statement.statement, registry)?
+            .ok_or_else(|| {
+                LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "broad public read preparation failed: typed broad statement binding was unavailable",
+        )
+            })?;
+
+    let dependency_spec = augment_dependency_spec_for_broad_public_read(
+        registry,
+        derive_dependency_spec_from_bound_public_surface_bindings(
+            &read_summary.bound_surface_bindings,
+        ),
+    );
+    if let Some(error) = unknown_public_state_schema_error(registry, dependency_spec.as_ref()) {
+        return Err(error);
+    }
+
+    let logical_started = Instant::now();
+    let logical_plan = PublicReadLogicalPlan::Broad {
+        broad_statement: Box::new(broad_statement.clone()),
+        surface_bindings: read_summary.bound_surface_bindings.clone(),
+        dependency_spec: dependency_spec.clone(),
+    };
+    verify_logical_plan(&LogicalPlan::PublicRead(logical_plan.clone())).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "public read logical plan verification failed: {}",
+                error.message
+            ),
+        )
+    })?;
+    stage_timings.record(ExplainStage::LogicalPlanning, logical_started.elapsed());
 
     let active_version_id = bound_statement
         .execution_context
@@ -4971,9 +5009,10 @@ async fn prepare_public_read_via_surface_lowering(
         ExplainStage::CapabilityResolution,
         capability_started.elapsed(),
     );
+
     let optimizer_started = Instant::now();
-    let optimized_statement = match optimize_broad_public_read_statement_with_known_live_layouts(
-        &bound_statement.statement,
+    let optimized_broad_read = match optimize_broad_public_read_statement_with_known_live_layouts(
+        &broad_statement,
         registry,
         backend.dialect(),
         active_version_id,
@@ -4990,50 +5029,48 @@ async fn prepare_public_read_via_surface_lowering(
             return Err(error);
         }
     };
+    let optimized_logical_plan = PublicReadLogicalPlan::Broad {
+        broad_statement: Box::new(optimized_broad_read.broad_statement.clone()),
+        surface_bindings: read_summary.bound_surface_bindings.clone(),
+        dependency_spec: dependency_spec.clone(),
+    };
+    verify_logical_plan(&LogicalPlan::PublicRead(optimized_logical_plan.clone())).map_err(
+        |error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "public read optimized logical plan verification failed: {}",
+                    error.message
+                ),
+            )
+        },
+    )?;
     stage_timings.record(ExplainStage::Optimizer, optimizer_started.elapsed());
-    let rewritten_statement = optimized_statement.shell_statement;
+
+    let physical_started = Instant::now();
+    let rendered_statement =
+        render_broad_public_read_statement_with_registry_and_active_version_id_and_layouts(
+            &optimized_broad_read.broad_statement,
+            registry,
+            backend.dialect(),
+            active_version_id,
+            &known_live_layouts,
+        )?;
+    let rewritten_statement = rendered_statement.shell_statement;
     if statement_references_public_surface(registry, &rewritten_statement) {
         return Ok(None);
     }
     if rewritten_statement == bound_statement.statement
-        && optimized_statement.relation_render_nodes.is_empty()
+        && rendered_statement.relation_render_nodes.is_empty()
     {
         return Ok(None);
     }
-
-    let dependency_spec = augment_dependency_spec_for_broad_public_read(
-        registry,
-        derive_dependency_spec_from_bound_public_surface_bindings(
-            &read_summary.bound_surface_bindings,
-        ),
-    );
-    if let Some(error) = unknown_public_state_schema_error(registry, dependency_spec.as_ref()) {
-        return Err(error);
-    }
-
-    let logical_started = Instant::now();
-    let logical_plan = PublicReadLogicalPlan::Broad {
-        surface_bindings: read_summary.bound_surface_bindings.clone(),
-        dependency_spec: dependency_spec.clone(),
-    };
-    verify_logical_plan(&LogicalPlan::PublicRead(logical_plan.clone())).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "public read logical plan verification failed: {}",
-                error.message
-            ),
-        )
-    })?;
-    stage_timings.record(ExplainStage::LogicalPlanning, logical_started.elapsed());
-
-    let physical_started = Instant::now();
     let lowered_read = LoweredReadProgram {
         statements: vec![compile_lowered_read_statement(
             backend.dialect(),
             bound_statement.bound_parameters.len(),
             rewritten_statement,
-            optimized_statement.relation_render_nodes,
+            rendered_statement.relation_render_nodes,
         )?],
         pushdown_decision: PushdownDecision::default(),
         result_columns: LoweredResultColumns::Static(Vec::new()),
@@ -5045,6 +5082,7 @@ async fn prepare_public_read_via_surface_lowering(
 
     let semantic_read = PublicReadSemantics {
         surface_bindings: read_summary.bound_surface_bindings.clone(),
+        broad_statement: Some(Box::new(broad_statement)),
         structured_read: None,
         effective_state_request: None,
         effective_state_plan: None,
@@ -5070,13 +5108,13 @@ async fn prepare_public_read_via_surface_lowering(
         request: explain_request.cloned(),
         semantics: semantic_read,
         logical_plan: logical_plan.clone(),
-        optimized_logical_plan: logical_plan.clone(),
+        optimized_logical_plan: optimized_logical_plan.clone(),
         execution: PreparedPublicReadExecution::LoweredSql(lowered_read.clone()),
         runtime_artifacts: PublicReadExplainRuntimeArtifacts {
             pushdown_decision: Some(PushdownDecision::default()),
             lowered_sql,
         },
-        optimizer_passes: optimized_statement.pass_traces.clone(),
+        optimizer_passes: optimized_broad_read.pass_traces.clone(),
         stage_timings: stage_timings.finish(),
     });
 
