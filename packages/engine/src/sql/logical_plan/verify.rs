@@ -6,14 +6,12 @@ use crate::sql::logical_plan::plan::{
     InternalLogicalPlan, LogicalPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan,
 };
 use crate::sql::logical_plan::public_ir::{
+    BroadNestedQueryExpr, BroadPublicReadGroupByKind, BroadPublicReadProjectionItemKind,
     BroadPublicReadQuery, BroadPublicReadRelation, BroadPublicReadSetExpr,
     BroadPublicReadStatement, BroadPublicReadTableFactor, BroadPublicReadTableWithJoins,
+    BroadSqlExpr,
 };
 use crate::sql::logical_plan::result_contract::ResultContract;
-use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, OrderBy, OrderByExpr,
-    Query, Select, SelectItem, SetExpr,
-};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LogicalPlanVerificationError {
@@ -95,17 +93,23 @@ fn broad_public_read_query_has_typed_surface_relation(query: &BroadPublicReadQue
     query.with.as_ref().is_some_and(|with| {
         with.cte_tables
             .iter()
-            .any(broad_public_read_query_has_typed_surface_relation)
+            .any(|cte| broad_public_read_query_has_typed_surface_relation(&cte.query))
     }) || broad_public_read_set_expr_has_typed_surface_relation(&query.body)
-        || query_has_nested_query_expressions(&query.original)
+        || query
+            .order_by
+            .as_ref()
+            .is_some_and(broad_public_read_order_by_has_typed_surface_relation)
+        || query
+            .limit_clause
+            .as_ref()
+            .is_some_and(broad_public_read_limit_clause_has_typed_surface_relation)
 }
 
 fn broad_public_read_set_expr_has_typed_surface_relation(expr: &BroadPublicReadSetExpr) -> bool {
     match expr {
-        BroadPublicReadSetExpr::Select(select) => select
-            .from
-            .iter()
-            .any(broad_public_read_table_with_joins_has_typed_surface_relation),
+        BroadPublicReadSetExpr::Select(select) => {
+            broad_public_read_select_has_typed_surface_relation(select)
+        }
         BroadPublicReadSetExpr::Query(query) => {
             broad_public_read_query_has_typed_surface_relation(query)
         }
@@ -119,7 +123,94 @@ fn broad_public_read_set_expr_has_typed_surface_relation(expr: &BroadPublicReadS
                 BroadPublicReadRelation::Public(_) | BroadPublicReadRelation::LoweredPublic(_)
             )
         }
-        BroadPublicReadSetExpr::Other(_) => false,
+        BroadPublicReadSetExpr::Other { .. } => false,
+    }
+}
+
+fn broad_public_read_select_has_typed_surface_relation(
+    select: &crate::sql::logical_plan::public_ir::BroadPublicReadSelect,
+) -> bool {
+    select
+        .from
+        .iter()
+        .any(broad_public_read_table_with_joins_has_typed_surface_relation)
+        || select
+            .projection
+            .iter()
+            .any(broad_public_read_projection_item_has_typed_surface_relation)
+        || select
+            .selection
+            .as_ref()
+            .is_some_and(broad_sql_expr_has_typed_surface_relation)
+        || broad_public_read_group_by_has_typed_surface_relation(&select.group_by)
+        || select
+            .having
+            .as_ref()
+            .is_some_and(broad_sql_expr_has_typed_surface_relation)
+}
+
+fn broad_public_read_projection_item_has_typed_surface_relation(
+    item: &crate::sql::logical_plan::public_ir::BroadPublicReadProjectionItem,
+) -> bool {
+    match &item.kind {
+        BroadPublicReadProjectionItemKind::Expr { nested_queries, .. } => nested_queries
+            .iter()
+            .any(broad_nested_query_expr_has_typed_surface_relation),
+        BroadPublicReadProjectionItemKind::Wildcard
+        | BroadPublicReadProjectionItemKind::QualifiedWildcard { .. } => false,
+    }
+}
+
+fn broad_public_read_group_by_has_typed_surface_relation(
+    group_by: &crate::sql::logical_plan::public_ir::BroadPublicReadGroupBy,
+) -> bool {
+    match &group_by.kind {
+        BroadPublicReadGroupByKind::All => false,
+        BroadPublicReadGroupByKind::Expressions(expressions) => expressions
+            .iter()
+            .any(broad_sql_expr_has_typed_surface_relation),
+    }
+}
+
+fn broad_public_read_order_by_has_typed_surface_relation(
+    order_by: &crate::sql::logical_plan::public_ir::BroadPublicReadOrderBy,
+) -> bool {
+    match &order_by.kind {
+        crate::sql::logical_plan::public_ir::BroadPublicReadOrderByKind::All => false,
+        crate::sql::logical_plan::public_ir::BroadPublicReadOrderByKind::Expressions(
+            expressions,
+        ) => expressions
+            .iter()
+            .any(|expr| broad_sql_expr_has_typed_surface_relation(&expr.expr)),
+    }
+}
+
+fn broad_public_read_limit_clause_has_typed_surface_relation(
+    limit_clause: &crate::sql::logical_plan::public_ir::BroadPublicReadLimitClause,
+) -> bool {
+    match &limit_clause.kind {
+        crate::sql::logical_plan::public_ir::BroadPublicReadLimitClauseKind::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => {
+            limit
+                .as_ref()
+                .is_some_and(broad_sql_expr_has_typed_surface_relation)
+                || offset
+                    .as_ref()
+                    .is_some_and(broad_sql_expr_has_typed_surface_relation)
+                || limit_by
+                    .iter()
+                    .any(broad_sql_expr_has_typed_surface_relation)
+        }
+        crate::sql::logical_plan::public_ir::BroadPublicReadLimitClauseKind::OffsetCommaLimit {
+            offset,
+            limit,
+        } => {
+            broad_sql_expr_has_typed_surface_relation(offset)
+                || broad_sql_expr_has_typed_surface_relation(limit)
+        }
     }
 }
 
@@ -130,7 +221,17 @@ fn broad_public_read_table_with_joins_has_typed_surface_relation(
         || table
             .joins
             .iter()
-            .any(|join| broad_public_read_table_factor_has_typed_surface_relation(&join.relation))
+            .any(broad_public_read_join_has_typed_surface_relation)
+}
+
+fn broad_public_read_join_has_typed_surface_relation(
+    join: &crate::sql::logical_plan::public_ir::BroadPublicReadJoin,
+) -> bool {
+    broad_public_read_table_factor_has_typed_surface_relation(&join.relation)
+        || join
+            .constraint_expressions
+            .iter()
+            .any(broad_sql_expr_has_typed_surface_relation)
 }
 
 fn broad_public_read_table_factor_has_typed_surface_relation(
@@ -149,221 +250,28 @@ fn broad_public_read_table_factor_has_typed_surface_relation(
         BroadPublicReadTableFactor::NestedJoin {
             table_with_joins, ..
         } => broad_public_read_table_with_joins_has_typed_surface_relation(table_with_joins),
-        BroadPublicReadTableFactor::Other(_) => false,
+        BroadPublicReadTableFactor::Other { .. } => false,
     }
 }
 
-fn query_has_nested_query_expressions(query: &Query) -> bool {
-    set_expr_has_nested_query_expressions(query.body.as_ref())
-        || query
-            .order_by
-            .as_ref()
-            .is_some_and(order_by_has_nested_query_expressions)
-        || query
-            .limit_clause
-            .as_ref()
-            .is_some_and(|limit_clause| match limit_clause {
-                sqlparser::ast::LimitClause::LimitOffset {
-                    limit,
-                    offset,
-                    limit_by,
-                } => {
-                    limit
-                        .as_ref()
-                        .is_some_and(expr_has_nested_query_expressions)
-                        || offset
-                            .as_ref()
-                            .is_some_and(|offset| expr_has_nested_query_expressions(&offset.value))
-                        || limit_by.iter().any(expr_has_nested_query_expressions)
-                }
-                sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
-                    expr_has_nested_query_expressions(offset)
-                        || expr_has_nested_query_expressions(limit)
-                }
-            })
-        || query.fetch.as_ref().is_some_and(|fetch| {
-            fetch
-                .quantity
-                .as_ref()
-                .is_some_and(expr_has_nested_query_expressions)
-        })
-}
-
-fn set_expr_has_nested_query_expressions(expr: &SetExpr) -> bool {
-    match expr {
-        SetExpr::Select(select) => select_has_nested_query_expressions(select),
-        SetExpr::Query(query) => query_has_nested_query_expressions(query),
-        SetExpr::SetOperation { left, right, .. } => {
-            set_expr_has_nested_query_expressions(left)
-                || set_expr_has_nested_query_expressions(right)
-        }
-        SetExpr::Values(values) => values
-            .rows
-            .iter()
-            .flatten()
-            .any(expr_has_nested_query_expressions),
-        _ => false,
-    }
-}
-
-fn select_has_nested_query_expressions(select: &Select) -> bool {
-    select
-        .projection
+fn broad_sql_expr_has_typed_surface_relation(expr: &BroadSqlExpr) -> bool {
+    expr.nested_queries
         .iter()
-        .any(select_item_has_nested_query_expressions)
-        || select
-            .prewhere
-            .as_ref()
-            .is_some_and(expr_has_nested_query_expressions)
-        || select
-            .selection
-            .as_ref()
-            .is_some_and(expr_has_nested_query_expressions)
-        || match &select.group_by {
-            GroupByExpr::All(_) => false,
-            GroupByExpr::Expressions(expressions, _) => {
-                expressions.iter().any(expr_has_nested_query_expressions)
-            }
-        }
-        || select
-            .cluster_by
-            .iter()
-            .any(expr_has_nested_query_expressions)
-        || select
-            .distribute_by
-            .iter()
-            .any(expr_has_nested_query_expressions)
-        || select
-            .sort_by
-            .iter()
-            .any(order_by_expr_has_nested_query_expressions)
-        || select
-            .having
-            .as_ref()
-            .is_some_and(expr_has_nested_query_expressions)
-        || select
-            .qualify
-            .as_ref()
-            .is_some_and(expr_has_nested_query_expressions)
-        || select.connect_by.as_ref().is_some_and(|connect_by| {
-            expr_has_nested_query_expressions(&connect_by.condition)
-                || connect_by
-                    .relationships
-                    .iter()
-                    .any(expr_has_nested_query_expressions)
-        })
+        .any(broad_nested_query_expr_has_typed_surface_relation)
 }
 
-fn select_item_has_nested_query_expressions(item: &SelectItem) -> bool {
-    match item {
-        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-            expr_has_nested_query_expressions(expr)
-        }
-        SelectItem::QualifiedWildcard(
-            sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr),
-            _,
-        ) => expr_has_nested_query_expressions(expr),
-        _ => false,
-    }
-}
-
-fn order_by_has_nested_query_expressions(order_by: &OrderBy) -> bool {
-    match &order_by.kind {
-        sqlparser::ast::OrderByKind::Expressions(expressions) => expressions
-            .iter()
-            .any(order_by_expr_has_nested_query_expressions),
-        sqlparser::ast::OrderByKind::All(_) => false,
-    }
-}
-
-fn order_by_expr_has_nested_query_expressions(order_by_expr: &OrderByExpr) -> bool {
-    expr_has_nested_query_expressions(&order_by_expr.expr)
-        || order_by_expr.with_fill.as_ref().is_some_and(|with_fill| {
-            with_fill
-                .from
-                .as_ref()
-                .is_some_and(expr_has_nested_query_expressions)
-                || with_fill
-                    .to
-                    .as_ref()
-                    .is_some_and(expr_has_nested_query_expressions)
-                || with_fill
-                    .step
-                    .as_ref()
-                    .is_some_and(expr_has_nested_query_expressions)
-        })
-}
-
-fn expr_has_nested_query_expressions(expr: &Expr) -> bool {
+fn broad_nested_query_expr_has_typed_surface_relation(expr: &BroadNestedQueryExpr) -> bool {
     match expr {
-        Expr::Subquery(_) | Expr::Exists { .. } => true,
-        Expr::InSubquery { expr, subquery, .. } => {
-            expr_has_nested_query_expressions(expr) || query_has_nested_query_expressions(subquery)
+        BroadNestedQueryExpr::ScalarSubquery(query) => {
+            broad_public_read_query_has_typed_surface_relation(query)
         }
-        Expr::BinaryOp { left, right, .. }
-        | Expr::AnyOp { left, right, .. }
-        | Expr::AllOp { left, right, .. } => {
-            expr_has_nested_query_expressions(left) || expr_has_nested_query_expressions(right)
+        BroadNestedQueryExpr::Exists { subquery, .. } => {
+            broad_public_read_query_has_typed_surface_relation(subquery)
         }
-        Expr::UnaryOp { expr, .. }
-        | Expr::Nested(expr)
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::Cast { expr, .. } => expr_has_nested_query_expressions(expr),
-        Expr::InList { expr, list, .. } => {
-            expr_has_nested_query_expressions(expr)
-                || list.iter().any(expr_has_nested_query_expressions)
+        BroadNestedQueryExpr::InSubquery { expr, subquery, .. } => {
+            broad_sql_expr_has_typed_surface_relation(expr)
+                || broad_public_read_query_has_typed_surface_relation(subquery)
         }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            expr_has_nested_query_expressions(expr)
-                || expr_has_nested_query_expressions(low)
-                || expr_has_nested_query_expressions(high)
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            expr_has_nested_query_expressions(expr) || expr_has_nested_query_expressions(pattern)
-        }
-        Expr::InUnnest {
-            expr, array_expr, ..
-        } => {
-            expr_has_nested_query_expressions(expr) || expr_has_nested_query_expressions(array_expr)
-        }
-        Expr::Function(function) => match &function.args {
-            FunctionArguments::List(list) => list.args.iter().any(function_arg_has_nested_query),
-            _ => false,
-        },
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            operand
-                .as_ref()
-                .is_some_and(|expr| expr_has_nested_query_expressions(expr.as_ref()))
-                || conditions.iter().any(|condition| {
-                    expr_has_nested_query_expressions(&condition.condition)
-                        || expr_has_nested_query_expressions(&condition.result)
-                })
-                || else_result
-                    .as_ref()
-                    .is_some_and(|expr| expr_has_nested_query_expressions(expr.as_ref()))
-        }
-        Expr::Tuple(items) => items.iter().any(expr_has_nested_query_expressions),
-        _ => false,
-    }
-}
-
-fn function_arg_has_nested_query(arg: &FunctionArg) -> bool {
-    match arg {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
-            expr_has_nested_query_expressions(expr)
-        }
-        FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
-            matches!(arg, FunctionArgExpr::Expr(expr) if expr_has_nested_query_expressions(expr))
-        }
-        _ => false,
     }
 }
 
