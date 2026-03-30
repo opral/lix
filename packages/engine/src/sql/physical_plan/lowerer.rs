@@ -89,14 +89,6 @@ impl RenderRelationSubstitutionCollector {
 }
 
 mod broad;
-pub(crate) use broad::RenderedBroadPublicReadStatement;
-
-#[cfg(test)]
-pub(crate) fn rewrite_supported_public_read_surfaces_in_statement(
-    statement: &mut Statement,
-) -> Result<(), LixError> {
-    broad::rewrite_supported_public_read_surfaces_in_statement(statement, SqlDialect::Sqlite)
-}
 
 pub(crate) fn bind_broad_public_read_statement_with_registry(
     statement: &Statement,
@@ -121,17 +113,19 @@ pub(crate) fn broad_public_relation_supports_terminal_render(
     )
 }
 
-pub(crate) fn render_broad_public_read_statement_with_registry_and_active_version_id_and_layouts(
+pub(crate) fn lower_broad_public_read_for_execution_with_layouts(
     statement: &BroadPublicReadStatement,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
+    params_len: usize,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-) -> Result<RenderedBroadPublicReadStatement, LixError> {
-    broad::render_broad_public_read_statement_with_registry_and_active_version_id(
+) -> Result<Option<LoweredReadProgram>, LixError> {
+    broad::lower_broad_public_read_for_execution(
         statement,
         registry,
         dialect,
+        params_len,
         active_version_id,
         known_live_layouts,
     )
@@ -2662,11 +2656,14 @@ fn escape_sql_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        lower_read_for_execution_with_layouts, rewrite_supported_public_read_surfaces_in_statement,
+        bind_broad_public_read_statement_with_registry,
+        lower_broad_public_read_for_execution_with_layouts, lower_read_for_execution_with_layouts,
         LoweredReadProgram,
     };
     use crate::sql::binder::bind_statement;
     use crate::sql::catalog::SurfaceRegistry;
+    use crate::sql::logical_plan::public_ir::BroadPublicReadStatement;
+    use crate::sql::optimizer::optimize_broad_public_read_statement_with_known_live_layouts;
     use crate::sql::semantic_ir::canonicalize::canonicalize_read;
     use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
     use crate::sql::semantic_ir::semantics::effective_state_resolver::build_effective_state;
@@ -2704,6 +2701,43 @@ mod tests {
         .expect("lowering should succeed")
     }
 
+    fn bound_broad_statement(registry: &SurfaceRegistry, sql: &str) -> BroadPublicReadStatement {
+        let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
+        let statement = statements.pop().expect("single statement");
+        bind_broad_public_read_statement_with_registry(&statement, registry)
+            .expect("broad binding should succeed")
+            .expect("query should bind as broad public read")
+    }
+
+    fn lowered_broad_program(registry: &SurfaceRegistry, sql: &str) -> Option<LoweredReadProgram> {
+        lowered_broad_program_with_layouts(registry, sql, &BTreeMap::new())
+    }
+
+    fn lowered_broad_program_with_layouts(
+        registry: &SurfaceRegistry,
+        sql: &str,
+        known_live_layouts: &BTreeMap<String, JsonValue>,
+    ) -> Option<LoweredReadProgram> {
+        let broad_statement = bound_broad_statement(registry, sql);
+        let optimized = optimize_broad_public_read_statement_with_known_live_layouts(
+            &broad_statement,
+            registry,
+            SqlDialect::Sqlite,
+            Some("main"),
+            known_live_layouts,
+        )
+        .expect("broad optimization should succeed");
+        lower_broad_public_read_for_execution_with_layouts(
+            &optimized.broad_statement,
+            registry,
+            SqlDialect::Sqlite,
+            0,
+            Some("main"),
+            known_live_layouts,
+        )
+        .expect("broad lowering should succeed")
+    }
+
     #[test]
     fn lowers_builtin_entity_reads_through_state_surfaces() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
@@ -2733,32 +2767,38 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_joined_builtin_entity_surfaces_to_internal_queries() {
-        let mut statements = crate::sql::parser::parse_sql_script(
-            "SELECT COUNT(*) \
-             FROM lix_entity_label el \
-             JOIN lix_label l ON l.id = el.label_id \
-             WHERE el.entity_id = 'commit-1' \
-               AND el.schema_key = 'lix_commit' \
-               AND el.file_id = 'lix' \
-               AND l.name = 'checkpoint'",
+    fn broad_physical_lowering_requires_optimizer_lowered_relations() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let broad_statement = bound_broad_statement(
+            &registry,
+            "SELECT s.schema_key, COUNT(*) \
+             FROM lix_state s \
+             JOIN lix_state_by_version sv ON sv.entity_id = s.entity_id \
+             WHERE s.schema_key = 'lix_key_value' AND sv.lixcol_version_id = 'main' \
+             GROUP BY s.schema_key \
+             ORDER BY s.schema_key",
+        );
+
+        let lowered = lower_broad_public_read_for_execution_with_layouts(
+            &broad_statement,
+            &registry,
+            SqlDialect::Sqlite,
+            0,
+            Some("main"),
+            &BTreeMap::new(),
         )
-        .expect("SQL should parse");
-        let mut statement = statements.pop().expect("single statement");
+        .expect("broad lowering should not error");
 
-        rewrite_supported_public_read_surfaces_in_statement(&mut statement)
-            .expect("joined entity surfaces should rewrite");
-        let lowered_sql = statement.to_string();
-
-        assert!(lowered_sql.contains("FROM lix_entity_label"));
-        assert!(lowered_sql.contains("JOIN lix_label"));
-        assert!(!lowered_sql.contains("lix_internal_live_v1_lix_entity_label"));
-        assert!(!lowered_sql.contains("lix_internal_live_v1_lix_label"));
+        assert_eq!(
+            lowered, None,
+            "physical lowering should decline broad statements until optimizer marks renderable relations as lowered_public"
+        );
     }
 
     #[test]
-    fn rewrites_cte_and_joined_state_surfaces_to_internal_queries() {
-        let mut statements = crate::sql::parser::parse_sql_script(
+    fn lowers_optimized_cte_and_joined_state_surfaces_to_internal_queries() {
+        let lowered = lowered_broad_program(
+            &SurfaceRegistry::with_builtin_surfaces(),
             "WITH keyed AS ( \
                SELECT entity_id, schema_key \
                FROM lix_state_by_version \
@@ -2773,12 +2813,10 @@ mod tests {
              GROUP BY keyed.schema_key \
              ORDER BY keyed.schema_key",
         )
-        .expect("SQL should parse");
-        let mut statement = statements.pop().expect("single statement");
-
-        rewrite_supported_public_read_surfaces_in_statement(&mut statement)
-            .expect("cte and joined state surfaces should rewrite");
-        let lowered_sql = statement.to_string();
+        .expect("optimized broad state query should lower");
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
 
         assert!(!lowered_sql.contains("FROM lix_state "));
         assert!(!lowered_sql.contains("JOIN lix_state_by_version"));
@@ -2787,21 +2825,17 @@ mod tests {
     }
 
     #[test]
-    fn does_not_rewrite_cte_names_that_shadow_public_surfaces() {
-        let mut statements = crate::sql::parser::parse_sql_script(
+    fn cte_names_that_shadow_public_surfaces_do_not_lower_through_broad_physical_planning() {
+        let lowered = lowered_broad_program(
+            &SurfaceRegistry::with_builtin_surfaces(),
             "WITH lix_state AS (SELECT 'shadow' AS entity_id) \
              SELECT entity_id FROM lix_state",
-        )
-        .expect("SQL should parse");
-        let mut statement = statements.pop().expect("single statement");
+        );
 
-        rewrite_supported_public_read_surfaces_in_statement(&mut statement)
-            .expect("shadowing cte should remain untouched");
-        let lowered_sql = statement.to_string();
-
-        assert!(lowered_sql.contains("FROM lix_state"));
-        assert!(!lowered_sql.contains("lix_internal_live_v1_"));
-        assert!(!lowered_sql.contains("untracked = true"));
+        assert_eq!(
+            lowered, None,
+            "physical broad lowering should decline cte-shadowed names instead of rendering or reparsing shell SQL"
+        );
     }
 
     #[test]
@@ -2958,6 +2992,51 @@ mod tests {
         );
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_file_descriptor"));
         assert!(lowered_sql.contains("FROM (WITH RECURSIVE"));
+    }
+
+    #[test]
+    fn lowers_broad_working_changes_reads_with_nested_filesystem_subqueries() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let lowered = lowered_broad_program(
+            &registry,
+            "SELECT COUNT(*) \
+             FROM lix_working_changes wc \
+             WHERE wc.file_id IN (SELECT f.id FROM lix_file f WHERE f.path = '/hello.txt')",
+        )
+        .expect(
+            "optimized broad working changes read with nested filesystem subquery should lower",
+        );
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered broad statement should render");
+
+        assert!(
+            !lowered_sql.contains("FROM lix_file"),
+            "lowered broad sql still contains public lix_file: {lowered_sql}"
+        );
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_file_descriptor"));
+        assert!(lowered_sql.contains("FROM (WITH RECURSIVE"));
+    }
+
+    #[test]
+    fn lowers_broad_scalar_subqueries_without_top_level_surface_relations() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let lowered = lowered_broad_program(
+            &registry,
+            "SELECT \
+                (SELECT lixcol_change_id FROM lix_directory WHERE id = 'dir-stable-parent'), \
+                (SELECT lixcol_change_id FROM lix_directory WHERE id = 'dir-stable-child'), \
+                (SELECT lixcol_change_id FROM lix_file WHERE id = 'file-stable-child')",
+        )
+        .expect("optimized broad scalar subqueries over public surfaces should lower");
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered broad scalar subquery statement should render");
+
+        assert!(!lowered_sql.contains("FROM lix_directory"));
+        assert!(!lowered_sql.contains("FROM lix_file"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_directory_descriptor"));
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_file_descriptor"));
     }
 
     #[test]
