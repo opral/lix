@@ -1,5 +1,4 @@
-use crate::canonical::readers::load_committed_version_head_commit_id;
-use crate::engine::TransactionBackendAdapter;
+use crate::version::context::require_target_version_context_in_transaction;
 use crate::{errors, ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -34,10 +33,15 @@ async fn create_version_in_transaction(
     tx: &mut SessionTransaction<'_>,
     options: CreateVersionOptions,
 ) -> Result<CreateVersionResult, LixError> {
-    let SourceVersion {
-        version_id: parent_version_id,
-        commit_id: parent_commit_id,
-    } = load_create_version_source(tx, options.source_version_id.as_deref()).await?;
+    let source_context = require_target_version_context_in_transaction(
+        tx,
+        options.source_version_id.as_deref(),
+        "source_version_id",
+        "source version",
+    )
+    .await?;
+    let parent_version_id = source_context.version_id().to_string();
+    let parent_commit_id = source_context.head_commit_id().to_string();
 
     let id =
         normalize_optional_non_empty_text(options.id, "id")?.unwrap_or(generate_uuid(tx).await?);
@@ -69,64 +73,6 @@ async fn create_version_in_transaction(
         parent_version_id,
         parent_commit_id,
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SourceVersion {
-    version_id: String,
-    commit_id: String,
-}
-
-async fn load_create_version_source(
-    tx: &mut SessionTransaction<'_>,
-    source_version_id: Option<&str>,
-) -> Result<SourceVersion, LixError> {
-    match source_version_id {
-        Some(source_version_id) => load_explicit_source_version(tx, source_version_id).await,
-        None => load_active_source_version(tx).await,
-    }
-}
-
-async fn load_active_source_version(
-    tx: &mut SessionTransaction<'_>,
-) -> Result<SourceVersion, LixError> {
-    let version_id = tx.context.active_version_id.clone();
-    let commit_id = load_required_version_head_commit_id(tx, &version_id).await?;
-    Ok(SourceVersion {
-        version_id,
-        commit_id,
-    })
-}
-
-async fn load_explicit_source_version(
-    tx: &mut SessionTransaction<'_>,
-    source_version_id: &str,
-) -> Result<SourceVersion, LixError> {
-    let source_version_id = normalize_optional_non_empty_text(
-        Some(source_version_id.to_string()),
-        "source_version_id",
-    )?
-    .expect("source_version_id should remain present after normalization");
-    let commit_id = load_required_version_head_commit_id(tx, &source_version_id).await?;
-    Ok(SourceVersion {
-        version_id: source_version_id,
-        commit_id,
-    })
-}
-
-async fn load_required_version_head_commit_id(
-    tx: &mut SessionTransaction<'_>,
-    version_id: &str,
-) -> Result<String, LixError> {
-    let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
-    let Some(commit_id) = load_committed_version_head_commit_id(&mut executor, version_id).await?
-    else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("source version '{version_id}' does not exist"),
-        });
-    };
-    Ok(commit_id)
 }
 
 async fn generate_uuid(tx: &mut SessionTransaction<'_>) -> Result<String, LixError> {

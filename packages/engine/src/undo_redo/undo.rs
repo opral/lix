@@ -1,9 +1,9 @@
-use crate::canonical::append::{
-    append_tracked, CreateCommitArgs, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
-    CreateCommitPreconditions, CreateCommitWriteLane,
-};
-use crate::canonical::readers::load_committed_version_head_commit_id;
+use crate::canonical::append::{append_tracked, CreateCommitArgs};
 use crate::functions::LixFunctionProvider;
+use crate::version::context::{
+    exact_current_head_preconditions, require_version_context_with_executor, ResolvedVersionTarget,
+    VersionContextSource,
+};
 use crate::{LixError, Session, SessionTransaction};
 
 use super::store::insert_undo_redo_operation_in_transaction;
@@ -179,29 +179,30 @@ async fn undo_in_transaction(
         let mut functions = functions;
         let timestamp = functions.timestamp();
         let mut head_executor = crate::engine::TransactionBackendAdapter::new(transaction);
-        let current_head_commit_id =
-            load_committed_version_head_commit_id(&mut head_executor, &version_id)
-                .await?
-                .ok_or_else(|| {
-                    LixError::unknown(format!(
-                        "cannot undo in version '{}' without a current head commit",
-                        version_id
-                    ))
-                })?;
+        let version_context = require_version_context_with_executor(
+            &mut head_executor,
+            ResolvedVersionTarget {
+                version_id: version_id.clone(),
+                source: VersionContextSource::ExplicitArgument,
+            },
+            "version",
+        )
+        .await?;
         let create_result = append_tracked(
             transaction,
             CreateCommitArgs {
                 timestamp: Some(timestamp.clone()),
                 changes: inverse_changes,
                 filesystem_state: Default::default(),
-                preconditions: CreateCommitPreconditions {
-                    write_lane: CreateCommitWriteLane::Version(version_id.clone()),
-                    expected_head: CreateCommitExpectedHead::CurrentHead,
-                    idempotency_key: CreateCommitIdempotencyKey::Exact(format!(
+                preconditions: exact_current_head_preconditions(
+                    &version_context,
+                    format!(
                         "undo:{}:{}:{}",
-                        version_id, target_commit_id, current_head_commit_id
-                    )),
-                },
+                        version_id,
+                        target_commit_id,
+                        version_context.head_commit_id()
+                    ),
+                ),
                 active_account_ids: active_account_ids.clone(),
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,

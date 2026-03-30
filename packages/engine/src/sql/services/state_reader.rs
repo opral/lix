@@ -1,12 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::canonical::readers::{
-    load_committed_version_head_commit_id as load_canonical_committed_version_head_commit_id,
-    load_exact_committed_state_row_at_version_head,
-    load_version_ref_with_backend as load_canonical_version_ref_with_backend,
-};
+use crate::canonical::readers::load_exact_committed_state_row_at_version_head;
 pub(crate) use crate::canonical::readers::{
-    CommitQueryExecutor, ExactCommittedStateRow, ExactCommittedStateRowRequest, VersionRefRow,
+    CommitQueryExecutor, ExactCommittedStateRow, ExactCommittedStateRowRequest,
 };
 use crate::live_state::is_untracked_live_table;
 use crate::live_state::schema_access::{
@@ -131,14 +127,6 @@ impl From<UntrackedRow> for LiveReadRow {
     }
 }
 
-pub(crate) async fn load_committed_version_head_commit_id(
-    backend: &dyn LixBackend,
-    version_id: &str,
-) -> Result<Option<String>, LixError> {
-    let mut executor = backend;
-    load_canonical_committed_version_head_commit_id(&mut executor, version_id).await
-}
-
 pub(crate) async fn load_exact_committed_state_row(
     backend: &dyn LixBackend,
     request: &ExactCommittedStateRowRequest,
@@ -227,13 +215,6 @@ async fn overlay_workspace_writer_key_annotations_on_tracked_rows_with_executor(
     }
 
     Ok(rows)
-}
-
-pub(crate) async fn load_version_ref(
-    backend: &dyn LixBackend,
-    version_id: &str,
-) -> Result<Option<VersionRefRow>, LixError> {
-    load_canonical_version_ref_with_backend(backend, version_id).await
 }
 
 pub(crate) async fn load_exact_tombstone(

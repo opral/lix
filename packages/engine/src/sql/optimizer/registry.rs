@@ -49,7 +49,8 @@ pub(crate) struct OptimizerPassTrace {
     pub(crate) description: &'static str,
     pub(crate) enabled: bool,
     pub(crate) changed: bool,
-    pub(crate) duration_us: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) duration_us: Option<u64>,
     pub(crate) diagnostics: Vec<String>,
 }
 
@@ -98,7 +99,7 @@ fn skipped_trace(metadata: OptimizerPassMetadata) -> OptimizerPassTrace {
         description: metadata.description,
         enabled: false,
         changed: false,
-        duration_us: 0,
+        duration_us: None,
         diagnostics: vec!["pass disabled".to_string()],
     }
 }
@@ -114,7 +115,7 @@ fn trace_from_outcome(
         description: metadata.description,
         enabled: true,
         changed: outcome.changed,
-        duration_us: duration_us.min(u128::from(u64::MAX)) as u64,
+        duration_us: Some(duration_us.min(u128::from(u64::MAX)) as u64),
         diagnostics: outcome.diagnostics,
     }
 }
@@ -142,6 +143,7 @@ mod tests {
 
         assert!(!trace.enabled);
         assert!(!trace.changed);
+        assert_eq!(trace.duration_us, None);
         assert_eq!(trace.diagnostics, vec!["pass disabled".to_string()]);
     }
 }

@@ -7,6 +7,7 @@ use crate::init::seed::{
 };
 use crate::live_state::schema_access::tracked_relation_name;
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;
+use crate::version::context::require_target_version_context_in_transaction;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -28,9 +29,23 @@ pub(crate) async fn create_checkpoint_in_session(
 async fn create_checkpoint_in_transaction(
     tx: &mut SessionTransaction<'_>,
 ) -> Result<CreateCheckpointResult, LixError> {
-    let version_id = tx.context.active_version_id.clone();
-    let local_commit_id = load_version_commit_id(tx, &version_id).await?;
-    let global_commit_id = load_global_version_commit_id(tx).await?;
+    let active_context = require_target_version_context_in_transaction(
+        tx,
+        None,
+        "active_version_id",
+        "active version",
+    )
+    .await?;
+    let global_context = require_target_version_context_in_transaction(
+        tx,
+        Some(crate::version::GLOBAL_VERSION_ID),
+        "version_id",
+        "global version",
+    )
+    .await?;
+    let version_id = active_context.version_id().to_string();
+    let local_commit_id = active_context.head_commit_id().to_string();
+    let global_commit_id = global_context.head_commit_id().to_string();
 
     let commit = load_commit(tx, &local_commit_id)
         .await?
@@ -87,41 +102,6 @@ async fn load_commit(
     Ok(Some(CommitRow {
         change_set_id: commit.change_set_id.unwrap_or_default(),
     }))
-}
-
-async fn load_global_version_commit_id(
-    tx: &mut SessionTransaction<'_>,
-) -> Result<String, LixError> {
-    let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
-    let Some(commit_id) = crate::canonical::refs::load_committed_version_head_commit_id(
-        &mut executor,
-        crate::version::GLOBAL_VERSION_ID,
-    )
-    .await?
-    else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "hidden global version ref row is missing".to_string(),
-        });
-    };
-    Ok(commit_id)
-}
-
-async fn load_version_commit_id(
-    tx: &mut SessionTransaction<'_>,
-    version_id: &str,
-) -> Result<String, LixError> {
-    let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
-    let Some(commit_id) =
-        crate::canonical::refs::load_committed_version_head_commit_id(&mut executor, version_id)
-            .await?
-    else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("version '{version_id}' is missing"),
-        });
-    };
-    Ok(commit_id)
 }
 
 async fn ensure_checkpoint_label_on_commit(
