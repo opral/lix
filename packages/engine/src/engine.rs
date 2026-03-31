@@ -1,58 +1,34 @@
-use crate::cel::CelEvaluator;
 use crate::contracts::artifacts::{FilesystemPayloadDomainChange, MutationRow};
-use crate::contracts::surface::SurfaceRegistry;
-use crate::deterministic_mode::{
-    deterministic_mode_key, DeterministicSettings, RuntimeFunctionProvider,
-};
+use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::functions::SharedFunctionProvider;
-use crate::key_value::key_value_schema_key;
-use crate::plugin::types::InstalledPlugin;
-use crate::runtime::{RuntimeHost, SchemaCache};
-use crate::state::stream::{
-    StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
-};
+use crate::runtime::Runtime;
+use crate::state::stream::{StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter};
 use crate::WasmRuntime;
-use crate::{LixBackend, LixBackendTransaction, LixError, TransactionMode};
+use crate::{LixBackend, LixBackendTransaction, LixError};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::RwLock;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
-pub(crate) const INIT_STATE_NOT_STARTED: u8 = 0;
-pub(crate) const INIT_STATE_IN_PROGRESS: u8 = 1;
-pub(crate) const INIT_STATE_COMPLETED: u8 = 2;
 
 pub struct Engine {
-    pub(crate) backend: Arc<dyn LixBackend + Send + Sync>,
-    wasm_runtime: Arc<dyn WasmRuntime>,
-    pub(crate) cel_evaluator: CelEvaluator,
-    pub(crate) schema_cache: SchemaCache,
+    runtime: Arc<Runtime>,
     boot_key_values: Vec<BootKeyValue>,
     boot_active_account: Option<BootAccount>,
-    boot_deterministic_settings: Option<DeterministicSettings>,
-    deterministic_boot_pending: AtomicBool,
-    deterministic_settings_cache: RwLock<Option<DeterministicSettings>>,
-    init_state: AtomicU8,
-    /// When true, the backend connection has an active transaction started by
-    /// the init path. `begin_write_unit()` uses savepoints instead of BEGIN.
-    in_init_transaction: AtomicBool,
-    savepoint_counter: AtomicU64,
-    // Shared repo/process-scoped caches and buses. Session-local snapshots and
-    // observe handles live under `session/*`.
-    public_surface_registry: RwLock<SurfaceRegistry>,
-    access_to_internal: bool,
-    installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
-    plugin_component_cache: Mutex<BTreeMap<String, crate::plugin::runtime::CachedPluginComponent>>,
-    state_commit_stream_bus: Arc<StateCommitStreamBus>,
 }
 
 impl Engine {
+    pub(crate) fn runtime(&self) -> &Arc<Runtime> {
+        &self.runtime
+    }
+
+    pub(crate) fn backend(&self) -> &Arc<dyn LixBackend + Send + Sync> {
+        self.runtime.backend()
+    }
+
     pub async fn open_workspace_session(self: &Arc<Self>) -> Result<crate::Session, LixError> {
         crate::Session::open_workspace(Arc::clone(self)).await
     }
@@ -66,41 +42,19 @@ impl Engine {
     }
 
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
-        self.wasm_runtime.clone()
+        self.runtime.wasm_runtime()
     }
 
     pub fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {
-        self.state_commit_stream_bus.subscribe(filter)
-    }
-
-    pub(crate) fn access_to_internal(&self) -> bool {
-        self.access_to_internal
+        self.runtime.state_commit_stream(filter)
     }
 
     pub(crate) fn wasm_runtime_ref(&self) -> &dyn WasmRuntime {
-        self.wasm_runtime.as_ref()
+        self.runtime.wasm_runtime_ref()
     }
 
     pub(crate) fn deterministic_boot_pending(&self) -> bool {
-        self.deterministic_boot_pending.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn boot_deterministic_settings(&self) -> Option<DeterministicSettings> {
-        self.boot_deterministic_settings
-    }
-
-    pub(crate) fn cached_deterministic_settings(&self) -> Option<DeterministicSettings> {
-        *self
-            .deterministic_settings_cache
-            .read()
-            .expect("deterministic settings cache lock poisoned")
-    }
-
-    pub(crate) fn cache_deterministic_settings(&self, settings: DeterministicSettings) {
-        *self
-            .deterministic_settings_cache
-            .write()
-            .expect("deterministic settings cache lock poisoned") = Some(settings);
+        self.runtime.deterministic_boot_pending()
     }
 
     pub(crate) fn boot_key_values(&self) -> &[BootKeyValue] {
@@ -111,82 +65,28 @@ impl Engine {
         self.boot_active_account.as_ref()
     }
 
-    pub(crate) fn public_surface_registry(&self) -> SurfaceRegistry {
-        self.public_surface_registry
-            .read()
-            .expect("public surface registry lock poisoned")
-            .clone()
+    pub(crate) fn public_surface_registry(&self) -> crate::contracts::surface::SurfaceRegistry {
+        self.runtime.public_surface_registry()
     }
 
     pub(crate) async fn refresh_public_surface_registry(&self) -> Result<(), LixError> {
-        let registry = SurfaceRegistry::bootstrap_with_backend(self.backend.as_ref()).await?;
-        let mut guard = self
-            .public_surface_registry
-            .write()
-            .expect("public surface registry lock poisoned");
-        *guard = registry;
-        Ok(())
+        self.runtime.refresh_public_surface_registry().await
     }
 
     pub(crate) fn try_mark_init_in_progress(&self) -> Result<(), LixError> {
-        self.init_state
-            .compare_exchange(
-                INIT_STATE_NOT_STARTED,
-                INIT_STATE_IN_PROGRESS,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .map(|_| ())
-            .map_err(|_| crate::errors::already_initialized_error())
+        self.runtime.try_mark_init_in_progress()
     }
 
     pub(crate) fn clear_deterministic_boot_pending(&self) {
-        self.deterministic_boot_pending
-            .store(false, Ordering::SeqCst);
-    }
-
-    pub(crate) fn invalidate_deterministic_settings_cache(&self) {
-        *self
-            .deterministic_settings_cache
-            .write()
-            .expect("deterministic settings cache lock poisoned") = None;
+        self.runtime.clear_deterministic_boot_pending();
     }
 
     pub(crate) fn mark_init_completed(&self) {
-        self.init_state
-            .store(INIT_STATE_COMPLETED, Ordering::SeqCst);
+        self.runtime.mark_init_completed();
     }
 
     pub(crate) fn reset_init_state(&self) {
-        self.init_state
-            .store(INIT_STATE_NOT_STARTED, Ordering::SeqCst);
-    }
-
-    /// Begin an isolated unit of work on the backend.
-    ///
-    /// During normal operation, this starts a real transaction (`BEGIN IMMEDIATE`).
-    /// During init (when an outer transaction is active on the connection),
-    /// this uses a savepoint instead to avoid nested `BEGIN` errors.
-    pub(crate) async fn begin_write_unit(
-        &self,
-    ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, crate::LixError> {
-        if self.in_init_transaction.load(Ordering::SeqCst) {
-            let id = self.savepoint_counter.fetch_add(1, Ordering::SeqCst);
-            self.backend.begin_savepoint(&format!("sp_{id}")).await
-        } else {
-            self.backend.begin_transaction(TransactionMode::Write).await
-        }
-    }
-
-    pub(crate) async fn begin_read_unit(
-        &self,
-        mode: TransactionMode,
-    ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, crate::LixError> {
-        self.backend.begin_transaction(mode).await
-    }
-
-    pub(crate) fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
-        self.state_commit_stream_bus.emit(changes);
+        self.runtime.reset_init_state();
     }
 
     pub(crate) fn should_invalidate_deterministic_settings_cache(
@@ -194,26 +94,48 @@ impl Engine {
         mutations: &[MutationRow],
         state_commit_stream_changes: &[StateCommitStreamChange],
     ) -> bool {
-        mutations.iter().any(|row| {
-            row.schema_key == key_value_schema_key() && row.entity_id == deterministic_mode_key()
-        }) || state_commit_stream_changes.iter().any(|change| {
-            change.schema_key == key_value_schema_key()
-                && change.entity_id == deterministic_mode_key()
-        })
+        self.runtime
+            .should_invalidate_deterministic_settings_cache(mutations, state_commit_stream_changes)
     }
 
     pub(crate) fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
-        let mut guard = self.installed_plugins_cache.write().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "installed plugin cache lock poisoned".to_string(),
-        })?;
-        *guard = None;
-        let mut component_guard = self.plugin_component_cache.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "plugin component cache lock poisoned".to_string(),
-        })?;
-        component_guard.clear();
-        Ok(())
+        self.runtime.invalidate_installed_plugins_cache()
+    }
+
+    pub(crate) async fn prepare_runtime_functions_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+    ) -> Result<
+        (
+            DeterministicSettings,
+            SharedFunctionProvider<RuntimeFunctionProvider>,
+        ),
+        LixError,
+    > {
+        self.runtime
+            .prepare_runtime_functions_with_backend(backend)
+            .await
+    }
+
+    pub(crate) async fn ensure_runtime_sequence_initialized_in_transaction(
+        &self,
+        transaction: &mut dyn LixBackendTransaction,
+        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
+    ) -> Result<(), LixError> {
+        self.runtime
+            .ensure_runtime_sequence_initialized_in_transaction(transaction, functions)
+            .await
+    }
+
+    pub(crate) async fn persist_runtime_sequence_in_transaction(
+        &self,
+        transaction: &mut dyn LixBackendTransaction,
+        settings: DeterministicSettings,
+        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
+    ) -> Result<(), LixError> {
+        self.runtime
+            .persist_runtime_sequence_in_transaction(transaction, settings, functions)
+            .await
     }
 }
 
@@ -330,25 +252,15 @@ impl Engine {
         args: BootArgs,
         boot_deterministic_settings: Option<DeterministicSettings>,
     ) -> Self {
-        let deterministic_boot_pending = boot_deterministic_settings.is_some();
         Self {
-            backend: Arc::from(args.backend),
-            wasm_runtime: args.wasm_runtime,
-            cel_evaluator: CelEvaluator::new(),
-            schema_cache: SchemaCache::new(),
+            runtime: Arc::new(Runtime::new(
+                args.backend,
+                args.wasm_runtime,
+                args.access_to_internal,
+                boot_deterministic_settings,
+            )),
             boot_key_values: args.key_values,
             boot_active_account: args.active_account,
-            boot_deterministic_settings,
-            deterministic_boot_pending: AtomicBool::new(deterministic_boot_pending),
-            deterministic_settings_cache: RwLock::new(boot_deterministic_settings),
-            init_state: AtomicU8::new(INIT_STATE_NOT_STARTED),
-            in_init_transaction: AtomicBool::new(false),
-            savepoint_counter: AtomicU64::new(0),
-            public_surface_registry: RwLock::new(SurfaceRegistry::with_builtin_surfaces()),
-            access_to_internal: args.access_to_internal,
-            installed_plugins_cache: RwLock::new(None),
-            plugin_component_cache: Mutex::new(BTreeMap::new()),
-            state_commit_stream_bus: Arc::new(StateCommitStreamBus::default()),
         }
     }
 }
@@ -421,49 +333,6 @@ pub(crate) fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, Lix
         })?;
 
     Ok(format!("{schema_key}~{schema_version}"))
-}
-
-#[async_trait::async_trait(?Send)]
-impl RuntimeHost for Engine {
-    fn cel_evaluator(&self) -> &CelEvaluator {
-        &self.cel_evaluator
-    }
-
-    fn schema_cache(&self) -> &SchemaCache {
-        &self.schema_cache
-    }
-
-    async fn prepare_runtime_functions_with_backend(
-        &self,
-        backend: &dyn LixBackend,
-    ) -> Result<
-        (
-            DeterministicSettings,
-            SharedFunctionProvider<RuntimeFunctionProvider>,
-        ),
-        LixError,
-    > {
-        Engine::prepare_runtime_functions_with_backend(self, backend).await
-    }
-
-    async fn ensure_runtime_sequence_initialized_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
-    ) -> Result<(), LixError> {
-        Engine::ensure_runtime_sequence_initialized_in_transaction(self, transaction, functions)
-            .await
-    }
-
-    async fn persist_runtime_sequence_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        settings: DeterministicSettings,
-        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
-    ) -> Result<(), LixError> {
-        Engine::persist_runtime_sequence_in_transaction(self, transaction, settings, functions)
-            .await
-    }
 }
 
 #[cfg(test)]
@@ -679,7 +548,8 @@ mod tests {
 
         {
             let mut cache = engine
-                .installed_plugins_cache
+                .runtime()
+                .installed_plugins_cache()
                 .write()
                 .expect("installed plugins cache lock");
             *cache = Some(Vec::new());
@@ -694,7 +564,8 @@ mod tests {
 
         assert!(
             engine
-                .installed_plugins_cache
+                .runtime()
+                .installed_plugins_cache()
                 .read()
                 .expect("installed plugins cache lock")
                 .is_some(),
@@ -706,7 +577,8 @@ mod tests {
         assert!(!rollback_called.load(Ordering::SeqCst));
         assert!(
             engine
-                .installed_plugins_cache
+                .runtime()
+                .installed_plugins_cache()
                 .read()
                 .expect("installed plugins cache lock")
                 .is_none(),
@@ -730,7 +602,8 @@ mod tests {
 
         {
             let mut cache = engine
-                .installed_plugins_cache
+                .runtime()
+                .installed_plugins_cache()
                 .write()
                 .expect("installed plugins cache lock");
             *cache = Some(Vec::new());
@@ -748,7 +621,8 @@ mod tests {
         assert!(rollback_called.load(Ordering::SeqCst));
         assert!(
             engine
-                .installed_plugins_cache
+                .runtime()
+                .installed_plugins_cache()
                 .read()
                 .expect("installed plugins cache lock")
                 .is_some(),

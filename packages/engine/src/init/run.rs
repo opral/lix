@@ -28,13 +28,13 @@ use super::InitExecutor;
 pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
     engine.try_mark_init_in_progress()?;
 
-    if load_mode_with_backend(engine.backend.as_ref()).await? != LiveStateMode::Uninitialized {
+    if load_mode_with_backend(engine.backend().as_ref()).await? != LiveStateMode::Uninitialized {
         engine.reset_init_state();
         return Err(crate::errors::already_initialized_error());
     }
 
     let mut transaction = engine
-        .backend
+        .backend()
         .begin_transaction(TransactionMode::Write)
         .await?;
     let mut claimed_bootstrap = false;
@@ -195,7 +195,7 @@ impl Engine {
     }
 
     async fn backend_has_been_initialized(&self) -> Result<bool, LixError> {
-        Ok(load_mode_with_backend(self.backend.as_ref()).await? != LiveStateMode::Uninitialized)
+        Ok(load_mode_with_backend(self.backend().as_ref()).await? != LiveStateMode::Uninitialized)
     }
 
     async fn normalize_init_error(&self, error: LixError) -> LixError {
@@ -216,7 +216,7 @@ impl Engine {
         const DELAY_MS: u64 = 50;
 
         for attempt in 0..ATTEMPTS {
-            match load_mode_with_backend(self.backend.as_ref()).await? {
+            match load_mode_with_backend(self.backend().as_ref()).await? {
                 LiveStateMode::Ready => return Ok(()),
                 LiveStateMode::Bootstrapping => {
                     if attempt + 1 == ATTEMPTS {

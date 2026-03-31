@@ -91,7 +91,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let runtime_state = self.ensure_runtime_state().await?;
         runtime_state
             .ensure_sequence_initialized_in_transaction(
-                self.engine,
+                self.engine.runtime().as_ref(),
                 self.write_transaction.backend_transaction_mut(),
             )
             .await?;
@@ -102,7 +102,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let runtime_state = self.ensure_runtime_state().await?;
         runtime_state
             .ensure_sequence_initialized_in_transaction(
-                self.engine,
+                self.engine.runtime().as_ref(),
                 self.write_transaction.backend_transaction_mut(),
             )
             .await?;
@@ -115,7 +115,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         };
         runtime_state
             .flush_in_transaction(
-                self.engine,
+                self.engine.runtime().as_ref(),
                 self.write_transaction.backend_transaction_mut(),
             )
             .await
@@ -127,7 +127,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         }
         let backend =
             TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
-        let runtime_state = ExecutionRuntimeState::prepare(self.engine, &backend).await?;
+        let runtime_state =
+            ExecutionRuntimeState::prepare(self.engine.runtime().as_ref(), &backend).await?;
         self.context
             .set_execution_runtime_state(runtime_state.clone());
         Ok(runtime_state)

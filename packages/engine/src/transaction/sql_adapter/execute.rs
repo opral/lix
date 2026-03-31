@@ -140,7 +140,7 @@ async fn ensure_execution_runtime_state_for_write_scope(
         return Ok(());
     }
     let backend = TransactionBackendAdapter::new(transaction);
-    let runtime_state = ExecutionRuntimeState::prepare(engine, &backend).await?;
+    let runtime_state = ExecutionRuntimeState::prepare(engine.runtime().as_ref(), &backend).await?;
     context.set_execution_runtime_state(runtime_state);
     Ok(())
 }

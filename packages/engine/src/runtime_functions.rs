@@ -4,11 +4,11 @@ use crate::deterministic_mode::{
     build_persist_sequence_highest_batch, load_runtime_sequence_start_in_transaction,
     load_runtime_settings, DeterministicSettings, RuntimeFunctionProvider,
 };
-use crate::engine::Engine;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::runtime::Runtime;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 
-impl Engine {
+impl Runtime {
     pub(crate) async fn prepare_runtime_functions_with_backend(
         &self,
         backend: &dyn LixBackend,
@@ -132,7 +132,8 @@ mod tests {
         let engine = boot(BootArgs::new(Box::new(backend), Arc::new(NoopWasmRuntime)));
 
         let (settings, _) = engine
-            .prepare_runtime_functions_with_backend(engine.backend.as_ref())
+            .runtime()
+            .prepare_runtime_functions_with_backend(engine.backend().as_ref())
             .await
             .expect("first runtime preparation should succeed");
         assert!(!settings.enabled);
@@ -143,7 +144,8 @@ mod tests {
         );
 
         let (_settings, _) = engine
-            .prepare_runtime_functions_with_backend(engine.backend.as_ref())
+            .runtime()
+            .prepare_runtime_functions_with_backend(engine.backend().as_ref())
             .await
             .expect("second runtime preparation should succeed");
         assert_eq!(
@@ -152,10 +154,11 @@ mod tests {
             "disabled deterministic settings should be served from cache"
         );
 
-        engine.invalidate_deterministic_settings_cache();
+        engine.runtime().invalidate_deterministic_settings_cache();
 
         let (_settings, _) = engine
-            .prepare_runtime_functions_with_backend(engine.backend.as_ref())
+            .runtime()
+            .prepare_runtime_functions_with_backend(engine.backend().as_ref())
             .await
             .expect("runtime preparation after invalidation should succeed");
         assert_eq!(
