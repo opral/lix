@@ -7,9 +7,10 @@ use crate::commit::{
     CreateCommitError, CreateCommitErrorKind, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
     CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
 };
-use crate::engine::{Engine, TransactionBackendAdapter};
+use crate::engine::Engine;
 use crate::functions::LixFunctionProvider;
-use crate::sql::semantic_ir::validation::{validate_commit_time_write, SchemaCache};
+use crate::runtime::{SchemaCache, TransactionBackendAdapter};
+use crate::sql::semantic_ir::validation::validate_commit_time_write;
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
 use super::{

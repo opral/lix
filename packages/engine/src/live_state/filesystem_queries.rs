@@ -6,7 +6,7 @@ use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, Pendi
 use crate::filesystem::path::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
 use crate::filesystem::runtime::FilesystemTransactionFileState;
 use crate::live_state::schema_access::tracked_relation_name;
-use crate::sql::common::text::escape_sql_string;
+use crate::text::escape_sql_string;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, SqlDialect, Value};
 use serde_json::Value as JsonValue;

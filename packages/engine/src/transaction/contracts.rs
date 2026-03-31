@@ -1,7 +1,7 @@
+use crate::contracts::session::SessionStateDelta;
 use crate::live_state::{
     TrackedWriteOperation, TrackedWriteRow, UntrackedWriteOperation, UntrackedWriteRow,
 };
-use crate::session::contracts::SessionStateDelta;
 use crate::state::stream::StateCommitStreamChange;
 use crate::LixError;
 

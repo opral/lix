@@ -4,7 +4,7 @@ use serde_json::Value as JsonValue;
 use sqlparser::ast::{Expr, Statement};
 
 use crate::backend::prepared::PreparedStatement;
-use crate::session::contracts::SessionStateDelta;
+use crate::contracts::session::SessionStateDelta;
 use crate::state::stream::StateCommitStreamChange;
 use crate::{LixError, Value};
 

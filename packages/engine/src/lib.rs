@@ -25,12 +25,15 @@ mod plugin;
 mod read;
 pub(crate) mod refs;
 mod replay_cursor;
+mod runtime;
+mod runtime_functions;
 mod schema;
 pub mod session;
 pub(crate) mod sql;
 pub(crate) mod state;
 #[cfg(test)]
 mod test_support;
+mod text;
 pub mod transaction;
 mod types;
 mod undo_redo;
@@ -54,9 +57,10 @@ pub use backend::TransactionMode;
 pub use canonical_json::CanonicalJson;
 pub use checkpoint::CreateCheckpointResult;
 pub use committed_frontier::CommittedVersionFrontier;
+pub use contracts::session::ExecuteOptions;
 #[doc(hidden)]
 pub use engine::{boot, BootArgs};
-pub use engine::{BootAccount, BootKeyValue, Engine, ExecuteOptions};
+pub use engine::{BootAccount, BootKeyValue, Engine};
 pub use errors::LixError;
 pub use identity::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,

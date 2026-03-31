@@ -415,7 +415,7 @@ pub(crate) async fn load_live_read_contract_for_table_name(
 pub(crate) fn build_effective_public_read_source_sql(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
-    effective_state_request: &crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStateRequest,
+    effective_state_request: &crate::contracts::read::EffectiveStateRequest,
     surface_binding: &crate::contracts::surface::SurfaceBinding,
     pushdown_predicates: &[sqlparser::ast::Expr],
     known_live_layouts: &BTreeMap<String, JsonValue>,

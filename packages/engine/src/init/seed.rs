@@ -1,5 +1,7 @@
-use crate::engine::{Engine, ExecuteOptions, TransactionBackendAdapter};
+use crate::contracts::session::ExecuteOptions;
+use crate::engine::Engine;
 use crate::refs::load_committed_version_head_commit_id;
+use crate::runtime::TransactionBackendAdapter;
 use crate::sql::executor::execution_program::{ExecutionContext, SessionExecutionRuntime};
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::sql::parser::parse_sql;

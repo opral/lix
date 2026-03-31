@@ -1,3 +1,1 @@
-pub(crate) fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
-}
+pub(crate) use crate::text::escape_sql_string;

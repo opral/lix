@@ -4,8 +4,8 @@ use crate::commit::{
     CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitPreconditions,
     CreateCommitWriteLane,
 };
-use crate::engine::TransactionBackendAdapter;
 use crate::refs::load_committed_version_ref_with_executor;
+use crate::runtime::TransactionBackendAdapter;
 use crate::workspace::require_workspace_active_version_id;
 use crate::{LixError, SessionTransaction};
 

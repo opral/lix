@@ -1,17 +1,13 @@
 use crate::contracts::artifacts::ResultContract;
-use crate::engine::{
-    normalize_sql_execution_error_with_backend, Engine, TransactionBackendAdapter,
-};
-use crate::read::contracts::committed_read_mode_from_prepared_public_read;
-use crate::session::contracts::SessionExecutionMode;
-use crate::sql::executor::execute_prepared::execute_prepared_with_transaction;
-use crate::sql::executor::execution_program::{
-    BoundStatementTemplateInstance, ExecutionContext, ExecutionProgram,
-};
-use crate::sql::executor::runtime_state::ExecutionRuntimeState;
-use crate::sql::executor::{
+use crate::contracts::read::{
     compile_execution_from_template_instance_with_backend, execute_prepared_public_read,
-    CompiledExecution, PreparationPolicy,
+    execute_prepared_with_transaction, BoundStatementTemplateInstance, CompiledExecution,
+    ExecutionContext, ExecutionProgram, ExecutionRuntimeState, PreparationPolicy,
+};
+use crate::contracts::session::SessionExecutionMode;
+use crate::read::contracts::committed_read_mode_from_prepared_public_read;
+use crate::runtime::{
+    normalize_sql_execution_error_with_backend, RuntimeHost, TransactionBackendAdapter,
 };
 use crate::{
     ExecuteResult, LixBackend, LixBackendTransaction, LixError, QueryResult, TransactionMode,
@@ -31,7 +27,8 @@ struct PreparedCommittedReadStep {
 }
 
 pub(crate) async fn prepare_committed_read_program(
-    engine: &Engine,
+    runtime_host: &dyn RuntimeHost,
+    backend: &dyn LixBackend,
     program: &ExecutionProgram,
     allow_internal_tables: bool,
     context: &ExecutionContext,
@@ -51,8 +48,8 @@ pub(crate) async fn prepare_committed_read_program(
     for step in program.steps() {
         let compiled = if precompile_steps {
             let compiled = compile_bound_statement_template_instance_for_committed_read(
-                engine,
-                engine.backend.as_ref(),
+                runtime_host,
+                backend,
                 step,
                 allow_internal_tables,
                 context,
@@ -82,7 +79,7 @@ pub(crate) async fn prepare_committed_read_program(
 }
 
 async fn compile_bound_statement_template_instance_for_committed_read(
-    engine: &Engine,
+    runtime_host: &dyn RuntimeHost,
     backend: &dyn LixBackend,
     bound_statement_template: &BoundStatementTemplateInstance,
     allow_internal_tables: bool,
@@ -91,7 +88,7 @@ async fn compile_bound_statement_template_instance_for_committed_read(
 ) -> Result<CompiledExecution, LixError> {
     let parsed_statements = std::slice::from_ref(bound_statement_template.statement());
     match compile_execution_from_template_instance_with_backend(
-        engine,
+        runtime_host,
         backend,
         None,
         bound_statement_template,
@@ -185,7 +182,7 @@ fn public_result_from_contract(
 }
 
 pub(crate) async fn execute_execution_program_in_committed_read_transaction(
-    engine: &Engine,
+    runtime_host: &dyn RuntimeHost,
     transaction: &mut dyn LixBackendTransaction,
     prepared: &PreparedCommittedReadProgram,
     allow_internal_tables: bool,
@@ -202,14 +199,14 @@ pub(crate) async fn execute_execution_program_in_committed_read_transaction(
             );
             if runtime_state.settings().enabled && transaction.mode() == TransactionMode::Write {
                 runtime_state
-                    .ensure_sequence_initialized_in_transaction(engine, transaction)
+                    .ensure_sequence_initialized_in_transaction(runtime_host, transaction)
                     .await?;
             }
 
             let backend = TransactionBackendAdapter::new(transaction);
             Some(
                 compile_bound_statement_template_instance_for_committed_read(
-                    engine,
+                    runtime_host,
                     &backend,
                     &step.bound_statement_template,
                     allow_internal_tables,
@@ -239,7 +236,7 @@ pub(crate) async fn execute_execution_program_in_committed_read_transaction(
     context
         .execution_runtime_state()
         .expect("committed execution should retain its runtime state until flush")
-        .flush_in_transaction(engine, transaction)
+        .flush_in_transaction(runtime_host, transaction)
         .await?;
 
     Ok(ExecuteResult {

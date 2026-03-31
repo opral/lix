@@ -36,7 +36,7 @@ pub(crate) async fn execute_planned_write_delta(
                 run_internal_write_txn_with_transaction(engine, transaction, internal).await?
             }
             PlannedWriteUnit::WorkspaceWriterKey(workspace_writer_key) => {
-                let mut backend = crate::engine::TransactionBackendAdapter::new(transaction);
+                let mut backend = crate::runtime::TransactionBackendAdapter::new(transaction);
                 crate::workspace::writer_key::apply_workspace_writer_key_annotations_with_executor(
                     &mut backend,
                     &workspace_writer_key.annotations,

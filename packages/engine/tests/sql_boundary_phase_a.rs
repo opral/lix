@@ -17,7 +17,7 @@ const EXPECTED_COMPILER_CORE_COUNTS: &[(&str, usize)] = &[
     ("canonical_read", 1),
     ("refs", 0),
     ("version", 5),
-    ("live_state_root", 3),
+    ("live_state_root", 0),
     ("workspace_writer_key", 1),
     ("filesystem_debt", 10),
     ("live_state_concrete_contract_debt", 0),

@@ -14,7 +14,6 @@ pub(crate) mod execution_program;
 pub(crate) mod intent;
 pub(crate) mod preprocess;
 mod public_runtime;
-pub(crate) mod runtime_functions;
 pub(crate) mod runtime_state;
 
 pub(crate) use compile::{

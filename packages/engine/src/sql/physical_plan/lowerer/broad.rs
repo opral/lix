@@ -1,4 +1,5 @@
 use super::*;
+use crate::contracts::live::build_working_changes_public_read_source_sql;
 use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadAlias, BroadPublicReadDistinct, BroadPublicReadGroupBy,
@@ -2687,12 +2688,10 @@ fn build_public_change_surface_sql(
         let Some(active_version_id) = active_version_id else {
             return Ok(None);
         };
-        return Ok(Some(
-            crate::live_state::build_working_changes_public_read_source_sql(
-                dialect,
-                active_version_id,
-            ),
-        ));
+        return Ok(Some(build_working_changes_public_read_source_sql(
+            dialect,
+            active_version_id,
+        )));
     }
     if CanonicalChangeScan::from_surface_binding(surface_binding.clone()).is_some() {
         return Ok(Some(build_change_source_sql()));

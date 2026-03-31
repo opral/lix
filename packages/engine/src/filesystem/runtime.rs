@@ -1,9 +1,10 @@
 use crate::backend::program::WriteProgram;
 use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::contracts::artifacts::{FilesystemPayloadDomainChange, MutationRow, OptionalTextPatch};
-use crate::engine::{dedupe_filesystem_payload_domain_changes, Engine, TransactionBackendAdapter};
+use crate::engine::{dedupe_filesystem_payload_domain_changes, Engine};
 use crate::filesystem::live_projection::FilesystemProjectionScope;
 use crate::filesystem::queries::load_file_row_by_id_without_path;
+use crate::runtime::TransactionBackendAdapter;
 use crate::sql::storage::queries::{
     filesystem as filesystem_queries, history as history_queries, state as state_queries,
 };

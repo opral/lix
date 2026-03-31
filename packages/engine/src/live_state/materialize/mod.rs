@@ -23,8 +23,8 @@ pub use types::{
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 
-use crate::engine::TransactionBackendAdapter;
 use crate::live_state::shared::identity::RowIdentity;
+use crate::runtime::TransactionBackendAdapter;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 
 pub async fn rebuild_plan(

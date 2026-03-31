@@ -1,6 +1,6 @@
 use crate::contracts::traits::PendingView;
-use crate::engine::Engine;
 use crate::functions::SharedFunctionProvider;
+use crate::runtime::RuntimeHost;
 use crate::sql::explain::{
     build_internal_explain_artifacts, unsupported_explain_analyze_error, unwrap_explain_statement,
     ExplainRequest, ExplainStage, ExplainTimingCollector, InternalExplainBuildInput,
@@ -81,7 +81,7 @@ pub(crate) fn prepared_execution_mutates_public_surface_registry(
 }
 
 async fn compile_execution_with_backend(
-    engine: &Engine,
+    runtime_host: &dyn RuntimeHost,
     backend: &dyn LixBackend,
     pending_transaction_view: Option<&dyn PendingView>,
     parsed_statements: &[Statement],
@@ -97,7 +97,7 @@ async fn compile_execution_with_backend(
 ) -> Result<CompiledExecution, LixError> {
     let owned_runtime_state = match runtime_state {
         Some(_) => None,
-        None => Some(ExecutionRuntimeState::prepare(engine, backend).await?),
+        None => Some(ExecutionRuntimeState::prepare(runtime_host, backend).await?),
     };
     let runtime_state = runtime_state.unwrap_or_else(|| {
         owned_runtime_state
@@ -167,7 +167,6 @@ async fn compile_execution_with_backend(
         }
     } else {
         collect_execution_intent_with_backend(
-            engine,
             backend,
             &statements,
             params,
@@ -221,7 +220,7 @@ async fn compile_execution_with_backend(
         let internal_logical_planning_started = Instant::now();
         let internal_logical_plan = preprocess_with_surfaces_to_logical_plan(
             backend,
-            &engine.cel_evaluator,
+            runtime_host.cel_evaluator(),
             internal_source_statements,
             params,
             functions.clone(),
@@ -242,7 +241,7 @@ async fn compile_execution_with_backend(
         validate_compiled_internal_execution(&preprocess, internal_logical_plan.result_contract)?;
 
         if !preprocess.mutations.is_empty() {
-            validate_inserts(backend, &engine.schema_cache, &preprocess.mutations)
+            validate_inserts(backend, runtime_host.schema_cache(), &preprocess.mutations)
                 .await
                 .map_err(|error| LixError {
                     code: error.code,
@@ -255,7 +254,7 @@ async fn compile_execution_with_backend(
         if !preprocess.update_validations.is_empty() {
             validate_updates(
                 backend,
-                &engine.schema_cache,
+                runtime_host.schema_cache(),
                 &preprocess.update_validations,
                 params,
             )
@@ -295,15 +294,19 @@ async fn compile_execution_with_backend(
     };
 
     if let Some(public_write) = public_write.as_ref() {
-        validate_batch_local_write(backend, &engine.schema_cache, &public_write.planned_write)
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "prepare_execution_with_backend public batch-local validation failed: {}",
-                    error.description
-                ),
-            })?;
+        validate_batch_local_write(
+            backend,
+            runtime_host.schema_cache(),
+            &public_write.planned_write,
+        )
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "prepare_execution_with_backend public batch-local validation failed: {}",
+                error.description
+            ),
+        })?;
     }
 
     let body = match (public_read, public_write, internal_execution) {
@@ -479,7 +482,7 @@ async fn prepare_public_execution_for_compile(
 }
 
 pub(crate) async fn compile_execution_from_template_instance_with_backend(
-    engine: &Engine,
+    runtime_host: &dyn RuntimeHost,
     backend: &dyn LixBackend,
     pending_transaction_view: Option<&dyn PendingView>,
     template_instance: &BoundStatementTemplateInstance,
@@ -492,7 +495,7 @@ pub(crate) async fn compile_execution_from_template_instance_with_backend(
     policy: PreparationPolicy,
 ) -> Result<CompiledExecution, LixError> {
     compile_execution_with_backend(
-        engine,
+        runtime_host,
         backend,
         pending_transaction_view,
         std::slice::from_ref(template_instance.statement()),

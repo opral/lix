@@ -1,5 +1,5 @@
+use crate::contracts::history::{DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest};
 use crate::contracts::surface::SurfaceBinding;
-use crate::read::models::{DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest};
 use crate::sql::physical_plan::LoweredResultColumns;
 use crate::Value;
 

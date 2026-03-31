@@ -3,19 +3,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::contracts::session::ExecuteOptions;
 use crate::contracts::surface::SurfaceRegistry;
-use crate::engine::{Engine, ExecuteOptions};
+use crate::contracts::write::{BorrowedWriteTransaction, WriteProgramExecutor, WriteTransaction};
 use crate::sql::binder::{
     bind_statement_binding_template, compile_statement_binding_template_with_state,
     RuntimeBindingValues, StatementBindingTemplate,
 };
 use crate::sql::internal::script::coalesce_state_surface_inserts_in_transactions;
 use crate::sql::parser::placeholders::PlaceholderState;
-use crate::transaction::{
-    execute_bound_statement_template_instance_in_borrowed_write_transaction,
-    execute_bound_statement_template_instance_in_write_transaction, BorrowedWriteTransaction,
-    WriteTransaction,
-};
 use crate::{ExecuteResult, LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
 
@@ -391,7 +387,7 @@ impl ExecutionProgram {
 }
 
 pub(crate) async fn execute_execution_program_with_write_transaction(
-    engine: &Engine,
+    executor: &dyn WriteProgramExecutor,
     write_transaction: &mut WriteTransaction<'_>,
     program: &ExecutionProgram,
     allow_internal_tables: bool,
@@ -403,16 +399,16 @@ pub(crate) async fn execute_execution_program_with_write_transaction(
         match step {
             ExecutionProgramStep::TransactionControl => {}
             ExecutionProgramStep::Statement(step) => {
-                let result = execute_bound_statement_template_instance_in_write_transaction(
-                    engine,
-                    write_transaction,
-                    &step.bound_template,
-                    allow_internal_tables,
-                    context,
-                    None,
-                    false,
-                )
-                .await?;
+                let result = executor
+                    .execute_bound_statement_template_instance_in_write_transaction(
+                        write_transaction,
+                        &step.bound_template,
+                        allow_internal_tables,
+                        context,
+                        None,
+                        false,
+                    )
+                    .await?;
                 results.push(result);
             }
         }
@@ -430,7 +426,7 @@ pub(crate) async fn execute_execution_program_with_write_transaction(
 }
 
 pub(crate) async fn execute_execution_program_with_borrowed_write_transaction(
-    engine: &Engine,
+    executor: &dyn WriteProgramExecutor,
     write_transaction: &mut BorrowedWriteTransaction<'_>,
     program: &ExecutionProgram,
     allow_internal_tables: bool,
@@ -442,9 +438,8 @@ pub(crate) async fn execute_execution_program_with_borrowed_write_transaction(
         match step {
             ExecutionProgramStep::TransactionControl => {}
             ExecutionProgramStep::Statement(step) => {
-                let result =
-                    execute_bound_statement_template_instance_in_borrowed_write_transaction(
-                        engine,
+                let result = executor
+                    .execute_bound_statement_template_instance_in_borrowed_write_transaction(
                         write_transaction,
                         &step.bound_template,
                         allow_internal_tables,

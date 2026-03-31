@@ -1,9 +1,9 @@
-use crate::contracts::surface::SurfaceRegistry;
-use crate::contracts::traits::PendingView;
-use crate::live_state::{
+use crate::contracts::live::{
     bootstrap_public_surface_registry_with_pending_transaction_view,
     execute_prepared_public_read_with_pending_transaction_view,
 };
+use crate::contracts::surface::SurfaceRegistry;
+use crate::contracts::traits::PendingView;
 use crate::sql::executor::{
     execute_prepared_public_read, try_prepare_public_read_with_registry_and_internal_access,
 };
