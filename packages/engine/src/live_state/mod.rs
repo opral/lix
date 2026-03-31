@@ -49,7 +49,7 @@ pub(crate) mod testing;
 pub mod tracked;
 pub mod untracked;
 mod visible_rows;
-use crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
+use crate::contracts::artifacts::SchemaLiveTableRequirement;
 use crate::{LixBackend, LixBackendTransaction, LixError, ReplayCursor, SqlDialect};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -416,7 +416,7 @@ pub(crate) fn build_effective_public_read_source_sql(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     effective_state_request: &crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStateRequest,
-    surface_binding: &crate::sql::catalog::SurfaceBinding,
+    surface_binding: &crate::contracts::surface::SurfaceBinding,
     pushdown_predicates: &[sqlparser::ast::Expr],
     known_live_layouts: &BTreeMap<String, JsonValue>,
     include_snapshot_content: bool,

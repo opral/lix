@@ -2,6 +2,7 @@ use crate::canonical::read::{
     load_exact_committed_state_row_at_version_head as load_exact_committed_state_row,
     ExactCommittedStateRow, ExactCommittedStateRowRequest,
 };
+use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
 use crate::live_state::{
     load_exact_untracked_effective_row_with_backend, normalize_live_snapshot_values_with_backend,
     tracked_tombstone_shadows_exact_row_with_backend, EffectiveRow, ExactUntrackedLookupRequest,
@@ -15,8 +16,6 @@ use crate::sql::semantic_ir::semantics::surface_semantics::{
     canonical_filter_column_name, effective_state_pushdown_predicates, overlay_lanes,
     overlay_lanes_for_version, OverlayLane,
 };
-use crate::transaction::PendingTransactionView;
-use crate::transaction::{PendingSemanticRow, PendingSemanticStorage};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::workspace::writer_key::load_workspace_writer_key_annotation_for_state_row;
 use crate::{LixBackend, LixError, Value};
@@ -271,7 +270,7 @@ fn collect_columns_from_expr(expr: &Expr, required: &mut BTreeSet<String>) {
 pub(crate) async fn resolve_exact_effective_state_row_with_pending_transaction_view(
     backend: &dyn LixBackend,
     request: &ExactEffectiveStateRowRequest,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
 ) -> Result<Option<ExactEffectiveStateRow>, LixError> {
     let requested_untracked = request.row_key.untracked;
     let mut requested_global = request.row_key.global;
@@ -348,7 +347,7 @@ pub(crate) async fn resolve_exact_effective_state_row_with_pending_transaction_v
 
 async fn load_exact_tracked_effective_row(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     request: &ExactEffectiveStateRowRequest,
     internal_version_id: &str,
     overlay_lane: OverlayLane,
@@ -523,7 +522,7 @@ fn sql_overlay_lane(lane: crate::live_state::OverlayLane) -> OverlayLane {
 
 async fn annotate_tracked_exact_row_with_workspace_writer_key(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     row: ExactCommittedStateRow,
 ) -> Result<WorkspaceAnnotatedTrackedExactRow, LixError> {
     let writer_key = if let Some(writer_key) = pending_workspace_writer_key_annotation(
@@ -551,19 +550,17 @@ async fn annotate_tracked_exact_row_with_workspace_writer_key(
 }
 
 fn pending_workspace_writer_key_annotation(
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     schema_key: &str,
     entity_id: &str,
     file_id: &str,
 ) -> Option<Option<String>> {
-    pending_transaction_view
-        .and_then(PendingTransactionView::workspace_writer_key_overlay)
-        .and_then(|overlay| {
-            overlay
-                .annotation_for_state_row(version_id, schema_key, entity_id, file_id)
-                .cloned()
-        })
+    pending_transaction_view.and_then(|view| {
+        view.workspace_writer_key_annotation_for_state_row(
+            version_id, schema_key, entity_id, file_id,
+        )
+    })
 }
 
 fn tracked_exact_row_matches_row_key(
@@ -614,7 +611,7 @@ fn row_key_text_value<'a>(row_key: &'a CanonicalStateRowKey, column: &str) -> Op
 
 async fn load_exact_pending_effective_row(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     request: &ExactEffectiveStateRowRequest,
     internal_version_id: &str,
     overlay_lane: OverlayLane,
@@ -625,15 +622,11 @@ async fn load_exact_pending_effective_row(
             PendingSemanticStorage::Untracked
         }
     };
-    let Some(overlay) = pending_transaction_view.and_then(PendingTransactionView::semantic_overlay)
-    else {
-        return Ok(None);
-    };
-
-    let pending = overlay
-        .visible_rows(storage, &request.schema_key)
-        .find(|row| pending_row_matches_exact_request(row, request, internal_version_id));
-    let Some(pending) = pending else {
+    let Some(pending) = pending_transaction_view.and_then(|view| {
+        view.visible_semantic_rows(storage, &request.schema_key)
+            .into_iter()
+            .find(|row| pending_row_matches_exact_request(row, request, internal_version_id))
+    }) else {
         return Ok(None);
     };
 
@@ -644,7 +637,7 @@ async fn load_exact_pending_effective_row(
     let row = exact_effective_state_row_from_pending(
         backend,
         pending_transaction_view,
-        pending,
+        &pending,
         &request.version_id,
         overlay_lane,
     )
@@ -672,7 +665,7 @@ fn pending_row_matches_exact_request(
 
 async fn exact_effective_state_row_from_pending(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     row: &PendingSemanticRow,
     requested_version_id: &str,
     overlay_lane: OverlayLane,
@@ -753,8 +746,8 @@ fn pending_effective_row_matches_row_key(
 #[cfg(test)]
 mod tests {
     use super::{build_effective_state, OverlayLane, StateSourceAuthority};
+    use crate::contracts::surface::SurfaceRegistry;
     use crate::sql::binder::bind_statement;
-    use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::logical_plan::public_ir::StructuredPublicRead;
     use crate::sql::semantic_ir::canonicalize::canonicalize_read;
     use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;

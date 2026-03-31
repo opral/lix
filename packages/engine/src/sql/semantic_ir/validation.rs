@@ -7,6 +7,7 @@ use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 
 use crate::checkpoint::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME};
+use crate::contracts::surface::SurfaceFamily;
 use crate::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
@@ -20,7 +21,6 @@ use crate::schema::{
     SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,
 };
 use crate::sql::binder::bind_sql;
-use crate::sql::catalog::SurfaceFamily;
 use crate::sql::executor::contracts::planned_statement::{
     MutationOperation, MutationRow, UpdateValidationPlan,
 };

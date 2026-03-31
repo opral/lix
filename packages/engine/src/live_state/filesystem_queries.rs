@@ -2,12 +2,11 @@ use super::filesystem_projection::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
     FilesystemProjectionScope,
 };
+use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
 use crate::filesystem::path::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
 use crate::filesystem::runtime::FilesystemTransactionFileState;
 use crate::live_state::schema_access::tracked_relation_name;
 use crate::sql::common::text::escape_sql_string;
-use crate::transaction::PendingTransactionView;
-use crate::transaction::{PendingSemanticRow, PendingSemanticStorage};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, SqlDialect, Value};
 use serde_json::Value as JsonValue;
@@ -313,7 +312,7 @@ pub(crate) async fn load_file_row_by_id_without_path(
 
 pub(crate) async fn load_directory_row_by_id_with_pending_transaction_view(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     directory_id: &str,
     scope: FilesystemProjectionScope,
@@ -344,7 +343,7 @@ pub(crate) async fn load_directory_row_by_id_with_pending_transaction_view(
 
 pub(crate) async fn load_directory_row_by_path_with_pending_transaction_view(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     path: &NormalizedDirectoryPath,
     scope: FilesystemProjectionScope,
@@ -369,7 +368,7 @@ pub(crate) async fn load_directory_row_by_path_with_pending_transaction_view(
 
 pub(crate) async fn load_file_row_by_path_with_pending_transaction_view(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     path: &ParsedFilePath,
     scope: FilesystemProjectionScope,
@@ -393,7 +392,7 @@ pub(crate) async fn load_file_row_by_path_with_pending_transaction_view(
 
 pub(crate) async fn load_file_row_by_id_with_pending_transaction_view(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     file_id: &str,
     scope: FilesystemProjectionScope,
@@ -414,13 +413,9 @@ pub(crate) async fn load_file_row_by_id_with_pending_transaction_view(
         return Ok(None);
     };
 
-    let Some(overlay) =
-        pending_transaction_view.and_then(PendingTransactionView::filesystem_overlay)
-    else {
-        return Ok(Some(base_row));
-    };
-    let Some(pending) = overlay
-        .visible_files()
+    let Some(pending) = pending_transaction_view
+        .into_iter()
+        .flat_map(PendingView::visible_files)
         .find(|pending| pending.version_id == version_id && pending.file_id == file_id)
     else {
         return Ok(Some(base_row));
@@ -436,7 +431,7 @@ pub(crate) async fn load_file_row_by_id_with_pending_transaction_view(
 
 pub(crate) async fn load_file_row_by_id_without_path_with_pending_transaction_view(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     file_id: &str,
     scope: FilesystemProjectionScope,
@@ -458,7 +453,7 @@ pub(crate) async fn load_file_row_by_id_without_path_with_pending_transaction_vi
 
 pub(crate) async fn lookup_directory_id_by_path_with_pending_transaction_view(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     path: &NormalizedDirectoryPath,
     scope: FilesystemProjectionScope,
@@ -476,7 +471,7 @@ pub(crate) async fn lookup_directory_id_by_path_with_pending_transaction_view(
 
 pub(crate) async fn lookup_file_id_by_path_with_pending_transaction_view(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     path: &ParsedFilePath,
     scope: FilesystemProjectionScope,
@@ -494,7 +489,7 @@ pub(crate) async fn lookup_file_id_by_path_with_pending_transaction_view(
 
 pub(crate) async fn lookup_directory_path_by_id_with_pending_transaction_view(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     directory_id: &str,
     scope: FilesystemProjectionScope,
@@ -563,21 +558,19 @@ pub(crate) async fn load_file_rows_under_path(
 
 async fn pending_directory_row_by_id(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     directory_id: &str,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
-    let Some(overlay) =
-        pending_transaction_view.and_then(PendingTransactionView::filesystem_overlay)
-    else {
-        return Ok(None);
-    };
-    let Some(pending) = overlay
-        .visible_directory_rows(
-            PendingSemanticStorage::Tracked,
-            FILESYSTEM_DIRECTORY_SCHEMA_KEY,
-        )
+    let Some(pending) = pending_transaction_view
+        .into_iter()
+        .flat_map(|view| {
+            view.visible_directory_rows(
+                PendingSemanticStorage::Tracked,
+                FILESYSTEM_DIRECTORY_SCHEMA_KEY,
+            )
+        })
         .find(|row| row.version_id == version_id && row.entity_id == directory_id)
     else {
         return Ok(None);
@@ -586,31 +579,27 @@ async fn pending_directory_row_by_id(
         return Ok(None);
     }
 
-    build_pending_directory_row(backend, pending_transaction_view, pending, scope).await
+    build_pending_directory_row(backend, pending_transaction_view, &pending, scope).await
 }
 
 async fn pending_directory_row_by_path(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     path: &NormalizedDirectoryPath,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
-    let Some(overlay) =
-        pending_transaction_view.and_then(PendingTransactionView::filesystem_overlay)
-    else {
-        return Ok(None);
-    };
-
-    for pending in overlay.visible_directory_rows(
-        PendingSemanticStorage::Tracked,
-        FILESYSTEM_DIRECTORY_SCHEMA_KEY,
-    ) {
+    for pending in pending_transaction_view.into_iter().flat_map(|view| {
+        view.visible_directory_rows(
+            PendingSemanticStorage::Tracked,
+            FILESYSTEM_DIRECTORY_SCHEMA_KEY,
+        )
+    }) {
         if pending.version_id != version_id || pending.tombstone {
             continue;
         }
         let Some(row) =
-            build_pending_directory_row(backend, pending_transaction_view, pending, scope).await?
+            build_pending_directory_row(backend, pending_transaction_view, &pending, scope).await?
         else {
             continue;
         };
@@ -623,18 +612,14 @@ async fn pending_directory_row_by_path(
 
 async fn pending_file_row_by_id(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     file_id: &str,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
-    let Some(overlay) =
-        pending_transaction_view.and_then(PendingTransactionView::filesystem_overlay)
-    else {
-        return Ok(None);
-    };
-    let Some(pending) = overlay
-        .visible_files()
+    let Some(pending) = pending_transaction_view
+        .into_iter()
+        .flat_map(PendingView::visible_files)
         .find(|pending| pending.version_id == version_id && pending.file_id == file_id)
     else {
         return Ok(None);
@@ -642,28 +627,25 @@ async fn pending_file_row_by_id(
     if pending.deleted {
         return Ok(None);
     }
-    build_pending_file_row(backend, pending_transaction_view, pending, scope).await
+    build_pending_file_row(backend, pending_transaction_view, &pending, scope).await
 }
 
 async fn pending_file_row_by_path(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     path: &ParsedFilePath,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
-    let Some(overlay) =
-        pending_transaction_view.and_then(PendingTransactionView::filesystem_overlay)
-    else {
-        return Ok(None);
-    };
-
-    for pending in overlay.visible_files() {
+    for pending in pending_transaction_view
+        .into_iter()
+        .flat_map(PendingView::visible_files)
+    {
         if pending.version_id != version_id || pending.deleted {
             continue;
         }
         let Some(row) =
-            build_pending_file_row(backend, pending_transaction_view, pending, scope).await?
+            build_pending_file_row(backend, pending_transaction_view, &pending, scope).await?
         else {
             continue;
         };
@@ -675,41 +657,39 @@ async fn pending_file_row_by_path(
 }
 
 fn pending_directory_row_is_hidden(
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     directory_id: &str,
 ) -> bool {
     pending_transaction_view
-        .and_then(PendingTransactionView::filesystem_overlay)
-        .and_then(|overlay| {
-            overlay
-                .visible_directory_rows(
-                    PendingSemanticStorage::Tracked,
-                    FILESYSTEM_DIRECTORY_SCHEMA_KEY,
-                )
-                .find(|row| row.version_id == version_id && row.entity_id == directory_id)
+        .into_iter()
+        .flat_map(|view| {
+            view.visible_directory_rows(
+                PendingSemanticStorage::Tracked,
+                FILESYSTEM_DIRECTORY_SCHEMA_KEY,
+            )
         })
-        .is_some_and(|row| row.tombstone)
+        .any(|row| row.version_id == version_id && row.entity_id == directory_id && row.tombstone)
 }
 
 fn pending_file_row_is_hidden(
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     file_id: &str,
 ) -> bool {
     pending_transaction_view
-        .and_then(PendingTransactionView::filesystem_overlay)
-        .and_then(|overlay| {
-            overlay
-                .visible_files()
-                .find(|pending| pending.version_id == version_id && pending.file_id == file_id)
+        .into_iter()
+        .flat_map(PendingView::visible_files)
+        .any(|pending| {
+            pending.version_id == version_id
+                && pending.file_id == file_id
+                && (pending.deleted || pending.descriptor.is_some())
         })
-        .is_some_and(|pending| pending.deleted || pending.descriptor.is_some())
 }
 
 async fn build_pending_directory_row(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     row: &PendingSemanticRow,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
@@ -767,7 +747,7 @@ async fn build_pending_directory_row(
 
 async fn build_pending_file_row(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     row: &FilesystemTransactionFileState,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {

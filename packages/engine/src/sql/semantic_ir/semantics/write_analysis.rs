@@ -1,4 +1,4 @@
-use crate::sql::catalog::SurfaceOverrideValue;
+use crate::contracts::surface::SurfaceOverrideValue;
 use crate::sql::logical_plan::public_ir::{
     MutationPayload, PlannedWrite, SchemaProof, ScopeProof, StateSourceKind, TargetSetProof,
     WriteModeRequest,
@@ -70,7 +70,7 @@ fn analyze_write_scope(
     }
 
     match canonicalized.surface_binding.default_scope {
-        crate::sql::catalog::DefaultScopeSemantics::ActiveVersion => {
+        crate::contracts::surface::DefaultScopeSemantics::ActiveVersion => {
             if canonicalized
                 .write_command
                 .execution_context
@@ -82,12 +82,14 @@ fn analyze_write_scope(
                 Ok(ScopeProof::Unknown)
             }
         }
-        crate::sql::catalog::DefaultScopeSemantics::ExplicitVersion => {
+        crate::contracts::surface::DefaultScopeSemantics::ExplicitVersion => {
             Ok(write_scope_for_explicit_version_surface(canonicalized))
         }
-        crate::sql::catalog::DefaultScopeSemantics::History => Ok(ScopeProof::Unbounded),
-        crate::sql::catalog::DefaultScopeSemantics::GlobalAdmin => Ok(ScopeProof::GlobalAdmin),
-        crate::sql::catalog::DefaultScopeSemantics::WorkingChanges => Ok(ScopeProof::Unknown),
+        crate::contracts::surface::DefaultScopeSemantics::History => Ok(ScopeProof::Unbounded),
+        crate::contracts::surface::DefaultScopeSemantics::GlobalAdmin => {
+            Ok(ScopeProof::GlobalAdmin)
+        }
+        crate::contracts::surface::DefaultScopeSemantics::WorkingChanges => Ok(ScopeProof::Unknown),
     }
 }
 
@@ -97,15 +99,15 @@ fn insert_scope_proof(canonicalized: &CanonicalizedWrite) -> Option<ScopeProof> 
     };
 
     Some(match canonicalized.surface_binding.default_scope {
-        crate::sql::catalog::DefaultScopeSemantics::ActiveVersion => {
+        crate::contracts::surface::DefaultScopeSemantics::ActiveVersion => {
             insert_scope_for_active_version_surface(canonicalized, rows)
         }
-        crate::sql::catalog::DefaultScopeSemantics::ExplicitVersion => {
+        crate::contracts::surface::DefaultScopeSemantics::ExplicitVersion => {
             insert_scope_for_explicit_version_surface(rows)
         }
-        crate::sql::catalog::DefaultScopeSemantics::History => ScopeProof::Unbounded,
-        crate::sql::catalog::DefaultScopeSemantics::GlobalAdmin => ScopeProof::GlobalAdmin,
-        crate::sql::catalog::DefaultScopeSemantics::WorkingChanges => ScopeProof::Unknown,
+        crate::contracts::surface::DefaultScopeSemantics::History => ScopeProof::Unbounded,
+        crate::contracts::surface::DefaultScopeSemantics::GlobalAdmin => ScopeProof::GlobalAdmin,
+        crate::contracts::surface::DefaultScopeSemantics::WorkingChanges => ScopeProof::Unknown,
     })
 }
 
@@ -555,8 +557,8 @@ fn selector_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<
 #[cfg(test)]
 mod tests {
     use super::analyze_write;
+    use crate::contracts::surface::SurfaceRegistry;
     use crate::sql::binder::bind_statement;
-    use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::logical_plan::public_ir::{SchemaProof, ScopeProof, TargetSetProof};
     use crate::sql::semantic_ir::canonicalize::canonicalize_write;
     use crate::sql::semantic_ir::ExecutionContext;

@@ -153,13 +153,13 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
                     .as_ref()
                     .map(|batch| batch.write_lane.clone())
                     .unwrap_or_else(|| match &unit.execution.create_preconditions.write_lane {
-                        crate::sql::logical_plan::public_ir::WriteLane::SingleVersion(
-                            version_id,
-                        ) => WriteLane::SingleVersion(version_id.clone()),
-                        crate::sql::logical_plan::public_ir::WriteLane::ActiveVersion => {
+                        crate::contracts::artifacts::WriteLane::SingleVersion(version_id) => {
+                            WriteLane::SingleVersion(version_id.clone())
+                        }
+                        crate::contracts::artifacts::WriteLane::ActiveVersion => {
                             WriteLane::ActiveVersion
                         }
-                        crate::sql::logical_plan::public_ir::WriteLane::GlobalAdmin => {
+                        crate::contracts::artifacts::WriteLane::GlobalAdmin => {
                             WriteLane::GlobalAdmin
                         }
                     }),
@@ -246,10 +246,10 @@ fn canonical_create_commit_preconditions_from_public_write(
     public_write: &super::PreparedPublicWrite,
 ) -> Result<CreateCommitPreconditions, LixError> {
     let write_lane = match &commit_preconditions.write_lane {
-        crate::sql::logical_plan::public_ir::WriteLane::SingleVersion(version_id) => {
+        crate::contracts::artifacts::WriteLane::SingleVersion(version_id) => {
             CreateCommitWriteLane::Version(version_id.clone())
         }
-        crate::sql::logical_plan::public_ir::WriteLane::ActiveVersion => {
+        crate::contracts::artifacts::WriteLane::ActiveVersion => {
             let version_id = batch
                 .into_iter()
                 .flat_map(|batch| batch.changes.first())
@@ -271,9 +271,7 @@ fn canonical_create_commit_preconditions_from_public_write(
                 })?;
             CreateCommitWriteLane::Version(version_id)
         }
-        crate::sql::logical_plan::public_ir::WriteLane::GlobalAdmin => {
-            CreateCommitWriteLane::GlobalAdmin
-        }
+        crate::contracts::artifacts::WriteLane::GlobalAdmin => CreateCommitWriteLane::GlobalAdmin,
     };
     let expected_head = match &commit_preconditions.expected_head {
         crate::sql::logical_plan::public_ir::ExpectedHead::CurrentHead => {

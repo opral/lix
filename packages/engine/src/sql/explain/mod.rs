@@ -5,13 +5,13 @@
 
 use crate::backend::prepared::PreparedStatement;
 use crate::backend::SqlDialect;
-use crate::session::contracts::{SessionDependency, SessionStateDelta};
-use crate::sql::backend::{PushdownDecision, PushdownSupport};
-use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
-use crate::sql::catalog::{
+use crate::contracts::surface::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
     SurfaceVariant,
 };
+use crate::session::contracts::{SessionDependency, SessionStateDelta};
+use crate::sql::backend::{PushdownDecision, PushdownSupport};
+use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::executor::contracts::effects::PlanEffects;
 use crate::sql::executor::contracts::planned_statement::{
     MutationOperation, MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
@@ -5673,13 +5673,13 @@ fn surface_read_freshness_name(freshness: SurfaceReadFreshness) -> &'static str 
     }
 }
 
-fn default_scope_name(scope: crate::sql::catalog::DefaultScopeSemantics) -> &'static str {
+fn default_scope_name(scope: crate::contracts::surface::DefaultScopeSemantics) -> &'static str {
     match scope {
-        crate::sql::catalog::DefaultScopeSemantics::ActiveVersion => "active_version",
-        crate::sql::catalog::DefaultScopeSemantics::ExplicitVersion => "explicit_version",
-        crate::sql::catalog::DefaultScopeSemantics::History => "history",
-        crate::sql::catalog::DefaultScopeSemantics::GlobalAdmin => "global_admin",
-        crate::sql::catalog::DefaultScopeSemantics::WorkingChanges => "working_changes",
+        crate::contracts::surface::DefaultScopeSemantics::ActiveVersion => "active_version",
+        crate::contracts::surface::DefaultScopeSemantics::ExplicitVersion => "explicit_version",
+        crate::contracts::surface::DefaultScopeSemantics::History => "history",
+        crate::contracts::surface::DefaultScopeSemantics::GlobalAdmin => "global_admin",
+        crate::contracts::surface::DefaultScopeSemantics::WorkingChanges => "working_changes",
     }
 }
 

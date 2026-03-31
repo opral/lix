@@ -1,4 +1,5 @@
 use super::*;
+use crate::contracts::traits::PendingView;
 use crate::filesystem::live_projection::FilesystemProjectionScope;
 use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
@@ -23,7 +24,6 @@ use crate::sql::semantic_ir::semantics::filesystem_assignments::{
 use crate::sql::semantic_ir::semantics::filesystem_planning::{
     plan_directory_insert_batch, plan_file_insert_batch,
 };
-use crate::transaction::PendingTransactionView;
 use serde_json::json;
 use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue, ValueWithSpan};
 use std::collections::{BTreeMap, BTreeSet};
@@ -174,7 +174,7 @@ async fn resolve_directory_insert_write_plan(
 async fn resolve_existing_directory_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let version_id = resolved_filesystem_version_id(planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
@@ -516,7 +516,7 @@ async fn resolve_file_insert_write_plan(
 async fn resolve_existing_file_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let version_id = resolved_filesystem_version_id(planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
@@ -754,7 +754,7 @@ async fn resolve_existing_file_write(
 
 async fn resolve_parent_directory_target(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     directory_path: Option<&str>,
     untracked: bool,
@@ -866,7 +866,7 @@ fn set_filesystem_deleted_state(
 
 async fn resolve_missing_directory_rows(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     directory_path: &str,
     untracked: bool,
@@ -938,7 +938,7 @@ async fn resolve_missing_directory_rows(
 
 async fn resolve_file_update_target(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     current_row: &FileFilesystemRow,
     assignments: &FileUpdateAssignments,
     version_id: &str,
@@ -1343,7 +1343,7 @@ fn resolve_proposed_directory_path(
 async fn load_target_directory_rows_for_selector(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<Vec<DirectoryFilesystemRow>, WriteResolveError> {
@@ -1381,7 +1381,7 @@ async fn load_target_directory_rows_for_selector(
 async fn load_target_file_rows_for_selector(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
     require_paths: bool,

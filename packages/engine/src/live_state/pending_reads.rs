@@ -1,23 +1,19 @@
 use std::collections::BTreeMap;
 
+use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
+use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::schema_access::{live_read_contract_from_layout, LiveReadContract};
 use crate::live_state::shared::identity::RowIdentity;
 use crate::read::contracts::{
     committed_read_mode_from_prepared_public_read, CommittedReadMode, PublicReadExecutionMode,
 };
-use crate::sql::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::sql::executor::{
     decode_public_read_result, execute_prepared_public_read,
     execute_prepared_public_read_in_transaction,
     execute_prepared_public_read_without_freshness_check, PreparedPublicRead,
 };
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
-use crate::transaction::{
-    PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
-    PendingSemanticRow, PendingSemanticStorage, PendingTransactionView,
-    PendingWorkspaceWriterKeyOverlay,
-};
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
@@ -33,46 +29,27 @@ const GLOBAL_VERSION_ID: &str = "global";
 
 struct TransactionReadModel<'a> {
     base: &'a dyn LixBackend,
-    registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
-    semantic_overlay: Option<PendingSemanticOverlay>,
-    filesystem_overlay: Option<PendingFilesystemOverlay>,
-    workspace_writer_key_overlay: Option<PendingWorkspaceWriterKeyOverlay>,
+    pending_view: Option<&'a dyn PendingView>,
 }
 
 impl<'a> TransactionReadModel<'a> {
-    fn new(
-        base: &'a dyn LixBackend,
-        pending_transaction_view: Option<&PendingTransactionView>,
-    ) -> Self {
-        let pending_transaction_view = pending_transaction_view.cloned().unwrap_or_default();
-        Self {
-            base,
-            registered_schema_overlay: pending_transaction_view
-                .registered_schema_overlay()
-                .cloned(),
-            semantic_overlay: pending_transaction_view.semantic_overlay().cloned(),
-            filesystem_overlay: pending_transaction_view.filesystem_overlay().cloned(),
-            workspace_writer_key_overlay: pending_transaction_view
-                .workspace_writer_key_overlay()
-                .cloned(),
-        }
+    fn new(base: &'a dyn LixBackend, pending_view: Option<&'a dyn PendingView>) -> Self {
+        Self { base, pending_view }
     }
 
     fn has_pending_visibility(&self) -> bool {
-        self.registered_schema_overlay.is_some()
-            || self.semantic_overlay.is_some()
-            || self.filesystem_overlay.is_some()
-            || self.workspace_writer_key_overlay.is_some()
+        self.pending_view.is_some_and(PendingView::has_overlays)
     }
 
     async fn bootstrap_public_surface_registry(
         &self,
-    ) -> Result<crate::sql::catalog::SurfaceRegistry, LixError> {
+    ) -> Result<crate::contracts::surface::SurfaceRegistry, LixError> {
         if !self.has_pending_visibility() {
-            return crate::sql::catalog::SurfaceRegistry::bootstrap_with_backend(self.base).await;
+            return crate::contracts::surface::SurfaceRegistry::bootstrap_with_backend(self.base)
+                .await;
         }
 
-        let mut registry = crate::sql::catalog::SurfaceRegistry::with_builtin_surfaces();
+        let mut registry = crate::contracts::surface::SurfaceRegistry::with_builtin_surfaces();
         for snapshot_content in self.visible_registered_schema_rows().await?.into_values() {
             let snapshot: JsonValue = serde_json::from_str(&snapshot_content).map_err(|error| {
                 LixError::new(
@@ -136,21 +113,20 @@ impl<'a> TransactionReadModel<'a> {
             rows.insert(key.entity_id(), snapshot_content.clone());
         }
 
-        if let Some(overlay) = self.registered_schema_overlay.as_ref() {
-            for (entity_id, pending) in overlay.visible_entries() {
-                match pending.snapshot_content.as_ref() {
+        if let Some(pending_view) = self.pending_view {
+            for (entity_id, snapshot_content) in pending_view.visible_registered_schema_entries() {
+                match snapshot_content {
                     Some(snapshot_content) => {
-                        rows.insert(entity_id.to_string(), snapshot_content.clone());
+                        rows.insert(entity_id, snapshot_content);
                     }
                     None => {
-                        rows.remove(entity_id);
+                        rows.remove(&entity_id);
                     }
                 }
             }
-        }
 
-        if let Some(overlay) = self.semantic_overlay.as_ref() {
-            for row in overlay.visible_rows(PendingSemanticStorage::Tracked, REGISTERED_SCHEMA_KEY)
+            for row in pending_view
+                .visible_semantic_rows(PendingSemanticStorage::Tracked, REGISTERED_SCHEMA_KEY)
             {
                 if row.version_id != GLOBAL_VERSION_ID {
                     continue;
@@ -210,9 +186,9 @@ impl<'a> TransactionReadModel<'a> {
             .drain(..)
             .map(|row| (visible_live_row_identity(&row), row))
             .collect::<BTreeMap<_, _>>();
-        if let Some(overlay) = self.semantic_overlay.as_ref() {
-            for row in overlay.visible_rows(query.storage, &query.schema_key) {
-                let visible = visible_live_row_from_pending(&access, row)?;
+        if let Some(pending_view) = self.pending_view {
+            for row in pending_view.visible_semantic_rows(query.storage, &query.schema_key) {
+                let visible = visible_live_row_from_pending(&access, &row)?;
                 let identity = visible_live_row_identity(&visible);
                 if visible.is_tombstone && matches!(query.storage, PendingSemanticStorage::Tracked)
                 {
@@ -301,7 +277,7 @@ impl<'a> TransactionReadModel<'a> {
         access: &LiveReadContract,
         rows: &mut BTreeMap<OverlayVisibleLiveRowIdentity, OverlayVisibleLiveRow>,
     ) {
-        let Some(overlay) = self.filesystem_overlay.as_ref() else {
+        let Some(pending_view) = self.pending_view else {
             return;
         };
         if query.storage != PendingSemanticStorage::Tracked
@@ -314,9 +290,9 @@ impl<'a> TransactionReadModel<'a> {
         }
 
         for pending in
-            overlay.visible_directory_rows(PendingSemanticStorage::Tracked, &query.schema_key)
+            pending_view.visible_directory_rows(PendingSemanticStorage::Tracked, &query.schema_key)
         {
-            let Ok(visible) = visible_live_row_from_pending(access, pending) else {
+            let Ok(visible) = visible_live_row_from_pending(access, &pending) else {
                 continue;
             };
             let identity = visible_live_row_identity(&visible);
@@ -331,7 +307,7 @@ impl<'a> TransactionReadModel<'a> {
             return;
         }
 
-        for pending in overlay.visible_files() {
+        for pending in pending_view.visible_files() {
             if pending.deleted {
                 rows.retain(|_, row| {
                     !(row.schema_key == "lix_file_descriptor"
@@ -341,7 +317,8 @@ impl<'a> TransactionReadModel<'a> {
                 continue;
             }
 
-            if let Some(visible) = visible_live_row_from_pending_filesystem_state(access, pending) {
+            if let Some(visible) = visible_live_row_from_pending_filesystem_state(access, &pending)
+            {
                 let identity = visible_live_row_identity(&visible);
                 rows.insert(identity, visible);
                 continue;
@@ -366,7 +343,7 @@ impl<'a> TransactionReadModel<'a> {
         if query.storage != PendingSemanticStorage::Tracked {
             return;
         }
-        let Some(overlay) = self.workspace_writer_key_overlay.as_ref() else {
+        let Some(pending_view) = self.pending_view else {
             return;
         };
 
@@ -377,7 +354,7 @@ impl<'a> TransactionReadModel<'a> {
                 entity_id: row.entity_id.clone(),
                 file_id: row.file_id.clone(),
             };
-            let Some(writer_key) = overlay.annotation(&identity) else {
+            let Some(writer_key) = pending_view.workspace_writer_key_annotation(&identity) else {
                 continue;
             };
             row.normalized_values.insert(
@@ -390,8 +367,8 @@ impl<'a> TransactionReadModel<'a> {
 
 pub(crate) async fn bootstrap_public_surface_registry_with_pending_transaction_view(
     base: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
-) -> Result<crate::sql::catalog::SurfaceRegistry, LixError> {
+    pending_transaction_view: Option<&dyn PendingView>,
+) -> Result<crate::contracts::surface::SurfaceRegistry, LixError> {
     TransactionReadModel::new(base, pending_transaction_view)
         .bootstrap_public_surface_registry()
         .await
@@ -399,7 +376,7 @@ pub(crate) async fn bootstrap_public_surface_registry_with_pending_transaction_v
 
 pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view(
     base: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     public_read: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
     let Some(pending_transaction_view) = pending_transaction_view else {
@@ -412,7 +389,7 @@ pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view(
 
 pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     public_read: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
     let execution_mode = public_read_execution_mode(public_read);

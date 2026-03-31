@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::time::Instant;
 
 use crate::commit::{CanonicalCommitReceipt, PendingPublicCommitSession};
+use crate::contracts::artifacts::{PlanEffects, ResultContract};
+use crate::contracts::traits::PendingView;
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::engine::{
     normalize_sql_execution_error_with_backend, Engine, TransactionBackendAdapter,
@@ -11,14 +13,12 @@ use crate::live_state::{
     execute_prepared_public_read_with_pending_transaction_view_in_transaction,
     SchemaRegistrationSet,
 };
-use crate::sql::executor::contracts::effects::PlanEffects;
 use crate::sql::executor::contracts::executor_error::ExecutorError;
 use crate::sql::executor::execute_prepared::execute_prepared_with_transaction;
 use crate::sql::executor::{
     schema_registrations_for_compiled_execution, CompiledExecution, CompiledInternalExecution,
     PreparedPublicRead,
 };
-use crate::sql::logical_plan::ResultContract;
 use crate::state::stream::StateCommitStreamChange;
 use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, QueryResult};
@@ -133,7 +133,7 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
             let public_result =
                 match execute_prepared_public_read_with_pending_transaction_view_in_transaction(
                     transaction,
-                    pending_transaction_view,
+                    pending_transaction_view.map(|view| view as &dyn PendingView),
                     public_read,
                 )
                 .await

@@ -166,8 +166,8 @@ mod tests {
                 include_str!("../plugin/runtime.rs"),
             ),
             (
-                "packages/engine/src/sql/catalog/mod.rs",
-                include_str!("../sql/catalog/mod.rs"),
+                "packages/engine/src/contracts/surface.rs",
+                include_str!("../contracts/surface.rs"),
             ),
             (
                 "packages/engine/src/sql/semantic_ir/semantics/state_assignments.rs",

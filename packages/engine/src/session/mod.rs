@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use futures_util::FutureExt;
 use sqlparser::ast::Statement;
 
+use crate::contracts::surface::SurfaceRegistry;
 use crate::engine::{
     reject_internal_table_writes, reject_public_create_table, Engine, ExecuteOptions,
 };
@@ -23,7 +24,6 @@ use crate::errors;
 use crate::read::runtime::{
     execute_execution_program_in_committed_read_transaction, prepare_committed_read_program,
 };
-use crate::sql::catalog::SurfaceRegistry;
 use crate::sql::executor::execution_program::{
     execute_execution_program_with_write_transaction, ExecutionContext, ExecutionProgram,
     SessionExecutionRuntime, SessionExecutionRuntimeHandle,

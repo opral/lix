@@ -1,3 +1,6 @@
+use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
+use crate::live_state::RowIdentity;
+
 use super::write_plan::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
     PendingWorkspaceWriterKeyOverlay,
@@ -48,5 +51,80 @@ impl PendingTransactionView {
 
     pub(crate) fn workspace_writer_key_overlay(&self) -> Option<&PendingWorkspaceWriterKeyOverlay> {
         self.workspace_writer_key_overlay.as_ref()
+    }
+}
+
+impl PendingView for PendingTransactionView {
+    fn has_overlays(&self) -> bool {
+        self.has_overlays()
+    }
+
+    fn visible_registered_schema_entries(&self) -> Vec<(String, Option<String>)> {
+        self.registered_schema_overlay()
+            .map(|overlay| {
+                overlay
+                    .visible_entries()
+                    .map(|(entity_id, entry)| {
+                        (entity_id.to_string(), entry.snapshot_content.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn visible_semantic_rows(
+        &self,
+        storage: PendingSemanticStorage,
+        schema_key: &str,
+    ) -> Vec<PendingSemanticRow> {
+        self.semantic_overlay()
+            .map(|overlay| {
+                overlay
+                    .visible_rows(storage, schema_key)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn visible_directory_rows(
+        &self,
+        storage: PendingSemanticStorage,
+        schema_key: &str,
+    ) -> Vec<PendingSemanticRow> {
+        self.filesystem_overlay()
+            .map(|overlay| {
+                overlay
+                    .visible_directory_rows(storage, schema_key)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn visible_files(&self) -> Vec<crate::filesystem::runtime::FilesystemTransactionFileState> {
+        self.filesystem_overlay()
+            .map(|overlay| overlay.visible_files().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn workspace_writer_key_annotation(&self, identity: &RowIdentity) -> Option<Option<String>> {
+        self.workspace_writer_key_overlay()
+            .and_then(|overlay| overlay.annotation(identity))
+            .cloned()
+    }
+
+    fn workspace_writer_key_annotation_for_state_row(
+        &self,
+        version_id: &str,
+        schema_key: &str,
+        entity_id: &str,
+        file_id: &str,
+    ) -> Option<Option<String>> {
+        self.workspace_writer_key_overlay()
+            .and_then(|overlay| {
+                overlay.annotation_for_state_row(version_id, schema_key, entity_id, file_id)
+            })
+            .cloned()
     }
 }

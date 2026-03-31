@@ -1,6 +1,6 @@
+use crate::contracts::surface::{SurfaceBinding, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
 #[cfg(test)]
 use crate::sql::binder::bind_broad_public_read_statement_with_registry;
-use crate::sql::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadCte, BroadPublicReadDistinct, BroadPublicReadGroupBy,
     BroadPublicReadGroupByKind, BroadPublicReadJoin, BroadPublicReadJoinConstraint,
@@ -2248,7 +2248,7 @@ mod tests {
         public_read_routing_pass_registry, route_broad_public_read_statement,
         route_public_read_execution_strategy,
     };
-    use crate::sql::catalog::SurfaceRegistry;
+    use crate::contracts::surface::SurfaceRegistry;
     use crate::sql::logical_plan::public_ir::{
         BroadPublicReadProjectionItemKind, BroadPublicReadRelation, BroadPublicReadSetExpr,
         BroadPublicReadStatement, BroadPublicReadTableFactor, BroadSqlExprKind,

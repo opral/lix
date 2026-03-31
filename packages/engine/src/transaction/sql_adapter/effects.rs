@@ -1,10 +1,11 @@
+use crate::contracts::surface::SurfaceRegistry;
+use crate::contracts::traits::PendingView;
 use crate::engine::{DeferredTransactionSideEffects, Engine, TransactionBackendAdapter};
 use crate::filesystem::runtime::merge_filesystem_transaction_state;
 use crate::live_state::{
     bootstrap_public_surface_registry_with_pending_transaction_view, public_read_execution_mode,
 };
 use crate::read::contracts::PublicReadExecutionMode;
-use crate::sql::catalog::SurfaceRegistry;
 use crate::sql::executor::execution_program::ExecutionContext;
 use crate::sql::executor::{
     apply_public_surface_registry_mutations, prepared_execution_mutates_public_surface_registry,
@@ -72,7 +73,7 @@ pub(super) async fn refresh_public_surface_registry_from_pending_transaction_vie
     context.public_surface_registry =
         bootstrap_public_surface_registry_with_pending_transaction_view(
             &backend,
-            pending_transaction_view,
+            pending_transaction_view.map(|view| view as &dyn PendingView),
         )
         .await?;
     context.bump_public_surface_registry_generation();
