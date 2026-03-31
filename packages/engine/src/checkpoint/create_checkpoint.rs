@@ -192,11 +192,11 @@ async fn checkpoint_runtime_state(
         return Ok(runtime_state);
     }
 
-    let engine = tx.engine;
+    let runtime = tx.runtime;
     let backend = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
-    let runtime_state = ExecutionRuntimeState::prepare(engine, &backend).await?;
+    let runtime_state = ExecutionRuntimeState::prepare(runtime, &backend).await?;
     runtime_state
-        .ensure_sequence_initialized_in_transaction(engine, tx.backend_transaction_mut()?)
+        .ensure_sequence_initialized_in_transaction(runtime, tx.backend_transaction_mut()?)
         .await?;
     tx.context
         .set_execution_runtime_state(runtime_state.clone());

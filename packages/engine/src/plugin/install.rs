@@ -34,7 +34,7 @@ pub(crate) async fn install_plugin_in_session(
     let parsed = parse_plugin_archive(archive_bytes)?;
     ensure_valid_wasm_binary(&parsed.wasm_bytes)?;
 
-    let transaction = session.engine().begin_write_unit().await?;
+    let transaction = session.runtime().begin_write_unit().await?;
     let mut write_transaction = WriteTransaction::new_buffered_write(transaction);
     let mut context = session.new_execution_context(ExecuteOptions::default());
 

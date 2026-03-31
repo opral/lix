@@ -1,4 +1,3 @@
-use crate::engine::Engine;
 use crate::errors;
 use crate::session::{contracts::SessionDependency, Session};
 use crate::sql::executor::dependency_spec::{
@@ -426,7 +425,7 @@ impl ObserveState {
                 query,
                 session_dependency_generations,
             } => {
-                let latest_tick_seq = latest_observe_tick_seq(session.engine().as_ref()).await?;
+                let latest_tick_seq = latest_observe_tick_seq(session.runtime().as_ref()).await?;
                 let rows = execute_observe_query(session, &query).await?;
                 PollOutcome {
                     maybe_rows: Some((rows, None)),
@@ -474,7 +473,7 @@ impl ObserveState {
             } => {
                 observe_poll_sleep(OBSERVE_TICK_POLL_INTERVAL).await;
                 let observed_ticks =
-                    observe_ticks_since(session.engine().as_ref(), last_seen_tick_seq).await?;
+                    observe_ticks_since(session.runtime().as_ref(), last_seen_tick_seq).await?;
                 if observed_ticks.is_empty() {
                     PollOutcome {
                         maybe_rows: None,
@@ -766,7 +765,7 @@ fn build_shared_observe_source(
         include: filter.writer_keys.iter().cloned().collect(),
         exclude: filter.exclude_writer_keys.iter().cloned().collect(),
     };
-    let state_commits = session.engine().state_commit_stream(filter);
+    let state_commits = session.runtime().state_commit_stream(filter);
 
     Ok(SharedObserveSource::new(
         query,
@@ -847,8 +846,10 @@ async fn observe_poll_sleep(duration: Duration) {
     gloo_timers::future::TimeoutFuture::new(millis).await;
 }
 
-async fn latest_observe_tick_seq(engine: &Engine) -> Result<Option<i64>, LixError> {
-    let result = Box::pin(engine.execute_backend_sql(
+async fn latest_observe_tick_seq(
+    runtime: &crate::runtime::Runtime,
+) -> Result<Option<i64>, LixError> {
+    let result = Box::pin(runtime.backend().execute(
         "SELECT tick_seq \
          FROM lix_internal_observe_tick \
          ORDER BY tick_seq DESC \
@@ -866,11 +867,11 @@ async fn latest_observe_tick_seq(engine: &Engine) -> Result<Option<i64>, LixErro
 }
 
 async fn observe_ticks_since(
-    engine: &Engine,
+    runtime: &crate::runtime::Runtime,
     last_seen_tick_seq: Option<i64>,
 ) -> Result<Vec<ObserveTickRow>, LixError> {
     let result = if let Some(last_seen) = last_seen_tick_seq {
-        Box::pin(engine.execute_backend_sql(
+        Box::pin(runtime.backend().execute(
             "SELECT tick_seq, writer_key \
              FROM lix_internal_observe_tick \
              WHERE tick_seq > $1 \
@@ -879,7 +880,7 @@ async fn observe_ticks_since(
         ))
         .await?
     } else {
-        Box::pin(engine.execute_backend_sql(
+        Box::pin(runtime.backend().execute(
             "SELECT tick_seq, writer_key \
              FROM lix_internal_observe_tick \
              ORDER BY tick_seq ASC",

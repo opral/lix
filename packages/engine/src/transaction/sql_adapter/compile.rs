@@ -37,12 +37,12 @@ pub(super) async fn compile_sql_buffered_write_command(
         .expect("write execution should install an execution runtime state before compilation");
     if runtime_state.settings().enabled {
         runtime_state
-            .ensure_sequence_initialized_in_transaction(engine, transaction)
+            .ensure_sequence_initialized_in_transaction(engine.runtime().as_ref(), transaction)
             .await?;
     }
     let backend = TransactionBackendAdapter::new(transaction);
     let compiled_execution = match compile_execution_from_template_instance_with_backend(
-        engine,
+        engine.runtime().as_ref(),
         &backend,
         pending_transaction_view.map(|view| view as &dyn PendingView),
         bound_statement_template,
