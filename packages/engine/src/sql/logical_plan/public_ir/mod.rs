@@ -1,5 +1,3 @@
-use crate::filesystem::runtime::{merge_filesystem_transaction_state, FilesystemTransactionState};
-use crate::live_state::RowIdentity;
 use crate::sql::catalog::{DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, SurfaceVariant};
 use crate::sql::semantic_ir::ExecutionContext;
 use crate::Value;
@@ -915,17 +913,60 @@ impl OptionalTextPatch {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PlannedRowIdentity {
+    pub(crate) schema_key: String,
+    pub(crate) version_id: String,
+    pub(crate) entity_id: String,
+    pub(crate) file_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedFilesystemDescriptor {
+    pub(crate) directory_id: String,
+    pub(crate) name: String,
+    pub(crate) extension: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) hidden: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedFilesystemFile {
+    pub(crate) file_id: String,
+    pub(crate) version_id: String,
+    pub(crate) untracked: bool,
+    pub(crate) descriptor: Option<PlannedFilesystemDescriptor>,
+    pub(crate) metadata_patch: OptionalTextPatch,
+    pub(crate) data: Option<Vec<u8>>,
+    pub(crate) deleted: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PlannedFilesystemState {
+    pub(crate) files: BTreeMap<(String, String), PlannedFilesystemFile>,
+}
+
+impl PlannedFilesystemState {
+    pub(crate) fn merge_from(&mut self, next: &Self) {
+        self.files.extend(next.files.clone());
+    }
+
+    pub(crate) fn has_binary_payloads(&self) -> bool {
+        self.files.values().any(|file| file.data.is_some())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedWritePartition {
     pub(crate) execution_mode: WriteMode,
     pub(crate) authoritative_pre_state: Vec<ResolvedRowRef>,
     pub(crate) authoritative_pre_state_rows: Vec<PlannedStateRow>,
     pub(crate) intended_post_state: Vec<PlannedStateRow>,
-    pub(crate) workspace_writer_key_updates: BTreeMap<RowIdentity, Option<String>>,
+    pub(crate) workspace_writer_key_updates: BTreeMap<PlannedRowIdentity, Option<String>>,
     pub(crate) tombstones: Vec<ResolvedRowRef>,
     pub(crate) lineage: Vec<RowLineage>,
     pub(crate) target_write_lane: Option<WriteLane>,
-    pub(crate) filesystem_state: FilesystemTransactionState,
+    pub(crate) filesystem_state: PlannedFilesystemState,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -971,10 +1012,10 @@ impl ResolvedWritePlan {
             .flat_map(|partition| partition.intended_post_state.iter())
     }
 
-    pub(crate) fn filesystem_state(&self) -> FilesystemTransactionState {
-        let mut merged = FilesystemTransactionState::default();
+    pub(crate) fn filesystem_state(&self) -> PlannedFilesystemState {
+        let mut merged = PlannedFilesystemState::default();
         for partition in &self.partitions {
-            merge_filesystem_transaction_state(&mut merged, &partition.filesystem_state);
+            merged.merge_from(&partition.filesystem_state);
         }
         merged
     }
@@ -982,7 +1023,10 @@ impl ResolvedWritePlan {
 
 #[cfg(test)]
 mod tests {
-    use super::{CanonicalStateScan, EntityProjectionSpec, VersionScope};
+    use super::{
+        CanonicalStateScan, EntityProjectionSpec, PlannedFilesystemFile, PlannedFilesystemState,
+        VersionScope,
+    };
     use crate::sql::catalog::{DynamicEntitySurfaceSpec, SurfaceRegistry};
     use std::collections::BTreeMap;
 
@@ -1022,5 +1066,24 @@ mod tests {
         assert_eq!(projection.schema_key, "lix_key_value");
         assert_eq!(scan.version_scope, VersionScope::ActiveVersion);
         assert!(scan.entity_projection.is_some());
+    }
+
+    #[test]
+    fn planned_filesystem_state_tracks_binary_payloads() {
+        let mut state = PlannedFilesystemState::default();
+        state.files.insert(
+            ("file".to_string(), "version".to_string()),
+            PlannedFilesystemFile {
+                file_id: "file".to_string(),
+                version_id: "version".to_string(),
+                untracked: false,
+                descriptor: None,
+                metadata_patch: super::OptionalTextPatch::Unchanged,
+                data: Some(vec![1, 2, 3]),
+                deleted: false,
+            },
+        );
+
+        assert!(state.has_binary_payloads());
     }
 }

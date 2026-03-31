@@ -10,7 +10,11 @@ use crate::checkpoint::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME};
 use crate::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
-use crate::live_state::{LiveReadContract, ScanConstraint, ScanField, ScanOperator};
+use crate::live_state::{
+    is_untracked_live_table, load_live_read_shape_for_table_name,
+    load_live_snapshot_rows_with_backend, LiveFilter, LiveFilterField, LiveFilterOp, LiveReadShape,
+    LiveSnapshotRow, LiveSnapshotStorage,
+};
 use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
     SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,
@@ -23,11 +27,6 @@ use crate::sql::executor::contracts::planned_statement::{
 use crate::sql::logical_plan::public_ir::{
     InsertOnConflictAction, PlannedStateRow, PlannedWrite, ResolvedWritePlan, WriteMode,
     WriteOperationKind,
-};
-use crate::sql::services::state_reader::{
-    is_untracked_live_table_name, live_storage_relation_exists, load_live_row_access,
-    load_live_row_access_for_table, projected_row_snapshot_json, scan_live_rows,
-    snapshot_json_from_row, LiveReadRow, LiveStorageLane,
 };
 use crate::{LixBackend, LixError, Value};
 
@@ -186,7 +185,7 @@ pub async fn validate_updates(
     let mut deleted_rows = Vec::new();
 
     for plan in plans {
-        let live_access = load_live_row_access_for_table(backend, &plan.table).await?;
+        let live_access = load_live_read_shape_for_table_name(backend, &plan.table).await?;
         let snapshot_projection = if live_access.is_some() {
             String::new()
         } else {
@@ -217,8 +216,13 @@ pub async fn validate_updates(
             let entity_id = value_to_string(&row[0], "entity_id")?;
             let schema_key = value_to_string(&row[4], "schema_key")?;
             let schema_version = value_to_string(&row[5], "schema_version")?;
-            let base_snapshot =
-                projected_row_snapshot_json(live_access.as_ref(), &schema_key, &row, 6, 6)?;
+            let base_snapshot = required_projected_row_snapshot_json(
+                live_access.as_ref(),
+                &schema_key,
+                &row,
+                6,
+                6,
+            )?;
             let snapshot = resolve_update_snapshot(plan, &base_snapshot, &schema_key)?;
             let storage = storage_kind_for_table(&plan.table);
 
@@ -316,6 +320,61 @@ pub async fn validate_updates(
     }
 
     Ok(())
+}
+
+fn required_projected_row_snapshot_json(
+    access: Option<&LiveReadShape>,
+    schema_key: &str,
+    row: &[Value],
+    first_projected_column: usize,
+    raw_snapshot_index: usize,
+) -> Result<JsonValue, LixError> {
+    let snapshot = match access {
+        Some(access) => access.snapshot_from_projected_row(
+            schema_key,
+            row,
+            first_projected_column,
+            raw_snapshot_index,
+        )?,
+        None => value_snapshot_json(row.get(raw_snapshot_index), schema_key)?,
+    };
+    snapshot.ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "projected row for schema '{}' did not contain a logical snapshot",
+                schema_key
+            ),
+        )
+    })
+}
+
+fn value_snapshot_json(
+    value: Option<&Value>,
+    schema_key: &str,
+) -> Result<Option<JsonValue>, LixError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Json(json)) => Ok(Some(json.clone())),
+        Some(Value::Text(text)) => serde_json::from_str::<JsonValue>(text)
+            .map(Some)
+            .map_err(|err| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "projected snapshot_content for schema '{}' is not valid JSON: {err}",
+                        schema_key
+                    ),
+                )
+            }),
+        Some(other) => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "projected snapshot_content for schema '{}' must be JSON, text, or null, got {other:?}",
+                schema_key
+            ),
+        )),
+    }
 }
 
 pub(crate) async fn validate_batch_local_write(
@@ -588,7 +647,7 @@ fn storage_kind_for_write_mode(mode: WriteMode) -> ConstraintStorageKind {
 }
 
 fn storage_kind_for_table(table: &str) -> ConstraintStorageKind {
-    if is_untracked_live_table_name(&table.to_ascii_lowercase()) {
+    if is_untracked_live_table(&table.to_ascii_lowercase()) {
         ConstraintStorageKind::Untracked
     } else {
         ConstraintStorageKind::Tracked
@@ -1649,113 +1708,58 @@ async fn query_committed_scope_rows(
     backend: &dyn LixBackend,
     scope: &ConstraintScopeKey,
 ) -> Result<Vec<ConstraintCommittedRow>, LixError> {
-    let storage = match scope.storage {
-        ConstraintStorageKind::Tracked => LiveStorageLane::Tracked,
-        ConstraintStorageKind::Untracked => LiveStorageLane::Untracked,
-    };
-    if !live_storage_relation_exists(backend, storage, &scope.schema_key).await? {
-        return Ok(Vec::new());
-    }
-    let access = load_live_row_access(backend, &scope.schema_key).await?;
-    let required_columns = access
-        .columns()
-        .iter()
-        .map(|column| column.property_name.clone())
-        .collect::<Vec<_>>();
-    let constraints = vec![ScanConstraint {
-        field: ScanField::FileId,
-        operator: ScanOperator::Eq(Value::Text(scope.file_id.clone())),
-    }];
-
-    match scope.storage {
-        ConstraintStorageKind::Tracked => scan_live_rows(
-            backend,
-            LiveStorageLane::Tracked,
-            &scope.schema_key,
-            &scope.version_id,
-            &constraints,
-            &required_columns,
-        )
-        .await?
-        .into_iter()
-        .map(|row| committed_row_from_raw(&scope.schema_key, &scope.version_id, &access, row))
-        .collect(),
-        ConstraintStorageKind::Untracked => scan_live_rows(
-            backend,
-            LiveStorageLane::Untracked,
-            &scope.schema_key,
-            &scope.version_id,
-            &constraints,
-            &required_columns,
-        )
-        .await?
-        .into_iter()
-        .map(|row| committed_row_from_raw(&scope.schema_key, &scope.version_id, &access, row))
-        .collect(),
-    }
+    load_live_snapshot_rows_with_backend(
+        backend,
+        live_snapshot_storage(scope.storage),
+        &scope.schema_key,
+        &scope.version_id,
+        &[LiveFilter {
+            field: LiveFilterField::FileId,
+            operator: LiveFilterOp::Eq(Value::Text(scope.file_id.clone())),
+        }],
+    )
+    .await?
+    .into_iter()
+    .map(committed_row_from_snapshot_row)
+    .collect()
 }
 
 async fn query_committed_schema_version_rows(
     backend: &dyn LixBackend,
     scope: &ConstraintSchemaVersionKey,
 ) -> Result<Vec<ConstraintCommittedRow>, LixError> {
-    let storage = match scope.storage {
-        ConstraintStorageKind::Tracked => LiveStorageLane::Tracked,
-        ConstraintStorageKind::Untracked => LiveStorageLane::Untracked,
-    };
-    if !live_storage_relation_exists(backend, storage, &scope.schema_key).await? {
-        return Ok(Vec::new());
-    }
-    let access = load_live_row_access(backend, &scope.schema_key).await?;
-    let required_columns = access
-        .columns()
-        .iter()
-        .map(|column| column.property_name.clone())
-        .collect::<Vec<_>>();
+    load_live_snapshot_rows_with_backend(
+        backend,
+        live_snapshot_storage(scope.storage),
+        &scope.schema_key,
+        &scope.version_id,
+        &[],
+    )
+    .await?
+    .into_iter()
+    .map(committed_row_from_snapshot_row)
+    .collect()
+}
 
-    match scope.storage {
-        ConstraintStorageKind::Tracked => scan_live_rows(
-            backend,
-            LiveStorageLane::Tracked,
-            &scope.schema_key,
-            &scope.version_id,
-            &[],
-            &required_columns,
-        )
-        .await?
-        .into_iter()
-        .map(|row| committed_row_from_raw(&scope.schema_key, &scope.version_id, &access, row))
-        .collect(),
-        ConstraintStorageKind::Untracked => scan_live_rows(
-            backend,
-            LiveStorageLane::Untracked,
-            &scope.schema_key,
-            &scope.version_id,
-            &[],
-            &required_columns,
-        )
-        .await?
-        .into_iter()
-        .map(|row| committed_row_from_raw(&scope.schema_key, &scope.version_id, &access, row))
-        .collect(),
+fn live_snapshot_storage(storage: ConstraintStorageKind) -> LiveSnapshotStorage {
+    match storage {
+        ConstraintStorageKind::Tracked => LiveSnapshotStorage::Tracked,
+        ConstraintStorageKind::Untracked => LiveSnapshotStorage::Untracked,
     }
 }
 
-fn committed_row_from_raw(
-    schema_key: &str,
-    version_id: &str,
-    access: &LiveReadContract,
-    row: LiveReadRow,
+fn committed_row_from_snapshot_row(
+    row: LiveSnapshotRow,
 ) -> Result<ConstraintCommittedRow, LixError> {
     Ok(ConstraintCommittedRow {
         identity: ConstraintRowIdentity {
-            entity_id: row.entity_id().to_string(),
-            schema_key: schema_key.to_string(),
-            file_id: row.file_id().to_string(),
-            version_id: version_id.to_string(),
+            entity_id: row.entity_id,
+            schema_key: row.schema_key,
+            file_id: row.file_id,
+            version_id: row.version_id,
         },
-        schema_version: row.schema_version().to_string(),
-        snapshot: snapshot_json_from_row(access, &row)?,
+        schema_version: row.schema_version,
+        snapshot: row.snapshot,
     })
 }
 

@@ -8,13 +8,11 @@ use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateAssignments, CanonicalStateRowKey, InsertOnConflictAction,
 };
-use crate::sql::semantic_ir::semantics::effective_state_resolver::resolve_exact_effective_state_row_with_pending_transaction_view;
 use crate::sql::semantic_ir::semantics::state_assignments::{
     apply_entity_state_assignments, apply_state_assignments, assignments_from_payload,
     build_entity_insert_rows_with_functions, build_state_insert_row,
     ensure_identity_columns_preserved, EntityAssignmentsSemantics, EntityInsertSemantics,
 };
-use crate::transaction::PendingTransactionView;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
@@ -26,9 +24,8 @@ fn authoritative_version_id_for_effective_row(current_row: &ExactEffectiveStateR
 }
 
 async fn query_entity_selector_rows(
-    backend: &dyn LixBackend,
+    hydrator: &PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError> {
     let selector = canonical_state_selector(planned_write);
     let mut selector_columns = vec!["lixcol_entity_id"];
@@ -36,9 +33,9 @@ async fn query_entity_selector_rows(
         selector_columns.push(version_column);
     }
     let query_result = execute_public_selector_query_strict(
-        backend,
+        hydrator.backend(),
         planned_write,
-        pending_transaction_view,
+        hydrator.pending_transaction_view(),
         build_public_selector_query(
             &planned_write.command.target.descriptor.public_name,
             &selector,
@@ -75,9 +72,8 @@ async fn query_entity_selector_rows(
 }
 
 async fn query_state_selector_rows(
-    backend: &dyn LixBackend,
+    hydrator: &PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError> {
     let selector = canonical_state_selector(planned_write);
     let mut selector_columns = vec!["entity_id", "file_id", "plugin_key", "schema_version"];
@@ -87,9 +83,9 @@ async fn query_state_selector_rows(
     selector_columns.push("global");
     selector_columns.push("untracked");
     let query_result = execute_public_selector_query_strict(
-        backend,
+        hydrator.backend(),
         planned_write,
-        pending_transaction_view,
+        hydrator.pending_transaction_view(),
         build_public_selector_query(
             &planned_write.command.target.descriptor.public_name,
             &selector,
@@ -239,22 +235,20 @@ fn authoritative_pre_state_row_for_effective_row(
 }
 
 pub(super) async fn resolve_state_write<P>(
-    backend: &dyn LixBackend,
+    hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
     functions: SharedFunctionProvider<P>,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let mut provider = SqlRegisteredSchemaProvider::new(backend);
+    let mut provider = SqlRegisteredSchemaProvider::new(hydrator.backend());
     let state_schema = load_optional_annotation_schema(&mut provider, planned_write)
         .await
         .map_err(write_resolve_backend_error)?;
     resolve_state_backed_write(
-        backend,
+        hydrator,
         planned_write,
-        pending_transaction_view,
         StateBackedSurface::State(state_schema.as_ref()),
         functions,
     )
@@ -262,23 +256,21 @@ where
 }
 
 pub(super) async fn resolve_entity_write<P>(
-    backend: &dyn LixBackend,
+    hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
     functions: SharedFunctionProvider<P>,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let mut provider = SqlRegisteredSchemaProvider::new(backend);
+    let mut provider = SqlRegisteredSchemaProvider::new(hydrator.backend());
     let entity_schema = load_entity_schema(&mut provider, planned_write)
         .await
         .map_err(write_resolve_backend_error)?;
     reject_unsupported_entity_overrides(planned_write, &entity_schema)?;
     resolve_state_backed_write(
-        backend,
+        hydrator,
         planned_write,
-        pending_transaction_view,
         StateBackedSurface::Entity(&entity_schema),
         functions,
     )
@@ -414,8 +406,7 @@ impl StateBackedSurface<'_> {
 
     async fn resolve_insert_conflict_row(
         self,
-        backend: &dyn LixBackend,
-        pending_transaction_view: Option<&PendingTransactionView>,
+        hydrator: &PublicWriteHydrator<'_>,
         _planned_write: &PlannedWrite,
         row: &PlannedStateRow,
     ) -> Result<Option<ExactEffectiveStateRow>, WriteResolveError> {
@@ -425,69 +416,53 @@ impl StateBackedSurface<'_> {
                     message: "public state insert resolver requires a concrete version_id"
                         .to_string(),
                 })?;
-                resolve_exact_effective_state_row_with_pending_transaction_view(
-                    backend,
-                    &ExactEffectiveStateRowRequest {
+                hydrator
+                    .resolve_exact_effective_state_row(&ExactEffectiveStateRowRequest {
                         schema_key: row.schema_key.clone(),
                         version_id,
                         row_key: state_insert_row_key(row),
                         include_global_overlay: true,
                         include_untracked_overlay: true,
-                    },
-                    pending_transaction_view,
-                )
-                .await
-                .map_err(write_resolve_backend_error)
+                    })
+                    .await
+                    .map_err(write_resolve_backend_error)
             }
             Self::Entity(entity_schema) => {
                 let version_id = row.version_id.clone().ok_or_else(|| WriteResolveError {
                     message: "public entity insert resolver requires a concrete version_id"
                         .to_string(),
                 })?;
-                resolve_exact_effective_state_row_with_pending_transaction_view(
-                    backend,
-                    &ExactEffectiveStateRowRequest {
+                hydrator
+                    .resolve_exact_effective_state_row(&ExactEffectiveStateRowRequest {
                         schema_key: entity_schema.annotations.schema_key.clone(),
                         version_id,
                         row_key: entity_insert_row_key(entity_schema, row)?,
                         include_global_overlay: true,
                         include_untracked_overlay: true,
-                    },
-                    pending_transaction_view,
-                )
-                .await
-                .map_err(write_resolve_backend_error)
+                    })
+                    .await
+                    .map_err(write_resolve_backend_error)
             }
         }
     }
 
     async fn resolve_target_rows(
         self,
-        backend: &dyn LixBackend,
+        hydrator: &PublicWriteHydrator<'_>,
         planned_write: &PlannedWrite,
-        pending_transaction_view: Option<&PendingTransactionView>,
     ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
         match self {
-            Self::State(_) => {
-                resolve_target_state_rows(backend, planned_write, pending_transaction_view).await
-            }
+            Self::State(_) => resolve_target_state_rows(hydrator, planned_write).await,
             Self::Entity(entity_schema) => {
-                resolve_target_entity_rows(
-                    backend,
-                    planned_write,
-                    entity_schema,
-                    pending_transaction_view,
-                )
-                .await
+                resolve_target_entity_rows(hydrator, planned_write, entity_schema).await
             }
         }
     }
 }
 
 async fn resolve_state_backed_write<P>(
-    backend: &dyn LixBackend,
+    hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
     surface: StateBackedSurface<'_>,
     functions: SharedFunctionProvider<P>,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
@@ -496,38 +471,24 @@ where
 {
     match planned_write.command.operation_kind {
         WriteOperationKind::Insert => {
-            resolve_state_backed_insert_write(
-                backend,
-                planned_write,
-                pending_transaction_view,
-                surface,
-                functions,
-            )
-            .await
+            resolve_state_backed_insert_write(hydrator, planned_write, surface, functions).await
         }
         WriteOperationKind::Update | WriteOperationKind::Delete => {
-            resolve_state_backed_existing_write(
-                backend,
-                planned_write,
-                pending_transaction_view,
-                surface,
-            )
-            .await
+            resolve_state_backed_existing_write(hydrator, planned_write, surface).await
         }
     }
 }
 
 async fn resolve_state_backed_insert_write<P>(
-    backend: &dyn LixBackend,
+    hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
     surface: StateBackedSurface<'_>,
     functions: SharedFunctionProvider<P>,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let row_version_ids = resolved_insert_version_ids(backend, planned_write).await?;
+    let row_version_ids = resolved_insert_version_ids(hydrator, planned_write).await?;
     let rows = surface.build_insert_rows(planned_write, &row_version_ids, functions)?;
     let payloads = payload_maps(planned_write)?;
     if rows.len() != payloads.len() {
@@ -542,7 +503,7 @@ where
         let default_execution_mode = default_execution_mode_for_request(row_requested_mode);
         if let Some(conflict) = planned_write.command.on_conflict.as_ref() {
             if let Some(current_row) = surface
-                .resolve_insert_conflict_row(backend, pending_transaction_view, planned_write, &row)
+                .resolve_insert_conflict_row(hydrator, planned_write, &row)
                 .await?
             {
                 if conflict.action == InsertOnConflictAction::DoNothing {
@@ -597,25 +558,19 @@ where
 }
 
 async fn resolve_state_backed_existing_write(
-    backend: &dyn LixBackend,
+    hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
     surface: StateBackedSurface<'_>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let _ = resolved_existing_version_ids(backend, planned_write).await?;
+    let _ = resolved_existing_version_ids(hydrator, planned_write).await?;
     let current_rows = match surface {
         StateBackedSurface::State(_)
             if planned_write.command.selector.exact_only
                 && state_selector_targets_single_effective_row(planned_write) =>
         {
-            resolve_exact_state_target_rows(backend, planned_write, pending_transaction_view)
-                .await?
+            resolve_exact_state_target_rows(hydrator, planned_write).await?
         }
-        _ => {
-            surface
-                .resolve_target_rows(backend, planned_write, pending_transaction_view)
-                .await?
-        }
+        _ => surface.resolve_target_rows(hydrator, planned_write).await?,
     };
     resolve_state_backed_existing_write_from_rows(surface, planned_write, current_rows)
 }
@@ -958,27 +913,23 @@ fn exact_selector_row_key(
 }
 
 async fn resolve_exact_state_target_rows(
-    backend: &dyn LixBackend,
+    hydrator: &PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
     let schema_key = resolved_schema_key(planned_write)?;
     let version_id = resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
         message: "public existing-row write resolver requires a concrete version_id".to_string(),
     })?;
-    let current_row = resolve_exact_effective_state_row_with_pending_transaction_view(
-        backend,
-        &ExactEffectiveStateRowRequest {
+    let current_row = hydrator
+        .resolve_exact_effective_state_row(&ExactEffectiveStateRowRequest {
             schema_key,
             version_id,
             row_key: exact_selector_row_key(planned_write)?,
             include_global_overlay: true,
             include_untracked_overlay: true,
-        },
-        pending_transaction_view,
-    )
-    .await
-    .map_err(write_resolve_backend_error)?;
+        })
+        .await
+        .map_err(write_resolve_backend_error)?;
     Ok(current_row.into_iter().collect())
 }
 
@@ -996,31 +947,26 @@ fn state_insert_row_key(row: &PlannedStateRow) -> CanonicalStateRowKey {
 }
 
 async fn resolve_target_entity_rows(
-    backend: &dyn LixBackend,
+    hydrator: &PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
     entity_schema: &EntityWriteSchema,
-    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
-    let selector_rows =
-        query_entity_selector_rows(backend, planned_write, pending_transaction_view).await?;
+    let selector_rows = query_entity_selector_rows(hydrator, planned_write).await?;
     let mut rows = Vec::new();
     for selector_row in selector_rows {
         let version_id =
             selector_row_version_id(planned_write, selector_row.version_id.as_deref())?;
         let row_key = entity_state_row_key(planned_write, entity_schema, &selector_row.entity_id)?;
-        let Some(current_row) = resolve_exact_effective_state_row_with_pending_transaction_view(
-            backend,
-            &ExactEffectiveStateRowRequest {
+        let Some(current_row) = hydrator
+            .resolve_exact_effective_state_row(&ExactEffectiveStateRowRequest {
                 schema_key: entity_schema.annotations.schema_key.clone(),
                 version_id,
                 row_key,
                 include_global_overlay: true,
                 include_untracked_overlay: true,
-            },
-            pending_transaction_view,
-        )
-        .await
-        .map_err(write_resolve_backend_error)?
+            })
+            .await
+            .map_err(write_resolve_backend_error)?
         else {
             continue;
         };
@@ -1030,30 +976,25 @@ async fn resolve_target_entity_rows(
 }
 
 async fn resolve_target_state_rows(
-    backend: &dyn LixBackend,
+    hydrator: &PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
     let schema_key = resolved_schema_key(planned_write)?;
-    let selector_rows =
-        query_state_selector_rows(backend, planned_write, pending_transaction_view).await?;
+    let selector_rows = query_state_selector_rows(hydrator, planned_write).await?;
     let mut rows = Vec::new();
     for selector_row in selector_rows {
         let version_id =
             selector_row_version_id(planned_write, selector_row.version_id.as_deref())?;
-        let Some(current_row) = resolve_exact_effective_state_row_with_pending_transaction_view(
-            backend,
-            &ExactEffectiveStateRowRequest {
+        let Some(current_row) = hydrator
+            .resolve_exact_effective_state_row(&ExactEffectiveStateRowRequest {
                 schema_key: schema_key.clone(),
                 version_id,
                 row_key: selector_row,
                 include_global_overlay: true,
                 include_untracked_overlay: true,
-            },
-            pending_transaction_view,
-        )
-        .await
-        .map_err(write_resolve_backend_error)?
+            })
+            .await
+            .map_err(write_resolve_backend_error)?
         else {
             continue;
         };

@@ -4,6 +4,7 @@
 //! semantic IR.
 
 pub(crate) mod canonicalize;
+pub(crate) mod hydration;
 pub(crate) mod internal;
 pub(crate) mod public;
 pub(crate) mod semantics;

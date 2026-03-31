@@ -3,6 +3,22 @@
 //! The long-term ownership model is stage-oriented:
 //! parser -> binder -> semantic IR -> logical plan -> routing / optimizer
 //! -> physical plan -> executor -> explain.
+//!
+//! Post-Plan-20 dependency rules:
+//!
+//! - compiler-core SQL may depend on owner-owned contracts from
+//!   `canonical/read/*`, `refs/*`, `version/*`, root-level `live_state`, and
+//!   `workspace::writer_key::*` where workspace-owned facts are required
+//! - compiler-core SQL must not depend on `commit/*`
+//! - compiler-core SQL must not depend on `canonical/journal/*` or
+//!   `canonical/graph/*` implementation details
+//! - SQL should not grow a compiler-owned cross-subsystem capability hub
+//! - cross-owner read glue should live in owner-owned contracts or
+//!   stage-owned helpers, not in `sql/services/*`
+//! - current-state access from compiler-core should use owner-owned logical
+//!   `live_state` contracts, not concrete row/scan contracts
+//! - direct `filesystem::*` imports inside compiler-core remain explicit
+//!   tracked debt during the Plan 9 hardening work
 
 pub(crate) mod analysis;
 pub(crate) mod ast;

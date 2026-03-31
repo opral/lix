@@ -22,7 +22,8 @@ use super::derive_effects::derive_plan_effects;
 use super::derive_requirements::derive_plan_requirements;
 use super::execution_program::{BoundStatementTemplateInstance, StatementTemplateOwnership};
 use super::intent::{
-    collect_execution_intent_with_backend, ExecutionIntent, IntentCollectionPolicy,
+    collect_execution_intent_with_backend, filesystem_transaction_state_from_planned,
+    ExecutionIntent, IntentCollectionPolicy,
 };
 use super::preprocess::preprocess_with_surfaces_to_logical_plan;
 use super::public_runtime::{
@@ -147,13 +148,7 @@ async fn compile_execution_with_backend(
                 .planned_write
                 .resolved_write_plan
                 .as_ref()
-                .is_some_and(|resolved| {
-                    resolved
-                        .filesystem_state()
-                        .files
-                        .values()
-                        .any(|file| file.data.is_some())
-                })
+                .is_some_and(|resolved| resolved.filesystem_state().has_binary_payloads())
         });
 
     let public_read_owns_execution = public_read.is_some();
@@ -528,7 +523,7 @@ fn derived_public_execution_intent(
     };
 
     crate::sql::executor::intent::ExecutionIntent {
-        filesystem_state: resolved.filesystem_state(),
+        filesystem_state: filesystem_transaction_state_from_planned(&resolved.filesystem_state()),
     }
 }
 

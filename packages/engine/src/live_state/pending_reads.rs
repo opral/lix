@@ -13,10 +13,6 @@ use crate::sql::executor::{
     execute_prepared_public_read_without_freshness_check, PreparedPublicRead,
 };
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
-use crate::sql::services::state_reader::{
-    normalized_values_from_snapshot, scan_live_rows, snapshot_text_from_row, LiveReadRow,
-    LiveStorageLane,
-};
 use crate::transaction::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
     PendingSemanticRow, PendingSemanticStorage, PendingTransactionView,
@@ -28,6 +24,8 @@ use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, OrderBy, OrderByExpr,
     OrderByKind, SelectItem, UnaryOperator, Value as SqlValue,
 };
+
+use super::{scan_live_rows, LiveReadRow, LiveStorageLane};
 
 const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -862,7 +860,7 @@ fn visible_live_row_from_raw(
     access: &LiveReadContract,
     row: LiveReadRow,
 ) -> Result<OverlayVisibleLiveRow, LixError> {
-    let snapshot_content = snapshot_text_from_row(access, &row)?;
+    let snapshot_content = row.snapshot_text(access)?;
     Ok(OverlayVisibleLiveRow {
         entity_id: row.entity_id().to_string(),
         schema_key: row.schema_key().to_string(),
@@ -893,10 +891,7 @@ fn visible_live_row_from_pending(
         change_id: None,
         snapshot_content: pending.snapshot_content.clone(),
         is_tombstone: pending.tombstone,
-        normalized_values: normalized_values_from_snapshot(
-            access,
-            pending.snapshot_content.as_deref(),
-        )?,
+        normalized_values: access.normalized_values(pending.snapshot_content.as_deref())?,
     })
 }
 
@@ -929,7 +924,7 @@ fn visible_live_row_from_pending_filesystem_state(
         change_id: None,
         snapshot_content: Some(snapshot_content.clone()),
         is_tombstone: false,
-        normalized_values: normalized_values_from_snapshot(access, Some(&snapshot_content)).ok()?,
+        normalized_values: access.normalized_values(Some(&snapshot_content)).ok()?,
     })
 }
 

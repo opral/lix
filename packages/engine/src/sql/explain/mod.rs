@@ -5,9 +5,6 @@
 
 use crate::backend::prepared::PreparedStatement;
 use crate::backend::SqlDialect;
-use crate::filesystem::runtime::{
-    FilesystemDescriptorState, FilesystemTransactionFileState, FilesystemTransactionState,
-};
 use crate::session::contracts::{SessionDependency, SessionStateDelta};
 use crate::sql::backend::{PushdownDecision, PushdownSupport};
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
@@ -42,11 +39,11 @@ use crate::sql::logical_plan::public_ir::{
     BroadSqlFunctionArgExpr, BroadSqlFunctionArguments, CanonicalAdminKind, CanonicalAdminScan,
     CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan, CanonicalWorkingChangesScan,
     CommitPreconditions, ExpectedHead, FilesystemKind, InsertOnConflict, InsertOnConflictAction,
-    MutationPayload, NormalizedPublicReadQuery, OptionalTextPatch, PlannedStateRow, PlannedWrite,
-    ReadCommand, ReadContract, ReadPlan, ResolvedRowRef, ResolvedWritePartition, ResolvedWritePlan,
-    RowLineage, SchemaProof, ScopeProof, StateSourceKind, StructuredPublicRead, TargetSetProof,
-    VersionScope, WriteCommand, WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
-    WriteSelector,
+    MutationPayload, NormalizedPublicReadQuery, OptionalTextPatch, PlannedFilesystemDescriptor,
+    PlannedFilesystemFile, PlannedFilesystemState, PlannedStateRow, PlannedWrite, ReadCommand,
+    ReadContract, ReadPlan, ResolvedRowRef, ResolvedWritePartition, ResolvedWritePlan, RowLineage,
+    SchemaProof, ScopeProof, StateSourceKind, StructuredPublicRead, TargetSetProof, VersionScope,
+    WriteCommand, WriteLane, WriteMode, WriteModeRequest, WriteOperationKind, WriteSelector,
 };
 use crate::sql::logical_plan::{
     DependencyPrecision, DependencySpec, InternalLogicalPlan, LogicalPlan, PublicReadLogicalPlan,
@@ -5120,7 +5117,7 @@ fn row_lineage_snapshot(lineage: &RowLineage) -> RowLineageSnapshot {
 }
 
 fn filesystem_transaction_state_snapshot(
-    state: &FilesystemTransactionState,
+    state: &PlannedFilesystemState,
 ) -> FilesystemTransactionStateSnapshot {
     FilesystemTransactionStateSnapshot {
         files: state
@@ -5132,7 +5129,7 @@ fn filesystem_transaction_state_snapshot(
 }
 
 fn filesystem_transaction_file_state_snapshot(
-    state: &FilesystemTransactionFileState,
+    state: &PlannedFilesystemFile,
 ) -> FilesystemTransactionFileStateSnapshot {
     FilesystemTransactionFileStateSnapshot {
         file_id: state.file_id.clone(),
@@ -5150,7 +5147,7 @@ fn filesystem_transaction_file_state_snapshot(
 }
 
 fn filesystem_descriptor_state_snapshot(
-    state: &FilesystemDescriptorState,
+    state: &PlannedFilesystemDescriptor,
 ) -> FilesystemDescriptorStateSnapshot {
     FilesystemDescriptorStateSnapshot {
         directory_id: state.directory_id.clone(),
