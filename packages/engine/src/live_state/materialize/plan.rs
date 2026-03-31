@@ -10,15 +10,14 @@ use super::types::{
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 use crate::backend::QueryExecutor;
-use crate::canonical::lineage::{
+use crate::canonical::graph::{
     build_version_commit_depth_map, build_version_head_map, collect_commit_edges,
     min_depth_by_commit, VersionCommitDepthMap, VersionHeadMap,
 };
-use crate::canonical::roots::load_all_version_head_commit_ids;
-use crate::live_state::ReplayCursor;
+use crate::refs::load_all_version_head_commit_ids;
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{CanonicalJson, LixBackend, LixError};
+use crate::{CanonicalJson, LixBackend, LixError, ReplayCursor};
 
 #[derive(Debug, Clone)]
 struct VisibleRow {
@@ -587,7 +586,11 @@ async fn load_version_heads_from_canonical(
     stats: &mut Vec<StageStat>,
 ) -> Result<VersionHeadMap, LixError> {
     let root_version_refs = load_all_version_head_commit_ids(executor).await?;
-    let heads = build_version_head_map(&root_version_refs);
+    let root_heads = root_version_refs
+        .iter()
+        .map(|row| (row.version_id.clone(), row.commit_id.clone()))
+        .collect::<Vec<_>>();
+    let heads = build_version_head_map(&root_heads);
 
     stats.push(StageStat {
         stage: "version_ref_heads".to_string(),

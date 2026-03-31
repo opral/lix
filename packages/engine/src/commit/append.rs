@@ -4,20 +4,20 @@ use crate::filesystem::runtime::{
 use crate::functions::LixFunctionProvider;
 use crate::{LixBackendTransaction, LixError};
 
-use super::create_commit::create_commit;
-pub(crate) use super::create_commit::{
+use super::create::create_commit;
+pub(crate) use super::create::{
     CreateCommitAppliedOutput, CreateCommitArgs, CreateCommitDisposition, CreateCommitError,
     CreateCommitErrorKind, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
     CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitResult,
     CreateCommitWriteLane,
 };
-use super::pending_session::{
+use super::pending::{
     build_pending_public_commit_session, create_commit_error_to_lix_error,
     merge_public_domain_change_batch_into_pending_commit, pending_session_matches_create_commit,
     PendingPublicCommitSession,
 };
 use super::receipt::CanonicalCommitReceipt;
-use super::ProposedDomainChange;
+use super::types::ProposedDomainChange;
 
 pub(crate) struct BufferedTrackedAppendArgs {
     pub(crate) timestamp: Option<String>,
@@ -265,8 +265,8 @@ mod tests {
         }
     }
 
-    fn sample_change() -> crate::canonical::ProposedDomainChange {
-        crate::canonical::ProposedDomainChange {
+    fn sample_change() -> crate::commit::ProposedDomainChange {
+        crate::commit::ProposedDomainChange {
             entity_id: "entity-1".try_into().unwrap(),
             schema_key: "lix_key_value".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),

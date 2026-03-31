@@ -3,13 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value as JsonValue;
 
 use crate::backend::prepared::{PreparedBatch, PreparedStatement};
+use crate::canonical::journal::CanonicalCommitOutput;
+use crate::canonical::read::CommitQueryExecutor;
 use crate::sql::binder::bind_sql;
 use crate::Value as EngineValue;
 use crate::{LixError, SqlDialect};
-
-use super::graph_sql::build_commit_generation_seed_sql as build_commit_generation_seed_sql_impl;
-use super::state_source::CommitQueryExecutor;
-use super::types::CanonicalCommitOutput;
 
 pub(crate) const COMMIT_GRAPH_NODE_TABLE: &str = "lix_internal_commit_graph_node";
 
@@ -203,8 +201,4 @@ fn resolve_commit_generation(
     let generation = max_parent_generation + 1;
     resolved.insert(commit_id.to_string(), generation);
     Ok(generation)
-}
-
-pub(crate) fn build_commit_generation_seed_sql(dialect: SqlDialect) -> String {
-    build_commit_generation_seed_sql_impl(dialect)
 }

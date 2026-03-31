@@ -1,7 +1,12 @@
+//! Replica-local root resolution over committed version-head state.
+//!
+//! This module maps requested lineage scopes and version scopes onto the local
+//! committed heads selected by `refs/version_heads.rs`.
+
 use crate::backend::QueryExecutor;
 use crate::{LixBackend, LixError};
 
-use super::refs::{
+use super::version_heads::{
     load_all_committed_version_refs_with_executor, load_committed_version_ref_with_executor,
 };
 
@@ -48,20 +53,6 @@ pub(crate) enum HistoryRootTraversal {
 pub(crate) struct HistoryRootFacts {
     pub(crate) traversal: HistoryRootTraversal,
     pub(crate) root_version_refs: Vec<ResolvedRootCommit>,
-}
-
-pub(crate) async fn load_committed_version_head_commit_id(
-    executor: &mut dyn QueryExecutor,
-    version_id: &str,
-) -> Result<Option<String>, LixError> {
-    super::refs::load_committed_version_head_commit_id(executor, version_id).await
-}
-
-pub(crate) async fn load_head_commit_id_for_version(
-    executor: &mut dyn QueryExecutor,
-    version_id: &str,
-) -> Result<Option<String>, LixError> {
-    load_committed_version_head_commit_id(executor, version_id).await
 }
 
 pub(crate) async fn load_all_version_head_commit_ids(

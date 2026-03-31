@@ -40,7 +40,6 @@ pub(crate) mod pending_reads;
 pub(crate) mod projection;
 mod public_read_sql;
 pub(crate) mod raw;
-mod replay_cursor;
 pub(crate) mod schema_access;
 pub(crate) mod shared;
 mod storage;
@@ -48,9 +47,8 @@ mod storage;
 pub(crate) mod testing;
 pub mod tracked;
 pub mod untracked;
-use crate::backend::QueryExecutor;
 use crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
-use crate::{LixBackend, LixBackendTransaction, LixError, SqlDialect, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, ReplayCursor, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
@@ -102,7 +100,6 @@ pub(crate) use pending_reads::{
 pub use projection::{
     DerivedProjectionId, DerivedProjectionStatus, ProjectionReplayMode, ProjectionStatus,
 };
-pub use replay_cursor::ReplayCursor;
 pub(crate) use schema_access::LiveReadContract;
 pub use shared::identity::RowIdentity;
 pub(crate) use shared::query::entity_id_in_constraint;
@@ -334,14 +331,14 @@ pub(crate) async fn load_latest_live_state_replay_cursor_with_backend(
 
 pub(crate) async fn apply_canonical_receipt_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    receipt: &crate::canonical::CanonicalCommitReceipt,
+    receipt: &crate::commit::CanonicalCommitReceipt,
 ) -> Result<(), LixError> {
     projection::apply_canonical_receipt_in_transaction(transaction, receipt).await
 }
 
 pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    receipt: &crate::canonical::CanonicalCommitReceipt,
+    receipt: &crate::commit::CanonicalCommitReceipt,
     tracked_writer_key_hints: &BTreeMap<RowIdentity, Option<String>>,
 ) -> Result<(), LixError> {
     projection::apply_commit_projections_best_effort_in_transaction(
@@ -434,22 +431,11 @@ pub(crate) fn build_working_changes_public_read_source_sql(
     public_read_sql::build_working_changes_public_read_source_sql(dialect, active_version_id)
 }
 
-pub(crate) fn build_local_version_ref_heads_source_sql() -> String {
-    public_read_sql::build_local_version_ref_heads_source_sql()
-}
-
 pub(crate) async fn live_storage_relation_exists_with_backend(
     backend: &dyn LixBackend,
     schema_key: &str,
 ) -> Result<bool, LixError> {
     schema_access::live_storage_relation_exists_with_backend(backend, schema_key).await
-}
-
-pub(crate) async fn live_storage_relation_exists_with_executor(
-    executor: &mut dyn QueryExecutor,
-    schema_key: &str,
-) -> Result<bool, LixError> {
-    schema_access::live_storage_relation_exists_with_executor(executor, schema_key).await
 }
 
 pub(crate) async fn apply_tracked_write_batch_in_transaction(

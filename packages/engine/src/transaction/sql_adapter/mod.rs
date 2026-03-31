@@ -8,7 +8,7 @@ mod runtime;
 mod tracked_apply;
 mod untracked_apply;
 
-pub(crate) use crate::canonical::pending_session::PendingPublicCommitSession;
+pub(crate) use crate::commit::PendingPublicCommitSession;
 pub(crate) use crate::filesystem::runtime::{
     build_filesystem_payload_domain_changes_insert,
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,

@@ -1,6 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::program_runner::execute_write_program_with_transaction;
+use crate::canonical::graph::{
+    build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
+};
+use crate::canonical::journal::{
+    build_prepared_batch_from_canonical_output, CanonicalCommitOutput,
+};
+use crate::canonical::read::{
+    load_exact_committed_state_row_at_version_head_with_executor, load_version_info_for_versions,
+    CommitQueryExecutor, ExactCommittedStateRowRequest, VersionInfo, VersionSnapshot,
+};
 use crate::canonical_json::CanonicalJson;
 use crate::deterministic_mode::{
     build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
@@ -14,32 +24,23 @@ use crate::filesystem::runtime::{
     FILESYSTEM_FILE_SCHEMA_VERSION,
 };
 use crate::functions::LixFunctionProvider;
+use crate::refs::load_committed_version_head_commit_id;
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::SqlDialect;
 use crate::{CanonicalSchemaKey, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
 
-use super::change_log::build_prepared_batch_from_canonical_output;
-use super::create_commit_preflight::{
+use super::generate::generate_commit;
+use super::preflight::{
     load_create_commit_deterministic_sequence_start as load_create_commit_deterministic_sequence_start_impl,
     load_untracked_file_descriptor as load_untracked_file_descriptor_impl,
-};
-use super::generate_commit::generate_commit;
-use super::graph_index::{
-    build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
 };
 use super::receipt::{
     latest_replay_cursor_from_change_rows, CanonicalCommitReceipt, UpdatedVersionRef,
 };
-use super::roots::load_committed_version_head_commit_id;
-use super::state_source::{
-    load_exact_committed_state_row_at_version_head_with_executor, load_version_info_for_versions,
-    CommitQueryExecutor, ExactCommittedStateRowRequest,
-};
 use super::types::{
-    CanonicalCommitOutput, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
-    ProposedDomainChange, VersionInfo, VersionSnapshot,
+    DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange,
 };
 
 const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
@@ -59,6 +60,7 @@ pub(crate) enum CreateCommitWriteLane {
 pub(crate) enum CreateCommitExpectedHead {
     CurrentHead,
     CommitId(String),
+    #[allow(dead_code)]
     CreateIfMissing,
 }
 
@@ -147,7 +149,6 @@ pub(crate) enum CreateCommitErrorKind {
     MissingDomainField,
     MissingWriteLane,
     TipDrift,
-    UnsupportedWriteLane,
     Internal,
 }
 
@@ -1112,25 +1113,6 @@ async fn load_tracked_file_descriptor(
     parse_file_descriptor_preflight_row(&snapshot_content, metadata, false).map(Some)
 }
 
-fn parse_deterministic_sequence_snapshot(snapshot_content: &str) -> Result<i64, CreateCommitError> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(snapshot_content).map_err(|error| CreateCommitError {
-            kind: CreateCommitErrorKind::Internal,
-            message: format!(
-                "create commit preflight deterministic sequence snapshot could not be parsed: {error}"
-            ),
-        })?;
-    let value = parsed
-        .get("value")
-        .and_then(|value| match value {
-            serde_json::Value::Number(number) => number.as_i64(),
-            serde_json::Value::String(text) => text.parse::<i64>().ok(),
-            _ => None,
-        })
-        .unwrap_or(-1);
-    Ok(value + 1)
-}
-
 fn validate_change_versions(
     changes: &[ProposedDomainChange],
     filesystem_state: &FilesystemTransactionState,
@@ -1337,10 +1319,6 @@ fn value_as_text(value: &Value) -> Option<String> {
     }
 }
 
-fn quote_ident(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -1363,8 +1341,8 @@ mod tests {
         CreateCommitIdempotencyKey, CreateCommitInvariantChecker, CreateCommitPreconditions,
         CreateCommitWriteLane,
     };
-    use crate::canonical::receipt::UpdatedVersionRef;
-    use crate::canonical::types::{CanonicalCommitOutput, ChangeRow};
+    use crate::canonical::journal::{CanonicalCommitOutput, ChangeRow};
+    use crate::commit::receipt::UpdatedVersionRef;
     use crate::filesystem::runtime::{
         FilesystemTransactionFileState, FilesystemTransactionState, OptionalTextPatch,
     };
@@ -1457,7 +1435,7 @@ mod tests {
 
     fn create_commit_args(
         preconditions: CreateCommitPreconditions,
-        changes: Vec<crate::canonical::ProposedDomainChange>,
+        changes: Vec<crate::commit::ProposedDomainChange>,
         filesystem_state: FilesystemTransactionState,
     ) -> CreateCommitArgs {
         CreateCommitArgs {
@@ -1504,8 +1482,8 @@ mod tests {
         }
     }
 
-    fn sample_change() -> crate::canonical::ProposedDomainChange {
-        crate::canonical::ProposedDomainChange {
+    fn sample_change() -> crate::commit::ProposedDomainChange {
+        crate::commit::ProposedDomainChange {
             entity_id: "entity-1".try_into().unwrap(),
             schema_key: "lix_key_value".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
@@ -1518,8 +1496,8 @@ mod tests {
         }
     }
 
-    fn sample_global_change() -> crate::canonical::ProposedDomainChange {
-        crate::canonical::ProposedDomainChange {
+    fn sample_global_change() -> crate::commit::ProposedDomainChange {
+        crate::commit::ProposedDomainChange {
             entity_id: "version-a".try_into().unwrap(),
             schema_key: "lix_version_descriptor".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),

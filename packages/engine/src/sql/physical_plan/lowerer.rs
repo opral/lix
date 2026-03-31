@@ -998,7 +998,7 @@ fn build_admin_source_sql(
 ) -> Result<String, LixError> {
     Ok(match kind {
         CanonicalAdminKind::Version => {
-            crate::canonical::version_state::build_admin_version_source_sql(dialect)
+            crate::canonical::read::build_admin_version_source_sql(dialect)
         }
     })
 }
@@ -1010,7 +1010,7 @@ fn build_admin_source_sql_with_current_heads(
 ) -> Result<String, LixError> {
     Ok(match kind {
         CanonicalAdminKind::Version => {
-            crate::canonical::version_state::build_admin_version_source_sql_with_current_heads(
+            crate::canonical::read::build_admin_version_source_sql_with_current_heads(
                 dialect,
                 Some(current_version_heads),
             )

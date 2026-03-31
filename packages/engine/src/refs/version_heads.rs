@@ -6,14 +6,9 @@
 //! winner from canonical change order.
 
 use crate::backend::QueryExecutor;
-use crate::live_state::live_storage_relation_exists_with_executor;
-use crate::live_state::{
-    load_exact_untracked_row_with_executor, scan_untracked_rows_with_executor,
-    ExactUntrackedRowRequest, UntrackedRow, UntrackedScanRequest,
-};
 use crate::version::{
-    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-    version_ref_schema_version, version_ref_storage_version_id,
+    load_all_local_version_refs_with_executor, load_local_version_head_commit_id_with_executor,
+    load_local_version_ref_with_executor, LocalVersionRefRow,
 };
 use crate::{CommittedVersionFrontier, LixBackend, LixError};
 
@@ -35,27 +30,26 @@ pub(crate) async fn load_committed_version_ref_with_executor(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
 ) -> Result<Option<VersionRefRow>, LixError> {
-    load_committed_version_ref_from_local_state(executor, version_id).await
+    Ok(load_local_version_ref_with_executor(executor, version_id)
+        .await?
+        .map(version_ref_row_from_local))
 }
 
 pub(crate) async fn load_committed_version_head_commit_id(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
 ) -> Result<Option<String>, LixError> {
-    let Some(version_ref) = load_committed_version_ref_with_executor(executor, version_id).await?
-    else {
-        return Ok(None);
-    };
-    if version_ref.commit_id.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(version_ref.commit_id))
+    load_local_version_head_commit_id_with_executor(executor, version_id).await
 }
 
 pub(crate) async fn load_all_committed_version_refs_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<Vec<VersionRefRow>, LixError> {
-    load_all_committed_version_refs_from_local_state(executor).await
+    Ok(load_all_local_version_refs_with_executor(executor)
+        .await?
+        .into_iter()
+        .map(version_ref_row_from_local)
+        .collect())
 }
 
 pub(crate) async fn load_current_committed_version_frontier_with_backend(
@@ -69,109 +63,15 @@ pub(crate) async fn load_current_committed_version_frontier_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<CommittedVersionFrontier, LixError> {
     Ok(CommittedVersionFrontier::from_version_ref_rows(
-        load_all_committed_version_refs_from_local_state(executor).await?,
+        load_all_committed_version_refs_with_executor(executor).await?,
     ))
 }
 
-async fn load_committed_version_ref_from_local_state(
-    executor: &mut dyn QueryExecutor,
-    version_id: &str,
-) -> Result<Option<VersionRefRow>, LixError> {
-    if !live_storage_relation_exists_with_executor(executor, version_ref_schema_key()).await? {
-        return Ok(None);
+fn version_ref_row_from_local(row: LocalVersionRefRow) -> VersionRefRow {
+    VersionRefRow {
+        version_id: row.version_id,
+        commit_id: row.commit_id,
     }
-    let row = load_exact_untracked_row_with_executor(
-        executor,
-        &ExactUntrackedRowRequest {
-            schema_key: version_ref_schema_key().to_string(),
-            version_id: version_ref_storage_version_id().to_string(),
-            entity_id: version_id.to_string(),
-            file_id: Some(version_ref_file_id().to_string()),
-        },
-    )
-    .await?;
-    match row {
-        Some(row) => Ok(Some(parse_version_ref_row_from_untracked(
-            row.entity_id.clone(),
-            &row,
-        )?)),
-        None => Ok(None),
-    }
-}
-
-async fn load_all_committed_version_refs_from_local_state(
-    executor: &mut dyn QueryExecutor,
-) -> Result<Vec<VersionRefRow>, LixError> {
-    if !live_storage_relation_exists_with_executor(executor, version_ref_schema_key()).await? {
-        return Ok(Vec::new());
-    }
-    let rows = scan_untracked_rows_with_executor(
-        executor,
-        &UntrackedScanRequest {
-            schema_key: version_ref_schema_key().to_string(),
-            version_id: version_ref_storage_version_id().to_string(),
-            constraints: Vec::new(),
-            required_columns: Vec::new(),
-        },
-    )
-    .await?;
-    let mut version_refs = Vec::with_capacity(rows.len());
-    let mut previous_version_id: Option<String> = None;
-
-    for row in rows {
-        if row.file_id != version_ref_file_id()
-            || row.schema_version != version_ref_schema_version()
-            || row.plugin_key != version_ref_plugin_key()
-        {
-            continue;
-        }
-        if let Some(previous) = previous_version_id.as_ref() {
-            if previous == &row.entity_id {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "local version-head resolution for version '{}' found multiple exact rows",
-                        row.entity_id
-                    ),
-                ));
-            }
-        }
-        previous_version_id = Some(row.entity_id.clone());
-        version_refs.push(parse_version_ref_row_from_untracked(
-            row.entity_id.clone(),
-            &row,
-        )?);
-    }
-
-    Ok(version_refs)
-}
-
-fn parse_version_ref_row_from_untracked(
-    version_id: String,
-    row: &UntrackedRow,
-) -> Result<VersionRefRow, LixError> {
-    let commit_id = row.property_text("commit_id").ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "local version head for '{}' is missing commit_id",
-                version_id
-            ),
-        )
-    })?;
-    if commit_id.is_empty() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "local version head for '{}' has empty commit_id",
-                version_id
-            ),
-        ));
-    }
-    Ok(VersionRefRow {
-        version_id,
-        commit_id,
-    })
 }
 
 #[cfg(test)]
@@ -182,6 +82,10 @@ mod tests {
         live_relation_name, live_schema_column_names, normalized_values_for_schema,
     };
     use crate::test_support::{init_test_backend_core, seed_local_version_head, TestSqliteBackend};
+    use crate::version::{
+        version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
+        version_ref_schema_version, version_ref_storage_version_id,
+    };
     use crate::{LixBackend, Value};
 
     async fn init_refs_backend() -> TestSqliteBackend {

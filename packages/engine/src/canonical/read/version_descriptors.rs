@@ -1,16 +1,15 @@
 use std::collections::BTreeMap;
 
 use crate::backend::QueryExecutor;
-use crate::live_state::build_local_version_ref_heads_source_sql;
 use crate::version::{
-    parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
-    version_descriptor_schema_key, version_descriptor_schema_version, GLOBAL_VERSION_ID,
+    build_local_version_ref_heads_source_sql, load_all_local_version_refs_with_executor,
+    load_local_version_head_commit_id_with_executor, parse_version_descriptor_snapshot,
+    version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
+    version_descriptor_schema_version, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
-use super::readers::load_committed_version_head_commit_id;
-use super::refs::load_all_committed_version_refs_with_executor;
-use super::state_source::{
+use super::state::{
     load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRowRequest,
 };
 
@@ -35,7 +34,7 @@ pub(crate) async fn load_version_descriptor_with_executor(
     version_id: &str,
 ) -> Result<Option<VersionDescriptorRow>, LixError> {
     let Some(global_head_commit_id) =
-        load_committed_version_head_commit_id(executor, GLOBAL_VERSION_ID).await?
+        load_local_version_head_commit_id_with_executor(executor, GLOBAL_VERSION_ID).await?
     else {
         return Ok(None);
     };
@@ -79,7 +78,7 @@ pub(crate) async fn load_all_version_descriptors_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<Vec<VersionDescriptorRow>, LixError> {
     let mut descriptors = Vec::new();
-    for version_ref in load_all_committed_version_refs_with_executor(executor).await? {
+    for version_ref in load_all_local_version_refs_with_executor(executor).await? {
         if let Some(descriptor) =
             load_version_descriptor_with_executor(executor, &version_ref.version_id).await?
         {

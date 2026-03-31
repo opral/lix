@@ -1,8 +1,8 @@
-use crate::canonical::CanonicalCommitReceipt;
+use crate::commit::CanonicalCommitReceipt;
 use crate::engine::Engine;
-use crate::live_state::{ReplayCursor, SchemaRegistration};
+use crate::live_state::SchemaRegistration;
 use crate::state::stream::StateCommitStreamChange;
-use crate::{LixBackendTransaction, LixError};
+use crate::{LixBackendTransaction, LixError, ReplayCursor};
 
 use super::buffered_write_state::BufferedWriteState;
 use super::contracts::{

@@ -81,7 +81,7 @@ pub(super) async fn refresh_public_surface_registry_from_pending_transaction_vie
 
 pub(crate) async fn mirror_public_registered_schema_bootstrap_rows(
     transaction: &mut dyn LixBackendTransaction,
-    applied_output: &crate::canonical::append::CreateCommitAppliedOutput,
+    applied_output: &crate::commit::CreateCommitAppliedOutput,
 ) -> Result<(), LixError> {
     for row in &applied_output.canonical_output.changes {
         if row.schema_key != REGISTERED_SCHEMA_KEY {

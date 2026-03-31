@@ -13,13 +13,11 @@ pub(crate) mod status;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::canonical::receipt::UpdatedVersionRef;
-use crate::canonical::CanonicalCommitReceipt;
+use crate::commit::{CanonicalCommitReceipt, UpdatedVersionRef};
 use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::untracked::{
     UntrackedWriteBatch, UntrackedWriteOperation, UntrackedWriteParticipant, UntrackedWriteRow,
 };
-use crate::live_state::ReplayCursor;
 use crate::live_state::{
     LiveStateMode, LiveStateProjectionStatus, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
     LiveStateRebuildScope,
@@ -29,7 +27,8 @@ use crate::version::{
     version_ref_schema_version, version_ref_snapshot_content, version_ref_storage_version_id,
 };
 use crate::{
-    CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, TransactionMode,
+    CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, ReplayCursor,
+    TransactionMode,
 };
 
 const MAX_LIVE_STATE_DELTA_MERGE_PASSES: usize = 16;
@@ -429,14 +428,14 @@ mod tests {
         catch_up_live_state_to_current_frontier, projection_status, replay, status,
         DerivedProjectionId, ProjectionCatchUpOutcome, ProjectionReplayMode, UpdatedVersionRef,
     };
-    use crate::canonical::CanonicalCommitReceipt;
+    use crate::commit::CanonicalCommitReceipt;
     use crate::live_state::LiveStateMode;
-    use crate::live_state::ReplayCursor;
     use crate::test_support::{
         boot_test_engine, init_test_backend_core, seed_canonical_change_row,
         seed_live_state_status_row, seed_local_version_head, CanonicalChangeSeed,
         TestSqliteBackend,
     };
+    use crate::ReplayCursor;
     use crate::{CommittedVersionFrontier, LixBackend, LixError, TransactionMode};
     use crate::{CreateVersionOptions, VersionId};
     use std::collections::BTreeMap;

@@ -1,12 +1,12 @@
 use std::collections::BTreeSet;
 
-use crate::canonical::append::{
+use crate::checkpoint::apply_public_version_last_checkpoint_side_effects;
+use crate::commit::ProposedDomainChange;
+use crate::commit::{
     append_tracked_with_pending_public_session, BufferedTrackedAppendArgs, CreateCommitDisposition,
     CreateCommitError, CreateCommitErrorKind, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
     CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
 };
-use crate::canonical::ProposedDomainChange;
-use crate::checkpoint::apply_public_version_last_checkpoint_side_effects;
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::LixFunctionProvider;
 use crate::sql::semantic_ir::validation::{validate_commit_time_write, SchemaCache};

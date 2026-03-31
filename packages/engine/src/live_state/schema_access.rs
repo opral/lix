@@ -1,4 +1,3 @@
-use crate::backend::QueryExecutor;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 
@@ -95,40 +94,6 @@ pub(crate) async fn live_storage_relation_exists_with_backend(
         }
         SqlDialect::Postgres => {
             let result = backend
-                .execute(
-                    "SELECT 1 \
-                     FROM information_schema.tables \
-                     WHERE table_name = $1 \
-                     LIMIT 1",
-                    &[Value::Text(relation_name)],
-                )
-                .await?;
-            Ok(!result.rows.is_empty())
-        }
-    }
-}
-
-pub(crate) async fn live_storage_relation_exists_with_executor(
-    executor: &mut dyn QueryExecutor,
-    schema_key: &str,
-) -> Result<bool, LixError> {
-    let relation_name = tracked_relation_name(schema_key);
-    match executor.dialect() {
-        SqlDialect::Sqlite => {
-            let result = executor
-                .execute(
-                    "SELECT 1 \
-                     FROM sqlite_master \
-                     WHERE name = $1 \
-                       AND type IN ('table', 'view') \
-                     LIMIT 1",
-                    &[Value::Text(relation_name)],
-                )
-                .await?;
-            Ok(!result.rows.is_empty())
-        }
-        SqlDialect::Postgres => {
-            let result = executor
                 .execute(
                     "SELECT 1 \
                      FROM information_schema.tables \

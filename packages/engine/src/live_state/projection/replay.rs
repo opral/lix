@@ -4,8 +4,8 @@
 //! mechanics for derived projections. They are rebuildable and non-semantic.
 
 use crate::live_state::lifecycle;
-use crate::live_state::{LiveStateMode, ReplayCursor};
-use crate::{LixBackend, LixBackendTransaction, LixError};
+use crate::live_state::LiveStateMode;
+use crate::{LixBackend, LixBackendTransaction, LixError, ReplayCursor};
 
 pub(crate) async fn load_latest_live_state_replay_cursor_with_backend(
     backend: &dyn LixBackend,

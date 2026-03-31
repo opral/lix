@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::canonical::receipt::UpdatedVersionRef;
-use crate::canonical::types::{
-    CanonicalCommitOutput, ChangeRow, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
-};
+use crate::canonical::journal::{CanonicalCommitOutput, ChangeRow};
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
 use crate::{CanonicalJson, LixError};
 use serde_json::json;
+
+use super::receipt::UpdatedVersionRef;
+use super::types::{DomainChangeInput, GenerateCommitArgs, GenerateCommitResult};
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const CHANGE_SET_SCHEMA_KEY: &str = "lix_change_set";
@@ -395,7 +395,7 @@ fn collapse_domain_changes_last_wins(changes: &[DomainChangeInput]) -> Vec<&Doma
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::types::{VersionInfo, VersionSnapshot};
+    use crate::canonical::read::{VersionInfo, VersionSnapshot};
 
     fn domain_change(
         id: &str,

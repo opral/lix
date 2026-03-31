@@ -1,5 +1,4 @@
 use super::*;
-use crate::canonical::refs::load_current_committed_version_frontier_with_backend;
 use crate::errors::classification::sanitize_lowered_public_sql_error_description;
 use crate::read::models::{
     load_directory_history_rows, load_file_history_rows, DirectoryHistoryRequest,
@@ -10,6 +9,7 @@ use crate::read::models::{
     load_state_history_rows, StateHistoryContentMode, StateHistoryLineageScope,
     StateHistoryRequest, StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
 };
+use crate::refs::load_current_committed_version_frontier_with_backend;
 use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
 use crate::sql::binder::{bind_public_read_statement, RuntimeBindingValues};
 use crate::sql::catalog::{SurfaceBinding, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry};
@@ -243,7 +243,7 @@ fn public_read_projection_stale_error(
     )
 }
 
-fn format_optional_replay_cursor(cursor: Option<&crate::live_state::ReplayCursor>) -> String {
+fn format_optional_replay_cursor(cursor: Option<&crate::ReplayCursor>) -> String {
     cursor
         .map(|cursor| format!("{}@{}", cursor.change_id, cursor.created_at))
         .unwrap_or_else(|| "(none)".to_string())

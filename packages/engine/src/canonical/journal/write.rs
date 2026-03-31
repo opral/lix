@@ -7,9 +7,10 @@
 use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::functions::LixFunctionProvider;
 use crate::sql::binder::bind_sql;
-use crate::{LixError, SqlDialect, Value};
-
-use super::types::CanonicalCommitOutput;
+use crate::{
+    CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
+    FileId, LixError, SqlDialect, Value,
+};
 
 const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
 const CHANGE_TABLE: &str = "lix_internal_change";
@@ -17,6 +18,24 @@ const SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 32_766;
 const POSTGRES_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 65_535;
 const SNAPSHOT_INSERT_PARAM_COLUMNS: usize = 2;
 const CHANGE_INSERT_PARAM_COLUMNS: usize = 9;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeRow {
+    pub id: String,
+    pub entity_id: EntityId,
+    pub schema_key: CanonicalSchemaKey,
+    pub schema_version: CanonicalSchemaVersion,
+    pub file_id: FileId,
+    pub plugin_key: CanonicalPluginKey,
+    pub snapshot_content: Option<CanonicalJson>,
+    pub metadata: Option<CanonicalJson>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalCommitOutput {
+    pub changes: Vec<ChangeRow>,
+}
 
 #[derive(Debug, Clone)]
 struct SnapshotInsertRow {

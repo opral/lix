@@ -9,7 +9,7 @@ use crate::live_state::{load_exact_untracked_row_with_executor, ExactUntrackedRo
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, Value};
 
-use super::state_source::{
+use crate::canonical::read::{
     load_exact_committed_state_row_at_version_head_with_executor, CommitQueryExecutor,
     ExactCommittedStateRowRequest,
 };

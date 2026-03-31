@@ -668,7 +668,7 @@ mod tests {
         state_commit_stream_changes_from_planned_rows, StateCommitStreamOperation,
         StateCommitStreamRuntimeMetadata,
     };
-    use crate::canonical::ProposedDomainChange;
+    use crate::commit::ProposedDomainChange;
     use crate::sql::logical_plan::public_ir::PlannedStateRow;
     use crate::Value;
     use std::collections::BTreeMap;

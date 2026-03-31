@@ -1,4 +1,4 @@
-use crate::canonical::version_state::find_version_id_by_name_with_backend;
+use crate::canonical::read::find_version_id_by_name_with_backend;
 use crate::version::DEFAULT_ACTIVE_VERSION_NAME;
 use crate::{LixBackend, LixError, Value};
 

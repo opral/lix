@@ -1,7 +1,5 @@
-use crate::live_state::ReplayCursor;
-use crate::VersionId;
-
-use super::types::ChangeRow;
+use crate::canonical::journal::ChangeRow;
+use crate::{ReplayCursor, VersionId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatedVersionRef {

@@ -5,11 +5,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
-use crate::live_state::ReplayCursor;
 use crate::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::{
     boot, BootArgs, CommittedVersionFrontier, Engine, LixBackend, LixBackendTransaction, LixError,
-    NoopWasmRuntime, QueryResult, Session, SqlDialect, TransactionMode, Value,
+    NoopWasmRuntime, QueryResult, ReplayCursor, Session, SqlDialect, TransactionMode, Value,
 };
 
 type SqlPredicate = Arc<dyn Fn(&str, &[Value]) -> bool + Send + Sync>;
@@ -242,6 +241,7 @@ pub(crate) async fn init_test_backend_core(backend: &dyn LixBackend) -> Result<(
     crate::live_state::init(backend).await?;
     crate::schema::init(backend).await?;
     crate::canonical::init(backend).await?;
+    crate::commit::init(backend).await?;
     crate::version::init(backend).await?;
     Ok(())
 }
@@ -593,7 +593,7 @@ mod tests {
             crate::live_state::LiveStateMode::Ready,
             Some(&ReplayCursor::new("change-1", "2026-03-30T00:00:00Z")),
             Some(&CommittedVersionFrontier::from_version_ref_rows(vec![
-                crate::canonical::refs::VersionRefRow {
+                crate::refs::VersionRefRow {
                     version_id: "main".to_string(),
                     commit_id: "commit-1".to_string(),
                 },
@@ -603,10 +603,9 @@ mod tests {
         .await
         .expect("live-state status seed should succeed");
 
-        let frontier =
-            crate::canonical::refs::load_current_committed_version_frontier_with_backend(&backend)
-                .await
-                .expect("frontier load should succeed");
+        let frontier = crate::refs::load_current_committed_version_frontier_with_backend(&backend)
+            .await
+            .expect("frontier load should succeed");
         assert_eq!(
             frontier.version_heads.get("main").map(String::as_str),
             Some("commit-1")

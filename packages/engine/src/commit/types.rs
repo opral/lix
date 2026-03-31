@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::canonical::journal::CanonicalCommitOutput;
+use crate::canonical::read::VersionInfo;
 use crate::change_view::TrackedDomainChangeView;
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
@@ -71,41 +73,12 @@ pub struct DomainChangeInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VersionSnapshot {
-    pub id: VersionId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VersionInfo {
-    pub parent_commit_ids: Vec<String>,
-    pub snapshot: VersionSnapshot,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateCommitArgs {
     pub timestamp: String,
     pub active_accounts: Vec<String>,
     pub changes: Vec<DomainChangeInput>,
     pub versions: BTreeMap<String, VersionInfo>,
     pub force_commit_versions: BTreeSet<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChangeRow {
-    pub id: String,
-    pub entity_id: EntityId,
-    pub schema_key: CanonicalSchemaKey,
-    pub schema_version: CanonicalSchemaVersion,
-    pub file_id: FileId,
-    pub plugin_key: CanonicalPluginKey,
-    pub snapshot_content: Option<CanonicalJson>,
-    pub metadata: Option<CanonicalJson>,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalCommitOutput {
-    pub changes: Vec<ChangeRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

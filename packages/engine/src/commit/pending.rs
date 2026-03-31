@@ -2,6 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::program::WriteProgram;
 use crate::backend::program_runner::execute_write_program_with_transaction;
+use crate::canonical::graph::{
+    build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
+};
+use crate::canonical::journal::{
+    build_prepared_batch_from_canonical_output, CanonicalCommitOutput,
+};
+use crate::canonical::read::{load_version_info_for_versions, CommitQueryExecutor, VersionInfo};
 use crate::canonical_json::CanonicalJson;
 use crate::filesystem::runtime::{build_binary_blob_fastcdc_write_program, BinaryBlobWrite};
 use crate::functions::LixFunctionProvider;
@@ -11,21 +18,16 @@ use crate::{
 };
 use serde_json::{json, Value as JsonValue};
 
-use super::change_log::build_prepared_batch_from_canonical_output;
-use super::create_commit::{
+use super::create::{
     CreateCommitAppliedOutput, CreateCommitError, CreateCommitExpectedHead,
     CreateCommitPreconditions, CreateCommitWriteLane,
 };
-use super::generate_commit::generate_commit;
-use super::graph_index::{
-    build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
-};
+use super::generate::generate_commit;
 use super::receipt::{
     latest_replay_cursor_from_change_rows, CanonicalCommitReceipt, UpdatedVersionRef,
 };
-use super::state_source::{load_version_info_for_versions, CommitQueryExecutor};
 use super::types::{
-    DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange, VersionInfo,
+    DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange,
 };
 
 #[derive(Debug, Clone)]
@@ -307,7 +309,7 @@ fn rewrite_generated_commit_result_for_pending_session(
         .collect();
 
     Ok(GenerateCommitResult {
-        canonical_output: super::types::CanonicalCommitOutput {
+        canonical_output: CanonicalCommitOutput {
             changes: generated
                 .canonical_output
                 .changes

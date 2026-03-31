@@ -12,6 +12,7 @@ pub(crate) mod context;
 mod create_version;
 mod init;
 mod merge_version;
+mod ref_storage;
 
 pub(crate) use create_version::create_version_in_session;
 pub use create_version::{CreateVersionOptions, CreateVersionResult};
@@ -19,6 +20,11 @@ pub(crate) use init::{init, seed_bootstrap};
 pub(crate) use merge_version::merge_version_in_session;
 pub use merge_version::{
     ExpectedVersionHeads, MergeOutcome, MergeVersionOptions, MergeVersionResult,
+};
+pub(crate) use ref_storage::{
+    build_local_version_ref_heads_source_sql, load_all_local_version_refs_with_executor,
+    load_local_version_head_commit_id_with_executor, load_local_version_ref_with_executor,
+    LocalVersionRefRow,
 };
 
 pub(crate) const GLOBAL_VERSION_ID: &str = "global";

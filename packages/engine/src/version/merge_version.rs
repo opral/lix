@@ -1,12 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::canonical::append::{append_tracked, CreateCommitArgs};
-use crate::canonical::readers::{
+use crate::canonical::read::{
     load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,
     load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
-use crate::canonical::ProposedDomainChange;
+use crate::commit::{append_tracked, CreateCommitArgs, ProposedDomainChange};
 use crate::engine::TransactionBackendAdapter;
 use crate::functions::LixFunctionProvider;
 use crate::live_state::{

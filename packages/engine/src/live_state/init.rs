@@ -5,40 +5,6 @@ use crate::live_state::schema_access::{snapshot_select_expr_for_schema, tracked_
 use crate::{LixBackend, LixError};
 
 const LIVE_STATE_INIT_STATEMENTS: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS lix_internal_snapshot (\
-     id TEXT PRIMARY KEY,\
-     content TEXT\
-     )",
-    "INSERT INTO lix_internal_snapshot (id, content) \
-     SELECT 'no-content', NULL \
-     WHERE NOT EXISTS ( \
-       SELECT 1 FROM lix_internal_snapshot WHERE id = 'no-content' \
-     )",
-    "CREATE TABLE IF NOT EXISTS lix_internal_change (\
-     id TEXT PRIMARY KEY,\
-     entity_id TEXT NOT NULL,\
-     schema_key TEXT NOT NULL,\
-     schema_version TEXT NOT NULL,\
-     file_id TEXT NOT NULL,\
-     plugin_key TEXT NOT NULL,\
-     snapshot_id TEXT NOT NULL,\
-     metadata TEXT,\
-     created_at TEXT NOT NULL\
-     )",
-    "CREATE TABLE IF NOT EXISTS lix_internal_commit_idempotency (\
-     write_lane TEXT NOT NULL,\
-     idempotency_key TEXT NOT NULL,\
-     idempotency_kind TEXT NOT NULL,\
-     idempotency_value TEXT NOT NULL,\
-     parent_head_snapshot_content TEXT NOT NULL,\
-     commit_id TEXT NOT NULL,\
-     created_at TEXT NOT NULL,\
-     PRIMARY KEY (write_lane, idempotency_kind, idempotency_value, parent_head_snapshot_content)\
-     )",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_commit_idempotency_commit_id \
-     ON lix_internal_commit_idempotency (commit_id)",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_commit_idempotency_legacy \
-     ON lix_internal_commit_idempotency (write_lane, idempotency_key)",
     "CREATE TABLE IF NOT EXISTS lix_internal_registered_schema_bootstrap (\
      entity_id TEXT NOT NULL,\
      schema_key TEXT NOT NULL,\
