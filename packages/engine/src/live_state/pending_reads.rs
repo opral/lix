@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use async_trait::async_trait;
 use crate::contracts::artifacts::{
     PendingViewFilter, PendingViewOrderClause, PendingViewProjection, PendingViewReadQuery,
     PendingViewReadStorage, PublicReadExecutionMode, PublicReadResultColumn,
@@ -13,6 +12,7 @@ use crate::contracts::traits::{
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::schema_access::{live_read_contract_from_layout, LiveReadContract};
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
+use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use super::{scan_live_rows, LiveReadRow, LiveStorageLane};

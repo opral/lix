@@ -1,5 +1,5 @@
-use crate::errors;
 use crate::contracts::artifacts::SessionDependency;
+use crate::errors;
 use crate::session::Session;
 use crate::sql::executor::dependency_spec::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,

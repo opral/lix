@@ -1,12 +1,11 @@
 use std::collections::BTreeSet;
 
-use crate::contracts::artifacts::PlannedStateRow;
+use crate::contracts::artifacts::{
+    PlannedStateRow, UntrackedWriteBatch, UntrackedWriteOperation, UntrackedWriteRow,
+};
+use crate::contracts::traits::UntrackedWriteParticipant;
 use crate::engine::Engine;
 use crate::functions::LixFunctionProvider;
-use crate::live_state::{
-    apply_untracked_write_batch_in_transaction, UntrackedWriteBatch, UntrackedWriteOperation,
-    UntrackedWriteRow,
-};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -31,7 +30,7 @@ pub(super) async fn run_public_untracked_write_txn_with_transaction(
         &timestamp,
         plan.writer_key.as_deref(),
     )?;
-    apply_untracked_write_batch_in_transaction(transaction, &batch).await?;
+    transaction.apply_untracked_write_batch(&batch).await?;
 
     let filesystem_finalization = engine
         .compile_filesystem_finalization_from_state_in_transaction(

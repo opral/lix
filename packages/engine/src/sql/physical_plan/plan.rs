@@ -1,3 +1,4 @@
+use crate::contracts::artifacts::{CommitPreconditions, DomainChangeBatch};
 use crate::contracts::surface::SurfaceBinding;
 use crate::filesystem::live_projection::FilesystemProjectionScope;
 use crate::sql::ast::lowering::lower_statement;
@@ -7,11 +8,8 @@ use crate::sql::binder::{compile_statement_binding_template_with_state, RuntimeB
 use crate::sql::executor::contracts::effects::PlanEffects;
 use crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::sql::logical_plan::direct_reads::DirectPublicReadPlan;
-use crate::sql::logical_plan::public_ir::{
-    CommitPreconditions, FilesystemKind, PlannedStateRow, VersionScope,
-};
+use crate::sql::logical_plan::public_ir::{FilesystemKind, PlannedStateRow, VersionScope};
 use crate::sql::parser::placeholders::PlaceholderState;
-use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::{Statement, TableAlias, TableFactor};
 use std::collections::BTreeMap;

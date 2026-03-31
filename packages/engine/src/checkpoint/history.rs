@@ -12,13 +12,13 @@ use std::collections::BTreeSet;
 use crate::backend::QueryExecutor;
 use crate::canonical::graph::COMMIT_GRAPH_NODE_TABLE;
 use crate::canonical::read::load_commit_lineage_entry_by_id;
+use crate::contracts::artifacts::DomainChangeBatch;
 use crate::errors::classification::is_missing_relation_error;
 use crate::init::seed::text_value;
 use crate::init::tables::execute_init_statements;
 use crate::init::InitExecutor;
 use crate::sql::common::text::escape_sql_string;
 use crate::sql::executor::PreparedPublicWrite;
-use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
 const HISTORY_INIT_STATEMENTS: &[&str] = &[

@@ -1,23 +1,14 @@
 use crate::change_view::TrackedDomainChangeView;
+use crate::contracts::artifacts::{
+    CommitPreconditions, DomainChangeBatch, ExpectedHead, IdempotencyKey, PublicDomainChange,
+    SemanticEffect,
+};
 use crate::sql::logical_plan::public_ir::{
-    CommitPreconditions, ExpectedHead, IdempotencyKey, MutationPayload, PlannedStateRow,
-    PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode, WriteOperationKind,
+    MutationPayload, PlannedStateRow, PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode,
+    WriteOperationKind,
 };
 use crate::{LixBackend, LixError};
 use serde_json::{json, Map, Value as JsonValue};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PublicDomainChange {
-    pub(crate) entity_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) schema_version: Option<String>,
-    pub(crate) file_id: Option<String>,
-    pub(crate) plugin_key: Option<String>,
-    pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<String>,
-    pub(crate) version_id: String,
-    pub(crate) writer_key: Option<String>,
-}
 
 impl TrackedDomainChangeView for PublicDomainChange {
     fn entity_id(&self) -> &str {
@@ -51,20 +42,6 @@ impl TrackedDomainChangeView for PublicDomainChange {
     fn writer_key(&self) -> Option<&str> {
         self.writer_key.as_deref()
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SemanticEffect {
-    pub(crate) effect_key: String,
-    pub(crate) target: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DomainChangeBatch {
-    pub(crate) changes: Vec<PublicDomainChange>,
-    pub(crate) write_lane: WriteLane,
-    pub(crate) writer_key: Option<String>,
-    pub(crate) semantic_effects: Vec<SemanticEffect>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,9 +381,10 @@ fn resolved_row_writer_key(row: &PlannedStateRow) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{build_domain_change_batch, derive_commit_preconditions};
+    use crate::contracts::artifacts::ExpectedHead;
     use crate::contracts::surface::SurfaceRegistry;
     use crate::sql::binder::bind_statement;
-    use crate::sql::logical_plan::public_ir::{ExpectedHead, WriteLane};
+    use crate::sql::logical_plan::public_ir::WriteLane;
     use crate::sql::semantic_ir::canonicalize::canonicalize_write;
     use crate::sql::semantic_ir::semantics::write_analysis::analyze_write;
     use crate::sql::semantic_ir::semantics::write_resolver::resolve_write_plan;

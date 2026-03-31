@@ -70,7 +70,9 @@ fn effective_state_version_scope(
     version_scope: VersionScope,
 ) -> crate::contracts::artifacts::EffectiveStateVersionScope {
     match version_scope {
-        VersionScope::ActiveVersion => crate::contracts::artifacts::EffectiveStateVersionScope::ActiveVersion,
+        VersionScope::ActiveVersion => {
+            crate::contracts::artifacts::EffectiveStateVersionScope::ActiveVersion
+        }
         VersionScope::ExplicitVersion => {
             crate::contracts::artifacts::EffectiveStateVersionScope::ExplicitVersion
         }

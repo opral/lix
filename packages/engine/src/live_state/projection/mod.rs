@@ -14,9 +14,10 @@ pub(crate) mod status;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::commit::{CanonicalCommitReceipt, UpdatedVersionRef};
+use crate::contracts::traits::UntrackedWriteParticipant;
 use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::untracked::{
-    UntrackedWriteBatch, UntrackedWriteOperation, UntrackedWriteParticipant, UntrackedWriteRow,
+    UntrackedWriteBatch, UntrackedWriteOperation, UntrackedWriteRow,
 };
 use crate::live_state::{
     LiveStateMode, LiveStateProjectionStatus, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
@@ -180,7 +181,7 @@ async fn apply_local_version_head_rows_in_transaction(
         .iter()
         .map(local_version_head_write_row_from_update)
         .collect();
-    UntrackedWriteParticipant::apply_write_batch(transaction, &batch).await
+    transaction.apply_untracked_write_batch(&batch).await
 }
 
 pub(crate) async fn mark_live_state_projection_ready_in_transaction(

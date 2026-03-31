@@ -6,11 +6,12 @@
 use crate::backend::prepared::PreparedStatement;
 use crate::backend::SqlDialect;
 use crate::contracts::artifacts::{
-    DirectoryHistoryRequest, EffectiveStateRequest, EffectiveStateVersionScope,
-    FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest, FileHistoryRootScope,
-    FileHistoryVersionScope, StateHistoryContentMode, StateHistoryLineageScope,
-    StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope, StateHistoryVersionScope,
-    SessionDependency, SessionStateDelta,
+    CommitPreconditions, DirectoryHistoryRequest, DomainChangeBatch, EffectiveStateRequest,
+    EffectiveStateVersionScope, ExpectedHead, FileHistoryContentMode, FileHistoryLineageScope,
+    FileHistoryRequest, FileHistoryRootScope, FileHistoryVersionScope, PublicDomainChange,
+    SemanticEffect, SessionDependency, SessionStateDelta, StateHistoryContentMode,
+    StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope,
+    StateHistoryVersionScope,
 };
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
@@ -44,8 +45,8 @@ use crate::sql::logical_plan::public_ir::{
     BroadSqlCaseWhen, BroadSqlExpr, BroadSqlExprKind, BroadSqlFunction, BroadSqlFunctionArg,
     BroadSqlFunctionArgExpr, BroadSqlFunctionArguments, CanonicalAdminKind, CanonicalAdminScan,
     CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan, CanonicalWorkingChangesScan,
-    CommitPreconditions, ExpectedHead, FilesystemKind, InsertOnConflict, InsertOnConflictAction,
-    MutationPayload, NormalizedPublicReadQuery, OptionalTextPatch, PlannedFilesystemDescriptor,
+    FilesystemKind, InsertOnConflict, InsertOnConflictAction, MutationPayload,
+    NormalizedPublicReadQuery, OptionalTextPatch, PlannedFilesystemDescriptor,
     PlannedFilesystemFile, PlannedFilesystemState, PlannedStateRow, PlannedWrite, ReadCommand,
     ReadContract, ReadPlan, ResolvedRowRef, ResolvedWritePartition, ResolvedWritePlan, RowLineage,
     SchemaProof, ScopeProof, StateSourceKind, StructuredPublicRead, TargetSetProof, VersionScope,
@@ -66,9 +67,6 @@ use crate::sql::physical_plan::{
 };
 use crate::sql::routing::RoutingPassTrace;
 use crate::sql::semantic_ir::internal::NormalizedInternalStatements;
-use crate::sql::semantic_ir::semantics::domain_changes::{
-    DomainChangeBatch, PublicDomainChange, SemanticEffect,
-};
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     EffectiveStatePlan, StateSourceAuthority,
 };

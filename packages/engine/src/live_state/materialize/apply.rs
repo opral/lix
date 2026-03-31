@@ -4,13 +4,13 @@ use super::types::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildScope, LiveStateWriteOp,
 };
 use crate::live_state::lifecycle::build_set_live_state_mode_sql;
-use crate::live_state::LiveStateMode;
 use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::storage::{
     load_live_table_layout_in_transaction, normalized_insert_columns_sql,
     normalized_insert_values_sql, normalized_live_column_values, normalized_update_assignments_sql,
     quoted_live_table_name,
 };
+use crate::live_state::LiveStateMode;
 use crate::live_state::{finalize_commit_in_transaction, register_schema_in_transaction};
 use crate::{LixBackend, LixBackendTransaction, LixError, TransactionMode, Value};
 

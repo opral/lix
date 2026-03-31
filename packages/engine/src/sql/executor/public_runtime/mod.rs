@@ -1,8 +1,10 @@
 //! Executor-owned implementation of the public SQL runtime surface.
 
 use crate::change_view::TrackedDomainChangeView;
-use crate::contracts::artifacts::SessionStateDelta;
-use crate::contracts::artifacts::{CommittedReadMode, EffectiveStateRequest};
+use crate::contracts::artifacts::{
+    CommitPreconditions, CommittedReadMode, DomainChangeBatch, EffectiveStateRequest,
+    SessionStateDelta,
+};
 use crate::contracts::surface::{
     SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry, SurfaceVariant,
 };
@@ -28,9 +30,7 @@ use crate::sql::explain::{
     build_public_write_explain_artifacts, unwrap_explain_statement, ExplainArtifacts, ExplainStage,
     ExplainTimingCollector, PublicWriteExplainBuildInput,
 };
-use crate::sql::logical_plan::public_ir::{
-    CommitPreconditions, PlannedWrite, StructuredPublicRead, WriteOperationKind,
-};
+use crate::sql::logical_plan::public_ir::{PlannedWrite, StructuredPublicRead, WriteOperationKind};
 use crate::sql::logical_plan::{
     verify_logical_plan, DependencySpec, LogicalPlan, PublicReadLogicalPlan,
 };
@@ -41,7 +41,7 @@ use crate::sql::physical_plan::{
 };
 use crate::sql::semantic_ir::canonicalize::CanonicalizedWrite;
 use crate::sql::semantic_ir::semantics::domain_changes::{
-    build_domain_change_batch, derive_commit_preconditions, DomainChangeBatch,
+    build_domain_change_batch, derive_commit_preconditions,
 };
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
 use crate::sql::semantic_ir::semantics::write_resolver::resolve_write_plan_with_functions;

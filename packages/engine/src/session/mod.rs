@@ -17,21 +17,19 @@ use futures_util::FutureExt;
 use sqlparser::ast::Statement;
 
 use crate::contracts::artifacts::ExecuteOptions;
-use crate::contracts::artifacts::{
-    SessionDependency, SessionExecutionMode, SessionStateSnapshot,
-};
+use crate::contracts::artifacts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
 use crate::contracts::surface::SurfaceRegistry;
 use crate::engine::{reject_internal_table_writes, reject_public_create_table, Engine};
 use crate::errors;
+use crate::runtime::execution_state::ExecutionRuntimeState;
+use crate::runtime::Runtime;
 use crate::session::committed_read_runtime::{
     execute_execution_program_in_committed_read_transaction, prepare_committed_read_program,
 };
-use crate::runtime::Runtime;
 use crate::sql::executor::execution_program::{
     execute_execution_program_with_write_transaction, ExecutionContext, ExecutionProgram,
     SessionExecutionRuntime, SessionExecutionRuntimeHandle,
 };
-use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
 #[cfg(test)]
 use crate::sql::parser::parse_sql;

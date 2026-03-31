@@ -12,7 +12,8 @@ use sqlparser::ast::{
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) use crate::contracts::artifacts::{
-    OptionalTextPatch, PlannedStateRow, WriteLane, WriteMode,
+    CommitPreconditions, OptionalTextPatch, PlannedRowIdentity, PlannedStateRow, WriteLane,
+    WriteMode,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -854,21 +855,6 @@ pub(crate) enum TargetSetProof {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExpectedHead {
-    CurrentHead,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IdempotencyKey(pub(crate) String);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommitPreconditions {
-    pub(crate) write_lane: WriteLane,
-    pub(crate) expected_head: ExpectedHead,
-    pub(crate) idempotency_key: IdempotencyKey,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedRowRef {
     pub(crate) entity_id: String,
@@ -883,14 +869,6 @@ pub(crate) struct RowLineage {
     pub(crate) entity_id: String,
     pub(crate) source_change_id: Option<String>,
     pub(crate) source_commit_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct PlannedRowIdentity {
-    pub(crate) schema_key: String,
-    pub(crate) version_id: String,
-    pub(crate) entity_id: String,
-    pub(crate) file_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

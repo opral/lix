@@ -1,16 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::contracts::artifacts::{
-    coalesce_live_table_requirements, MutationRow, OptionalTextPatch, PlanEffects, PlannedStateRow,
-    ResultContract, SchemaRegistration, SchemaRegistrationSet, WriteMode,
+    coalesce_live_table_requirements, DomainChangeBatch, ExpectedHead, MutationRow,
+    OptionalTextPatch, PlanEffects, PlannedRowIdentity, PlannedStateRow, ResultContract,
+    RowIdentity, SchemaRegistration, SchemaRegistrationSet, WriteMode,
 };
 use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage};
 use crate::filesystem::runtime::{
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
     FilesystemTransactionFileState, FilesystemTransactionState,
 };
-use crate::live_state::RowIdentity;
-use crate::sql::executor::runtime_state::ExecutionRuntimeState;
+use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::sql::executor::{
     build_tracked_txn_unit, CompiledExecution, CompiledInternalExecution, PreparedPublicWrite,
     TrackedTxnUnit,
@@ -19,7 +19,6 @@ use crate::sql::physical_plan::{
     PhysicalPlan, PreparedPublicWriteExecution, PublicWriteExecutionPartition,
     UntrackedWriteExecution,
 };
-use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
 use crate::transaction::PendingTransactionView;
 use crate::LixError;
 
@@ -1056,16 +1055,10 @@ fn tracked_plan_is_coalescible_filesystem(plan: &TrackedTxnUnit) -> bool {
     )
 }
 
-fn create_commit_expected_head_compatible(
-    left: &crate::sql::logical_plan::public_ir::ExpectedHead,
-    right: &crate::sql::logical_plan::public_ir::ExpectedHead,
-) -> bool {
+fn create_commit_expected_head_compatible(left: &ExpectedHead, right: &ExpectedHead) -> bool {
     matches!(
         (left, right),
-        (
-            crate::sql::logical_plan::public_ir::ExpectedHead::CurrentHead,
-            crate::sql::logical_plan::public_ir::ExpectedHead::CurrentHead,
-        )
+        (ExpectedHead::CurrentHead, ExpectedHead::CurrentHead)
     )
 }
 
@@ -1075,9 +1068,7 @@ fn tracked_plan_entity_targets_disjoint(left: &TrackedTxnUnit, right: &TrackedTx
     left_targets.is_disjoint(&right_targets)
 }
 
-fn runtime_row_identity_from_planned(
-    identity: &crate::sql::logical_plan::public_ir::PlannedRowIdentity,
-) -> RowIdentity {
+fn runtime_row_identity_from_planned(identity: &PlannedRowIdentity) -> RowIdentity {
     RowIdentity {
         schema_key: identity.schema_key.clone(),
         version_id: identity.version_id.clone(),

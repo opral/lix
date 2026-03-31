@@ -17,7 +17,7 @@ use async_trait::async_trait;
 
 use crate::backend::QueryExecutor;
 use crate::change_view::TrackedDomainChangeView;
-use crate::live_state::RowIdentity;
+use crate::contracts::artifacts::RowIdentity;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) const WORKSPACE_WRITER_KEY_TABLE: &str = "lix_internal_workspace_writer_key";

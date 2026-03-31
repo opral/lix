@@ -2,36 +2,43 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 
-use crate::live_state::{
-    matches_constraints, BatchTrackedRowRequest, BatchUntrackedRowRequest, ExactTrackedRowRequest,
-    ExactUntrackedRowRequest, LiveReadViews, LiveTrackedReader, LiveTrackedTombstoneReader,
-    LiveUntrackedReader, RowIdentity, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
-    UntrackedRow, UntrackedScanRequest,
+use crate::contracts::artifacts::{
+    matches_constraints, BatchRowRequest, RowIdentity, ScanRequest, TrackedRow,
+    TrackedTombstoneMarker, UntrackedRow,
+};
+use crate::contracts::traits::{
+    LiveReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView,
 };
 use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
 use crate::LixError;
 
 use super::overlay::PendingWriteOverlay;
 
+type BatchTrackedRowRequest = BatchRowRequest;
+type BatchUntrackedRowRequest = BatchRowRequest;
+type TrackedScanRequest = ScanRequest;
+type UntrackedScanRequest = ScanRequest;
+
 pub struct ReadContext<'a> {
-    base: LiveReadViews<'a>,
+    base: LiveReadContext<'a>,
 }
 
 impl<'a> ReadContext<'a> {
     #[cfg(test)]
     pub(crate) fn new(
-        tracked: &'a dyn LiveTrackedReader,
-        untracked: &'a dyn LiveUntrackedReader,
+        tracked: &'a dyn TrackedReadView,
+        untracked: &'a dyn UntrackedReadView,
         workspace_writer_keys: &'a dyn WorkspaceWriterKeyReadView,
     ) -> Self {
         Self {
-            base: LiveReadViews::new(tracked, untracked, workspace_writer_keys),
+            base: LiveReadContext::new(tracked, untracked, workspace_writer_keys),
         }
     }
 
-    pub fn with_tracked_tombstones(
+    #[cfg(test)]
+    pub(crate) fn with_tracked_tombstones(
         mut self,
-        tracked_tombstones: &'a dyn LiveTrackedTombstoneReader,
+        tracked_tombstones: &'a dyn TrackedTombstoneView,
     ) -> Self {
         self.base = self.base.with_tracked_tombstones(tracked_tombstones);
         self
@@ -70,9 +77,9 @@ pub(crate) struct PendingReadContext<'a> {
 }
 
 impl<'a> PendingReadContext<'a> {
-    pub(crate) fn effective_state_context(&'a self) -> LiveReadViews<'a> {
+    pub(crate) fn effective_state_context(&'a self) -> LiveReadContext<'a> {
         let context =
-            LiveReadViews::new(&self.tracked, &self.untracked, &self.workspace_writer_keys);
+            LiveReadContext::new(&self.tracked, &self.untracked, &self.workspace_writer_keys);
         if self.tracked_tombstones.has_source() {
             context.with_tracked_tombstones(&self.tracked_tombstones)
         } else {
@@ -82,17 +89,17 @@ impl<'a> PendingReadContext<'a> {
 }
 
 struct PendingTrackedReadView<'a> {
-    base: &'a dyn LiveTrackedReader,
+    base: &'a dyn TrackedReadView,
     pending: &'a PendingWriteOverlay,
 }
 
 struct PendingUntrackedReadView<'a> {
-    base: &'a dyn LiveUntrackedReader,
+    base: &'a dyn UntrackedReadView,
     pending: &'a PendingWriteOverlay,
 }
 
 struct PendingTrackedTombstoneView<'a> {
-    base: Option<&'a dyn LiveTrackedTombstoneReader>,
+    base: Option<&'a dyn TrackedTombstoneView>,
     pending: &'a PendingWriteOverlay,
 }
 
@@ -138,20 +145,7 @@ impl WorkspaceWriterKeyReadView for PendingWorkspaceWriterKeyReadView<'_> {
 }
 
 #[async_trait(?Send)]
-impl LiveTrackedReader for PendingTrackedReadView<'_> {
-    async fn load_exact_row(
-        &self,
-        request: &ExactTrackedRowRequest,
-    ) -> Result<Option<TrackedRow>, LixError> {
-        if let Some(row) = pending_tracked_row(self.pending, request) {
-            return Ok(Some(row.clone()));
-        }
-        if pending_tracked_tombstone(self.pending, request).is_some() {
-            return Ok(None);
-        }
-        self.base.load_exact_row(request).await
-    }
-
+impl TrackedReadView for PendingTrackedReadView<'_> {
     async fn load_exact_rows(
         &self,
         request: &BatchTrackedRowRequest,
@@ -214,20 +208,7 @@ impl LiveTrackedReader for PendingTrackedReadView<'_> {
 }
 
 #[async_trait(?Send)]
-impl LiveUntrackedReader for PendingUntrackedReadView<'_> {
-    async fn load_exact_row(
-        &self,
-        request: &ExactUntrackedRowRequest,
-    ) -> Result<Option<UntrackedRow>, LixError> {
-        if let Some(row) = pending_untracked_row(self.pending, request) {
-            return Ok(Some(row.clone()));
-        }
-        if pending_untracked_delete(self.pending, request) {
-            return Ok(None);
-        }
-        self.base.load_exact_row(request).await
-    }
-
+impl UntrackedReadView for PendingUntrackedReadView<'_> {
     async fn load_exact_rows(
         &self,
         request: &BatchUntrackedRowRequest,
@@ -293,23 +274,7 @@ impl LiveUntrackedReader for PendingUntrackedReadView<'_> {
 }
 
 #[async_trait(?Send)]
-impl LiveTrackedTombstoneReader for PendingTrackedTombstoneView<'_> {
-    async fn load_exact_tombstone(
-        &self,
-        request: &ExactTrackedRowRequest,
-    ) -> Result<Option<TrackedTombstoneMarker>, LixError> {
-        if let Some(row) = pending_tracked_tombstone(self.pending, request) {
-            return Ok(Some(row.clone()));
-        }
-        if pending_tracked_row(self.pending, request).is_some() {
-            return Ok(None);
-        }
-        match self.base {
-            Some(base) => base.load_exact_tombstone(request).await,
-            None => Ok(None),
-        }
-    }
-
+impl TrackedTombstoneView for PendingTrackedTombstoneView<'_> {
     async fn scan_tombstones(
         &self,
         request: &TrackedScanRequest,
@@ -401,28 +366,6 @@ fn sort_untracked_rows(rows: &mut [UntrackedRow]) {
     rows.sort_by_key(RowIdentity::from_untracked_row);
 }
 
-fn pending_tracked_row<'a>(
-    pending: &'a PendingWriteOverlay,
-    request: &ExactTrackedRowRequest,
-) -> Option<&'a TrackedRow> {
-    pending
-        .tracked_rows()
-        .iter()
-        .find(|(identity, _)| identity.matches_exact(request))
-        .map(|(_, row)| row)
-}
-
-fn pending_tracked_tombstone<'a>(
-    pending: &'a PendingWriteOverlay,
-    request: &ExactTrackedRowRequest,
-) -> Option<&'a TrackedTombstoneMarker> {
-    pending
-        .tracked_tombstones()
-        .iter()
-        .find(|(identity, _)| identity.matches_exact(request))
-        .map(|(_, row)| row)
-}
-
 fn pending_workspace_writer_key_annotation(
     pending: &PendingWriteOverlay,
     row_identity: &RowIdentity,
@@ -434,25 +377,4 @@ fn pending_workspace_writer_key_annotation(
         .tracked_tombstones()
         .get(row_identity)
         .map(|row| row.writer_key.clone())
-}
-
-fn pending_untracked_row<'a>(
-    pending: &'a PendingWriteOverlay,
-    request: &ExactUntrackedRowRequest,
-) -> Option<&'a UntrackedRow> {
-    pending
-        .untracked_rows()
-        .iter()
-        .find(|(identity, _)| identity.matches_exact(request))
-        .map(|(_, row)| row)
-}
-
-fn pending_untracked_delete(
-    pending: &PendingWriteOverlay,
-    request: &ExactUntrackedRowRequest,
-) -> bool {
-    pending
-        .untracked_deletes()
-        .iter()
-        .any(|identity| identity.matches_exact(request))
 }

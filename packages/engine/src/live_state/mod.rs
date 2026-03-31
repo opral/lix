@@ -29,10 +29,7 @@
 
 pub mod constraints;
 pub mod effective;
-pub(crate) mod filesystem_projection;
-pub(crate) mod filesystem_queries;
 mod init;
-pub(crate) mod key_value_queries;
 mod lifecycle;
 mod materialize;
 pub(crate) mod pending_reads;
@@ -48,7 +45,9 @@ pub(crate) mod testing;
 pub mod tracked;
 pub mod untracked;
 mod visible_rows;
+use crate::contracts::traits::{TrackedWriteParticipant, UntrackedWriteParticipant};
 use crate::{LixBackend, LixBackendTransaction, LixError, ReplayCursor};
+use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
@@ -58,37 +57,13 @@ pub(crate) use crate::contracts::artifacts::{
     LiveSnapshotStorage, LiveStateProjectionStatus, SchemaRegistrationSet,
     TrackedTombstoneLookupRequest,
 };
-pub(crate) use constraints::matches_constraints;
+pub use crate::contracts::artifacts::{LiveStateMode, SchemaRegistration};
 pub use constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
-pub(crate) use effective::resolve_effective_rows;
 pub use effective::{
     EffectiveRow, EffectiveRowIdentity, EffectiveRowRequest, EffectiveRowSet, EffectiveRowState,
     EffectiveRowsRequest, LaneResult, OverlayLane,
 };
-pub(crate) use filesystem_projection::{
-    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
-    resolve_file_id_by_path_in_version, FilesystemProjectionScope,
-};
-pub(crate) use filesystem_queries::{
-    ensure_no_directory_at_file_path, ensure_no_file_at_directory_path,
-    load_directory_descriptors_by_parent_name_pairs, load_directory_row_by_id,
-    load_directory_row_by_id_with_pending_transaction_view, load_directory_row_by_path,
-    load_directory_row_by_path_with_pending_transaction_view, load_directory_rows_under_path,
-    load_file_descriptors_by_directory_name_extension_triplets, load_file_row_by_id,
-    load_file_row_by_id_with_pending_transaction_view, load_file_row_by_id_without_path,
-    load_file_row_by_id_without_path_with_pending_transaction_view, load_file_row_by_path,
-    load_file_row_by_path_with_pending_transaction_view, load_file_rows_under_path,
-    lookup_directory_id_by_path, lookup_directory_id_by_path_with_pending_transaction_view,
-    lookup_directory_path_by_id, lookup_directory_path_by_id_with_pending_transaction_view,
-    lookup_file_id_by_path, lookup_file_id_by_path_with_pending_transaction_view,
-    DirectoryFilesystemRow, EffectiveDescriptorRow, FileFilesystemRow, FilesystemQueryError,
-};
 pub use init::init;
-pub(crate) use key_value_queries::{
-    build_ensure_runtime_sequence_row_sql, build_lock_runtime_sequence_row_sql,
-    build_update_runtime_sequence_highest_sql, load_key_value_payloads,
-};
-pub use crate::contracts::artifacts::{LiveStateMode, SchemaRegistration};
 pub use lifecycle::LiveStateReadiness;
 pub use materialize::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
@@ -102,9 +77,6 @@ pub use projection::{
 };
 pub(crate) use schema_access::LiveReadContract;
 pub use shared::identity::RowIdentity;
-pub(crate) use shared::query::entity_id_in_constraint;
-pub(crate) use shared::snapshot::values_from_snapshot_content;
-pub(crate) use shared::views::ReadViews as LiveReadViews;
 pub use tracked::{
     load_exact_row_with_backend as load_exact_tracked_row_with_backend,
     load_exact_rows_with_backend as load_exact_tracked_rows_with_backend,
@@ -115,19 +87,14 @@ pub use tracked::{
 pub(crate) use tracked::{
     load_exact_tombstone_with_executor as load_exact_tracked_tombstone_with_executor,
     scan_tombstones_with_executor as scan_tracked_tombstones_with_executor,
-    TrackedReadView as LiveTrackedReader, TrackedTombstoneView as LiveTrackedTombstoneReader,
-    TrackedWriteParticipant as LiveTrackedWriter,
 };
+pub(crate) use untracked::load_exact_row_with_executor as load_exact_untracked_row_with_executor;
 pub use untracked::{
     load_exact_row_with_backend as load_exact_untracked_row_with_backend,
     load_exact_rows_with_backend as load_exact_untracked_rows_with_backend,
     scan_rows_with_backend as scan_untracked_rows_with_backend, BatchUntrackedRowRequest,
     ExactUntrackedRowRequest, UntrackedRow, UntrackedScanRequest, UntrackedWriteBatch,
     UntrackedWriteOperation, UntrackedWriteRow,
-};
-pub(crate) use untracked::{
-    load_exact_row_with_executor as load_exact_untracked_row_with_executor,
-    UntrackedReadView as LiveUntrackedReader, UntrackedWriteParticipant as LiveUntrackedWriter,
 };
 pub(crate) use visible_rows::{scan_live_rows, LiveReadRow, LiveStorageLane};
 
@@ -259,6 +226,27 @@ pub(crate) async fn mark_live_state_projection_ready_with_backend(
     projection::mark_live_state_projection_ready_with_backend(backend, cursor).await
 }
 
+#[async_trait(?Send)]
+impl crate::contracts::traits::LiveStateTransactionBridge for dyn LixBackendTransaction + '_ {
+    async fn register_live_state_schema(
+        &mut self,
+        registration: &crate::contracts::artifacts::SchemaRegistration,
+    ) -> Result<(), LixError> {
+        register_schema_in_transaction(self, registration.clone()).await
+    }
+
+    async fn mark_live_state_projection_ready(&mut self) -> Result<ReplayCursor, LixError> {
+        mark_live_state_projection_ready_in_transaction(self).await
+    }
+
+    async fn apply_canonical_receipt_to_live_state(
+        &mut self,
+        receipt: &crate::commit::CanonicalCommitReceipt,
+    ) -> Result<(), LixError> {
+        apply_canonical_receipt_in_transaction(self, receipt).await
+    }
+}
+
 pub(crate) async fn mark_live_state_projection_ready_without_replay_cursor_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<(), LixError> {
@@ -312,14 +300,14 @@ pub(crate) async fn apply_tracked_write_batch_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     batch: &[TrackedWriteRow],
 ) -> Result<(), LixError> {
-    LiveTrackedWriter::apply_write_batch(transaction, batch).await
+    transaction.apply_tracked_write_batch(batch).await
 }
 
 pub(crate) async fn apply_untracked_write_batch_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     batch: &[UntrackedWriteRow],
 ) -> Result<(), LixError> {
-    LiveUntrackedWriter::apply_write_batch(transaction, batch).await
+    transaction.apply_untracked_write_batch(batch).await
 }
 
 pub(crate) async fn upsert_bootstrap_tracked_row_in_transaction(

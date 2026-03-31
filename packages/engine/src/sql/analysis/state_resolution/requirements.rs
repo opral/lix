@@ -1,5 +1,5 @@
+use crate::runtime::execution_state::derive_execution_runtime_effects;
 use crate::sql::executor::contracts::requirements::PlanRequirements;
-use crate::sql::executor::runtime_state::derive_execution_runtime_effects;
 use crate::sql::optimizer::optimize_state_resolution;
 use sqlparser::ast::Statement;
 

@@ -1,10 +1,10 @@
-use crate::contracts::artifacts::{
-    EffectiveStateRequest, EffectiveStateVersionScope, ExactUntrackedLookupRequest,
-    LiveQueryEffectiveRow, LiveQueryOverlayLane, TrackedTombstoneLookupRequest,
-};
 use crate::canonical::read::{
     load_exact_committed_state_row_at_version_head as load_exact_committed_state_row,
     ExactCommittedStateRow, ExactCommittedStateRowRequest,
+};
+use crate::contracts::artifacts::{
+    EffectiveStateRequest, EffectiveStateVersionScope, ExactUntrackedLookupRequest,
+    LiveQueryEffectiveRow, LiveQueryOverlayLane, TrackedTombstoneLookupRequest,
 };
 use crate::contracts::traits::{
     LiveStateQueryBackend, PendingSemanticRow, PendingSemanticStorage, PendingView,
@@ -402,19 +402,21 @@ async fn load_exact_untracked_effective_row(
     backend
         .load_exact_untracked_effective_row(
             &ExactUntrackedLookupRequest {
-            schema_key: request.schema_key.clone(),
-            version_id: version_id.to_string(),
-            entity_id: request.row_key.entity_id.clone(),
-            file_id: request.row_key.file_id.clone(),
-            plugin_key: request.row_key.plugin_key.clone(),
-            schema_version: request.row_key.schema_version.clone(),
-            writer_key: request.row_key.writer_key.clone(),
+                schema_key: request.schema_key.clone(),
+                version_id: version_id.to_string(),
+                entity_id: request.row_key.entity_id.clone(),
+                file_id: request.row_key.file_id.clone(),
+                plugin_key: request.row_key.plugin_key.clone(),
+                schema_version: request.row_key.schema_version.clone(),
+                writer_key: request.row_key.writer_key.clone(),
             },
             &request.version_id,
             live_state_overlay_lane(overlay_lane),
         )
         .await
-        .map(|row| row.map(|row| exact_effective_state_row_from_effective_untracked(row, overlay_lane)))
+        .map(|row| {
+            row.map(|row| exact_effective_state_row_from_effective_untracked(row, overlay_lane))
+        })
 }
 
 fn exact_effective_state_row_from_tracked(

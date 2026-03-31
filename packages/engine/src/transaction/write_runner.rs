@@ -1,7 +1,7 @@
-use crate::live_state::{
-    apply_tracked_write_batch_in_transaction, apply_untracked_write_batch_in_transaction,
+use crate::contracts::artifacts::{
     TrackedWriteOperation, TrackedWriteRow, UntrackedWriteOperation, UntrackedWriteRow,
 };
+use crate::contracts::traits::{TrackedWriteParticipant, UntrackedWriteParticipant};
 use crate::{LixBackendTransaction, LixError};
 
 use super::contracts::CommitOutcome;
@@ -16,11 +16,11 @@ pub(crate) async fn apply_write_plan(
     for unit in &plan.units {
         match unit {
             WriteUnit::ApplyTracked { writes } => {
-                apply_tracked_write_batch_in_transaction(transaction, writes).await?;
+                transaction.apply_tracked_write_batch(writes).await?;
                 outcome.merge(CommitOutcome::from_tracked_writes(writes));
             }
             WriteUnit::ApplyUntracked { writes } => {
-                apply_untracked_write_batch_in_transaction(transaction, writes).await?;
+                transaction.apply_untracked_write_batch(writes).await?;
                 outcome.merge(CommitOutcome::from_untracked_writes(writes));
             }
         }

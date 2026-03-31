@@ -8,13 +8,11 @@ use serde_json::Value as JsonValue;
 
 use crate::checkpoint::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME};
 use crate::contracts::artifacts::{
-    LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow, LiveSnapshotStorage,
-    is_untracked_live_table,
-};
-use crate::contracts::traits::{
-    LiveReadShapeContract, LiveStateQueryBackend,
+    is_untracked_live_table, LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow,
+    LiveSnapshotStorage,
 };
 use crate::contracts::surface::SurfaceFamily;
+use crate::contracts::traits::{LiveReadShapeContract, LiveStateQueryBackend};
 use crate::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
@@ -175,7 +173,9 @@ pub async fn validate_updates(
     let mut deleted_rows = Vec::new();
 
     for plan in plans {
-        let live_access = backend.load_live_read_shape_for_table_name(&plan.table).await?;
+        let live_access = backend
+            .load_live_read_shape_for_table_name(&plan.table)
+            .await?;
         let snapshot_projection = if live_access.is_some() {
             String::new()
         } else {
@@ -1704,14 +1704,14 @@ async fn query_committed_scope_rows(
             &scope.schema_key,
             &scope.version_id,
             &[LiveFilter {
-            field: LiveFilterField::FileId,
-            operator: LiveFilterOp::Eq(Value::Text(scope.file_id.clone())),
+                field: LiveFilterField::FileId,
+                operator: LiveFilterOp::Eq(Value::Text(scope.file_id.clone())),
             }],
         )
         .await?
-    .into_iter()
-    .map(committed_row_from_snapshot_row)
-    .collect()
+        .into_iter()
+        .map(committed_row_from_snapshot_row)
+        .collect()
 }
 
 async fn query_committed_schema_version_rows(
@@ -1726,9 +1726,9 @@ async fn query_committed_schema_version_rows(
             &[],
         )
         .await?
-    .into_iter()
-    .map(committed_row_from_snapshot_row)
-    .collect()
+        .into_iter()
+        .map(committed_row_from_snapshot_row)
+        .collect()
 }
 
 fn live_snapshot_storage(storage: ConstraintStorageKind) -> LiveSnapshotStorage {

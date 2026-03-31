@@ -1,7 +1,7 @@
 use super::{checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot};
 use crate::canonical::read::load_commit_lineage_entry_by_id;
+use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::TransactionBackendAdapter;
-use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::version::context::require_target_version_context_in_transaction;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 

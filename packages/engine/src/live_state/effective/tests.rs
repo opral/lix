@@ -1,22 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::contracts::traits::{
+    LiveReadContext as ReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView,
+};
 use crate::live_state::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::effective::{
-    overlay_lanes_for_version, resolve_effective_row, resolve_effective_rows, EffectiveRowRequest,
-    EffectiveRowState, EffectiveRowsRequest, OverlayLane, ReadContext,
+    EffectiveRowRequest, EffectiveRowState, EffectiveRowsRequest, OverlayLane,
 };
 use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::tracked::{
-    BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedReadView, TrackedRow,
-    TrackedScanRequest, TrackedTombstoneMarker, TrackedTombstoneView,
+    BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
 };
-use crate::live_state::untracked::{
-    BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedReadView, UntrackedRow,
-    UntrackedScanRequest,
-};
+use crate::live_state::untracked::{BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
 use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
 use crate::{LixError, Value};
 use async_trait::async_trait;
+
+use super::resolve::{overlay_lanes_for_version, resolve_effective_row, resolve_effective_rows};
 
 #[derive(Default)]
 struct MockTrackedView {
@@ -40,17 +40,6 @@ struct MockWorkspaceWriterKeys {
 
 #[async_trait(?Send)]
 impl TrackedReadView for MockTrackedView {
-    async fn load_exact_row(
-        &self,
-        request: &ExactTrackedRowRequest,
-    ) -> Result<Option<TrackedRow>, LixError> {
-        Ok(self
-            .rows
-            .iter()
-            .find(|row| tracked_row_matches_exact(row, request))
-            .cloned())
-    }
-
     async fn load_exact_rows(
         &self,
         request: &BatchTrackedRowRequest,
@@ -83,17 +72,6 @@ impl TrackedReadView for MockTrackedView {
 
 #[async_trait(?Send)]
 impl UntrackedReadView for MockUntrackedView {
-    async fn load_exact_row(
-        &self,
-        request: &ExactUntrackedRowRequest,
-    ) -> Result<Option<UntrackedRow>, LixError> {
-        Ok(self
-            .rows
-            .iter()
-            .find(|row| untracked_row_matches_exact(row, request))
-            .cloned())
-    }
-
     async fn load_exact_rows(
         &self,
         request: &BatchUntrackedRowRequest,
@@ -129,17 +107,6 @@ impl UntrackedReadView for MockUntrackedView {
 
 #[async_trait(?Send)]
 impl TrackedTombstoneView for MockTrackedTombstones {
-    async fn load_exact_tombstone(
-        &self,
-        request: &ExactTrackedRowRequest,
-    ) -> Result<Option<TrackedTombstoneMarker>, LixError> {
-        Ok(self
-            .rows
-            .iter()
-            .find(|row| tombstone_matches_exact(row, request))
-            .cloned())
-    }
-
     async fn scan_tombstones(
         &self,
         request: &TrackedScanRequest,
@@ -446,36 +413,6 @@ async fn effective_state_exact_overlays_workspace_writer_key_annotation() {
     .expect("winner should exist");
 
     assert_eq!(resolved.writer_key.as_deref(), Some("writer-overlay"));
-}
-
-fn tracked_row_matches_exact(row: &TrackedRow, request: &ExactTrackedRowRequest) -> bool {
-    row.schema_key == request.schema_key
-        && row.version_id == request.version_id
-        && row.entity_id == request.entity_id
-        && request
-            .file_id
-            .as_ref()
-            .is_none_or(|file_id| row.file_id == *file_id)
-}
-
-fn untracked_row_matches_exact(row: &UntrackedRow, request: &ExactUntrackedRowRequest) -> bool {
-    row.schema_key == request.schema_key
-        && row.version_id == request.version_id
-        && row.entity_id == request.entity_id
-        && request
-            .file_id
-            .as_ref()
-            .is_none_or(|file_id| row.file_id == *file_id)
-}
-
-fn tombstone_matches_exact(row: &TrackedTombstoneMarker, request: &ExactTrackedRowRequest) -> bool {
-    row.schema_key == request.schema_key
-        && row.version_id == request.version_id
-        && row.entity_id == request.entity_id
-        && request
-            .file_id
-            .as_ref()
-            .is_none_or(|file_id| row.file_id == *file_id)
 }
 
 fn tracked_row_matches_scan(row: &TrackedRow, request: &TrackedScanRequest) -> bool {
