@@ -1,15 +1,16 @@
-use crate::canonical::read::load_version_descriptor_with_backend;
 use crate::filesystem::queries::FilesystemQueryError;
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::live_state::RowIdentity;
-use crate::refs::load_committed_version_ref_with_backend as load_version_ref;
 use crate::sql::catalog::SurfaceFamily;
 use crate::sql::logical_plan::public_ir::{
-    CanonicalStateSelector, MutationPayload, PlannedStateRow, PlannedWrite, ResolvedRowRef,
+    CanonicalStateSelector, MutationPayload, PlannedFilesystemDescriptor, PlannedFilesystemFile,
+    PlannedFilesystemState, PlannedRowIdentity, PlannedStateRow, PlannedWrite, ResolvedRowRef,
     ResolvedWritePartition, ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, TargetSetProof,
     WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
+};
+use crate::sql::semantic_ir::hydration::{
+    HydratedVersionAdminRow as VersionAdminRow, PublicWriteHydrator,
 };
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
@@ -61,10 +62,10 @@ struct ResolvedWritePartitionBuilder {
     authoritative_pre_state: Vec<ResolvedRowRef>,
     authoritative_pre_state_rows: Vec<PlannedStateRow>,
     intended_post_state: Vec<PlannedStateRow>,
-    workspace_writer_key_updates: BTreeMap<RowIdentity, Option<String>>,
+    workspace_writer_key_updates: BTreeMap<PlannedRowIdentity, Option<String>>,
     tombstones: Vec<ResolvedRowRef>,
     lineage: Vec<RowLineage>,
-    filesystem_state: crate::filesystem::runtime::FilesystemTransactionState,
+    filesystem_state: PlannedFilesystemState,
 }
 
 impl ResolvedWritePartitionBuilder {
@@ -220,29 +221,16 @@ pub(crate) async fn resolve_write_plan_with_functions<P>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
+    let mut hydrator = PublicWriteHydrator::new(backend, pending_transaction_view);
     let resolved = match planned_write.command.target.descriptor.surface_family {
         SurfaceFamily::State => {
-            resolve_state_write(
-                backend,
-                planned_write,
-                pending_transaction_view,
-                functions.clone(),
-            )
-            .await
+            resolve_state_write(&mut hydrator, planned_write, functions.clone()).await
         }
         SurfaceFamily::Entity => {
-            resolve_entity_write(
-                backend,
-                planned_write,
-                pending_transaction_view,
-                functions.clone(),
-            )
-            .await
+            resolve_entity_write(&mut hydrator, planned_write, functions.clone()).await
         }
-        SurfaceFamily::Admin => resolve_admin_write(backend, planned_write).await,
-        SurfaceFamily::Filesystem => {
-            resolve_filesystem_write(backend, planned_write, pending_transaction_view).await
-        }
+        SurfaceFamily::Admin => resolve_admin_write(&mut hydrator, planned_write).await,
+        SurfaceFamily::Filesystem => resolve_filesystem_write(&mut hydrator, planned_write).await,
         SurfaceFamily::Change => Err(WriteResolveError {
             message: format!(
                 "public write resolver does not support '{}' writes",
@@ -254,26 +242,17 @@ where
     finalize_resolved_write_plan(planned_write, resolved)
 }
 
-#[derive(Debug, Clone)]
-struct VersionAdminRow {
-    id: String,
-    name: String,
-    hidden: bool,
-    commit_id: String,
-    descriptor_change_id: Option<String>,
-}
-
 async fn resolve_admin_write(
-    backend: &dyn LixBackend,
+    hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     match planned_write.command.target.descriptor.public_name.as_str() {
         "lix_version" => match planned_write.command.operation_kind {
             WriteOperationKind::Insert => {
-                resolve_version_insert_write_plan(backend, planned_write).await
+                resolve_version_insert_write_plan(hydrator, planned_write).await
             }
             WriteOperationKind::Update | WriteOperationKind::Delete => {
-                resolve_existing_version_write(backend, planned_write).await
+                resolve_existing_version_write(hydrator, planned_write).await
             }
         },
         other => Err(WriteResolveError {
@@ -286,7 +265,7 @@ async fn resolve_admin_write(
 }
 
 async fn resolve_version_insert_write_plan(
-    backend: &dyn LixBackend,
+    hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let rows = payload_maps(planned_write)?;
@@ -297,7 +276,8 @@ async fn resolve_version_insert_write_plan(
         let name = version_admin_required_text_from_payload_map(&row, "name")?;
         let commit_id = version_admin_required_text_from_payload_map(&row, "commit_id")?;
         let hidden = version_admin_hidden_from_payload_map(&row)?;
-        let existing = load_version_admin_row(backend, &version_id)
+        let existing = hydrator
+            .load_version_admin_row(&version_id)
             .await
             .map_err(write_resolve_backend_error)?;
 
@@ -341,13 +321,13 @@ async fn resolve_version_insert_write_plan(
 }
 
 async fn resolve_existing_version_write(
-    backend: &dyn LixBackend,
+    hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let version_ids = query_text_selector_values_for_write_selector(
-        backend,
+        hydrator.backend(),
         planned_write,
-        None,
+        hydrator.pending_transaction_view(),
         "id",
         "public version selector resolver expected id text rows",
     )
@@ -360,7 +340,8 @@ async fn resolve_existing_version_write(
 
     let mut current_rows = Vec::new();
     for version_id in version_ids {
-        let Some(current_row) = load_version_admin_row(backend, &version_id)
+        let Some(current_row) = hydrator
+            .load_version_admin_row(&version_id)
             .await
             .map_err(write_resolve_backend_error)?
         else {
@@ -497,27 +478,6 @@ async fn resolve_existing_version_write(
             message: "public version existing-row resolver does not handle inserts".to_string(),
         }),
     }
-}
-
-async fn load_version_admin_row(
-    backend: &dyn LixBackend,
-    version_id: &str,
-) -> Result<Option<VersionAdminRow>, crate::LixError> {
-    let Some(descriptor_row) = load_version_descriptor_with_backend(backend, version_id).await?
-    else {
-        return Ok(None);
-    };
-    let pointer_row = load_version_ref(backend, version_id).await?;
-    Ok(Some(VersionAdminRow {
-        id: version_id.to_string(),
-        name: descriptor_row.name,
-        hidden: descriptor_row.hidden,
-        commit_id: pointer_row
-            .as_ref()
-            .map(|row| row.commit_id.clone())
-            .unwrap_or_default(),
-        descriptor_change_id: descriptor_row.change_id,
-    }))
 }
 
 fn version_descriptor_pre_state_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
@@ -720,8 +680,8 @@ fn planned_state_rows_equivalent(left: &PlannedStateRow, right: &PlannedStateRow
         && left.values == right.values
 }
 
-fn planned_state_row_workspace_identity(row: &PlannedStateRow) -> Option<RowIdentity> {
-    Some(RowIdentity {
+fn planned_state_row_workspace_identity(row: &PlannedStateRow) -> Option<PlannedRowIdentity> {
+    Some(PlannedRowIdentity {
         schema_key: row.schema_key.clone(),
         version_id: row.version_id.clone()?,
         entity_id: row.entity_id.clone(),
@@ -982,7 +942,7 @@ pub(super) fn resolved_version_id_for_insert_payload(
 }
 
 async fn resolved_existing_version_ids(
-    backend: &dyn LixBackend,
+    hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
 ) -> Result<Vec<String>, WriteResolveError> {
     let version_ids = resolved_version_ids(planned_write)?;
@@ -990,7 +950,10 @@ async fn resolved_existing_version_ids(
 
     for version_id in &version_ids {
         if validated.insert(version_id.clone()) {
-            validate_public_write_version_target(backend, version_id).await?;
+            hydrator
+                .validate_version_target(version_id)
+                .await
+                .map_err(write_resolve_backend_error)?;
         }
     }
 
@@ -998,7 +961,7 @@ async fn resolved_existing_version_ids(
 }
 
 pub(super) async fn resolved_insert_version_ids(
-    backend: &dyn LixBackend,
+    hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
 ) -> Result<Vec<Option<String>>, WriteResolveError> {
     let payloads = payload_maps(planned_write)?;
@@ -1009,45 +972,16 @@ pub(super) async fn resolved_insert_version_ids(
         let version_id = resolved_version_id_for_insert_payload(planned_write, payload)?;
         if let Some(version_id_ref) = version_id.as_deref() {
             if validated.insert(version_id_ref.to_string()) {
-                validate_public_write_version_target(backend, version_id_ref).await?;
+                hydrator
+                    .validate_version_target(version_id_ref)
+                    .await
+                    .map_err(write_resolve_backend_error)?;
             }
         }
         version_ids.push(version_id);
     }
 
     Ok(version_ids)
-}
-
-async fn validate_public_write_version_target(
-    backend: &dyn LixBackend,
-    version_id: &str,
-) -> Result<(), WriteResolveError> {
-    if version_id == GLOBAL_VERSION_ID {
-        return Ok(());
-    }
-
-    let descriptor_exists = load_version_descriptor_with_backend(backend, version_id)
-        .await
-        .map_err(write_resolve_backend_error)?
-        .is_some();
-    if !descriptor_exists {
-        return Err(WriteResolveError {
-            message: format!("version with id '{version_id}' does not exist"),
-        });
-    }
-
-    let version_ref = load_version_ref(backend, version_id)
-        .await
-        .map_err(write_resolve_backend_error)?;
-    if version_ref.is_none() {
-        return Err(WriteResolveError {
-            message: format!(
-                "public write invariant violation: version with id '{version_id}' exists but its local version head is missing"
-            ),
-        });
-    }
-
-    Ok(())
 }
 
 fn finalize_resolved_write_plan(

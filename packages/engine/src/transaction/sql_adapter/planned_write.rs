@@ -355,6 +355,21 @@ impl PendingWorkspaceWriterKeyOverlay {
     pub(crate) fn annotation(&self, identity: &RowIdentity) -> Option<&Option<String>> {
         self.annotations.get(identity)
     }
+
+    pub(crate) fn annotation_for_state_row(
+        &self,
+        version_id: &str,
+        schema_key: &str,
+        entity_id: &str,
+        file_id: &str,
+    ) -> Option<&Option<String>> {
+        self.annotations.get(&RowIdentity {
+            version_id: version_id.to_string(),
+            schema_key: schema_key.to_string(),
+            entity_id: entity_id.to_string(),
+            file_id: file_id.to_string(),
+        })
+    }
 }
 
 impl PendingSemanticOverlay {
@@ -463,7 +478,14 @@ fn planned_workspace_writer_key_unit_from_public_write(
     let resolved = public_write.planned_write.resolved_write_plan.as_ref()?;
     let mut annotations = BTreeMap::new();
     for partition in &resolved.partitions {
-        annotations.extend(partition.workspace_writer_key_updates.clone());
+        annotations.extend(partition.workspace_writer_key_updates.iter().map(
+            |(identity, annotation)| {
+                (
+                    runtime_row_identity_from_planned(identity),
+                    annotation.clone(),
+                )
+            },
+        ));
     }
     (!annotations.is_empty()).then_some(PlannedWorkspaceWriterKeyUnit { annotations })
 }
@@ -1068,6 +1090,17 @@ fn tracked_plan_entity_targets_disjoint(left: &TrackedTxnUnit, right: &TrackedTx
     let left_targets = tracked_plan_entity_targets(left);
     let right_targets = tracked_plan_entity_targets(right);
     left_targets.is_disjoint(&right_targets)
+}
+
+fn runtime_row_identity_from_planned(
+    identity: &crate::sql::logical_plan::public_ir::PlannedRowIdentity,
+) -> RowIdentity {
+    RowIdentity {
+        schema_key: identity.schema_key.clone(),
+        version_id: identity.version_id.clone(),
+        entity_id: identity.entity_id.clone(),
+        file_id: identity.file_id.clone(),
+    }
 }
 
 fn merge_plan_effects(current: &mut PlanEffects, next: &PlanEffects) {

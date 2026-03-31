@@ -14,9 +14,6 @@ use crate::filesystem::queries::{
     lookup_directory_path_by_id, lookup_file_id_by_path_with_pending_transaction_view,
     DirectoryFilesystemRow, FileFilesystemRow,
 };
-use crate::filesystem::runtime::{
-    FilesystemDescriptorState, FilesystemTransactionFileState, FilesystemTransactionState,
-};
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::semantic_ir::semantics::filesystem_assignments::{
     parse_directory_insert_assignments, parse_directory_update_assignments,
@@ -41,29 +38,33 @@ const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 
 pub(super) async fn resolve_filesystem_write(
-    backend: &dyn LixBackend,
+    hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     match planned_write.command.target.descriptor.public_name.as_str() {
         "lix_file" | "lix_file_by_version" => match planned_write.command.operation_kind {
             WriteOperationKind::Insert => {
-                resolve_file_insert_write_plan(backend, planned_write).await
+                resolve_file_insert_write_plan(hydrator, planned_write).await
             }
             WriteOperationKind::Update | WriteOperationKind::Delete => {
-                resolve_existing_file_write(backend, planned_write, pending_transaction_view).await
+                resolve_existing_file_write(
+                    hydrator.backend(),
+                    planned_write,
+                    hydrator.pending_transaction_view(),
+                )
+                .await
             }
         },
         "lix_directory" | "lix_directory_by_version" => {
             match planned_write.command.operation_kind {
                 WriteOperationKind::Insert => {
-                    resolve_directory_insert_write_plan(backend, planned_write).await
+                    resolve_directory_insert_write_plan(hydrator, planned_write).await
                 }
                 WriteOperationKind::Update | WriteOperationKind::Delete => {
                     resolve_existing_directory_write(
-                        backend,
+                        hydrator.backend(),
                         planned_write,
-                        pending_transaction_view,
+                        hydrator.pending_transaction_view(),
                     )
                     .await
                 }
@@ -97,12 +98,12 @@ async fn resolved_filesystem_version_id(
 }
 
 async fn resolve_directory_insert_write_plan(
-    backend: &dyn LixBackend,
+    hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
     let payloads = payload_maps(planned_write)?;
-    let row_version_ids = resolved_insert_version_ids(backend, planned_write).await?;
+    let row_version_ids = resolved_insert_version_ids(hydrator, planned_write).await?;
     if payloads.len() != row_version_ids.len() {
         return Err(WriteResolveError {
             message:
@@ -136,10 +137,14 @@ async fn resolve_directory_insert_write_plan(
 
     let mut partitions = ResolvedWritePlanBuilder::default();
     for (execution_mode, version_id, assignments_batch) in grouped_batches {
-        let planned_batch =
-            plan_directory_insert_batch(backend, &assignments_batch, &version_id, lookup_scope)
-                .await
-                .map_err(write_resolve_filesystem_planning_error)?;
+        let planned_batch = plan_directory_insert_batch(
+            hydrator.backend(),
+            &assignments_batch,
+            &version_id,
+            lookup_scope,
+        )
+        .await
+        .map_err(write_resolve_filesystem_planning_error)?;
         let target_write_lane = target_write_lane_for_version(
             planned_write,
             execution_mode,
@@ -392,12 +397,12 @@ async fn resolve_existing_directory_write(
 }
 
 async fn resolve_file_insert_write_plan(
-    backend: &dyn LixBackend,
+    hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
     let payloads = payload_maps(planned_write)?;
-    let row_version_ids = resolved_insert_version_ids(backend, planned_write).await?;
+    let row_version_ids = resolved_insert_version_ids(hydrator, planned_write).await?;
     if payloads.len() != row_version_ids.len() {
         return Err(WriteResolveError {
             message: "public filesystem file insert requires one version target per payload row"
@@ -430,10 +435,14 @@ async fn resolve_file_insert_write_plan(
 
     let mut partitions = ResolvedWritePlanBuilder::default();
     for (execution_mode, version_id, assignments_batch) in grouped_batches {
-        let planned_batch =
-            plan_file_insert_batch(backend, &assignments_batch, &version_id, lookup_scope)
-                .await
-                .map_err(write_resolve_filesystem_planning_error)?;
+        let planned_batch = plan_file_insert_batch(
+            hydrator.backend(),
+            &assignments_batch,
+            &version_id,
+            lookup_scope,
+        )
+        .await
+        .map_err(write_resolve_filesystem_planning_error)?;
         let target_write_lane = target_write_lane_for_version(
             planned_write,
             execution_mode,
@@ -784,8 +793,8 @@ fn filesystem_descriptor_state_from_file_row(
     extension: Option<&str>,
     hidden: bool,
     metadata: Option<&str>,
-) -> FilesystemDescriptorState {
-    FilesystemDescriptorState {
+) -> PlannedFilesystemDescriptor {
+    PlannedFilesystemDescriptor {
         directory_id: directory_id.unwrap_or("").to_string(),
         name: name.to_string(),
         extension: extension.map(ToString::to_string),
@@ -795,15 +804,15 @@ fn filesystem_descriptor_state_from_file_row(
 }
 
 fn ensure_file_state_entry<'a>(
-    state: &'a mut FilesystemTransactionState,
+    state: &'a mut PlannedFilesystemState,
     file_id: &str,
     version_id: &str,
     untracked: bool,
-) -> &'a mut FilesystemTransactionFileState {
+) -> &'a mut PlannedFilesystemFile {
     state
         .files
         .entry((file_id.to_string(), version_id.to_string()))
-        .or_insert_with(|| FilesystemTransactionFileState {
+        .or_insert_with(|| PlannedFilesystemFile {
             file_id: file_id.to_string(),
             version_id: version_id.to_string(),
             untracked,
@@ -815,11 +824,11 @@ fn ensure_file_state_entry<'a>(
 }
 
 fn set_filesystem_descriptor_state(
-    state: &mut FilesystemTransactionState,
+    state: &mut PlannedFilesystemState,
     file_id: &str,
     version_id: &str,
     untracked: bool,
-    descriptor: FilesystemDescriptorState,
+    descriptor: PlannedFilesystemDescriptor,
 ) {
     let entry = ensure_file_state_entry(state, file_id, version_id, untracked);
     entry.untracked = untracked;
@@ -829,7 +838,7 @@ fn set_filesystem_descriptor_state(
 }
 
 fn set_filesystem_data_state(
-    state: &mut FilesystemTransactionState,
+    state: &mut PlannedFilesystemState,
     file_id: &str,
     version_id: &str,
     untracked: bool,
@@ -842,7 +851,7 @@ fn set_filesystem_data_state(
 }
 
 fn set_filesystem_deleted_state(
-    state: &mut FilesystemTransactionState,
+    state: &mut PlannedFilesystemState,
     file_id: &str,
     version_id: &str,
     untracked: bool,

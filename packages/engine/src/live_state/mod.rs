@@ -39,6 +39,7 @@ pub(crate) mod pending_reads;
 #[allow(dead_code)]
 pub(crate) mod projection;
 mod public_read_sql;
+mod query_contracts;
 pub(crate) mod raw;
 pub(crate) mod schema_access;
 pub(crate) mod shared;
@@ -47,8 +48,9 @@ mod storage;
 pub(crate) mod testing;
 pub mod tracked;
 pub mod untracked;
+mod visible_rows;
 use crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
-use crate::{LixBackend, LixBackendTransaction, LixError, ReplayCursor, SqlDialect, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, ReplayCursor, SqlDialect};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
@@ -100,6 +102,13 @@ pub(crate) use pending_reads::{
 pub use projection::{
     DerivedProjectionId, DerivedProjectionStatus, ProjectionReplayMode, ProjectionStatus,
 };
+pub(crate) use query_contracts::{
+    load_exact_untracked_effective_row_with_backend, load_live_read_shape_for_table_name,
+    load_live_snapshot_rows_with_backend, normalize_live_snapshot_values_with_backend,
+    tracked_tombstone_shadows_exact_row_with_backend, ExactUntrackedLookupRequest, LiveFilter,
+    LiveFilterField, LiveFilterOp, LiveReadShape, LiveSnapshotRow, LiveSnapshotStorage,
+    TrackedTombstoneLookupRequest,
+};
 pub(crate) use schema_access::LiveReadContract;
 pub use shared::identity::RowIdentity;
 pub(crate) use shared::query::entity_id_in_constraint;
@@ -114,7 +123,6 @@ pub use tracked::{
 };
 pub(crate) use tracked::{
     load_exact_tombstone_with_executor as load_exact_tracked_tombstone_with_executor,
-    scan_rows_with_executor as scan_tracked_rows_with_executor,
     scan_tombstones_with_executor as scan_tracked_tombstones_with_executor,
     TrackedReadView as LiveTrackedReader, TrackedTombstoneView as LiveTrackedTombstoneReader,
     TrackedWriteParticipant as LiveTrackedWriter,
@@ -128,9 +136,9 @@ pub use untracked::{
 };
 pub(crate) use untracked::{
     load_exact_row_with_executor as load_exact_untracked_row_with_executor,
-    scan_rows_with_executor as scan_untracked_rows_with_executor,
     UntrackedReadView as LiveUntrackedReader, UntrackedWriteParticipant as LiveUntrackedWriter,
 };
+pub(crate) use visible_rows::{scan_live_rows, LiveReadRow, LiveStorageLane};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaRegistration {
@@ -517,24 +525,8 @@ pub(crate) fn normalized_values_for_schema(
     schema_key: &str,
     schema_definition: Option<&JsonValue>,
     snapshot_content: Option<&str>,
-) -> Result<BTreeMap<String, Value>, LixError> {
+) -> Result<BTreeMap<String, crate::Value>, LixError> {
     schema_access::normalized_values_for_schema(schema_key, schema_definition, snapshot_content)
-}
-
-pub(crate) fn logical_snapshot_from_projected_row_with_contract(
-    access: Option<&LiveReadContract>,
-    schema_key: &str,
-    row: &[Value],
-    snapshot_index: usize,
-    normalized_start_index: usize,
-) -> Result<Option<JsonValue>, LixError> {
-    schema_access::logical_snapshot_from_projected_row_with_contract(
-        access,
-        schema_key,
-        row,
-        snapshot_index,
-        normalized_start_index,
-    )
 }
 
 pub(crate) async fn rebuild_scope_in_transaction(

@@ -81,6 +81,25 @@ pub(crate) async fn load_workspace_writer_key_annotation(
     load_workspace_writer_key_annotation_with_executor(&mut executor, row_identity).await
 }
 
+pub(crate) async fn load_workspace_writer_key_annotation_for_state_row(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    schema_key: &str,
+    entity_id: &str,
+    file_id: &str,
+) -> Result<Option<String>, LixError> {
+    load_workspace_writer_key_annotation(
+        backend,
+        &RowIdentity {
+            version_id: version_id.to_string(),
+            schema_key: schema_key.to_string(),
+            entity_id: entity_id.to_string(),
+            file_id: file_id.to_string(),
+        },
+    )
+    .await
+}
+
 pub(crate) async fn load_workspace_writer_key_annotation_with_executor(
     executor: &mut dyn QueryExecutor,
     row_identity: &RowIdentity,

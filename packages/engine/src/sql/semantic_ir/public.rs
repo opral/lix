@@ -1,6 +1,7 @@
 use super::canonicalize::{
     canonicalize_read_parts, canonicalize_write, CanonicalizeError, CanonicalizedWrite,
 };
+use super::hydration::hydrate_structured_public_read;
 use super::internal::NormalizedInternalStatements;
 use super::statement::BoundStatement;
 use crate::errors::schema_not_registered_error;
@@ -19,11 +20,8 @@ use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     build_effective_state, EffectiveStatePlan, EffectiveStateRequest,
 };
 use crate::sql::semantic_ir::semantics::write_analysis::{analyze_write, WriteAnalysisError};
-use crate::version::context::load_target_version_context_with_backend;
 use crate::{LixBackend, LixError};
-use sqlparser::ast::{
-    BinaryOperator, Expr, Ident, SetExpr, Statement, TableFactor, Value as SqlValue,
-};
+use sqlparser::ast::{BinaryOperator, Expr, SetExpr, Statement, TableFactor};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,8 +102,8 @@ pub(crate) async fn prepare_structured_public_read_analysis(
     };
 
     let structured_read =
-        maybe_bind_active_history_root(backend, structured_read, active_version_id)
-            .await
+        hydrate_structured_public_read(backend, structured_read, active_version_id)
+            .await?
             .ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -328,88 +326,6 @@ fn collect_read_conjunctive_predicates(expr: &Expr, predicates: &mut Vec<Expr>) 
         }
         Expr::Nested(inner) => collect_read_conjunctive_predicates(inner, predicates),
         _ => predicates.push(expr.clone()),
-    }
-}
-
-async fn maybe_bind_active_history_root(
-    backend: &dyn LixBackend,
-    mut structured_read: StructuredPublicRead,
-    active_version_id: &str,
-) -> Option<StructuredPublicRead> {
-    let descriptor = &structured_read.surface_binding.descriptor;
-    let public_name = descriptor.public_name.as_str();
-    let uses_active_history_root = descriptor.surface_variant == SurfaceVariant::History
-        && matches!(
-            descriptor.surface_family,
-            SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
-        )
-        && !public_name.ends_with("_history_by_version");
-    if !uses_active_history_root || structured_read_has_root_commit_predicate(&structured_read) {
-        return Some(structured_read);
-    }
-
-    let root_commit_id = load_target_version_context_with_backend(
-        backend,
-        Some(active_version_id),
-        "active_version_id",
-    )
-    .await
-    .ok()??
-    .history_root_commit_id()
-    .to_string();
-    let root_predicate = Expr::BinaryOp {
-        left: Box::new(Expr::Identifier(Ident::new("lixcol_root_commit_id"))),
-        op: BinaryOperator::Eq,
-        right: Box::new(Expr::Value(
-            SqlValue::SingleQuotedString(root_commit_id).into(),
-        )),
-    };
-
-    structured_read.query.selection = Some(match structured_read.query.selection.take() {
-        Some(existing) => Expr::BinaryOp {
-            left: Box::new(existing),
-            op: BinaryOperator::And,
-            right: Box::new(root_predicate.clone()),
-        },
-        None => root_predicate.clone(),
-    });
-    structured_read
-        .query
-        .selection_predicates
-        .push(root_predicate);
-    Some(structured_read)
-}
-
-fn structured_read_has_root_commit_predicate(structured_read: &StructuredPublicRead) -> bool {
-    structured_read
-        .query
-        .selection_predicates
-        .iter()
-        .any(expr_has_root_commit_predicate)
-}
-
-fn expr_has_root_commit_predicate(expr: &Expr) -> bool {
-    match expr {
-        Expr::BinaryOp { left, right, .. } => {
-            expr_references_root_commit(left) || expr_references_root_commit(right)
-        }
-        Expr::Nested(inner) => expr_has_root_commit_predicate(inner),
-        _ => false,
-    }
-}
-
-fn expr_references_root_commit(expr: &Expr) -> bool {
-    match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => matches!(
-            parts[1].value.to_ascii_lowercase().as_str(),
-            "lixcol_root_commit_id" | "root_commit_id"
-        ),
-        Expr::Identifier(identifier) => matches!(
-            identifier.value.to_ascii_lowercase().as_str(),
-            "lixcol_root_commit_id" | "root_commit_id"
-        ),
-        Expr::Nested(inner) => expr_references_root_commit(inner),
-        _ => false,
     }
 }
 
