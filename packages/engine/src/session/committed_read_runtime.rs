@@ -1,13 +1,15 @@
-use crate::contracts::artifacts::ResultContract;
-use crate::contracts::read::{
-    compile_execution_from_template_instance_with_backend, execute_prepared_public_read,
-    execute_prepared_with_transaction, BoundStatementTemplateInstance, CompiledExecution,
-    ExecutionContext, ExecutionProgram, ExecutionRuntimeState, PreparationPolicy,
-};
-use crate::contracts::session::SessionExecutionMode;
-use crate::read::contracts::committed_read_mode_from_prepared_public_read;
+use crate::contracts::artifacts::{ResultContract, SessionExecutionMode};
 use crate::runtime::{
     normalize_sql_execution_error_with_backend, RuntimeHost, TransactionBackendAdapter,
+};
+use crate::sql::executor::execution_program::{
+    BoundStatementTemplateInstance, ExecutionContext, ExecutionProgram,
+};
+use crate::sql::executor::execute_prepared::execute_prepared_with_transaction;
+use crate::sql::executor::runtime_state::ExecutionRuntimeState;
+use crate::sql::executor::{
+    compile_execution_from_template_instance_with_backend, execute_prepared_public_read,
+    CompiledExecution, PreparationPolicy,
 };
 use crate::{
     ExecuteResult, LixBackend, LixBackendTransaction, LixError, QueryResult, TransactionMode,
@@ -148,7 +150,7 @@ fn transaction_mode_for_committed_read_execution(
         return Ok(TransactionMode::Read);
     }
     if let Some(public_read) = compiled.public_read() {
-        return Ok(committed_read_mode_from_prepared_public_read(public_read).transaction_mode());
+        return Ok(public_read.committed_read_mode().transaction_mode());
     }
     if compiled.internal_execution().is_some() {
         return if compiled.read_only_query {
@@ -221,8 +223,8 @@ pub(crate) async fn execute_execution_program_in_committed_read_transaction(
             .as_ref()
             .or(compiled_on_demand.as_ref())
             .expect(
-            "compiled committed read step should be available after eager or on-demand preparation",
-        );
+                "compiled committed read step should be available after eager or on-demand preparation",
+            );
 
         let result = execute_compiled_committed_read_in_transaction(
             transaction,

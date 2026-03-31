@@ -1,18 +1,16 @@
-use crate::plugin::runtime::load_binary_blob_data_by_hash;
-use crate::read::models::{
-    load_state_history_rows, StateHistoryContentMode, StateHistoryLineageScope,
-    StateHistoryRequest, StateHistoryRootScope, StateHistoryVersionScope,
+use crate::canonical::read::load_state_history_rows;
+use crate::contracts::artifacts::{
+    DirectoryHistoryRequest, DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope,
+    FileHistoryRequest, FileHistoryRootScope, FileHistoryRow, FileHistoryVersionScope,
+    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
+    StateHistoryVersionScope,
 };
+use crate::plugin::runtime::load_binary_blob_data_by_hash;
 use crate::{LixBackend, LixError};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-
-use super::types::{
-    DirectoryHistoryRequest, DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope,
-    FileHistoryRequest, FileHistoryRootScope, FileHistoryRow, FileHistoryVersionScope,
-};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";

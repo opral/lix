@@ -2,9 +2,8 @@ use async_trait::async_trait;
 
 use crate::engine::DeferredTransactionSideEffects;
 use crate::sql::executor::execution_program::{BoundStatementTemplateInstance, ExecutionContext};
-use crate::{LixError, QueryResult};
-
 pub(crate) use crate::transaction::{BorrowedWriteTransaction, WriteTransaction};
+use crate::{LixError, QueryResult};
 
 #[async_trait(?Send)]
 pub(crate) trait WriteProgramExecutor {

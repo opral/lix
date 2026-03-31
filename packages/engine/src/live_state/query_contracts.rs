@@ -1,10 +1,16 @@
 use std::collections::BTreeMap;
 
+use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
+use crate::contracts::artifacts::{
+    ExactUntrackedLookupRequest, LiveFilter, LiveFilterField, LiveFilterOp,
+    LiveQueryEffectiveRow, LiveQueryOverlayLane, LiveSnapshotRow, LiveSnapshotStorage,
+    TrackedTombstoneLookupRequest,
+};
+use crate::contracts::traits::{LiveReadShapeContract, LiveStateQueryBackend};
 use crate::{LixBackend, LixError, Value};
 
-use super::effective::{EffectiveRow, EffectiveRowState, OverlayLane};
 use super::schema_access::LiveReadContract;
 use super::tracked::{ExactTrackedRowRequest, TrackedScanRequest, TrackedTombstoneMarker};
 use super::untracked::{ExactUntrackedRowRequest, UntrackedRow};
@@ -58,66 +64,26 @@ impl LiveReadShape {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LiveSnapshotStorage {
-    Tracked,
-    Untracked,
-}
+impl LiveReadShapeContract for LiveReadShape {
+    fn normalized_projection_sql(&self, table_alias: Option<&str>) -> String {
+        LiveReadShape::normalized_projection_sql(self, table_alias)
+    }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum LiveFilterField {
-    EntityId,
-    FileId,
-    PluginKey,
-    SchemaVersion,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub(crate) enum LiveFilterOp {
-    Eq(Value),
-    In(Vec<Value>),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct LiveFilter {
-    pub(crate) field: LiveFilterField,
-    pub(crate) operator: LiveFilterOp,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct LiveSnapshotRow {
-    pub(crate) entity_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) schema_version: String,
-    pub(crate) file_id: String,
-    pub(crate) version_id: String,
-    pub(crate) plugin_key: String,
-    pub(crate) metadata: Option<String>,
-    pub(crate) source_change_id: Option<String>,
-    pub(crate) snapshot: JsonValue,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExactUntrackedLookupRequest {
-    pub(crate) schema_key: String,
-    pub(crate) version_id: String,
-    pub(crate) entity_id: String,
-    pub(crate) file_id: Option<String>,
-    pub(crate) plugin_key: Option<String>,
-    pub(crate) schema_version: Option<String>,
-    pub(crate) writer_key: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedTombstoneLookupRequest {
-    pub(crate) schema_key: String,
-    pub(crate) version_id: String,
-    pub(crate) entity_id: String,
-    pub(crate) file_id: Option<String>,
-    pub(crate) plugin_key: Option<String>,
-    pub(crate) schema_version: Option<String>,
+    fn snapshot_from_projected_row(
+        &self,
+        schema_key: &str,
+        row: &[Value],
+        snapshot_index: usize,
+        normalized_start_index: usize,
+    ) -> Result<Option<JsonValue>, LixError> {
+        LiveReadShape::snapshot_from_projected_row(
+            self,
+            schema_key,
+            row,
+            snapshot_index,
+            normalized_start_index,
+        )
+    }
 }
 
 pub(crate) async fn load_live_read_shape_with_backend(
@@ -184,8 +150,8 @@ pub(crate) async fn load_exact_untracked_effective_row_with_backend(
     backend: &dyn LixBackend,
     request: &ExactUntrackedLookupRequest,
     requested_version_id: &str,
-    overlay_lane: OverlayLane,
-) -> Result<Option<EffectiveRow>, LixError> {
+    overlay_lane: LiveQueryOverlayLane,
+) -> Result<Option<LiveQueryEffectiveRow>, LixError> {
     let Some(file_id) = request.file_id.as_ref() else {
         return Ok(None);
     };
@@ -335,11 +301,11 @@ fn untracked_row_matches_lookup(row: &UntrackedRow, request: &ExactUntrackedLook
 fn effective_row_from_untracked(
     row: UntrackedRow,
     requested_version_id: &str,
-    overlay_lane: OverlayLane,
-) -> EffectiveRow {
+    overlay_lane: LiveQueryOverlayLane,
+) -> LiveQueryEffectiveRow {
     let source_version_id = row.version_id.clone();
     let version_id = projected_version_id(requested_version_id, overlay_lane, &source_version_id);
-    EffectiveRow {
+    LiveQueryEffectiveRow {
         entity_id: row.entity_id,
         schema_key: row.schema_key,
         schema_version: Some(row.schema_version),
@@ -354,20 +320,78 @@ fn effective_row_from_untracked(
         created_at: Some(row.created_at),
         updated_at: Some(row.updated_at),
         source_change_id: None,
-        overlay_lane,
-        state: EffectiveRowState::Visible,
         values: row.values,
     }
 }
 
 fn projected_version_id(
     requested_version_id: &str,
-    overlay_lane: OverlayLane,
+    overlay_lane: LiveQueryOverlayLane,
     source_version_id: &str,
 ) -> String {
     if overlay_lane.is_global() && source_version_id == GLOBAL_VERSION_ID {
         requested_version_id.to_string()
     } else {
         source_version_id.to_string()
+    }
+}
+
+#[async_trait(?Send)]
+impl LiveStateQueryBackend for dyn LixBackend + '_ {
+    async fn load_live_read_shape_for_table_name(
+        &self,
+        table_name: &str,
+    ) -> Result<Option<Box<dyn LiveReadShapeContract>>, LixError> {
+        load_live_read_shape_for_table_name(self, table_name)
+            .await
+            .map(|shape| {
+                shape.map(|shape| Box::new(shape) as Box<dyn LiveReadShapeContract>)
+            })
+    }
+
+    async fn load_live_snapshot_rows(
+        &self,
+        storage: LiveSnapshotStorage,
+        schema_key: &str,
+        version_id: &str,
+        filters: &[LiveFilter],
+    ) -> Result<Vec<LiveSnapshotRow>, LixError> {
+        load_live_snapshot_rows_with_backend(self, storage, schema_key, version_id, filters).await
+    }
+
+    async fn normalize_live_snapshot_values(
+        &self,
+        schema_key: &str,
+        snapshot_content: Option<&str>,
+    ) -> Result<BTreeMap<String, Value>, LixError> {
+        normalize_live_snapshot_values_with_backend(self, schema_key, snapshot_content).await
+    }
+
+    async fn load_exact_untracked_effective_row(
+        &self,
+        request: &ExactUntrackedLookupRequest,
+        requested_version_id: &str,
+        overlay_lane: LiveQueryOverlayLane,
+    ) -> Result<Option<LiveQueryEffectiveRow>, LixError> {
+        load_exact_untracked_effective_row_with_backend(
+            self,
+            request,
+            requested_version_id,
+            overlay_lane,
+        )
+        .await
+    }
+
+    async fn tracked_tombstone_shadows_exact_row(
+        &self,
+        request: &TrackedTombstoneLookupRequest,
+    ) -> Result<bool, LixError> {
+        tracked_tombstone_shadows_exact_row_with_backend(self, request).await
+    }
+
+    async fn load_live_state_projection_status(
+        &self,
+    ) -> Result<crate::contracts::artifacts::LiveStateProjectionStatus, LixError> {
+        crate::live_state::load_live_state_projection_status_with_backend(self).await
     }
 }

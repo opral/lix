@@ -1,6 +1,4 @@
-use crate::contracts::live::{
-    build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
-};
+use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
     SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
@@ -8,6 +6,9 @@ use crate::contracts::surface::{
 use crate::errors::sql_unknown_column_error;
 use crate::filesystem::live_projection::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
+};
+use crate::public_read_sql::{
+    build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
 };
 use crate::sql::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::logical_plan::public_ir::{
@@ -20,9 +21,7 @@ use crate::sql::physical_plan::plan::{
     compile_terminal_read_statement_from_template, FilesystemPublicSurface, LoweredReadProgram,
     LoweredResultColumn, LoweredResultColumns, TerminalRelationRenderNode,
 };
-use crate::sql::semantic_ir::semantics::effective_state_resolver::{
-    EffectiveStatePlan, EffectiveStateRequest,
-};
+use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;

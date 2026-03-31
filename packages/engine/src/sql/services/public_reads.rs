@@ -1,9 +1,5 @@
-use crate::contracts::live::{
-    bootstrap_public_surface_registry_with_pending_transaction_view,
-    execute_prepared_public_read_with_pending_transaction_view,
-};
 use crate::contracts::surface::SurfaceRegistry;
-use crate::contracts::traits::PendingView;
+use crate::contracts::traits::{PendingPublicReadBackend, PendingView};
 use crate::sql::executor::{
     execute_prepared_public_read, try_prepare_public_read_with_registry_and_internal_access,
 };
@@ -20,11 +16,9 @@ pub(crate) async fn execute_public_query_with_optional_pending_transaction_view(
 ) -> Result<QueryResult, LixError> {
     let registry = match pending_transaction_view {
         Some(pending_transaction_view) => {
-            bootstrap_public_surface_registry_with_pending_transaction_view(
-                backend,
-                Some(pending_transaction_view),
-            )
-            .await?
+            backend
+                .bootstrap_public_surface_registry_with_pending_view(Some(pending_transaction_view))
+                .await?
         }
         None => SurfaceRegistry::bootstrap_with_backend(backend).await?,
     };
@@ -48,12 +42,12 @@ pub(crate) async fn execute_public_query_with_optional_pending_transaction_view(
     };
     match pending_transaction_view {
         Some(pending_transaction_view) => {
-            execute_prepared_public_read_with_pending_transaction_view(
-                backend,
-                Some(pending_transaction_view),
-                &public_read,
-            )
-            .await
+            backend
+                .execute_prepared_public_read_with_pending_view(
+                    Some(pending_transaction_view),
+                    &public_read,
+                )
+                .await
         }
         None => execute_prepared_public_read(backend, &public_read).await,
     }

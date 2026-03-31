@@ -2,12 +2,8 @@ use std::collections::BTreeSet;
 use std::time::Instant;
 
 use crate::commit::{CanonicalCommitReceipt, PendingPublicCommitSession};
-use crate::contracts::artifacts::{PlanEffects, ResultContract};
-use crate::contracts::live::{
-    execute_prepared_public_read_with_pending_transaction_view_in_transaction,
-    SchemaRegistrationSet,
-};
-use crate::contracts::traits::PendingView;
+use crate::contracts::artifacts::{PlanEffects, ResultContract, SchemaRegistrationSet};
+use crate::contracts::traits::{PendingPublicReadTransaction, PendingView};
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::engine::Engine;
 use crate::functions::SharedFunctionProvider;
@@ -129,26 +125,25 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
         )),
         CompiledExecutionRoute::PublicRead(public_read) => {
             let execution_started = Instant::now();
-            let public_result =
-                match execute_prepared_public_read_with_pending_transaction_view_in_transaction(
-                    transaction,
+            let public_result = match transaction
+                .execute_prepared_public_read_with_pending_view(
                     pending_transaction_view.map(|view| view as &dyn PendingView),
                     public_read,
                 )
                 .await
-                {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let backend = TransactionBackendAdapter::new(transaction);
-                        let normalized = normalize_sql_execution_error_with_backend(
-                            &backend,
-                            error,
-                            parsed_statements,
-                        )
-                        .await;
-                        return Err(normalized);
-                    }
-                };
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    let backend = TransactionBackendAdapter::new(transaction);
+                    let normalized = normalize_sql_execution_error_with_backend(
+                        &backend,
+                        error,
+                        parsed_statements,
+                    )
+                    .await;
+                    return Err(normalized);
+                }
+            };
             if let Some(explain) = step.execution().analyzed_explain() {
                 return Ok(CompiledExecutionStepResult::Immediate(
                     explain.render_analyzed_query_result(

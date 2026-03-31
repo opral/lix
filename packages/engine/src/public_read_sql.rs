@@ -1,4 +1,4 @@
-use crate::contracts::read::EffectiveStateRequest;
+use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
 use crate::live_state::schema_access::{
     normalized_projection_sql_for_schema, payload_column_name_for_schema,

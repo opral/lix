@@ -49,8 +49,8 @@ fn live_state_does_not_reference_session() {
 }
 
 #[test]
-fn read_does_not_reference_sql() {
-    assert_no_reference("src/read", "crate::sql::");
+fn read_module_scaffolding_is_deleted() {
+    assert_path_absent("src/read");
 }
 
 #[test]
@@ -78,11 +78,89 @@ fn runtime_does_not_reference_transaction() {
     assert_no_reference("src/runtime", "crate::transaction::");
 }
 
+#[test]
+fn contracts_do_not_reexport_internal_modules() {
+    assert_no_reference("src/contracts", "pub(crate) use crate::");
+    assert_no_reference("src/contracts", "pub use crate::");
+}
+
+#[test]
+fn contracts_do_not_reference_sql() {
+    assert_no_reference("src/contracts", "crate::sql::");
+}
+
+#[test]
+fn contracts_do_not_reference_read() {
+    assert_no_reference("src/contracts", "crate::read::");
+}
+
+#[test]
+fn contracts_do_not_reference_transaction() {
+    assert_no_reference("src/contracts", "crate::transaction::");
+}
+
+#[test]
+fn contracts_do_not_reference_live_state() {
+    assert_no_reference("src/contracts", "crate::live_state::");
+}
+
+#[test]
+fn contracts_do_not_reference_session() {
+    assert_no_reference("src/contracts", "crate::session::");
+}
+
+#[test]
+fn contracts_do_not_reference_engine() {
+    assert_no_reference("src/contracts", "crate::engine::");
+}
+
+#[test]
+fn session_contracts_shim_is_deleted() {
+    assert_path_absent("src/session/contracts.rs");
+}
+
+#[test]
+fn transaction_sql_adapter_mod_does_not_reexport_sql() {
+    assert_file_has_no_reference(
+        "src/transaction/sql_adapter/mod.rs",
+        "pub(crate) use crate::sql::",
+    );
+}
+
+#[test]
+fn transaction_sql_adapter_mod_does_not_reexport_crate_modules() {
+    assert_file_has_no_reference(
+        "src/transaction/sql_adapter/mod.rs",
+        "pub(crate) use crate::",
+    );
+    assert_file_has_no_reference("src/transaction/sql_adapter/mod.rs", "pub use crate::");
+}
+
 fn assert_no_reference(relative_dir: &str, needle: &str) {
     let hits = collect_reference_hits(relative_dir, needle);
     assert!(
         hits.is_empty(),
         "found forbidden reference `{needle}` under {relative_dir}:\n{}",
+        format_hits(&hits)
+    );
+}
+
+fn assert_path_absent(relative_path: &str) {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest_dir.join(relative_path);
+    assert!(
+        !path.exists(),
+        "expected {relative_path} to be deleted, but it still exists"
+    );
+}
+
+fn assert_file_has_no_reference(relative_path: &str, needle: &str) {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest_dir.join(relative_path);
+    let hits = collect_file_hits(manifest_dir, &path, needle);
+    assert!(
+        hits.is_empty(),
+        "found forbidden reference `{needle}` in {relative_path}:\n{}",
         format_hits(&hits)
     );
 }

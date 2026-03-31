@@ -1,3 +1,4 @@
+use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::SurfaceBinding;
 use crate::sql::logical_plan::dependency_spec::DependencySpec;
 use crate::sql::logical_plan::direct_reads::DirectPublicReadPlan;
@@ -6,9 +7,7 @@ use crate::sql::logical_plan::public_ir::{
 };
 use crate::sql::logical_plan::result_contract::ResultContract;
 use crate::sql::semantic_ir::internal::NormalizedInternalStatements;
-use crate::sql::semantic_ir::semantics::effective_state_resolver::{
-    EffectiveStatePlan, EffectiveStateRequest,
-};
+use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PublicReadLogicalPlan {

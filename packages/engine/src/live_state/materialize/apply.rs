@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::types::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildScope, LiveStateWriteOp,
 };
-use crate::live_state::lifecycle::{build_set_live_state_mode_sql, LiveStateMode};
+use crate::live_state::lifecycle::build_set_live_state_mode_sql;
+use crate::live_state::LiveStateMode;
 use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::storage::{
     load_live_table_layout_in_transaction, normalized_insert_columns_sql,

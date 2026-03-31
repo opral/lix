@@ -3,7 +3,6 @@ use sqlparser::ast::Statement;
 use std::time::Duration;
 
 use crate::commit::PendingPublicCommitSession;
-use crate::contracts::write::WriteProgramExecutor;
 use crate::engine::{DeferredTransactionSideEffects, Engine};
 use crate::runtime::TransactionBackendAdapter;
 use crate::sql::executor::execution_program::{
@@ -12,7 +11,8 @@ use crate::sql::executor::execution_program::{
     ExecutionContext, ExecutionProgram,
 };
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;
-use crate::transaction::PendingTransactionView;
+use crate::transaction::{BorrowedWriteTransaction, PendingTransactionView, WriteTransaction};
+use crate::write_runtime::WriteProgramExecutor;
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 
 use super::compile::{
@@ -22,13 +22,14 @@ use super::effects::{
     apply_buffered_write_planning_effects, command_metadata, complete_sql_command_execution,
     refresh_public_surface_registry_from_pending_transaction_view,
 };
-use super::{execute_compiled_execution_step_with_transaction, CompiledExecutionStepResult};
+use super::runtime::{
+    execute_compiled_execution_step_with_transaction, CompiledExecutionStepResult,
+};
 use crate::transaction::buffered_write_runner::execute_buffered_write_input;
 use crate::transaction::commands::{
     BufferedWriteAdapter, BufferedWriteExecutionResult, BufferedWriteScope,
 };
-use crate::transaction::contracts::TransactionCommitOutcome;
-use crate::transaction::execution::{BorrowedWriteTransaction, WriteTransaction};
+use crate::transaction::contracts::{BufferedWriteExecutionContext, TransactionCommitOutcome};
 
 pub(crate) async fn execute_parsed_statements_in_write_transaction(
     engine: &Engine,
@@ -62,6 +63,28 @@ pub(crate) async fn execute_parsed_statements_in_write_transaction(
         context,
     )
     .await
+}
+
+impl BufferedWriteExecutionContext for ExecutionContext {
+    fn writer_key(&self) -> Option<&str> {
+        self.options.writer_key.as_deref()
+    }
+
+    fn active_version_id(&self) -> &str {
+        &self.active_version_id
+    }
+
+    fn active_account_ids(&self) -> &[String] {
+        &self.active_account_ids
+    }
+
+    fn set_active_version_id(&mut self, version_id: String) {
+        self.active_version_id = version_id;
+    }
+
+    fn set_active_account_ids(&mut self, active_account_ids: Vec<String>) {
+        self.active_account_ids = active_account_ids;
+    }
 }
 
 pub(crate) async fn execute_parsed_statements_in_borrowed_write_transaction(

@@ -12,12 +12,16 @@ fn read_engine_source(relative: &str) -> String {
 fn sql_execution_uses_transaction_module_for_write_orchestration() {
     let source = read_engine_source("sql/executor/execution_program.rs");
     assert!(
-        source.contains("use crate::contracts::write::{"),
-        "execution_program.rs should import the contracts-owned write seam"
+        source.contains("use crate::write_runtime::{"),
+        "execution_program.rs should use the write-runtime seam instead of importing transaction or engine directly"
     );
     assert!(
         !source.contains("use crate::transaction::{"),
         "execution_program.rs should not import transaction-owned write orchestration directly"
+    );
+    assert!(
+        !source.contains("use crate::engine::{"),
+        "execution_program.rs should not import engine-owned side-effect state directly"
     );
     assert!(
         !source.contains("sql::executor::write_txn_plan"),
@@ -290,6 +294,10 @@ fn execution_program_is_a_thin_client_for_adapter_runtime() {
     assert!(
         !adapter_mod_source.contains("pub(crate) use crate::sql::executor::compiled::"),
         "transaction/sql_adapter/mod.rs should not re-export the neutral compiled execution model"
+    );
+    assert!(
+        !adapter_mod_source.contains("pub(crate) use crate::"),
+        "transaction/sql_adapter/mod.rs should not serve as a crate-level compatibility barrel"
     );
 }
 

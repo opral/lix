@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::contracts::traits::{EffectiveRowProvider, EffectiveRowsRequest};
-use crate::live_state::entity_id_in_constraint;
+use crate::live_state::{entity_id_in_constraint, resolve_effective_rows, EffectiveRowsRequest};
 use crate::LixError;
 
 use super::contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
@@ -89,8 +88,8 @@ pub(crate) async fn prepare_materialization_plan(
                 entity_ids.into_iter().collect::<Vec<_>>(),
             )]
         };
-        let _ = effective_context
-            .resolve_effective_rows(&EffectiveRowsRequest {
+        let _ = resolve_effective_rows(
+            &EffectiveRowsRequest {
                 schema_key,
                 version_id,
                 constraints,
@@ -98,8 +97,10 @@ pub(crate) async fn prepare_materialization_plan(
                 include_global: true,
                 include_untracked: true,
                 include_tombstones: true,
-            })
-            .await?;
+            },
+            &effective_context,
+        )
+        .await?;
     }
 
     Ok(plan.clone())

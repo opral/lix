@@ -1,5 +1,4 @@
 use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
-use crate::live_state::RowIdentity;
 
 use super::write_plan::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
@@ -106,12 +105,6 @@ impl PendingView for PendingTransactionView {
         self.filesystem_overlay()
             .map(|overlay| overlay.visible_files().cloned().collect())
             .unwrap_or_default()
-    }
-
-    fn workspace_writer_key_annotation(&self, identity: &RowIdentity) -> Option<Option<String>> {
-        self.workspace_writer_key_overlay()
-            .and_then(|overlay| overlay.annotation(identity))
-            .cloned()
     }
 
     fn workspace_writer_key_annotation_for_state_row(

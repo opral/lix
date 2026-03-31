@@ -1,4 +1,4 @@
-use crate::contracts::session::SessionStateDelta;
+use crate::contracts::artifacts::SessionStateDelta;
 use crate::live_state::{
     TrackedWriteOperation, TrackedWriteRow, UntrackedWriteOperation, UntrackedWriteRow,
 };
@@ -129,4 +129,12 @@ impl TransactionCommitOutcome {
         self.state_commit_stream_changes
             .extend(other.state_commit_stream_changes);
     }
+}
+
+pub(crate) trait BufferedWriteExecutionContext {
+    fn writer_key(&self) -> Option<&str>;
+    fn active_version_id(&self) -> &str;
+    fn active_account_ids(&self) -> &[String];
+    fn set_active_version_id(&mut self, version_id: String);
+    fn set_active_account_ids(&mut self, active_account_ids: Vec<String>);
 }

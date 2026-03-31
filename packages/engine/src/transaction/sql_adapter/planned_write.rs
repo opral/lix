@@ -1,21 +1,27 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::contracts::artifacts::{
+    coalesce_live_table_requirements, MutationRow, OptionalTextPatch, PlanEffects, PlannedStateRow,
+    ResultContract, SchemaRegistration, SchemaRegistrationSet, WriteMode,
+};
 use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage};
-use crate::live_state::{
-    coalesce_live_table_requirements, RowIdentity, SchemaRegistration, SchemaRegistrationSet,
+use crate::filesystem::runtime::{
+    filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
+    FilesystemTransactionFileState, FilesystemTransactionState,
 };
+use crate::live_state::RowIdentity;
 use crate::sql::executor::runtime_state::ExecutionRuntimeState;
-use crate::sql::executor::{CompiledExecution, CompiledInternalExecution};
-use crate::sql::physical_plan::{PhysicalPlan, PreparedPublicWriteExecution};
-use crate::LixError;
-
-use super::{
-    build_tracked_txn_unit, filesystem_transaction_state_has_binary_payloads,
-    merge_filesystem_transaction_state, DomainChangeBatch, FilesystemTransactionFileState,
-    FilesystemTransactionState, MutationRow, OptionalTextPatch, PendingTransactionView,
-    PlanEffects, PreparedPublicWrite, PublicWriteExecutionPartition, ResultContract,
-    TrackedTxnUnit, UntrackedWriteExecution, WriteMode,
+use crate::sql::executor::{
+    build_tracked_txn_unit, CompiledExecution, CompiledInternalExecution, PreparedPublicWrite,
+    TrackedTxnUnit,
 };
+use crate::sql::physical_plan::{
+    PhysicalPlan, PreparedPublicWriteExecution, PublicWriteExecutionPartition,
+    UntrackedWriteExecution,
+};
+use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
+use crate::transaction::PendingTransactionView;
+use crate::LixError;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const GLOBAL_VERSION_ID: &str = "global";
@@ -333,10 +339,6 @@ impl PendingFilesystemOverlay {
 }
 
 impl PendingWorkspaceWriterKeyOverlay {
-    pub(crate) fn annotation(&self, identity: &RowIdentity) -> Option<&Option<String>> {
-        self.annotations.get(identity)
-    }
-
     pub(crate) fn annotation_for_state_row(
         &self,
         version_id: &str,
@@ -771,7 +773,7 @@ fn collect_filesystem_overlay_from_tracked_plan(
 }
 
 fn collect_directory_descriptor_overlay_from_planned_rows<'a>(
-    rows: impl Iterator<Item = &'a super::PlannedStateRow>,
+    rows: impl Iterator<Item = &'a PlannedStateRow>,
     overlay: &mut PendingFilesystemOverlay,
 ) -> bool {
     for row in rows {
@@ -865,7 +867,7 @@ fn collect_semantic_overlay_from_public_write(
 }
 
 fn collect_semantic_overlay_from_planned_rows<'a>(
-    rows: impl Iterator<Item = &'a super::PlannedStateRow>,
+    rows: impl Iterator<Item = &'a PlannedStateRow>,
     storage: PendingSemanticStorage,
     overlay: &mut PendingSemanticOverlay,
 ) -> Result<bool, LixError> {
