@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-/// Replica-local replay boundary for derived state catch-up.
+/// Replica-local replay boundary for derived-state catch-up.
 ///
 /// This cursor only describes how far a particular engine instance has replayed
 /// canonical storage into derived projections. It is not canonical meaning.

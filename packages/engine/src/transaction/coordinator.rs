@@ -1,6 +1,6 @@
-use crate::canonical::CanonicalCommitReceipt;
-use crate::live_state::{ReplayCursor, SchemaRegistration, SchemaRegistrationSet};
-use crate::{LixBackendTransaction, LixError};
+use crate::commit::CanonicalCommitReceipt;
+use crate::live_state::{SchemaRegistration, SchemaRegistrationSet};
+use crate::{LixBackendTransaction, LixError, ReplayCursor};
 
 pub(crate) struct TransactionCoordinator<'a> {
     backend_txn: Option<Box<dyn LixBackendTransaction + 'a>>,

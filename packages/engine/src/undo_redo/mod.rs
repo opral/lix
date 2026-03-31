@@ -6,13 +6,13 @@ mod undo;
 
 use std::collections::BTreeMap;
 
-use crate::canonical::readers::{
+use crate::canonical::read::{
     load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,
     load_exact_committed_state_row_from_commit_with_executor, CommitLineageEntry,
     CommitQueryExecutor, CommittedCanonicalChangeRow, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
-use crate::canonical::ProposedDomainChange;
+use crate::commit::ProposedDomainChange;
 use crate::state::stream::StateCommitStreamOperation;
 use crate::version::context::{
     load_version_context_with_executor, ResolvedVersionTarget, VersionContextSource,

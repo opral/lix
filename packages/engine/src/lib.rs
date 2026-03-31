@@ -7,6 +7,7 @@ mod canonical_json;
 mod cel;
 mod change_view;
 pub(crate) mod checkpoint;
+pub(crate) mod commit;
 mod committed_frontier;
 mod deterministic_mode;
 mod engine;
@@ -21,6 +22,8 @@ mod lix;
 mod observe;
 mod plugin;
 mod read;
+pub(crate) mod refs;
+mod replay_cursor;
 mod schema;
 pub mod session;
 pub(crate) mod sql;
@@ -67,6 +70,7 @@ pub use live_state::{
 };
 pub use lix::{InitResult, Lix, LixConfig};
 pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
+pub use replay_cursor::ReplayCursor;
 pub use session::{OpenSessionOptions, Session, SessionTransaction};
 #[doc(hidden)]
 pub use sql::binder::{delay_broad_binding_for_test, BroadBindingDelayForTestGuard};

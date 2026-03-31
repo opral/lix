@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::account;
 use crate::canonical;
 use crate::checkpoint;
+use crate::commit;
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::filesystem;
 use crate::key_value;
@@ -51,6 +52,9 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             canonical::init(&backend)
                 .await
                 .map_err(|error| init_step_error("canonical::init", error))?;
+            commit::init(&backend)
+                .await
+                .map_err(|error| init_step_error("commit::init", error))?;
             filesystem::init(&backend)
                 .await
                 .map_err(|error| init_step_error("filesystem::init", error))?;

@@ -5,6 +5,26 @@ use crate::Value;
 use crate::{LixBackend, LixError};
 
 const CANONICAL_INIT_STATEMENTS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS lix_internal_snapshot (\
+     id TEXT PRIMARY KEY,\
+     content TEXT\
+     )",
+    "INSERT INTO lix_internal_snapshot (id, content) \
+     SELECT 'no-content', NULL \
+     WHERE NOT EXISTS ( \
+       SELECT 1 FROM lix_internal_snapshot WHERE id = 'no-content' \
+     )",
+    "CREATE TABLE IF NOT EXISTS lix_internal_change (\
+     id TEXT PRIMARY KEY,\
+     entity_id TEXT NOT NULL,\
+     schema_key TEXT NOT NULL,\
+     schema_version TEXT NOT NULL,\
+     file_id TEXT NOT NULL,\
+     plugin_key TEXT NOT NULL,\
+     snapshot_id TEXT NOT NULL,\
+     metadata TEXT,\
+     created_at TEXT NOT NULL\
+     )",
     "CREATE TABLE IF NOT EXISTS lix_internal_commit_graph_node (\
      commit_id TEXT PRIMARY KEY,\
      generation BIGINT NOT NULL\

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use sqlparser::ast::Statement;
 use std::time::Duration;
 
-use crate::canonical::pending_session::PendingPublicCommitSession;
+use crate::commit::PendingPublicCommitSession;
 use crate::engine::{DeferredTransactionSideEffects, Engine};
 use crate::sql::executor::execution_program::{
     execute_execution_program_with_borrowed_write_transaction,

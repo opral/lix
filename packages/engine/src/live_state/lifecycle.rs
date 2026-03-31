@@ -2,9 +2,9 @@
 
 use crate::errors::classification::is_missing_relation_error;
 use crate::init::tables::add_column_if_missing;
-use crate::live_state::ReplayCursor;
 use crate::{
-    CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, QueryResult, Value,
+    CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, QueryResult,
+    ReplayCursor, Value,
 };
 
 pub(crate) const LIVE_STATE_SCHEMA_EPOCH: &str = "1";
@@ -363,8 +363,7 @@ pub(crate) async fn mark_live_state_ready_with_backend(
     cursor: &ReplayCursor,
 ) -> Result<(), LixError> {
     let frontier =
-        crate::canonical::refs::load_current_committed_version_frontier_with_backend(backend)
-            .await?;
+        crate::refs::load_current_committed_version_frontier_with_backend(backend).await?;
     backend
         .execute(&build_mark_live_state_ready_sql(cursor, &frontier), &[])
         .await?;
@@ -548,8 +547,7 @@ async fn load_live_state_snapshot_with_backend(
         status: load_nullable_live_state_status_with_backend(backend).await?,
         latest_replay_cursor: load_latest_replay_cursor(backend).await?,
         current_committed_frontier:
-            crate::canonical::refs::load_current_committed_version_frontier_with_backend(backend)
-                .await?,
+            crate::refs::load_current_committed_version_frontier_with_backend(backend).await?,
     })
 }
 
@@ -752,8 +750,7 @@ async fn load_current_committed_frontier_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<CommittedVersionFrontier, LixError> {
     let mut executor = transaction;
-    crate::canonical::refs::load_current_committed_version_frontier_with_executor(&mut executor)
-        .await
+    crate::refs::load_current_committed_version_frontier_with_executor(&mut executor).await
 }
 
 async fn load_current_applied_frontier_in_transaction(

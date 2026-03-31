@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::canonical::readers::load_exact_committed_state_row_at_version_head;
-pub(crate) use crate::canonical::readers::{
+use crate::canonical::read::load_exact_committed_state_row_at_version_head;
+pub(crate) use crate::canonical::read::{
     CommitQueryExecutor, ExactCommittedStateRow, ExactCommittedStateRowRequest,
 };
 use crate::live_state::{is_untracked_live_table, live_storage_relation_exists_with_backend};

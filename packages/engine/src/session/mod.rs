@@ -659,7 +659,7 @@ impl<'a> SessionTransaction<'a> {
 
     pub(crate) fn record_canonical_commit_receipt(
         &mut self,
-        receipt: crate::canonical::CanonicalCommitReceipt,
+        receipt: crate::commit::CanonicalCommitReceipt,
     ) -> Result<(), LixError> {
         self.write_transaction
             .as_mut()

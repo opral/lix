@@ -1,4 +1,4 @@
-use crate::canonical::CanonicalCommitReceipt;
+use crate::commit::CanonicalCommitReceipt;
 use crate::engine::Engine;
 use crate::LixBackendTransaction;
 use crate::LixError;

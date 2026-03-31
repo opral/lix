@@ -1,8 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-use crate::canonical::pending_session::PendingPublicCommitSession;
-use crate::canonical::CanonicalCommitReceipt;
+use crate::commit::{CanonicalCommitReceipt, PendingPublicCommitSession};
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::engine::{
     normalize_sql_execution_error_with_backend, Engine, TransactionBackendAdapter,

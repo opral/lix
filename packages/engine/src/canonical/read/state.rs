@@ -9,10 +9,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::errors::classification::is_missing_relation_error;
 use crate::schema::builtin::types::LixCommit;
+use crate::version::load_local_version_head_commit_id_with_executor;
 use crate::{LixBackend, LixError, Value, VersionId};
-
-use super::roots::{load_committed_version_head_commit_id, load_head_commit_id_for_version};
-use super::types::{VersionInfo, VersionSnapshot};
 
 /// Canonical committed row resolved from commit-graph facts plus local
 /// version-head selection.
@@ -59,6 +57,17 @@ pub(crate) struct ExactCommittedStateRowRequest {
     pub(crate) exact_filters: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionSnapshot {
+    pub id: VersionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionInfo {
+    pub parent_commit_ids: Vec<String>,
+    pub snapshot: VersionSnapshot,
+}
+
 pub(crate) use crate::backend::QueryExecutor as CommitQueryExecutor;
 
 pub(crate) async fn load_version_info_for_versions(
@@ -82,7 +91,8 @@ pub(crate) async fn load_version_info_for_versions(
         );
     }
     for version_id in version_ids {
-        if let Some(commit_id) = load_committed_version_head_commit_id(executor, version_id).await?
+        if let Some(commit_id) =
+            load_local_version_head_commit_id_with_executor(executor, version_id).await?
         {
             versions.insert(
                 version_id.clone(),
@@ -112,7 +122,7 @@ pub(crate) async fn load_exact_committed_state_row_at_version_head_with_executor
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
     let Some(head_commit_id) =
-        load_head_commit_id_for_version(executor, &request.version_id).await?
+        load_local_version_head_commit_id_with_executor(executor, &request.version_id).await?
     else {
         return Ok(None);
     };
@@ -415,7 +425,6 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::roots::load_head_commit_id_for_version;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
@@ -609,7 +618,7 @@ mod tests {
         backend.clear_query_log();
 
         let mut executor = &backend;
-        let commit_id = load_head_commit_id_for_version(&mut executor, "v1")
+        let commit_id = load_local_version_head_commit_id_with_executor(&mut executor, "v1")
             .await
             .expect("canonical version head lookup should succeed");
 

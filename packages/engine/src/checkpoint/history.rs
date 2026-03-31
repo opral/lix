@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use crate::backend::QueryExecutor;
 use crate::canonical::graph::COMMIT_GRAPH_NODE_TABLE;
-use crate::canonical::readers::load_commit_lineage_entry_by_id;
+use crate::canonical::read::load_commit_lineage_entry_by_id;
 use crate::errors::classification::is_missing_relation_error;
 use crate::init::seed::text_value;
 use crate::init::tables::execute_init_statements;
@@ -111,10 +111,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     pub(crate) async fn rebuild_internal_last_checkpoint(&mut self) -> Result<(), LixError> {
         let version_descriptors = {
             let mut backend = self.backend_adapter();
-            crate::canonical::version_state::load_all_version_descriptors_with_executor(
-                &mut backend,
-            )
-            .await?
+            crate::canonical::read::load_all_version_descriptors_with_executor(&mut backend).await?
         };
 
         // `lix_internal_last_checkpoint` is derived checkpoint-history state.
@@ -143,17 +140,14 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             }
             let commit_id = {
                 let mut backend = self.backend_adapter();
-                crate::canonical::refs::load_committed_version_head_commit_id(
-                    &mut backend,
-                    &version_id,
-                )
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!("version '{version_id}' is missing a committed head"),
-                    )
-                })?
+                crate::refs::load_committed_version_head_commit_id(&mut backend, &version_id)
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!("version '{version_id}' is missing a committed head"),
+                        )
+                    })?
             };
             let checkpoint_commit_id = {
                 let mut backend = self.backend_adapter();

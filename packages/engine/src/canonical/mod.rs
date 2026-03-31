@@ -1,25 +1,34 @@
 //! Canonical committed-history subsystem boundary.
 //!
-//! `canonical` owns the semantic meaning of committed history. Use this module
-//! when the question is "what happened?" or "what state does commit/root X
-//! mean?".
+//! `canonical` owns durable canonical facts, canonical graph derivation, and
+//! committed read resolution over those facts.
 //!
-//! The intended model is:
+//! Use this subsystem when the question is:
+//! - what canonical facts were committed?
+//! - what commit graph do those facts imply?
+//! - what state/history does an explicit commit/root input mean?
+//!
+//! The intended ownership model is:
 //! - canonical changes are the only semantic source of truth
 //! - commit graph facts are a canonical projection derived from those changes
-//! - replica-local version-head state selects committed heads/roots in that
-//!   graph
-//! - committed meaning/state is resolved from commit-graph facts plus those
-//!   local selectors
+//! - `refs` owns replica-local committed-head/root selection
+//! - `commit` owns write orchestration that composes canonical facts with other
+//!   owners atomically
+//! - committed meaning/state is resolved from commit-graph facts plus explicit
+//!   selected roots supplied by higher owners
 //!
 //! `canonical` owns:
 //! - canonical change facts and commit headers stored in the journal
 //! - commit DAG interpretation and canonical history indexes
-//! - head/root resolution
 //! - commit-addressed and root-addressed state lookup
 //!
 //! Derived mirrors, replay cursors, and storage-local append order may help
 //! execution, but they must not redefine committed semantics.
+//!
+//! Plan 20 Phase 1 introduces the canonical-only package layout:
+//! - `canonical::journal`
+//! - `canonical::graph`
+//! - `canonical::read`
 //!
 //! `checkpoint` depends on canonical as a derived acceleration layer.
 //! `live_state` may mirror canonical facts and derived commit-family surfaces
@@ -27,26 +36,8 @@
 //! `lix_commit_edge` as read-only query surfaces for SQL/public reads, but it
 //! does not own the meaning of those facts.
 //!
-pub(crate) mod append;
-mod change_log;
-#[allow(dead_code)]
-mod create_commit;
-mod create_commit_preflight;
-mod generate_commit;
 pub(crate) mod graph;
-mod graph_index;
-mod graph_sql;
-pub(crate) mod history;
 mod init;
-pub(crate) mod lineage;
-pub(crate) mod pending_session;
-pub(crate) mod readers;
-pub(crate) mod receipt;
-pub(crate) mod refs;
-pub(crate) mod roots;
-pub(crate) mod state_source;
-mod types;
-pub(crate) mod version_state;
+pub(crate) mod journal;
+pub(crate) mod read;
 pub(crate) use init::{init, seed_bootstrap};
-pub(crate) use receipt::CanonicalCommitReceipt;
-pub(crate) use types::ProposedDomainChange;

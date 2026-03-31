@@ -1,11 +1,11 @@
 use crate::backend::{LixBackend, QueryExecutor};
-use crate::canonical::append::{
+use crate::canonical::read::{version_exists_with_backend, version_exists_with_executor};
+use crate::commit::{
     CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitPreconditions,
     CreateCommitWriteLane,
 };
-use crate::canonical::refs::load_committed_version_ref_with_executor;
-use crate::canonical::version_state::{version_exists_with_backend, version_exists_with_executor};
 use crate::engine::TransactionBackendAdapter;
+use crate::refs::load_committed_version_ref_with_executor;
 use crate::workspace::require_workspace_active_version_id;
 use crate::{LixError, SessionTransaction};
 

@@ -68,8 +68,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         name: &str,
     ) -> Result<Option<String>, LixError> {
         let mut executor = self.backend_adapter();
-        crate::canonical::version_state::find_version_id_by_name_with_executor(&mut executor, name)
-            .await
+        crate::canonical::read::find_version_id_by_name_with_executor(&mut executor, name).await
     }
 
     pub(crate) async fn assert_commit_change_set_integrity(

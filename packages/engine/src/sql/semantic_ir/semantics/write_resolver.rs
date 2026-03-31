@@ -1,10 +1,10 @@
-use crate::canonical::readers::load_version_ref_with_backend as load_version_ref;
-use crate::canonical::version_state::load_version_descriptor_with_backend;
+use crate::canonical::read::load_version_descriptor_with_backend;
 use crate::filesystem::queries::FilesystemQueryError;
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::live_state::RowIdentity;
+use crate::refs::load_committed_version_ref_with_backend as load_version_ref;
 use crate::sql::catalog::SurfaceFamily;
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateSelector, MutationPayload, PlannedStateRow, PlannedWrite, ResolvedRowRef,

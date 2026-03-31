@@ -4,11 +4,7 @@ use crate::live_state::schema_access::{
 };
 use crate::sql::catalog::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStateRequest;
-use crate::version::{
-    version_descriptor_schema_key, version_ref_file_id, version_ref_plugin_key,
-    version_ref_schema_key, version_ref_schema_version, version_ref_storage_version_id,
-    GLOBAL_VERSION_ID,
-};
+use crate::version::{version_descriptor_schema_key, version_ref_schema_key, GLOBAL_VERSION_ID};
 use crate::workspace::writer_key::WORKSPACE_WRITER_KEY_TABLE;
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
@@ -507,37 +503,6 @@ pub(crate) fn build_working_changes_public_read_source_sql(
         parent_value_expr = parent_value_expr,
         change_id_join_sql = change_id_join_sql,
         change_id_value_expr = change_id_value_expr,
-    )
-}
-
-pub(crate) fn build_local_version_ref_heads_source_sql() -> String {
-    let version_ref_table = tracked_relation_name(version_ref_schema_key());
-    let version_ref_commit_id_column = quote_ident(&builtin_payload_column_name(
-        version_ref_schema_key(),
-        "commit_id",
-    ));
-
-    format!(
-        "SELECT \
-            entity_id AS version_id, \
-            {version_ref_commit_id_column} AS commit_id \
-         FROM {version_ref_table} \
-         WHERE schema_key = '{ref_schema_key}' \
-           AND schema_version = '{ref_schema_version}' \
-           AND file_id = '{ref_file_id}' \
-           AND plugin_key = '{ref_plugin_key}' \
-           AND version_id = '{storage_version_id}' \
-           AND untracked = true \
-           AND is_tombstone = 0 \
-           AND {version_ref_commit_id_column} IS NOT NULL \
-           AND {version_ref_commit_id_column} <> ''",
-        version_ref_table = version_ref_table,
-        version_ref_commit_id_column = version_ref_commit_id_column,
-        ref_schema_key = escape_sql_string(version_ref_schema_key()),
-        ref_schema_version = escape_sql_string(version_ref_schema_version()),
-        ref_file_id = escape_sql_string(version_ref_file_id()),
-        ref_plugin_key = escape_sql_string(version_ref_plugin_key()),
-        storage_version_id = escape_sql_string(version_ref_storage_version_id()),
     )
 }
 

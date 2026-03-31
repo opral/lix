@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use super::roots::ResolvedRootCommit;
-
 // Canonical owns commit lineage semantics even when live_state consumes the
 // resulting maps for query-serving rebuilds.
 pub(crate) type VersionHeadMap = BTreeMap<String, Vec<String>>;
@@ -39,17 +37,17 @@ where
     edges
 }
 
-pub(crate) fn build_version_head_map(root_version_refs: &[ResolvedRootCommit]) -> VersionHeadMap {
+pub(crate) fn build_version_head_map(root_version_refs: &[(String, String)]) -> VersionHeadMap {
     let mut heads = BTreeMap::new();
 
-    for row in root_version_refs {
-        if row.version_id.is_empty() || row.commit_id.is_empty() {
+    for (version_id, commit_id) in root_version_refs {
+        if version_id.is_empty() || commit_id.is_empty() {
             continue;
         }
         heads
-            .entry(row.version_id.clone())
+            .entry(version_id.clone())
             .or_insert_with(Vec::new)
-            .push(row.commit_id.clone());
+            .push(commit_id.clone());
     }
 
     for commit_ids in heads.values_mut() {
@@ -165,18 +163,9 @@ mod tests {
     #[test]
     fn version_head_map_sorts_and_deduplicates_heads() {
         let heads = build_version_head_map(&[
-            ResolvedRootCommit {
-                version_id: "main".to_string(),
-                commit_id: "commit-b".to_string(),
-            },
-            ResolvedRootCommit {
-                version_id: "main".to_string(),
-                commit_id: "commit-a".to_string(),
-            },
-            ResolvedRootCommit {
-                version_id: "main".to_string(),
-                commit_id: "commit-a".to_string(),
-            },
+            ("main".to_string(), "commit-b".to_string()),
+            ("main".to_string(), "commit-a".to_string()),
+            ("main".to_string(), "commit-a".to_string()),
         ]);
 
         assert_eq!(

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::canonical::refs::VersionRefRow;
+use crate::refs::VersionRefRow;
 use crate::LixError;
 
 /// Semantic frontier for committed state selected by replica-local version
