@@ -1,15 +1,14 @@
-use crate::commit::CanonicalCommitReceipt;
+use crate::commit::{CanonicalCommitReceipt, PendingPublicCommitSession};
 use crate::engine::Engine;
 use crate::LixBackendTransaction;
 use crate::LixError;
 
-use super::contracts::TransactionCommitOutcome;
+use super::contracts::{BufferedWriteExecutionContext, TransactionCommitOutcome};
 use super::coordinator::apply_schema_registrations_in_transaction;
-use super::sql_adapter::{
-    ExecutionContext, PendingPublicCommitSession, PendingTransactionView, SqlExecutionOutcome,
-};
+use super::sql_adapter::SqlExecutionOutcome;
 use super::write_plan::{BufferedWriteJournal, PlannedWriteDelta};
 use super::write_runner::execute_planned_write_delta;
+use super::PendingTransactionView;
 
 #[derive(Default)]
 pub(crate) struct BufferedWriteState {
@@ -88,11 +87,11 @@ impl BufferedWriteState {
             .extend(changes);
     }
 
-    pub(crate) async fn flush(
+    pub(crate) async fn flush<Context: BufferedWriteExecutionContext>(
         &mut self,
         transaction: &mut dyn LixBackendTransaction,
         engine: &Engine,
-        context: &mut ExecutionContext,
+        context: &mut Context,
     ) -> Result<(), LixError> {
         let Some(delta) = self.journal.take_staged_delta() else {
             return Ok(());
@@ -112,20 +111,17 @@ impl BufferedWriteState {
         Ok(())
     }
 
-    pub(crate) async fn prepare_commit(
+    pub(crate) async fn prepare_commit<Context: BufferedWriteExecutionContext>(
         &mut self,
         transaction: &mut dyn LixBackendTransaction,
         engine: &Engine,
-        context: &mut ExecutionContext,
+        context: &mut Context,
     ) -> Result<(), LixError> {
         self.flush(transaction, engine, context).await?;
         if !self.observe_tick_emitted && !self.commit_outcome.state_commit_stream_changes.is_empty()
         {
             engine
-                .append_observe_tick_in_transaction(
-                    transaction,
-                    context.options.writer_key.as_deref(),
-                )
+                .append_observe_tick_in_transaction(transaction, context.writer_key())
                 .await?;
             self.observe_tick_emitted = true;
         }
@@ -133,10 +129,10 @@ impl BufferedWriteState {
     }
 }
 
-fn apply_buffered_write_execution_outcome(
+fn apply_buffered_write_execution_outcome<Context: BufferedWriteExecutionContext>(
     state: &mut BufferedWriteState,
     engine: &Engine,
-    context: &mut ExecutionContext,
+    context: &mut Context,
     execution: SqlExecutionOutcome,
 ) {
     let active_effects = execution
@@ -145,10 +141,10 @@ fn apply_buffered_write_execution_outcome(
         .cloned()
         .unwrap_or_default();
     if let Some(version_id) = &active_effects.session_delta.next_active_version_id {
-        context.active_version_id = version_id.clone();
+        context.set_active_version_id(version_id.clone());
     }
     if let Some(active_account_ids) = &active_effects.session_delta.next_active_account_ids {
-        context.active_account_ids = active_account_ids.clone();
+        context.set_active_account_ids(active_account_ids.clone());
     }
     let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
     state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());

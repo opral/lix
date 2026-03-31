@@ -1,11 +1,8 @@
-use crate::contracts::live::{
-    bootstrap_public_surface_registry_with_pending_transaction_view, public_read_execution_mode,
-};
+use crate::contracts::artifacts::PublicReadExecutionMode;
 use crate::contracts::surface::SurfaceRegistry;
-use crate::contracts::traits::PendingView;
+use crate::contracts::traits::{PendingPublicReadBackend, PendingView, PreparedPublicReadExecutor};
 use crate::engine::{DeferredTransactionSideEffects, Engine};
 use crate::filesystem::runtime::merge_filesystem_transaction_state;
-use crate::read::contracts::PublicReadExecutionMode;
 use crate::runtime::TransactionBackendAdapter;
 use crate::sql::executor::execution_program::ExecutionContext;
 use crate::sql::executor::{
@@ -17,7 +14,7 @@ use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError};
 
 use super::compile::SqlBufferedWriteCommand;
-use super::{CompiledExecutionRoute, SqlExecutionOutcome};
+use super::runtime::{CompiledExecutionRoute, SqlExecutionOutcome};
 use crate::transaction::commands::{
     BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteExecutionRoute,
 };
@@ -35,7 +32,7 @@ pub(super) fn command_metadata(
         CompiledExecutionRoute::Internal(_) => BufferedWriteExecutionRoute::Internal,
         CompiledExecutionRoute::PublicRead(public_read)
             if matches!(
-                public_read_execution_mode(public_read),
+                public_read.execution_mode(),
                 PublicReadExecutionMode::Committed(_)
             ) =>
         {
@@ -71,9 +68,8 @@ pub(super) async fn refresh_public_surface_registry_from_pending_transaction_vie
     context: &mut ExecutionContext,
 ) -> Result<(), LixError> {
     let backend = TransactionBackendAdapter::new(transaction);
-    context.public_surface_registry =
-        bootstrap_public_surface_registry_with_pending_transaction_view(
-            &backend,
+    context.public_surface_registry = (&backend as &dyn crate::LixBackend)
+        .bootstrap_public_surface_registry_with_pending_view(
             pending_transaction_view.map(|view| view as &dyn PendingView),
         )
         .await?;

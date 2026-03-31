@@ -1,10 +1,10 @@
+use crate::contracts::artifacts::FilesystemPayloadDomainChange;
 use crate::engine::Engine;
+use crate::filesystem::runtime::build_filesystem_payload_domain_changes_insert;
 use crate::{LixBackendTransaction, LixError};
 
-use super::{
-    build_filesystem_payload_domain_changes_insert, execute_internal_execution_with_transaction,
-    PlannedInternalWriteUnit, SqlExecutionOutcome,
-};
+use super::planned_write::PlannedInternalWriteUnit;
+use super::runtime::{execute_internal_execution_with_transaction, SqlExecutionOutcome};
 
 pub(super) async fn run_internal_write_txn_with_transaction(
     engine: &Engine,
@@ -72,7 +72,7 @@ pub(super) async fn run_internal_write_txn_with_transaction(
 
 async fn persist_filesystem_payload_domain_changes_direct(
     transaction: &mut dyn LixBackendTransaction,
-    changes: &[super::FilesystemPayloadDomainChange],
+    changes: &[FilesystemPayloadDomainChange],
 ) -> Result<(), LixError> {
     let tracked = changes
         .iter()

@@ -6,18 +6,22 @@ use crate::commit::{
     append_tracked_with_pending_public_session, BufferedTrackedAppendArgs, CreateCommitDisposition,
     CreateCommitError, CreateCommitErrorKind, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
     CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
+    PendingPublicCommitSession,
 };
+use crate::contracts::artifacts::{PlanEffects, WriteLane};
 use crate::engine::Engine;
 use crate::functions::LixFunctionProvider;
 use crate::runtime::{SchemaCache, TransactionBackendAdapter};
+use crate::sql::executor::{
+    semantic_plan_effects_from_domain_changes, state_commit_stream_operation, PreparedPublicWrite,
+    TrackedTxnUnit,
+};
+use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
 use crate::sql::semantic_ir::validation::validate_commit_time_write;
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
-use super::{
-    empty_public_write_execution_outcome, mirror_public_registered_schema_bootstrap_rows,
-    semantic_plan_effects_from_domain_changes, state_commit_stream_operation, DomainChangeBatch,
-    PendingPublicCommitSession, PlanEffects, SqlExecutionOutcome, TrackedTxnUnit, WriteLane,
-};
+use super::effects::mirror_public_registered_schema_bootstrap_rows;
+use super::runtime::{empty_public_write_execution_outcome, SqlExecutionOutcome};
 
 struct PublicCommitInvariantChecker<'a> {
     planned_write: &'a crate::sql::logical_plan::public_ir::PlannedWrite,
@@ -244,7 +248,7 @@ fn canonical_create_commit_preconditions_for_tracked_unit(
 fn canonical_create_commit_preconditions_from_public_write(
     commit_preconditions: &crate::sql::logical_plan::public_ir::CommitPreconditions,
     batch: Option<&DomainChangeBatch>,
-    public_write: &super::PreparedPublicWrite,
+    public_write: &PreparedPublicWrite,
 ) -> Result<CreateCommitPreconditions, LixError> {
     let write_lane = match &commit_preconditions.write_lane {
         crate::contracts::artifacts::WriteLane::SingleVersion(version_id) => {

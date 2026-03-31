@@ -5,7 +5,7 @@
 //! or kept ephemeral for child sessions, but they are distinct from canonical
 //! version refs and committed graph state.
 
-pub mod contracts;
+mod committed_read_runtime;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -16,11 +16,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use futures_util::FutureExt;
 use sqlparser::ast::Statement;
 
-use crate::contracts::session::ExecuteOptions;
+use crate::contracts::artifacts::ExecuteOptions;
+use crate::contracts::artifacts::{
+    SessionDependency, SessionExecutionMode, SessionStateSnapshot,
+};
 use crate::contracts::surface::SurfaceRegistry;
 use crate::engine::{reject_internal_table_writes, reject_public_create_table, Engine};
 use crate::errors;
-use crate::read::runtime::{
+use crate::session::committed_read_runtime::{
     execute_execution_program_in_committed_read_transaction, prepare_committed_read_program,
 };
 use crate::runtime::Runtime;
@@ -39,8 +42,6 @@ use crate::workspace::{
     require_workspace_active_version_id,
 };
 use crate::{ExecuteResult, LixError, Value};
-
-use contracts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct OpenSessionOptions {

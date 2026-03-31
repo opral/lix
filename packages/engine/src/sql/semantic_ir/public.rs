@@ -4,6 +4,7 @@ use super::canonicalize::{
 use super::hydration::hydrate_structured_public_read;
 use super::internal::NormalizedInternalStatements;
 use super::statement::BoundStatement;
+use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
@@ -17,7 +18,7 @@ use crate::sql::logical_plan::{
 };
 use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
-    build_effective_state, EffectiveStatePlan, EffectiveStateRequest,
+    build_effective_state, EffectiveStatePlan,
 };
 use crate::sql::semantic_ir::semantics::write_analysis::{analyze_write, WriteAnalysisError};
 use crate::{LixBackend, LixError};

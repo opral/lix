@@ -1,7 +1,8 @@
 //! Executor-owned implementation of the public SQL runtime surface.
 
-use crate::contracts::history::TrackedDomainChangeView;
-use crate::contracts::session::SessionStateDelta;
+use crate::change_view::TrackedDomainChangeView;
+use crate::contracts::artifacts::SessionStateDelta;
+use crate::contracts::artifacts::{CommittedReadMode, EffectiveStateRequest};
 use crate::contracts::surface::{
     SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry, SurfaceVariant,
 };
@@ -42,9 +43,7 @@ use crate::sql::semantic_ir::canonicalize::CanonicalizedWrite;
 use crate::sql::semantic_ir::semantics::domain_changes::{
     build_domain_change_batch, derive_commit_preconditions, DomainChangeBatch,
 };
-use crate::sql::semantic_ir::semantics::effective_state_resolver::{
-    EffectiveStatePlan, EffectiveStateRequest,
-};
+use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
 use crate::sql::semantic_ir::semantics::write_resolver::resolve_write_plan_with_functions;
 use crate::sql::semantic_ir::{
     analyze_public_write_semantics, BoundStatement, ExecutionContext, PublicWriteInvariantTrace,
@@ -89,11 +88,7 @@ pub(crate) struct PreparedPublicRead {
     pub(crate) explain: ExplainArtifacts,
 }
 
-pub(crate) use read::{
-    decode_public_read_result, execute_prepared_public_read,
-    execute_prepared_public_read_in_transaction,
-    execute_prepared_public_read_without_freshness_check,
-};
+pub(crate) use read::execute_prepared_public_read;
 
 impl PreparedPublicRead {
     pub(crate) fn structured_read(&self) -> Option<&StructuredPublicRead> {
@@ -117,6 +112,10 @@ impl PreparedPublicRead {
             PreparedPublicReadExecution::LoweredSql(lowered) => Some(lowered),
             PreparedPublicReadExecution::Direct(_) => None,
         }
+    }
+
+    pub(crate) fn committed_read_mode(&self) -> CommittedReadMode {
+        read::committed_read_mode_from_prepared_public_read(self)
     }
 
     pub(crate) fn surface_bindings(&self) -> &[String] {
@@ -1895,9 +1894,11 @@ mod tests {
         prepare_public_execution, prepare_public_read, prepare_public_read_strict,
         PreparedPublicExecution, PreparedPublicReadExecution,
     };
-    use crate::contracts::history::StateHistoryRootScope;
-    use crate::contracts::live::{mark_mode_with_backend, LiveStateMode};
+    use crate::contracts::artifacts::{
+        FileHistoryRootScope, FileHistoryVersionScope, LiveStateMode, StateHistoryRootScope,
+    };
     use crate::contracts::surface::{SurfaceReadFreshness, SurfaceRegistry};
+    use crate::live_state::mark_mode_with_backend;
     use crate::sql::routing::delay_broad_routing_for_test;
     use crate::sql::{
         binder::{
@@ -2255,7 +2256,7 @@ mod tests {
             .dependency_spec()
             .expect("dependency spec should be derived")
             .session_dependencies
-            .contains(&crate::contracts::session::SessionDependency::ActiveVersion));
+            .contains(&crate::contracts::artifacts::SessionDependency::ActiveVersion));
         assert_eq!(
             prepared
                 .effective_state_request()
@@ -2819,7 +2820,7 @@ mod tests {
             .dependency_spec()
             .expect("filesystem dependency spec should be recorded")
             .session_dependencies
-            .contains(&crate::contracts::session::SessionDependency::ActiveVersion));
+            .contains(&crate::contracts::artifacts::SessionDependency::ActiveVersion));
         assert_eq!(
             prepared
                 .explain
@@ -2925,9 +2926,7 @@ mod tests {
             PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(plan)) => {
                 assert_eq!(
                     plan.request.root_scope,
-                    crate::filesystem::history::FileHistoryRootScope::RequestedRoots(vec![
-                        "commit-1".to_string()
-                    ])
+                    FileHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
                 );
                 assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
             }
@@ -2987,9 +2986,7 @@ mod tests {
             PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(plan)) => {
                 assert_eq!(
                     plan.request.version_scope,
-                    crate::filesystem::history::FileHistoryVersionScope::RequestedVersions(vec![
-                        "version-a".to_string()
-                    ])
+                    FileHistoryVersionScope::RequestedVersions(vec!["version-a".to_string()])
                 );
                 assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
             }
@@ -3050,9 +3047,7 @@ mod tests {
             PreparedPublicReadExecution::Direct(DirectPublicReadPlan::DirectoryHistory(plan)) => {
                 assert_eq!(
                     plan.request.root_scope,
-                    crate::filesystem::history::FileHistoryRootScope::RequestedRoots(vec![
-                        "commit-1".to_string()
-                    ])
+                    FileHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
                 );
                 assert_eq!(plan.request.directory_ids, vec!["dir-1".to_string()]);
                 assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
@@ -3104,9 +3099,7 @@ mod tests {
                         )) => {
                             assert_eq!(
                                 plan.request.root_scope,
-                                crate::filesystem::history::FileHistoryRootScope::RequestedRoots(
-                                    vec![active_commit_id]
-                                )
+                                FileHistoryRootScope::RequestedRoots(vec![active_commit_id])
                             );
                         }
                         PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(

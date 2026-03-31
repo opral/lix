@@ -1,13 +1,14 @@
+use crate::contracts::artifacts::{
+    EffectiveStateRequest, EffectiveStateVersionScope, ExactUntrackedLookupRequest,
+    LiveQueryEffectiveRow, LiveQueryOverlayLane, TrackedTombstoneLookupRequest,
+};
 use crate::canonical::read::{
     load_exact_committed_state_row_at_version_head as load_exact_committed_state_row,
     ExactCommittedStateRow, ExactCommittedStateRowRequest,
 };
-use crate::contracts::live::{
-    load_exact_untracked_effective_row_with_backend, normalize_live_snapshot_values_with_backend,
-    tracked_tombstone_shadows_exact_row_with_backend, EffectiveRow, ExactUntrackedLookupRequest,
-    OverlayLane as LiveOverlayLane, TrackedTombstoneLookupRequest,
+use crate::contracts::traits::{
+    LiveStateQueryBackend, PendingSemanticRow, PendingSemanticStorage, PendingView,
 };
-use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
 };
@@ -26,17 +27,6 @@ use std::ops::ControlFlow;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StateSourceAuthority {
     AuthoritativeCommitted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EffectiveStateRequest {
-    pub(crate) schema_set: BTreeSet<String>,
-    pub(crate) version_scope: VersionScope,
-    pub(crate) include_global_overlay: bool,
-    pub(crate) include_untracked_overlay: bool,
-    pub(crate) include_tombstones: bool,
-    pub(crate) predicate_classes: Vec<String>,
-    pub(crate) required_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,7 +78,7 @@ pub(crate) fn build_effective_state(
     let scan = canonical_state_scan(&structured_read.read_command.root)?;
     let request = EffectiveStateRequest {
         schema_set: schema_set_for_read(structured_read, dependency_spec),
-        version_scope: scan.version_scope,
+        version_scope: effective_state_version_scope(scan.version_scope),
         include_global_overlay: true,
         include_untracked_overlay: true,
         include_tombstones: scan.include_tombstones,
@@ -115,6 +105,14 @@ pub(crate) fn build_effective_state(
             .collect(),
     };
     Some((request, plan))
+}
+
+fn effective_state_version_scope(version_scope: VersionScope) -> EffectiveStateVersionScope {
+    match version_scope {
+        VersionScope::ActiveVersion => EffectiveStateVersionScope::ActiveVersion,
+        VersionScope::ExplicitVersion => EffectiveStateVersionScope::ExplicitVersion,
+        VersionScope::History => EffectiveStateVersionScope::History,
+    }
 }
 
 fn canonical_state_scan(read_plan: &ReadPlan) -> Option<&CanonicalStateScan> {
@@ -378,18 +376,16 @@ async fn load_exact_tracked_effective_row(
         return Ok(TrackedExactEffectiveRowLookup::Shadowed);
     }
 
-    if tracked_tombstone_shadows_exact_row_with_backend(
-        backend,
-        &TrackedTombstoneLookupRequest {
+    if backend
+        .tracked_tombstone_shadows_exact_row(&TrackedTombstoneLookupRequest {
             schema_key: request.schema_key.clone(),
             version_id: internal_version_id.to_string(),
             entity_id: request.row_key.entity_id.clone(),
             file_id: request.row_key.file_id.clone(),
             plugin_key: request.row_key.plugin_key.clone(),
             schema_version: request.row_key.schema_version.clone(),
-        },
-    )
-    .await?
+        })
+        .await?
     {
         return Ok(TrackedExactEffectiveRowLookup::Shadowed);
     }
@@ -403,9 +399,9 @@ async fn load_exact_untracked_effective_row(
     version_id: &str,
     overlay_lane: OverlayLane,
 ) -> Result<Option<ExactEffectiveStateRow>, LixError> {
-    load_exact_untracked_effective_row_with_backend(
-        backend,
-        &ExactUntrackedLookupRequest {
+    backend
+        .load_exact_untracked_effective_row(
+            &ExactUntrackedLookupRequest {
             schema_key: request.schema_key.clone(),
             version_id: version_id.to_string(),
             entity_id: request.row_key.entity_id.clone(),
@@ -413,12 +409,12 @@ async fn load_exact_untracked_effective_row(
             plugin_key: request.row_key.plugin_key.clone(),
             schema_version: request.row_key.schema_version.clone(),
             writer_key: request.row_key.writer_key.clone(),
-        },
-        &request.version_id,
-        live_state_overlay_lane(overlay_lane),
-    )
-    .await
-    .map(|row| row.map(exact_effective_state_row_from_effective_untracked))
+            },
+            &request.version_id,
+            live_state_overlay_lane(overlay_lane),
+        )
+        .await
+        .map(|row| row.map(|row| exact_effective_state_row_from_effective_untracked(row, overlay_lane)))
 }
 
 fn exact_effective_state_row_from_tracked(
@@ -457,7 +453,10 @@ fn exact_effective_state_row_from_tracked(
     }
 }
 
-fn exact_effective_state_row_from_effective_untracked(row: EffectiveRow) -> ExactEffectiveStateRow {
+fn exact_effective_state_row_from_effective_untracked(
+    row: LiveQueryEffectiveRow,
+    overlay_lane: OverlayLane,
+) -> ExactEffectiveStateRow {
     let mut values = row.values;
     values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
     values.insert(
@@ -498,25 +497,16 @@ fn exact_effective_state_row_from_effective_untracked(row: EffectiveRow) -> Exac
         version_id: row.version_id,
         values,
         source_change_id: row.source_change_id,
-        overlay_lane: sql_overlay_lane(row.overlay_lane),
+        overlay_lane,
     }
 }
 
-fn live_state_overlay_lane(lane: OverlayLane) -> LiveOverlayLane {
+fn live_state_overlay_lane(lane: OverlayLane) -> LiveQueryOverlayLane {
     match lane {
-        OverlayLane::GlobalTracked => LiveOverlayLane::GlobalTracked,
-        OverlayLane::LocalTracked => LiveOverlayLane::LocalTracked,
-        OverlayLane::GlobalUntracked => LiveOverlayLane::GlobalUntracked,
-        OverlayLane::LocalUntracked => LiveOverlayLane::LocalUntracked,
-    }
-}
-
-fn sql_overlay_lane(lane: LiveOverlayLane) -> OverlayLane {
-    match lane {
-        LiveOverlayLane::GlobalTracked => OverlayLane::GlobalTracked,
-        LiveOverlayLane::LocalTracked => OverlayLane::LocalTracked,
-        LiveOverlayLane::GlobalUntracked => OverlayLane::GlobalUntracked,
-        LiveOverlayLane::LocalUntracked => OverlayLane::LocalUntracked,
+        OverlayLane::GlobalTracked => LiveQueryOverlayLane::GlobalTracked,
+        OverlayLane::LocalTracked => LiveQueryOverlayLane::LocalTracked,
+        OverlayLane::GlobalUntracked => LiveQueryOverlayLane::GlobalUntracked,
+        OverlayLane::LocalUntracked => LiveQueryOverlayLane::LocalUntracked,
     }
 }
 
@@ -679,12 +669,9 @@ async fn exact_effective_state_row_from_pending(
     } else {
         row.version_id.clone()
     };
-    let mut values = normalize_live_snapshot_values_with_backend(
-        backend,
-        &row.schema_key,
-        row.snapshot_content.as_deref(),
-    )
-    .await?;
+    let mut values = backend
+        .normalize_live_snapshot_values(&row.schema_key, row.snapshot_content.as_deref())
+        .await?;
     values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
     values.insert(
         "schema_key".to_string(),

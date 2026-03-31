@@ -5,13 +5,13 @@
 
 use crate::backend::prepared::PreparedStatement;
 use crate::backend::SqlDialect;
-use crate::contracts::history::{
-    DirectoryHistoryRequest, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
-    FileHistoryRootScope, FileHistoryVersionScope, StateHistoryContentMode,
-    StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope,
-    StateHistoryVersionScope,
+use crate::contracts::artifacts::{
+    DirectoryHistoryRequest, EffectiveStateRequest, EffectiveStateVersionScope,
+    FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest, FileHistoryRootScope,
+    FileHistoryVersionScope, StateHistoryContentMode, StateHistoryLineageScope,
+    StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope, StateHistoryVersionScope,
+    SessionDependency, SessionStateDelta,
 };
-use crate::contracts::session::{SessionDependency, SessionStateDelta};
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
     SurfaceVariant,
@@ -70,7 +70,7 @@ use crate::sql::semantic_ir::semantics::domain_changes::{
     DomainChangeBatch, PublicDomainChange, SemanticEffect,
 };
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
-    EffectiveStatePlan, EffectiveStateRequest, StateSourceAuthority,
+    EffectiveStatePlan, StateSourceAuthority,
 };
 use crate::sql::semantic_ir::semantics::surface_semantics::OverlayLane;
 use crate::sql::semantic_ir::{
@@ -5565,7 +5565,7 @@ fn effective_state_request_snapshot(
 ) -> EffectiveStateRequestSnapshot {
     EffectiveStateRequestSnapshot {
         schema_set: request.schema_set.iter().cloned().collect(),
-        version_scope: version_scope_snapshot(request.version_scope),
+        version_scope: effective_state_version_scope_snapshot(request.version_scope),
         include_global_overlay: request.include_global_overlay,
         include_untracked_overlay: request.include_untracked_overlay,
         include_tombstones: request.include_tombstones,
@@ -5697,6 +5697,16 @@ fn version_scope_snapshot(scope: VersionScope) -> ExplainVersionScope {
         VersionScope::ActiveVersion => ExplainVersionScope::ActiveVersion,
         VersionScope::ExplicitVersion => ExplainVersionScope::ExplicitVersion,
         VersionScope::History => ExplainVersionScope::History,
+    }
+}
+
+fn effective_state_version_scope_snapshot(
+    scope: EffectiveStateVersionScope,
+) -> ExplainVersionScope {
+    match scope {
+        EffectiveStateVersionScope::ActiveVersion => ExplainVersionScope::ActiveVersion,
+        EffectiveStateVersionScope::ExplicitVersion => ExplainVersionScope::ExplicitVersion,
+        EffectiveStateVersionScope::History => ExplainVersionScope::History,
     }
 }
 

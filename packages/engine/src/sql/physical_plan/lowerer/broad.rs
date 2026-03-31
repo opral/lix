@@ -1,5 +1,5 @@
 use super::*;
-use crate::contracts::live::build_working_changes_public_read_source_sql;
+use crate::public_read_sql::build_working_changes_public_read_source_sql;
 use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadAlias, BroadPublicReadDistinct, BroadPublicReadGroupBy,
@@ -64,6 +64,18 @@ fn with_current_broad_render_substitution_collector<T>(
         };
         work(collector)
     })
+}
+
+fn effective_state_version_scope(
+    version_scope: VersionScope,
+) -> crate::contracts::artifacts::EffectiveStateVersionScope {
+    match version_scope {
+        VersionScope::ActiveVersion => crate::contracts::artifacts::EffectiveStateVersionScope::ActiveVersion,
+        VersionScope::ExplicitVersion => {
+            crate::contracts::artifacts::EffectiveStateVersionScope::ExplicitVersion
+        }
+        VersionScope::History => crate::contracts::artifacts::EffectiveStateVersionScope::History,
+    }
 }
 
 pub(crate) fn lower_broad_public_read_for_execution(
@@ -2643,7 +2655,7 @@ fn build_public_state_surface_sql(
         .collect();
     let request = EffectiveStateRequest {
         schema_set,
-        version_scope: state_scan.version_scope,
+        version_scope: effective_state_version_scope(state_scan.version_scope),
         include_global_overlay: true,
         include_untracked_overlay: true,
         include_tombstones: state_scan.include_tombstones,
@@ -2730,7 +2742,7 @@ fn build_entity_surface_sql_for_broad_lowering(
     };
     let request = EffectiveStateRequest {
         schema_set: BTreeSet::from([schema_key]),
-        version_scope: state_scan.version_scope,
+        version_scope: effective_state_version_scope(state_scan.version_scope),
         include_global_overlay: true,
         include_untracked_overlay: true,
         include_tombstones: state_scan.include_tombstones,

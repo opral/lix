@@ -38,7 +38,6 @@ mod materialize;
 pub(crate) mod pending_reads;
 #[allow(dead_code)]
 pub(crate) mod projection;
-mod public_read_sql;
 mod query_contracts;
 pub(crate) mod raw;
 pub(crate) mod schema_access;
@@ -49,11 +48,16 @@ pub(crate) mod testing;
 pub mod tracked;
 pub mod untracked;
 mod visible_rows;
-use crate::contracts::artifacts::SchemaLiveTableRequirement;
-use crate::{LixBackend, LixBackendTransaction, LixError, ReplayCursor, SqlDialect};
+use crate::{LixBackend, LixBackendTransaction, LixError, ReplayCursor};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
+#[allow(unused_imports)]
+pub(crate) use crate::contracts::artifacts::{
+    ExactUntrackedLookupRequest, LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow,
+    LiveSnapshotStorage, LiveStateProjectionStatus, SchemaRegistrationSet,
+    TrackedTombstoneLookupRequest,
+};
 pub(crate) use constraints::matches_constraints;
 pub use constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 pub(crate) use effective::resolve_effective_rows;
@@ -84,8 +88,8 @@ pub(crate) use key_value_queries::{
     build_ensure_runtime_sequence_row_sql, build_lock_runtime_sequence_row_sql,
     build_update_runtime_sequence_highest_sql, load_key_value_payloads,
 };
-pub(crate) use lifecycle::LiveStateProjectionStatus;
-pub use lifecycle::{LiveStateMode, LiveStateReadiness};
+pub use crate::contracts::artifacts::{LiveStateMode, SchemaRegistration};
+pub use lifecycle::LiveStateReadiness;
 pub use materialize::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
@@ -93,21 +97,8 @@ pub use materialize::{
     LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
-pub(crate) use pending_reads::{
-    bootstrap_public_surface_registry_with_pending_transaction_view,
-    execute_prepared_public_read_with_pending_transaction_view,
-    execute_prepared_public_read_with_pending_transaction_view_in_transaction,
-    public_read_execution_mode,
-};
 pub use projection::{
     DerivedProjectionId, DerivedProjectionStatus, ProjectionReplayMode, ProjectionStatus,
-};
-pub(crate) use query_contracts::{
-    load_exact_untracked_effective_row_with_backend, load_live_read_shape_for_table_name,
-    load_live_snapshot_rows_with_backend, normalize_live_snapshot_values_with_backend,
-    tracked_tombstone_shadows_exact_row_with_backend, ExactUntrackedLookupRequest, LiveFilter,
-    LiveFilterField, LiveFilterOp, LiveReadShape, LiveSnapshotRow, LiveSnapshotStorage,
-    TrackedTombstoneLookupRequest,
 };
 pub(crate) use schema_access::LiveReadContract;
 pub use shared::identity::RowIdentity;
@@ -139,108 +130,6 @@ pub(crate) use untracked::{
     UntrackedReadView as LiveUntrackedReader, UntrackedWriteParticipant as LiveUntrackedWriter,
 };
 pub(crate) use visible_rows::{scan_live_rows, LiveReadRow, LiveStorageLane};
-
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct SchemaRegistration {
-    schema_key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    registered_snapshot: Option<JsonValue>,
-    #[serde(skip, default)]
-    source: SchemaRegistrationSource,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SchemaRegistrationSet {
-    inner: BTreeMap<String, SchemaRegistration>,
-}
-
-impl SchemaRegistrationSet {
-    pub(crate) fn insert(&mut self, registration: impl Into<SchemaRegistration>) {
-        let registration = registration.into();
-        self.inner
-            .insert(registration.schema_key().to_string(), registration);
-    }
-
-    pub(crate) fn extend(&mut self, other: SchemaRegistrationSet) {
-        self.inner.extend(other.inner);
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    pub(crate) fn values(&self) -> impl Iterator<Item = &SchemaRegistration> {
-        self.inner.values()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-enum SchemaRegistrationSource {
-    #[default]
-    StoredLayout,
-    SchemaDefinition(JsonValue),
-}
-
-impl From<&str> for SchemaRegistration {
-    fn from(schema_key: &str) -> Self {
-        Self::new(schema_key)
-    }
-}
-
-impl From<String> for SchemaRegistration {
-    fn from(schema_key: String) -> Self {
-        Self::new(schema_key)
-    }
-}
-
-impl SchemaRegistration {
-    pub fn new(schema_key: impl Into<String>) -> Self {
-        Self {
-            schema_key: schema_key.into(),
-            registered_snapshot: None,
-            source: SchemaRegistrationSource::StoredLayout,
-        }
-    }
-
-    pub fn schema_key(&self) -> &str {
-        &self.schema_key
-    }
-
-    pub fn with_registered_snapshot(
-        schema_key: impl Into<String>,
-        registered_snapshot: JsonValue,
-    ) -> Self {
-        Self {
-            schema_key: schema_key.into(),
-            registered_snapshot: Some(registered_snapshot),
-            source: SchemaRegistrationSource::StoredLayout,
-        }
-    }
-
-    pub(crate) fn with_schema_definition(
-        schema_key: impl Into<String>,
-        schema_definition: JsonValue,
-    ) -> Self {
-        Self {
-            schema_key: schema_key.into(),
-            registered_snapshot: None,
-            source: SchemaRegistrationSource::SchemaDefinition(schema_definition),
-        }
-    }
-
-    fn registered_snapshot(&self) -> Option<&JsonValue> {
-        self.registered_snapshot.as_ref()
-    }
-
-    fn schema_definition_override(&self) -> Option<&JsonValue> {
-        match &self.source {
-            SchemaRegistrationSource::StoredLayout => None,
-            SchemaRegistrationSource::SchemaDefinition(schema_definition) => {
-                Some(schema_definition)
-            }
-        }
-    }
-}
 
 pub async fn require_ready(backend: &dyn LixBackend) -> Result<(), LixError> {
     lifecycle::require_ready(backend).await
@@ -412,33 +301,6 @@ pub(crate) async fn load_live_read_contract_for_table_name(
     schema_access::load_schema_read_contract_for_table_name(backend, table_name).await
 }
 
-pub(crate) fn build_effective_public_read_source_sql(
-    dialect: SqlDialect,
-    active_version_id: Option<&str>,
-    effective_state_request: &crate::contracts::read::EffectiveStateRequest,
-    surface_binding: &crate::contracts::surface::SurfaceBinding,
-    pushdown_predicates: &[sqlparser::ast::Expr],
-    known_live_layouts: &BTreeMap<String, JsonValue>,
-    include_snapshot_content: bool,
-) -> Result<String, LixError> {
-    public_read_sql::build_effective_public_read_source_sql(
-        dialect,
-        active_version_id,
-        effective_state_request,
-        surface_binding,
-        pushdown_predicates,
-        known_live_layouts,
-        include_snapshot_content,
-    )
-}
-
-pub(crate) fn build_working_changes_public_read_source_sql(
-    dialect: SqlDialect,
-    active_version_id: &str,
-) -> String {
-    public_read_sql::build_working_changes_public_read_source_sql(dialect, active_version_id)
-}
-
 pub(crate) async fn live_storage_relation_exists_with_backend(
     backend: &dyn LixBackend,
     schema_key: &str,
@@ -600,23 +462,3 @@ pub(crate) fn live_schema_column_names(
 
 #[cfg(test)]
 pub(crate) use lifecycle::LIVE_STATE_SCHEMA_EPOCH;
-pub(crate) fn is_untracked_live_table(table_name: &str) -> bool {
-    storage::is_untracked_live_table(table_name)
-}
-
-pub(crate) fn coalesce_live_table_requirements(
-    requirements: &[SchemaLiveTableRequirement],
-) -> Vec<SchemaLiveTableRequirement> {
-    let mut by_schema = std::collections::BTreeMap::<String, SchemaLiveTableRequirement>::new();
-    for requirement in requirements {
-        by_schema
-            .entry(requirement.schema_key.clone())
-            .and_modify(|existing| {
-                if existing.schema_definition.is_none() && requirement.schema_definition.is_some() {
-                    existing.schema_definition = requirement.schema_definition.clone();
-                }
-            })
-            .or_insert_with(|| requirement.clone());
-    }
-    by_schema.into_values().collect()
-}

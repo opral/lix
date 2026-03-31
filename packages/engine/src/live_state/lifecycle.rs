@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::contracts::artifacts::{LiveStateMode, LiveStateProjectionStatus};
 use crate::errors::classification::is_missing_relation_error;
 use crate::init::tables::add_column_if_missing;
 use crate::{
@@ -29,15 +30,6 @@ pub(crate) const LIVE_STATE_STATUS_SEED_ROW_SQL: &str = "INSERT INTO lix_interna
      WHERE NOT EXISTS (\
        SELECT 1 FROM lix_internal_live_state_status WHERE singleton_id = 1\
      )";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LiveStateMode {
-    Uninitialized,
-    Bootstrapping,
-    Ready,
-    NeedsRebuild,
-    Rebuilding,
-}
 
 impl LiveStateMode {
     fn as_str(self) -> &'static str {
@@ -74,18 +66,6 @@ struct LiveStateStatusRow {
 pub(crate) struct LiveStateSnapshot {
     status: Option<LiveStateStatusRow>,
     pub(crate) latest_replay_cursor: Option<ReplayCursor>,
-    pub(crate) current_committed_frontier: CommittedVersionFrontier,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LiveStateProjectionStatus {
-    pub(crate) mode: LiveStateMode,
-    /// Replica-local replay cursor used to resume scanning canonical storage.
-    pub(crate) applied_cursor: Option<ReplayCursor>,
-    pub(crate) latest_cursor: Option<ReplayCursor>,
-    /// Semantic frontier actually served by the current live-state projection.
-    pub(crate) applied_committed_frontier: Option<CommittedVersionFrontier>,
-    /// Current committed frontier resolved from replica-local version heads.
     pub(crate) current_committed_frontier: CommittedVersionFrontier,
 }
 

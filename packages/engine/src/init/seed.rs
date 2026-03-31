@@ -1,4 +1,4 @@
-use crate::contracts::session::ExecuteOptions;
+use crate::contracts::artifacts::ExecuteOptions;
 use crate::engine::Engine;
 use crate::refs::load_committed_version_head_commit_id;
 use crate::runtime::TransactionBackendAdapter;

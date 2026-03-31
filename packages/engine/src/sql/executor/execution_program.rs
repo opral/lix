@@ -3,15 +3,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::contracts::session::ExecuteOptions;
+use crate::contracts::artifacts::ExecuteOptions;
 use crate::contracts::surface::SurfaceRegistry;
-use crate::contracts::write::{BorrowedWriteTransaction, WriteProgramExecutor, WriteTransaction};
 use crate::sql::binder::{
     bind_statement_binding_template, compile_statement_binding_template_with_state,
     RuntimeBindingValues, StatementBindingTemplate,
 };
 use crate::sql::internal::script::coalesce_state_surface_inserts_in_transactions;
 use crate::sql::parser::placeholders::PlaceholderState;
+use crate::write_runtime::{BorrowedWriteTransaction, WriteProgramExecutor, WriteTransaction};
 use crate::{ExecuteResult, LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
 

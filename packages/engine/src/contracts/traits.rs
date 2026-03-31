@@ -1,9 +1,15 @@
 use async_trait::async_trait;
+use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 
+use crate::contracts::artifacts::{
+    ExactUntrackedLookupRequest, LiveFilter, LiveQueryEffectiveRow, LiveQueryOverlayLane,
+    LiveSnapshotRow, LiveSnapshotStorage, LiveStateProjectionStatus, PreparedPublicReadContract,
+    PublicReadExecutionMode, TrackedTombstoneLookupRequest,
+};
+use crate::contracts::surface::SurfaceRegistry;
 use crate::filesystem::runtime::FilesystemTransactionFileState;
-pub(crate) use crate::live_state::{EffectiveRowSet, EffectiveRowsRequest};
-use crate::live_state::{LiveReadViews, RowIdentity};
-use crate::LixError;
+use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PendingSemanticStorage {
@@ -46,8 +52,6 @@ pub(crate) trait PendingView {
 
     fn visible_files(&self) -> Vec<FilesystemTransactionFileState>;
 
-    fn workspace_writer_key_annotation(&self, identity: &RowIdentity) -> Option<Option<String>>;
-
     fn workspace_writer_key_annotation_for_state_row(
         &self,
         version_id: &str,
@@ -57,27 +61,101 @@ pub(crate) trait PendingView {
     ) -> Option<Option<String>>;
 }
 
-#[async_trait(?Send)]
-pub(crate) trait EffectiveRowProvider {
-    async fn resolve_effective_rows(
+pub(crate) trait LiveReadShapeContract {
+    fn normalized_projection_sql(&self, table_alias: Option<&str>) -> String;
+
+    fn snapshot_from_projected_row(
         &self,
-        request: &EffectiveRowsRequest,
-    ) -> Result<EffectiveRowSet, LixError>;
+        schema_key: &str,
+        row: &[Value],
+        snapshot_index: usize,
+        normalized_start_index: usize,
+    ) -> Result<Option<JsonValue>, LixError>;
 }
 
 #[async_trait(?Send)]
-impl EffectiveRowProvider for LiveReadViews<'_> {
-    async fn resolve_effective_rows(
+pub(crate) trait LiveStateQueryBackend {
+    async fn load_live_read_shape_for_table_name(
         &self,
-        request: &EffectiveRowsRequest,
-    ) -> Result<EffectiveRowSet, LixError> {
-        crate::live_state::resolve_effective_rows(request, self).await
-    }
+        table_name: &str,
+    ) -> Result<Option<Box<dyn LiveReadShapeContract>>, LixError>;
+
+    async fn load_live_snapshot_rows(
+        &self,
+        storage: LiveSnapshotStorage,
+        schema_key: &str,
+        version_id: &str,
+        filters: &[LiveFilter],
+    ) -> Result<Vec<LiveSnapshotRow>, LixError>;
+
+    async fn normalize_live_snapshot_values(
+        &self,
+        schema_key: &str,
+        snapshot_content: Option<&str>,
+    ) -> Result<BTreeMap<String, Value>, LixError>;
+
+    async fn load_exact_untracked_effective_row(
+        &self,
+        request: &ExactUntrackedLookupRequest,
+        requested_version_id: &str,
+        overlay_lane: LiveQueryOverlayLane,
+    ) -> Result<Option<LiveQueryEffectiveRow>, LixError>;
+
+    async fn tracked_tombstone_shadows_exact_row(
+        &self,
+        request: &TrackedTombstoneLookupRequest,
+    ) -> Result<bool, LixError>;
+
+    async fn load_live_state_projection_status(
+        &self,
+    ) -> Result<LiveStateProjectionStatus, LixError>;
 }
 
-#[allow(dead_code)]
-pub(crate) trait ReadContext: EffectiveRowProvider {
-    fn pending_view(&self) -> Option<&dyn PendingView> {
-        None
+#[async_trait(?Send)]
+pub(crate) trait PendingPublicReadBackend {
+    async fn bootstrap_public_surface_registry_with_pending_view(
+        &self,
+        pending_view: Option<&dyn PendingView>,
+    ) -> Result<SurfaceRegistry, LixError>;
+
+    async fn execute_prepared_public_read_with_pending_view(
+        &self,
+        pending_view: Option<&dyn PendingView>,
+        public_read: &dyn PreparedPublicReadExecutor,
+    ) -> Result<QueryResult, LixError>;
+}
+
+#[async_trait(?Send)]
+pub(crate) trait PendingPublicReadTransaction {
+    async fn require_live_state_ready(&mut self) -> Result<(), LixError>;
+
+    async fn execute_prepared_public_read_with_pending_view(
+        &mut self,
+        pending_view: Option<&dyn PendingView>,
+        public_read: &dyn PreparedPublicReadExecutor,
+    ) -> Result<QueryResult, LixError>;
+}
+
+#[async_trait(?Send)]
+pub(crate) trait PreparedPublicReadExecutor {
+    fn contract(&self) -> PreparedPublicReadContract;
+
+    fn execution_mode(&self) -> PublicReadExecutionMode {
+        self.contract().execution_mode()
     }
+
+    async fn execute(
+        &self,
+        backend: &dyn LixBackend,
+    ) -> Result<QueryResult, LixError>;
+
+    async fn execute_without_freshness_check(
+        &self,
+        backend: &dyn LixBackend,
+    ) -> Result<QueryResult, LixError>;
+
+    async fn execute_in_transaction(
+        &self,
+        transaction: &mut dyn LixBackendTransaction,
+    ) -> Result<QueryResult, LixError>;
 }

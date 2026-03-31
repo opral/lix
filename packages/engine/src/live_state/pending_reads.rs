@@ -1,25 +1,19 @@
 use std::collections::BTreeMap;
 
-use crate::contracts::read::{
-    decode_public_read_result, execute_prepared_public_read,
-    execute_prepared_public_read_in_transaction,
-    execute_prepared_public_read_without_freshness_check, resolve_placeholder_index,
-    PlaceholderState, PreparedPublicRead,
+use async_trait::async_trait;
+use crate::contracts::artifacts::{
+    PendingViewFilter, PendingViewOrderClause, PendingViewProjection, PendingViewReadQuery,
+    PendingViewReadStorage, PublicReadExecutionMode, PublicReadResultColumn,
+    PublicReadResultColumns,
 };
-use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
-use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
+use crate::contracts::traits::{
+    PendingPublicReadBackend, PendingPublicReadTransaction, PendingSemanticRow,
+    PendingSemanticStorage, PendingView, PreparedPublicReadExecutor,
+};
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::schema_access::{live_read_contract_from_layout, LiveReadContract};
-use crate::live_state::shared::identity::RowIdentity;
-use crate::read::contracts::{
-    committed_read_mode_from_prepared_public_read, CommittedReadMode, PublicReadExecutionMode,
-};
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
-use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, OrderBy, OrderByExpr,
-    OrderByKind, SelectItem, UnaryOperator, Value as SqlValue,
-};
 
 use super::{scan_live_rows, LiveReadRow, LiveStorageLane};
 
@@ -64,25 +58,27 @@ impl<'a> TransactionReadModel<'a> {
 
     async fn execute_prepared_public_read(
         &self,
-        public_read: &PreparedPublicRead,
+        public_read: &dyn PreparedPublicReadExecutor,
     ) -> Result<QueryResult, LixError> {
         if !self.has_pending_visibility() {
-            return execute_prepared_public_read(self.base, public_read).await;
+            return public_read.execute(self.base).await;
         }
 
-        match public_read_execution_mode(public_read) {
+        let contract = public_read.contract();
+        match contract.execution_mode() {
             PublicReadExecutionMode::PendingView => {
-                let query = live_table_query_from_prepared_public_read(public_read)
+                let query = contract
+                    .pending_view_query
+                    .as_ref()
                     .expect("pending-view public reads must lower to a typed live-table query");
-                let result = self.execute_live_table_query(&query).await?;
-                if let Some(lowered) = public_read.lowered_read() {
-                    return Ok(decode_public_read_result(result, lowered));
+                let result = self.execute_live_table_query(query).await?;
+                if let Some(result_columns) = contract.result_columns.as_ref() {
+                    return Ok(decode_public_read_result_contract(result, result_columns));
                 }
                 Ok(result)
             }
-            PublicReadExecutionMode::Committed(CommittedReadMode::CommittedOnly)
-            | PublicReadExecutionMode::Committed(CommittedReadMode::MaterializedState) => {
-                execute_prepared_public_read_without_freshness_check(self.base, public_read).await
+            PublicReadExecutionMode::Committed(_) => {
+                public_read.execute_without_freshness_check(self.base).await
             }
         }
     }
@@ -156,8 +152,9 @@ impl<'a> TransactionReadModel<'a> {
             .iter()
             .map(|column| column.property_name.clone())
             .collect::<Vec<_>>();
+        let storage = pending_semantic_storage(query.storage);
         let mut rows = match query.storage {
-            PendingSemanticStorage::Tracked => scan_live_rows(
+            PendingViewReadStorage::Tracked => scan_live_rows(
                 self.base,
                 LiveStorageLane::Tracked,
                 &query.schema_key,
@@ -169,7 +166,7 @@ impl<'a> TransactionReadModel<'a> {
             .into_iter()
             .map(|row| visible_live_row_from_raw(&access, row))
             .collect::<Result<Vec<_>, _>>()?,
-            PendingSemanticStorage::Untracked => scan_live_rows(
+            PendingViewReadStorage::Untracked => scan_live_rows(
                 self.base,
                 LiveStorageLane::Untracked,
                 &query.schema_key,
@@ -187,10 +184,10 @@ impl<'a> TransactionReadModel<'a> {
             .map(|row| (visible_live_row_identity(&row), row))
             .collect::<BTreeMap<_, _>>();
         if let Some(pending_view) = self.pending_view {
-            for row in pending_view.visible_semantic_rows(query.storage, &query.schema_key) {
+            for row in pending_view.visible_semantic_rows(storage, &query.schema_key) {
                 let visible = visible_live_row_from_pending(&access, &row)?;
                 let identity = visible_live_row_identity(&visible);
-                if visible.is_tombstone && matches!(query.storage, PendingSemanticStorage::Tracked)
+                if visible.is_tombstone && matches!(query.storage, PendingViewReadStorage::Tracked)
                 {
                     by_identity.remove(&identity);
                 } else {
@@ -280,7 +277,7 @@ impl<'a> TransactionReadModel<'a> {
         let Some(pending_view) = self.pending_view else {
             return;
         };
-        if query.storage != PendingSemanticStorage::Tracked
+        if query.storage != PendingViewReadStorage::Tracked
             || !matches!(
                 query.schema_key.as_str(),
                 "lix_file_descriptor" | "lix_directory_descriptor"
@@ -340,7 +337,7 @@ impl<'a> TransactionReadModel<'a> {
         query: &LiveTableOverlayQuery,
         rows: &mut BTreeMap<OverlayVisibleLiveRowIdentity, OverlayVisibleLiveRow>,
     ) {
-        if query.storage != PendingSemanticStorage::Tracked {
+        if query.storage != PendingViewReadStorage::Tracked {
             return;
         }
         let Some(pending_view) = self.pending_view else {
@@ -348,13 +345,12 @@ impl<'a> TransactionReadModel<'a> {
         };
 
         for row in rows.values_mut() {
-            let identity = RowIdentity {
-                schema_key: row.schema_key.clone(),
-                version_id: row.version_id.clone(),
-                entity_id: row.entity_id.clone(),
-                file_id: row.file_id.clone(),
-            };
-            let Some(writer_key) = pending_view.workspace_writer_key_annotation(&identity) else {
+            let Some(writer_key) = pending_view.workspace_writer_key_annotation_for_state_row(
+                &row.version_id,
+                &row.schema_key,
+                &row.entity_id,
+                &row.file_id,
+            ) else {
                 continue;
             };
             row.normalized_values.insert(
@@ -377,10 +373,10 @@ pub(crate) async fn bootstrap_public_surface_registry_with_pending_transaction_v
 pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view(
     base: &dyn LixBackend,
     pending_transaction_view: Option<&dyn PendingView>,
-    public_read: &PreparedPublicRead,
+    public_read: &dyn PreparedPublicReadExecutor,
 ) -> Result<QueryResult, LixError> {
     let Some(pending_transaction_view) = pending_transaction_view else {
-        return execute_prepared_public_read(base, public_read).await;
+        return public_read.execute(base).await;
     };
     TransactionReadModel::new(base, Some(pending_transaction_view))
         .execute_prepared_public_read(public_read)
@@ -390,7 +386,7 @@ pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view(
 pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     pending_transaction_view: Option<&dyn PendingView>,
-    public_read: &PreparedPublicRead,
+    public_read: &dyn PreparedPublicReadExecutor,
 ) -> Result<QueryResult, LixError> {
     let execution_mode = public_read_execution_mode(public_read);
     match (pending_transaction_view, execution_mode) {
@@ -400,61 +396,26 @@ pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view_i
                 .execute_prepared_public_read(public_read)
                 .await
         }
-        _ => execute_prepared_public_read_in_transaction(transaction, public_read).await,
+        _ => public_read.execute_in_transaction(transaction).await,
     }
 }
 
 pub(crate) fn public_read_execution_mode(
-    public_read: &PreparedPublicRead,
+    public_read: &dyn PreparedPublicReadExecutor,
 ) -> PublicReadExecutionMode {
-    if live_table_query_from_prepared_public_read(public_read).is_some() {
-        return PublicReadExecutionMode::PendingView;
+    public_read.execution_mode()
+}
+
+type LiveTableOverlayQuery = PendingViewReadQuery;
+type LiveProjection = PendingViewProjection;
+type LiveFilter = PendingViewFilter;
+type LiveOrderClause = PendingViewOrderClause;
+
+fn pending_semantic_storage(storage: PendingViewReadStorage) -> PendingSemanticStorage {
+    match storage {
+        PendingViewReadStorage::Tracked => PendingSemanticStorage::Tracked,
+        PendingViewReadStorage::Untracked => PendingSemanticStorage::Untracked,
     }
-
-    PublicReadExecutionMode::Committed(committed_read_mode_from_prepared_public_read(public_read))
-}
-
-#[derive(Clone)]
-struct LiveTableOverlayQuery {
-    storage: PendingSemanticStorage,
-    schema_key: String,
-    version_id: String,
-    projections: Vec<LiveProjection>,
-    filters: Vec<LiveFilter>,
-    order_by: Vec<LiveOrderClause>,
-    limit: Option<usize>,
-}
-
-#[derive(Clone)]
-enum LiveProjection {
-    Column {
-        source_column: String,
-        output_column: String,
-    },
-    CountAll {
-        output_column: String,
-    },
-}
-
-#[derive(Clone)]
-enum LiveFilter {
-    Equals(String, Value),
-    In(String, Vec<Value>),
-    IsNull(String),
-    IsNotNull(String),
-    Like {
-        column: String,
-        pattern: String,
-        case_insensitive: bool,
-    },
-    And(Vec<LiveFilter>),
-    Or(Vec<LiveFilter>),
-}
-
-#[derive(Clone)]
-struct LiveOrderClause {
-    column: String,
-    descending: bool,
 }
 
 #[derive(Clone)]
@@ -482,321 +443,103 @@ struct OverlayVisibleLiveRowIdentity {
     plugin_key: String,
 }
 
-fn live_projection_from_select_item(
-    item: &SelectItem,
-    table_alias: Option<&str>,
-) -> Option<LiveProjection> {
-    match item {
-        SelectItem::UnnamedExpr(expr) => live_projection_from_expr(
-            expr,
-            table_alias,
-            live_identifier_name(expr, table_alias).unwrap_or_else(|| expr.to_string()),
-        ),
-        SelectItem::ExprWithAlias { expr, alias } => {
-            live_projection_from_expr(expr, table_alias, alias.value.clone())
-        }
-        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
-    }
-}
-
-fn live_table_query_from_prepared_public_read(
-    public_read: &PreparedPublicRead,
-) -> Option<LiveTableOverlayQuery> {
-    let structured_read = public_read.structured_read()?;
-    if !matches!(
-        structured_read.surface_binding.descriptor.surface_family,
-        SurfaceFamily::State | SurfaceFamily::Entity
-    ) {
-        return None;
-    }
-    if matches!(
-        structured_read.surface_binding.descriptor.surface_variant,
-        SurfaceVariant::History | SurfaceVariant::WorkingChanges
-    ) {
-        return None;
-    }
-
-    let table_alias = structured_read
-        .query
-        .source_alias
-        .as_ref()
-        .map(|alias| alias.name.value.as_str());
-    let mut placeholder_state = PlaceholderState::new();
-    let bound_parameters = &structured_read.bound_parameters;
-
-    Some(LiveTableOverlayQuery {
-        storage: PendingSemanticStorage::Tracked,
-        schema_key: structured_read
-            .surface_binding
-            .implicit_overrides
-            .fixed_schema_key
-            .clone()
-            .or_else(|| {
-                let request = public_read.effective_state_request()?;
-                (request.schema_set.len() == 1)
-                    .then(|| request.schema_set.iter().next().cloned())
-                    .flatten()
-            })?,
-        version_id: structured_read.requested_version_id.clone()?,
-        projections: structured_read
-            .query
-            .projection
+fn decode_public_read_result_contract(
+    mut result: QueryResult,
+    result_columns: &PublicReadResultColumns,
+) -> QueryResult {
+    let column_plan = match result_columns {
+        PublicReadResultColumns::Static(columns) => columns
             .iter()
-            .map(|item| live_projection_from_select_item(item, table_alias))
-            .collect::<Option<Vec<_>>>()?,
-        filters: structured_read
-            .query
-            .selection_predicates
+            .copied()
+            .chain(std::iter::repeat(PublicReadResultColumn::Untyped))
+            .take(result.columns.len())
+            .collect::<Vec<_>>(),
+        PublicReadResultColumns::ByColumnName(columns_by_name) => result
+            .columns
             .iter()
-            .map(|predicate| {
-                live_filter_from_expr(
-                    predicate,
-                    table_alias,
-                    bound_parameters,
-                    &mut placeholder_state,
-                )
+            .map(|column| {
+                columns_by_name
+                    .iter()
+                    .find_map(|(candidate, kind)| {
+                        candidate.eq_ignore_ascii_case(column).then_some(*kind)
+                    })
+                    .unwrap_or(PublicReadResultColumn::Untyped)
             })
-            .collect::<Option<Vec<_>>>()?,
-        order_by: structured_read
-            .query
-            .order_by
-            .as_ref()
-            .map(|order_by| live_order_by_from_clause(order_by, table_alias))
-            .flatten()
-            .unwrap_or_default(),
-        limit: live_limit_from_clause(structured_read.query.limit_clause.as_ref())?,
-    })
-}
+            .collect::<Vec<_>>(),
+    };
 
-fn live_projection_from_expr(
-    expr: &Expr,
-    table_alias: Option<&str>,
-    output_column: String,
-) -> Option<LiveProjection> {
-    if live_expr_is_count_all(expr) {
-        return Some(LiveProjection::CountAll { output_column });
+    if !column_plan
+        .iter()
+        .any(|kind| *kind == PublicReadResultColumn::Boolean)
+    {
+        return result;
     }
 
-    Some(LiveProjection::Column {
-        source_column: live_identifier_name(expr, table_alias)?,
-        output_column,
-    })
+    for row in &mut result.rows {
+        for (value, kind) in row.iter_mut().zip(column_plan.iter().copied()) {
+            if kind == PublicReadResultColumn::Boolean {
+                if let Some(decoded) = decode_boolean_value(value) {
+                    *value = decoded;
+                }
+            }
+        }
+    }
+
+    result
 }
 
-fn live_filter_from_expr(
-    expr: &Expr,
-    table_alias: Option<&str>,
-    params: &[Value],
-    placeholder_state: &mut PlaceholderState,
-) -> Option<LiveFilter> {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => Some(LiveFilter::And(vec![
-            live_filter_from_expr(left, table_alias, params, placeholder_state)?,
-            live_filter_from_expr(right, table_alias, params, placeholder_state)?,
-        ])),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Or,
-            right,
-        } => Some(LiveFilter::Or(vec![
-            live_filter_from_expr(left, table_alias, params, placeholder_state)?,
-            live_filter_from_expr(right, table_alias, params, placeholder_state)?,
-        ])),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => match (
-            left.as_ref(),
-            live_value_from_expr(right, params, placeholder_state),
-            right.as_ref(),
-            live_value_from_expr(left, params, placeholder_state),
-        ) {
-            (left, Some(value), _, _) => Some(LiveFilter::Equals(
-                live_identifier_name(left, table_alias)?,
-                value,
-            )),
-            (_, _, right, Some(value)) => Some(LiveFilter::Equals(
-                live_identifier_name(right, table_alias)?,
-                value,
-            )),
+fn decode_boolean_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Null => Some(Value::Null),
+        Value::Boolean(value) => Some(Value::Boolean(*value)),
+        Value::Integer(0) => Some(Value::Boolean(false)),
+        Value::Integer(1) => Some(Value::Boolean(true)),
+        Value::Text(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" => Some(Value::Boolean(false)),
+            "1" | "true" => Some(Value::Boolean(true)),
             _ => None,
         },
-        Expr::InList {
-            expr,
-            list,
-            negated: false,
-        } => Some(LiveFilter::In(
-            live_identifier_name(expr, table_alias)?,
-            list.iter()
-                .map(|expr| live_value_from_expr(expr, params, placeholder_state))
-                .collect::<Option<Vec<_>>>()?,
-        )),
-        Expr::IsNull(expr) => Some(LiveFilter::IsNull(live_identifier_name(expr, table_alias)?)),
-        Expr::IsNotNull(expr) => Some(LiveFilter::IsNotNull(live_identifier_name(
-            expr,
-            table_alias,
-        )?)),
-        Expr::Like {
-            expr,
-            pattern,
-            negated: false,
-            ..
-        } => Some(LiveFilter::Like {
-            column: live_identifier_name(expr, table_alias)?,
-            pattern: live_value_from_expr(pattern, params, placeholder_state)
-                .and_then(|value| overlay_filter_text(&value))?,
-            case_insensitive: false,
-        }),
-        Expr::ILike {
-            expr,
-            pattern,
-            negated: false,
-            ..
-        } => Some(LiveFilter::Like {
-            column: live_identifier_name(expr, table_alias)?,
-            pattern: live_value_from_expr(pattern, params, placeholder_state)
-                .and_then(|value| overlay_filter_text(&value))?,
-            case_insensitive: true,
-        }),
-        Expr::Nested(inner) => live_filter_from_expr(inner, table_alias, params, placeholder_state),
-        _ => None,
+        Value::Real(_) | Value::Json(_) | Value::Blob(_) => None,
+        Value::Integer(_) => None,
     }
 }
 
-fn live_order_by_from_clause(
-    order_by: &OrderBy,
-    table_alias: Option<&str>,
-) -> Option<Vec<LiveOrderClause>> {
-    let OrderByKind::Expressions(expressions) = &order_by.kind else {
-        return None;
-    };
-    expressions
-        .iter()
-        .map(|expr| live_order_clause_from_expr(expr, table_alias))
-        .collect()
-}
+#[async_trait(?Send)]
+impl PendingPublicReadBackend for dyn LixBackend + '_ {
+    async fn bootstrap_public_surface_registry_with_pending_view(
+        &self,
+        pending_view: Option<&dyn PendingView>,
+    ) -> Result<crate::contracts::surface::SurfaceRegistry, LixError> {
+        bootstrap_public_surface_registry_with_pending_transaction_view(self, pending_view).await
+    }
 
-fn live_order_clause_from_expr(
-    expr: &OrderByExpr,
-    table_alias: Option<&str>,
-) -> Option<LiveOrderClause> {
-    Some(LiveOrderClause {
-        column: live_identifier_name(&expr.expr, table_alias)?,
-        descending: expr.options.asc == Some(false),
-    })
-}
-
-fn live_limit_from_clause(
-    limit_clause: Option<&sqlparser::ast::LimitClause>,
-) -> Option<Option<usize>> {
-    let Some(limit_clause) = limit_clause else {
-        return Some(None);
-    };
-    match limit_clause {
-        sqlparser::ast::LimitClause::LimitOffset {
-            limit,
-            offset,
-            limit_by,
-        } => {
-            if offset.is_some() || !limit_by.is_empty() {
-                return None;
-            }
-            let Some(limit) = limit.as_ref() else {
-                return Some(None);
-            };
-            let Expr::Value(value) = limit else {
-                return None;
-            };
-            match &value.value {
-                SqlValue::Number(value, _) => value.parse::<usize>().ok().map(Some),
-                _ => None,
-            }
-        }
-        sqlparser::ast::LimitClause::OffsetCommaLimit { .. } => None,
+    async fn execute_prepared_public_read_with_pending_view(
+        &self,
+        pending_view: Option<&dyn PendingView>,
+        public_read: &dyn PreparedPublicReadExecutor,
+    ) -> Result<QueryResult, LixError> {
+        execute_prepared_public_read_with_pending_transaction_view(self, pending_view, public_read)
+            .await
     }
 }
 
-fn live_identifier_name(expr: &Expr, table_alias: Option<&str>) -> Option<String> {
-    match expr {
-        Expr::Identifier(ident) => Some(ident.value.clone()),
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            let qualifier = parts[0].value.as_str();
-            let column = parts[1].value.clone();
-            match table_alias {
-                Some(alias) if alias.eq_ignore_ascii_case(qualifier) => Some(column),
-                None => Some(column),
-                _ => None,
-            }
-        }
-        _ => None,
+#[async_trait(?Send)]
+impl PendingPublicReadTransaction for dyn LixBackendTransaction + '_ {
+    async fn require_live_state_ready(&mut self) -> Result<(), LixError> {
+        crate::live_state::require_ready_in_transaction(self).await
     }
-}
 
-fn live_expr_is_count_all(expr: &Expr) -> bool {
-    let Expr::Function(function) = expr else {
-        return false;
-    };
-    function.name.to_string().eq_ignore_ascii_case("count")
-        && matches!(
-            &function.args,
-            FunctionArguments::List(list)
-                if list.args.len() == 1
-                    && matches!(
-                        &list.args[0],
-                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
-                    )
+    async fn execute_prepared_public_read_with_pending_view(
+        &mut self,
+        pending_view: Option<&dyn PendingView>,
+        public_read: &dyn PreparedPublicReadExecutor,
+    ) -> Result<QueryResult, LixError> {
+        execute_prepared_public_read_with_pending_transaction_view_in_transaction(
+            self,
+            pending_view,
+            public_read,
         )
-}
-
-fn live_value_from_expr(
-    expr: &Expr,
-    params: &[Value],
-    placeholder_state: &mut PlaceholderState,
-) -> Option<Value> {
-    match expr {
-        Expr::Nested(inner) => live_value_from_expr(inner, params, placeholder_state),
-        Expr::UnaryOp { op, expr } => {
-            let value = live_value_from_expr(expr, params, placeholder_state)?;
-            match (op, value) {
-                (UnaryOperator::Minus, Value::Integer(value)) => Some(Value::Integer(-value)),
-                (UnaryOperator::Minus, Value::Real(value)) => Some(Value::Real(-value)),
-                (UnaryOperator::Plus, value) => Some(value),
-                _ => None,
-            }
-        }
-        Expr::Value(value) => match &value.value {
-            SqlValue::Placeholder(token) => {
-                let index =
-                    resolve_placeholder_index(token, params.len(), placeholder_state).ok()?;
-                params.get(index).cloned()
-            }
-            _ => sql_value_as_engine_value(value),
-        },
-        _ => None,
-    }
-}
-
-fn sql_value_as_engine_value(value: &sqlparser::ast::ValueWithSpan) -> Option<Value> {
-    match &value.value {
-        SqlValue::Null => Some(Value::Null),
-        SqlValue::Boolean(value) => Some(Value::Boolean(*value)),
-        SqlValue::SingleQuotedString(text)
-        | SqlValue::TripleSingleQuotedString(text)
-        | SqlValue::EscapedStringLiteral(text)
-        | SqlValue::DollarQuotedString(sqlparser::ast::DollarQuotedString {
-            value: text, ..
-        }) => Some(Value::Text(text.clone())),
-        SqlValue::Number(value, _) => value
-            .parse::<i64>()
-            .map(Value::Integer)
-            .or_else(|_| value.parse::<f64>().map(Value::Real))
-            .ok(),
-        _ => None,
+        .await
     }
 }
 

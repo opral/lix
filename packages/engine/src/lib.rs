@@ -22,7 +22,7 @@ pub mod live_state;
 mod lix;
 mod observe;
 mod plugin;
-mod read;
+mod public_read_sql;
 pub(crate) mod refs;
 mod replay_cursor;
 mod runtime;
@@ -40,6 +40,7 @@ mod undo_redo;
 mod version;
 mod wasm_runtime;
 pub mod wire;
+mod write_runtime;
 pub(crate) mod workspace;
 
 pub use schema::{
@@ -57,7 +58,7 @@ pub use backend::TransactionMode;
 pub use canonical_json::CanonicalJson;
 pub use checkpoint::CreateCheckpointResult;
 pub use committed_frontier::CommittedVersionFrontier;
-pub use contracts::session::ExecuteOptions;
+pub use contracts::artifacts::ExecuteOptions;
 #[doc(hidden)]
 pub use engine::{boot, BootArgs};
 pub use engine::{BootAccount, BootKeyValue, Engine};

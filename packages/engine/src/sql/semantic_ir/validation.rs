@@ -7,10 +7,12 @@ use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 
 use crate::checkpoint::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME};
-use crate::contracts::live::{
-    is_untracked_live_table, load_live_read_shape_for_table_name,
-    load_live_snapshot_rows_with_backend, LiveFilter, LiveFilterField, LiveFilterOp, LiveReadShape,
-    LiveSnapshotRow, LiveSnapshotStorage,
+use crate::contracts::artifacts::{
+    LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow, LiveSnapshotStorage,
+    is_untracked_live_table,
+};
+use crate::contracts::traits::{
+    LiveReadShapeContract, LiveStateQueryBackend,
 };
 use crate::contracts::surface::SurfaceFamily;
 use crate::identity::{
@@ -173,7 +175,7 @@ pub async fn validate_updates(
     let mut deleted_rows = Vec::new();
 
     for plan in plans {
-        let live_access = load_live_read_shape_for_table_name(backend, &plan.table).await?;
+        let live_access = backend.load_live_read_shape_for_table_name(&plan.table).await?;
         let snapshot_projection = if live_access.is_some() {
             String::new()
         } else {
@@ -205,7 +207,7 @@ pub async fn validate_updates(
             let schema_key = value_to_string(&row[4], "schema_key")?;
             let schema_version = value_to_string(&row[5], "schema_version")?;
             let base_snapshot = required_projected_row_snapshot_json(
-                live_access.as_ref(),
+                live_access.as_deref(),
                 &schema_key,
                 &row,
                 6,
@@ -311,7 +313,7 @@ pub async fn validate_updates(
 }
 
 fn required_projected_row_snapshot_json(
-    access: Option<&LiveReadShape>,
+    access: Option<&dyn LiveReadShapeContract>,
     schema_key: &str,
     row: &[Value],
     first_projected_column: usize,
@@ -1696,17 +1698,17 @@ async fn query_committed_scope_rows(
     backend: &dyn LixBackend,
     scope: &ConstraintScopeKey,
 ) -> Result<Vec<ConstraintCommittedRow>, LixError> {
-    load_live_snapshot_rows_with_backend(
-        backend,
-        live_snapshot_storage(scope.storage),
-        &scope.schema_key,
-        &scope.version_id,
-        &[LiveFilter {
+    backend
+        .load_live_snapshot_rows(
+            live_snapshot_storage(scope.storage),
+            &scope.schema_key,
+            &scope.version_id,
+            &[LiveFilter {
             field: LiveFilterField::FileId,
             operator: LiveFilterOp::Eq(Value::Text(scope.file_id.clone())),
-        }],
-    )
-    .await?
+            }],
+        )
+        .await?
     .into_iter()
     .map(committed_row_from_snapshot_row)
     .collect()
@@ -1716,14 +1718,14 @@ async fn query_committed_schema_version_rows(
     backend: &dyn LixBackend,
     scope: &ConstraintSchemaVersionKey,
 ) -> Result<Vec<ConstraintCommittedRow>, LixError> {
-    load_live_snapshot_rows_with_backend(
-        backend,
-        live_snapshot_storage(scope.storage),
-        &scope.schema_key,
-        &scope.version_id,
-        &[],
-    )
-    .await?
+    backend
+        .load_live_snapshot_rows(
+            live_snapshot_storage(scope.storage),
+            &scope.schema_key,
+            &scope.version_id,
+            &[],
+        )
+        .await?
     .into_iter()
     .map(committed_row_from_snapshot_row)
     .collect()

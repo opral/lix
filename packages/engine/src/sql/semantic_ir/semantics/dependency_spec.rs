@@ -1,4 +1,4 @@
-use crate::contracts::session::SessionDependency;
+use crate::contracts::artifacts::SessionDependency;
 use crate::contracts::surface::{SurfaceBinding, SurfaceFamily};
 use crate::sql::logical_plan::public_ir::{
     CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan,
@@ -583,7 +583,7 @@ fn add_filter_literal(column: FilterColumn, value: String, spec: &mut Dependency
 #[cfg(test)]
 mod tests {
     use super::derive_dependency_spec_from_structured_public_read;
-    use crate::contracts::session::SessionDependency;
+    use crate::contracts::artifacts::SessionDependency;
     use crate::contracts::surface::SurfaceRegistry;
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::StructuredPublicRead;

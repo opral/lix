@@ -13,7 +13,7 @@ use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, Value};
 use sqlparser::ast::Statement;
 
-use super::CompiledExecutionStep;
+use super::runtime::CompiledExecutionStep;
 
 pub(super) struct SqlBufferedWriteCommand {
     pub(super) statement: Statement,
