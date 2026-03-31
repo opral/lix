@@ -1,17 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::live_state::effective::contracts::{
-    EffectiveRow, EffectiveRowIdentity, EffectiveRowRequest, EffectiveRowSet, EffectiveRowState,
-    EffectiveRowsRequest, LaneResult, OverlayLane, ReadContext,
+use async_trait::async_trait;
+
+#[cfg(test)]
+use crate::contracts::artifacts::{
+    exact_row_constraints, BatchRowRequest, EffectiveRowRequest, ScanRequest,
 };
+use crate::contracts::artifacts::{
+    EffectiveRow, EffectiveRowIdentity, EffectiveRowSet, EffectiveRowState, EffectiveRowsRequest,
+    LaneResult, OverlayLane,
+};
+use crate::contracts::traits::EffectiveRowsResolver;
+use crate::contracts::traits::LiveReadContext as ReadContext;
 use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::tracked::{
-    BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedRow, TrackedScanRequest,
-    TrackedTombstoneMarker,
+    BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
 };
-use crate::live_state::untracked::{
-    BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedRow, UntrackedScanRequest,
-};
+use crate::live_state::untracked::{BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
 use crate::{LixError, Value};
@@ -41,7 +46,8 @@ pub fn overlay_lanes_for_version(
     )
 }
 
-pub async fn resolve_effective_row(
+#[cfg(test)]
+pub(crate) async fn resolve_effective_row(
     request: &EffectiveRowRequest,
     context: &ReadContext<'_>,
 ) -> Result<Option<EffectiveRow>, LixError> {
@@ -56,13 +62,19 @@ pub async fn resolve_effective_row(
 
         match lane {
             OverlayLane::LocalTracked | OverlayLane::GlobalTracked => {
-                let exact_request = ExactTrackedRowRequest {
+                let exact_request = BatchTrackedRowRequest {
                     schema_key: request.schema_key.clone(),
                     version_id: storage_version_id.clone(),
-                    entity_id: request.entity_id.clone(),
+                    entity_ids: vec![request.entity_id.clone()],
                     file_id: request.file_id.clone(),
                 };
-                if let Some(row) = context.tracked.load_exact_row(&exact_request).await? {
+                if let Some(row) = context
+                    .tracked
+                    .load_exact_rows(&exact_request)
+                    .await?
+                    .into_iter()
+                    .next()
+                {
                     let writer_key =
                         tracked_row_workspace_writer_key(context.workspace_writer_keys, &row)
                             .await?;
@@ -74,23 +86,40 @@ pub async fn resolve_effective_row(
                     )));
                 }
                 if let Some(tombstone_view) = context.tracked_tombstones {
-                    if tombstone_view
-                        .load_exact_tombstone(&exact_request)
-                        .await?
-                        .is_some()
-                    {
+                    let tombstones = tombstone_view
+                        .scan_tombstones(&ScanRequest {
+                            schema_key: request.schema_key.clone(),
+                            version_id: storage_version_id,
+                            constraints: exact_row_constraints(
+                                &crate::contracts::artifacts::ExactRowRequest {
+                                    schema_key: request.schema_key.clone(),
+                                    version_id: request.version_id.clone(),
+                                    entity_id: request.entity_id.clone(),
+                                    file_id: request.file_id.clone(),
+                                },
+                            ),
+                            required_columns: Vec::new(),
+                        })
+                        .await?;
+                    if !tombstones.is_empty() {
                         return Ok(None);
                     }
                 }
             }
             OverlayLane::LocalUntracked | OverlayLane::GlobalUntracked => {
-                let exact_request = ExactUntrackedRowRequest {
+                let exact_request = BatchRowRequest {
                     schema_key: request.schema_key.clone(),
                     version_id: storage_version_id,
-                    entity_id: request.entity_id.clone(),
+                    entity_ids: vec![request.entity_id.clone()],
                     file_id: request.file_id.clone(),
                 };
-                if let Some(row) = context.untracked.load_exact_row(&exact_request).await? {
+                if let Some(row) = context
+                    .untracked
+                    .load_exact_rows(&exact_request)
+                    .await?
+                    .into_iter()
+                    .next()
+                {
                     return Ok(Some(effective_row_from_untracked(
                         row,
                         &request.version_id,
@@ -104,7 +133,7 @@ pub async fn resolve_effective_row(
     Ok(None)
 }
 
-pub async fn resolve_effective_rows(
+pub(crate) async fn resolve_effective_rows(
     request: &EffectiveRowsRequest,
     context: &ReadContext<'_>,
 ) -> Result<EffectiveRowSet, LixError> {
@@ -162,6 +191,16 @@ pub async fn resolve_effective_rows(
     });
 
     Ok(EffectiveRowSet { rows })
+}
+
+#[async_trait(?Send)]
+impl EffectiveRowsResolver for ReadContext<'_> {
+    async fn resolve_effective_rows(
+        &self,
+        request: &EffectiveRowsRequest,
+    ) -> Result<EffectiveRowSet, LixError> {
+        resolve_effective_rows(request, self).await
+    }
 }
 
 async fn scan_tracked_lane(
@@ -427,6 +466,7 @@ async fn load_effective_rows_exact_batch(
 #[allow(dead_code)]
 fn _preserve_value_type(_value: &Value) {}
 
+#[cfg(test)]
 async fn tracked_row_workspace_writer_key(
     workspace_writer_keys: &dyn WorkspaceWriterKeyReadView,
     row: &TrackedRow,

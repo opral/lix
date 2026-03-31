@@ -3,6 +3,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+pub(crate) mod execution_state;
+
 use crate::backend::QueryExecutor;
 use crate::cel::CelEvaluator;
 use crate::contracts::artifacts::MutationRow;

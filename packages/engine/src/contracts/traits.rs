@@ -3,13 +3,19 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
 use crate::contracts::artifacts::{
-    ExactUntrackedLookupRequest, LiveFilter, LiveQueryEffectiveRow, LiveQueryOverlayLane,
-    LiveSnapshotRow, LiveSnapshotStorage, LiveStateProjectionStatus, PreparedPublicReadContract,
-    PublicReadExecutionMode, TrackedTombstoneLookupRequest,
+    EffectiveRowSet, EffectiveRowsRequest, ExactUntrackedLookupRequest, LiveFilter,
+    LiveQueryEffectiveRow, LiveQueryOverlayLane, LiveSnapshotRow, LiveSnapshotStorage,
+    LiveStateProjectionStatus, PreparedPublicReadContract, PublicReadExecutionMode, ScanRequest,
+    SchemaRegistration, TrackedRow, TrackedTombstoneLookupRequest, TrackedTombstoneMarker,
+    TrackedWriteRow, UntrackedRow, UntrackedWriteRow,
 };
 use crate::contracts::surface::SurfaceRegistry;
 use crate::filesystem::runtime::FilesystemTransactionFileState;
-use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
+use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
+use crate::{
+    commit::CanonicalCommitReceipt, LixBackend, LixBackendTransaction, LixError, QueryResult,
+    ReplayCursor, Value,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PendingSemanticStorage {
@@ -71,6 +77,103 @@ pub(crate) trait LiveReadShapeContract {
         snapshot_index: usize,
         normalized_start_index: usize,
     ) -> Result<Option<JsonValue>, LixError>;
+}
+
+#[async_trait(?Send)]
+pub(crate) trait TrackedReadView {
+    async fn load_exact_rows(
+        &self,
+        request: &crate::contracts::artifacts::BatchRowRequest,
+    ) -> Result<Vec<TrackedRow>, LixError>;
+
+    async fn scan_rows(&self, request: &ScanRequest) -> Result<Vec<TrackedRow>, LixError>;
+}
+
+#[async_trait(?Send)]
+pub(crate) trait TrackedTombstoneView {
+    async fn scan_tombstones(
+        &self,
+        request: &ScanRequest,
+    ) -> Result<Vec<TrackedTombstoneMarker>, LixError>;
+}
+
+#[async_trait(?Send)]
+pub(crate) trait TrackedWriteParticipant {
+    async fn apply_tracked_write_batch(
+        &mut self,
+        batch: &[TrackedWriteRow],
+    ) -> Result<(), LixError>;
+}
+
+#[async_trait(?Send)]
+pub(crate) trait UntrackedReadView {
+    async fn load_exact_rows(
+        &self,
+        request: &crate::contracts::artifacts::BatchRowRequest,
+    ) -> Result<Vec<UntrackedRow>, LixError>;
+
+    async fn scan_rows(&self, request: &ScanRequest) -> Result<Vec<UntrackedRow>, LixError>;
+}
+
+#[async_trait(?Send)]
+pub(crate) trait UntrackedWriteParticipant {
+    async fn apply_untracked_write_batch(
+        &mut self,
+        batch: &[UntrackedWriteRow],
+    ) -> Result<(), LixError>;
+}
+
+pub(crate) struct LiveReadContext<'a> {
+    pub(crate) tracked: &'a dyn TrackedReadView,
+    pub(crate) untracked: &'a dyn UntrackedReadView,
+    pub(crate) tracked_tombstones: Option<&'a dyn TrackedTombstoneView>,
+    pub(crate) workspace_writer_keys: &'a dyn WorkspaceWriterKeyReadView,
+}
+
+impl<'a> LiveReadContext<'a> {
+    pub(crate) fn new(
+        tracked: &'a dyn TrackedReadView,
+        untracked: &'a dyn UntrackedReadView,
+        workspace_writer_keys: &'a dyn WorkspaceWriterKeyReadView,
+    ) -> Self {
+        Self {
+            tracked,
+            untracked,
+            tracked_tombstones: None,
+            workspace_writer_keys,
+        }
+    }
+
+    pub(crate) fn with_tracked_tombstones(
+        mut self,
+        tracked_tombstones: &'a dyn TrackedTombstoneView,
+    ) -> Self {
+        self.tracked_tombstones = Some(tracked_tombstones);
+        self
+    }
+}
+
+#[async_trait(?Send)]
+pub(crate) trait EffectiveRowsResolver {
+    async fn resolve_effective_rows(
+        &self,
+        request: &EffectiveRowsRequest,
+    ) -> Result<EffectiveRowSet, LixError>;
+}
+
+#[async_trait(?Send)]
+pub(crate) trait LiveStateTransactionBridge {
+    async fn register_live_state_schema(
+        &mut self,
+        registration: &SchemaRegistration,
+    ) -> Result<(), LixError>;
+
+    async fn mark_live_state_projection_ready(&mut self) -> Result<ReplayCursor, LixError>;
+
+    async fn apply_canonical_receipt_to_live_state(
+        &mut self,
+        receipt: &CanonicalCommitReceipt,
+    ) -> Result<(), LixError>;
 }
 
 #[async_trait(?Send)]
@@ -144,10 +247,7 @@ pub(crate) trait PreparedPublicReadExecutor {
         self.contract().execution_mode()
     }
 
-    async fn execute(
-        &self,
-        backend: &dyn LixBackend,
-    ) -> Result<QueryResult, LixError>;
+    async fn execute(&self, backend: &dyn LixBackend) -> Result<QueryResult, LixError>;
 
     async fn execute_without_freshness_check(
         &self,

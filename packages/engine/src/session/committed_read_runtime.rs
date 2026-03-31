@@ -1,12 +1,12 @@
 use crate::contracts::artifacts::{ResultContract, SessionExecutionMode};
+use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::{
     normalize_sql_execution_error_with_backend, RuntimeHost, TransactionBackendAdapter,
 };
+use crate::sql::executor::execute_prepared::execute_prepared_with_transaction;
 use crate::sql::executor::execution_program::{
     BoundStatementTemplateInstance, ExecutionContext, ExecutionProgram,
 };
-use crate::sql::executor::execute_prepared::execute_prepared_with_transaction;
-use crate::sql::executor::runtime_state::ExecutionRuntimeState;
 use crate::sql::executor::{
     compile_execution_from_template_instance_with_backend, execute_prepared_public_read,
     CompiledExecution, PreparationPolicy,
@@ -223,8 +223,8 @@ pub(crate) async fn execute_execution_program_in_committed_read_transaction(
             .as_ref()
             .or(compiled_on_demand.as_ref())
             .expect(
-                "compiled committed read step should be available after eager or on-demand preparation",
-            );
+            "compiled committed read step should be available after eager or on-demand preparation",
+        );
 
         let result = execute_compiled_committed_read_in_transaction(
             transaction,

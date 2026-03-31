@@ -4,9 +4,8 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use crate::contracts::artifacts::{
-    ExactUntrackedLookupRequest, LiveFilter, LiveFilterField, LiveFilterOp,
-    LiveQueryEffectiveRow, LiveQueryOverlayLane, LiveSnapshotRow, LiveSnapshotStorage,
-    TrackedTombstoneLookupRequest,
+    ExactUntrackedLookupRequest, LiveFilter, LiveFilterField, LiveFilterOp, LiveQueryEffectiveRow,
+    LiveQueryOverlayLane, LiveSnapshotRow, LiveSnapshotStorage, TrackedTombstoneLookupRequest,
 };
 use crate::contracts::traits::{LiveReadShapeContract, LiveStateQueryBackend};
 use crate::{LixBackend, LixError, Value};
@@ -344,9 +343,7 @@ impl LiveStateQueryBackend for dyn LixBackend + '_ {
     ) -> Result<Option<Box<dyn LiveReadShapeContract>>, LixError> {
         load_live_read_shape_for_table_name(self, table_name)
             .await
-            .map(|shape| {
-                shape.map(|shape| Box::new(shape) as Box<dyn LiveReadShapeContract>)
-            })
+            .map(|shape| shape.map(|shape| Box::new(shape) as Box<dyn LiveReadShapeContract>))
     }
 
     async fn load_live_snapshot_rows(

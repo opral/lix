@@ -1,4 +1,4 @@
-use crate::sql::executor::runtime_state::ExecutionRuntimeEffects;
+use crate::runtime::execution_state::ExecutionRuntimeEffects;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PlanRequirements {

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::contracts::artifacts::ExecuteOptions;
 use crate::contracts::surface::SurfaceRegistry;
+use crate::runtime::execution_state::{ExecutionRuntimeEffects, ExecutionRuntimeState};
 use crate::sql::binder::{
     bind_statement_binding_template, compile_statement_binding_template_with_state,
     RuntimeBindingValues, StatementBindingTemplate,
@@ -16,7 +17,6 @@ use crate::{ExecuteResult, LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
 
 use super::contracts::requirements::PlanRequirements;
-use super::runtime_state::{ExecutionRuntimeEffects, ExecutionRuntimeState};
 use super::{classify_public_execution_route_with_registry, PublicExecutionRoute};
 
 pub(crate) struct ExecutionProgram {

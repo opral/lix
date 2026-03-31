@@ -1,6 +1,6 @@
 use crate::commit::{CanonicalCommitReceipt, PendingPublicCommitSession};
+use crate::contracts::artifacts::SchemaRegistration;
 use crate::engine::Engine;
-use crate::live_state::SchemaRegistration;
 use crate::state::stream::StateCommitStreamChange;
 use crate::{LixBackendTransaction, LixError, ReplayCursor};
 
@@ -363,15 +363,15 @@ mod tests {
     use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
 
+    use crate::contracts::traits::{TrackedReadView, TrackedTombstoneView, UntrackedReadView};
     use crate::live_state::shared::identity::RowIdentity;
     use crate::live_state::tracked::{
-        BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedReadView, TrackedRow,
-        TrackedScanRequest, TrackedTombstoneMarker, TrackedTombstoneView, TrackedWriteOperation,
-        TrackedWriteRow,
+        BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
+        TrackedWriteOperation, TrackedWriteRow,
     };
     use crate::live_state::untracked::{
-        BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedReadView, UntrackedRow,
-        UntrackedScanRequest, UntrackedWriteOperation, UntrackedWriteRow,
+        BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest, UntrackedWriteOperation,
+        UntrackedWriteRow,
     };
     use crate::transaction::live_state_write_state::prepare_materialization_plan;
     use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
@@ -393,13 +393,6 @@ mod tests {
 
     #[async_trait(?Send)]
     impl TrackedReadView for CountingTrackedView {
-        async fn load_exact_row(
-            &self,
-            _request: &ExactTrackedRowRequest,
-        ) -> Result<Option<TrackedRow>, LixError> {
-            Ok(None)
-        }
-
         async fn load_exact_rows(
             &self,
             _request: &BatchTrackedRowRequest,
@@ -418,13 +411,6 @@ mod tests {
 
     #[async_trait(?Send)]
     impl UntrackedReadView for CountingUntrackedView {
-        async fn load_exact_row(
-            &self,
-            _request: &ExactUntrackedRowRequest,
-        ) -> Result<Option<UntrackedRow>, LixError> {
-            Ok(None)
-        }
-
         async fn load_exact_rows(
             &self,
             _request: &BatchUntrackedRowRequest,
@@ -443,13 +429,6 @@ mod tests {
 
     #[async_trait(?Send)]
     impl TrackedTombstoneView for EmptyTombstones {
-        async fn load_exact_tombstone(
-            &self,
-            _request: &ExactTrackedRowRequest,
-        ) -> Result<Option<TrackedTombstoneMarker>, LixError> {
-            Ok(None)
-        }
-
         async fn scan_tombstones(
             &self,
             _request: &TrackedScanRequest,

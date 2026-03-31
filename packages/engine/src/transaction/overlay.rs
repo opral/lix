@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::live_state::{
+use crate::contracts::artifacts::{
     values_from_snapshot_content, RowIdentity, TrackedRow, TrackedTombstoneMarker,
     TrackedWriteOperation, TrackedWriteRow, UntrackedRow, UntrackedWriteOperation,
     UntrackedWriteRow,

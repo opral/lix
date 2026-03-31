@@ -562,7 +562,9 @@ impl SchemaRegistration {
     pub(crate) fn schema_definition_override(&self) -> Option<&JsonValue> {
         match &self.source {
             SchemaRegistrationSource::StoredLayout => None,
-            SchemaRegistrationSource::SchemaDefinition(schema_definition) => Some(schema_definition),
+            SchemaRegistrationSource::SchemaDefinition(schema_definition) => {
+                Some(schema_definition)
+            }
         }
     }
 }
@@ -720,6 +722,21 @@ pub(crate) enum WriteLane {
     GlobalAdmin,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpectedHead {
+    CurrentHead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyKey(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitPreconditions {
+    pub write_lane: WriteLane,
+    pub expected_head: ExpectedHead,
+    pub idempotency_key: IdempotencyKey,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PlannedStateRow {
     pub(crate) entity_id: String,
@@ -728,6 +745,41 @@ pub(crate) struct PlannedStateRow {
     pub(crate) values: BTreeMap<String, Value>,
     pub(crate) writer_key: Option<String>,
     pub(crate) tombstone: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PlannedRowIdentity {
+    pub schema_key: String,
+    pub version_id: String,
+    pub entity_id: String,
+    pub file_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicDomainChange {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: Option<String>,
+    pub file_id: Option<String>,
+    pub plugin_key: Option<String>,
+    pub snapshot_content: Option<String>,
+    pub metadata: Option<String>,
+    pub version_id: String,
+    pub writer_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticEffect {
+    pub effect_key: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainChangeBatch {
+    pub changes: Vec<PublicDomainChange>,
+    pub write_lane: WriteLane,
+    pub writer_key: Option<String>,
+    pub semantic_effects: Vec<SemanticEffect>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -739,4 +791,526 @@ impl OptionalTextPatch {
     pub(crate) fn apply(&self, current: Option<String>) -> Option<String> {
         current
     }
+}
+
+/// Which indexed field a live-state scan constraint applies to.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ScanField {
+    EntityId,
+    FileId,
+    PluginKey,
+    SchemaVersion,
+}
+
+/// Inclusive or exclusive range bound.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Bound {
+    pub value: Value,
+    pub inclusive: bool,
+}
+
+/// SQL-free structured scan constraint.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ScanConstraint {
+    pub field: ScanField,
+    pub operator: ScanOperator,
+}
+
+/// Structured scan operator aligned with the current planner/storage split.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ScanOperator {
+    Eq(Value),
+    In(Vec<Value>),
+    Range {
+        lower: Option<Bound>,
+        upper: Option<Bound>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExactRowRequest {
+    pub schema_key: String,
+    pub version_id: String,
+    pub entity_id: String,
+    pub file_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct BatchRowRequest {
+    pub schema_key: String,
+    pub version_id: String,
+    pub entity_ids: Vec<String>,
+    pub file_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct ScanRequest {
+    pub schema_key: String,
+    pub version_id: String,
+    #[serde(default)]
+    pub constraints: Vec<ScanConstraint>,
+    #[serde(default)]
+    pub required_columns: Vec<String>,
+}
+
+pub(crate) fn exact_row_constraints(request: &ExactRowRequest) -> Vec<ScanConstraint> {
+    let mut constraints = vec![ScanConstraint {
+        field: ScanField::EntityId,
+        operator: ScanOperator::Eq(Value::Text(request.entity_id.clone())),
+    }];
+    if let Some(file_id) = &request.file_id {
+        constraints.push(ScanConstraint {
+            field: ScanField::FileId,
+            operator: ScanOperator::Eq(Value::Text(file_id.clone())),
+        });
+    }
+    constraints
+}
+
+pub(crate) fn batch_row_constraints(request: &BatchRowRequest) -> Vec<ScanConstraint> {
+    let mut constraints = vec![ScanConstraint {
+        field: ScanField::EntityId,
+        operator: ScanOperator::In(
+            request
+                .entity_ids
+                .iter()
+                .cloned()
+                .map(Value::Text)
+                .collect(),
+        ),
+    }];
+    if let Some(file_id) = &request.file_id {
+        constraints.push(ScanConstraint {
+            field: ScanField::FileId,
+            operator: ScanOperator::Eq(Value::Text(file_id.clone())),
+        });
+    }
+    constraints
+}
+
+pub(crate) fn entity_id_in_constraint<I>(entity_ids: I) -> ScanConstraint
+where
+    I: IntoIterator<Item = String>,
+{
+    ScanConstraint {
+        field: ScanField::EntityId,
+        operator: ScanOperator::In(entity_ids.into_iter().map(Value::Text).collect()),
+    }
+}
+
+/// Logical live-state row key shared across tracked and untracked lanes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RowIdentity {
+    pub schema_key: String,
+    pub version_id: String,
+    pub entity_id: String,
+    pub file_id: String,
+}
+
+impl RowIdentity {
+    pub fn from_tracked_write(row: &TrackedWriteRow) -> Self {
+        Self {
+            schema_key: row.schema_key.clone(),
+            version_id: row.version_id.clone(),
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+        }
+    }
+
+    pub fn from_untracked_write(row: &UntrackedWriteRow) -> Self {
+        Self {
+            schema_key: row.schema_key.clone(),
+            version_id: row.version_id.clone(),
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+        }
+    }
+
+    pub fn from_tracked_row(row: &TrackedRow) -> Self {
+        Self {
+            schema_key: row.schema_key.clone(),
+            version_id: row.version_id.clone(),
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+        }
+    }
+
+    pub fn from_untracked_row(row: &UntrackedRow) -> Self {
+        Self {
+            schema_key: row.schema_key.clone(),
+            version_id: row.version_id.clone(),
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+        }
+    }
+
+    pub fn from_tombstone(row: &TrackedTombstoneMarker) -> Self {
+        Self {
+            schema_key: row.schema_key.clone(),
+            version_id: row.version_id.clone(),
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+        }
+    }
+
+    pub fn matches_exact(&self, request: &ExactRowRequest) -> bool {
+        self.schema_key == request.schema_key
+            && self.version_id == request.version_id
+            && self.entity_id == request.entity_id
+            && request
+                .file_id
+                .as_ref()
+                .is_none_or(|file_id| self.file_id == *file_id)
+    }
+
+    pub fn matches_batch(&self, request: &BatchRowRequest) -> bool {
+        self.schema_key == request.schema_key
+            && self.version_id == request.version_id
+            && request.entity_ids.contains(&self.entity_id)
+            && request
+                .file_id
+                .as_ref()
+                .is_none_or(|file_id| self.file_id == *file_id)
+    }
+
+    pub fn matches_scan_partition(&self, request: &ScanRequest) -> bool {
+        self.schema_key == request.schema_key && self.version_id == request.version_id
+    }
+}
+
+/// Decoded tracked live row.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TrackedRow {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub global: bool,
+    pub plugin_key: String,
+    pub metadata: Option<String>,
+    pub change_id: Option<String>,
+    pub writer_key: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub values: BTreeMap<String, Value>,
+}
+
+impl TrackedRow {
+    pub fn property_text(&self, property_name: &str) -> Option<String> {
+        self.values
+            .get(property_name)
+            .and_then(value_as_text)
+            .map(ToString::to_string)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TrackedTombstoneMarker {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub global: bool,
+    pub schema_version: Option<String>,
+    pub plugin_key: Option<String>,
+    pub metadata: Option<String>,
+    pub writer_key: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub change_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TrackedWriteOperation {
+    Upsert,
+    Tombstone,
+}
+
+/// Single tracked live-state write operation.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TrackedWriteRow {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub global: bool,
+    pub plugin_key: String,
+    pub metadata: Option<String>,
+    pub change_id: String,
+    pub writer_key: Option<String>,
+    pub snapshot_content: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: String,
+    pub operation: TrackedWriteOperation,
+}
+
+pub type TrackedWriteBatch = Vec<TrackedWriteRow>;
+
+/// Decoded untracked/helper live row.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UntrackedRow {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub global: bool,
+    pub plugin_key: String,
+    pub metadata: Option<String>,
+    pub writer_key: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub values: BTreeMap<String, Value>,
+}
+
+impl UntrackedRow {
+    pub fn property_text(&self, property_name: &str) -> Option<String> {
+        self.values
+            .get(property_name)
+            .and_then(value_as_text)
+            .map(ToString::to_string)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UntrackedWriteOperation {
+    Upsert,
+    Delete,
+}
+
+/// Single untracked/helper write operation.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UntrackedWriteRow {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub global: bool,
+    pub plugin_key: String,
+    pub metadata: Option<String>,
+    pub writer_key: Option<String>,
+    pub snapshot_content: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: String,
+    pub operation: UntrackedWriteOperation,
+}
+
+pub type UntrackedWriteBatch = Vec<UntrackedWriteRow>;
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum OverlayLane {
+    LocalUntracked,
+    LocalTracked,
+    GlobalUntracked,
+    GlobalTracked,
+}
+
+impl OverlayLane {
+    pub fn is_global(self) -> bool {
+        matches!(self, Self::GlobalTracked | Self::GlobalUntracked)
+    }
+
+    pub fn is_untracked(self) -> bool {
+        matches!(self, Self::LocalUntracked | Self::GlobalUntracked)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum LaneResult<T> {
+    Found(T),
+    Missing,
+    Tombstone,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EffectiveRowRequest {
+    pub schema_key: String,
+    pub version_id: String,
+    pub entity_id: String,
+    pub file_id: Option<String>,
+    pub include_global: bool,
+    pub include_untracked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct EffectiveRowsRequest {
+    pub schema_key: String,
+    pub version_id: String,
+    #[serde(default)]
+    pub constraints: Vec<ScanConstraint>,
+    #[serde(default)]
+    pub required_columns: Vec<String>,
+    pub include_global: bool,
+    pub include_untracked: bool,
+    pub include_tombstones: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct EffectiveRowIdentity {
+    pub entity_id: String,
+    pub file_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EffectiveRowState {
+    Visible,
+    Tombstone,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EffectiveRow {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: Option<String>,
+    pub file_id: String,
+    pub version_id: String,
+    pub source_version_id: String,
+    pub global: bool,
+    pub untracked: bool,
+    pub plugin_key: Option<String>,
+    pub metadata: Option<String>,
+    pub writer_key: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub source_change_id: Option<String>,
+    pub overlay_lane: OverlayLane,
+    pub state: EffectiveRowState,
+    pub values: BTreeMap<String, Value>,
+}
+
+impl EffectiveRow {
+    pub fn identity(&self) -> EffectiveRowIdentity {
+        EffectiveRowIdentity {
+            entity_id: self.entity_id.clone(),
+            file_id: self.file_id.clone(),
+        }
+    }
+
+    pub fn is_tombstone(&self) -> bool {
+        matches!(self.state, EffectiveRowState::Tombstone)
+    }
+
+    pub fn property_text(&self, property_name: &str) -> Option<String> {
+        self.values
+            .get(property_name)
+            .and_then(value_as_text)
+            .map(ToString::to_string)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct EffectiveRowSet {
+    pub rows: Vec<EffectiveRow>,
+}
+
+pub(crate) fn values_from_snapshot_content(
+    snapshot_content: Option<&str>,
+) -> Result<BTreeMap<String, Value>, LixError> {
+    let Some(snapshot_content) = snapshot_content else {
+        return Ok(BTreeMap::new());
+    };
+
+    let parsed = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            &format!("failed to decode transaction snapshot content: {error}"),
+        )
+    })?;
+
+    let JsonValue::Object(object) = parsed else {
+        return Ok(BTreeMap::new());
+    };
+
+    Ok(object
+        .into_iter()
+        .map(|(key, value)| (key, value_from_json(value)))
+        .collect())
+}
+
+fn value_from_json(value: JsonValue) -> Value {
+    match value {
+        JsonValue::Null => Value::Null,
+        JsonValue::Bool(value) => Value::Boolean(value),
+        JsonValue::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Value::Integer(value)
+            } else if let Some(value) = value.as_f64() {
+                Value::Real(value)
+            } else {
+                Value::Null
+            }
+        }
+        JsonValue::String(value) => Value::Text(value),
+        JsonValue::Array(value) => Value::Json(JsonValue::Array(value)),
+        JsonValue::Object(value) => Value::Json(JsonValue::Object(value)),
+    }
+}
+
+fn value_as_text(value: &Value) -> Option<&str> {
+    match value {
+        Value::Text(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+pub(crate) fn matches_constraints(
+    entity_id: &str,
+    file_id: &str,
+    plugin_key: &str,
+    schema_version: &str,
+    constraints: &[ScanConstraint],
+) -> bool {
+    constraints.iter().all(|constraint| {
+        let candidate = match constraint.field {
+            ScanField::EntityId => entity_id,
+            ScanField::FileId => file_id,
+            ScanField::PluginKey => plugin_key,
+            ScanField::SchemaVersion => schema_version,
+        };
+        matches_constraint(candidate, &constraint.operator)
+    })
+}
+
+fn matches_constraint(candidate: &str, operator: &ScanOperator) -> bool {
+    match operator {
+        ScanOperator::Eq(value) => value_as_text(value).is_some_and(|value| value == candidate),
+        ScanOperator::In(values) => values
+            .iter()
+            .filter_map(value_as_text)
+            .any(|value| value == candidate),
+        ScanOperator::Range { lower, upper } => {
+            lower
+                .as_ref()
+                .is_none_or(|bound| compare_lower(candidate, &bound.value, bound.inclusive))
+                && upper
+                    .as_ref()
+                    .is_none_or(|bound| compare_upper(candidate, &bound.value, bound.inclusive))
+        }
+    }
+}
+
+fn compare_lower(candidate: &str, bound: &Value, inclusive: bool) -> bool {
+    value_as_text(bound).is_some_and(|value| {
+        if inclusive {
+            candidate >= value
+        } else {
+            candidate > value
+        }
+    })
+}
+
+fn compare_upper(candidate: &str, bound: &Value, inclusive: bool) -> bool {
+    value_as_text(bound).is_some_and(|value| {
+        if inclusive {
+            candidate <= value
+        } else {
+            candidate < value
+        }
+    })
 }

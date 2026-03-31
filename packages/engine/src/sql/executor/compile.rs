@@ -1,5 +1,6 @@
 use crate::contracts::traits::PendingView;
 use crate::functions::SharedFunctionProvider;
+use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::RuntimeHost;
 use crate::sql::explain::{
     build_internal_explain_artifacts, unsupported_explain_analyze_error, unwrap_explain_statement,
@@ -34,7 +35,6 @@ use super::public_runtime::{
     try_prepare_public_write_with_functions, try_prepare_public_write_with_registry_and_functions,
     PreparedPublicExecution, PreparedPublicWrite,
 };
-use super::runtime_state::ExecutionRuntimeState;
 use crate::sql::logical_plan::{result_contract_for_statements, ResultContract};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";

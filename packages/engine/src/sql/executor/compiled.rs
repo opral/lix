@@ -2,6 +2,7 @@ use crate::backend::prepared::PreparedStatement;
 use crate::contracts::artifacts::{
     coalesce_live_table_requirements, SchemaRegistration, SchemaRegistrationSet,
 };
+use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::sql::explain::ExplainArtifacts;
 use crate::sql::logical_plan::ResultContract;
 use crate::sql::physical_plan::PhysicalPlan;
@@ -11,7 +12,6 @@ use super::contracts::planned_statement::{
     MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
 use super::public_runtime::{PreparedPublicRead, PreparedPublicWrite};
-use super::runtime_state::ExecutionRuntimeState;
 
 #[derive(Clone)]
 pub(crate) struct CompiledInternalExecution {

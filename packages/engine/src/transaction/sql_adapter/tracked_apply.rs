@@ -8,7 +8,10 @@ use crate::commit::{
     CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
     PendingPublicCommitSession,
 };
-use crate::contracts::artifacts::{PlanEffects, WriteLane};
+use crate::contracts::artifacts::{
+    CommitPreconditions, DomainChangeBatch, ExpectedHead, PlanEffects, PublicDomainChange,
+    WriteLane,
+};
 use crate::engine::Engine;
 use crate::functions::LixFunctionProvider;
 use crate::runtime::{SchemaCache, TransactionBackendAdapter};
@@ -16,7 +19,6 @@ use crate::sql::executor::{
     semantic_plan_effects_from_domain_changes, state_commit_stream_operation, PreparedPublicWrite,
     TrackedTxnUnit,
 };
-use crate::sql::semantic_ir::semantics::domain_changes::DomainChangeBatch;
 use crate::sql::semantic_ir::validation::validate_commit_time_write;
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
@@ -246,7 +248,7 @@ fn canonical_create_commit_preconditions_for_tracked_unit(
 }
 
 fn canonical_create_commit_preconditions_from_public_write(
-    commit_preconditions: &crate::sql::logical_plan::public_ir::CommitPreconditions,
+    commit_preconditions: &CommitPreconditions,
     batch: Option<&DomainChangeBatch>,
     public_write: &PreparedPublicWrite,
 ) -> Result<CreateCommitPreconditions, LixError> {
@@ -279,26 +281,22 @@ fn canonical_create_commit_preconditions_from_public_write(
         crate::contracts::artifacts::WriteLane::GlobalAdmin => CreateCommitWriteLane::GlobalAdmin,
     };
     let expected_head = match &commit_preconditions.expected_head {
-        crate::sql::logical_plan::public_ir::ExpectedHead::CurrentHead => {
-            CreateCommitExpectedHead::CurrentHead
-        }
+        ExpectedHead::CurrentHead => CreateCommitExpectedHead::CurrentHead,
     };
 
     Ok(CreateCommitPreconditions {
         write_lane,
         expected_head,
         idempotency_key: match &commit_preconditions.expected_head {
-            crate::sql::logical_plan::public_ir::ExpectedHead::CurrentHead => {
-                CreateCommitIdempotencyKey::CurrentHeadFingerprint(
-                    commit_preconditions.idempotency_key.0.clone(),
-                )
-            }
+            ExpectedHead::CurrentHead => CreateCommitIdempotencyKey::CurrentHeadFingerprint(
+                commit_preconditions.idempotency_key.0.clone(),
+            ),
         },
     })
 }
 
 fn public_domain_changes_to_proposed(
-    changes: &[crate::sql::semantic_ir::semantics::domain_changes::PublicDomainChange],
+    changes: &[PublicDomainChange],
 ) -> Result<Vec<ProposedDomainChange>, LixError> {
     changes
         .iter()
@@ -307,7 +305,7 @@ fn public_domain_changes_to_proposed(
 }
 
 fn public_domain_change_to_proposed(
-    change: &crate::sql::semantic_ir::semantics::domain_changes::PublicDomainChange,
+    change: &PublicDomainChange,
 ) -> Result<ProposedDomainChange, LixError> {
     Ok(ProposedDomainChange {
         entity_id: crate::EntityId::new(change.entity_id.clone())?,
@@ -332,21 +330,19 @@ fn public_domain_change_to_proposed(
 
 fn public_domain_changes_from_proposed(
     changes: &[ProposedDomainChange],
-) -> Vec<crate::sql::semantic_ir::semantics::domain_changes::PublicDomainChange> {
+) -> Vec<PublicDomainChange> {
     changes
         .iter()
-        .map(
-            |change| crate::sql::semantic_ir::semantics::domain_changes::PublicDomainChange {
-                entity_id: change.entity_id.to_string(),
-                schema_key: change.schema_key.to_string(),
-                schema_version: change.schema_version.as_ref().map(ToString::to_string),
-                file_id: change.file_id.as_ref().map(ToString::to_string),
-                plugin_key: change.plugin_key.as_ref().map(ToString::to_string),
-                snapshot_content: change.snapshot_content.clone(),
-                metadata: change.metadata.clone(),
-                version_id: change.version_id.to_string(),
-                writer_key: change.writer_key.clone(),
-            },
-        )
+        .map(|change| PublicDomainChange {
+            entity_id: change.entity_id.to_string(),
+            schema_key: change.schema_key.to_string(),
+            schema_version: change.schema_version.as_ref().map(ToString::to_string),
+            file_id: change.file_id.as_ref().map(ToString::to_string),
+            plugin_key: change.plugin_key.as_ref().map(ToString::to_string),
+            snapshot_content: change.snapshot_content.clone(),
+            metadata: change.metadata.clone(),
+            version_id: change.version_id.to_string(),
+            writer_key: change.writer_key.clone(),
+        })
         .collect()
 }

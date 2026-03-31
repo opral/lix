@@ -3,9 +3,10 @@ use std::ops::ControlFlow;
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::functions::SharedFunctionProvider;
 use crate::runtime::RuntimeHost;
-use crate::sql::ast::walk::object_name_matches;
 use crate::{LixBackend, LixBackendTransaction, LixError};
-use sqlparser::ast::{Expr, Function, FunctionArguments, Statement, Visit, Visitor};
+use sqlparser::ast::{
+    Expr, Function, FunctionArguments, ObjectName, ObjectNamePart, Statement, Visit, Visitor,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ExecutionRuntimeEffects {
@@ -109,6 +110,14 @@ fn deterministic_sequence_function(function: &Function) -> bool {
     function_args_empty(function)
         && (object_name_matches(&function.name, "lix_uuid_v7")
             || object_name_matches(&function.name, "lix_timestamp"))
+}
+
+fn object_name_matches(name: &ObjectName, target: &str) -> bool {
+    name.0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .map(|ident| ident.value.eq_ignore_ascii_case(target))
+        .unwrap_or(false)
 }
 
 fn function_args_empty(function: &Function) -> bool {

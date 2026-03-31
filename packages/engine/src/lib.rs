@@ -40,8 +40,8 @@ mod undo_redo;
 mod version;
 mod wasm_runtime;
 pub mod wire;
-mod write_runtime;
 pub(crate) mod workspace;
+mod write_runtime;
 
 pub use schema::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,
