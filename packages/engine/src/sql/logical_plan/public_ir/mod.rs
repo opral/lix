@@ -1,4 +1,6 @@
-use crate::sql::catalog::{DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, SurfaceVariant};
+use crate::contracts::surface::{
+    DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, SurfaceVariant,
+};
 use crate::sql::semantic_ir::ExecutionContext;
 use crate::Value;
 use sqlparser::ast::{
@@ -8,6 +10,10 @@ use sqlparser::ast::{
     TableFactor, TableWithJoins, UnaryOperator, ValueWithSpan, With,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+pub(crate) use crate::contracts::artifacts::{
+    OptionalTextPatch, PlannedStateRow, WriteLane, WriteMode,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VersionScope {
@@ -724,12 +730,6 @@ pub(crate) enum WriteOperationKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WriteMode {
-    Tracked,
-    Untracked,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteModeRequest {
     Auto,
     ForceTracked,
@@ -855,13 +855,6 @@ pub(crate) enum TargetSetProof {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WriteLane {
-    ActiveVersion,
-    SingleVersion(String),
-    GlobalAdmin,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpectedHead {
     CurrentHead,
 }
@@ -885,32 +878,11 @@ pub(crate) struct ResolvedRowRef {
     pub(crate) source_commit_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PlannedStateRow {
-    pub(crate) entity_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) version_id: Option<String>,
-    pub(crate) values: BTreeMap<String, Value>,
-    pub(crate) writer_key: Option<String>,
-    pub(crate) tombstone: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RowLineage {
     pub(crate) entity_id: String,
     pub(crate) source_change_id: Option<String>,
     pub(crate) source_commit_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum OptionalTextPatch {
-    Unchanged,
-}
-
-impl OptionalTextPatch {
-    pub(crate) fn apply(&self, current: Option<String>) -> Option<String> {
-        current
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1027,7 +999,7 @@ mod tests {
         CanonicalStateScan, EntityProjectionSpec, PlannedFilesystemFile, PlannedFilesystemState,
         VersionScope,
     };
-    use crate::sql::catalog::{DynamicEntitySurfaceSpec, SurfaceRegistry};
+    use crate::contracts::surface::{DynamicEntitySurfaceSpec, SurfaceRegistry};
     use std::collections::BTreeMap;
 
     #[test]

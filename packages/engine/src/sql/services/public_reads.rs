@@ -1,12 +1,12 @@
+use crate::contracts::surface::SurfaceRegistry;
+use crate::contracts::traits::PendingView;
 use crate::live_state::{
     bootstrap_public_surface_registry_with_pending_transaction_view,
     execute_prepared_public_read_with_pending_transaction_view,
 };
-use crate::sql::catalog::SurfaceRegistry;
 use crate::sql::executor::{
     execute_prepared_public_read, try_prepare_public_read_with_registry_and_internal_access,
 };
-use crate::transaction::PendingTransactionView;
 use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::{Query, Statement};
 
@@ -16,7 +16,7 @@ pub(crate) async fn execute_public_query_with_optional_pending_transaction_view(
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
 ) -> Result<QueryResult, LixError> {
     let registry = match pending_transaction_view {
         Some(pending_transaction_view) => {

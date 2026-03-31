@@ -1,3 +1,4 @@
+use crate::contracts::artifacts::ResultContract;
 use crate::engine::{
     normalize_sql_execution_error_with_backend, Engine, TransactionBackendAdapter,
 };
@@ -12,7 +13,6 @@ use crate::sql::executor::{
     compile_execution_from_template_instance_with_backend, execute_prepared_public_read,
     CompiledExecution, PreparationPolicy,
 };
-use crate::sql::logical_plan::ResultContract;
 use crate::{
     ExecuteResult, LixBackend, LixBackendTransaction, LixError, QueryResult, TransactionMode,
 };

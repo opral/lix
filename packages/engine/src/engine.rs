@@ -1,8 +1,9 @@
 use crate::cel::CelEvaluator;
+use crate::contracts::artifacts::{FilesystemPayloadDomainChange, MutationRow};
+use crate::contracts::surface::SurfaceRegistry;
 use crate::deterministic_mode::{deterministic_mode_key, DeterministicSettings};
 use crate::key_value::key_value_schema_key;
 use crate::plugin::types::InstalledPlugin;
-use crate::sql::catalog::SurfaceRegistry;
 use crate::sql::semantic_ir::validation::SchemaCache;
 use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
@@ -17,9 +18,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
-
-use crate::sql::executor::contracts::effects::FilesystemPayloadDomainChange;
-use crate::sql::executor::contracts::planned_statement::MutationRow;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
@@ -325,7 +323,7 @@ fn object_name_is_protected_lix_ddl_target(name: &sqlparser::ast::ObjectName) ->
     };
 
     relation.starts_with("lix_internal_")
-        || crate::sql::catalog::builtin_public_surface_names()
+        || crate::contracts::surface::builtin_public_surface_names()
             .iter()
             .any(|surface| surface.eq_ignore_ascii_case(&relation))
 }

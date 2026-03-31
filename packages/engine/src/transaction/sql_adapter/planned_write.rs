@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage};
 use crate::live_state::{
     coalesce_live_table_requirements, RowIdentity, SchemaRegistration, SchemaRegistrationSet,
 };
@@ -288,12 +289,6 @@ impl PendingRegisteredSchemaOverlay {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum PendingSemanticStorage {
-    Tracked,
-    Untracked,
-}
-
 #[derive(Clone, Default)]
 pub(crate) struct PendingSemanticOverlay {
     rows: BTreeMap<PendingSemanticRowIdentity, PendingSemanticRow>,
@@ -308,20 +303,6 @@ struct PendingSemanticRowIdentity {
     version_id: String,
     plugin_key: String,
     schema_version: String,
-}
-
-#[derive(Clone)]
-pub(crate) struct PendingSemanticRow {
-    pub(crate) storage: PendingSemanticStorage,
-    pub(crate) entity_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) schema_version: String,
-    pub(crate) file_id: String,
-    pub(crate) version_id: String,
-    pub(crate) plugin_key: String,
-    pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<String>,
-    pub(crate) tombstone: bool,
 }
 
 #[derive(Clone, Default)]

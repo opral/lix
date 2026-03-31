@@ -1,5 +1,9 @@
 //! Executor-owned implementation of the public SQL runtime surface.
 
+use crate::contracts::surface::{
+    SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry, SurfaceVariant,
+};
+use crate::contracts::traits::PendingView;
 use crate::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
 };
@@ -16,9 +20,6 @@ use crate::session::contracts::SessionStateDelta;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::backend::PushdownDecision;
 use crate::sql::binder::{bind_statement, RuntimeBindingValues};
-use crate::sql::catalog::{
-    SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry, SurfaceVariant,
-};
 use crate::sql::executor::contracts::effects::PlanEffects;
 use crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::sql::executor::intent::authoritative_binary_blob_write_targets;
@@ -53,7 +54,6 @@ use crate::state::stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
 };
-use crate::transaction::PendingTransactionView;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot, GLOBAL_VERSION_ID,
@@ -170,7 +170,7 @@ pub(crate) enum PublicExecutionRoute {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BoundPublicReadSummary {
-    bound_surface_bindings: Vec<crate::sql::catalog::SurfaceBinding>,
+    bound_surface_bindings: Vec<crate::contracts::surface::SurfaceBinding>,
     internal_relations: Vec<String>,
     external_relations: Vec<String>,
     requested_history_root_commit_ids: Vec<String>,
@@ -213,7 +213,7 @@ pub(crate) async fn prepare_public_execution_with_registry_and_internal_access_a
     active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     parse_duration: Option<Duration>,
     functions: SharedFunctionProvider<P>,
 ) -> Result<Option<PreparedPublicExecution>, LixError>
@@ -613,7 +613,7 @@ fn merge_surface_read_freshness(
 }
 
 fn bound_surface_freshness_contract(
-    bindings: &[crate::sql::catalog::SurfaceBinding],
+    bindings: &[crate::contracts::surface::SurfaceBinding],
 ) -> Option<SurfaceReadFreshness> {
     let mut bindings = bindings.iter();
     let first = bindings.next()?;
@@ -1150,7 +1150,7 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions<P>(
     active_version_id: &str,
     active_account_ids: &[String],
     writer_key: Option<&str>,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     parse_duration: Option<Duration>,
     functions: SharedFunctionProvider<P>,
 ) -> Result<Option<PreparedPublicWrite>, LixError>
@@ -1672,7 +1672,7 @@ fn public_write_preparation_error(
 }
 
 fn public_write_preparation_error_for_surface(
-    surface_binding: &crate::sql::catalog::SurfaceBinding,
+    surface_binding: &crate::contracts::surface::SurfaceBinding,
     operation_kind: WriteOperationKind,
     message: &str,
 ) -> Option<LixError> {
@@ -1895,13 +1895,13 @@ mod tests {
         prepare_public_execution, prepare_public_read, prepare_public_read_strict,
         PreparedPublicExecution, PreparedPublicReadExecution,
     };
+    use crate::contracts::surface::{SurfaceReadFreshness, SurfaceRegistry};
     use crate::read::models::StateHistoryRootScope;
     use crate::sql::routing::delay_broad_routing_for_test;
     use crate::sql::{
         binder::{
             bind_public_read_statement, delay_broad_binding_for_test, forbid_broad_binding_for_test,
         },
-        catalog::{SurfaceReadFreshness, SurfaceRegistry},
         explain::ExplainTimingCollector,
         logical_plan::{DependencyPrecision, DirectPublicReadPlan},
         semantic_ir::ExecutionContext,

@@ -4,13 +4,13 @@
 //! SQL planning so the surrounding semantic/logical stages can stay focused on
 //! SQL-owned data.
 
-use crate::sql::catalog::{SurfaceFamily, SurfaceVariant};
+use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
+use crate::contracts::traits::PendingView;
 use crate::sql::logical_plan::public_ir::StructuredPublicRead;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     resolve_exact_effective_state_row_with_pending_transaction_view, ExactEffectiveStateRow,
     ExactEffectiveStateRowRequest,
 };
-use crate::transaction::PendingTransactionView;
 use crate::{LixBackend, LixError};
 use sqlparser::ast::{BinaryOperator, Expr, Ident, Value as SqlValue};
 use std::collections::{BTreeMap, BTreeSet};
@@ -77,7 +77,7 @@ pub(crate) async fn hydrate_structured_public_read(
 
 pub(crate) struct PublicWriteHydrator<'a> {
     backend: &'a dyn LixBackend,
-    pending_transaction_view: Option<&'a PendingTransactionView>,
+    pending_transaction_view: Option<&'a dyn PendingView>,
     version_admin_rows: BTreeMap<String, Option<HydratedVersionAdminRow>>,
     validated_version_targets: BTreeSet<String>,
 }
@@ -85,7 +85,7 @@ pub(crate) struct PublicWriteHydrator<'a> {
 impl<'a> PublicWriteHydrator<'a> {
     pub(crate) fn new(
         backend: &'a dyn LixBackend,
-        pending_transaction_view: Option<&'a PendingTransactionView>,
+        pending_transaction_view: Option<&'a dyn PendingView>,
     ) -> Self {
         Self {
             backend,
@@ -99,7 +99,7 @@ impl<'a> PublicWriteHydrator<'a> {
         self.backend
     }
 
-    pub(crate) fn pending_transaction_view(&self) -> Option<&'a PendingTransactionView> {
+    pub(crate) fn pending_transaction_view(&self) -> Option<&'a dyn PendingView> {
         self.pending_transaction_view
     }
 

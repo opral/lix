@@ -24,7 +24,6 @@ pub(crate) mod analysis;
 pub(crate) mod ast;
 pub(crate) mod backend;
 pub(crate) mod binder;
-pub(crate) mod catalog;
 pub(crate) mod common;
 pub(crate) mod executor;
 pub(crate) mod explain;

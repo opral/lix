@@ -1,3 +1,7 @@
+use crate::contracts::surface::{
+    SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
+    SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
+};
 use crate::errors::sql_unknown_column_error;
 use crate::filesystem::live_projection::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
@@ -6,10 +10,6 @@ use crate::live_state::{
     build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
 };
 use crate::sql::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
-use crate::sql::catalog::{
-    SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
-    SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
-};
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan,
     CanonicalStateScan, CanonicalWorkingChangesScan, FilesystemKind, ReadPlan,
@@ -1470,11 +1470,11 @@ mod tests {
         lower_broad_public_read_for_execution_with_layouts, lower_read_for_execution_with_layouts,
         LoweredReadProgram,
     };
+    use crate::contracts::surface::SurfaceRegistry;
     use crate::sql::binder::{
         bind_broad_public_read_statement_with_registry, bind_statement,
         forbid_broad_binding_for_test,
     };
-    use crate::sql::catalog::SurfaceRegistry;
     use crate::sql::logical_plan::public_ir::{
         BroadPublicReadDistinct, BroadPublicReadGroupBy, BroadPublicReadJoin,
         BroadPublicReadLimitClause, BroadPublicReadOrderBy, BroadPublicReadQuery,
@@ -2020,27 +2020,31 @@ mod tests {
     #[test]
     fn lowers_dynamic_entity_reads_with_scalar_override_predicates() {
         let mut registry = SurfaceRegistry::with_builtin_surfaces();
-        registry.register_dynamic_entity_surfaces(crate::sql::catalog::DynamicEntitySurfaceSpec {
-            schema_key: "message".to_string(),
-            visible_columns: vec!["body".to_string(), "id".to_string()],
-            column_types: BTreeMap::new(),
-            predicate_overrides: vec![
-                crate::sql::catalog::SurfaceOverridePredicate {
-                    column: "file_id".to_string(),
-                    value: crate::sql::catalog::SurfaceOverrideValue::String("inlang".to_string()),
-                },
-                crate::sql::catalog::SurfaceOverridePredicate {
-                    column: "plugin_key".to_string(),
-                    value: crate::sql::catalog::SurfaceOverrideValue::String(
-                        "inlang_sdk".to_string(),
-                    ),
-                },
-                crate::sql::catalog::SurfaceOverridePredicate {
-                    column: "global".to_string(),
-                    value: crate::sql::catalog::SurfaceOverrideValue::Boolean(true),
-                },
-            ],
-        });
+        registry.register_dynamic_entity_surfaces(
+            crate::contracts::surface::DynamicEntitySurfaceSpec {
+                schema_key: "message".to_string(),
+                visible_columns: vec!["body".to_string(), "id".to_string()],
+                column_types: BTreeMap::new(),
+                predicate_overrides: vec![
+                    crate::contracts::surface::SurfaceOverridePredicate {
+                        column: "file_id".to_string(),
+                        value: crate::contracts::surface::SurfaceOverrideValue::String(
+                            "inlang".to_string(),
+                        ),
+                    },
+                    crate::contracts::surface::SurfaceOverridePredicate {
+                        column: "plugin_key".to_string(),
+                        value: crate::contracts::surface::SurfaceOverrideValue::String(
+                            "inlang_sdk".to_string(),
+                        ),
+                    },
+                    crate::contracts::surface::SurfaceOverridePredicate {
+                        column: "global".to_string(),
+                        value: crate::contracts::surface::SurfaceOverrideValue::Boolean(true),
+                    },
+                ],
+            },
+        );
 
         let mut known_live_layouts = BTreeMap::new();
         known_live_layouts.insert(

@@ -1,8 +1,9 @@
+use crate::contracts::surface::SurfaceFamily;
+use crate::contracts::traits::PendingView;
 use crate::filesystem::queries::FilesystemQueryError;
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::sql::catalog::SurfaceFamily;
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateSelector, MutationPayload, PlannedFilesystemDescriptor, PlannedFilesystemFile,
     PlannedFilesystemState, PlannedRowIdentity, PlannedStateRow, PlannedWrite, ResolvedRowRef,
@@ -22,7 +23,6 @@ use crate::sql::semantic_ir::semantics::surface_semantics::{
     public_selector_column_name, public_selector_version_column, OverlayLane,
 };
 use crate::sql::services::public_reads::execute_public_query_with_optional_pending_transaction_view;
-use crate::transaction::PendingTransactionView;
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content, version_ref_file_id,
@@ -201,7 +201,7 @@ impl ResolvedWritePlanBuilder {
 pub(crate) async fn resolve_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     resolve_write_plan_with_functions(
         backend,
@@ -215,7 +215,7 @@ pub(crate) async fn resolve_write_plan(
 pub(crate) async fn resolve_write_plan_with_functions<P>(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     functions: SharedFunctionProvider<P>,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
 where
@@ -898,7 +898,7 @@ fn surface_forces_global_write_scope(planned_write: &PlannedWrite) -> bool {
         .iter()
         .any(|predicate| {
             predicate.column == "global"
-                && predicate.value == crate::sql::catalog::SurfaceOverrideValue::Boolean(true)
+                && predicate.value == crate::contracts::surface::SurfaceOverrideValue::Boolean(true)
         })
 }
 
@@ -913,7 +913,7 @@ pub(super) fn resolved_version_id_for_insert_payload(
     }
 
     match planned_write.command.target.default_scope {
-        crate::sql::catalog::DefaultScopeSemantics::ActiveVersion => planned_write
+        crate::contracts::surface::DefaultScopeSemantics::ActiveVersion => planned_write
             .command
             .execution_context
             .requested_version_id
@@ -924,20 +924,22 @@ pub(super) fn resolved_version_id_for_insert_payload(
                     "public write resolver requires requested_version_id for ActiveVersion writes"
                         .to_string(),
             }),
-        crate::sql::catalog::DefaultScopeSemantics::ExplicitVersion => payload
+        crate::contracts::surface::DefaultScopeSemantics::ExplicitVersion => payload
             .get("version_id")
             .and_then(text_from_value)
             .map(Some)
             .ok_or_else(|| WriteResolveError {
                 message: "public write resolver requires a concrete version_id".to_string(),
             }),
-        crate::sql::catalog::DefaultScopeSemantics::GlobalAdmin => {
+        crate::contracts::surface::DefaultScopeSemantics::GlobalAdmin => {
             Ok(Some(GLOBAL_VERSION_ID.to_string()))
         }
-        crate::sql::catalog::DefaultScopeSemantics::History
-        | crate::sql::catalog::DefaultScopeSemantics::WorkingChanges => Err(WriteResolveError {
-            message: "public write resolver requires a bounded scope proof".to_string(),
-        }),
+        crate::contracts::surface::DefaultScopeSemantics::History
+        | crate::contracts::surface::DefaultScopeSemantics::WorkingChanges => {
+            Err(WriteResolveError {
+                message: "public write resolver requires a bounded scope proof".to_string(),
+            })
+        }
     }
 }
 
@@ -1086,7 +1088,7 @@ fn write_resolve_to_lix_error(error: WriteResolveError) -> crate::LixError {
 pub(super) async fn query_text_selector_values_for_write_selector(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     selector_column: &str,
     error_message: &str,
 ) -> Result<Vec<String>, WriteResolveError> {
@@ -1143,7 +1145,7 @@ pub(super) fn canonical_state_selector(planned_write: &PlannedWrite) -> Canonica
 pub(super) async fn execute_public_selector_query_strict(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     query: Query,
 ) -> Result<QueryResult, LixError> {
     let active_version_id = planned_write

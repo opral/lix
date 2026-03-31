@@ -1,5 +1,5 @@
 use crate::change_view::TrackedDomainChangeView;
-use crate::sql::executor::contracts::planned_statement::{MutationOperation, MutationRow};
+use crate::contracts::artifacts::{MutationOperation, MutationRow, PlannedStateRow};
 use crate::{LixError, Value};
 use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
@@ -562,7 +562,7 @@ pub(crate) fn state_commit_stream_changes_from_domain_changes<Change: TrackedDom
 }
 
 pub(crate) fn state_commit_stream_changes_from_planned_rows(
-    rows: &[crate::sql::logical_plan::public_ir::PlannedStateRow],
+    rows: &[PlannedStateRow],
     operation: StateCommitStreamOperation,
     untracked: bool,
     runtime_metadata: StateCommitStreamRuntimeMetadata,
@@ -610,20 +610,14 @@ fn state_commit_stream_writer_key(
         .or_else(|| runtime_metadata.writer_key.clone())
 }
 
-fn planned_row_required_text(
-    row: &crate::sql::logical_plan::public_ir::PlannedStateRow,
-    key: &str,
-) -> Result<String, LixError> {
+fn planned_row_required_text(row: &PlannedStateRow, key: &str) -> Result<String, LixError> {
     planned_row_optional_text(row, key).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("planned row state commit stream requires '{key}'"),
     })
 }
 
-fn planned_row_optional_text(
-    row: &crate::sql::logical_plan::public_ir::PlannedStateRow,
-    key: &str,
-) -> Option<String> {
+fn planned_row_optional_text(row: &PlannedStateRow, key: &str) -> Option<String> {
     match row.values.get(key) {
         Some(Value::Text(text)) => Some(text.clone()),
         Some(Value::Integer(number)) => Some(number.to_string()),
@@ -631,9 +625,7 @@ fn planned_row_optional_text(
     }
 }
 
-fn planned_row_snapshot_content(
-    row: &crate::sql::logical_plan::public_ir::PlannedStateRow,
-) -> Result<Option<JsonValue>, LixError> {
+fn planned_row_snapshot_content(row: &PlannedStateRow) -> Result<Option<JsonValue>, LixError> {
     match row.values.get("snapshot_content") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Json(value)) => Ok(Some(value.clone())),
@@ -669,7 +661,7 @@ mod tests {
         StateCommitStreamRuntimeMetadata,
     };
     use crate::commit::ProposedDomainChange;
-    use crate::sql::logical_plan::public_ir::PlannedStateRow;
+    use crate::contracts::artifacts::PlannedStateRow;
     use crate::Value;
     use std::collections::BTreeMap;
 

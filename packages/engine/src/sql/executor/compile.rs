@@ -1,3 +1,4 @@
+use crate::contracts::traits::PendingView;
 use crate::engine::Engine;
 use crate::functions::SharedFunctionProvider;
 use crate::sql::explain::{
@@ -8,7 +9,6 @@ use crate::sql::physical_plan::PhysicalPlan;
 use crate::sql::semantic_ir::validation::{
     validate_batch_local_write, validate_inserts, validate_updates,
 };
-use crate::transaction::PendingTransactionView;
 use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::Statement;
 use std::time::Duration;
@@ -83,14 +83,14 @@ pub(crate) fn prepared_execution_mutates_public_surface_registry(
 async fn compile_execution_with_backend(
     engine: &Engine,
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
     active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
-    public_surface_registry_override: Option<&crate::sql::catalog::SurfaceRegistry>,
+    public_surface_registry_override: Option<&crate::contracts::surface::SurfaceRegistry>,
     policy: PreparationPolicy,
     runtime_state: Option<&ExecutionRuntimeState>,
     static_artifacts: StaticCompilationArtifacts<'_>,
@@ -362,14 +362,14 @@ async fn compile_execution_with_backend(
 
 async fn prepare_public_execution_for_compile(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
     active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
-    public_surface_registry_override: Option<&crate::sql::catalog::SurfaceRegistry>,
+    public_surface_registry_override: Option<&crate::contracts::surface::SurfaceRegistry>,
     parse_duration: Option<Duration>,
     ownership_hint: Option<StatementTemplateOwnership>,
     functions: SharedFunctionProvider<crate::deterministic_mode::RuntimeFunctionProvider>,
@@ -481,13 +481,13 @@ async fn prepare_public_execution_for_compile(
 pub(crate) async fn compile_execution_from_template_instance_with_backend(
     engine: &Engine,
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&PendingTransactionView>,
+    pending_transaction_view: Option<&dyn PendingView>,
     template_instance: &BoundStatementTemplateInstance,
     active_version_id: &str,
     active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
-    public_surface_registry_override: Option<&crate::sql::catalog::SurfaceRegistry>,
+    public_surface_registry_override: Option<&crate::contracts::surface::SurfaceRegistry>,
     runtime_state: Option<&ExecutionRuntimeState>,
     policy: PreparationPolicy,
 ) -> Result<CompiledExecution, LixError> {

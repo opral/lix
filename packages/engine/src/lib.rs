@@ -9,6 +9,7 @@ mod change_view;
 pub(crate) mod checkpoint;
 pub(crate) mod commit;
 mod committed_frontier;
+pub(crate) mod contracts;
 mod deterministic_mode;
 mod engine;
 mod errors;

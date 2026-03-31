@@ -1,4 +1,4 @@
-use crate::sql::catalog::SurfaceRegistry;
+use crate::contracts::surface::SurfaceRegistry;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadAlias, BroadPublicReadCte, BroadPublicReadDistinct, BroadPublicReadGroupBy,
     BroadPublicReadGroupByKind, BroadPublicReadJoin, BroadPublicReadJoinConstraint,
@@ -1038,7 +1038,7 @@ fn table_name_terminal(name: &ObjectName) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::bind_broad_public_read_statement_with_registry;
-    use crate::sql::catalog::SurfaceRegistry;
+    use crate::contracts::surface::SurfaceRegistry;
     use crate::sql::logical_plan::public_ir::{
         BroadPublicReadDistinct, BroadPublicReadGroupByKind, BroadPublicReadLimitClauseKind,
         BroadPublicReadOrderByKind, BroadPublicReadProjectionItemKind, BroadPublicReadSetExpr,

@@ -1,9 +1,9 @@
+use crate::contracts::surface::SurfaceBinding;
 use crate::filesystem::live_projection::FilesystemProjectionScope;
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::backend::PushdownDecision;
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::binder::{compile_statement_binding_template_with_state, RuntimeBindingValues};
-use crate::sql::catalog::SurfaceBinding;
 use crate::sql::executor::contracts::effects::PlanEffects;
 use crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::sql::logical_plan::direct_reads::DirectPublicReadPlan;

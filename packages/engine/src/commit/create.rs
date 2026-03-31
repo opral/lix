@@ -12,6 +12,7 @@ use crate::canonical::read::{
     CommitQueryExecutor, ExactCommittedStateRowRequest, VersionInfo, VersionSnapshot,
 };
 use crate::canonical_json::CanonicalJson;
+use crate::contracts::artifacts::{MutationRow, OptionalTextPatch};
 use crate::deterministic_mode::{
     build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
 };
@@ -19,9 +20,8 @@ use crate::filesystem::runtime::{
     build_binary_blob_fastcdc_write_program, compile_filesystem_transaction_state_from_state,
     filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
     BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
-    FilesystemSemanticChange, FilesystemTransactionState, MutationRow, OptionalTextPatch,
-    FILESYSTEM_DESCRIPTOR_FILE_ID, FILESYSTEM_DESCRIPTOR_PLUGIN_KEY, FILESYSTEM_FILE_SCHEMA_KEY,
-    FILESYSTEM_FILE_SCHEMA_VERSION,
+    FilesystemSemanticChange, FilesystemTransactionState, FILESYSTEM_DESCRIPTOR_FILE_ID,
+    FILESYSTEM_DESCRIPTOR_PLUGIN_KEY, FILESYSTEM_FILE_SCHEMA_KEY, FILESYSTEM_FILE_SCHEMA_VERSION,
 };
 use crate::functions::LixFunctionProvider;
 use crate::refs::load_committed_version_head_commit_id;
@@ -1343,9 +1343,8 @@ mod tests {
     };
     use crate::canonical::journal::{CanonicalCommitOutput, ChangeRow};
     use crate::commit::receipt::UpdatedVersionRef;
-    use crate::filesystem::runtime::{
-        FilesystemTransactionFileState, FilesystemTransactionState, OptionalTextPatch,
-    };
+    use crate::contracts::artifacts::OptionalTextPatch;
+    use crate::filesystem::runtime::{FilesystemTransactionFileState, FilesystemTransactionState};
     use crate::functions::LixFunctionProvider;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, seed_local_version_head,

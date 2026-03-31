@@ -1,4 +1,4 @@
-use crate::sql::catalog::{
+use crate::contracts::surface::{
     builtin_public_surface_columns, builtin_public_surface_names, SurfaceRegistry,
 };
 use crate::LixBackend;

@@ -9,24 +9,22 @@ mod tracked_apply;
 mod untracked_apply;
 
 pub(crate) use crate::commit::PendingPublicCommitSession;
+pub(crate) use crate::contracts::artifacts::MutationRow;
+pub(crate) use crate::contracts::artifacts::ResultContract;
+pub(crate) use crate::contracts::artifacts::{FilesystemPayloadDomainChange, PlanEffects};
+pub(crate) use crate::contracts::artifacts::{
+    OptionalTextPatch, PlannedStateRow, WriteLane, WriteMode,
+};
 pub(crate) use crate::filesystem::runtime::{
     build_filesystem_payload_domain_changes_insert,
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
     FilesystemTransactionFileState, FilesystemTransactionState,
 };
-pub(crate) use crate::sql::executor::contracts::effects::{
-    FilesystemPayloadDomainChange, PlanEffects,
-};
-pub(crate) use crate::sql::executor::contracts::planned_statement::MutationRow;
 pub(crate) use crate::sql::executor::execution_program::ExecutionContext;
 pub(crate) use crate::sql::executor::{
     build_tracked_txn_unit, semantic_plan_effects_from_domain_changes,
     state_commit_stream_operation, PreparedPublicWrite, TrackedTxnUnit,
 };
-pub(crate) use crate::sql::logical_plan::public_ir::{
-    OptionalTextPatch, PlannedStateRow, WriteLane, WriteMode,
-};
-pub(crate) use crate::sql::logical_plan::ResultContract;
 pub(crate) use crate::sql::physical_plan::{
     PublicWriteExecutionPartition, UntrackedWriteExecution,
 };
@@ -42,9 +40,8 @@ pub(crate) use execute::{
 };
 pub(crate) use planned_write::{
     BufferedWriteJournal, PendingFilesystemOverlay, PendingRegisteredSchemaOverlay,
-    PendingSemanticOverlay, PendingSemanticRow, PendingSemanticStorage,
-    PendingWorkspaceWriterKeyOverlay, PlannedInternalWriteUnit, PlannedPublicUntrackedWriteUnit,
-    PlannedWriteDelta, PlannedWriteUnit,
+    PendingSemanticOverlay, PendingWorkspaceWriterKeyOverlay, PlannedInternalWriteUnit,
+    PlannedPublicUntrackedWriteUnit, PlannedWriteDelta, PlannedWriteUnit,
 };
 pub(crate) use planned_write_runner::execute_planned_write_delta;
 pub(crate) use runtime::{

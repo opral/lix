@@ -1,3 +1,4 @@
+use crate::contracts::traits::PendingView;
 use crate::engine::{
     normalize_sql_execution_error_with_backend, Engine, TransactionBackendAdapter,
 };
@@ -44,7 +45,7 @@ pub(super) async fn compile_sql_buffered_write_command(
     let compiled_execution = match compile_execution_from_template_instance_with_backend(
         engine,
         &backend,
-        pending_transaction_view,
+        pending_transaction_view.map(|view| view as &dyn PendingView),
         bound_statement_template,
         context.active_version_id.as_str(),
         &context.active_account_ids,
