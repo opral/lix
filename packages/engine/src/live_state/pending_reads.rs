@@ -1,5 +1,11 @@
 use std::collections::BTreeMap;
 
+use crate::contracts::read::{
+    decode_public_read_result, execute_prepared_public_read,
+    execute_prepared_public_read_in_transaction,
+    execute_prepared_public_read_without_freshness_check, resolve_placeholder_index,
+    PlaceholderState, PreparedPublicRead,
+};
 use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
 use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
@@ -8,12 +14,6 @@ use crate::live_state::shared::identity::RowIdentity;
 use crate::read::contracts::{
     committed_read_mode_from_prepared_public_read, CommittedReadMode, PublicReadExecutionMode,
 };
-use crate::sql::executor::{
-    decode_public_read_result, execute_prepared_public_read,
-    execute_prepared_public_read_in_transaction,
-    execute_prepared_public_read_without_freshness_check, PreparedPublicRead,
-};
-use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
@@ -395,7 +395,7 @@ pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view_i
     let execution_mode = public_read_execution_mode(public_read);
     match (pending_transaction_view, execution_mode) {
         (Some(pending_transaction_view), PublicReadExecutionMode::PendingView) => {
-            let backend = crate::engine::TransactionBackendAdapter::new(transaction);
+            let backend = crate::runtime::TransactionBackendAdapter::new(transaction);
             TransactionReadModel::new(&backend, Some(pending_transaction_view))
                 .execute_prepared_public_read(public_read)
                 .await

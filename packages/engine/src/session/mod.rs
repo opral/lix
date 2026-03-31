@@ -16,10 +16,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use futures_util::FutureExt;
 use sqlparser::ast::Statement;
 
+use crate::contracts::session::ExecuteOptions;
 use crate::contracts::surface::SurfaceRegistry;
-use crate::engine::{
-    reject_internal_table_writes, reject_public_create_table, Engine, ExecuteOptions,
-};
+use crate::engine::{reject_internal_table_writes, reject_public_create_table, Engine};
 use crate::errors;
 use crate::read::runtime::{
     execute_execution_program_in_committed_read_transaction, prepare_committed_read_program,
@@ -386,6 +385,7 @@ impl Session {
             | SessionExecutionMode::CommittedRuntimeMutation => {
                 let prepared_committed_read = prepare_committed_read_program(
                     self.engine.as_ref(),
+                    self.engine.backend.as_ref(),
                     &program,
                     allow_internal_sql,
                     &context,

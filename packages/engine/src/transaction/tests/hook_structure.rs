@@ -12,8 +12,12 @@ fn read_engine_source(relative: &str) -> String {
 fn sql_execution_uses_transaction_module_for_write_orchestration() {
     let source = read_engine_source("sql/executor/execution_program.rs");
     assert!(
-        source.contains("use crate::transaction::{"),
-        "execution_program.rs should import transaction-owned write orchestration"
+        source.contains("use crate::contracts::write::{"),
+        "execution_program.rs should import the contracts-owned write seam"
+    );
+    assert!(
+        !source.contains("use crate::transaction::{"),
+        "execution_program.rs should not import transaction-owned write orchestration directly"
     );
     assert!(
         !source.contains("sql::executor::write_txn_plan"),

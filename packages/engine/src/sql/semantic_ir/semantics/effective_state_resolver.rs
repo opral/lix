@@ -2,12 +2,12 @@ use crate::canonical::read::{
     load_exact_committed_state_row_at_version_head as load_exact_committed_state_row,
     ExactCommittedStateRow, ExactCommittedStateRowRequest,
 };
-use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
-use crate::live_state::{
+use crate::contracts::live::{
     load_exact_untracked_effective_row_with_backend, normalize_live_snapshot_values_with_backend,
     tracked_tombstone_shadows_exact_row_with_backend, EffectiveRow, ExactUntrackedLookupRequest,
-    TrackedTombstoneLookupRequest,
+    OverlayLane as LiveOverlayLane, TrackedTombstoneLookupRequest,
 };
+use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
 };
@@ -502,21 +502,21 @@ fn exact_effective_state_row_from_effective_untracked(row: EffectiveRow) -> Exac
     }
 }
 
-fn live_state_overlay_lane(lane: OverlayLane) -> crate::live_state::OverlayLane {
+fn live_state_overlay_lane(lane: OverlayLane) -> LiveOverlayLane {
     match lane {
-        OverlayLane::GlobalTracked => crate::live_state::OverlayLane::GlobalTracked,
-        OverlayLane::LocalTracked => crate::live_state::OverlayLane::LocalTracked,
-        OverlayLane::GlobalUntracked => crate::live_state::OverlayLane::GlobalUntracked,
-        OverlayLane::LocalUntracked => crate::live_state::OverlayLane::LocalUntracked,
+        OverlayLane::GlobalTracked => LiveOverlayLane::GlobalTracked,
+        OverlayLane::LocalTracked => LiveOverlayLane::LocalTracked,
+        OverlayLane::GlobalUntracked => LiveOverlayLane::GlobalUntracked,
+        OverlayLane::LocalUntracked => LiveOverlayLane::LocalUntracked,
     }
 }
 
-fn sql_overlay_lane(lane: crate::live_state::OverlayLane) -> OverlayLane {
+fn sql_overlay_lane(lane: LiveOverlayLane) -> OverlayLane {
     match lane {
-        crate::live_state::OverlayLane::GlobalTracked => OverlayLane::GlobalTracked,
-        crate::live_state::OverlayLane::LocalTracked => OverlayLane::LocalTracked,
-        crate::live_state::OverlayLane::GlobalUntracked => OverlayLane::GlobalUntracked,
-        crate::live_state::OverlayLane::LocalUntracked => OverlayLane::LocalUntracked,
+        LiveOverlayLane::GlobalTracked => OverlayLane::GlobalTracked,
+        LiveOverlayLane::LocalTracked => OverlayLane::LocalTracked,
+        LiveOverlayLane::GlobalUntracked => OverlayLane::GlobalUntracked,
+        LiveOverlayLane::LocalUntracked => OverlayLane::LocalUntracked,
     }
 }
 

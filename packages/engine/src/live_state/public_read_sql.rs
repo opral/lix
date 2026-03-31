@@ -1,9 +1,9 @@
+use crate::contracts::read::EffectiveStateRequest;
 use crate::contracts::surface::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
 use crate::live_state::schema_access::{
     normalized_projection_sql_for_schema, payload_column_name_for_schema,
     snapshot_select_expr_for_schema, tracked_relation_name,
 };
-use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStateRequest;
 use crate::version::{version_descriptor_schema_key, version_ref_schema_key, GLOBAL_VERSION_ID};
 use crate::workspace::writer_key::WORKSPACE_WRITER_KEY_TABLE;
 use crate::{LixError, SqlDialect};

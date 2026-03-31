@@ -1,5 +1,7 @@
 //! Executor-owned implementation of the public SQL runtime surface.
 
+use crate::contracts::history::TrackedDomainChangeView;
+use crate::contracts::session::SessionStateDelta;
 use crate::contracts::surface::{
     SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry, SurfaceVariant,
 };
@@ -14,9 +16,7 @@ use crate::filesystem::runtime::{
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::read::models::TrackedDomainChangeView;
 use crate::schema::builtin::builtin_schema_definition;
-use crate::session::contracts::SessionStateDelta;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::backend::PushdownDecision;
 use crate::sql::binder::{bind_statement, RuntimeBindingValues};
@@ -1895,8 +1895,9 @@ mod tests {
         prepare_public_execution, prepare_public_read, prepare_public_read_strict,
         PreparedPublicExecution, PreparedPublicReadExecution,
     };
+    use crate::contracts::history::StateHistoryRootScope;
+    use crate::contracts::live::{mark_mode_with_backend, LiveStateMode};
     use crate::contracts::surface::{SurfaceReadFreshness, SurfaceRegistry};
-    use crate::read::models::StateHistoryRootScope;
     use crate::sql::routing::delay_broad_routing_for_test;
     use crate::sql::{
         binder::{
@@ -2174,12 +2175,9 @@ mod tests {
                     )
                     .await
                     .expect("tracked write should succeed before staleness test");
-                crate::live_state::mark_mode_with_backend(
-                    &backend,
-                    crate::live_state::LiveStateMode::NeedsRebuild,
-                )
-                .await
-                .expect("marking live_state stale should succeed");
+                mark_mode_with_backend(&backend, LiveStateMode::NeedsRebuild)
+                    .await
+                    .expect("marking live_state stale should succeed");
 
                 let stale_error = session
                     .execute(
@@ -2257,7 +2255,7 @@ mod tests {
             .dependency_spec()
             .expect("dependency spec should be derived")
             .session_dependencies
-            .contains(&crate::session::contracts::SessionDependency::ActiveVersion));
+            .contains(&crate::contracts::session::SessionDependency::ActiveVersion));
         assert_eq!(
             prepared
                 .effective_state_request()
@@ -2821,7 +2819,7 @@ mod tests {
             .dependency_spec()
             .expect("filesystem dependency spec should be recorded")
             .session_dependencies
-            .contains(&crate::session::contracts::SessionDependency::ActiveVersion));
+            .contains(&crate::contracts::session::SessionDependency::ActiveVersion));
         assert_eq!(
             prepared
                 .explain

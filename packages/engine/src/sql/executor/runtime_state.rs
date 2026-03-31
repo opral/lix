@@ -1,8 +1,8 @@
 use std::ops::ControlFlow;
 
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
-use crate::engine::Engine;
 use crate::functions::SharedFunctionProvider;
+use crate::runtime::RuntimeHost;
 use crate::sql::ast::walk::object_name_matches;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 use sqlparser::ast::{Expr, Function, FunctionArguments, Statement, Visit, Visitor};
@@ -30,12 +30,10 @@ pub(crate) struct ExecutionRuntimeState {
 
 impl ExecutionRuntimeState {
     pub(crate) async fn prepare(
-        engine: &Engine,
+        host: &dyn RuntimeHost,
         backend: &dyn LixBackend,
     ) -> Result<Self, LixError> {
-        let (settings, functions) = engine
-            .prepare_runtime_functions_with_backend(backend)
-            .await?;
+        let (settings, functions) = host.prepare_runtime_functions_with_backend(backend).await?;
         Ok(Self {
             settings,
             functions,
@@ -52,21 +50,19 @@ impl ExecutionRuntimeState {
 
     pub(crate) async fn ensure_sequence_initialized_in_transaction(
         &self,
-        engine: &Engine,
+        host: &dyn RuntimeHost,
         transaction: &mut dyn LixBackendTransaction,
     ) -> Result<(), LixError> {
-        engine
-            .ensure_runtime_sequence_initialized_in_transaction(transaction, &self.functions)
+        host.ensure_runtime_sequence_initialized_in_transaction(transaction, &self.functions)
             .await
     }
 
     pub(crate) async fn flush_in_transaction(
         &self,
-        engine: &Engine,
+        host: &dyn RuntimeHost,
         transaction: &mut dyn LixBackendTransaction,
     ) -> Result<(), LixError> {
-        engine
-            .persist_runtime_sequence_in_transaction(transaction, self.settings, &self.functions)
+        host.persist_runtime_sequence_in_transaction(transaction, self.settings, &self.functions)
             .await
     }
 }

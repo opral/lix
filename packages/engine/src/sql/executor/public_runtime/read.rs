@@ -1,18 +1,21 @@
 use super::*;
+use crate::contracts::history::{
+    load_directory_history_rows, load_file_history_rows, load_state_history_rows,
+    DirectoryHistoryRequest, DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope,
+    FileHistoryRequest, FileHistoryRootScope, FileHistoryRow, FileHistoryVersionScope,
+    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
+    StateHistoryRow, StateHistoryVersionScope,
+};
+use crate::contracts::live::{
+    load_live_state_projection_status_with_backend, require_ready_in_transaction, LiveStateMode,
+    LiveStateProjectionStatus,
+};
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry,
 };
 use crate::errors::classification::sanitize_lowered_public_sql_error_description;
-use crate::read::models::{
-    load_directory_history_rows, load_file_history_rows, DirectoryHistoryRequest,
-    DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
-    FileHistoryRootScope, FileHistoryRow, FileHistoryVersionScope,
-};
-use crate::read::models::{
-    load_state_history_rows, StateHistoryContentMode, StateHistoryLineageScope,
-    StateHistoryRequest, StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
-};
 use crate::refs::load_current_committed_version_frontier_with_backend;
+use crate::runtime::TransactionBackendAdapter;
 use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
 use crate::sql::binder::{bind_public_read_statement, RuntimeBindingValues};
 use crate::sql::explain::{
@@ -150,7 +153,7 @@ pub(crate) async fn execute_prepared_public_read_in_transaction(
         prepared.surface_bindings(),
     )
     .await?;
-    let backend = crate::engine::TransactionBackendAdapter::new(transaction);
+    let backend = TransactionBackendAdapter::new(transaction);
     execute_prepared_public_read_unchecked(&backend, prepared).await
 }
 
@@ -186,10 +189,10 @@ async fn ensure_surface_read_freshness(
         return Ok(());
     }
 
-    let status = crate::live_state::load_live_state_projection_status_with_backend(backend).await?;
+    let status = load_live_state_projection_status_with_backend(backend).await?;
     if matches!(
         status.mode,
-        crate::live_state::LiveStateMode::Ready | crate::live_state::LiveStateMode::Bootstrapping
+        LiveStateMode::Ready | LiveStateMode::Bootstrapping
     ) {
         return Ok(());
     }
@@ -206,17 +209,13 @@ async fn ensure_surface_read_freshness_in_transaction(
         return Ok(());
     }
 
-    if crate::live_state::require_ready_in_transaction(transaction)
-        .await
-        .is_ok()
-    {
+    if require_ready_in_transaction(transaction).await.is_ok() {
         return Ok(());
     }
 
-    let backend = crate::engine::TransactionBackendAdapter::new(transaction);
-    let status =
-        crate::live_state::load_live_state_projection_status_with_backend(&backend).await?;
-    if status.mode == crate::live_state::LiveStateMode::Bootstrapping {
+    let backend = TransactionBackendAdapter::new(transaction);
+    let status = load_live_state_projection_status_with_backend(&backend).await?;
+    if status.mode == LiveStateMode::Bootstrapping {
         return Ok(());
     }
     Err(public_read_projection_stale_error(surface_names, &status))
@@ -224,7 +223,7 @@ async fn ensure_surface_read_freshness_in_transaction(
 
 fn public_read_projection_stale_error(
     surface_names: &[String],
-    status: &crate::live_state::LiveStateProjectionStatus,
+    status: &LiveStateProjectionStatus,
 ) -> LixError {
     let surfaces = if surface_names.is_empty() {
         "this public read".to_string()

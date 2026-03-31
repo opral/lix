@@ -1,3 +1,6 @@
+use crate::contracts::live::{
+    build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
+};
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
     SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
@@ -5,9 +8,6 @@ use crate::contracts::surface::{
 use crate::errors::sql_unknown_column_error;
 use crate::filesystem::live_projection::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
-};
-use crate::live_state::{
-    build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
 };
 use crate::sql::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::logical_plan::public_ir::{

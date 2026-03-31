@@ -5,11 +5,17 @@
 
 use crate::backend::prepared::PreparedStatement;
 use crate::backend::SqlDialect;
+use crate::contracts::history::{
+    DirectoryHistoryRequest, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
+    FileHistoryRootScope, FileHistoryVersionScope, StateHistoryContentMode,
+    StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope,
+    StateHistoryVersionScope,
+};
+use crate::contracts::session::{SessionDependency, SessionStateDelta};
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
     SurfaceVariant,
 };
-use crate::session::contracts::{SessionDependency, SessionStateDelta};
 use crate::sql::backend::{PushdownDecision, PushdownSupport};
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::executor::contracts::effects::PlanEffects;
@@ -5464,9 +5470,7 @@ fn directory_history_direct_plan_snapshot(
     }
 }
 
-fn state_history_request_snapshot(
-    request: &crate::read::history::StateHistoryRequest,
-) -> StateHistoryRequestSnapshot {
+fn state_history_request_snapshot(request: &StateHistoryRequest) -> StateHistoryRequestSnapshot {
     StateHistoryRequestSnapshot {
         root_scope: state_history_root_scope_snapshot(&request.root_scope),
         requested_roots: state_history_requested_roots(&request.root_scope),
@@ -5485,9 +5489,7 @@ fn state_history_request_snapshot(
     }
 }
 
-fn file_history_request_snapshot(
-    request: &crate::read::models::FileHistoryRequest,
-) -> FileHistoryRequestSnapshot {
+fn file_history_request_snapshot(request: &FileHistoryRequest) -> FileHistoryRequestSnapshot {
     FileHistoryRequestSnapshot {
         lineage_scope: file_history_lineage_scope_snapshot(request.lineage_scope),
         active_version_id: request.active_version_id.clone(),
@@ -5501,7 +5503,7 @@ fn file_history_request_snapshot(
 }
 
 fn directory_history_request_snapshot(
-    request: &crate::read::models::DirectoryHistoryRequest,
+    request: &DirectoryHistoryRequest,
 ) -> DirectoryHistoryRequestSnapshot {
     DirectoryHistoryRequestSnapshot {
         lineage_scope: file_history_lineage_scope_snapshot(request.lineage_scope),
@@ -5808,151 +5810,113 @@ fn result_contract_snapshot(contract: ResultContract) -> ExplainResultContract {
     }
 }
 
-fn state_history_root_scope_snapshot(
-    scope: &crate::read::history::StateHistoryRootScope,
-) -> ExplainHistoryRootScopeKind {
+fn state_history_root_scope_snapshot(scope: &StateHistoryRootScope) -> ExplainHistoryRootScopeKind {
     match scope {
-        crate::read::history::StateHistoryRootScope::AllRoots => {
-            ExplainHistoryRootScopeKind::AllRoots
-        }
-        crate::read::history::StateHistoryRootScope::RequestedRoots(_) => {
-            ExplainHistoryRootScopeKind::RequestedRoots
-        }
+        StateHistoryRootScope::AllRoots => ExplainHistoryRootScopeKind::AllRoots,
+        StateHistoryRootScope::RequestedRoots(_) => ExplainHistoryRootScopeKind::RequestedRoots,
     }
 }
 
-fn state_history_requested_roots(
-    scope: &crate::read::history::StateHistoryRootScope,
-) -> Vec<String> {
+fn state_history_requested_roots(scope: &StateHistoryRootScope) -> Vec<String> {
     match scope {
-        crate::read::history::StateHistoryRootScope::AllRoots => Vec::new(),
-        crate::read::history::StateHistoryRootScope::RequestedRoots(roots) => roots.clone(),
+        StateHistoryRootScope::AllRoots => Vec::new(),
+        StateHistoryRootScope::RequestedRoots(roots) => roots.clone(),
     }
 }
 
 fn state_history_lineage_scope_snapshot(
-    scope: crate::read::history::StateHistoryLineageScope,
+    scope: StateHistoryLineageScope,
 ) -> ExplainHistoryLineageScope {
     match scope {
-        crate::read::history::StateHistoryLineageScope::Standard => {
-            ExplainHistoryLineageScope::Standard
-        }
-        crate::read::history::StateHistoryLineageScope::ActiveVersion => {
-            ExplainHistoryLineageScope::ActiveVersion
-        }
+        StateHistoryLineageScope::Standard => ExplainHistoryLineageScope::Standard,
+        StateHistoryLineageScope::ActiveVersion => ExplainHistoryLineageScope::ActiveVersion,
     }
 }
 
 fn state_history_version_scope_snapshot(
-    scope: &crate::read::history::StateHistoryVersionScope,
+    scope: &StateHistoryVersionScope,
 ) -> ExplainHistoryVersionScopeKind {
     match scope {
-        crate::read::history::StateHistoryVersionScope::Any => ExplainHistoryVersionScopeKind::Any,
-        crate::read::history::StateHistoryVersionScope::RequestedVersions(_) => {
+        StateHistoryVersionScope::Any => ExplainHistoryVersionScopeKind::Any,
+        StateHistoryVersionScope::RequestedVersions(_) => {
             ExplainHistoryVersionScopeKind::RequestedVersions
         }
     }
 }
 
-fn state_history_requested_versions(
-    scope: &crate::read::history::StateHistoryVersionScope,
-) -> Vec<String> {
+fn state_history_requested_versions(scope: &StateHistoryVersionScope) -> Vec<String> {
     match scope {
-        crate::read::history::StateHistoryVersionScope::Any => Vec::new(),
-        crate::read::history::StateHistoryVersionScope::RequestedVersions(versions) => {
-            versions.clone()
-        }
+        StateHistoryVersionScope::Any => Vec::new(),
+        StateHistoryVersionScope::RequestedVersions(versions) => versions.clone(),
     }
 }
 
 fn state_history_content_mode_snapshot(
-    mode: crate::read::history::StateHistoryContentMode,
+    mode: StateHistoryContentMode,
 ) -> ExplainStateHistoryContentMode {
     match mode {
-        crate::read::history::StateHistoryContentMode::MetadataOnly => {
-            ExplainStateHistoryContentMode::MetadataOnly
-        }
-        crate::read::history::StateHistoryContentMode::IncludeSnapshotContent => {
+        StateHistoryContentMode::MetadataOnly => ExplainStateHistoryContentMode::MetadataOnly,
+        StateHistoryContentMode::IncludeSnapshotContent => {
             ExplainStateHistoryContentMode::IncludeSnapshotContent
         }
     }
 }
 
-fn state_history_order_snapshot(
-    order: crate::read::history::StateHistoryOrder,
-) -> ExplainStateHistoryOrder {
+fn state_history_order_snapshot(order: StateHistoryOrder) -> ExplainStateHistoryOrder {
     match order {
-        crate::read::history::StateHistoryOrder::EntityFileSchemaDepthAsc => {
+        StateHistoryOrder::EntityFileSchemaDepthAsc => {
             ExplainStateHistoryOrder::EntityFileSchemaDepthAsc
         }
     }
 }
 
-fn file_history_root_scope_snapshot(
-    scope: &crate::read::models::FileHistoryRootScope,
-) -> ExplainHistoryRootScopeKind {
+fn file_history_root_scope_snapshot(scope: &FileHistoryRootScope) -> ExplainHistoryRootScopeKind {
     match scope {
-        crate::read::models::FileHistoryRootScope::AllRoots => {
-            ExplainHistoryRootScopeKind::AllRoots
-        }
-        crate::read::models::FileHistoryRootScope::RequestedRoots(_) => {
-            ExplainHistoryRootScopeKind::RequestedRoots
-        }
+        FileHistoryRootScope::AllRoots => ExplainHistoryRootScopeKind::AllRoots,
+        FileHistoryRootScope::RequestedRoots(_) => ExplainHistoryRootScopeKind::RequestedRoots,
     }
 }
 
-fn file_history_requested_roots(scope: &crate::read::models::FileHistoryRootScope) -> Vec<String> {
+fn file_history_requested_roots(scope: &FileHistoryRootScope) -> Vec<String> {
     match scope {
-        crate::read::models::FileHistoryRootScope::AllRoots => Vec::new(),
-        crate::read::models::FileHistoryRootScope::RequestedRoots(roots) => roots.clone(),
+        FileHistoryRootScope::AllRoots => Vec::new(),
+        FileHistoryRootScope::RequestedRoots(roots) => roots.clone(),
     }
 }
 
 fn file_history_version_scope_snapshot(
-    scope: &crate::read::models::FileHistoryVersionScope,
+    scope: &FileHistoryVersionScope,
 ) -> ExplainHistoryVersionScopeKind {
     match scope {
-        crate::read::models::FileHistoryVersionScope::Any => ExplainHistoryVersionScopeKind::Any,
-        crate::read::models::FileHistoryVersionScope::RequestedVersions(_) => {
+        FileHistoryVersionScope::Any => ExplainHistoryVersionScopeKind::Any,
+        FileHistoryVersionScope::RequestedVersions(_) => {
             ExplainHistoryVersionScopeKind::RequestedVersions
         }
     }
 }
 
-fn file_history_requested_versions(
-    scope: &crate::read::models::FileHistoryVersionScope,
-) -> Vec<String> {
+fn file_history_requested_versions(scope: &FileHistoryVersionScope) -> Vec<String> {
     match scope {
-        crate::read::models::FileHistoryVersionScope::Any => Vec::new(),
-        crate::read::models::FileHistoryVersionScope::RequestedVersions(versions) => {
-            versions.clone()
-        }
+        FileHistoryVersionScope::Any => Vec::new(),
+        FileHistoryVersionScope::RequestedVersions(versions) => versions.clone(),
     }
 }
 
 fn file_history_lineage_scope_snapshot(
-    scope: crate::read::models::FileHistoryLineageScope,
+    scope: FileHistoryLineageScope,
 ) -> ExplainHistoryLineageScope {
     match scope {
-        crate::read::models::FileHistoryLineageScope::ActiveVersion => {
-            ExplainHistoryLineageScope::ActiveVersion
-        }
-        crate::read::models::FileHistoryLineageScope::Standard => {
-            ExplainHistoryLineageScope::Standard
-        }
+        FileHistoryLineageScope::ActiveVersion => ExplainHistoryLineageScope::ActiveVersion,
+        FileHistoryLineageScope::Standard => ExplainHistoryLineageScope::Standard,
     }
 }
 
 fn file_history_content_mode_snapshot(
-    mode: crate::read::models::FileHistoryContentMode,
+    mode: FileHistoryContentMode,
 ) -> ExplainFileHistoryContentMode {
     match mode {
-        crate::read::models::FileHistoryContentMode::MetadataOnly => {
-            ExplainFileHistoryContentMode::MetadataOnly
-        }
-        crate::read::models::FileHistoryContentMode::IncludeData => {
-            ExplainFileHistoryContentMode::IncludeData
-        }
+        FileHistoryContentMode::MetadataOnly => ExplainFileHistoryContentMode::MetadataOnly,
+        FileHistoryContentMode::IncludeData => ExplainFileHistoryContentMode::IncludeData,
     }
 }
 

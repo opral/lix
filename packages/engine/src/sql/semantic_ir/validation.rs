@@ -1,21 +1,22 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 
 use crate::checkpoint::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME};
-use crate::contracts::surface::SurfaceFamily;
-use crate::identity::{
-    derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
-};
-use crate::live_state::{
+use crate::contracts::live::{
     is_untracked_live_table, load_live_read_shape_for_table_name,
     load_live_snapshot_rows_with_backend, LiveFilter, LiveFilterField, LiveFilterOp, LiveReadShape,
     LiveSnapshotRow, LiveSnapshotStorage,
 };
+use crate::contracts::surface::SurfaceFamily;
+use crate::identity::{
+    derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
+};
+use crate::runtime::SchemaCache;
 use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
     SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,
@@ -36,19 +37,6 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const REGISTERED_SCHEMA_FILE_ID: &str = "lix";
 const REGISTERED_SCHEMA_PLUGIN_KEY: &str = "lix";
 const REGISTERED_SCHEMA_VERSION_ID: &str = "global";
-
-#[derive(Debug, Default)]
-pub struct SchemaCache {
-    inner: RwLock<HashMap<SchemaKey, Arc<JSONSchema>>>,
-}
-
-impl SchemaCache {
-    pub fn new() -> Self {
-        Self {
-            inner: RwLock::new(HashMap::new()),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ConstraintStorageKind {
@@ -1909,7 +1897,7 @@ async fn load_compiled_schema<P: SchemaProvider + ?Sized>(
     cache: &SchemaCache,
     key: &SchemaKey,
 ) -> Result<Arc<JSONSchema>, LixError> {
-    if let Some(existing) = cache.inner.read().unwrap().get(key) {
+    if let Some(existing) = cache.read().unwrap().get(key) {
         return Ok(existing.clone());
     }
 
@@ -1923,11 +1911,7 @@ async fn load_compiled_schema<P: SchemaProvider + ?Sized>(
     })?;
     let compiled = Arc::new(compiled);
 
-    cache
-        .inner
-        .write()
-        .unwrap()
-        .insert(key.clone(), compiled.clone());
+    cache.write().unwrap().insert(key.clone(), compiled.clone());
 
     Ok(compiled)
 }

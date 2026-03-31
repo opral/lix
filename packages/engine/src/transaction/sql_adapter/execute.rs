@@ -3,7 +3,9 @@ use sqlparser::ast::Statement;
 use std::time::Duration;
 
 use crate::commit::PendingPublicCommitSession;
+use crate::contracts::write::WriteProgramExecutor;
 use crate::engine::{DeferredTransactionSideEffects, Engine};
+use crate::runtime::TransactionBackendAdapter;
 use crate::sql::executor::execution_program::{
     execute_execution_program_with_borrowed_write_transaction,
     execute_execution_program_with_write_transaction, BoundStatementTemplateInstance,
@@ -137,7 +139,7 @@ async fn ensure_execution_runtime_state_for_write_scope(
     if context.execution_runtime_state().is_some() {
         return Ok(());
     }
-    let backend = crate::engine::TransactionBackendAdapter::new(transaction);
+    let backend = TransactionBackendAdapter::new(transaction);
     let runtime_state = ExecutionRuntimeState::prepare(engine, &backend).await?;
     context.set_execution_runtime_state(runtime_state);
     Ok(())
@@ -207,6 +209,51 @@ async fn execute_bound_statement_template_instance_in_buffered_write_scope(
         skip_side_effect_collection,
     )
     .await
+}
+
+#[async_trait(?Send)]
+impl WriteProgramExecutor for Engine {
+    async fn execute_bound_statement_template_instance_in_write_transaction(
+        &self,
+        write_transaction: &mut WriteTransaction<'_>,
+        bound_statement_template: &BoundStatementTemplateInstance,
+        allow_internal_tables: bool,
+        context: &mut ExecutionContext,
+        deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
+        skip_side_effect_collection: bool,
+    ) -> Result<QueryResult, LixError> {
+        execute_bound_statement_template_instance_in_write_transaction(
+            self,
+            write_transaction,
+            bound_statement_template,
+            allow_internal_tables,
+            context,
+            deferred_side_effects,
+            skip_side_effect_collection,
+        )
+        .await
+    }
+
+    async fn execute_bound_statement_template_instance_in_borrowed_write_transaction(
+        &self,
+        write_transaction: &mut BorrowedWriteTransaction<'_>,
+        bound_statement_template: &BoundStatementTemplateInstance,
+        allow_internal_tables: bool,
+        context: &mut ExecutionContext,
+        deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
+        skip_side_effect_collection: bool,
+    ) -> Result<QueryResult, LixError> {
+        execute_bound_statement_template_instance_in_borrowed_write_transaction(
+            self,
+            write_transaction,
+            bound_statement_template,
+            allow_internal_tables,
+            context,
+            deferred_side_effects,
+            skip_side_effect_collection,
+        )
+        .await
+    }
 }
 
 struct SqlBufferedWriteAdapter;

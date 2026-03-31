@@ -4,7 +4,7 @@ use crate::account;
 use crate::canonical;
 use crate::checkpoint;
 use crate::commit;
-use crate::engine::{Engine, TransactionBackendAdapter};
+use crate::engine::Engine;
 use crate::filesystem;
 use crate::key_value;
 use crate::live_state;
@@ -15,6 +15,7 @@ use crate::live_state::{
     LiveStateRebuildRequest, LiveStateRebuildScope,
 };
 use crate::observe;
+use crate::runtime::TransactionBackendAdapter;
 use crate::schema;
 use crate::undo_redo;
 use crate::version;

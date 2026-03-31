@@ -6,13 +6,13 @@ use crate::canonical::read::{
     ExactCommittedStateRowRequest,
 };
 use crate::commit::{append_tracked, CreateCommitArgs, ProposedDomainChange};
-use crate::engine::TransactionBackendAdapter;
 use crate::functions::LixFunctionProvider;
 use crate::live_state::{
     mark_live_state_projection_ready_without_replay_cursor_in_transaction,
     rebuild_scope_in_transaction, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
     LiveStateRebuildScope,
 };
+use crate::runtime::TransactionBackendAdapter;
 use crate::state::stream::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::version::context::{
     exact_resolved_head_preconditions, require_version_context_pair_in_transaction,

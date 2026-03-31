@@ -89,7 +89,7 @@ async fn redo_in_transaction(
             forward_changes.push(proposed);
         }
 
-        let backend = crate::engine::TransactionBackendAdapter::new(transaction);
+        let backend = crate::runtime::TransactionBackendAdapter::new(transaction);
         let (_settings, functions) = engine
             .prepare_runtime_functions_with_backend(&backend)
             .await?;
@@ -98,7 +98,7 @@ async fn redo_in_transaction(
             .await?;
         let mut functions = functions;
         let timestamp = functions.timestamp();
-        let mut head_executor = crate::engine::TransactionBackendAdapter::new(transaction);
+        let mut head_executor = crate::runtime::TransactionBackendAdapter::new(transaction);
         let version_context = require_version_context_with_executor(
             &mut head_executor,
             ResolvedVersionTarget {

@@ -1,7 +1,6 @@
 use crate::contracts::traits::PendingView;
-use crate::engine::{
-    normalize_sql_execution_error_with_backend, Engine, TransactionBackendAdapter,
-};
+use crate::engine::Engine;
+use crate::runtime::{normalize_sql_execution_error_with_backend, TransactionBackendAdapter};
 use crate::sql::executor::execution_program::{
     BoundStatementTemplateInstance, ExecutionContext, StatementTemplate, StatementTemplateCacheKey,
 };

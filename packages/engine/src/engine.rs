@@ -1,19 +1,21 @@
 use crate::cel::CelEvaluator;
 use crate::contracts::artifacts::{FilesystemPayloadDomainChange, MutationRow};
 use crate::contracts::surface::SurfaceRegistry;
-use crate::deterministic_mode::{deterministic_mode_key, DeterministicSettings};
+use crate::deterministic_mode::{
+    deterministic_mode_key, DeterministicSettings, RuntimeFunctionProvider,
+};
+use crate::functions::SharedFunctionProvider;
 use crate::key_value::key_value_schema_key;
 use crate::plugin::types::InstalledPlugin;
-use crate::sql::semantic_ir::validation::SchemaCache;
+use crate::runtime::{RuntimeHost, SchemaCache};
 use crate::state::stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
 use crate::WasmRuntime;
-use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, TransactionMode, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, TransactionMode};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
-use std::collections::{BTreeMap, BTreeSet};
-use std::marker::PhantomData;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -21,17 +23,10 @@ use std::sync::RwLock;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
-const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
-const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 pub(crate) const INIT_STATE_NOT_STARTED: u8 = 0;
 pub(crate) const INIT_STATE_IN_PROGRESS: u8 = 1;
 pub(crate) const INIT_STATE_COMPLETED: u8 = 2;
-
-#[derive(Debug, Clone, Default)]
-pub struct ExecuteOptions {
-    pub writer_key: Option<String>,
-}
 
 pub struct Engine {
     pub(crate) backend: Arc<dyn LixBackend + Send + Sync>,
@@ -222,12 +217,6 @@ impl Engine {
     }
 }
 
-pub(crate) struct TransactionBackendAdapter<'a> {
-    dialect: crate::SqlDialect,
-    transaction: Mutex<*mut (dyn LixBackendTransaction + 'a)>,
-    _lifetime: PhantomData<&'a ()>,
-}
-
 #[derive(Default)]
 pub(crate) struct DeferredTransactionSideEffects {
     pub(crate) filesystem_state: crate::filesystem::runtime::FilesystemTransactionState,
@@ -328,92 +317,12 @@ fn object_name_is_protected_lix_ddl_target(name: &sqlparser::ast::ObjectName) ->
             .any(|surface| surface.eq_ignore_ascii_case(&relation))
 }
 
-pub(crate) async fn normalize_sql_execution_error_with_backend(
-    backend: &dyn LixBackend,
-    error: LixError,
-    statements: &[Statement],
-) -> LixError {
-    crate::errors::classification::normalize_sql_error_with_backend(backend, error, statements)
-        .await
-}
-
 #[cfg(test)]
 fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
     let Ok(statements) = crate::sql::parser::parse_sql(sql) else {
         return false;
     };
     crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements(&statements)
-}
-
-// SAFETY: `TransactionBackendAdapter` is only used inside a single async execution flow.
-// Internal access to the raw transaction pointer is serialized with a mutex.
-unsafe impl<'a> Send for TransactionBackendAdapter<'a> {}
-// SAFETY: see `Send` impl above.
-unsafe impl<'a> Sync for TransactionBackendAdapter<'a> {}
-
-impl<'a> TransactionBackendAdapter<'a> {
-    pub(crate) fn new(transaction: &'a mut dyn LixBackendTransaction) -> Self {
-        Self {
-            dialect: transaction.dialect(),
-            transaction: Mutex::new(transaction as *mut (dyn LixBackendTransaction + 'a)),
-            _lifetime: PhantomData,
-        }
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl<'a> crate::backend::QueryExecutor for TransactionBackendAdapter<'a> {
-    fn dialect(&self) -> crate::SqlDialect {
-        self.dialect
-    }
-
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let mut guard = self.transaction.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction adapter lock poisoned".to_string(),
-        })?;
-        // SAFETY: the pointer is created from a live `&mut dyn LixBackendTransaction` and
-        // this mutex serializes all calls so the mutable borrow is not aliased.
-        unsafe { (&mut **guard).execute(sql, params).await }
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl<'a> LixBackend for TransactionBackendAdapter<'a> {
-    fn dialect(&self) -> crate::SqlDialect {
-        self.dialect
-    }
-
-    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let mut guard = self.transaction.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction adapter lock poisoned".to_string(),
-        })?;
-        // SAFETY: the pointer is created from a live `&mut dyn LixBackendTransaction` and
-        // this mutex serializes all calls so the mutable borrow is not aliased.
-        unsafe { (&mut **guard).execute(sql, params).await }
-    }
-
-    async fn begin_transaction(
-        &self,
-        _mode: TransactionMode,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "nested transactions are not supported via TransactionBackendAdapter"
-                .to_string(),
-        })
-    }
-
-    async fn begin_savepoint(
-        &self,
-        _name: &str,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "savepoints are not supported via TransactionBackendAdapter".to_string(),
-        })
-    }
 }
 
 impl Engine {
@@ -442,19 +351,6 @@ impl Engine {
             state_commit_stream_bus: Arc::new(StateCommitStreamBus::default()),
         }
     }
-}
-
-pub(crate) fn direct_state_file_cache_refresh_targets(
-    mutations: &[MutationRow],
-) -> BTreeSet<(String, String)> {
-    mutations
-        .iter()
-        .filter(|mutation| !mutation.untracked)
-        .filter(|mutation| mutation.file_id != "lix")
-        .filter(|mutation| mutation.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY)
-        .filter(|mutation| mutation.schema_key != DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
-        .map(|mutation| (mutation.file_id.clone(), mutation.version_id.clone()))
-        .collect()
 }
 
 pub(crate) fn should_run_binary_cas_gc(
@@ -527,11 +423,52 @@ pub(crate) fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, Lix
     Ok(format!("{schema_key}~{schema_version}"))
 }
 
+#[async_trait::async_trait(?Send)]
+impl RuntimeHost for Engine {
+    fn cel_evaluator(&self) -> &CelEvaluator {
+        &self.cel_evaluator
+    }
+
+    fn schema_cache(&self) -> &SchemaCache {
+        &self.schema_cache
+    }
+
+    async fn prepare_runtime_functions_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+    ) -> Result<
+        (
+            DeterministicSettings,
+            SharedFunctionProvider<RuntimeFunctionProvider>,
+        ),
+        LixError,
+    > {
+        Engine::prepare_runtime_functions_with_backend(self, backend).await
+    }
+
+    async fn ensure_runtime_sequence_initialized_in_transaction(
+        &self,
+        transaction: &mut dyn LixBackendTransaction,
+        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
+    ) -> Result<(), LixError> {
+        Engine::ensure_runtime_sequence_initialized_in_transaction(self, transaction, functions)
+            .await
+    }
+
+    async fn persist_runtime_sequence_in_transaction(
+        &self,
+        transaction: &mut dyn LixBackendTransaction,
+        settings: DeterministicSettings,
+        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
+    ) -> Result<(), LixError> {
+        Engine::persist_runtime_sequence_in_transaction(self, transaction, settings, functions)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{
-        boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
-    };
+    use super::{boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs};
     use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect, TransactionMode};
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
     use crate::sql::binder::{advance_placeholder_state_for_statement_ast, bind_sql_with_state};
@@ -539,7 +476,7 @@ mod tests {
     use crate::sql::optimizer::optimize_state_resolution;
     use crate::sql::parser::parse_sql_statements;
     use crate::sql::parser::placeholders::PlaceholderState;
-    use crate::{LixError, NoopWasmRuntime, QueryResult, Session, Value};
+    use crate::{ExecuteOptions, LixError, NoopWasmRuntime, QueryResult, Session, Value};
     use async_trait::async_trait;
     use sqlparser::ast::Statement;
     use std::sync::atomic::{AtomicBool, Ordering};

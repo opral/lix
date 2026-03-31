@@ -58,7 +58,7 @@ async fn ensure_version_exists_with_transaction(
     transaction: &mut dyn LixBackendTransaction,
     version_id: &str,
 ) -> Result<(), LixError> {
-    let mut executor = crate::engine::TransactionBackendAdapter::new(transaction);
+    let mut executor = crate::runtime::TransactionBackendAdapter::new(transaction);
     crate::version::context::ensure_version_exists_with_executor(&mut executor, version_id).await
 }
 
@@ -66,7 +66,7 @@ pub(crate) async fn rebuild_semantic_undo_redo_stacks(
     transaction: &mut dyn LixBackendTransaction,
     version_id: &str,
 ) -> Result<SemanticUndoRedoStacks, LixError> {
-    let mut executor = crate::engine::TransactionBackendAdapter::new(transaction);
+    let mut executor = crate::runtime::TransactionBackendAdapter::new(transaction);
     let Some(version_context) = load_version_context_with_executor(
         &mut executor,
         ResolvedVersionTarget {
@@ -172,7 +172,7 @@ pub(crate) async fn load_target_commit_change_effects(
     version_id: &str,
     target_commit_id: &str,
 ) -> Result<Vec<TargetCommitChangeEffect>, LixError> {
-    let mut executor = crate::engine::TransactionBackendAdapter::new(transaction);
+    let mut executor = crate::runtime::TransactionBackendAdapter::new(transaction);
     let Some(target_commit) =
         load_commit_lineage_entry_by_id(&mut executor, target_commit_id).await?
     else {

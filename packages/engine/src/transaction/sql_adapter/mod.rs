@@ -33,8 +33,6 @@ pub(crate) use crate::transaction::PendingTransactionView;
 
 pub(crate) use effects::mirror_public_registered_schema_bootstrap_rows;
 pub(crate) use execute::{
-    execute_bound_statement_template_instance_in_borrowed_write_transaction,
-    execute_bound_statement_template_instance_in_write_transaction,
     execute_parsed_statements_in_borrowed_write_transaction,
     execute_parsed_statements_in_write_transaction, execute_with_options_in_write_transaction,
 };

@@ -3,16 +3,15 @@ use std::time::Instant;
 
 use crate::commit::{CanonicalCommitReceipt, PendingPublicCommitSession};
 use crate::contracts::artifacts::{PlanEffects, ResultContract};
-use crate::contracts::traits::PendingView;
-use crate::deterministic_mode::RuntimeFunctionProvider;
-use crate::engine::{
-    normalize_sql_execution_error_with_backend, Engine, TransactionBackendAdapter,
-};
-use crate::functions::SharedFunctionProvider;
-use crate::live_state::{
+use crate::contracts::live::{
     execute_prepared_public_read_with_pending_transaction_view_in_transaction,
     SchemaRegistrationSet,
 };
+use crate::contracts::traits::PendingView;
+use crate::deterministic_mode::RuntimeFunctionProvider;
+use crate::engine::Engine;
+use crate::functions::SharedFunctionProvider;
+use crate::runtime::{normalize_sql_execution_error_with_backend, TransactionBackendAdapter};
 use crate::sql::executor::contracts::executor_error::ExecutorError;
 use crate::sql::executor::execute_prepared::execute_prepared_with_transaction;
 use crate::sql::executor::{

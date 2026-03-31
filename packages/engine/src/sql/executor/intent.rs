@@ -21,7 +21,6 @@ pub(crate) struct ExecutionIntent {
 }
 
 pub(crate) async fn collect_execution_intent_with_backend(
-    _engine: &crate::engine::Engine,
     _backend: &dyn LixBackend,
     _statements: &[Statement],
     _params: &[Value],

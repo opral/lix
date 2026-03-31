@@ -1,7 +1,6 @@
 use serde_json::Value as JsonValue;
 
 use crate::backend::prepared::PreparedBatch;
-use crate::engine::TransactionBackendAdapter;
 use crate::errors::classification::is_missing_relation_error;
 use crate::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
 use crate::key_value::{
@@ -10,6 +9,7 @@ use crate::key_value::{
     build_update_runtime_sequence_highest_sql as build_update_runtime_sequence_highest_sql_impl,
     load_key_value_payloads,
 };
+use crate::runtime::TransactionBackendAdapter;
 use crate::{LixBackend, LixBackendTransaction, LixError, SqlDialect, Value};
 
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
