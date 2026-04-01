@@ -1,4 +1,4 @@
-use crate::contracts::artifacts::{CommitPreconditions, DomainChangeBatch};
+use crate::contracts::artifacts::{CommitPreconditions, DomainChangeBatch, ReadTimeProjectionRead};
 use crate::contracts::surface::SurfaceBinding;
 use crate::filesystem::live_projection::FilesystemProjectionScope;
 use crate::sql::ast::lowering::lower_statement;
@@ -23,6 +23,7 @@ pub(crate) enum PhysicalPlan {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PreparedPublicReadExecution {
     LoweredSql(LoweredReadProgram),
+    ReadTimeProjection(ReadTimeProjectionRead),
     Direct(DirectPublicReadPlan),
 }
 

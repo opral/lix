@@ -386,6 +386,7 @@ pub(crate) async fn create_commit(
         committed_head.clone(),
         &canonical_output,
         &updated_version_refs,
+        &affected_versions.iter().cloned().collect::<Vec<_>>(),
     )?;
     let mut executor = &mut *transaction;
     let commit_graph_rows =
@@ -1259,6 +1260,7 @@ fn build_canonical_commit_receipt(
     commit_id: String,
     canonical_output: &CanonicalCommitOutput,
     updated_version_refs: &[UpdatedVersionRef],
+    affected_versions: &[String],
 ) -> Result<CanonicalCommitReceipt, CreateCommitError> {
     let replay_cursor = latest_replay_cursor_from_change_rows(&canonical_output.changes)
         .ok_or_else(|| CreateCommitError {
@@ -1266,15 +1268,11 @@ fn build_canonical_commit_receipt(
             message: "canonical commit receipt requires at least one canonical change row"
                 .to_string(),
         })?;
-    let affected_versions = updated_version_refs
-        .iter()
-        .map(|update| update.version_id.to_string())
-        .collect();
     Ok(CanonicalCommitReceipt {
         commit_id,
         replay_cursor,
         updated_version_refs: updated_version_refs.to_vec(),
-        affected_versions,
+        affected_versions: affected_versions.to_vec(),
     })
 }
 
@@ -2141,11 +2139,13 @@ mod tests {
             commit_id: "commit-123".to_string(),
             created_at: "2026-03-06T14:22:01.000Z".to_string(),
         }];
+        let affected_versions = vec!["global".to_string(), "version-a".to_string()];
 
         let receipt = build_canonical_commit_receipt(
             "commit-123".to_string(),
             &canonical_output,
             &updated_version_refs,
+            &affected_versions,
         )
         .expect("receipt should build");
 
@@ -2153,6 +2153,6 @@ mod tests {
         assert_eq!(receipt.replay_cursor.change_id, "change-2");
         assert_eq!(receipt.replay_cursor.created_at, "2026-03-06T14:22:01.000Z");
         assert_eq!(receipt.updated_version_refs, updated_version_refs);
-        assert_eq!(receipt.affected_versions, vec!["version-a".to_string()]);
+        assert_eq!(receipt.affected_versions, affected_versions);
     }
 }
