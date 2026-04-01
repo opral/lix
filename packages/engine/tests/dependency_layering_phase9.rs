@@ -20,6 +20,8 @@ const FORBIDDEN_SPECIALIZED_PUBLIC_READ_IMPORTS: &[&str] = &[
     "ReadTimeProjectionRead",
     "ReadTimeProjectionReadQuery",
     "ReadTimeProjectionSurface",
+    "try_compile_read_time_projection_read",
+    "lower_read_for_execution_with_layouts",
 ];
 
 #[test]
@@ -78,6 +80,26 @@ fn specialized_public_version_read_path_does_not_compile_projection_artifacts_lo
         "specialized public read orchestration should not compile read-time projection artifacts locally\nhits:\n{}",
         format_import_sites(&hits),
     );
+}
+
+#[test]
+fn specialized_public_version_read_path_does_not_define_compiler_owned_layout_helpers_locally() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest_dir.join(SPECIALIZED_PUBLIC_READ_FILE);
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+
+    for forbidden in [
+        "fn required_schema_keys_from_dependency_spec(",
+        "async fn load_known_live_layouts_for_dependency_spec(",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "specialized public read orchestration should not define compiler-owned public-read layout helpers locally\nfile: {}\nforbidden: {}",
+            SPECIALIZED_PUBLIC_READ_FILE,
+            forbidden,
+        );
+    }
 }
 
 fn collect_file_imports_for(relative_path: &str) -> Vec<ImportSite> {
