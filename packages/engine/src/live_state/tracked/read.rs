@@ -214,7 +214,7 @@ fn decode_tracked_row(
 
     let mut values = std::collections::BTreeMap::new();
     for (offset, column) in selected_columns.iter().enumerate() {
-        let value = row.get(12 + offset).ok_or_else(|| {
+        let raw_value = row.get(12 + offset).ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 &format!(
@@ -223,7 +223,8 @@ fn decode_tracked_row(
                 ),
             )
         })?;
-        values.insert(column.property_name.clone(), value.clone());
+        let value = normalize_live_property_value(raw_value, column, schema_key)?;
+        values.insert(column.property_name.clone(), value);
     }
 
     Ok(TrackedRow {
@@ -241,6 +242,29 @@ fn decode_tracked_row(
         updated_at,
         values,
     })
+}
+
+fn normalize_live_property_value(
+    value: &Value,
+    column: &crate::live_state::storage::LiveColumnSpec,
+    schema_key: &str,
+) -> Result<Value, LixError> {
+    match column.kind {
+        crate::live_state::storage::LiveColumnKind::Boolean => match value {
+            Value::Null => Ok(Value::Null),
+            Value::Boolean(value) => Ok(Value::Boolean(*value)),
+            Value::Integer(0) => Ok(Value::Boolean(false)),
+            Value::Integer(1) => Ok(Value::Boolean(true)),
+            other => Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                &format!(
+                    "tracked row for schema '{}' expected boolean property '{}', got {other:?}",
+                    schema_key, column.property_name
+                ),
+            )),
+        },
+        _ => Ok(value.clone()),
+    }
 }
 
 fn decode_tracked_tombstone(

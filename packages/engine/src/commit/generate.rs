@@ -234,11 +234,24 @@ where
 
     output_changes.extend(meta_changes);
 
+    let affected_versions = effective_domain_changes
+        .iter()
+        .map(|change| change.version_id.to_string())
+        .chain(
+            updated_version_refs
+                .iter()
+                .map(|update| update.version_id.to_string()),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
     Ok(GenerateCommitResult {
         canonical_output: CanonicalCommitOutput {
             changes: output_changes,
         },
         updated_version_refs,
+        affected_versions,
     })
 }
 
@@ -500,6 +513,7 @@ mod tests {
             result.updated_version_refs[0].version_id.as_str(),
             "version-main"
         );
+        assert_eq!(result.affected_versions, vec!["version-main".to_string()]);
     }
 
     #[test]
@@ -535,6 +549,7 @@ mod tests {
         assert_eq!(counts.get("lix_commit"), Some(&1));
         assert_eq!(result.updated_version_refs.len(), 1);
         assert_eq!(result.updated_version_refs[0].version_id.as_str(), "global");
+        assert_eq!(result.affected_versions, vec!["global".to_string()]);
 
         let commit_row = result
             .canonical_output
@@ -616,6 +631,10 @@ mod tests {
         assert_eq!(
             updated_versions,
             BTreeSet::from(["global".to_string(), "version-main".to_string()])
+        );
+        assert_eq!(
+            result.affected_versions,
+            vec!["global".to_string(), "version-main".to_string()]
         );
     }
 

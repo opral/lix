@@ -319,6 +319,7 @@ fn rewrite_generated_commit_result_for_pending_session(
                 .collect(),
         },
         updated_version_refs,
+        affected_versions: generated.affected_versions,
     })
 }
 
@@ -428,11 +429,7 @@ fn canonical_commit_receipt_from_generated_result(
         commit_id,
         replay_cursor,
         updated_version_refs: result.updated_version_refs.clone(),
-        affected_versions: result
-            .updated_version_refs
-            .iter()
-            .map(|update| update.version_id.to_string())
-            .collect(),
+        affected_versions: result.affected_versions.clone(),
     })
 }
 

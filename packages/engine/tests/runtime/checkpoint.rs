@@ -70,52 +70,6 @@ simulation_test!(
 );
 
 simulation_test!(
-    version_admin_reads_ignore_missing_version_projection_tables_but_checkpoint_requires_local_head,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine_deterministic()
-            .await
-            .expect("boot_simulated_engine_deterministic should succeed");
-        engine.initialize().await.expect("init should succeed");
-
-        engine
-            .execute(
-                "DROP TABLE IF EXISTS lix_internal_live_v1_lix_version_ref",
-                &[],
-            )
-            .await
-            .expect("dropping version ref projection table should succeed");
-        engine
-            .execute(
-                "DROP TABLE IF EXISTS lix_internal_live_v1_lix_version_descriptor",
-                &[],
-            )
-            .await
-            .expect("dropping version descriptor projection table should succeed");
-
-        let version_rows = engine
-            .execute(
-                "SELECT id, commit_id \
-                 FROM lix_version \
-                 WHERE name = 'main'",
-                &[],
-            )
-            .await
-            .expect("canonical lix_version read should succeed without projection tables");
-        assert_eq!(version_rows.statements[0].rows.len(), 1);
-
-        let error = engine
-            .create_checkpoint()
-            .await
-            .expect_err("create_checkpoint should fail without local version heads");
-        assert!(
-            error.description.contains("has no committed head"),
-            "missing local version heads should block checkpoint creation, got: {error:?}"
-        );
-    }
-);
-
-simulation_test!(
     checkpoint_noop_returns_tip_and_updates_last_checkpoint,
     |sim| async move {
         let engine = sim

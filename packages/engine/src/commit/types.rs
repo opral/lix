@@ -85,4 +85,5 @@ pub struct GenerateCommitArgs {
 pub struct GenerateCommitResult {
     pub canonical_output: CanonicalCommitOutput,
     pub updated_version_refs: Vec<UpdatedVersionRef>,
+    pub affected_versions: Vec<String>,
 }

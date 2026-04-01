@@ -110,6 +110,7 @@ impl PreparedPublicRead {
     pub(crate) fn lowered_read(&self) -> Option<&LoweredReadProgram> {
         match &self.execution {
             PreparedPublicReadExecution::LoweredSql(lowered) => Some(lowered),
+            PreparedPublicReadExecution::ReadTimeProjection(_) => None,
             PreparedPublicReadExecution::Direct(_) => None,
         }
     }
@@ -1891,22 +1892,32 @@ fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWri
 #[cfg(test)]
 mod tests {
     use super::{
-        prepare_public_execution, prepare_public_read, prepare_public_read_strict,
-        PreparedPublicExecution, PreparedPublicReadExecution,
+        execute_prepared_public_read, prepare_public_execution, prepare_public_read,
+        prepare_public_read_strict, PreparedPublicExecution, PreparedPublicReadExecution,
     };
     use crate::contracts::artifacts::{
         FileHistoryRootScope, FileHistoryVersionScope, LiveStateMode, StateHistoryRootScope,
     };
     use crate::contracts::surface::{SurfaceReadFreshness, SurfaceRegistry};
-    use crate::live_state::mark_mode_with_backend;
+    use crate::live_state::{self, mark_mode_with_backend};
+    use crate::schema::builtin::types::LixCommit;
     use crate::sql::routing::delay_broad_routing_for_test;
     use crate::sql::{
         binder::{
             bind_public_read_statement, delay_broad_binding_for_test, forbid_broad_binding_for_test,
         },
-        explain::ExplainTimingCollector,
+        explain::{
+            ExplainPhysicalPlanSnapshot, ExplainPublicReadExecution, ExplainTimingCollector,
+        },
         logical_plan::{DependencyPrecision, DirectPublicReadPlan},
         semantic_ir::ExecutionContext,
+    };
+    use crate::test_support::{seed_canonical_change_row, CanonicalChangeSeed, TestSqliteBackend};
+    use crate::version::{
+        version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
+        version_descriptor_schema_version, version_descriptor_snapshot_content,
+        version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
+        version_ref_schema_version, version_ref_snapshot_content,
     };
     use crate::{LixBackend, LixError, QueryResult, Session, SqlDialect, Value};
     use async_trait::async_trait;
@@ -2100,6 +2111,14 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct VersionProjectionCaseDescriptor {
+        id: &'static str,
+        name: Option<&'static str>,
+        hidden: bool,
+        current_commit_id: Option<&'static str>,
+    }
+
     fn run_with_large_stack<T, F>(run: F) -> T
     where
         F: FnOnce() -> T + Send + 'static,
@@ -2158,6 +2177,298 @@ mod tests {
             admin_read.freshness_contract,
             SurfaceReadFreshness::AllowsStaleProjection
         );
+        match &admin_read.execution {
+            PreparedPublicReadExecution::ReadTimeProjection(artifact) => {
+                assert_eq!(artifact.surface.public_name(), "lix_version");
+                assert!(admin_read.explain.executor_artifacts.lowered_sql.is_empty());
+            }
+            PreparedPublicReadExecution::LoweredSql(_) => {
+                panic!("plain lix_version read should use read-time projection execution")
+            }
+            PreparedPublicReadExecution::Direct(_) => {
+                panic!("plain lix_version read should not use direct execution")
+            }
+        }
+    }
+
+    #[test]
+    fn prepares_plain_lix_version_reads_through_read_time_projection_without_lowered_sql() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    let active_version_id = session.active_version_id();
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one("SELECT id, commit_id FROM lix_version WHERE name = 'main'"),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("plain lix_version read should prepare");
+
+                    match &prepared.execution {
+                        PreparedPublicReadExecution::ReadTimeProjection(artifact) => {
+                            assert_eq!(artifact.surface.public_name(), "lix_version");
+                        }
+                        PreparedPublicReadExecution::LoweredSql(_) => {
+                            panic!("plain lix_version read should not lower canonical admin SQL")
+                        }
+                        PreparedPublicReadExecution::Direct(_) => {
+                            panic!("plain lix_version read should not use direct execution")
+                        }
+                    }
+
+                    assert!(
+                        prepared.explain.executor_artifacts.lowered_sql.is_empty(),
+                        "read-time projection execution should not emit lowered SQL"
+                    );
+                    match prepared.explain.physical_plan.as_deref() {
+                        Some(ExplainPhysicalPlanSnapshot::PublicRead(execution)) => {
+                            match execution.as_ref() {
+                                ExplainPublicReadExecution::ReadTimeProjection(snapshot) => {
+                                    assert_eq!(snapshot.surface_name, "lix_version");
+                                }
+                                ExplainPublicReadExecution::LoweredSql(_) => {
+                                    panic!("plain lix_version explain should not report lowered SQL execution")
+                                }
+                                ExplainPublicReadExecution::Direct(_) => {
+                                    panic!("plain lix_version explain should not report direct execution")
+                                }
+                            }
+                        }
+                        other => panic!("expected public-read physical plan snapshot, got {other:?}"),
+                    }
+                })
+        });
+    }
+
+    #[test]
+    fn descriptor_only_lix_version_read_matches_current_admin_sql_through_public_runtime() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    let active_version_id = session.active_version_id();
+                    seed_public_version_projection_case(
+                        &backend,
+                        &[VersionProjectionCaseDescriptor {
+                            id: "version-descriptor-only-public",
+                            name: Some("descriptor-only-public"),
+                            hidden: false,
+                            current_commit_id: None,
+                        }],
+                    )
+                    .await
+                    .expect("descriptor-only version case should seed");
+
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(
+                            "SELECT id, name, hidden, commit_id \
+                             FROM lix_version \
+                             WHERE id = 'version-descriptor-only-public'",
+                        ),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("descriptor-only lix_version read should prepare");
+                    assert!(matches!(
+                        prepared.execution,
+                        PreparedPublicReadExecution::ReadTimeProjection(_)
+                    ));
+                    assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
+
+                    let actual = execute_prepared_public_read(&backend, &prepared)
+                        .await
+                        .expect("descriptor-only lix_version read should execute");
+                    assert_eq!(
+                        actual,
+                        QueryResult {
+                            columns: vec![
+                                "id".to_string(),
+                                "name".to_string(),
+                                "hidden".to_string(),
+                                "commit_id".to_string(),
+                            ],
+                            rows: vec![vec![
+                                Value::Text("version-descriptor-only-public".to_string()),
+                                Value::Text("descriptor-only-public".to_string()),
+                                Value::Boolean(false),
+                                Value::Text(String::new()),
+                            ]],
+                        }
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn descriptor_and_ref_lix_version_read_matches_current_admin_sql_through_public_runtime() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    let active_version_id = session.active_version_id();
+                    seed_public_version_projection_case(
+                        &backend,
+                        &[VersionProjectionCaseDescriptor {
+                            id: "version-with-ref-public",
+                            name: Some("with-ref-public"),
+                            hidden: false,
+                            current_commit_id: Some("commit-with-ref-public"),
+                        }],
+                    )
+                    .await
+                    .expect("descriptor+ref version case should seed");
+
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(
+                            "SELECT id, name, hidden, commit_id \
+                             FROM lix_version \
+                             WHERE id = 'version-with-ref-public'",
+                        ),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("descriptor+ref lix_version read should prepare");
+                    assert!(matches!(
+                        prepared.execution,
+                        PreparedPublicReadExecution::ReadTimeProjection(_)
+                    ));
+                    assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
+
+                    let actual = execute_prepared_public_read(&backend, &prepared)
+                        .await
+                        .expect("descriptor+ref lix_version read should execute");
+                    assert_eq!(
+                        actual,
+                        QueryResult {
+                            columns: vec![
+                                "id".to_string(),
+                                "name".to_string(),
+                                "hidden".to_string(),
+                                "commit_id".to_string(),
+                            ],
+                            rows: vec![vec![
+                                Value::Text("version-with-ref-public".to_string()),
+                                Value::Text("with-ref-public".to_string()),
+                                Value::Boolean(false),
+                                Value::Text("commit-with-ref-public".to_string()),
+                            ]],
+                        }
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn multi_version_lix_version_read_matches_current_admin_sql_through_public_runtime() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    let active_version_id = session.active_version_id();
+                    seed_public_version_projection_case(
+                        &backend,
+                        &[
+                            VersionProjectionCaseDescriptor {
+                                id: "version-alpha-public",
+                                name: Some("alpha-public"),
+                                hidden: false,
+                                current_commit_id: Some("commit-alpha-public"),
+                            },
+                            VersionProjectionCaseDescriptor {
+                                id: "version-beta-public",
+                                name: None,
+                                hidden: false,
+                                current_commit_id: None,
+                            },
+                            VersionProjectionCaseDescriptor {
+                                id: "version-hidden-public",
+                                name: Some("hidden-public"),
+                                hidden: true,
+                                current_commit_id: Some("commit-hidden-public"),
+                            },
+                        ],
+                    )
+                    .await
+                    .expect("multi-version case should seed");
+
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(
+                            "SELECT id, name, hidden, commit_id \
+                             FROM lix_version \
+                             WHERE id IN ('version-alpha-public', 'version-beta-public', 'version-hidden-public') \
+                             ORDER BY id",
+                        ),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("multi-version lix_version read should prepare");
+                    assert!(matches!(
+                        prepared.execution,
+                        PreparedPublicReadExecution::ReadTimeProjection(_)
+                    ));
+                    assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
+
+                    let actual = execute_prepared_public_read(&backend, &prepared)
+                        .await
+                        .expect("multi-version lix_version read should execute");
+                    assert_eq!(
+                        actual,
+                        QueryResult {
+                            columns: vec![
+                                "id".to_string(),
+                                "name".to_string(),
+                                "hidden".to_string(),
+                                "commit_id".to_string(),
+                            ],
+                            rows: vec![
+                                vec![
+                                    Value::Text("version-alpha-public".to_string()),
+                                    Value::Text("alpha-public".to_string()),
+                                    Value::Boolean(false),
+                                    Value::Text("commit-alpha-public".to_string()),
+                                ],
+                                vec![
+                                    Value::Text("version-beta-public".to_string()),
+                                    Value::Text(String::new()),
+                                    Value::Boolean(false),
+                                    Value::Text(String::new()),
+                                ],
+                                vec![
+                                    Value::Text("version-hidden-public".to_string()),
+                                    Value::Text("hidden-public".to_string()),
+                                    Value::Boolean(true),
+                                    Value::Text("commit-hidden-public".to_string()),
+                                ],
+                            ],
+                        }
+                    );
+                })
+        });
     }
 
     #[test]
@@ -2942,6 +3253,9 @@ mod tests {
             PreparedPublicReadExecution::LoweredSql(_) => {
                 panic!("filesystem history read should not use lowered SQL")
             }
+            PreparedPublicReadExecution::ReadTimeProjection(_) => {
+                panic!("filesystem history read should not use read-time projection execution")
+            }
         }
     }
 
@@ -3008,6 +3322,11 @@ mod tests {
             PreparedPublicReadExecution::LoweredSql(_) => {
                 panic!("filesystem by-version history read should not use lowered SQL")
             }
+            PreparedPublicReadExecution::ReadTimeProjection(_) => {
+                panic!(
+                    "filesystem by-version history read should not use read-time projection execution"
+                )
+            }
         }
     }
 
@@ -3064,6 +3383,9 @@ mod tests {
             PreparedPublicReadExecution::LoweredSql(_) => {
                 panic!("directory history read should not use lowered SQL")
             }
+            PreparedPublicReadExecution::ReadTimeProjection(_) => {
+                panic!("directory history read should not use read-time projection execution")
+            }
         }
     }
 
@@ -3119,6 +3441,11 @@ mod tests {
                         }
                         PreparedPublicReadExecution::LoweredSql(_) => {
                             panic!("filesystem history read should not use lowered SQL")
+                        }
+                        PreparedPublicReadExecution::ReadTimeProjection(_) => {
+                            panic!(
+                                "filesystem history read should not use read-time projection execution"
+                            )
                         }
                     }
                 })
@@ -3689,6 +4016,9 @@ mod tests {
             PreparedPublicReadExecution::LoweredSql(_) => {
                 panic!("state-history read should not use lowered SQL")
             }
+            PreparedPublicReadExecution::ReadTimeProjection(_) => {
+                panic!("state-history read should not use read-time projection execution")
+            }
         }
     }
 
@@ -3788,16 +4118,149 @@ mod tests {
                     .expect("session runtime function read should prepare through public lowering");
 
                     assert_eq!(prepared.surface_bindings(), vec!["lix_version"]);
-                    if let Some(lowered_sql) =
-                        prepared.explain.executor_artifacts.lowered_sql.first()
-                    {
-                        assert!(!lowered_sql.contains("FROM lix_version"));
-                        assert!(lowered_sql.contains("FROM lix_internal_change c"));
-                        assert!(lowered_sql.contains("lix_version_descriptor"));
-                        assert!(lowered_sql.contains("current_refs"));
-                        assert!(!lowered_sql.contains("FROM lix_state_by_version"));
+                    match &prepared.execution {
+                        PreparedPublicReadExecution::LoweredSql(_) => {
+                            let lowered_sql = prepared
+                                .explain
+                                .executor_artifacts
+                                .lowered_sql
+                                .first()
+                                .expect("runtime-function lix_version read should still lower SQL");
+                            assert!(!lowered_sql.contains("FROM lix_version"));
+                            assert!(lowered_sql.contains("FROM lix_internal_change c"));
+                            assert!(lowered_sql.contains("lix_version_descriptor"));
+                            assert!(lowered_sql.contains("current_refs"));
+                            assert!(!lowered_sql.contains("FROM lix_state_by_version"));
+                        }
+                        PreparedPublicReadExecution::ReadTimeProjection(_) => {
+                            panic!(
+                                "runtime-function lix_version read should fall back to lowered SQL"
+                            )
+                        }
+                        PreparedPublicReadExecution::Direct(_) => {
+                            panic!(
+                                "runtime-function lix_version read should not use direct execution"
+                            )
+                        }
                     }
                 })
         });
+    }
+
+    async fn seed_public_version_projection_case(
+        backend: &TestSqliteBackend,
+        descriptors: &[VersionProjectionCaseDescriptor],
+    ) -> Result<(), LixError> {
+        live_state::register_schema(backend, version_descriptor_schema_key()).await?;
+        live_state::register_schema(backend, version_ref_schema_key()).await?;
+
+        let mut transaction = backend
+            .begin_transaction(crate::TransactionMode::Write)
+            .await?;
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            let timestamp = format!("2026-04-02T00:00:0{}Z", index);
+            live_state::upsert_bootstrap_tracked_row_in_transaction(
+                transaction.as_mut(),
+                descriptor.id,
+                version_descriptor_schema_key(),
+                version_descriptor_schema_version(),
+                version_descriptor_file_id(),
+                crate::version::GLOBAL_VERSION_ID,
+                version_descriptor_plugin_key(),
+                &format!("change-public-{}", descriptor.id),
+                &public_version_descriptor_snapshot_json(descriptor),
+                &timestamp,
+            )
+            .await?;
+
+            if let Some(commit_id) = descriptor.current_commit_id {
+                live_state::upsert_bootstrap_untracked_row_in_transaction(
+                    transaction.as_mut(),
+                    descriptor.id,
+                    version_ref_schema_key(),
+                    version_ref_schema_version(),
+                    version_ref_file_id(),
+                    crate::version::GLOBAL_VERSION_ID,
+                    version_ref_plugin_key(),
+                    &version_ref_snapshot_content(descriptor.id, commit_id),
+                    &format!("2026-04-02T00:01:0{}Z", index),
+                )
+                .await?;
+            }
+        }
+        transaction.commit().await?;
+
+        let mut change_ids = Vec::new();
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            let change_id = format!("change-public-{}", descriptor.id);
+            let snapshot_id = format!("snapshot-public-{}", descriptor.id);
+            change_ids.push(change_id.clone());
+            let snapshot_content = public_version_descriptor_snapshot_json(descriptor);
+            seed_canonical_change_row(
+                backend,
+                CanonicalChangeSeed {
+                    id: &change_id,
+                    entity_id: descriptor.id,
+                    schema_key: version_descriptor_schema_key(),
+                    schema_version: version_descriptor_schema_version(),
+                    file_id: version_descriptor_file_id(),
+                    plugin_key: version_descriptor_plugin_key(),
+                    snapshot_id: &snapshot_id,
+                    snapshot_content: Some(snapshot_content.as_str()),
+                    metadata: None,
+                    created_at: match index {
+                        0 => "2026-04-02T01:00:00Z",
+                        1 => "2026-04-02T01:00:01Z",
+                        2 => "2026-04-02T01:00:02Z",
+                        _ => "2026-04-02T01:00:03Z",
+                    },
+                },
+            )
+            .await?;
+        }
+
+        if !change_ids.is_empty() {
+            let commit_snapshot = serde_json::to_string(&LixCommit {
+                id: "commit-public-root".to_string(),
+                change_set_id: Some("cs-public-root".to_string()),
+                change_ids,
+                author_account_ids: Vec::new(),
+                parent_commit_ids: Vec::new(),
+            })
+            .expect("commit snapshot should serialize");
+            seed_canonical_change_row(
+                backend,
+                CanonicalChangeSeed {
+                    id: "change-public-root-commit",
+                    entity_id: "commit-public-root",
+                    schema_key: "lix_commit",
+                    schema_version: "1",
+                    file_id: "lix",
+                    plugin_key: "lix",
+                    snapshot_id: "snapshot-public-root-commit",
+                    snapshot_content: Some(commit_snapshot.as_str()),
+                    metadata: None,
+                    created_at: "2026-04-02T01:10:00Z",
+                },
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    fn public_version_descriptor_snapshot_json(
+        descriptor: &VersionProjectionCaseDescriptor,
+    ) -> String {
+        match descriptor.name {
+            Some(name) => {
+                version_descriptor_snapshot_content(descriptor.id, name, descriptor.hidden)
+            }
+            None => serde_json::json!({
+                "id": descriptor.id,
+                "hidden": descriptor.hidden,
+            })
+            .to_string(),
+        }
     }
 }
