@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use lix_engine::wasm::NoopWasmRuntime;
 use lix_engine::{
-    boot, BootArgs, CreateVersionOptions, Engine, Lix, LixConfig, NoopWasmRuntime, ObserveEvents,
+    boot, BootArgs, CreateVersionOptions, Engine, Lix, LixConfig, ObserveEvents,
     ObserveEventsOwned, ObserveQuery, OpenSessionOptions, Session, Value,
 };
 

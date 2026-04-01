@@ -1,6 +1,6 @@
 use crate::contracts::artifacts::SessionStateDelta;
 use crate::runtime::direct_state_file_cache_refresh_targets;
-use crate::state::stream::{
+use crate::runtime::streams::{
     state_commit_stream_changes_from_mutations, StateCommitStreamRuntimeMetadata,
 };
 

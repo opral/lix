@@ -13,7 +13,7 @@ use crate::canonical::read::{
     ExactCommittedStateRowRequest,
 };
 use crate::commit::ProposedDomainChange;
-use crate::state::stream::StateCommitStreamOperation;
+use crate::runtime::streams::StateCommitStreamOperation;
 use crate::version::context::{
     load_version_context_with_executor, ResolvedVersionTarget, VersionContextSource,
 };

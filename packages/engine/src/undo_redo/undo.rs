@@ -56,14 +56,14 @@ async fn undo_in_transaction(
         let mut state_commit_stream_changes = Vec::with_capacity(effects.len());
         for effect in &effects {
             match effect.forward_operation {
-                crate::state::stream::StateCommitStreamOperation::Insert => {
+                crate::runtime::streams::StateCommitStreamOperation::Insert => {
                     inverse_changes.push(build_tombstone_proposed_change(
                         &version_id,
                         &effect.forward_change,
                     )?);
                     state_commit_stream_changes.push(
-                        crate::state::stream::StateCommitStreamChange {
-                            operation: crate::state::stream::StateCommitStreamOperation::Delete,
+                        crate::runtime::streams::StateCommitStreamChange {
+                            operation: crate::runtime::streams::StateCommitStreamOperation::Delete,
                             entity_id: effect.forward_change.entity_id.clone(),
                             schema_key: effect.forward_change.schema_key.clone(),
                             schema_version: effect.forward_change.schema_version.clone(),
@@ -76,7 +76,7 @@ async fn undo_in_transaction(
                         },
                     );
                 }
-                crate::state::stream::StateCommitStreamOperation::Update => {
+                crate::runtime::streams::StateCommitStreamOperation::Update => {
                     let previous_row = effect.previous_row.as_ref().ok_or_else(|| {
                         LixError::unknown(format!(
                             "undo for commit '{}' requires prior row for updated change '{}'",
@@ -85,8 +85,8 @@ async fn undo_in_transaction(
                     })?;
                     let restored = build_restore_proposed_change(&version_id, previous_row)?;
                     state_commit_stream_changes.push(
-                        crate::state::stream::StateCommitStreamChange {
-                            operation: crate::state::stream::StateCommitStreamOperation::Update,
+                        crate::runtime::streams::StateCommitStreamChange {
+                            operation: crate::runtime::streams::StateCommitStreamOperation::Update,
                             entity_id: restored.entity_id.to_string(),
                             schema_key: restored.schema_key.to_string(),
                             schema_version: restored
@@ -121,7 +121,7 @@ async fn undo_in_transaction(
                     );
                     inverse_changes.push(restored);
                 }
-                crate::state::stream::StateCommitStreamOperation::Delete => {
+                crate::runtime::streams::StateCommitStreamOperation::Delete => {
                     let previous_row = effect.previous_row.as_ref().ok_or_else(|| {
                         LixError::unknown(format!(
                             "undo for commit '{}' requires prior row for deleted change '{}'",
@@ -130,8 +130,8 @@ async fn undo_in_transaction(
                     })?;
                     let restored = build_restore_proposed_change(&version_id, previous_row)?;
                     state_commit_stream_changes.push(
-                        crate::state::stream::StateCommitStreamChange {
-                            operation: crate::state::stream::StateCommitStreamOperation::Insert,
+                        crate::runtime::streams::StateCommitStreamChange {
+                            operation: crate::runtime::streams::StateCommitStreamOperation::Insert,
                             entity_id: restored.entity_id.to_string(),
                             schema_key: restored.schema_key.to_string(),
                             schema_version: restored

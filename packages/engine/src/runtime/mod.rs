@@ -4,6 +4,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 pub(crate) mod execution_state;
+pub(crate) mod functions;
+pub mod image;
+pub mod streams;
+pub mod wasm;
 
 use crate::backend::QueryExecutor;
 use crate::cel::CelEvaluator;
@@ -14,13 +18,13 @@ use crate::functions::SharedFunctionProvider;
 use crate::key_value::key_value_schema_key;
 use crate::plugin::runtime::CachedPluginComponent;
 use crate::plugin::types::InstalledPlugin;
-use crate::schema::SchemaKey;
-use crate::state::stream::{
+use crate::runtime::streams::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
+use crate::runtime::wasm::WasmRuntime;
+use crate::schema::SchemaKey;
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
-    WasmRuntime,
 };
 use async_trait::async_trait;
 use jsonschema::JSONSchema;

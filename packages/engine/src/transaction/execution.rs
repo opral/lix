@@ -1,7 +1,7 @@
 use crate::commit::{CanonicalCommitReceipt, PendingPublicCommitSession};
 use crate::contracts::artifacts::SchemaRegistration;
 use crate::engine::Engine;
-use crate::state::stream::StateCommitStreamChange;
+use crate::runtime::streams::StateCommitStreamChange;
 use crate::{LixBackendTransaction, LixError, ReplayCursor};
 
 use super::buffered_write_state::BufferedWriteState;

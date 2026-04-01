@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lix_engine::{boot, BootArgs, ExecuteOptions, LixError, NoopWasmRuntime, Value};
+use lix_engine::wasm::NoopWasmRuntime;
+use lix_engine::{boot, BootArgs, ExecuteOptions, LixError, Value};
 use serde_json::json;
 
 fn assert_text(value: &Value, expected: &str) {

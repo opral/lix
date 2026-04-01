@@ -7,8 +7,9 @@ use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::matching::select_best_glob_match;
 use crate::plugin::storage::plugin_key_from_archive_path;
 use crate::plugin::types::{InstalledPlugin, PluginContentType};
+use crate::runtime::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
 use crate::sql::executor::preprocess::preprocess_sql_to_plan as preprocess_sql;
-use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
+use crate::{LixBackend, LixError, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
@@ -52,7 +53,7 @@ struct PluginEntityChange {
 #[derive(Clone)]
 pub(crate) struct CachedPluginComponent {
     pub wasm: Vec<u8>,
-    pub instance: Arc<dyn crate::WasmComponentInstance>,
+    pub instance: Arc<dyn WasmComponentInstance>,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,7 +74,7 @@ async fn load_or_init_plugin_component(
     runtime: &dyn WasmRuntime,
     loaded_instances: &mut BTreeMap<String, CachedPluginComponent>,
     plugin: &InstalledPlugin,
-) -> Result<Arc<dyn crate::WasmComponentInstance>, LixError> {
+) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
     if let Some(cached) = loaded_instances.get(&plugin.key) {
         if cached.wasm == plugin.wasm {
             return Ok(cached.instance.clone());
@@ -283,7 +284,7 @@ pub(crate) fn binary_blob_hash_hex(data: &[u8]) -> String {
 }
 
 async fn call_apply_changes(
-    instance: &dyn crate::WasmComponentInstance,
+    instance: &dyn WasmComponentInstance,
     payload: &[u8],
 ) -> Result<Vec<u8>, LixError> {
     let mut errors = Vec::new();
@@ -1039,7 +1040,8 @@ mod tests {
     };
     use crate::plugin::matching::glob_matches_path;
     use crate::plugin::types::{InstalledPlugin, PluginContentType, PluginRuntime};
-    use crate::{LixError, Value, WasmComponentInstance, WasmLimits, WasmRuntime};
+    use crate::runtime::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
+    use crate::{LixError, Value};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;

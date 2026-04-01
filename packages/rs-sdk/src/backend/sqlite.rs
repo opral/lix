@@ -1,7 +1,8 @@
 use async_trait::async_trait;
+use lix_engine::image::{ImageChunkReader, ImageChunkWriter};
 use lix_engine::{
-    ImageChunkReader, ImageChunkWriter, LixBackend, LixBackendTransaction, LixError, PreparedBatch,
-    QueryResult, SqlDialect, TransactionMode, Value,
+    LixBackend, LixBackendTransaction, LixError, PreparedBatch, QueryResult, SqlDialect,
+    TransactionMode, Value,
 };
 use rusqlite::{
     backup::{Backup, StepResult},

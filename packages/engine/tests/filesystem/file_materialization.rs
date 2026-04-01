@@ -13,7 +13,8 @@ use std::sync::Arc;
 #[cfg(any())]
 use std::sync::OnceLock;
 
-use lix_engine::{ExecuteOptions, LixError, Value, WasmComponentInstance, WasmLimits, WasmRuntime};
+use lix_engine::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
+use lix_engine::{ExecuteOptions, LixError, Value};
 #[cfg(any())]
 use lix_engine::{LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope};
 use serde::{Deserialize, Serialize};
