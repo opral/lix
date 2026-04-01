@@ -1,6 +1,8 @@
 use crate::contracts::artifacts::FilesystemPayloadDomainChange;
 use crate::engine::Engine;
-use crate::filesystem::runtime::build_filesystem_payload_domain_changes_insert;
+use crate::filesystem::runtime::{
+    build_filesystem_payload_domain_changes_insert, resolve_binary_blob_writes_in_transaction,
+};
 use crate::{LixBackendTransaction, LixError};
 
 use super::planned_write::PlannedInternalWriteUnit;
@@ -30,12 +32,16 @@ pub(super) async fn run_internal_write_txn_with_transaction(
         )
         .await?;
     if !filesystem_finalization.binary_blob_writes.is_empty() {
-        engine
-            .persist_binary_blob_writes_in_transaction(
-                transaction,
-                &filesystem_finalization.binary_blob_writes,
-            )
-            .await?;
+        let resolved_binary_blob_writes = resolve_binary_blob_writes_in_transaction(
+            transaction,
+            &filesystem_finalization.binary_blob_writes,
+        )
+        .await?;
+        crate::binary_cas::write::persist_resolved_binary_blob_writes_in_transaction(
+            transaction,
+            &resolved_binary_blob_writes,
+        )
+        .await?;
     }
     persist_filesystem_payload_domain_changes_direct(
         transaction,

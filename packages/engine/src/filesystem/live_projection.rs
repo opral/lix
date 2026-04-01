@@ -1,3 +1,4 @@
+use crate::binary_cas::schema::INTERNAL_BINARY_BLOB_STORE;
 use crate::filesystem::path::ParsedFilePath;
 use crate::filesystem::queries::lookup_file_id_by_path;
 use crate::live_state::schema_access::{payload_column_name_for_schema, tracked_relation_name};
@@ -292,7 +293,7 @@ pub(crate) fn build_filesystem_file_projection_sql(
          LEFT JOIN binary_blob_ref_rows bfr \
            ON bfr.id = f.id \
           AND bfr.lixcol_version_id = f.lixcol_version_id \
-        LEFT JOIN lix_internal_binary_blob_store bbs \
+        LEFT JOIN {binary_blob_store} bbs \
            ON bbs.blob_hash = bfr.blob_hash",
         target_versions_cte = target_versions_cte_sql(
             scope,
@@ -308,6 +309,7 @@ pub(crate) fn build_filesystem_file_projection_sql(
         blob_candidates_sql = effective_binary_blob_ref_candidates_sql(),
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
         blob_hash_projection = blob_hash_projection,
+        binary_blob_store = INTERNAL_BINARY_BLOB_STORE,
         commit_id_projection = commit_id_projection,
         commit_change_set_id_column = commit_change_set_id_column,
         cse_change_set_id_column = cse_change_set_id_column,

@@ -1,6 +1,7 @@
 mod account;
 mod api;
 mod backend;
+mod binary_cas;
 mod boot;
 pub(crate) mod canonical;
 mod canonical_json;

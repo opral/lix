@@ -120,52 +120,6 @@ const INIT_STATEMENTS: &[&str] = &[
      built_max_depth BIGINT NOT NULL,\
      built_at TEXT NOT NULL\
      )",
-    "CREATE TABLE lix_internal_binary_blob_store (\
-     blob_hash TEXT PRIMARY KEY,\
-     data BYTEA NOT NULL,\
-     size_bytes BIGINT NOT NULL,\
-     created_at TEXT NOT NULL\
-     )",
-    "CREATE TABLE lix_internal_binary_blob_manifest (\
-     blob_hash TEXT PRIMARY KEY,\
-     size_bytes BIGINT NOT NULL,\
-     chunk_count BIGINT NOT NULL,\
-     created_at TEXT NOT NULL\
-     )",
-    "CREATE TABLE lix_internal_binary_chunk_store (\
-     chunk_hash TEXT PRIMARY KEY,\
-     data BYTEA NOT NULL,\
-     size_bytes BIGINT NOT NULL,\
-     codec TEXT NOT NULL DEFAULT 'legacy',\
-     codec_dict_id TEXT,\
-     created_at TEXT NOT NULL\
-     )",
-    "CREATE TABLE lix_internal_binary_blob_manifest_chunk (\
-     blob_hash TEXT NOT NULL,\
-     chunk_index BIGINT NOT NULL,\
-     chunk_hash TEXT NOT NULL,\
-     chunk_size BIGINT NOT NULL,\
-     PRIMARY KEY (blob_hash, chunk_index),\
-     FOREIGN KEY (blob_hash) REFERENCES lix_internal_binary_blob_manifest (blob_hash) ON DELETE RESTRICT,\
-     FOREIGN KEY (chunk_hash) REFERENCES lix_internal_binary_chunk_store (chunk_hash) ON DELETE RESTRICT\
-     )",
-    "CREATE INDEX idx_lix_internal_binary_blob_manifest_chunk_hash \
-     ON lix_internal_binary_blob_manifest_chunk (chunk_hash)",
-    "CREATE INDEX idx_lix_internal_binary_blob_manifest_chunk_blob_hash \
-     ON lix_internal_binary_blob_manifest_chunk (blob_hash)",
-    "CREATE TABLE lix_internal_binary_file_version_ref (\
-     file_id TEXT NOT NULL,\
-     version_id TEXT NOT NULL,\
-     blob_hash TEXT NOT NULL,\
-     size_bytes BIGINT NOT NULL,\
-     updated_at TEXT NOT NULL,\
-     PRIMARY KEY (file_id, version_id),\
-     FOREIGN KEY (blob_hash) REFERENCES lix_internal_binary_blob_manifest (blob_hash) ON DELETE RESTRICT\
-     )",
-    "CREATE INDEX idx_lix_internal_binary_file_version_ref_blob_hash \
-     ON lix_internal_binary_file_version_ref (blob_hash)",
-    "CREATE INDEX idx_lix_internal_binary_file_version_ref_version_id \
-     ON lix_internal_binary_file_version_ref (version_id)",
     "CREATE TABLE lix_internal_file_path_cache (\
      file_id TEXT NOT NULL,\
      version_id TEXT NOT NULL,\
@@ -231,13 +185,13 @@ pub(crate) async fn create_backend_tables(backend: &dyn LixBackend) -> Result<()
                 ),
             )
         })?;
-    add_binary_chunk_codec_columns(backend)
+    crate::binary_cas::init(backend)
         .await
         .map_err(|error| {
             LixError::new(
                 &error.code,
                 &format!(
-                    "create_backend_tables add_binary_chunk_codec_columns failed: {}",
+                    "create_backend_tables binary_cas::init failed: {}",
                     error.description
                 ),
             )
@@ -323,24 +277,6 @@ async fn create_observe_tick_table(backend: &dyn LixBackend) -> Result<(), LixEr
                 .await?;
         }
     }
-    Ok(())
-}
-
-async fn add_binary_chunk_codec_columns(backend: &dyn LixBackend) -> Result<(), LixError> {
-    add_column_if_missing(
-        backend,
-        "lix_internal_binary_chunk_store",
-        "codec",
-        "TEXT NOT NULL DEFAULT 'legacy'",
-    )
-    .await?;
-    add_column_if_missing(
-        backend,
-        "lix_internal_binary_chunk_store",
-        "codec_dict_id",
-        "TEXT",
-    )
-    .await?;
     Ok(())
 }
 

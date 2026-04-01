@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::program_runner::execute_write_program_with_transaction;
+use crate::binary_cas::write::build_binary_blob_fastcdc_write_program;
 use crate::canonical::graph::{
     build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
 };
@@ -17,7 +18,7 @@ use crate::deterministic_mode::{
     build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
 };
 use crate::filesystem::runtime::{
-    build_binary_blob_fastcdc_write_program, compile_filesystem_transaction_state_from_state,
+    compile_filesystem_transaction_state_from_state,
     filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
     BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
     FilesystemSemanticChange, FilesystemTransactionState, FILESYSTEM_DESCRIPTOR_FILE_ID,
@@ -1363,6 +1364,9 @@ mod tests {
         init_test_backend_core(&backend)
             .await
             .expect("test backend init should succeed");
+        crate::binary_cas::init(&backend)
+            .await
+            .expect("binary cas tables should init");
         crate::filesystem::init(&backend)
             .await
             .expect("filesystem tables should init");

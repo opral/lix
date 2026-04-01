@@ -5,6 +5,7 @@ use crate::contracts::artifacts::{
 };
 use crate::contracts::traits::UntrackedWriteParticipant;
 use crate::engine::Engine;
+use crate::filesystem::runtime::resolve_binary_blob_writes_in_transaction;
 use crate::functions::LixFunctionProvider;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
@@ -43,19 +44,30 @@ pub(super) async fn run_public_untracked_write_txn_with_transaction(
     if plan.execution.persist_filesystem_payloads_before_write
         && !filesystem_finalization.binary_blob_writes.is_empty()
     {
-        engine
-            .persist_binary_blob_writes_in_transaction(
-                transaction,
-                &filesystem_finalization.binary_blob_writes,
-            )
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "public untracked filesystem payload persistence failed inside write txn: {}",
-                    error.description
-                ),
-            })?;
+        let resolved_binary_blob_writes = resolve_binary_blob_writes_in_transaction(
+            transaction,
+            &filesystem_finalization.binary_blob_writes,
+        )
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "public untracked filesystem payload resolution failed inside write txn: {}",
+                error.description
+            ),
+        })?;
+        crate::binary_cas::write::persist_resolved_binary_blob_writes_in_transaction(
+            transaction,
+            &resolved_binary_blob_writes,
+        )
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "public untracked filesystem payload persistence failed inside write txn: {}",
+                error.description
+            ),
+        })?;
     }
     if filesystem_finalization.should_run_gc {
         engine

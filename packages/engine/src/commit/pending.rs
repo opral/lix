@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::program::WriteProgram;
 use crate::backend::program_runner::execute_write_program_with_transaction;
+use crate::binary_cas::write::build_binary_blob_fastcdc_write_program;
 use crate::canonical::graph::{
     build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
 };
@@ -10,7 +11,7 @@ use crate::canonical::journal::{
 };
 use crate::canonical::read::{load_version_info_for_versions, CommitQueryExecutor, VersionInfo};
 use crate::canonical_json::CanonicalJson;
-use crate::filesystem::runtime::{build_binary_blob_fastcdc_write_program, BinaryBlobWrite};
+use crate::filesystem::runtime::BinaryBlobWrite;
 use crate::functions::LixFunctionProvider;
 use crate::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,

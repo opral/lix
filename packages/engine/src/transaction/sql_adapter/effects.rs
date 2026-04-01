@@ -2,7 +2,9 @@ use crate::contracts::artifacts::PublicReadExecutionMode;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::{PendingPublicReadBackend, PendingView, PreparedPublicReadExecutor};
 use crate::engine::{DeferredTransactionSideEffects, Engine};
-use crate::filesystem::runtime::merge_filesystem_transaction_state;
+use crate::filesystem::runtime::{
+    merge_filesystem_transaction_state, resolve_binary_blob_writes_in_transaction,
+};
 use crate::runtime::TransactionBackendAdapter;
 use crate::sql::executor::execution_program::ExecutionContext;
 use crate::sql::executor::{
@@ -215,16 +217,28 @@ pub(super) async fn complete_sql_command_execution(
                 &command.compiled.execution().intent.filesystem_state,
             );
         if !filesystem_payload_changes_already_committed {
-            engine
-                .persist_binary_blob_writes_in_transaction(transaction, &binary_blob_writes)
-                .await
-                .map_err(|error| LixError {
-                    code: error.code,
-                    description: format!(
-                        "transaction pending filesystem payload persistence failed: {}",
-                        error.description
-                    ),
-                })?;
+            let resolved_binary_blob_writes =
+                resolve_binary_blob_writes_in_transaction(transaction, &binary_blob_writes)
+                    .await
+                    .map_err(|error| LixError {
+                        code: error.code,
+                        description: format!(
+                            "transaction pending filesystem payload resolution failed: {}",
+                            error.description
+                        ),
+                    })?;
+            crate::binary_cas::write::persist_resolved_binary_blob_writes_in_transaction(
+                transaction,
+                &resolved_binary_blob_writes,
+            )
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "transaction pending filesystem payload persistence failed: {}",
+                    error.description
+                ),
+            })?;
         }
         let filesystem_finalization = if filesystem_payload_changes_already_committed {
             None

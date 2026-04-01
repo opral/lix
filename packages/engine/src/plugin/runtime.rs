@@ -1,3 +1,5 @@
+use crate::binary_cas::read::load_binary_blob_data_by_hash;
+use crate::binary_cas::schema::INTERNAL_BINARY_FILE_VERSION_REF;
 use crate::cel::shared_runtime;
 use crate::filesystem::live_projection::{
     build_filesystem_file_projection_sql, FilesystemProjectionScope,
@@ -22,11 +24,6 @@ pub(crate) const BUILTIN_BINARY_FALLBACK_PLUGIN_KEY: &str = "lix_builtin_binary_
 const BUILTIN_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 const APPLY_CHANGES_EXPORTS: &[&str] = &["apply-changes", "api#apply-changes"];
-const BINARY_CHUNK_CODEC_LEGACY: &str = "legacy";
-const BINARY_CHUNK_CODEC_RAW: &str = "raw";
-const BINARY_CHUNK_CODEC_ZSTD: &str = "zstd";
-const BINARY_CHUNK_CODEC_PREFIX_RAW: &[u8] = b"LIXRAW01";
-const BINARY_CHUNK_CODEC_PREFIX_ZSTD: &[u8] = b"LIXZSTD1";
 
 #[derive(Debug, Clone)]
 struct FileDescriptorRow {
@@ -279,10 +276,6 @@ fn select_plugin_for_path<'a>(
     )
 }
 
-pub(crate) fn binary_blob_hash_hex(data: &[u8]) -> String {
-    blake3::hash(data).to_hex().to_string()
-}
-
 async fn call_apply_changes(
     instance: &dyn WasmComponentInstance,
     payload: &[u8],
@@ -408,15 +401,18 @@ pub(crate) async fn load_installed_plugins(
 ) -> Result<Vec<InstalledPlugin>, LixError> {
     let rows = backend
         .execute(
-            "SELECT binary_ref.file_id, path_cache.path, binary_ref.blob_hash \
-             FROM lix_internal_binary_file_version_ref AS binary_ref \
-             INNER JOIN lix_internal_file_path_cache AS path_cache \
-                 ON path_cache.file_id = binary_ref.file_id \
-                AND path_cache.version_id = binary_ref.version_id \
-             WHERE binary_ref.version_id = 'global' \
-               AND path_cache.path LIKE '/.lix/plugins/%.lixplugin' \
-               AND path_cache.path NOT LIKE '/.lix/plugins/%/%' \
-             ORDER BY path_cache.path",
+            &format!(
+                "SELECT binary_ref.file_id, path_cache.path, binary_ref.blob_hash \
+                 FROM {binary_file_version_ref} AS binary_ref \
+                 INNER JOIN lix_internal_file_path_cache AS path_cache \
+                     ON path_cache.file_id = binary_ref.file_id \
+                    AND path_cache.version_id = binary_ref.version_id \
+                 WHERE binary_ref.version_id = 'global' \
+                   AND path_cache.path LIKE '/.lix/plugins/%.lixplugin' \
+                   AND path_cache.path NOT LIKE '/.lix/plugins/%/%' \
+                 ORDER BY path_cache.path",
+                binary_file_version_ref = INTERNAL_BINARY_FILE_VERSION_REF,
+            ),
             &[],
         )
         .await?;
@@ -673,229 +669,6 @@ fn ensure_valid_plugin_wasm(wasm_bytes: &[u8]) -> Result<(), LixError> {
     Ok(())
 }
 
-pub(crate) async fn load_binary_blob_data_by_hash(
-    backend: &dyn LixBackend,
-    blob_hash: &str,
-) -> Result<Option<Vec<u8>>, LixError> {
-    let inline_result = backend
-        .execute(
-            "SELECT data \
-             FROM lix_internal_binary_blob_store \
-             WHERE blob_hash = $1 \
-             LIMIT 1",
-            &[Value::Text(blob_hash.to_string())],
-        )
-        .await?;
-
-    if let Some(row) = inline_result.rows.first() {
-        return Ok(Some(blob_required(row, 0, "data")?));
-    }
-
-    let manifest_rows = backend
-        .execute(
-            "SELECT size_bytes, chunk_count \
-             FROM lix_internal_binary_blob_manifest \
-             WHERE blob_hash = $1 \
-             LIMIT 1",
-            &[Value::Text(blob_hash.to_string())],
-        )
-        .await?;
-    let Some(manifest_row) = manifest_rows.rows.first() else {
-        return Ok(None);
-    };
-    let manifest_size_bytes = i64_required(manifest_row, 0, "size_bytes")?;
-    let manifest_chunk_count = i64_required(manifest_row, 1, "chunk_count")?;
-    if manifest_size_bytes < 0 || manifest_chunk_count < 0 {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: invalid negative manifest values for blob hash '{}'",
-                blob_hash
-            ),
-        });
-    }
-
-    let chunk_rows = backend
-        .execute(
-            "SELECT mc.chunk_index, mc.chunk_hash, mc.chunk_size, cs.data, cs.codec \
-             FROM lix_internal_binary_blob_manifest_chunk mc \
-             LEFT JOIN lix_internal_binary_chunk_store cs ON cs.chunk_hash = mc.chunk_hash \
-             WHERE mc.blob_hash = $1 \
-             ORDER BY mc.chunk_index ASC",
-            &[Value::Text(blob_hash.to_string())],
-        )
-        .await?;
-
-    let expected_chunk_count = usize::try_from(manifest_chunk_count).map_err(|_| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "plugin materialization: chunk count out of range for blob hash '{}'",
-            blob_hash
-        ),
-    })?;
-    if chunk_rows.rows.len() != expected_chunk_count {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                "plugin materialization: chunk manifest mismatch for blob hash '{}': expected {} chunks, got {}",
-                blob_hash,
-                expected_chunk_count,
-                chunk_rows.rows.len()
-            ),
-        });
-    }
-
-    let mut reconstructed = Vec::with_capacity(usize::try_from(manifest_size_bytes).unwrap_or(0));
-    for (expected_index, row) in chunk_rows.rows.iter().enumerate() {
-        let chunk_index = i64_required(row, 0, "chunk_index")?;
-        let chunk_hash = text_required(row, 1, "chunk_hash")?;
-        let chunk_size = i64_required(row, 2, "chunk_size")?;
-        if chunk_index != expected_index as i64 {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                    "plugin materialization: unexpected chunk order for blob hash '{}': expected index {}, got {}",
-                    blob_hash, expected_index, chunk_index
-                ),
-            });
-        }
-        if chunk_size < 0 {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                    "plugin materialization: invalid negative chunk size for blob hash '{}' chunk '{}'",
-                    blob_hash, chunk_hash
-                ),
-            });
-        }
-        let chunk_data = blob_required(row, 3, "data").map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: missing chunk payload for blob hash '{}' chunk '{}'",
-                blob_hash, chunk_hash
-            ),
-        })?;
-        let codec = nullable_text(row, 4, "codec")?;
-        let expected_chunk_size = usize::try_from(chunk_size).map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: chunk size out of range for blob hash '{}' chunk '{}': {}",
-                blob_hash, chunk_hash, chunk_size
-            ),
-        })?;
-        let decoded_chunk_data = decode_binary_chunk_payload(
-            &chunk_data,
-            codec.as_deref(),
-            expected_chunk_size,
-            blob_hash,
-            &chunk_hash,
-        )?;
-        if decoded_chunk_data.len() as i64 != chunk_size {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                    "plugin materialization: chunk size mismatch for blob hash '{}' chunk '{}': expected {}, got {}",
-                    blob_hash,
-                    chunk_hash,
-                    chunk_size,
-                    decoded_chunk_data.len()
-                ),
-            });
-        }
-        reconstructed.extend_from_slice(&decoded_chunk_data);
-    }
-
-    if reconstructed.len() as i64 != manifest_size_bytes {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                "plugin materialization: reconstructed size mismatch for blob hash '{}': expected {}, got {}",
-                blob_hash,
-                manifest_size_bytes,
-                reconstructed.len()
-            ),
-        });
-    }
-
-    Ok(Some(reconstructed))
-}
-
-fn decode_binary_chunk_payload(
-    chunk_data: &[u8],
-    codec: Option<&str>,
-    expected_chunk_size: usize,
-    blob_hash: &str,
-    chunk_hash: &str,
-) -> Result<Vec<u8>, LixError> {
-    match codec {
-        Some(BINARY_CHUNK_CODEC_RAW) => Ok(chunk_data.to_vec()),
-        Some(BINARY_CHUNK_CODEC_ZSTD) => {
-            decode_binary_chunk_zstd_payload(chunk_data, expected_chunk_size, blob_hash, chunk_hash)
-        }
-        Some(BINARY_CHUNK_CODEC_LEGACY) | None => {
-            decode_legacy_binary_chunk_payload(chunk_data, expected_chunk_size, blob_hash, chunk_hash)
-        }
-        Some(other) => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                "plugin materialization: unsupported chunk codec '{}' for blob hash '{}' chunk '{}'",
-                other, blob_hash, chunk_hash
-            ),
-        }),
-    }
-}
-
-fn decode_legacy_binary_chunk_payload(
-    chunk_data: &[u8],
-    expected_chunk_size: usize,
-    blob_hash: &str,
-    chunk_hash: &str,
-) -> Result<Vec<u8>, LixError> {
-    if let Some(raw_payload) = chunk_data.strip_prefix(BINARY_CHUNK_CODEC_PREFIX_RAW) {
-        return Ok(raw_payload.to_vec());
-    }
-
-    if let Some(compressed_payload) = chunk_data.strip_prefix(BINARY_CHUNK_CODEC_PREFIX_ZSTD) {
-        return decode_binary_chunk_zstd_payload(
-            compressed_payload,
-            expected_chunk_size,
-            blob_hash,
-            chunk_hash,
-        );
-    }
-
-    // Backward compatibility for unframed rows written before Phase 2.
-    Ok(chunk_data.to_vec())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn decode_binary_chunk_zstd_payload(
-    compressed_payload: &[u8],
-    expected_chunk_size: usize,
-    blob_hash: &str,
-    chunk_hash: &str,
-) -> Result<Vec<u8>, LixError> {
-    zstd::bulk::decompress(compressed_payload, expected_chunk_size).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-            "plugin materialization: chunk decompression failed for blob hash '{}' chunk '{}': {error}",
-            blob_hash, chunk_hash
-        ),
-    })
-}
-
-#[cfg(target_arch = "wasm32")]
-fn decode_binary_chunk_zstd_payload(
-    compressed_payload: &[u8],
-    _expected_chunk_size: usize,
-    blob_hash: &str,
-    chunk_hash: &str,
-) -> Result<Vec<u8>, LixError> {
-    use std::io::Read as _;
-
-    let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed_payload).map_err(
-        |error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                "plugin materialization: chunk decompression failed for blob hash '{}' chunk '{}': {error}",
-                blob_hash, chunk_hash
-            ),
-        },
-    )?;
-
-    let mut output = Vec::new();
-    decoder.read_to_end(&mut output).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-            "plugin materialization: chunk decompression failed for blob hash '{}' chunk '{}': {error}",
-            blob_hash, chunk_hash
-        ),
-    })?;
-    Ok(output)
-}
-
 async fn load_file_cache_data(
     backend: &dyn LixBackend,
     file_id: &str,
@@ -978,43 +751,6 @@ fn text_required(row: &[Value], index: usize, column: &str) -> Result<String, Li
     }
 }
 
-fn nullable_text(row: &[Value], index: usize, column: &str) -> Result<Option<String>, LixError> {
-    let Some(value) = row.get(index) else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: row missing column '{column}' at index {index}"
-            ),
-        });
-    };
-    match value {
-        Value::Null => Ok(None),
-        Value::Text(text) => Ok(Some(text.clone())),
-        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                "plugin materialization: expected nullable text column '{column}' at index {index}, got {other:?}"
-            ),
-        }),
-    }
-}
-
-fn i64_required(row: &[Value], index: usize, column: &str) -> Result<i64, LixError> {
-    let Some(value) = row.get(index) else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: row missing column '{column}' at index {index}"
-            ),
-        });
-    };
-    match value {
-        Value::Integer(number) => Ok(*number),
-        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                "plugin materialization: expected integer column '{column}' at index {index}, got {other:?}"
-            ),
-        }),
-    }
-}
-
 fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, LixError> {
     let Some(value) = row.get(index) else {
         return Err(LixError {
@@ -1035,13 +771,11 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        blob_required, load_or_init_plugin_component, select_plugin_for_path, CachedPluginComponent,
-    };
+    use super::{load_or_init_plugin_component, select_plugin_for_path, CachedPluginComponent};
     use crate::plugin::matching::glob_matches_path;
     use crate::plugin::types::{InstalledPlugin, PluginContentType, PluginRuntime};
     use crate::runtime::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
-    use crate::{LixError, Value};
+    use crate::LixError;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1102,19 +836,6 @@ mod tests {
     #[test]
     fn match_path_glob_invalid_pattern_does_not_match() {
         assert!(!glob_matches_path("*.{md,mdx", "/notes.md"));
-    }
-
-    #[test]
-    fn blob_required_rejects_text_values() {
-        let err = blob_required(&[Value::Text("hello".to_string())], 0, "data")
-            .expect_err("text should not be accepted as blob data");
-
-        assert!(
-            err.description
-                .contains("expected blob column 'data' at index 0"),
-            "unexpected error: {}",
-            err.description
-        );
     }
 
     #[test]

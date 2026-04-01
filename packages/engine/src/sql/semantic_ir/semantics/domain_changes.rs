@@ -226,7 +226,7 @@ fn build_idempotency_key(
     let summarized_bytes = serde_json::to_vec(&summarized).map_err(|error| DomainChangeError {
         message: format!("public idempotency-key serialization failed: {error}"),
     })?;
-    let fingerprint = crate::plugin::runtime::binary_blob_hash_hex(&summarized_bytes);
+    let fingerprint = crate::binary_cas::codec::binary_blob_hash_hex(&summarized_bytes);
 
     Ok(IdempotencyKey(
         json!({
@@ -307,20 +307,20 @@ fn summarize_engine_value(value: &crate::Value) -> JsonValue {
         }),
         crate::Value::Text(text) => json!({
             "kind": "text",
-            "sha256": crate::plugin::runtime::binary_blob_hash_hex(text.as_bytes()),
+            "sha256": crate::binary_cas::codec::binary_blob_hash_hex(text.as_bytes()),
             "len": text.len(),
         }),
         crate::Value::Json(value) => {
             let encoded = value.to_string();
             json!({
                 "kind": "json",
-                "sha256": crate::plugin::runtime::binary_blob_hash_hex(encoded.as_bytes()),
+                "sha256": crate::binary_cas::codec::binary_blob_hash_hex(encoded.as_bytes()),
                 "len": encoded.len(),
             })
         }
         crate::Value::Blob(bytes) => json!({
             "kind": "blob",
-            "sha256": crate::plugin::runtime::binary_blob_hash_hex(bytes),
+            "sha256": crate::binary_cas::codec::binary_blob_hash_hex(bytes),
             "len": bytes.len(),
         }),
         crate::Value::Integer(value) => json!({
