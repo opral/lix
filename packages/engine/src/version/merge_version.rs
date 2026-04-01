@@ -12,8 +12,8 @@ use crate::live_state::{
     rebuild_scope_in_transaction, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
     LiveStateRebuildScope,
 };
+use crate::runtime::streams::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::runtime::TransactionBackendAdapter;
-use crate::state::stream::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::version::context::{
     exact_resolved_head_preconditions, require_version_context_pair_in_transaction,
     validate_expected_head_commit_id,

@@ -55,7 +55,7 @@ async fn redo_in_transaction(
         let mut state_commit_stream_changes = Vec::with_capacity(effects.len());
         for effect in &effects {
             let proposed = build_forward_proposed_change(&version_id, &effect.forward_change)?;
-            state_commit_stream_changes.push(crate::state::stream::StateCommitStreamChange {
+            state_commit_stream_changes.push(crate::runtime::streams::StateCommitStreamChange {
                 operation: effect.forward_operation,
                 entity_id: proposed.entity_id.to_string(),
                 schema_key: proposed.schema_key.to_string(),

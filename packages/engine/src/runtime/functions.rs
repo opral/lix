@@ -5,8 +5,9 @@ use crate::deterministic_mode::{
     load_runtime_settings, DeterministicSettings, RuntimeFunctionProvider,
 };
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::runtime::Runtime;
 use crate::{LixBackend, LixBackendTransaction, LixError};
+
+use super::Runtime;
 
 impl Runtime {
     pub(crate) async fn prepare_runtime_functions_with_backend(
@@ -77,7 +78,8 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{boot, BootArgs, NoopWasmRuntime, QueryResult, SqlDialect, Value};
+    use crate::runtime::wasm::NoopWasmRuntime;
+    use crate::{boot, BootArgs, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},

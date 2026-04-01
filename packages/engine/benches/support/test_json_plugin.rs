@@ -1,5 +1,6 @@
 use async_trait::async_trait;
-use lix_engine::{LixError, WasmComponentInstance, WasmLimits, WasmRuntime};
+use lix_engine::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
+use lix_engine::LixError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use std::io::{Cursor, Write};

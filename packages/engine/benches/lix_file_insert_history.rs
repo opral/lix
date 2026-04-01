@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use lix_engine::wasm::NoopWasmRuntime;
 use lix_engine::{
-    boot, BootArgs, LixBackend, LixBackendTransaction, LixError, NoopWasmRuntime, PreparedBatch,
-    QueryResult, Session, SqlDialect, TransactionMode, Value,
+    boot, BootArgs, LixBackend, LixBackendTransaction, LixError, PreparedBatch, QueryResult,
+    Session, SqlDialect, TransactionMode, Value,
 };
 use std::collections::BTreeMap;
 use std::fs;

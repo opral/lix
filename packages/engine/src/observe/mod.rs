@@ -1,11 +1,11 @@
 use crate::contracts::artifacts::SessionDependency;
 use crate::errors;
+use crate::runtime::streams::StateCommitStream;
 use crate::session::Session;
 use crate::sql::executor::dependency_spec::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
 };
 use crate::sql::parser::parse_sql_statements;
-use crate::state::stream::StateCommitStream;
 use crate::wire::WireValue;
 use crate::{LixError, QueryResult, Value};
 use serde::{Deserialize, Serialize};
@@ -949,9 +949,8 @@ mod tests {
         OBSERVE_TICK_POLL_INTERVAL,
     };
     use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect};
-    use crate::{
-        boot, BootArgs, ExecuteOptions, LixError, NoopWasmRuntime, QueryResult, Session, Value,
-    };
+    use crate::runtime::wasm::NoopWasmRuntime;
+    use crate::{boot, BootArgs, ExecuteOptions, LixError, QueryResult, Session, Value};
     use async_trait::async_trait;
     use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -3,12 +3,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
+use crate::runtime::image::ImageChunkWriter;
+use crate::runtime::wasm::WasmRuntime;
 use crate::{
     boot::EngineConfig, observe::observe_owned_session, BootKeyValue, CreateCheckpointResult,
-    CreateVersionOptions, CreateVersionResult, Engine, ExecuteOptions, ExecuteResult,
-    ImageChunkWriter, LixBackend, LixError, MergeVersionOptions, MergeVersionResult,
-    ObserveEventsOwned, ObserveQuery, OpenSessionOptions, RedoOptions, RedoResult, Session,
-    UndoOptions, UndoResult, Value, WasmRuntime,
+    CreateVersionOptions, CreateVersionResult, Engine, ExecuteOptions, ExecuteResult, LixBackend,
+    LixError, MergeVersionOptions, MergeVersionResult, ObserveEventsOwned, ObserveQuery,
+    OpenSessionOptions, RedoOptions, RedoResult, Session, UndoOptions, UndoResult, Value,
 };
 
 pub struct LixConfig {

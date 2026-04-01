@@ -5,10 +5,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
+use crate::runtime::wasm::NoopWasmRuntime;
 use crate::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::{
     boot, BootArgs, CommittedVersionFrontier, Engine, LixBackend, LixBackendTransaction, LixError,
-    NoopWasmRuntime, QueryResult, ReplayCursor, Session, SqlDialect, TransactionMode, Value,
+    QueryResult, ReplayCursor, Session, SqlDialect, TransactionMode, Value,
 };
 
 type SqlPredicate = Arc<dyn Fn(&str, &[Value]) -> bool + Send + Sync>;

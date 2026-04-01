@@ -5,11 +5,12 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use lix_engine::image::{ImageChunkReader, ImageChunkWriter};
+use lix_engine::wasm::{NoopWasmRuntime, WasmRuntime};
 use lix_engine::{
-    boot, collapse_prepared_batch_for_dialect, BootArgs, CreateVersionOptions, Engine,
-    ImageChunkReader, ImageChunkWriter, LixBackend, LixBackendTransaction, LixError,
-    NoopWasmRuntime, PreparedBatch, QueryResult, Session, SqlDialect, TransactionMode, Value,
-    WasmRuntime,
+    boot, collapse_prepared_batch_for_dialect, BootArgs, CreateVersionOptions, Engine, LixBackend,
+    LixBackendTransaction, LixError, PreparedBatch, QueryResult, Session, SqlDialect,
+    TransactionMode, Value,
 };
 use rusqlite::{
     backup::{Backup, StepResult},
