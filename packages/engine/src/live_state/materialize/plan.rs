@@ -607,15 +607,27 @@ fn resolve_projection_candidates(
     let mut rows = Vec::new();
     for ((_version_id, _entity_id, _schema_key, _file_id), mut items) in candidates {
         items.sort_by(|a, b| {
-            a.depth
-                .cmp(&b.depth)
-                .then_with(|| b.row.change_id.cmp(&a.row.change_id))
+            if uses_global_version_descriptor_replay_ordering(a) {
+                b.row
+                    .replay_cursor
+                    .cmp(&a.row.replay_cursor)
+                    .then_with(|| b.row.change_id.cmp(&a.row.change_id))
+            } else {
+                a.depth
+                    .cmp(&b.depth)
+                    .then_with(|| b.row.change_id.cmp(&a.row.change_id))
+            }
         });
         if let Some(winner) = items.into_iter().next() {
             rows.push(winner.row);
         }
     }
     rows
+}
+
+fn uses_global_version_descriptor_replay_ordering(candidate: &ProjectionCandidate) -> bool {
+    candidate.row.version_id == GLOBAL_VERSION_ID
+        && candidate.row.schema_key == "lix_version_descriptor"
 }
 
 fn canonical_json_value(value: serde_json::Value) -> CanonicalJson {
@@ -1029,5 +1041,65 @@ mod tests {
             "expected explicit canonical version-ref rejection, got: {}",
             error.description
         );
+    }
+
+    #[test]
+    fn resolve_projection_candidates_prefers_newer_global_version_descriptor_tombstone() {
+        let key = (
+            GLOBAL_VERSION_ID.to_string(),
+            "version-deleted".to_string(),
+            "lix_version_descriptor".to_string(),
+            "lix".to_string(),
+        );
+        let older_descriptor = ProjectionCandidate {
+            depth: usize::MAX / 4,
+            row: VisibleRow {
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                commit_id: GLOBAL_VERSION_ID.to_string(),
+                replay_cursor: ReplayCursor::new("change-old", "2026-04-01T00:00:00Z"),
+                change_id: "change-old".to_string(),
+                entity_id: "version-deleted".to_string(),
+                schema_key: "lix_version_descriptor".to_string(),
+                schema_version: "1".to_string(),
+                file_id: "lix".to_string(),
+                plugin_key: "lix".to_string(),
+                snapshot_content: Some(
+                    CanonicalJson::from_text(
+                        "{\"id\":\"version-deleted\",\"name\":\"Version Deleted\",\"hidden\":false}",
+                    )
+                    .expect("descriptor snapshot should parse"),
+                ),
+                metadata: None,
+                created_at: "2026-04-01T00:00:00Z".to_string(),
+                updated_at: "2026-04-01T00:00:00Z".to_string(),
+            },
+        };
+        let newer_tombstone = ProjectionCandidate {
+            depth: usize::MAX / 4,
+            row: VisibleRow {
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                commit_id: GLOBAL_VERSION_ID.to_string(),
+                replay_cursor: ReplayCursor::new("change-new", "2026-04-01T00:00:01Z"),
+                change_id: "change-new".to_string(),
+                entity_id: "version-deleted".to_string(),
+                schema_key: "lix_version_descriptor".to_string(),
+                schema_version: "1".to_string(),
+                file_id: "lix".to_string(),
+                plugin_key: "lix".to_string(),
+                snapshot_content: None,
+                metadata: None,
+                created_at: "2026-04-01T00:00:01Z".to_string(),
+                updated_at: "2026-04-01T00:00:01Z".to_string(),
+            },
+        };
+
+        let rows = resolve_projection_candidates(BTreeMap::from([(
+            key,
+            vec![older_descriptor, newer_tombstone],
+        )]));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].change_id, "change-new");
+        assert_eq!(rows[0].snapshot_content, None);
     }
 }

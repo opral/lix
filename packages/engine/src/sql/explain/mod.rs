@@ -9,9 +9,9 @@ use crate::contracts::artifacts::{
     CommitPreconditions, DirectoryHistoryRequest, DomainChangeBatch, EffectiveStateRequest,
     EffectiveStateVersionScope, ExpectedHead, FileHistoryContentMode, FileHistoryLineageScope,
     FileHistoryRequest, FileHistoryRootScope, FileHistoryVersionScope, PublicDomainChange,
-    SemanticEffect, SessionDependency, SessionStateDelta, StateHistoryContentMode,
-    StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope,
-    StateHistoryVersionScope,
+    ReadTimeProjectionRead, SemanticEffect, SessionDependency, SessionStateDelta,
+    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest,
+    StateHistoryRootScope, StateHistoryVersionScope,
 };
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
@@ -1177,7 +1177,18 @@ pub(crate) enum ExplainDirectPublicReadPlan {
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub(crate) enum ExplainPublicReadExecution {
     LoweredSql(Box<LoweredReadProgramSnapshot>),
+    ReadTimeProjection(Box<ExplainReadTimeProjectionReadSnapshot>),
     Direct(Box<ExplainDirectPublicReadPlan>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExplainReadTimeProjectionReadSnapshot {
+    pub(crate) surface_name: String,
+    pub(crate) projection_count: usize,
+    pub(crate) filter_count: usize,
+    pub(crate) order_by_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -2058,6 +2069,14 @@ fn render_physical_plan_text(plan: &ExplainPhysicalPlanSnapshot) -> String {
                 "kind: public_read\nexecution: lowered_sql\nstatements: {}\nresult_columns: {}",
                 program.statements.len(),
                 explain_lowered_result_columns_kind_label(program.result_columns.kind),
+            ),
+            ExplainPublicReadExecution::ReadTimeProjection(read) => format!(
+                "kind: public_read\nexecution: read_time_projection\nsurface: {}\nprojections: {}\nfilters: {}\norder_by: {}\nlimit: {}",
+                read.surface_name,
+                read.projection_count,
+                read.filter_count,
+                read.order_by_count,
+                read.limit.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string()),
             ),
             ExplainPublicReadExecution::Direct(plan) => format!(
                 "kind: public_read\nexecution: direct\ndirect_plan: {}",
@@ -4691,9 +4710,26 @@ fn public_read_execution_snapshot(
         PreparedPublicReadExecution::LoweredSql(program) => {
             ExplainPublicReadExecution::LoweredSql(Box::new(lowered_read_program_snapshot(program)))
         }
+        PreparedPublicReadExecution::ReadTimeProjection(read) => {
+            ExplainPublicReadExecution::ReadTimeProjection(Box::new(
+                read_time_projection_read_snapshot(read),
+            ))
+        }
         PreparedPublicReadExecution::Direct(plan) => {
             ExplainPublicReadExecution::Direct(Box::new(direct_public_read_plan_snapshot(plan)))
         }
+    }
+}
+
+fn read_time_projection_read_snapshot(
+    read: &ReadTimeProjectionRead,
+) -> ExplainReadTimeProjectionReadSnapshot {
+    ExplainReadTimeProjectionReadSnapshot {
+        surface_name: read.surface.public_name().to_string(),
+        projection_count: read.query.projections.len(),
+        filter_count: read.query.filters.len(),
+        order_by_count: read.query.order_by.len(),
+        limit: read.query.limit,
     }
 }
 

@@ -124,7 +124,7 @@ fn finalize_dependency_spec(mut spec: DependencySpec) -> DependencySpec {
                     depends_on_active_version = true;
                 }
             }
-            "lix_version" | "lix_version_by_version" => {
+            "lix_version" => {
                 compiled_schema_keys.insert("lix_version_descriptor".to_string());
                 compiled_schema_keys.insert("lix_version_ref".to_string());
                 depends_on_public_surface_registry = true;
@@ -676,15 +676,11 @@ mod tests {
     }
 
     #[test]
-    fn derive_dependency_spec_maps_version_views_to_descriptor_and_pointer() {
-        let statements = parse_sql_statements(
-            "SELECT id FROM lix_version; \
-             SELECT id FROM lix_version_by_version",
-        )
-        .expect("parse sql");
+    fn derive_dependency_spec_maps_lix_version_to_descriptor_and_pointer() {
+        let statements = parse_sql_statements("SELECT id FROM lix_version").expect("parse sql");
         let spec = derive_dependency_spec_from_statements(&statements, &[]).expect("derive spec");
 
-        assert_eq!(spec.precision, DependencyPrecision::Conservative);
+        assert_eq!(spec.precision, DependencyPrecision::Precise);
         assert_eq!(
             spec.schema_keys.iter().cloned().collect::<Vec<_>>(),
             vec![

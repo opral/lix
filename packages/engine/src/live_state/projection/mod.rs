@@ -8,6 +8,8 @@
 //! If this state is lost, the engine may need to rescan or rebuild projections.
 //! Canonical meaning remains recoverable from `canonical/*`.
 
+pub(crate) mod dispatch;
+pub(crate) mod hydration;
 pub(crate) mod replay;
 pub(crate) mod status;
 
