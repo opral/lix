@@ -808,23 +808,6 @@ async fn validate_filesystem_insert_integrity(
     validate_filesystem_snapshot_integrity(backend, &row.schema_key, snapshot, true, None).await
 }
 
-async fn binary_cas_blob_exists(
-    backend: &dyn LixBackend,
-    blob_hash: &str,
-) -> Result<bool, LixError> {
-    let result = backend
-        .execute(
-            "SELECT 1 \
-             FROM lix_internal_binary_blob_store bs \
-             JOIN lix_internal_binary_blob_manifest bm ON bm.blob_hash = bs.blob_hash \
-             WHERE bs.blob_hash = $1 \
-             LIMIT 1",
-            &[Value::Text(blob_hash.to_string())],
-        )
-        .await?;
-    Ok(!result.rows.is_empty())
-}
-
 fn extract_registered_schema_value(snapshot: &JsonValue) -> Result<&JsonValue, LixError> {
     snapshot.get("value").ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -900,7 +883,7 @@ async fn validate_filesystem_snapshot_integrity(
         .is_some_and(|planned_binary_blob_hashes| planned_binary_blob_hashes.contains(blob_hash));
     if require_binary_blob_ref_cas
         && !is_planned_blob
-        && !binary_cas_blob_exists(backend, blob_hash).await?
+        && !crate::binary_cas::read::blob_exists(backend, blob_hash).await?
     {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -925,7 +908,7 @@ fn collect_planned_binary_blob_hashes(
     let mut hashes = HashSet::new();
     for file in resolved.filesystem_state().files.values() {
         if let Some(data) = file.data.as_ref() {
-            hashes.insert(crate::plugin::runtime::binary_blob_hash_hex(data));
+            hashes.insert(crate::binary_cas::codec::binary_blob_hash_hex(data));
         }
     }
     Ok(hashes)

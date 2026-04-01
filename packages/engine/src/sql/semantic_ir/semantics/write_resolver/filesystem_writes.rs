@@ -1865,7 +1865,7 @@ fn binary_blob_ref_row(
     })?;
     let snapshot_content = json!({
         "id": file_id,
-        "blob_hash": crate::plugin::runtime::binary_blob_hash_hex(data),
+        "blob_hash": crate::binary_cas::codec::binary_blob_hash_hex(data),
         "size_bytes": size_bytes,
     })
     .to_string();

@@ -1,3 +1,4 @@
+use crate::binary_cas::read::load_binary_blob_data_by_hash;
 use crate::canonical::read::load_state_history_rows;
 use crate::contracts::artifacts::{
     DirectoryHistoryRequest, DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope,
@@ -5,7 +6,6 @@ use crate::contracts::artifacts::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
     StateHistoryVersionScope,
 };
-use crate::plugin::runtime::load_binary_blob_data_by_hash;
 use crate::{LixBackend, LixError};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;

@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crate::account;
+use crate::binary_cas;
 use crate::canonical;
 use crate::checkpoint;
 use crate::commit;
@@ -56,6 +57,9 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             commit::init(&backend)
                 .await
                 .map_err(|error| init_step_error("commit::init", error))?;
+            binary_cas::init(&backend)
+                .await
+                .map_err(|error| init_step_error("binary_cas::init", error))?;
             filesystem::init(&backend)
                 .await
                 .map_err(|error| init_step_error("filesystem::init", error))?;
