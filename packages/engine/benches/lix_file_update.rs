@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use lix_engine::wasm::NoopWasmRuntime;
 use lix_engine::{
-    boot, BootArgs, BootKeyValue, LixBackend, LixBackendTransaction, LixError, NoopWasmRuntime,
-    QueryResult, Session, SqlDialect, TransactionMode, Value,
+    boot, BootArgs, BootKeyValue, LixBackend, LixBackendTransaction, LixError, QueryResult,
+    Session, SqlDialect, TransactionMode, Value,
 };
 use serde_json::json;
 use std::collections::BTreeMap;

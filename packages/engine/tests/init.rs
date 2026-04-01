@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lix_engine::{boot, BootAccount, BootArgs, BootKeyValue, NoopWasmRuntime, Value};
+use lix_engine::wasm::NoopWasmRuntime;
+use lix_engine::{boot, BootAccount, BootArgs, BootKeyValue, Value};
 use serde_json::json;
 
 const CHECKPOINT_LABEL_ID: &str = "lix_label_checkpoint";

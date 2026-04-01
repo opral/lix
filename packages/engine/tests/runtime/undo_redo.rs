@@ -1,8 +1,7 @@
 use crate::support;
 
-use lix_engine::{
-    CreateVersionOptions, StateCommitStreamFilter, StateCommitStreamOperation, UndoOptions, Value,
-};
+use lix_engine::streams::{StateCommitStreamFilter, StateCommitStreamOperation};
+use lix_engine::{CreateVersionOptions, UndoOptions, Value};
 
 const CHECKPOINT_LABEL_ID: &str = "lix_label_checkpoint";
 

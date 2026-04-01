@@ -1,4 +1,5 @@
-use lix_engine::{ImageChunkReader, ImageChunkWriter, LixError, TransactionMode};
+use lix_engine::image::{ImageChunkReader, ImageChunkWriter};
+use lix_engine::{LixError, TransactionMode};
 use lix_rs_sdk::{LixBackend, SqliteBackend, Value};
 
 struct VecImageWriter {

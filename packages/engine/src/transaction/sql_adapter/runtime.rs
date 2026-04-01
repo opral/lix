@@ -7,6 +7,7 @@ use crate::contracts::traits::{PendingPublicReadTransaction, PendingView};
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::engine::Engine;
 use crate::functions::SharedFunctionProvider;
+use crate::runtime::streams::StateCommitStreamChange;
 use crate::runtime::{normalize_sql_execution_error_with_backend, TransactionBackendAdapter};
 use crate::sql::executor::contracts::executor_error::ExecutorError;
 use crate::sql::executor::execute_prepared::execute_prepared_with_transaction;
@@ -14,7 +15,6 @@ use crate::sql::executor::{
     schema_registrations_for_compiled_execution, CompiledExecution, CompiledInternalExecution,
     PreparedPublicRead,
 };
-use crate::state::stream::StateCommitStreamChange;
 use crate::transaction::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, QueryResult};
 use sqlparser::ast::Statement;

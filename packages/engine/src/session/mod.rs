@@ -321,7 +321,7 @@ impl Session {
 
     pub async fn export_image(
         &self,
-        writer: &mut dyn crate::ImageChunkWriter,
+        writer: &mut dyn crate::runtime::image::ImageChunkWriter,
     ) -> Result<(), LixError> {
         self.runtime.backend().export_image(writer).await
     }
@@ -660,7 +660,7 @@ impl<'a> SessionTransaction<'a> {
 
     pub(crate) fn record_state_commit_stream_changes(
         &mut self,
-        changes: Vec<crate::StateCommitStreamChange>,
+        changes: Vec<crate::runtime::streams::StateCommitStreamChange>,
     ) -> Result<(), LixError> {
         self.write_transaction
             .as_mut()
@@ -972,7 +972,7 @@ mod tests {
     fn test_engine(backend: RecordingBackend) -> Arc<Engine> {
         Arc::new(crate::boot(crate::BootArgs::new(
             Box::new(backend),
-            Arc::new(crate::NoopWasmRuntime),
+            Arc::new(crate::runtime::wasm::NoopWasmRuntime),
         )))
     }
 

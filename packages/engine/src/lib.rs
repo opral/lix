@@ -26,11 +26,9 @@ mod public_read_sql;
 pub(crate) mod refs;
 mod replay_cursor;
 mod runtime;
-mod runtime_functions;
 mod schema;
 pub mod session;
 pub(crate) mod sql;
-pub(crate) mod state;
 #[cfg(test)]
 mod test_support;
 mod text;
@@ -38,10 +36,26 @@ pub mod transaction;
 mod types;
 mod undo_redo;
 mod version;
-mod wasm_runtime;
 pub mod wire;
 pub(crate) mod workspace;
 mod write_runtime;
+
+pub mod image {
+    pub use crate::runtime::image::{ImageChunkReader, ImageChunkWriter};
+}
+
+pub mod streams {
+    pub use crate::runtime::streams::{
+        StateCommitStream, StateCommitStreamBatch, StateCommitStreamChange,
+        StateCommitStreamFilter, StateCommitStreamOperation,
+    };
+}
+
+pub mod wasm {
+    pub use crate::runtime::wasm::{
+        NoopWasmRuntime, WasmComponentInstance, WasmLimits, WasmRuntime,
+    };
+}
 
 pub use schema::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,
@@ -82,15 +96,9 @@ pub use session::{OpenSessionOptions, Session, SessionTransaction};
 pub use sql::binder::{delay_broad_binding_for_test, BroadBindingDelayForTestGuard};
 #[doc(hidden)]
 pub use sql::routing::{delay_broad_routing_for_test, BroadRoutingDelayForTestGuard};
-pub use state::image::{ImageChunkReader, ImageChunkWriter};
-pub use state::stream::{
-    StateCommitStream, StateCommitStreamBatch, StateCommitStreamChange, StateCommitStreamFilter,
-    StateCommitStreamOperation,
-};
 pub use types::{ExecuteResult, QueryResult, Value};
 pub use undo_redo::{RedoOptions, RedoResult, UndoOptions, UndoResult};
 pub use version::{
     CreateVersionOptions, CreateVersionResult, ExpectedVersionHeads, MergeOutcome,
     MergeVersionOptions, MergeVersionResult,
 };
-pub use wasm_runtime::{NoopWasmRuntime, WasmComponentInstance, WasmLimits, WasmRuntime};

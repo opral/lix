@@ -2,7 +2,7 @@ use crate::contracts::artifacts::{
     SessionStateDelta, TrackedWriteOperation, TrackedWriteRow, UntrackedWriteOperation,
     UntrackedWriteRow,
 };
-use crate::state::stream::StateCommitStreamChange;
+use crate::runtime::streams::StateCommitStreamChange;
 use crate::LixError;
 
 use super::write_plan::{WriteDelta, WriteJournal};

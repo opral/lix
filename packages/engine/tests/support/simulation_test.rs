@@ -10,13 +10,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use lix_engine::wasm::{NoopWasmRuntime, WasmRuntime};
 use lix_engine::{
     boot, BootAccount, BootArgs, BootKeyValue, CreateCheckpointResult, CreateVersionOptions,
     CreateVersionResult, Engine, ExecuteOptions, ExecuteResult, LiveStateApplyReport,
     LiveStateRebuildDebugMode, LiveStateRebuildPlan, LiveStateRebuildReport,
     LiveStateRebuildRequest, LiveStateRebuildScope, LixBackend, LixError, MergeVersionOptions,
-    MergeVersionResult, NoopWasmRuntime, ObserveEvents, ObserveQuery, RedoOptions, RedoResult,
-    Session, SessionTransaction, UndoOptions, UndoResult, Value, WasmRuntime,
+    MergeVersionResult, ObserveEvents, ObserveQuery, RedoOptions, RedoResult, Session,
+    SessionTransaction, UndoOptions, UndoResult, Value,
 };
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex as TokioMutex;

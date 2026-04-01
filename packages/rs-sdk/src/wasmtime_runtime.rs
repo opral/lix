@@ -3,7 +3,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use lix_engine::{CanonicalJson, LixError, WasmComponentInstance, WasmLimits, WasmRuntime};
+use lix_engine::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
+use lix_engine::{CanonicalJson, LixError};
 use serde::{Deserialize, Serialize};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
