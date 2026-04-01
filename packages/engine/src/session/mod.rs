@@ -5,8 +5,6 @@
 //! or kept ephemeral for child sessions, but they are distinct from canonical
 //! version refs and committed graph state.
 
-mod committed_read_runtime;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -21,11 +19,11 @@ use crate::contracts::artifacts::{SessionDependency, SessionExecutionMode, Sessi
 use crate::contracts::surface::SurfaceRegistry;
 use crate::engine::{reject_internal_table_writes, reject_public_create_table, Engine};
 use crate::errors;
-use crate::runtime::execution_state::ExecutionRuntimeState;
-use crate::runtime::Runtime;
-use crate::session::committed_read_runtime::{
+use crate::read_runtime::{
     execute_execution_program_in_committed_read_transaction, prepare_committed_read_program,
 };
+use crate::runtime::execution_state::ExecutionRuntimeState;
+use crate::runtime::Runtime;
 use crate::sql::executor::execution_program::{
     execute_execution_program_with_write_transaction, ExecutionContext, ExecutionProgram,
     SessionExecutionRuntime, SessionExecutionRuntimeHandle,

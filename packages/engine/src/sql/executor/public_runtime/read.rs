@@ -5,11 +5,10 @@ use crate::canonical::read::load_state_history_rows;
 use crate::contracts::artifacts::{
     CommittedReadMode, DirectoryHistoryRequest, DirectoryHistoryRow, FileHistoryContentMode,
     FileHistoryLineageScope, FileHistoryRequest, FileHistoryRootScope, FileHistoryRow,
-    FileHistoryVersionScope, LiveStateMode, LiveStateProjectionStatus, PendingViewFilter,
-    PendingViewOrderClause, PendingViewProjection, PendingViewReadQuery, PendingViewReadStorage,
-    PreparedPublicReadContract, PublicReadResultColumn, PublicReadResultColumns,
-    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
-    StateHistoryRow, StateHistoryVersionScope,
+    FileHistoryVersionScope, LiveStateMode, LiveStateProjectionStatus, PendingViewReadQuery,
+    PendingViewReadStorage, PreparedPublicReadContract, PublicReadResultColumn,
+    PublicReadResultColumns, StateHistoryContentMode, StateHistoryLineageScope,
+    StateHistoryRequest, StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
 };
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry,
@@ -44,7 +43,8 @@ use crate::sql::physical_plan::lowerer::{
     lower_broad_public_read_for_execution_with_layouts, lower_read_for_execution_with_layouts,
 };
 use crate::sql::physical_plan::{
-    LoweredReadProgram, LoweredResultColumn, LoweredResultColumns, PreparedPublicReadExecution,
+    compile_public_rowset_query, try_compile_read_time_projection_read, LoweredReadProgram,
+    LoweredResultColumn, LoweredResultColumns, PreparedPublicReadExecution,
 };
 use crate::sql::routing::{
     route_broad_public_read_statement_with_known_live_layouts, route_public_read_execution_strategy,
@@ -58,8 +58,7 @@ use crate::{LixBackendTransaction, SqlDialect};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
-    LimitClause, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
-    UnaryOperator, Value as SqlValue,
+    LimitClause, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Value as SqlValue,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -169,13 +168,7 @@ fn pending_view_query_from_prepared_public_read(
         return None;
     }
 
-    let table_alias = structured_read
-        .query
-        .source_alias
-        .as_ref()
-        .map(|alias| alias.name.value.as_str());
-    let mut placeholder_state = PlaceholderState::new();
-    let bound_parameters = &structured_read.bound_parameters;
+    let compiled_query = compile_public_rowset_query(structured_read)?;
 
     Some(PendingViewReadQuery {
         storage: PendingViewReadStorage::Tracked,
@@ -191,297 +184,11 @@ fn pending_view_query_from_prepared_public_read(
                     .flatten()
             })?,
         version_id: structured_read.requested_version_id.clone()?,
-        projections: structured_read
-            .query
-            .projection
-            .iter()
-            .map(|item| pending_view_projection_from_select_item(item, table_alias))
-            .collect::<Option<Vec<_>>>()?,
-        filters: structured_read
-            .query
-            .selection_predicates
-            .iter()
-            .map(|predicate| {
-                pending_view_filter_from_expr(
-                    predicate,
-                    table_alias,
-                    bound_parameters,
-                    &mut placeholder_state,
-                )
-            })
-            .collect::<Option<Vec<_>>>()?,
-        order_by: structured_read
-            .query
-            .order_by
-            .as_ref()
-            .map(|order_by| pending_view_order_by_from_clause(order_by, table_alias))
-            .flatten()
-            .unwrap_or_default(),
-        limit: pending_view_limit_from_clause(structured_read.query.limit_clause.as_ref())?,
+        projections: compiled_query.projections,
+        filters: compiled_query.filters,
+        order_by: compiled_query.order_by,
+        limit: compiled_query.limit,
     })
-}
-
-fn pending_view_projection_from_select_item(
-    item: &SelectItem,
-    table_alias: Option<&str>,
-) -> Option<PendingViewProjection> {
-    match item {
-        SelectItem::UnnamedExpr(expr) => pending_view_projection_from_expr(
-            expr,
-            table_alias,
-            pending_view_identifier_name(expr, table_alias).unwrap_or_else(|| expr.to_string()),
-        ),
-        SelectItem::ExprWithAlias { expr, alias } => {
-            pending_view_projection_from_expr(expr, table_alias, alias.value.clone())
-        }
-        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
-    }
-}
-
-fn pending_view_projection_from_expr(
-    expr: &Expr,
-    table_alias: Option<&str>,
-    output_column: String,
-) -> Option<PendingViewProjection> {
-    if pending_view_expr_is_count_all(expr) {
-        return Some(PendingViewProjection::CountAll { output_column });
-    }
-
-    Some(PendingViewProjection::Column {
-        source_column: pending_view_identifier_name(expr, table_alias)?,
-        output_column,
-    })
-}
-
-fn pending_view_filter_from_expr(
-    expr: &Expr,
-    table_alias: Option<&str>,
-    params: &[Value],
-    placeholder_state: &mut PlaceholderState,
-) -> Option<PendingViewFilter> {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => Some(PendingViewFilter::And(vec![
-            pending_view_filter_from_expr(left, table_alias, params, placeholder_state)?,
-            pending_view_filter_from_expr(right, table_alias, params, placeholder_state)?,
-        ])),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Or,
-            right,
-        } => Some(PendingViewFilter::Or(vec![
-            pending_view_filter_from_expr(left, table_alias, params, placeholder_state)?,
-            pending_view_filter_from_expr(right, table_alias, params, placeholder_state)?,
-        ])),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => match (
-            left.as_ref(),
-            pending_view_value_from_expr(right, params, placeholder_state),
-            right.as_ref(),
-            pending_view_value_from_expr(left, params, placeholder_state),
-        ) {
-            (left, Some(value), _, _) => Some(PendingViewFilter::Equals(
-                pending_view_identifier_name(left, table_alias)?,
-                value,
-            )),
-            (_, _, right, Some(value)) => Some(PendingViewFilter::Equals(
-                pending_view_identifier_name(right, table_alias)?,
-                value,
-            )),
-            _ => None,
-        },
-        Expr::InList {
-            expr,
-            list,
-            negated: false,
-        } => Some(PendingViewFilter::In(
-            pending_view_identifier_name(expr, table_alias)?,
-            list.iter()
-                .map(|expr| pending_view_value_from_expr(expr, params, placeholder_state))
-                .collect::<Option<Vec<_>>>()?,
-        )),
-        Expr::IsNull(expr) => Some(PendingViewFilter::IsNull(pending_view_identifier_name(
-            expr,
-            table_alias,
-        )?)),
-        Expr::IsNotNull(expr) => Some(PendingViewFilter::IsNotNull(pending_view_identifier_name(
-            expr,
-            table_alias,
-        )?)),
-        Expr::Like {
-            expr,
-            pattern,
-            negated: false,
-            ..
-        } => Some(PendingViewFilter::Like {
-            column: pending_view_identifier_name(expr, table_alias)?,
-            pattern: pending_view_value_from_expr(pattern, params, placeholder_state)
-                .and_then(|value| pending_view_filter_text(&value))?,
-            case_insensitive: false,
-        }),
-        Expr::ILike {
-            expr,
-            pattern,
-            negated: false,
-            ..
-        } => Some(PendingViewFilter::Like {
-            column: pending_view_identifier_name(expr, table_alias)?,
-            pattern: pending_view_value_from_expr(pattern, params, placeholder_state)
-                .and_then(|value| pending_view_filter_text(&value))?,
-            case_insensitive: true,
-        }),
-        Expr::Nested(inner) => {
-            pending_view_filter_from_expr(inner, table_alias, params, placeholder_state)
-        }
-        _ => None,
-    }
-}
-
-fn pending_view_order_by_from_clause(
-    order_by: &OrderBy,
-    table_alias: Option<&str>,
-) -> Option<Vec<PendingViewOrderClause>> {
-    let OrderByKind::Expressions(expressions) = &order_by.kind else {
-        return None;
-    };
-    expressions
-        .iter()
-        .map(|expr| pending_view_order_clause_from_expr(expr, table_alias))
-        .collect()
-}
-
-fn pending_view_order_clause_from_expr(
-    expr: &OrderByExpr,
-    table_alias: Option<&str>,
-) -> Option<PendingViewOrderClause> {
-    Some(PendingViewOrderClause {
-        column: pending_view_identifier_name(&expr.expr, table_alias)?,
-        descending: expr.options.asc == Some(false),
-    })
-}
-
-fn pending_view_limit_from_clause(limit_clause: Option<&LimitClause>) -> Option<Option<usize>> {
-    let Some(limit_clause) = limit_clause else {
-        return Some(None);
-    };
-    match limit_clause {
-        LimitClause::LimitOffset {
-            limit,
-            offset,
-            limit_by,
-        } => {
-            if offset.is_some() || !limit_by.is_empty() {
-                return None;
-            }
-            let Some(limit) = limit.as_ref() else {
-                return Some(None);
-            };
-            let Expr::Value(value) = limit else {
-                return None;
-            };
-            match &value.value {
-                SqlValue::Number(value, _) => value.parse::<usize>().ok().map(Some),
-                _ => None,
-            }
-        }
-        LimitClause::OffsetCommaLimit { .. } => None,
-    }
-}
-
-fn pending_view_identifier_name(expr: &Expr, table_alias: Option<&str>) -> Option<String> {
-    match expr {
-        Expr::Identifier(ident) => Some(ident.value.clone()),
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            let qualifier = parts[0].value.as_str();
-            let column = parts[1].value.clone();
-            match table_alias {
-                Some(alias) if alias.eq_ignore_ascii_case(qualifier) => Some(column),
-                None => Some(column),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-fn pending_view_expr_is_count_all(expr: &Expr) -> bool {
-    let Expr::Function(function) = expr else {
-        return false;
-    };
-    function.name.to_string().eq_ignore_ascii_case("count")
-        && matches!(
-            &function.args,
-            FunctionArguments::List(list)
-                if list.args.len() == 1
-                    && matches!(
-                        &list.args[0],
-                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
-                    )
-        )
-}
-
-fn pending_view_value_from_expr(
-    expr: &Expr,
-    params: &[Value],
-    placeholder_state: &mut PlaceholderState,
-) -> Option<Value> {
-    match expr {
-        Expr::Nested(inner) => pending_view_value_from_expr(inner, params, placeholder_state),
-        Expr::UnaryOp { op, expr } => {
-            let value = pending_view_value_from_expr(expr, params, placeholder_state)?;
-            match (op, value) {
-                (UnaryOperator::Minus, Value::Integer(value)) => Some(Value::Integer(-value)),
-                (UnaryOperator::Minus, Value::Real(value)) => Some(Value::Real(-value)),
-                (UnaryOperator::Plus, value) => Some(value),
-                _ => None,
-            }
-        }
-        Expr::Value(value) => match &value.value {
-            SqlValue::Placeholder(token) => {
-                let index =
-                    resolve_placeholder_index(token, params.len(), placeholder_state).ok()?;
-                params.get(index).cloned()
-            }
-            _ => sql_value_as_engine_value(value),
-        },
-        _ => None,
-    }
-}
-
-fn sql_value_as_engine_value(value: &sqlparser::ast::ValueWithSpan) -> Option<Value> {
-    match &value.value {
-        SqlValue::Null => Some(Value::Null),
-        SqlValue::Boolean(value) => Some(Value::Boolean(*value)),
-        SqlValue::SingleQuotedString(text)
-        | SqlValue::TripleSingleQuotedString(text)
-        | SqlValue::EscapedStringLiteral(text)
-        | SqlValue::DollarQuotedString(sqlparser::ast::DollarQuotedString {
-            value: text, ..
-        }) => Some(Value::Text(text.clone())),
-        SqlValue::Number(value, _) => value
-            .parse::<i64>()
-            .map(Value::Integer)
-            .or_else(|_| value.parse::<f64>().map(Value::Real))
-            .ok(),
-        _ => None,
-    }
-}
-
-fn pending_view_filter_text(value: &Value) -> Option<String> {
-    match value {
-        Value::Text(text) => Some(text.clone()),
-        Value::Integer(value) => Some(value.to_string()),
-        Value::Boolean(value) => Some(if *value { "1" } else { "0" }.to_string()),
-        Value::Real(value) => Some(value.to_string()),
-        Value::Json(value) => Some(value.to_string()),
-        Value::Null | Value::Blob(_) => None,
-    }
 }
 
 fn public_read_result_columns_from_lowered(
@@ -590,6 +297,10 @@ async fn execute_prepared_public_read_unchecked(
                 &prepared.runtime_bindings,
             )
             .await
+        }
+        PreparedPublicReadExecution::ReadTimeProjection(artifact) => {
+            crate::read_runtime::execute_read_time_projection_read_with_backend(backend, artifact)
+                .await
         }
         PreparedPublicReadExecution::Direct(plan) => {
             execute_direct_public_read(backend, plan).await
@@ -4950,51 +4661,60 @@ async fn try_prepare_public_read_via_specialized_optimization(
             }
         }
     } else {
-        let capability_started = Instant::now();
-        let known_live_layouts = load_known_live_layouts_for_public_read(
-            backend,
-            &structured_read,
-            analysis.dependency_spec.as_ref(),
-            analysis.semantics.effective_state_request.as_ref(),
-        )
-        .await?;
-        stage_timings.record(
-            ExplainStage::CapabilityResolution,
-            capability_started.elapsed(),
-        );
-        let current_version_heads =
-            load_local_version_heads_for_surface(backend, &surface_binding).await?;
-        let lowered_read = match lower_read_for_execution_with_layouts(
-            backend.dialect(),
-            &structured_read,
-            analysis.semantics.effective_state_request.as_ref(),
-            analysis.semantics.effective_state_plan.as_ref(),
-            &known_live_layouts,
-            &current_version_heads,
-        ) {
-            Ok(Some(program)) => Ok::<LoweredReadProgram, LixError>(program),
-            Ok(None) => {
-                return Ok(SpecializedPublicReadPreparation::Declined {
-                    reason: format!(
-                        "specialized read optimization declined '{}'",
-                        structured_read.surface_binding.descriptor.public_name
-                    ),
-                    bound_statement: analysis.bound_statement,
-                })
-            }
-            Err(error) if specialized_public_read_error_is_semantic(&error) => return Err(error),
-            Err(error) => {
-                return Ok(SpecializedPublicReadPreparation::Declined {
-                    reason: error.description,
-                    bound_statement: analysis.bound_statement,
-                })
-            }
-        }?;
-        let pushdown_decision = Some(lowered_read.pushdown_decision.clone());
-        (
-            PreparedPublicReadExecution::LoweredSql(lowered_read),
-            pushdown_decision,
-        )
+        if let Some(artifact) = try_compile_read_time_projection_read(&structured_read) {
+            (
+                PreparedPublicReadExecution::ReadTimeProjection(artifact),
+                None,
+            )
+        } else {
+            let capability_started = Instant::now();
+            let known_live_layouts = load_known_live_layouts_for_public_read(
+                backend,
+                &structured_read,
+                analysis.dependency_spec.as_ref(),
+                analysis.semantics.effective_state_request.as_ref(),
+            )
+            .await?;
+            stage_timings.record(
+                ExplainStage::CapabilityResolution,
+                capability_started.elapsed(),
+            );
+            let current_version_heads =
+                load_local_version_heads_for_surface(backend, &surface_binding).await?;
+            let lowered_read = match lower_read_for_execution_with_layouts(
+                backend.dialect(),
+                &structured_read,
+                analysis.semantics.effective_state_request.as_ref(),
+                analysis.semantics.effective_state_plan.as_ref(),
+                &known_live_layouts,
+                &current_version_heads,
+            ) {
+                Ok(Some(program)) => Ok::<LoweredReadProgram, LixError>(program),
+                Ok(None) => {
+                    return Ok(SpecializedPublicReadPreparation::Declined {
+                        reason: format!(
+                            "specialized read optimization declined '{}'",
+                            structured_read.surface_binding.descriptor.public_name
+                        ),
+                        bound_statement: analysis.bound_statement,
+                    })
+                }
+                Err(error) if specialized_public_read_error_is_semantic(&error) => {
+                    return Err(error)
+                }
+                Err(error) => {
+                    return Ok(SpecializedPublicReadPreparation::Declined {
+                        reason: error.description,
+                        bound_statement: analysis.bound_statement,
+                    })
+                }
+            }?;
+            let pushdown_decision = Some(lowered_read.pushdown_decision.clone());
+            (
+                PreparedPublicReadExecution::LoweredSql(lowered_read),
+                pushdown_decision,
+            )
+        }
     };
     stage_timings.record(ExplainStage::PhysicalPlanning, physical_started.elapsed());
 
@@ -5013,11 +4733,13 @@ async fn try_prepare_public_read_via_specialized_optimization(
             );
             lowered_sql
         }
+        PreparedPublicReadExecution::ReadTimeProjection(_) => Vec::new(),
         PreparedPublicReadExecution::Direct(_) => Vec::new(),
     };
 
     let optimized_logical_plan = match &execution {
         PreparedPublicReadExecution::LoweredSql(_) => logical_plan.clone(),
+        PreparedPublicReadExecution::ReadTimeProjection(_) => logical_plan.clone(),
         PreparedPublicReadExecution::Direct(direct_plan) => {
             analysis.logical_plan_with_direct_execution(direct_plan.clone())
         }
