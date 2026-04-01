@@ -6,6 +6,7 @@ use crate::live_state::{
     mark_mode_with_backend, LiveStateApplyReport, LiveStateMode, LiveStateRebuildPlan,
     LiveStateRebuildReport, LiveStateRebuildRequest, ProjectionStatus,
 };
+use crate::runtime::image::{ImageChunkReader, ImageChunkWriter};
 use crate::sql::common::text::escape_sql_string;
 use crate::{LixBackendTransaction, LixError};
 
@@ -44,16 +45,13 @@ impl Engine {
     }
 
     /// Exports a portable image as SQLite3 file bytes written via chunk stream.
-    pub async fn export_image(
-        &self,
-        writer: &mut dyn crate::ImageChunkWriter,
-    ) -> Result<(), LixError> {
+    pub async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
         self.backend().export_image(writer).await
     }
 
     pub async fn restore_from_image(
         &self,
-        reader: &mut dyn crate::ImageChunkReader,
+        reader: &mut dyn ImageChunkReader,
     ) -> Result<(), LixError> {
         self.backend().restore_from_image(reader).await?;
         self.refresh_public_surface_registry().await?;

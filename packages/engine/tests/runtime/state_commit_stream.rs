@@ -1,4 +1,5 @@
-use lix_engine::{ExecuteOptions, LixError, StateCommitStreamFilter, StateCommitStreamOperation};
+use lix_engine::streams::{StateCommitStreamFilter, StateCommitStreamOperation};
+use lix_engine::{ExecuteOptions, LixError};
 
 fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     format!(

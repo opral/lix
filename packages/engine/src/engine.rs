@@ -1,9 +1,11 @@
 use crate::contracts::artifacts::{FilesystemPayloadDomainChange, MutationRow};
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::functions::SharedFunctionProvider;
+use crate::runtime::streams::{
+    StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter,
+};
+use crate::runtime::wasm::WasmRuntime;
 use crate::runtime::Runtime;
-use crate::state::stream::{StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter};
-use crate::WasmRuntime;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
@@ -339,13 +341,14 @@ pub(crate) fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, Lix
 mod tests {
     use super::{boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs};
     use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect, TransactionMode};
+    use crate::runtime::wasm::NoopWasmRuntime;
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
     use crate::sql::binder::{advance_placeholder_state_for_statement_ast, bind_sql_with_state};
     use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
     use crate::sql::optimizer::optimize_state_resolution;
     use crate::sql::parser::parse_sql_statements;
     use crate::sql::parser::placeholders::PlaceholderState;
-    use crate::{ExecuteOptions, LixError, NoopWasmRuntime, QueryResult, Session, Value};
+    use crate::{ExecuteOptions, LixError, QueryResult, Session, Value};
     use async_trait::async_trait;
     use sqlparser::ast::Statement;
     use std::sync::atomic::{AtomicBool, Ordering};

@@ -3,16 +3,16 @@ mod wasm {
     use async_trait::async_trait;
     use futures_util::future::{AbortHandle, Abortable};
     use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
+    use lix_engine::image::ImageChunkWriter;
+    use lix_engine::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
     use lix_engine::wire::{WireQueryResult, WireValue};
     use lix_engine::{
         BootKeyValue, CreateCheckpointResult, CreateVersionOptions, CreateVersionResult,
-        ExecuteOptions, ExecuteResult as EngineExecuteResult, ImageChunkWriter,
-        InitResult as EngineInitResult, Lix as CoreLix, LixBackend, LixBackendTransaction,
-        LixConfig, LixError, ObserveEvent as EngineObserveEvent,
-        ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
-        QueryResult as EngineQueryResult, RedoOptions, RedoResult, SqlDialect, TransactionMode,
-        UndoOptions, UndoResult, Value as EngineValue, WasmComponentInstance, WasmLimits,
-        WasmRuntime,
+        ExecuteOptions, ExecuteResult as EngineExecuteResult, InitResult as EngineInitResult,
+        Lix as CoreLix, LixBackend, LixBackendTransaction, LixConfig, LixError,
+        ObserveEvent as EngineObserveEvent, ObserveEventsOwned as EngineObserveEvents,
+        ObserveQuery as EngineObserveQuery, QueryResult as EngineQueryResult, RedoOptions,
+        RedoResult, SqlDialect, TransactionMode, UndoOptions, UndoResult, Value as EngineValue,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;

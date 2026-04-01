@@ -1,6 +1,7 @@
 use crate::support;
 
-use lix_engine::{boot, BootArgs, CreateVersionOptions, Engine, ExecuteOptions, NoopWasmRuntime};
+use lix_engine::wasm::NoopWasmRuntime;
+use lix_engine::{boot, BootArgs, CreateVersionOptions, Engine, ExecuteOptions};
 use lix_engine::{ObserveQuery, Value};
 use std::path::PathBuf;
 use std::sync::Arc;

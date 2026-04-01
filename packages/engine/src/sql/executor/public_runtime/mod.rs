@@ -19,6 +19,10 @@ use crate::filesystem::runtime::{
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::runtime::streams::{
+    state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
+    StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
+};
 use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::backend::PushdownDecision;
@@ -48,10 +52,6 @@ use crate::sql::semantic_ir::semantics::write_resolver::resolve_write_plan_with_
 use crate::sql::semantic_ir::{
     analyze_public_write_semantics, BoundStatement, ExecutionContext, PublicWriteInvariantTrace,
     PublicWriteSemantics,
-};
-use crate::state::stream::{
-    state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
-    StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,

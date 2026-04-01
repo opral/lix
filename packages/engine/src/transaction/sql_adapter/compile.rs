@@ -124,9 +124,8 @@ pub(super) fn bind_single_statement_template(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        boot, BootArgs, Engine, ExecuteOptions, NoopWasmRuntime, QueryResult, Session, SqlDialect,
-    };
+    use crate::runtime::wasm::NoopWasmRuntime;
+    use crate::{boot, BootArgs, Engine, ExecuteOptions, QueryResult, Session, SqlDialect};
     use async_trait::async_trait;
     use std::sync::Arc;
 

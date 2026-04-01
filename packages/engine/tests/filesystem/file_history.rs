@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
-use lix_engine::{Value, WasmRuntime};
+use lix_engine::wasm::WasmRuntime;
+use lix_engine::Value;
 use serde_json::Value as JsonValue;
 
 const TEST_PLUGIN_MANIFEST: &str = r#"{

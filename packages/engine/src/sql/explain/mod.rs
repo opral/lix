@@ -17,6 +17,7 @@ use crate::contracts::surface::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
     SurfaceVariant,
 };
+use crate::runtime::streams::StateCommitStreamChange;
 use crate::sql::backend::{PushdownDecision, PushdownSupport};
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::executor::contracts::effects::PlanEffects;
@@ -75,7 +76,6 @@ use crate::sql::semantic_ir::{
     BoundPublicLeaf, PublicReadSemantics, PublicWriteInvariantTrace, PublicWriteSemantics,
     SemanticStatement,
 };
-use crate::state::stream::StateCommitStreamChange;
 use crate::{LixError, QueryResult, Value};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
